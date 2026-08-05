@@ -948,7 +948,7 @@ dependencies = [
  "owo-colors",
  "parking_lot",
  "pd-edge-abi 0.1.0",
- "pd-edge-host-function",
+ "pd-host-function 0.1.0",
  "pd-vm",
  "rand 0.8.7",
  "rcgen",
@@ -985,15 +985,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9676d58588b220f7af69d7aa86108042d2acaf21dd24c641a6d9ef3c4e193ba"
 dependencies = [
  "pd-host-function 0.22.7",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "pd-edge-host-function"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
  "syn 2.0.119",
 ]
 
