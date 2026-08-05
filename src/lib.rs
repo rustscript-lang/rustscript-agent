@@ -4,6 +4,9 @@ use std::path::Path;
 
 use rustscript_vm::{HostFunctionRegistry, HttpConfig, Program, Value, Vm, VmStatus};
 
+pub mod gateway;
+pub use gateway::{AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app};
+
 pub type Result<T> = std::result::Result<T, AgentError>;
 
 #[derive(Debug)]
