@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!(
-        "pd-edge-agent-gateway listening on http://{}",
+        "rustscript-agent-gateway listening on http://{}",
         listener.local_addr()?
     );
     axum::serve(listener, build_agent_gateway_app(state)).await?;
