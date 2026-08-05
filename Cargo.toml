@@ -1,0 +1,16 @@
+[package]
+name = "rustscript-agent"
+version = "0.1.0"
+edition = "2024"
+description = "Script-owned RustScript agent runner"
+license = "MIT"
+
+[lib]
+name = "rustscript_agent"
+
+[[bin]]
+name = "rustscript-agent"
+path = "src/bin/rustscript-agent.rs"
+
+[dependencies]
+rustscript-vm = { package = "pd-vm", path = "../rustscript", features = ["http-client"] }

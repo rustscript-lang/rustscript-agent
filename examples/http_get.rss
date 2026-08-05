@@ -1,0 +1,6 @@
+use http;
+
+http::client::request({
+    method: "GET",
+    url: "https://api.example.com/health",
+});
