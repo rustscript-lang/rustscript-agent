@@ -136,6 +136,10 @@ async fn run_returns_202_and_sse_contains_terminal_events() {
     let text = String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8");
     assert!(text.contains("message.delta"));
     assert!(text.contains("run.completed"));
+    assert!(text.contains("\"delta\""));
+    assert!(text.contains("\"output\""));
+    assert!(text.contains("\"usage\""));
+    assert!(!text.contains("\"data\":{\"delta\""));
     assert!(text.contains(run_id));
 }
 
@@ -235,8 +239,8 @@ async fn jobs_and_subagent_interrupt_follow_hermes_shapes() {
         Value::Null,
     )
     .await;
-    assert_eq!(run_status, StatusCode::OK);
-    assert_eq!(run["job"]["id"], job_id);
+    assert_eq!(run_status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(run["error"]["code"], "job_execution_unavailable");
 
     let (output_status, output) = json_request(
         &app,
@@ -246,7 +250,7 @@ async fn jobs_and_subagent_interrupt_follow_hermes_shapes() {
     )
     .await;
     assert_eq!(output_status, StatusCode::OK);
-    assert!(output["output"].is_object());
+    assert!(output["output"].is_null());
 
     let (interrupt_status, interrupt) = json_request(
         &app,

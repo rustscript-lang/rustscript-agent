@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
     path::Path as FsPath,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,6 +36,8 @@ pub struct AgentGatewayConfig {
     pub agent_name: String,
     pub bearer_token: Option<String>,
     pub max_body_bytes: usize,
+    pub max_concurrent_runs: usize,
+    pub run_timeout: Duration,
     pub http: HttpConfig,
 }
 
@@ -44,6 +49,8 @@ impl Default for AgentGatewayConfig {
             agent_name: "local-rss-agent".to_string(),
             bearer_token: None,
             max_body_bytes: 4 * 1024 * 1024,
+            max_concurrent_runs: 8,
+            run_timeout: Duration::from_secs(900),
             http: HttpConfig::default(),
         }
     }
@@ -122,13 +129,15 @@ impl AgentGatewayState {
         })
     }
 
-    fn persist(&self) {
+    fn persist(&self) -> bool {
         let Some(persistence) = self.persistence.as_ref() else {
-            return;
+            return true;
         };
         if let Err(error) = persistence.save(&self.store.read()) {
-            tracing::warn!("failed to persist agent gateway state: {error}");
+            tracing::error!("failed to persist agent gateway state: {error}");
+            return false;
         }
+        true
     }
 }
 
@@ -227,6 +236,7 @@ struct RunRecord {
     status: String,
     events: Vec<GatewayEvent>,
     sender: broadcast::Sender<GatewayEvent>,
+    cancel_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,13 +304,18 @@ impl GatewayEvent {
 
     fn into_sse(self) -> Event {
         let event_name = self.event.clone();
-        let data = serde_json::to_string(&json!({
-            "event": self.event,
-            "run_id": self.run_id,
-            "timestamp": self.timestamp,
-            "data": self.data,
-        }))
-        .unwrap_or_else(|_| "{}".to_string());
+        let mut payload = serde_json::Map::new();
+        payload.insert("event".to_string(), Value::String(self.event));
+        payload.insert("run_id".to_string(), Value::String(self.run_id));
+        payload.insert("timestamp".to_string(), json!(self.timestamp));
+        match self.data {
+            Value::Object(fields) => payload.extend(fields),
+            data => {
+                payload.insert("data".to_string(), data);
+            }
+        }
+        let data =
+            serde_json::to_string(&Value::Object(payload)).unwrap_or_else(|_| "{}".to_string());
         Event::default().event(event_name).data(data)
     }
 }
@@ -437,8 +452,15 @@ async fn persist_gateway_state(
     next: Next,
 ) -> Response {
     let response = next.run(request).await;
-    state.persist();
-    response
+    if state.persist() {
+        response
+    } else {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistence_failed",
+            "gateway state could not be persisted",
+        )
+    }
 }
 
 async fn bearer_auth_middleware(
@@ -689,8 +711,50 @@ async fn session_chat_handler(
     Path(session_id): Path<String>,
     Json(request): Json<ChatRequest>,
 ) -> Response {
+    let Some(source) = state.agent_source.clone() else {
+        return json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "agent_source_not_configured",
+            "session chat requires PD_EDGE_AGENT_SCRIPT",
+        );
+    };
+    if !state.store.read().sessions.contains_key(&session_id) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session not found",
+        );
+    }
+
     let input = request.input.unwrap_or(Value::Null);
-    let text = input_text(&input);
+    let input_text = input_text(&input);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let http_config = state.http_config.clone();
+    let worker_input = input_text.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        execute_rss_source(&source, http_config, worker_input, cancellation)
+    });
+    let output = match tokio::time::timeout(state.config.run_timeout, worker).await {
+        Ok(Ok(Ok(value))) => vm_value_to_json(&value),
+        Ok(Ok(Err(error))) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "agent_failed", &error);
+        }
+        Ok(Err(error)) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent_worker_failed",
+                &format!("agent worker join failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "agent_timeout",
+                "agent execution timed out",
+            );
+        }
+    };
+
     let mut store = state.store.write();
     let Some(session) = store.sessions.get_mut(&session_id) else {
         return json_error(
@@ -699,13 +763,15 @@ async fn session_chat_handler(
             "session not found",
         );
     };
-    if request.model.is_some() {
-        session.view.model = request.model.unwrap_or_default();
+    if let Some(model) = request.model {
+        session.view.model = model;
     }
     if request.provider.is_some() {
         session.view.provider = request.provider;
     }
-    let _ = request.instructions;
+    if request.instructions.is_some() {
+        session.view.system_prompt = request.instructions;
+    }
     append_message(
         &mut session.view,
         &mut session.messages,
@@ -718,7 +784,7 @@ async fn session_chat_handler(
         &mut session.view,
         &mut session.messages,
         "assistant",
-        Value::String(text.clone()),
+        output,
         None,
         Some("stop".to_string()),
     );
@@ -775,7 +841,23 @@ async fn create_run_handler(
             id
         }
     };
+    if state
+        .store
+        .read()
+        .runs
+        .values()
+        .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
+        .count()
+        >= state.config.max_concurrent_runs
+    {
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "run_limit_reached",
+            "maximum concurrent run limit reached",
+        );
+    }
     let run_id = Uuid::new_v4().to_string();
+    let cancel_requested = Arc::new(AtomicBool::new(false));
     let (sender, _) = broadcast::channel(32);
     {
         let mut store = state.store.write();
@@ -786,6 +868,15 @@ async fn create_run_handler(
                 "session not found",
             );
         };
+        if let Some(model) = request.model.clone() {
+            session.view.model = model;
+        }
+        if request.provider.is_some() {
+            session.view.provider = request.provider.clone();
+        }
+        if request.instructions.is_some() {
+            session.view.system_prompt = request.instructions.clone();
+        }
         append_message(
             &mut session.view,
             &mut session.messages,
@@ -802,6 +893,7 @@ async fn create_run_handler(
                 status: "started".to_string(),
                 events: Vec::new(),
                 sender,
+                cancel_requested: cancel_requested.clone(),
             },
         );
     }
@@ -848,12 +940,7 @@ async fn stop_run_handler(
     };
     if run.status == "started" {
         run.status = "stopping".to_string();
-        emit_event_locked(
-            run,
-            "run.cancelled",
-            json!({"status":"cancelled", "reason":"client_stop"}),
-        );
-        run.status = "cancelled".to_string();
+        run.cancel_requested.store(true, Ordering::Release);
     }
     drop(store);
     state.persist();
@@ -999,19 +1086,14 @@ async fn resume_job_handler(
 }
 
 async fn run_job_handler(
-    State(state): State<AgentGatewayState>,
-    Path(job_id): Path<String>,
+    State(_state): State<AgentGatewayState>,
+    Path(_job_id): Path<String>,
 ) -> Response {
-    let mut store = state.store.write();
-    let Some(job) = store.jobs.get_mut(&job_id) else {
-        return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
-    };
-    let now = timestamp();
-    job.view.last_run_at = Some(now);
-    job.view.updated_at = now;
-    job.output = Some(json!({"status":"started", "job_id":job_id}));
-    let view = job.view.clone();
-    json_response(StatusCode::OK, json!({"job":view}))
+    json_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "job_execution_unavailable",
+        "scheduled job execution is not wired to the agent runner",
+    )
 }
 
 async fn interrupt_subagent_handler(
@@ -1028,12 +1110,7 @@ async fn interrupt_subagent_handler(
     };
     if run.status == "started" {
         run.status = "stopping".to_string();
-        emit_event_locked(
-            run,
-            "run.cancelled",
-            json!({"status":"cancelled", "reason":"subagent_interrupt"}),
-        );
-        run.status = "cancelled".to_string();
+        run.cancel_requested.store(true, Ordering::Release);
     }
     drop(store);
     state.persist();
@@ -1060,46 +1137,45 @@ fn set_job_enabled(state: &AgentGatewayState, job_id: &str, enabled: bool) -> Re
 
 async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String) {
     tokio::task::yield_now().await;
-    let session_id = {
+    let (session_id, cancel_requested) = {
         let store = state.store.read();
         let Some(run) = store.runs.get(&run_id) else {
             return;
         };
-        if run.status != "started" {
-            return;
-        }
-        run.session_id.clone()
+        (run.session_id.clone(), run.cancel_requested.clone())
     };
+
+    if cancel_requested.load(Ordering::Acquire) {
+        finish_cancelled(&state, &run_id, "client_stop");
+        return;
+    }
 
     let output_text = if let Some(source) = state.agent_source.clone() {
         let http_config = state.http_config.clone();
         let input = text.clone();
-        match tokio::task::spawn_blocking(move || execute_rss_source(&source, http_config, input))
-            .await
-        {
-            Ok(Ok(value)) => format!("{value:?}"),
-            Ok(Err(error)) => {
-                let mut store = state.store.write();
-                if let Some(run) = store.runs.get_mut(&run_id) {
-                    emit_event_locked(run, "run.failed", json!({"error": error}));
-                    run.status = "failed".to_string();
-                }
-                drop(store);
-                state.persist();
+        let cancellation = cancel_requested.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            execute_rss_source(&source, http_config, input, cancellation)
+        });
+        match tokio::time::timeout(state.config.run_timeout, worker).await {
+            Ok(Ok(Ok(value))) => vm_value_to_json(&value).to_string(),
+            Ok(Ok(Err(error)))
+                if cancel_requested.load(Ordering::Acquire) || error == "cancelled" =>
+            {
+                finish_cancelled(&state, &run_id, "client_stop");
                 return;
             }
-            Err(error) => {
-                let mut store = state.store.write();
-                if let Some(run) = store.runs.get_mut(&run_id) {
-                    emit_event_locked(
-                        run,
-                        "run.failed",
-                        json!({"error": format!("RSS worker join failed: {error}")}),
-                    );
-                    run.status = "failed".to_string();
-                }
-                drop(store);
-                state.persist();
+            Ok(Ok(Err(error))) => {
+                finish_failed(&state, &run_id, error);
+                return;
+            }
+            Ok(Err(error)) => {
+                finish_failed(&state, &run_id, format!("RSS worker join failed: {error}"));
+                return;
+            }
+            Err(_) => {
+                cancel_requested.store(true, Ordering::Release);
+                finish_cancelled(&state, &run_id, "run_timeout");
                 return;
             }
         }
@@ -1107,17 +1183,27 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
         text.clone()
     };
 
+    if cancel_requested.load(Ordering::Acquire) {
+        finish_cancelled(&state, &run_id, "client_stop");
+        return;
+    }
+
+    let mut store = state.store.write();
+    let run_active = store.runs.get(&run_id).is_some_and(|run| {
+        run.status == "started" && !run.cancel_requested.load(Ordering::Acquire)
+    });
+    if !run_active {
+        drop(store);
+        finish_cancelled(&state, &run_id, "client_stop");
+        return;
+    }
+    if !store.sessions.contains_key(&session_id) {
+        drop(store);
+        finish_failed(&state, &run_id, "session not found".to_string());
+        return;
+    }
+
     let message = {
-        let mut store = state.store.write();
-        if !store.sessions.contains_key(&session_id) {
-            if let Some(run) = store.runs.get_mut(&run_id) {
-                emit_event_locked(run, "run.failed", json!({"error":"session not found"}));
-                run.status = "failed".to_string();
-            }
-            drop(store);
-            state.persist();
-            return;
-        }
         let session = store
             .sessions
             .get_mut(&session_id)
@@ -1131,14 +1217,7 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
             Some("stop".to_string()),
         )
     };
-
-    let mut store = state.store.write();
-    let Some(run) = store.runs.get_mut(&run_id) else {
-        return;
-    };
-    if run.status != "started" {
-        return;
-    }
+    let run = store.runs.get_mut(&run_id).expect("run was checked above");
     emit_event_locked(
         run,
         "message.delta",
@@ -1154,11 +1233,47 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
     state.persist();
 }
 
+fn finish_cancelled(state: &AgentGatewayState, run_id: &str, reason: &str) {
+    let mut store = state.store.write();
+    if let Some(run) = store.runs.get_mut(run_id) {
+        if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+            drop(store);
+            return;
+        }
+        emit_event_locked(
+            run,
+            "run.cancelled",
+            json!({"status":"cancelled", "reason":reason}),
+        );
+        run.status = "cancelled".to_string();
+    }
+    drop(store);
+    state.persist();
+}
+
+fn finish_failed(state: &AgentGatewayState, run_id: &str, error: String) {
+    let mut store = state.store.write();
+    if let Some(run) = store.runs.get_mut(run_id) {
+        if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+            drop(store);
+            return;
+        }
+        emit_event_locked(run, "run.failed", json!({"error":error}));
+        run.status = "failed".to_string();
+    }
+    drop(store);
+    state.persist();
+}
+
 fn execute_rss_source(
     source: &str,
     http_config: HttpConfig,
     input: String,
+    cancel_requested: Arc<AtomicBool>,
 ) -> Result<VmValue, String> {
+    if cancel_requested.load(Ordering::Acquire) {
+        return Err("cancelled".to_string());
+    }
     let input_literal =
         serde_json::to_string(&input).map_err(|error| format!("encode RSS input: {error}"))?;
     let wrapped_source = format!("let input = {input_literal};\n{source}");
@@ -1171,6 +1286,10 @@ fn execute_rss_source(
         .bind_vm_cached(&mut vm)
         .map_err(|error| format!("bind RSS host functions: {error}"))?;
     loop {
+        if cancel_requested.load(Ordering::Acquire) {
+            vm.cancel_waiting_host_op();
+            return Err("cancelled".to_string());
+        }
         match vm
             .run()
             .map_err(|error| format!("run RSS source: {error}"))?
@@ -1183,10 +1302,44 @@ fn execute_rss_source(
                     .ok_or_else(|| "RSS source halted without a result".to_string());
             }
             VmStatus::Waiting(_) => vm
-                .wait_for_host_op_blocking()
-                .map_err(|error| format!("resume RSS host operation: {error}"))?,
+                .wait_for_host_op_blocking_with_cancel(|| cancel_requested.load(Ordering::Acquire))
+                .map_err(|error| {
+                    if cancel_requested.load(Ordering::Acquire) {
+                        "cancelled".to_string()
+                    } else {
+                        format!("resume RSS host operation: {error}")
+                    }
+                })?,
             VmStatus::Yielded => continue,
         }
+    }
+}
+
+fn vm_value_to_json(value: &VmValue) -> Value {
+    match value {
+        VmValue::Null => Value::Null,
+        VmValue::Int(value) => json!(value),
+        VmValue::Float(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        VmValue::Bool(value) => json!(value),
+        VmValue::String(value) => Value::String(value.to_string()),
+        VmValue::Bytes(value) => Value::String(String::from_utf8_lossy(value).into_owned()),
+        VmValue::Array(values) => Value::Array(values.iter().map(vm_value_to_json).collect()),
+        VmValue::Map(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (vm_map_key_to_string(key), vm_value_to_json(value)))
+                .collect(),
+        ),
+        VmValue::Callable(_) => Value::String("<callable>".to_string()),
+    }
+}
+
+fn vm_map_key_to_string(value: &VmValue) -> String {
+    match value {
+        VmValue::String(value) => value.to_string(),
+        other => vm_value_to_json(other).to_string(),
     }
 }
 

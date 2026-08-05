@@ -9,8 +9,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = env::var("PD_EDGE_AGENT_GATEWAY_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8090".to_string())
         .parse::<SocketAddr>()?;
+    let bearer_token = env::var("PD_EDGE_AGENT_BEARER_TOKEN").ok();
+    if bearer_token.is_none() && env::var("PD_EDGE_AGENT_ALLOW_ANONYMOUS").as_deref() != Ok("1") {
+        return Err(
+            "PD_EDGE_AGENT_BEARER_TOKEN is required; set PD_EDGE_AGENT_ALLOW_ANONYMOUS=1 only for local testing"
+                .into(),
+        );
+    }
     let mut config = AgentGatewayConfig {
-        bearer_token: env::var("PD_EDGE_AGENT_BEARER_TOKEN").ok(),
+        bearer_token,
         ..AgentGatewayConfig::default()
     };
     if let Ok(hosts) = env::var("PD_EDGE_AGENT_ALLOW_HOSTS") {
@@ -20,10 +27,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.http.allowed_schemes = split_list(&schemes);
     }
     if let Ok(ports) = env::var("PD_EDGE_AGENT_ALLOW_PORTS") {
-        config.http.allowed_ports = ports
-            .split(',')
-            .filter_map(|port| port.trim().parse::<u16>().ok())
-            .collect();
+        let mut parsed = Vec::new();
+        for port in ports.split(',').map(str::trim) {
+            if port.is_empty() {
+                return Err("PD_EDGE_AGENT_ALLOW_PORTS contains an empty entry".into());
+            }
+            parsed.push(
+                port.parse::<u16>()
+                    .map_err(|_| format!("invalid port in PD_EDGE_AGENT_ALLOW_PORTS: {port}"))?,
+            );
+        }
+        if parsed.is_empty() {
+            return Err("PD_EDGE_AGENT_ALLOW_PORTS must contain at least one port".into());
+        }
+        config.http.allowed_ports = parsed;
     }
     if env::var("PD_EDGE_AGENT_ALLOW_PRIVATE_IPS").as_deref() == Ok("1") {
         config.http.allow_private_ips = true;
