@@ -1,0 +1,11 @@
+{
+  "name": "read_file",
+  "description": "Read bounded text from a workspace file",
+  "toolset": "file",
+  "risk_class": "read",
+  "schema": {
+    "type": "object",
+    "required": ["path"],
+    "properties": {"path": {"type": "string"}}
+  }
+}

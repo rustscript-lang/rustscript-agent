@@ -1,0 +1,11 @@
+{
+  "model": "test-model",
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+  "tools": [],
+  "tool_choice": null,
+  "reasoning": null,
+  "sampling": {"temperature": null, "top_p": null},
+  "max_output_tokens": 128,
+  "stream": false,
+  "provider_options": {}
+}

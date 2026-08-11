@@ -1,0 +1,102 @@
+struct StorageLimits {
+    max_rows: int,
+    max_bytes: int,
+    max_events: int,
+    max_messages: int
+}
+
+struct IdempotencyRecord {
+    scope: string,
+    key: string,
+    request_hash: string,
+    resource_type: string,
+    resource_id: string,
+    status: string,
+    response_json: string,
+    created_at_ms: int,
+    expires_at_ms: int
+}
+
+struct RecoveryRecord {
+    run_id: string,
+    from_status: string,
+    to_status: string,
+    reason: string,
+    recovered_at_ms: int
+}
+
+struct ContractSummary {
+    max_rows: int,
+    max_bytes: int,
+    next_cursor: int,
+    idempotency_status: string,
+    recovery_reason: string
+}
+
+fn clamp_limit(requested: int, fallback: int, maximum: int) -> int {
+    let candidate = if requested <= 0 => {
+        fallback
+    } else => {
+        requested
+    };
+    if candidate > maximum => {
+        maximum
+    } else => {
+        candidate
+    }
+}
+
+fn replay_cursor(last_seq: int, returned_rows: int, truncated: bool) -> int {
+    if truncated => {
+        last_seq + returned_rows
+    } else => {
+        last_seq + returned_rows
+    }
+}
+
+let limits: StorageLimits = {
+    max_rows: clamp_limit(128, 32, 512),
+    max_bytes: clamp_limit(65536, 16384, 2097152),
+    max_events: clamp_limit(64, 16, 256),
+    max_messages: clamp_limit(96, 16, 256)
+};
+
+let idempotency: IdempotencyRecord = {
+    scope: "api:chat",
+    key: "req-1",
+    request_hash: "sha256:fixture",
+    resource_type: "run",
+    resource_id: "run-1",
+    status: "completed",
+    response_json: "{\"ok\":true}",
+    created_at_ms: 1000,
+    expires_at_ms: 900000
+};
+
+let recovery: RecoveryRecord = {
+    run_id: "run-1",
+    from_status: "running",
+    to_status: "failed",
+    reason: "gateway_restart",
+    recovered_at_ms: 2000
+};
+
+let max_rows = limits.max_rows;
+let max_bytes = limits.max_bytes;
+let next_cursor = replay_cursor(32, 7, true);
+let idempotency_status = idempotency.status;
+let recovery_reason = recovery.reason;
+assert(max_rows == 128);
+assert(max_bytes == 65536);
+assert(next_cursor == 39);
+assert(idempotency_status == "completed");
+assert(recovery_reason == "gateway_restart");
+
+let summary: ContractSummary = {
+    max_rows: max_rows,
+    max_bytes: max_bytes,
+    next_cursor: next_cursor,
+    idempotency_status: idempotency_status,
+    recovery_reason: recovery_reason
+};
+summary;

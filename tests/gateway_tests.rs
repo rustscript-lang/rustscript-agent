@@ -275,7 +275,7 @@ async fn jobs_and_subagent_interrupt_follow_hermes_shapes() {
 
 #[tokio::test]
 async fn sessions_and_jobs_reload_from_sqlite_state() {
-    let path = std::env::temp_dir().join(format!("pd-edge-gateway-{}.db", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("rustscript-agent-gateway-{}.db", Uuid::new_v4()));
     let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
         .expect("SQLite state should open");
     let app = build_agent_gateway_app(state);
@@ -327,8 +327,11 @@ async fn sessions_and_jobs_reload_from_sqlite_state() {
 
 #[tokio::test]
 async fn configured_rss_source_runs_inside_the_vm() {
-    let state = AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), "input;")
-        .expect("RSS source should compile");
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: string) -> string { input; }",
+    )
+    .expect("RSS source should compile");
     let app = build_agent_gateway_app(state);
     let (session_status, session) = json_request(
         &app,

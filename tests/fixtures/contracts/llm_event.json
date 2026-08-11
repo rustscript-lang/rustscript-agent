@@ -1,0 +1,12 @@
+{
+  "type": "tool_call_completed",
+  "run_id": "run-test",
+  "session_id": "session-test",
+  "sequence": 3,
+  "tool_call": {
+    "id": "call-test",
+    "name": "read_file",
+    "arguments": {"path": "README.md"}
+  },
+  "created_at": 1700000000000
+}

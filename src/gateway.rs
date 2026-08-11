@@ -1,18 +1,20 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     convert::Infallible,
+    hash::{Hash, Hasher},
     path::Path as FsPath,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::{StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -22,12 +24,25 @@ use axum::{
 };
 use futures_util::stream::{self, Stream};
 use parking_lot::RwLock;
-use rusqlite::{Connection, OptionalExtension, params};
-use rustscript_vm::{HostFunctionRegistry, HttpConfig, Value as VmValue, Vm, VmStatus};
-use serde::{Deserialize, Serialize};
+use rustscript_vm::{CancellationReason, HttpConfig, SqlitePolicy, Value as VmValue};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use uuid::Uuid;
+
+use crate::{AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink};
+
+#[path = "gateway_store.rs"]
+mod gateway_store;
+use gateway_store::{
+    GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, JobRecord, JobView,
+    RunRecord, SessionMessage, SessionRecord, SessionView,
+};
+
+#[derive(Debug, Default, Deserialize)]
+struct EventQuery {
+    after_seq: Option<u64>,
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentGatewayConfig {
@@ -39,20 +54,44 @@ pub struct AgentGatewayConfig {
     pub max_concurrent_runs: usize,
     pub run_timeout: Duration,
     pub http: HttpConfig,
+    pub sqlite: SqlitePolicy,
+    pub fuel: Option<u64>,
 }
 
 impl Default for AgentGatewayConfig {
     fn default() -> Self {
+        let mut sqlite = SqlitePolicy::default();
+        sqlite.limits.max_statements = 1024;
         Self {
             model: "local-agent".to_string(),
-            provider: Some("pd-edge".to_string()),
+            provider: Some("local-agent".to_string()),
             agent_name: "local-rss-agent".to_string(),
             bearer_token: None,
             max_body_bytes: 4 * 1024 * 1024,
             max_concurrent_runs: 8,
             run_timeout: Duration::from_secs(900),
             http: HttpConfig::default(),
+            sqlite,
+            fuel: Some(10_000_000),
         }
+    }
+}
+
+#[derive(Clone)]
+struct AgentService {
+    persistence: Option<Arc<GatewayPersistence>>,
+}
+
+impl AgentService {
+    fn persist(&self, store: &GatewayStore) -> bool {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return true;
+        };
+        if let Err(error) = persistence.save(store) {
+            tracing::error!("failed to persist agent gateway state: {error}");
+            return false;
+        }
+        true
     }
 }
 
@@ -60,7 +99,7 @@ impl Default for AgentGatewayConfig {
 pub struct AgentGatewayState {
     config: Arc<AgentGatewayConfig>,
     store: Arc<RwLock<GatewayStore>>,
-    persistence: Option<Arc<GatewayPersistence>>,
+    service: AgentService,
     agent_source: Option<Arc<String>>,
     http_config: HttpConfig,
 }
@@ -71,7 +110,7 @@ impl AgentGatewayState {
         Self {
             config: Arc::new(config),
             store: Arc::new(RwLock::new(GatewayStore::default())),
-            persistence: None,
+            service: AgentService { persistence: None },
             agent_source: None,
             http_config,
         }
@@ -82,8 +121,13 @@ impl AgentGatewayState {
         source: impl Into<String>,
     ) -> Result<Self, String> {
         let source = source.into();
-        let validation_source = format!("let input = \"probe\";\n{source}");
-        rustscript_vm::compile_source(&validation_source)
+        if source.len() > crate::MAX_AGENT_SOURCE_BYTES {
+            return Err(format!(
+                "RSS source exceeds {} bytes",
+                crate::MAX_AGENT_SOURCE_BYTES
+            ));
+        }
+        rustscript_vm::compile_source(&source)
             .map_err(|error| format!("compile RSS agent source: {error}"))?;
         let mut state = Self::new(config);
         state.agent_source = Some(Arc::new(source));
@@ -95,16 +139,18 @@ impl AgentGatewayState {
         source: impl Into<String>,
         path: impl AsRef<FsPath>,
     ) -> Result<Self, String> {
-        let mut state = Self::with_agent_source(config, source)?;
+        let mut state = Self::with_agent_source(config.clone(), source)?;
         let persistence = Arc::new(
-            GatewayPersistence::open(path.as_ref())
+            GatewayPersistence::open(&config, path.as_ref())
                 .map_err(|error| format!("open gateway SQLite state: {error}"))?,
         );
         let store = persistence
             .load()
             .map_err(|error| format!("load gateway SQLite state: {error}"))?;
         state.store = Arc::new(RwLock::new(store));
-        state.persistence = Some(persistence);
+        state.service = AgentService {
+            persistence: Some(persistence),
+        };
         Ok(state)
     }
 
@@ -114,7 +160,7 @@ impl AgentGatewayState {
     ) -> Result<Self, String> {
         let http_config = config.http.clone();
         let persistence = Arc::new(
-            GatewayPersistence::open(path.as_ref())
+            GatewayPersistence::open(&config, path.as_ref())
                 .map_err(|error| format!("open gateway SQLite state: {error}"))?,
         );
         let store = persistence
@@ -123,200 +169,16 @@ impl AgentGatewayState {
         Ok(Self {
             config: Arc::new(config),
             store: Arc::new(RwLock::new(store)),
-            persistence: Some(persistence),
+            service: AgentService {
+                persistence: Some(persistence),
+            },
             agent_source: None,
             http_config,
         })
     }
 
     fn persist(&self) -> bool {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return true;
-        };
-        if let Err(error) = persistence.save(&self.store.read()) {
-            tracing::error!("failed to persist agent gateway state: {error}");
-            return false;
-        }
-        true
-    }
-}
-
-struct GatewayPersistence {
-    connection: std::sync::Mutex<Connection>,
-}
-
-impl GatewayPersistence {
-    fn open(path: &FsPath) -> rusqlite::Result<Self> {
-        let connection = Connection::open(path)?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS gateway_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                payload TEXT NOT NULL
-            )",
-        )?;
-        Ok(Self {
-            connection: std::sync::Mutex::new(connection),
-        })
-    }
-
-    fn load(&self) -> rusqlite::Result<GatewayStore> {
-        let connection = self.connection.lock().expect("gateway SQLite mutex");
-        let payload = connection
-            .query_row(
-                "SELECT payload FROM gateway_state WHERE id = 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(payload) = payload else {
-            return Ok(GatewayStore::default());
-        };
-        let snapshot = serde_json::from_str::<PersistedState>(&payload).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
-        Ok(GatewayStore::from_snapshot(snapshot))
-    }
-
-    fn save(&self, store: &GatewayStore) -> rusqlite::Result<()> {
-        let payload = serde_json::to_string(&store.snapshot())
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let connection = self.connection.lock().expect("gateway SQLite mutex");
-        connection.execute(
-            "INSERT INTO gateway_state (id, payload) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
-            params![payload],
-        )?;
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct GatewayStore {
-    sessions: BTreeMap<String, SessionRecord>,
-    runs: HashMap<String, RunRecord>,
-    jobs: BTreeMap<String, JobRecord>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PersistedState {
-    sessions: BTreeMap<String, SessionRecord>,
-    jobs: BTreeMap<String, JobRecord>,
-}
-
-impl GatewayStore {
-    fn snapshot(&self) -> PersistedState {
-        PersistedState {
-            sessions: self.sessions.clone(),
-            jobs: self.jobs.clone(),
-        }
-    }
-
-    fn from_snapshot(snapshot: PersistedState) -> Self {
-        Self {
-            sessions: snapshot.sessions,
-            runs: HashMap::new(),
-            jobs: snapshot.jobs,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SessionRecord {
-    view: SessionView,
-    messages: Vec<SessionMessage>,
-}
-
-struct RunRecord {
-    run_id: String,
-    session_id: String,
-    status: String,
-    events: Vec<GatewayEvent>,
-    sender: broadcast::Sender<GatewayEvent>,
-    cancel_requested: Arc<AtomicBool>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct JobRecord {
-    view: JobView,
-    output: Option<Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct JobView {
-    id: String,
-    name: String,
-    schedule: Value,
-    prompt: String,
-    deliver: Value,
-    skills: Vec<String>,
-    repeat: Option<i64>,
-    enabled: bool,
-    created_at: u64,
-    updated_at: u64,
-    last_run_at: Option<u64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SessionView {
-    id: String,
-    object: String,
-    title: Option<String>,
-    model: String,
-    provider: Option<String>,
-    source: String,
-    system_prompt: Option<String>,
-    created_at: u64,
-    updated_at: u64,
-    message_count: usize,
-    end_reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SessionMessage {
-    id: String,
-    session_id: String,
-    role: String,
-    content: Value,
-    created_at: u64,
-    run_id: Option<String>,
-    finish_reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct GatewayEvent {
-    event: String,
-    run_id: String,
-    timestamp: u64,
-    data: Value,
-}
-
-impl GatewayEvent {
-    fn is_terminal(&self) -> bool {
-        matches!(
-            self.event.as_str(),
-            "run.completed" | "run.cancelled" | "run.failed"
-        )
-    }
-
-    fn into_sse(self) -> Event {
-        let event_name = self.event.clone();
-        let mut payload = serde_json::Map::new();
-        payload.insert("event".to_string(), Value::String(self.event));
-        payload.insert("run_id".to_string(), Value::String(self.run_id));
-        payload.insert("timestamp".to_string(), json!(self.timestamp));
-        match self.data {
-            Value::Object(fields) => payload.extend(fields),
-            data => {
-                payload.insert("data".to_string(), data);
-            }
-        }
-        let data =
-            serde_json::to_string(&Value::Object(payload)).unwrap_or_else(|_| "{}".to_string());
-        Event::default().event(event_name).data(data)
+        self.service.persist(&self.store.read())
     }
 }
 
@@ -354,11 +216,12 @@ struct CreateRunRequest {
     session_id: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    parent_run_id: Option<String>,
     instructions: Option<String>,
     #[serde(rename = "conversation_history")]
-    _conversation_history: Option<Value>,
+    conversation_history: Option<Value>,
     #[serde(flatten)]
-    _extra: HashMap<String, Value>,
+    extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +326,16 @@ async fn persist_gateway_state(
     }
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = (left.len() ^ right.len()) as u8;
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        difference |=
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0);
+    }
+    difference == 0
+}
+
 async fn bearer_auth_middleware(
     State(state): State<AgentGatewayState>,
     request: Request,
@@ -476,7 +349,7 @@ async fn bearer_auth_middleware(
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| value == expected);
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()));
     if !authorized {
         return json_error(
             StatusCode::UNAUTHORIZED,
@@ -508,7 +381,7 @@ async fn models_handler(State(state): State<AgentGatewayState>) -> impl IntoResp
         "data": [{
             "id": state.config.model,
             "object": "model",
-            "owned_by": state.config.provider.clone().unwrap_or_else(|| "pd-edge".to_string()),
+            "owned_by": state.config.provider.clone().unwrap_or_else(|| "local-agent".to_string()),
             "root": state.config.model,
         }]
     }))
@@ -552,7 +425,13 @@ async fn create_session_handler(
         },
     );
     drop(store);
-    state.persist();
+    if !state.persist() {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_unavailable",
+            "failed to persist session",
+        );
+    }
     json_response(
         StatusCode::CREATED,
         json!({"object":"hermes.session", "session":view, "data":view}),
@@ -715,7 +594,7 @@ async fn session_chat_handler(
         return json_error(
             StatusCode::NOT_IMPLEMENTED,
             "agent_source_not_configured",
-            "session chat requires PD_EDGE_AGENT_SCRIPT",
+            "session chat requires RUSTSCRIPT_AGENT_SCRIPT",
         );
     };
     if !state.store.read().sessions.contains_key(&session_id) {
@@ -729,14 +608,22 @@ async fn session_chat_handler(
     let input = request.input.unwrap_or(Value::Null);
     let input_text = input_text(&input);
     let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation);
     let http_config = state.http_config.clone();
+    let sqlite_policy = state.config.sqlite.clone();
     let worker_input = input_text.clone();
-    let worker = tokio::task::spawn_blocking(move || {
-        execute_rss_source(&source, http_config, worker_input, cancellation)
+    let mut worker = tokio::task::spawn_blocking(move || {
+        execute_rss_source(
+            &source,
+            http_config,
+            sqlite_policy,
+            worker_input,
+            worker_cancellation,
+        )
     });
-    let output = match tokio::time::timeout(state.config.run_timeout, worker).await {
-        Ok(Ok(Ok(value))) => vm_value_to_json(&value),
-        Ok(Ok(Err(error))) => {
+    let output = match tokio::time::timeout(state.config.run_timeout, &mut worker).await {
+        Ok(Ok(Ok((value, _events)))) => vm_value_to_json(&value),
+        Ok(Ok(Err((error, _events)))) => {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "agent_failed", &error);
         }
         Ok(Err(error)) => {
@@ -747,6 +634,8 @@ async fn session_chat_handler(
             );
         }
         Err(_) => {
+            cancellation.store(true, Ordering::Release);
+            let _ = worker.await;
             return json_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "agent_timeout",
@@ -803,64 +692,131 @@ async fn session_chat_handler(
 
 async fn create_run_handler(
     State(state): State<AgentGatewayState>,
+    headers: HeaderMap,
     Json(request): Json<CreateRunRequest>,
 ) -> Response {
-    let input = request.input.unwrap_or(Value::Null);
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let request_hash = idempotency_key.as_ref().map(|_| {
+        let canonical = serde_json::to_string(&json!({
+            "input": request.input.clone(),
+            "session_id": request.session_id.clone(),
+            "model": request.model.clone(),
+            "provider": request.provider.clone(),
+            "parent_run_id": request.parent_run_id.clone(),
+            "instructions": request.instructions.clone(),
+            "conversation_history": request.conversation_history.clone(),
+            "extra": request.extra.clone(),
+        }))
+        .unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        format!("fnv64:{:016x}", hasher.finish())
+    });
+    let input = request.input.clone().unwrap_or(Value::Null);
     let text = input_text(&input);
-    let session_id = match request.session_id {
-        Some(session_id) => session_id,
-        None => {
-            let id = Uuid::new_v4().to_string();
-            let now = timestamp();
-            let view = SessionView {
-                id: id.clone(),
-                object: "hermes.session".to_string(),
-                title: None,
-                model: request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| state.config.model.clone()),
-                provider: request
-                    .provider
-                    .clone()
-                    .or_else(|| state.config.provider.clone()),
-                source: "yahu".to_string(),
-                system_prompt: request.instructions.clone(),
-                created_at: now,
-                updated_at: now,
-                message_count: 0,
-                end_reason: None,
-            };
-            state.store.write().sessions.insert(
-                id.clone(),
-                SessionRecord {
-                    view,
-                    messages: Vec::new(),
-                },
-            );
-            id
-        }
+    let agent_input = if request.conversation_history.is_none() && request.extra.is_empty() {
+        text.clone()
+    } else {
+        serde_json::to_string(&json!({
+            "input": input.clone(),
+            "conversation_history": request.conversation_history.clone(),
+            "options": request.extra.clone(),
+        }))
+        .map_err(|error| error.to_string())
+        .unwrap_or_else(|_| text.clone())
     };
-    if state
-        .store
-        .read()
-        .runs
-        .values()
-        .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
-        .count()
-        >= state.config.max_concurrent_runs
-    {
-        return json_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "run_limit_reached",
-            "maximum concurrent run limit reached",
-        );
-    }
     let run_id = Uuid::new_v4().to_string();
     let cancel_requested = Arc::new(AtomicBool::new(false));
     let (sender, _) = broadcast::channel(32);
+    let previous_session: Option<(String, Option<SessionRecord>)>;
     {
         let mut store = state.store.write();
+        if let (Some(key), Some(hash)) = (idempotency_key.as_ref(), request_hash.as_ref())
+            && let Some(existing) = store.idempotency.get(key)
+        {
+            if existing.request_hash != *hash {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "idempotency_key_reused",
+                    "idempotency key was used with a different request",
+                );
+            }
+            let status = store
+                .runs
+                .get(&existing.run_id)
+                .map(|run| run.status.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            return json_response(
+                StatusCode::ACCEPTED,
+                json!({"run_id": existing.run_id, "status": status}),
+            );
+        }
+        if store
+            .runs
+            .values()
+            .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
+            .count()
+            >= state.config.max_concurrent_runs
+        {
+            return json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "run_limit_reached",
+                "maximum concurrent run limit reached",
+            );
+        }
+        if let Some(parent_run_id) = request.parent_run_id.as_ref()
+            && !store.runs.contains_key(parent_run_id)
+        {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "parent_run_not_found",
+                "parent run not found",
+            );
+        }
+        let session_id = match request.session_id.clone() {
+            Some(session_id) => {
+                previous_session =
+                    Some((session_id.clone(), store.sessions.get(&session_id).cloned()));
+                session_id
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                previous_session = Some((id.clone(), None));
+                let now = timestamp();
+                let view = SessionView {
+                    id: id.clone(),
+                    object: "hermes.session".to_string(),
+                    title: None,
+                    model: request
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| state.config.model.clone()),
+                    provider: request
+                        .provider
+                        .clone()
+                        .or_else(|| state.config.provider.clone()),
+                    source: "yahu".to_string(),
+                    system_prompt: request.instructions.clone(),
+                    created_at: now,
+                    updated_at: now,
+                    message_count: 0,
+                    end_reason: None,
+                };
+                store.sessions.insert(
+                    id.clone(),
+                    SessionRecord {
+                        view,
+                        messages: Vec::new(),
+                    },
+                );
+                id
+            }
+        };
         let Some(session) = store.sessions.get_mut(&session_id) else {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -890,18 +846,57 @@ async fn create_run_handler(
             RunRecord {
                 run_id: run_id.clone(),
                 session_id: session_id.clone(),
+                parent_run_id: request.parent_run_id.clone(),
                 status: "started".to_string(),
                 events: Vec::new(),
                 sender,
                 cancel_requested: cancel_requested.clone(),
             },
         );
+        if let Some(run) = store.runs.get_mut(&run_id) {
+            emit_event_locked(
+                run,
+                "run.started",
+                json!({"status":"started","session_id":session_id}),
+            );
+        }
+        if let (Some(key), Some(hash)) = (idempotency_key.as_ref(), request_hash.as_ref()) {
+            store.idempotency.insert(
+                key.clone(),
+                IdempotencyRecord {
+                    request_hash: hash.clone(),
+                    run_id: run_id.clone(),
+                },
+            );
+        }
     }
-    state.persist();
+    if !state.persist() {
+        let mut store = state.store.write();
+        store.runs.remove(&run_id);
+        if let Some(key) = idempotency_key.as_ref() {
+            store.idempotency.remove(key);
+        }
+        if let Some((session_id, previous)) = previous_session {
+            match previous {
+                Some(session) => {
+                    store.sessions.insert(session_id, session);
+                }
+                None => {
+                    store.sessions.remove(&session_id);
+                }
+            }
+        }
+        drop(store);
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_unavailable",
+            "run admission could not be durably committed",
+        );
+    }
     let worker_state = state.clone();
     let worker_run_id = run_id.clone();
     tokio::spawn(async move {
-        run_local_agent(worker_state, worker_run_id, text).await;
+        run_local_agent(worker_state, worker_run_id, agent_input).await;
     });
     json_response(
         StatusCode::ACCEPTED,
@@ -912,13 +907,31 @@ async fn create_run_handler(
 async fn run_events_handler(
     State(state): State<AgentGatewayState>,
     Path(run_id): Path<String>,
+    Query(query): Query<EventQuery>,
 ) -> Response {
     let (history, receiver) = {
         let store = state.store.read();
         let Some(run) = store.runs.get(&run_id) else {
             return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
         };
-        (run.events.clone(), run.sender.subscribe())
+        if let Some(cursor) = query.after_seq
+            && let Some(earliest) = run.events.first().map(|event| event.seq)
+            && cursor + 1 < earliest
+        {
+            return json_error(
+                StatusCode::CONFLICT,
+                "event_cursor_too_old",
+                &format!("event cursor is older than retained history; earliest_seq={earliest}"),
+            );
+        }
+        (
+            run.events
+                .iter()
+                .filter(|event| query.after_seq.is_none_or(|cursor| event.seq > cursor))
+                .cloned()
+                .collect(),
+            run.sender.subscribe(),
+        )
     };
     let stream = event_stream(history, receiver);
     Sse::new(stream)
@@ -1089,10 +1102,15 @@ async fn run_job_handler(
     State(_state): State<AgentGatewayState>,
     Path(_job_id): Path<String>,
 ) -> Response {
-    json_error(
+    json_response(
         StatusCode::NOT_IMPLEMENTED,
-        "job_execution_unavailable",
-        "scheduled job execution is not wired to the agent runner",
+        json!({
+            "experimental": true,
+            "error": {
+                "code": "job_execution_unavailable",
+                "message": "scheduled job execution is not wired to the agent runner"
+            }
+        }),
     )
 }
 
@@ -1135,6 +1153,22 @@ fn set_job_enabled(state: &AgentGatewayState, job_id: &str, enabled: bool) -> Re
     json_response(StatusCode::OK, json!({"job":view}))
 }
 
+fn append_runtime_events(state: &AgentGatewayState, run_id: &str, runtime_events: &[VmValue]) {
+    if runtime_events.is_empty() {
+        return;
+    }
+    let mut store = state.store.write();
+    if let Some(run) = store.runs.get_mut(run_id) {
+        for event in runtime_events {
+            emit_event_locked(
+                run,
+                "runtime.emit",
+                json!({"value": vm_value_to_json(event)}),
+            );
+        }
+    }
+}
+
 async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String) {
     tokio::task::yield_now().await;
     let (session_id, cancel_requested) = {
@@ -1152,20 +1186,27 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
 
     let output_text = if let Some(source) = state.agent_source.clone() {
         let http_config = state.http_config.clone();
+        let sqlite_policy = state.config.sqlite.clone();
+        let run_timeout = state.config.run_timeout;
         let input = text.clone();
         let cancellation = cancel_requested.clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            execute_rss_source(&source, http_config, input, cancellation)
+        let mut worker = tokio::task::spawn_blocking(move || {
+            execute_rss_source(&source, http_config, sqlite_policy, input, cancellation)
         });
-        match tokio::time::timeout(state.config.run_timeout, worker).await {
-            Ok(Ok(Ok(value))) => vm_value_to_json(&value).to_string(),
-            Ok(Ok(Err(error)))
+        match tokio::time::timeout(run_timeout, &mut worker).await {
+            Ok(Ok(Ok((value, runtime_events)))) => {
+                append_runtime_events(&state, &run_id, &runtime_events);
+                vm_value_to_json(&value).to_string()
+            }
+            Ok(Ok(Err((error, runtime_events))))
                 if cancel_requested.load(Ordering::Acquire) || error == "cancelled" =>
             {
+                append_runtime_events(&state, &run_id, &runtime_events);
                 finish_cancelled(&state, &run_id, "client_stop");
                 return;
             }
-            Ok(Ok(Err(error))) => {
+            Ok(Ok(Err((error, runtime_events)))) => {
+                append_runtime_events(&state, &run_id, &runtime_events);
                 finish_failed(&state, &run_id, error);
                 return;
             }
@@ -1175,6 +1216,13 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
             }
             Err(_) => {
                 cancel_requested.store(true, Ordering::Release);
+                if let Ok(result) = worker.await {
+                    match result {
+                        Ok((_, runtime_events)) | Err((_, runtime_events)) => {
+                            append_runtime_events(&state, &run_id, &runtime_events);
+                        }
+                    }
+                }
                 finish_cancelled(&state, &run_id, "run_timeout");
                 return;
             }
@@ -1268,54 +1316,90 @@ fn finish_failed(state: &AgentGatewayState, run_id: &str, error: String) {
 fn execute_rss_source(
     source: &str,
     http_config: HttpConfig,
+    sqlite_policy: SqlitePolicy,
     input: String,
     cancel_requested: Arc<AtomicBool>,
-) -> Result<VmValue, String> {
+) -> Result<(VmValue, Vec<VmValue>), (String, Vec<VmValue>)> {
     if cancel_requested.load(Ordering::Acquire) {
-        return Err("cancelled".to_string());
+        return Err(("cancelled".to_string(), Vec::new()));
     }
-    let input_literal =
-        serde_json::to_string(&input).map_err(|error| format!("encode RSS input: {error}"))?;
-    let wrapped_source = format!("let input = {input_literal};\n{source}");
-    let program = rustscript_vm::compile_source(&wrapped_source)
-        .map_err(|error| format!("compile RSS run source: {error}"))?
-        .program;
-    let mut vm = Vm::new(program);
-    vm.configure_http(http_config);
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .map_err(|error| format!("bind RSS host functions: {error}"))?;
-    loop {
-        if cancel_requested.load(Ordering::Acquire) {
-            vm.cancel_waiting_host_op();
-            return Err("cancelled".to_string());
-        }
-        match vm
-            .run()
-            .map_err(|error| format!("run RSS source: {error}"))?
-        {
-            VmStatus::Halted => {
-                return vm
-                    .stack()
-                    .last()
-                    .cloned()
-                    .ok_or_else(|| "RSS source halted without a result".to_string());
+    if source.len() > crate::MAX_AGENT_SOURCE_BYTES {
+        return Err((
+            format!("RSS source exceeds {} bytes", crate::MAX_AGENT_SOURCE_BYTES),
+            Vec::new(),
+        ));
+    }
+    let runner = AgentRunner::from_source(
+        source,
+        AgentConfig {
+            http: http_config,
+            sqlite: sqlite_policy,
+            fuel: None,
+        },
+    )
+    .map_err(|error| (format!("compile RSS run source: {error}"), Vec::new()))?;
+
+    let events = Arc::new(Mutex::new(Vec::<VmValue>::new()));
+    let mut sink = GatewayEventSink {
+        events: Arc::clone(&events),
+        max_events: 128,
+    };
+
+    // Bridge the legacy boolean stop flag into the typed cancellation handle.
+    let cancellation = RunCancellation::new();
+    let bridge_cancellation = cancellation.clone();
+    let bridge_stop = Arc::new(AtomicBool::new(false));
+    let bridge_cancel_flag = Arc::clone(&cancel_requested);
+    let bridge_stop_flag = Arc::clone(&bridge_stop);
+    let bridge = thread::spawn(move || {
+        while !bridge_stop_flag.load(Ordering::Acquire) {
+            if bridge_cancel_flag.load(Ordering::Acquire) {
+                bridge_cancellation.request(CancellationReason::Requested);
+                return;
             }
-            VmStatus::Waiting(_) => vm
-                .wait_for_host_op_blocking_with_cancel(|| cancel_requested.load(Ordering::Acquire))
-                .map_err(|error| {
-                    if cancel_requested.load(Ordering::Acquire) {
-                        "cancelled".to_string()
-                    } else {
-                        format!("resume RSS host operation: {error}")
-                    }
-                })?,
-            VmStatus::Yielded => continue,
+            thread::sleep(Duration::from_millis(1));
         }
+    });
+
+    let result =
+        runner.run_with_context_and_events(VmValue::string(input), &mut sink, &cancellation);
+    bridge_stop.store(true, Ordering::Release);
+    let _ = bridge.join();
+
+    let event_snapshot = events
+        .lock()
+        .map(|events| events.clone())
+        .unwrap_or_default();
+    match result {
+        Ok(value) => Ok((value, event_snapshot)),
+        Err(error) => Err((error.to_string(), event_snapshot)),
     }
 }
 
-fn vm_value_to_json(value: &VmValue) -> Value {
+/// Collects script-visible `stream::emit` values with a bounded cap.
+struct GatewayEventSink {
+    events: Arc<Mutex<Vec<VmValue>>>,
+    max_events: usize,
+}
+
+impl RunEventSink for GatewayEventSink {
+    fn deliver(&mut self, value: VmValue) -> Result<(), RunDeliveryError> {
+        let mut events = self.events.lock().map_err(|_| RunDeliveryError::Rejected {
+            code: "sink_lock",
+            message: "event sink lock poisoned".to_string(),
+        })?;
+        if events.len() >= self.max_events {
+            return Err(RunDeliveryError::Rejected {
+                code: "event_limit",
+                message: format!("runtime event limit of {} exceeded", self.max_events),
+            });
+        }
+        events.push(value);
+        Ok(())
+    }
+}
+
+pub(crate) fn vm_value_to_json(value: &VmValue) -> Value {
     match value {
         VmValue::Null => Value::Null,
         VmValue::Int(value) => json!(value),
@@ -1357,28 +1441,47 @@ fn event_stream(
             if done {
                 return None;
             }
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => {
-                        done |= event.is_terminal();
-                        return Some((Ok(event.into_sse()), (history, receiver, done)));
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
+            match receiver.recv().await {
+                Ok(event) => {
+                    done |= event.is_terminal();
+                    Some((Ok(event.into_sse()), (history, receiver, done)))
                 }
+                Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                    done = true;
+                    let event = Event::default()
+                        .event("error")
+                        .data(json!({"code":"event_lagged","dropped":dropped}).to_string());
+                    Some((Ok(event), (history, receiver, done)))
+                }
+                Err(broadcast::error::RecvError::Closed) => None,
             }
         },
     )
 }
 
-fn emit_event_locked(run: &mut RunRecord, event: &str, data: Value) {
+fn emit_event_locked(run: &mut RunRecord, event: &str, mut data: Value) {
+    const MAX_EVENT_BYTES: usize = 32 * 1024;
+    const MAX_EVENTS_PER_RUN: usize = 240;
+    if serde_json::to_vec(&data)
+        .map(|payload| payload.len() > MAX_EVENT_BYTES)
+        .unwrap_or(true)
+    {
+        data = json!({"truncated":true,"original_bytes":"over_limit"});
+    }
+    let seq = run.events.last().map(|event| event.seq + 1).unwrap_or(1);
     let event = GatewayEvent {
+        event_id: Uuid::new_v4().to_string(),
+        seq,
         event: event.to_string(),
         run_id: run.run_id.clone(),
         timestamp: timestamp(),
         data,
     };
     run.events.push(event.clone());
+    if run.events.len() > MAX_EVENTS_PER_RUN {
+        let excess = run.events.len() - MAX_EVENTS_PER_RUN;
+        run.events.drain(0..excess);
+    }
     let _ = run.sender.send(event);
 }
 
@@ -1413,7 +1516,7 @@ fn input_text(input: &Value) -> String {
     }
 }
 
-fn timestamp() -> u64 {
+pub(crate) fn timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

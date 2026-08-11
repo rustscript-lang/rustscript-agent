@@ -20,9 +20,7 @@ path = "src/bin/rustscript-agent-gateway.rs"
 axum = "0.8"
 futures-util = "0.3"
 parking_lot = "0.12"
-edge = { package = "pd-edge", path = "../pd-edge", default-features = false, features = ["http", "tls", "websocket"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-rustscript-vm = { package = "pd-vm", path = "../rustscript", default-features = false, features = ["runtime", "http-client"] }
+rustscript-vm = { package = "pd-vm", path = "../rustscript", default-features = false, features = ["runtime", "http-client", "sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

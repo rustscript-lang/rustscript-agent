@@ -42,8 +42,13 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let result = AgentRunner::from_file(script, AgentConfig::for_hosts(hosts))
-        .and_then(|runner| runner.run());
+    let result: std::result::Result<rustscript_vm::Value, Box<dyn std::error::Error>> =
+        match AgentRunner::from_file(script, AgentConfig::for_hosts(hosts)) {
+            Ok(runner) => runner
+                .run_with_context(rustscript_vm::Value::Null)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+            Err(error) => Err(Box::new(error)),
+        };
     match result {
         Ok(value) => {
             println!("{value:?}");

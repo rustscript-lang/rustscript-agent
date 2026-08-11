@@ -28,12 +28,12 @@ The current scope is intentionally synchronous at the Rust API boundary: a pendi
 
 ## Hermes-compatible gateway
 
-The gateway is part of this independent repository. It uses the `pd-edge` library crate for edge/runtime integration and the RustScript `pd-vm` crate for RSS execution; `pd-edge` does not contain the gateway business layer.
+The gateway is part of this independent repository. It uses the RustScript `pd-vm` crate for RSS execution and does not depend on the `pd-edge` gateway runtime.
 
 ```bash
-PD_EDGE_AGENT_SCRIPT=examples/http_get.rss \
-PD_EDGE_AGENT_ALLOW_HOSTS=api.example.com \
+RUSTSCRIPT_AGENT_SCRIPT=examples/http_get.rss \
+RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com \
 cargo run --release --bin rustscript-agent-gateway
 ```
 
-Optional configuration includes `PD_EDGE_AGENT_STATE_DB`, `PD_EDGE_AGENT_BEARER_TOKEN`, `PD_EDGE_AGENT_GATEWAY_ADDR`, `PD_EDGE_AGENT_ALLOW_SCHEMES`, and `PD_EDGE_AGENT_ALLOW_PORTS`.
+Optional configuration includes `RUSTSCRIPT_AGENT_STATE_DB`, `RUSTSCRIPT_AGENT_BEARER_TOKEN`, `RUSTSCRIPT_AGENT_GATEWAY_ADDR`, `RUSTSCRIPT_AGENT_ALLOW_SCHEMES`, and `RUSTSCRIPT_AGENT_ALLOW_PORTS`.

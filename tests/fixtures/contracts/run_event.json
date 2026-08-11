@@ -1,0 +1,10 @@
+{
+  "type": "run.completed",
+  "run_id": "run-test",
+  "session_id": "session-test",
+  "sequence": 4,
+  "status": "completed",
+  "output": {"text": "done"},
+  "error": null,
+  "created_at": 1700000000000
+}
