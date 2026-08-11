@@ -535,3 +535,262 @@ async fn script_events_are_appended_durably_before_live_publish() {
     );
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
 }
+
+#[tokio::test]
+async fn atomic_admission_admits_exactly_the_configured_count() {
+    // A pure CPU loop keeps admitted runs active so capacity is exercised.
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            max_concurrent_runs: 2,
+            ..AgentGatewayConfig::default()
+        },
+        r#"
+        pub fn run(input: map) -> string {
+            while true {
+                1;
+            }
+            "unreachable";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+
+    let requests = (0..4).map(|index| {
+        let app = app.clone();
+        async move {
+            let (status, body) = json_request(
+                &app,
+                axum::http::Method::POST,
+                "/v1/runs",
+                json!({"input": format!("concurrent-{index}")}),
+            )
+            .await;
+            (status, body)
+        }
+    });
+    let responses = futures_util::future::join_all(requests).await;
+    let accepted = responses
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::ACCEPTED)
+        .count();
+    let rejected = responses
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert_eq!(
+        accepted, 2,
+        "exactly the configured capacity must be admitted"
+    );
+    assert_eq!(rejected, 2, "overflow admissions must be rejected");
+
+    // Rejected admission leaves no empty session/run behind: only the two
+    // accepted runs created sessions.
+    let (_, sessions) = json_request(
+        &app,
+        axum::http::Method::GET,
+        "/api/sessions?limit=50&offset=0",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        sessions["data"].as_array().map(Vec::len),
+        Some(2),
+        "rejected admissions must not leave empty sessions behind"
+    );
+
+    // Stop both admitted runs; each must reach a typed cancellation within a
+    // bounded worker exit.
+    for (_, body) in responses
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::ACCEPTED)
+    {
+        let run_id = body["run_id"].as_str().expect("run id");
+        let (stop_status, _) = json_request(
+            &app,
+            axum::http::Method::POST,
+            &format!("/v1/runs/{run_id}/stop"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(stop_status, StatusCode::OK);
+        let text = read_run_events(&app, run_id).await;
+        assert!(
+            text.contains("run.cancelled"),
+            "a stopped run must commit one typed cancellation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stop_and_timeout_finish_within_bounded_worker_exit() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            run_timeout: std::time::Duration::from_millis(300),
+            ..AgentGatewayConfig::default()
+        },
+        r#"
+        pub fn run(input: map) -> string {
+            while true {
+                1;
+            }
+            "unreachable";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+
+    // Timeout: the pure CPU loop must reach terminal cancellation within the
+    // configured bound.
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"timeout-me"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let started = std::time::Instant::now();
+    let text = read_run_events(&app, run_id).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "timeout must finish within the bounded worker exit"
+    );
+    assert!(
+        text.contains("run.cancelled"),
+        "a timed-out run must commit a typed cancellation"
+    );
+
+    // Stop: bounded exit as well.
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"stop-me"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let (stop_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+    let started = std::time::Instant::now();
+    let text = read_run_events(&app, run_id).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "stop must finish within the bounded worker exit"
+    );
+    assert!(text.contains("run.cancelled"));
+}
+
+#[tokio::test]
+async fn terminal_commit_is_single_and_late_stop_is_idempotent() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"done\"; }",
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"single-terminal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    assert_eq!(
+        text.matches("event: run.completed").count(),
+        1,
+        "exactly one terminal commit is allowed"
+    );
+
+    // A late stop must not produce a second terminal.
+    let (stop_status, stop_body) = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+    assert_eq!(stop_body["status"], "completed");
+    let after = read_run_events(&app, run_id).await;
+    assert_eq!(
+        after.matches("event: run.completed").count(),
+        1,
+        "a late stop must not add a second terminal commit"
+    );
+}
+
+#[tokio::test]
+async fn terminal_handles_are_released_after_the_configured_ttl() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            terminal_run_ttl: std::time::Duration::from_millis(300),
+            janitor_interval: std::time::Duration::from_millis(100),
+            ..AgentGatewayConfig::default()
+        },
+        "pub fn run(input: map) -> string { \"ttl\"; }",
+    )
+    .expect("RSS source should compile");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"ttl"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let _ = read_run_events(&app, run_id).await;
+    // The terminal handle is retained for replay handoff right after the run...
+    assert_eq!(service.handle_count(), 1);
+    // ...and released by the janitor after the TTL.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(
+        service.handle_count(),
+        0,
+        "terminal lifecycle handles must be released after the TTL"
+    );
+}
+
+#[tokio::test]
+async fn typed_capability_failure_marks_the_run_failed() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        r#"
+        use http;
+        pub fn run(input: map) -> map {
+            http::client::request({ method: "GET", url: "http://127.0.0.1:1/" });
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"capability"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    assert!(
+        text.contains("run.failed") && text.contains("capability_"),
+        "a typed capability failure must mark the run failed, got: {text}"
+    );
+}

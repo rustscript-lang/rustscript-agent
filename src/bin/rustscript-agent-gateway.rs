@@ -96,7 +96,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rustscript-agent-gateway listening on http://{}",
         listener.local_addr()?
     );
-    axum::serve(listener, build_agent_gateway_app(state)).await?;
+    let app = build_agent_gateway_app(state.clone());
+    tokio::select! {
+        result = axum::serve(listener, app) => result?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            eprintln!("halting: cancelling active runs with the typed resource-closed reason");
+            state.service().halt();
+        }
+    }
     Ok(())
 }
 

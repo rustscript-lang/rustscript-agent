@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use crate::gateway::timestamp;
+use crate::gateway::{timestamp, vm_value_to_json};
 use crate::{AgentConfig, AgentRunner};
 
 pub(crate) struct GatewayPersistence {
@@ -88,7 +88,7 @@ impl StorageRunner {
                 "RSS storage operation {op} returned a non-map result"
             ));
         };
-        Ok(super::vm_value_to_json(&VmValue::Map(result)))
+        Ok(vm_value_to_json(&VmValue::Map(result)))
     }
 }
 
@@ -427,6 +427,9 @@ pub(crate) struct RunRecord {
     pub(crate) status: String,
     pub(crate) events: Vec<GatewayEvent>,
     pub(crate) sender: broadcast::Sender<GatewayEvent>,
+    /// Legacy boolean stop flag kept for persisted-state compatibility; the
+    /// authoritative typed cancellation lives in the service RunHandle.
+    #[allow(dead_code)]
     pub(crate) cancel_requested: Arc<AtomicBool>,
 }
 

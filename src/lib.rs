@@ -10,8 +10,13 @@ pub mod events;
 pub mod gateway;
 pub mod runtime;
 
+#[path = "gateway_store.rs"]
+pub(crate) mod gateway_store;
+pub mod service;
+
 pub use gateway::{AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app};
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
 };
+pub use service::{AdmitError, AdmitRunRequest, AdmittedRun, AgentService, RunHandle};

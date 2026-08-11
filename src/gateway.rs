@@ -3,11 +3,7 @@ use std::{
     convert::Infallible,
     hash::{Hash, Hasher},
     path::Path as FsPath,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,11 +28,9 @@ use uuid::Uuid;
 
 use crate::{AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink, events};
 
-#[path = "gateway_store.rs"]
-mod gateway_store;
-use gateway_store::{
-    GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, JobRecord, JobView,
-    RunRecord, SessionMessage, SessionRecord, SessionView,
+use crate::gateway_store::{
+    GatewayEvent, GatewayPersistence, GatewayStore, JobRecord, JobView, RunRecord, SessionMessage,
+    SessionRecord, SessionView,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -56,9 +50,43 @@ pub struct AgentGatewayConfig {
     pub event_channel_capacity: usize,
     pub max_events_per_run: usize,
     pub max_event_bytes: usize,
+    pub terminal_run_ttl: Duration,
+    pub cancellation_grace: Duration,
+    pub janitor_interval: Duration,
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
     pub fuel: Option<u64>,
+}
+
+impl AgentGatewayConfig {
+    /// Validates that every lifecycle bound is positive.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_concurrent_runs == 0 {
+            return Err("max_concurrent_runs must be positive".to_string());
+        }
+        if self.run_timeout.is_zero() {
+            return Err("run_timeout must be positive".to_string());
+        }
+        if self.event_channel_capacity == 0 {
+            return Err("event_channel_capacity must be positive".to_string());
+        }
+        if self.max_events_per_run == 0 {
+            return Err("max_events_per_run must be positive".to_string());
+        }
+        if self.max_event_bytes == 0 {
+            return Err("max_event_bytes must be positive".to_string());
+        }
+        if self.terminal_run_ttl.is_zero() {
+            return Err("terminal_run_ttl must be positive".to_string());
+        }
+        if self.cancellation_grace.is_zero() {
+            return Err("cancellation_grace must be positive".to_string());
+        }
+        if self.janitor_interval.is_zero() {
+            return Err("janitor_interval must be positive".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl Default for AgentGatewayConfig {
@@ -76,6 +104,9 @@ impl Default for AgentGatewayConfig {
             event_channel_capacity: 64,
             max_events_per_run: 240,
             max_event_bytes: 32 * 1024,
+            terminal_run_ttl: Duration::from_secs(60),
+            cancellation_grace: Duration::from_secs(5),
+            janitor_interval: Duration::from_secs(5),
             http: HttpConfig::default(),
             sqlite,
             fuel: Some(10_000_000),
@@ -84,28 +115,10 @@ impl Default for AgentGatewayConfig {
 }
 
 #[derive(Clone)]
-struct AgentService {
-    persistence: Option<Arc<GatewayPersistence>>,
-}
-
-impl AgentService {
-    fn persist(&self, store: &GatewayStore) -> bool {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return true;
-        };
-        if let Err(error) = persistence.save(store) {
-            tracing::error!("failed to persist agent gateway state: {error}");
-            return false;
-        }
-        true
-    }
-}
-
-#[derive(Clone)]
 pub struct AgentGatewayState {
     config: Arc<AgentGatewayConfig>,
     store: Arc<RwLock<GatewayStore>>,
-    service: AgentService,
+    service: Arc<crate::service::AgentService>,
     agent_source: Option<Arc<String>>,
     http_config: HttpConfig,
 }
@@ -113,10 +126,21 @@ pub struct AgentGatewayState {
 impl AgentGatewayState {
     pub fn new(config: AgentGatewayConfig) -> Self {
         let http_config = config.http.clone();
+        config
+            .validate()
+            .expect("gateway configuration must validate");
+        let store = Arc::new(RwLock::new(GatewayStore::default()));
+        let service = Arc::new(crate::service::AgentService::new(
+            Arc::new(config),
+            Arc::clone(&store),
+            None,
+            None,
+            http_config.clone(),
+        ));
         Self {
-            config: Arc::new(config),
-            store: Arc::new(RwLock::new(GatewayStore::default())),
-            service: AgentService { persistence: None },
+            config: Arc::clone(service.config()),
+            store,
+            service,
             agent_source: None,
             http_config,
         }
@@ -145,7 +169,19 @@ impl AgentGatewayState {
         source: impl Into<String>,
         path: impl AsRef<FsPath>,
     ) -> Result<Self, String> {
-        let mut state = Self::with_agent_source(config.clone(), source)?;
+        let source = source.into();
+        if source.len() > crate::MAX_AGENT_SOURCE_BYTES {
+            return Err(format!(
+                "RSS source exceeds {} bytes",
+                crate::MAX_AGENT_SOURCE_BYTES
+            ));
+        }
+        rustscript_vm::compile_source(&source)
+            .map_err(|error| format!("compile RSS agent source: {error}"))?;
+        let http_config = config.http.clone();
+        config
+            .validate()
+            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
         let persistence = Arc::new(
             GatewayPersistence::open(&config, path.as_ref())
                 .map_err(|error| format!("open gateway SQLite state: {error}"))?,
@@ -153,11 +189,22 @@ impl AgentGatewayState {
         let store = persistence
             .load()
             .map_err(|error| format!("load gateway SQLite state: {error}"))?;
-        state.store = Arc::new(RwLock::new(store));
-        state.service = AgentService {
-            persistence: Some(persistence),
-        };
-        Ok(state)
+        let store = Arc::new(RwLock::new(store));
+        let agent_source = Some(Arc::new(source));
+        let service = Arc::new(crate::service::AgentService::new(
+            Arc::new(config),
+            Arc::clone(&store),
+            Some(persistence),
+            agent_source.clone(),
+            http_config.clone(),
+        ));
+        Ok(Self {
+            config: Arc::clone(service.config()),
+            store,
+            service,
+            agent_source,
+            http_config,
+        })
     }
 
     pub fn with_sqlite_path(
@@ -165,6 +212,9 @@ impl AgentGatewayState {
         path: impl AsRef<FsPath>,
     ) -> Result<Self, String> {
         let http_config = config.http.clone();
+        config
+            .validate()
+            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
         let persistence = Arc::new(
             GatewayPersistence::open(&config, path.as_ref())
                 .map_err(|error| format!("open gateway SQLite state: {error}"))?,
@@ -172,19 +222,29 @@ impl AgentGatewayState {
         let store = persistence
             .load()
             .map_err(|error| format!("load gateway SQLite state: {error}"))?;
+        let store = Arc::new(RwLock::new(store));
+        let service = Arc::new(crate::service::AgentService::new(
+            Arc::new(config),
+            Arc::clone(&store),
+            Some(persistence),
+            None,
+            http_config.clone(),
+        ));
         Ok(Self {
-            config: Arc::new(config),
-            store: Arc::new(RwLock::new(store)),
-            service: AgentService {
-                persistence: Some(persistence),
-            },
+            config: Arc::clone(service.config()),
+            store,
+            service,
             agent_source: None,
             http_config,
         })
     }
 
+    pub fn service(&self) -> Arc<crate::service::AgentService> {
+        Arc::clone(&self.service)
+    }
+
     fn persist(&self) -> bool {
-        self.service.persist(&self.store.read())
+        self.service.persist()
     }
 }
 
@@ -613,8 +673,7 @@ async fn session_chat_handler(
 
     let input = request.input.unwrap_or(Value::Null);
     let input_text = input_text(&input);
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let worker_cancellation = Arc::clone(&cancellation);
+    let cancellation = RunCancellation::new();
     let http_config = state.http_config.clone();
     let sqlite_policy = state.config.sqlite.clone();
     let worker_input = input_text.clone();
@@ -622,6 +681,7 @@ async fn session_chat_handler(
     // script events are validated and then discarded here. Run delivery is
     // the AgentService path (POST /v1/runs).
     let mut sink = DiscardingSink;
+    let run_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
         let context = VmValue::map(vec![(
             VmValue::string("input"),
@@ -633,13 +693,17 @@ async fn session_chat_handler(
             sqlite_policy,
             context,
             &mut sink,
-            worker_cancellation,
+            &run_cancellation,
         )
     });
     let output = match tokio::time::timeout(state.config.run_timeout, &mut worker).await {
         Ok(Ok(Ok(value))) => vm_value_to_json(&value),
         Ok(Ok(Err(error))) => {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "agent_failed", &error);
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent_failed",
+                &error.to_string(),
+            );
         }
         Ok(Err(error)) => {
             return json_error(
@@ -649,8 +713,8 @@ async fn session_chat_handler(
             );
         }
         Err(_) => {
-            cancellation.store(true, Ordering::Release);
-            let _ = worker.await;
+            cancellation.request(rustscript_vm::CancellationReason::Deadline);
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut worker).await;
             return json_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "agent_timeout",
@@ -745,177 +809,78 @@ async fn create_run_handler(
         .map_err(|error| error.to_string())
         .unwrap_or_else(|_| text.clone())
     };
-    let run_id = Uuid::new_v4().to_string();
-    let cancel_requested = Arc::new(AtomicBool::new(false));
-    let (sender, _) = broadcast::channel(32);
-    let previous_session: Option<(String, Option<SessionRecord>)>;
-    {
-        let mut store = state.store.write();
-        if let (Some(key), Some(hash)) = (idempotency_key.as_ref(), request_hash.as_ref())
-            && let Some(existing) = store.idempotency.get(key)
-        {
-            if existing.request_hash != *hash {
-                return json_error(
-                    StatusCode::CONFLICT,
-                    "idempotency_key_reused",
-                    "idempotency key was used with a different request",
-                );
-            }
-            let status = store
-                .runs
-                .get(&existing.run_id)
-                .map(|run| run.status.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            return json_response(
-                StatusCode::ACCEPTED,
-                json!({"run_id": existing.run_id, "status": status}),
-            );
-        }
-        if store
-            .runs
-            .values()
-            .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
-            .count()
-            >= state.config.max_concurrent_runs
-        {
+
+    // Atomic admission: one reservation covers capacity, session, run ID,
+    // cancellation and delivery state; rejection leaves nothing behind.
+    let admitted = match state.service.admit(crate::service::AdmitRunRequest {
+        input,
+        session_id: request.session_id.clone(),
+        model: request.model.clone(),
+        provider: request.provider.clone(),
+        parent_run_id: request.parent_run_id.clone(),
+        instructions: request.instructions.clone(),
+        platform: "api_server".to_string(),
+        idempotency_key,
+        idempotency_hash: request_hash,
+    }) {
+        Ok(admitted) => admitted,
+        Err(crate::service::AdmitError::RunLimitReached) => {
             return json_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "run_limit_reached",
                 "maximum concurrent run limit reached",
             );
         }
-        if let Some(parent_run_id) = request.parent_run_id.as_ref()
-            && !store.runs.contains_key(parent_run_id)
-        {
+        Err(crate::service::AdmitError::IdempotencyConflict) => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "idempotency_key_reused",
+                "idempotency key was used with a different request",
+            );
+        }
+        Err(crate::service::AdmitError::ParentNotFound) => {
             return json_error(
                 StatusCode::NOT_FOUND,
                 "parent_run_not_found",
                 "parent run not found",
             );
         }
-        let session_id = match request.session_id.clone() {
-            Some(session_id) => {
-                previous_session =
-                    Some((session_id.clone(), store.sessions.get(&session_id).cloned()));
-                session_id
-            }
-            None => {
-                let id = Uuid::new_v4().to_string();
-                previous_session = Some((id.clone(), None));
-                let now = timestamp();
-                let view = SessionView {
-                    id: id.clone(),
-                    object: "hermes.session".to_string(),
-                    title: None,
-                    model: request
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| state.config.model.clone()),
-                    provider: request
-                        .provider
-                        .clone()
-                        .or_else(|| state.config.provider.clone()),
-                    source: "yahu".to_string(),
-                    system_prompt: request.instructions.clone(),
-                    created_at: now,
-                    updated_at: now,
-                    message_count: 0,
-                    end_reason: None,
-                };
-                store.sessions.insert(
-                    id.clone(),
-                    SessionRecord {
-                        view,
-                        messages: Vec::new(),
-                    },
-                );
-                id
-            }
-        };
-        let Some(session) = store.sessions.get_mut(&session_id) else {
+        Err(crate::service::AdmitError::SessionNotFound) => {
             return json_error(
                 StatusCode::NOT_FOUND,
                 "session_not_found",
                 "session not found",
             );
-        };
-        if let Some(model) = request.model.clone() {
-            session.view.model = model;
         }
-        if request.provider.is_some() {
-            session.view.provider = request.provider.clone();
-        }
-        if request.instructions.is_some() {
-            session.view.system_prompt = request.instructions.clone();
-        }
-        append_message(
-            &mut session.view,
-            &mut session.messages,
-            "user",
-            input,
-            Some(run_id.clone()),
-            None,
-        );
-        store.runs.insert(
-            run_id.clone(),
-            RunRecord {
-                run_id: run_id.clone(),
-                session_id: session_id.clone(),
-                parent_run_id: request.parent_run_id.clone(),
-                status: "started".to_string(),
-                events: Vec::new(),
-                sender,
-                cancel_requested: cancel_requested.clone(),
-            },
-        );
-        if let Some(run) = store.runs.get_mut(&run_id) {
-            emit_event_locked(
-                run,
-                "run.started",
-                json!({"status":"started","session_id":session_id}),
+        Err(crate::service::AdmitError::Persistence(message)) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "persistence_unavailable",
+                &message,
             );
         }
-        if let (Some(key), Some(hash)) = (idempotency_key.as_ref(), request_hash.as_ref()) {
-            store.idempotency.insert(
-                key.clone(),
-                IdempotencyRecord {
-                    request_hash: hash.clone(),
-                    run_id: run_id.clone(),
-                },
+        Err(crate::service::AdmitError::Invalid(message)) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_admission",
+                &message,
             );
         }
-    }
-    if !state.persist() {
-        let mut store = state.store.write();
-        store.runs.remove(&run_id);
-        if let Some(key) = idempotency_key.as_ref() {
-            store.idempotency.remove(key);
-        }
-        if let Some((session_id, previous)) = previous_session {
-            match previous {
-                Some(session) => {
-                    store.sessions.insert(session_id, session);
-                }
-                None => {
-                    store.sessions.remove(&session_id);
-                }
-            }
-        }
-        drop(store);
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            "run admission could not be durably committed",
+    };
+    if admitted.replayed {
+        return json_response(
+            StatusCode::ACCEPTED,
+            json!({"run_id": admitted.run_id, "status": admitted.status}),
         );
     }
     let worker_state = state.clone();
-    let worker_run_id = run_id.clone();
+    let worker_run_id = admitted.run_id.clone();
     tokio::spawn(async move {
         run_local_agent(worker_state, worker_run_id, agent_input).await;
     });
     json_response(
         StatusCode::ACCEPTED,
-        json!({"run_id":run_id, "status":"started"}),
+        json!({"run_id": admitted.run_id, "status": "started"}),
     )
 }
 
@@ -962,20 +927,11 @@ async fn stop_run_handler(
     State(state): State<AgentGatewayState>,
     Path(run_id): Path<String>,
 ) -> Response {
-    let mut store = state.store.write();
-    let Some(run) = store.runs.get_mut(&run_id) else {
+    let Some(status) = state.service.stop(&run_id) else {
         return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
     };
-    if run.status == "started" {
-        run.status = "stopping".to_string();
-        run.cancel_requested.store(true, Ordering::Release);
-    }
-    drop(store);
     state.persist();
-    json_response(
-        StatusCode::OK,
-        json!({"run_id":run_id, "status":"stopping"}),
-    )
+    json_response(StatusCode::OK, json!({"run_id":run_id, "status":status}))
 }
 
 async fn create_job_handler(
@@ -1133,19 +1089,13 @@ async fn interrupt_subagent_handler(
     State(state): State<AgentGatewayState>,
     Path(subagent_id): Path<String>,
 ) -> Response {
-    let mut store = state.store.write();
-    let Some(run) = store.runs.get_mut(&subagent_id) else {
+    if state.service.stop(&subagent_id).is_none() {
         return json_error(
             StatusCode::NOT_FOUND,
             "subagent_not_found",
             "subagent not found",
         );
-    };
-    if run.status == "started" {
-        run.status = "stopping".to_string();
-        run.cancel_requested.store(true, Ordering::Release);
     }
-    drop(store);
     state.persist();
     json_response(
         StatusCode::ACCEPTED,
@@ -1179,16 +1129,20 @@ enum WorkerOutcome {
 
 async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String) {
     tokio::task::yield_now().await;
-    let (session_id, cancel_requested) = {
+    let Some(handle) = state.service.handle(&run_id) else {
+        return;
+    };
+    let session_id = {
         let store = state.store.read();
         let Some(run) = store.runs.get(&run_id) else {
             return;
         };
-        (run.session_id.clone(), run.cancel_requested.clone())
+        run.session_id.clone()
     };
+    let cancellation = handle.cancel.clone();
 
-    if cancel_requested.load(Ordering::Acquire) {
-        finish_cancelled(&state, &run_id, "client_stop");
+    if cancellation.requested().is_some() {
+        finish_cancelled(&state, &run_id, "requested");
         return;
     }
 
@@ -1198,7 +1152,6 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
         let run_timeout = state.config.run_timeout;
         let input = text.clone();
         let context = build_run_context(&state, &run_id, &session_id, &input);
-        let cancellation = cancel_requested.clone();
         // One bounded delivery path: the worker blocks on this channel when
         // the delivery task is busy, which pauses invocation polling
         // (backpressure). The delivery task validates, sequences, appends
@@ -1206,6 +1159,7 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
         let (sender, receiver) = tokio::sync::mpsc::channel(state.config.event_channel_capacity);
         let delivery = tokio::spawn(run_delivery_task(state.clone(), run_id.clone(), receiver));
         let mut sink = ChannelEventSink(sender);
+        let run_cancellation = cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
             execute_rss_source(
                 &source,
@@ -1213,23 +1167,19 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
                 sqlite_policy,
                 context,
                 &mut sink,
-                cancellation,
+                &run_cancellation,
             )
         });
         let outcome = match tokio::time::timeout(run_timeout, &mut worker).await {
             Ok(Ok(Ok(value))) => WorkerOutcome::Completed(value),
-            Ok(Ok(Err(error))) => {
-                if cancel_requested.load(Ordering::Acquire) {
-                    WorkerOutcome::Cancelled("client_stop")
-                } else {
-                    WorkerOutcome::Failed(error)
-                }
-            }
+            Ok(Ok(Err(error))) => WorkerOutcome::from_run_error(error),
             Ok(Err(error)) => WorkerOutcome::Failed(format!("RSS worker join failed: {error}")),
             Err(_) => {
-                cancel_requested.store(true, Ordering::Release);
-                let _ = worker.await;
-                WorkerOutcome::Cancelled("run_timeout")
+                // The timeout is authoritative: cancel with the typed deadline
+                // reason and wait only the configured grace for worker exit.
+                cancellation.request(CancellationReason::Deadline);
+                let _ = tokio::time::timeout(state.config.cancellation_grace, &mut worker).await;
+                WorkerOutcome::Cancelled("deadline")
             }
         };
         // The worker dropped the channel sender when it returned; the delivery
@@ -1274,18 +1224,19 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
         text.clone()
     };
 
-    if cancel_requested.load(Ordering::Acquire) {
-        finish_cancelled(&state, &run_id, "client_stop");
+    if cancellation.requested().is_some() {
+        finish_cancelled(&state, &run_id, "requested");
         return;
     }
 
     let mut store = state.store.write();
-    let run_active = store.runs.get(&run_id).is_some_and(|run| {
-        run.status == "started" && !run.cancel_requested.load(Ordering::Acquire)
-    });
+    let run_active = store
+        .runs
+        .get(&run_id)
+        .is_some_and(|run| run.status == "started" && cancellation.requested().is_none());
     if !run_active {
         drop(store);
-        finish_cancelled(&state, &run_id, "client_stop");
+        finish_cancelled(&state, &run_id, "requested");
         return;
     }
     if !store.sessions.contains_key(&session_id) {
@@ -1326,6 +1277,52 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
     run.status = "completed".to_string();
     drop(store);
     state.persist();
+    state.service.mark_terminal(&run_id);
+}
+
+impl WorkerOutcome {
+    /// Maps a typed runner error to the terminal outcome without string
+    /// matching: cancellation/deadline/fuel/capability categories are decided
+    /// from the typed variants.
+    fn from_run_error(error: crate::RunError) -> Self {
+        use crate::RunError;
+        match error {
+            RunError::Invocation(rustscript_vm::InvocationError::Cancelled(reason)) => {
+                WorkerOutcome::Cancelled(reason.as_str())
+            }
+            RunError::Invocation(rustscript_vm::InvocationError::DeadlineReached { .. }) => {
+                WorkerOutcome::Cancelled("deadline")
+            }
+            RunError::Invocation(rustscript_vm::InvocationError::OutOfFuel { .. }) => {
+                WorkerOutcome::Failed("out_of_fuel".to_string())
+            }
+            RunError::Invocation(rustscript_vm::InvocationError::Capability(error)) => {
+                WorkerOutcome::Failed(format!("capability_{}", error.code().as_str()))
+            }
+            RunError::Invocation(rustscript_vm::InvocationError::Host { message }) => {
+                WorkerOutcome::Failed(message)
+            }
+            RunError::Invocation(rustscript_vm::InvocationError::Vm(error)) => {
+                WorkerOutcome::Failed(format!("{error}"))
+            }
+            RunError::EarlyEnd => {
+                WorkerOutcome::Failed("invocation stream ended without a terminal item".to_string())
+            }
+            RunError::DeliveryClosed => {
+                WorkerOutcome::Failed("event delivery closed before the run completed".to_string())
+            }
+            RunError::DeliveryRejected { message, .. } => WorkerOutcome::Failed(message),
+            RunError::NoEntry => {
+                WorkerOutcome::Failed("agent script does not export run(context)".to_string())
+            }
+            RunError::EntryArity { expected, got } => WorkerOutcome::Failed(format!(
+                "exported run takes {got} parameter(s); expected exactly {expected}"
+            )),
+            RunError::Setup(error) | RunError::Vm(error) => {
+                WorkerOutcome::Failed(format!("{error}"))
+            }
+        }
+    }
 }
 
 fn finish_cancelled(state: &AgentGatewayState, run_id: &str, reason: &str) {
@@ -1344,6 +1341,7 @@ fn finish_cancelled(state: &AgentGatewayState, run_id: &str, reason: &str) {
     }
     drop(store);
     state.persist();
+    state.service.mark_terminal(run_id);
 }
 
 /// Canonical run.failed payload from a plain failure message.
@@ -1367,6 +1365,7 @@ fn finish_failed(state: &AgentGatewayState, run_id: &str, data: Value) {
     }
     drop(store);
     state.persist();
+    state.service.mark_terminal(run_id);
 }
 
 fn execute_rss_source(
@@ -1375,16 +1374,12 @@ fn execute_rss_source(
     sqlite_policy: SqlitePolicy,
     context: VmValue,
     sink: &mut dyn RunEventSink,
-    cancel_requested: Arc<AtomicBool>,
-) -> std::result::Result<VmValue, String> {
-    if cancel_requested.load(Ordering::Acquire) {
-        return Err("cancelled".to_string());
-    }
+    cancellation: &RunCancellation,
+) -> std::result::Result<VmValue, crate::RunError> {
     if source.len() > crate::MAX_AGENT_SOURCE_BYTES {
-        return Err(format!(
-            "RSS source exceeds {} bytes",
-            crate::MAX_AGENT_SOURCE_BYTES
-        ));
+        return Err(crate::RunError::Setup(rustscript_vm::VmError::HostError(
+            format!("RSS source exceeds {} bytes", crate::MAX_AGENT_SOURCE_BYTES),
+        )));
     }
     let runner = AgentRunner::from_source(
         source,
@@ -1394,28 +1389,12 @@ fn execute_rss_source(
             fuel: None,
         },
     )
-    .map_err(|error| format!("compile RSS run source: {error}"))?;
-
-    // Bridge the legacy boolean stop flag into the typed cancellation handle.
-    let cancellation = RunCancellation::new();
-    let bridge_cancellation = cancellation.clone();
-    let bridge_stop = Arc::new(AtomicBool::new(false));
-    let bridge_cancel_flag = Arc::clone(&cancel_requested);
-    let bridge_stop_flag = Arc::clone(&bridge_stop);
-    let bridge = thread::spawn(move || {
-        while !bridge_stop_flag.load(Ordering::Acquire) {
-            if bridge_cancel_flag.load(Ordering::Acquire) {
-                bridge_cancellation.request(CancellationReason::Requested);
-                return;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    let result = runner.run_with_context_and_events(context, sink, &cancellation);
-    bridge_stop.store(true, Ordering::Release);
-    let _ = bridge.join();
-    result.map_err(|error| error.to_string())
+    .map_err(|error| {
+        crate::RunError::Vm(rustscript_vm::VmError::HostError(format!(
+            "compile RSS run source: {error}"
+        )))
+    })?;
+    runner.run_with_context_and_events(context, sink, cancellation)
 }
 
 /// Bounded channel delivery sink: `blocking_send` pauses the worker (and
@@ -1659,7 +1638,7 @@ fn event_stream(
     )
 }
 
-fn emit_event_locked(run: &mut RunRecord, event: &str, mut data: Value) {
+pub(crate) fn emit_event_locked(run: &mut RunRecord, event: &str, mut data: Value) {
     const MAX_EVENT_BYTES: usize = 32 * 1024;
     const MAX_EVENTS_PER_RUN: usize = 240;
     if serde_json::to_vec(&data)
@@ -1685,7 +1664,7 @@ fn emit_event_locked(run: &mut RunRecord, event: &str, mut data: Value) {
     let _ = run.sender.send(event);
 }
 
-fn append_message(
+pub(crate) fn append_message(
     view: &mut SessionView,
     messages: &mut Vec<SessionMessage>,
     role: &str,
