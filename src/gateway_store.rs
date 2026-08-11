@@ -200,8 +200,11 @@ impl GatewayPersistence {
         }
         for (run_id, mut events) in events_by_run {
             events.sort_by_key(|event| event.seq);
+            // Retained history may begin at first_seq > 1 (retention floor);
+            // only adjacency must hold.
+            let first_seq = events.first().map(|event| event.seq).unwrap_or(1);
             for (index, event) in events.iter().enumerate() {
-                let expected_seq = index as u64 + 1;
+                let expected_seq = first_seq + index as u64;
                 if event.seq != expected_seq {
                     return Err(format!(
                         "event sequence gap for run {run_id}: expected {expected_seq}, got {}",

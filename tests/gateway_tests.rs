@@ -794,3 +794,141 @@ async fn typed_capability_failure_marks_the_run_failed() {
         "a typed capability failure must mark the run failed, got: {text}"
     );
 }
+
+#[tokio::test]
+async fn stop_racing_completion_commits_exactly_one_terminal() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"raced\"; }",
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"race"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    // Stop immediately; the run may complete or cancel, but never both.
+    let _ = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    let text = read_run_events(&app, run_id).await;
+    let terminals = text.matches("event: run.completed").count()
+        + text.matches("event: run.cancelled").count()
+        + text.matches("event: run.failed").count();
+    assert_eq!(
+        terminals, 1,
+        "a stop racing completion must commit exactly one terminal, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn no_events_are_published_after_the_terminal_commit() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "model.delta", "delta": "before"});
+            while true {
+                1;
+            }
+            "unreachable";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"no-after-terminal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let (stop_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+    let text = read_run_events(&app, run_id).await;
+    if let Some(delta) = text.find("model.delta") {
+        assert!(
+            delta < text.find("run.cancelled").expect("terminal event"),
+            "an event delivered before the stop must be published before the terminal"
+        );
+    }
+    let last_event = text
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("event:"))
+        .expect("at least one event");
+    assert_eq!(
+        last_event.trim(),
+        "event: run.cancelled",
+        "nothing may be published after the terminal commit; last event was {last_event}"
+    );
+}
+
+#[tokio::test]
+async fn event_retention_respects_the_configured_per_run_limit() {
+    let path =
+        std::env::temp_dir().join(format!("rustscript-agent-retention-{}.db", Uuid::new_v4()));
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            max_events_per_run: 3,
+            ..AgentGatewayConfig::default()
+        },
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "model.delta", "delta": "1"});
+            stream::emit({"type": "model.delta", "delta": "2"});
+            stream::emit({"type": "model.delta", "delta": "3"});
+            stream::emit({"type": "model.delta", "delta": "4"});
+            stream::emit({"type": "model.delta", "delta": "5"});
+            "done";
+        }
+        "#,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"retention"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    assert!(text.contains("run.completed"));
+    drop(app);
+
+    // The retained replay history obeys max_events_per_run.
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let replayed = read_run_events(&restored_app, run_id).await;
+    assert!(
+        replayed.matches("event: model.delta").count() <= 3,
+        "retained history must obey max_events_per_run, got: {replayed}"
+    );
+    assert!(replayed.contains("run.completed"));
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}

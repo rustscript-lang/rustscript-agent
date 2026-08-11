@@ -876,7 +876,22 @@ async fn create_run_handler(
     let worker_state = state.clone();
     let worker_run_id = admitted.run_id.clone();
     tokio::spawn(async move {
-        run_local_agent(worker_state, worker_run_id, agent_input).await;
+        // A worker that exits without committing a terminal (for example a
+        // panic) must fail the run rather than leave it started forever; the
+        // terminal guard inside the commit functions makes this idempotent.
+        let outcome = tokio::task::spawn(run_local_agent(
+            worker_state.clone(),
+            worker_run_id.clone(),
+            agent_input,
+        ))
+        .await;
+        if outcome.is_err() {
+            finish_failed(
+                &worker_state,
+                &worker_run_id,
+                failed_payload("agent worker exited without a terminal outcome".to_string()),
+            );
+        }
     });
     json_response(
         StatusCode::ACCEPTED,
