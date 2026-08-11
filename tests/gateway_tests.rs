@@ -329,7 +329,7 @@ async fn sessions_and_jobs_reload_from_sqlite_state() {
 async fn configured_rss_source_runs_inside_the_vm() {
     let state = AgentGatewayState::with_agent_source(
         AgentGatewayConfig::default(),
-        "pub fn run(input: string) -> string { input; }",
+        "pub fn run(input: map) -> string { let text: string = input[\"input\"]; text; }",
     )
     .expect("RSS source should compile");
     let app = build_agent_gateway_app(state);
@@ -391,4 +391,147 @@ async fn active_run_can_be_interrupted_as_a_subagent() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body["object"], "hermes.subagent.interrupt");
     assert_eq!(body["status"], "interrupt_requested");
+}
+
+/// Reads one run's full SSE body.
+async fn read_run_events(app: &axum::Router, run_id: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/v1/runs/{run_id}/events"))
+                .body(Body::empty())
+                .expect("SSE request should build"),
+        )
+        .await
+        .expect("SSE route should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("SSE body should be readable");
+    String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8")
+}
+
+#[tokio::test]
+async fn script_events_stream_in_order_before_the_terminal() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "model.started", "model": "local"});
+            stream::emit({"type": "model.delta", "delta": "hello"});
+            "done";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"emit-order"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    let started = text.find("model.started").expect("model.started event");
+    let delta = text.find("model.delta").expect("model.delta event");
+    let completed = text.find("run.completed").expect("terminal event");
+    assert!(
+        started < delta && delta < completed,
+        "script events must stream before the terminal event"
+    );
+    assert!(
+        text.contains("\"seq\":1") && text.contains("\"seq\":2"),
+        "AgentService must assign monotonic per-run sequence numbers"
+    );
+    assert!(
+        text.contains("\"event\":\"model.started\"") && text.contains("\"event\":\"model.delta\""),
+        "script events must be delivered live with their canonical names"
+    );
+}
+
+#[tokio::test]
+async fn invalid_script_event_fails_the_run_with_a_typed_code() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "not_a_canonical_event"});
+            "done";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"schema-violation"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    assert!(
+        text.contains("run.failed") && text.contains("invalid_event_schema"),
+        "a schema-violating event must fail the run with the typed code"
+    );
+    assert!(
+        !text.contains("run.completed"),
+        "no success terminal may be committed after a schema violation"
+    );
+}
+
+#[tokio::test]
+async fn script_events_are_appended_durably_before_live_publish() {
+    let path = std::env::temp_dir().join(format!("rustscript-agent-events-{}.db", Uuid::new_v4()));
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "model.started", "model": "local"});
+            "durable";
+        }
+        "#,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"durable"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    assert!(
+        text.contains("model.started") && text.contains("run.completed"),
+        "the live stream must publish the event and the terminal"
+    );
+    drop(app);
+
+    // A fresh gateway reloads only what was persisted: the script event must
+    // have been appended durably before it was ever published live.
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let restored_text = read_run_events(&restored_app, run_id).await;
+    assert!(
+        restored_text.contains("model.started")
+            && restored_text.contains("\"seq\":1")
+            && restored_text.contains("run.completed"),
+        "the script event must be replayed from durable storage after restart"
+    );
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
 }

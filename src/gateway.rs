@@ -4,7 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     path::Path as FsPath,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::{AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink};
+use crate::{AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink, events};
 
 #[path = "gateway_store.rs"]
 mod gateway_store;
@@ -53,6 +53,9 @@ pub struct AgentGatewayConfig {
     pub max_body_bytes: usize,
     pub max_concurrent_runs: usize,
     pub run_timeout: Duration,
+    pub event_channel_capacity: usize,
+    pub max_events_per_run: usize,
+    pub max_event_bytes: usize,
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
     pub fuel: Option<u64>,
@@ -70,6 +73,9 @@ impl Default for AgentGatewayConfig {
             max_body_bytes: 4 * 1024 * 1024,
             max_concurrent_runs: 8,
             run_timeout: Duration::from_secs(900),
+            event_channel_capacity: 64,
+            max_events_per_run: 240,
+            max_event_bytes: 32 * 1024,
             http: HttpConfig::default(),
             sqlite,
             fuel: Some(10_000_000),
@@ -612,18 +618,27 @@ async fn session_chat_handler(
     let http_config = state.http_config.clone();
     let sqlite_policy = state.config.sqlite.clone();
     let worker_input = input_text.clone();
+    // The legacy chat completion path has no run record to deliver events to;
+    // script events are validated and then discarded here. Run delivery is
+    // the AgentService path (POST /v1/runs).
+    let mut sink = DiscardingSink;
     let mut worker = tokio::task::spawn_blocking(move || {
+        let context = VmValue::map(vec![(
+            VmValue::string("input"),
+            VmValue::string(worker_input),
+        )]);
         execute_rss_source(
             &source,
             http_config,
             sqlite_policy,
-            worker_input,
+            context,
+            &mut sink,
             worker_cancellation,
         )
     });
     let output = match tokio::time::timeout(state.config.run_timeout, &mut worker).await {
-        Ok(Ok(Ok((value, _events)))) => vm_value_to_json(&value),
-        Ok(Ok(Err((error, _events)))) => {
+        Ok(Ok(Ok(value))) => vm_value_to_json(&value),
+        Ok(Ok(Err(error))) => {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "agent_failed", &error);
         }
         Ok(Err(error)) => {
@@ -1153,20 +1168,13 @@ fn set_job_enabled(state: &AgentGatewayState, job_id: &str, enabled: bool) -> Re
     json_response(StatusCode::OK, json!({"job":view}))
 }
 
-fn append_runtime_events(state: &AgentGatewayState, run_id: &str, runtime_events: &[VmValue]) {
-    if runtime_events.is_empty() {
-        return;
-    }
-    let mut store = state.store.write();
-    if let Some(run) = store.runs.get_mut(run_id) {
-        for event in runtime_events {
-            emit_event_locked(
-                run,
-                "runtime.emit",
-                json!({"value": vm_value_to_json(event)}),
-            );
-        }
-    }
+/// Outcome of the RSS worker: a completed value, a typed cancellation, or a
+/// failure string. No string matching drives control flow; the variants are
+/// decided from typed run outcomes.
+enum WorkerOutcome {
+    Completed(VmValue),
+    Cancelled(&'static str),
+    Failed(String),
 }
 
 async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String) {
@@ -1189,41 +1197,76 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
         let sqlite_policy = state.config.sqlite.clone();
         let run_timeout = state.config.run_timeout;
         let input = text.clone();
+        let context = build_run_context(&state, &run_id, &session_id, &input);
         let cancellation = cancel_requested.clone();
+        // One bounded delivery path: the worker blocks on this channel when
+        // the delivery task is busy, which pauses invocation polling
+        // (backpressure). The delivery task validates, sequences, appends
+        // durably, and only then publishes to live subscribers.
+        let (sender, receiver) = tokio::sync::mpsc::channel(state.config.event_channel_capacity);
+        let delivery = tokio::spawn(run_delivery_task(state.clone(), run_id.clone(), receiver));
+        let mut sink = ChannelEventSink(sender);
         let mut worker = tokio::task::spawn_blocking(move || {
-            execute_rss_source(&source, http_config, sqlite_policy, input, cancellation)
+            execute_rss_source(
+                &source,
+                http_config,
+                sqlite_policy,
+                context,
+                &mut sink,
+                cancellation,
+            )
         });
-        match tokio::time::timeout(run_timeout, &mut worker).await {
-            Ok(Ok(Ok((value, runtime_events)))) => {
-                append_runtime_events(&state, &run_id, &runtime_events);
-                vm_value_to_json(&value).to_string()
+        let outcome = match tokio::time::timeout(run_timeout, &mut worker).await {
+            Ok(Ok(Ok(value))) => WorkerOutcome::Completed(value),
+            Ok(Ok(Err(error))) => {
+                if cancel_requested.load(Ordering::Acquire) {
+                    WorkerOutcome::Cancelled("client_stop")
+                } else {
+                    WorkerOutcome::Failed(error)
+                }
             }
-            Ok(Ok(Err((error, runtime_events))))
-                if cancel_requested.load(Ordering::Acquire) || error == "cancelled" =>
-            {
-                append_runtime_events(&state, &run_id, &runtime_events);
-                finish_cancelled(&state, &run_id, "client_stop");
-                return;
-            }
-            Ok(Ok(Err((error, runtime_events)))) => {
-                append_runtime_events(&state, &run_id, &runtime_events);
-                finish_failed(&state, &run_id, error);
-                return;
-            }
-            Ok(Err(error)) => {
-                finish_failed(&state, &run_id, format!("RSS worker join failed: {error}"));
-                return;
-            }
+            Ok(Err(error)) => WorkerOutcome::Failed(format!("RSS worker join failed: {error}")),
             Err(_) => {
                 cancel_requested.store(true, Ordering::Release);
-                if let Ok(result) = worker.await {
-                    match result {
-                        Ok((_, runtime_events)) | Err((_, runtime_events)) => {
-                            append_runtime_events(&state, &run_id, &runtime_events);
-                        }
-                    }
+                let _ = worker.await;
+                WorkerOutcome::Cancelled("run_timeout")
+            }
+        };
+        // The worker dropped the channel sender when it returned; the delivery
+        // task drains the remaining events and then exits. Wait only a bounded
+        // grace for the drain so the terminal commit always follows the last
+        // durably delivered script event.
+        let delivery_outcome = tokio::time::timeout(Duration::from_secs(5), delivery)
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .unwrap_or_default();
+        match outcome {
+            WorkerOutcome::Completed(value) => {
+                if let Some(reason) = delivery_outcome.schema_violation {
+                    finish_failed(&state, &run_id, events::schema_violation_error(&reason));
+                    return;
                 }
-                finish_cancelled(&state, &run_id, "run_timeout");
+                if delivery_outcome.persist_failed {
+                    finish_failed(
+                        &state,
+                        &run_id,
+                        json!({
+                            "status": "failed",
+                            "error_code": "persistence_unavailable",
+                            "error_message": "a run event could not be appended durably",
+                        }),
+                    );
+                    return;
+                }
+                vm_value_to_json(&value).to_string()
+            }
+            WorkerOutcome::Cancelled(reason) => {
+                finish_cancelled(&state, &run_id, reason);
+                return;
+            }
+            WorkerOutcome::Failed(error) => {
+                finish_failed(&state, &run_id, failed_payload(error));
                 return;
             }
         }
@@ -1247,7 +1290,11 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
     }
     if !store.sessions.contains_key(&session_id) {
         drop(store);
-        finish_failed(&state, &run_id, "session not found".to_string());
+        finish_failed(
+            &state,
+            &run_id,
+            failed_payload("session not found".to_string()),
+        );
         return;
     }
 
@@ -1299,14 +1346,23 @@ fn finish_cancelled(state: &AgentGatewayState, run_id: &str, reason: &str) {
     state.persist();
 }
 
-fn finish_failed(state: &AgentGatewayState, run_id: &str, error: String) {
+/// Canonical run.failed payload from a plain failure message.
+fn failed_payload(error: String) -> Value {
+    json!({
+        "status": "failed",
+        "error_code": "agent_failed",
+        "error_message": error,
+    })
+}
+
+fn finish_failed(state: &AgentGatewayState, run_id: &str, data: Value) {
     let mut store = state.store.write();
     if let Some(run) = store.runs.get_mut(run_id) {
         if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
             drop(store);
             return;
         }
-        emit_event_locked(run, "run.failed", json!({"error":error}));
+        emit_event_locked(run, "run.failed", data);
         run.status = "failed".to_string();
     }
     drop(store);
@@ -1317,16 +1373,17 @@ fn execute_rss_source(
     source: &str,
     http_config: HttpConfig,
     sqlite_policy: SqlitePolicy,
-    input: String,
+    context: VmValue,
+    sink: &mut dyn RunEventSink,
     cancel_requested: Arc<AtomicBool>,
-) -> Result<(VmValue, Vec<VmValue>), (String, Vec<VmValue>)> {
+) -> std::result::Result<VmValue, String> {
     if cancel_requested.load(Ordering::Acquire) {
-        return Err(("cancelled".to_string(), Vec::new()));
+        return Err("cancelled".to_string());
     }
     if source.len() > crate::MAX_AGENT_SOURCE_BYTES {
-        return Err((
-            format!("RSS source exceeds {} bytes", crate::MAX_AGENT_SOURCE_BYTES),
-            Vec::new(),
+        return Err(format!(
+            "RSS source exceeds {} bytes",
+            crate::MAX_AGENT_SOURCE_BYTES
         ));
     }
     let runner = AgentRunner::from_source(
@@ -1337,13 +1394,7 @@ fn execute_rss_source(
             fuel: None,
         },
     )
-    .map_err(|error| (format!("compile RSS run source: {error}"), Vec::new()))?;
-
-    let events = Arc::new(Mutex::new(Vec::<VmValue>::new()));
-    let mut sink = GatewayEventSink {
-        events: Arc::clone(&events),
-        max_events: 128,
-    };
+    .map_err(|error| format!("compile RSS run source: {error}"))?;
 
     // Bridge the legacy boolean stop flag into the typed cancellation handle.
     let cancellation = RunCancellation::new();
@@ -1361,41 +1412,190 @@ fn execute_rss_source(
         }
     });
 
-    let result =
-        runner.run_with_context_and_events(VmValue::string(input), &mut sink, &cancellation);
+    let result = runner.run_with_context_and_events(context, sink, &cancellation);
     bridge_stop.store(true, Ordering::Release);
     let _ = bridge.join();
+    result.map_err(|error| error.to_string())
+}
 
-    let event_snapshot = events
-        .lock()
-        .map(|events| events.clone())
-        .unwrap_or_default();
-    match result {
-        Ok(value) => Ok((value, event_snapshot)),
-        Err(error) => Err((error.to_string(), event_snapshot)),
+/// Bounded channel delivery sink: `blocking_send` pauses the worker (and
+/// therefore invocation polling) while the delivery task is busy, and fails
+/// once the receiver is gone.
+struct ChannelEventSink(tokio::sync::mpsc::Sender<VmValue>);
+
+impl RunEventSink for ChannelEventSink {
+    fn deliver(&mut self, value: VmValue) -> std::result::Result<(), RunDeliveryError> {
+        self.0
+            .blocking_send(value)
+            .map_err(|_| RunDeliveryError::Closed)
     }
 }
 
-/// Collects script-visible `stream::emit` values with a bounded cap.
-struct GatewayEventSink {
-    events: Arc<Mutex<Vec<VmValue>>>,
-    max_events: usize,
+/// Discards script events (used by the legacy chat completion path, which has
+/// no run record for live delivery).
+struct DiscardingSink;
+
+impl RunEventSink for DiscardingSink {
+    fn deliver(&mut self, _value: VmValue) -> std::result::Result<(), RunDeliveryError> {
+        Ok(())
+    }
 }
 
-impl RunEventSink for GatewayEventSink {
-    fn deliver(&mut self, value: VmValue) -> Result<(), RunDeliveryError> {
-        let mut events = self.events.lock().map_err(|_| RunDeliveryError::Rejected {
-            code: "sink_lock",
-            message: "event sink lock poisoned".to_string(),
-        })?;
-        if events.len() >= self.max_events {
-            return Err(RunDeliveryError::Rejected {
-                code: "event_limit",
-                message: format!("runtime event limit of {} exceeded", self.max_events),
-            });
+/// Durable live delivery for one run.
+///
+/// For every script event: validate against the agent event schema, assign the
+/// monotonic per-run sequence, append durably (persist) and only then publish
+/// to live subscribers. Nothing is published after the run commits a terminal
+/// state, and a failed append is rolled back so no unpersisted event is ever
+/// visible.
+async fn run_delivery_task(
+    state: AgentGatewayState,
+    run_id: String,
+    mut receiver: tokio::sync::mpsc::Receiver<VmValue>,
+) -> events::DeliveryOutcome {
+    let mut outcome = events::DeliveryOutcome::default();
+    while let Some(value) = receiver.recv().await {
+        let event_type = match events::validate_script_event(&value) {
+            Ok(event_type) => event_type.to_string(),
+            Err(reason) => {
+                if outcome.schema_violation.is_none() {
+                    outcome.schema_violation = Some(reason.to_string());
+                }
+                continue;
+            }
+        };
+        let data = events::script_event_data(&value);
+        let (event, sender) = {
+            let mut store = state.store.write();
+            let Some(run) = store.runs.get_mut(&run_id) else {
+                break;
+            };
+            if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+                break;
+            }
+            let event = append_script_event_locked(
+                run,
+                &event_type,
+                data,
+                state.config.max_event_bytes,
+                state.config.max_events_per_run,
+            );
+            (event, run.sender.clone())
+        };
+        if !state.persist() {
+            // Roll back the in-memory append so no unpersisted event is
+            // visible, and keep draining so the worker never blocks forever.
+            let mut store = state.store.write();
+            if let Some(run) = store.runs.get_mut(&run_id) {
+                run.events
+                    .retain(|existing| existing.event_id != event.event_id);
+            }
+            drop(store);
+            outcome.persist_failed = true;
+            continue;
         }
-        events.push(value);
-        Ok(())
+        outcome.delivered += 1;
+        let _ = sender.send(event);
+    }
+    outcome
+}
+
+/// Appends one script event to the run's retained history and returns it with
+/// the live delivery sender. Sequence and timestamps are AgentService-owned.
+fn append_script_event_locked(
+    run: &mut RunRecord,
+    event_type: &str,
+    mut data: Value,
+    max_event_bytes: usize,
+    max_events_per_run: usize,
+) -> GatewayEvent {
+    if serde_json::to_vec(&data)
+        .map(|payload| payload.len() > max_event_bytes)
+        .unwrap_or(true)
+    {
+        data = json!({"truncated":true,"original_bytes":"over_limit"});
+    }
+    let seq = run.events.last().map(|event| event.seq + 1).unwrap_or(1);
+    let event = GatewayEvent {
+        event_id: Uuid::new_v4().to_string(),
+        seq,
+        event: event_type.to_string(),
+        run_id: run.run_id.clone(),
+        timestamp: timestamp(),
+        data,
+    };
+    run.events.push(event.clone());
+    if run.events.len() > max_events_per_run {
+        let excess = run.events.len() - max_events_per_run;
+        run.events.drain(0..excess);
+    }
+    event
+}
+
+/// Builds the canonical structured run context (gateway-api plan 4.2) that is
+/// passed as the sole argument to the exported `run(context)` callable.
+fn build_run_context(
+    state: &AgentGatewayState,
+    run_id: &str,
+    session_id: &str,
+    input: &str,
+) -> VmValue {
+    let store = state.store.read();
+    let session = store.sessions.get(session_id);
+    let run = store.runs.get(run_id);
+    let messages = session
+        .map(|session| {
+            json_to_vm_value(&serde_json::to_value(&session.messages).unwrap_or(Value::Null))
+        })
+        .unwrap_or(VmValue::array(vec![]));
+    let system_prompt = session
+        .and_then(|session| session.view.system_prompt.clone())
+        .map(VmValue::string)
+        .unwrap_or(VmValue::Null);
+    let model = session
+        .map(|session| session.view.model.clone())
+        .unwrap_or_else(|| state.config.model.clone());
+    let provider = session
+        .and_then(|session| session.view.provider.clone())
+        .or_else(|| state.config.provider.clone());
+    let parent_run_id = run
+        .and_then(|run| run.parent_run_id.clone())
+        .map(VmValue::string)
+        .unwrap_or(VmValue::Null);
+    VmValue::map(vec![
+        (VmValue::string("run_id"), VmValue::string(run_id)),
+        (VmValue::string("session_id"), VmValue::string(session_id)),
+        (VmValue::string("parent_run_id"), parent_run_id),
+        (VmValue::string("platform"), VmValue::string("api_server")),
+        (VmValue::string("input"), VmValue::string(input)),
+        (VmValue::string("messages"), messages),
+        (VmValue::string("system_prompt"), system_prompt),
+        (VmValue::string("model"), VmValue::string(&model)),
+        (
+            VmValue::string("provider"),
+            provider.map(VmValue::string).unwrap_or(VmValue::Null),
+        ),
+    ])
+}
+
+/// Converts one JSON value into a VM value (mirror of `vm_value_to_json`).
+fn json_to_vm_value(value: &Value) -> VmValue {
+    match value {
+        Value::Null => VmValue::Null,
+        Value::Bool(value) => VmValue::Bool(*value),
+        Value::Number(value) => value
+            .as_i64()
+            .map(VmValue::Int)
+            .or_else(|| value.as_f64().map(VmValue::Float))
+            .unwrap_or(VmValue::Null),
+        Value::String(value) => VmValue::string(value),
+        Value::Array(values) => VmValue::array(values.iter().map(json_to_vm_value).collect()),
+        Value::Object(fields) => VmValue::map(
+            fields
+                .iter()
+                .map(|(key, value)| (VmValue::string(key), json_to_vm_value(value)))
+                .collect(),
+        ),
     }
 }
 
