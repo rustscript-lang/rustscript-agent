@@ -2,7 +2,7 @@
 
 **Goal:** Build a standalone RustScript-driven agent framework with API Server and Telegram gateways, durable sessions, provider adapters, tool policy, compaction, and subagent orchestration.
 
-**Architecture:** Native Rust owns configuration, secrets, platform I/O, service lifecycle, event delivery, and composition of generic RustScript capabilities. RSS owns agent policy: provider protocol mapping, conversation/tool loop, SQL/schema, approvals, compaction, and subagent policy. Core VM/compiler/runtime work is tracked only in the `rustscript` repository and enters this plan as an external contract gate.
+**Architecture:** Native Rust owns configuration, secrets, platform I/O, service lifecycle, event delivery, and composition of generic RustScript capabilities. RSS owns agent policy: provider protocol mapping, conversation/tool loop, SQL/schema, approvals, compaction, and subagent policy. Each run invokes an exported RSS `run(context)` function and consumes a Rust-like stream of `Event` items followed by one `Complete` item or typed error. Core VM/compiler/runtime work is tracked only in the `rustscript` repository and enters this plan as an external contract gate.
 
 **Tech Stack:** Rust 2024, Axum/Tokio, RustScript RSS programs, SQLite through generic `sqlite::*`, API Server HTTP/SSE, Telegram Bot API.
 
@@ -28,7 +28,7 @@ Agent milestones may consume these contracts after their owning `rustscript` pla
 | Contract | Owning core plan |
 | --- | --- |
 | Static callable identity and capability binding | `rustscript/plans/2026-08-09_static-builtin-id.md`, `2026-08-09_capability-profile-host-binding.md` |
-| Structured run result, live events, typed errors | `rustscript/plans/2026-08-09_run-outcome-event-error-contract.md` |
+| Exported invocation item stream and typed errors | `rustscript/plans/2026-08-09_run-outcome-event-error-contract.md` |
 | Resource/operation/cancellation lifecycle | `rustscript/plans/2026-08-09_unified-host-lifecycle.md` |
 | HTTP transport | `rustscript/plans/2026-08-09_http-transport-security-executor.md` |
 | Reliable RSS module composition | `rustscript/plans/2026-08-09_nested-module-correctness.md` |
@@ -112,7 +112,7 @@ limits
 metadata
 ```
 
-The context enters RSS as a structured runtime value. Source-string input injection is prohibited.
+The context enters RSS as the sole argument to the exported `run(context)` callable. Ambient runtime input, JSON wrapper builtins, and source-string input injection are prohibited.
 
 ### 4.3 Canonical events
 
@@ -136,7 +136,7 @@ run.cancelled
 run.failed
 ```
 
-Every event carries run identity, timestamp, monotonic per-run sequence, typed payload, and parent identity where applicable.
+AgentService attaches run identity, timestamp, monotonic per-run sequence, typed payload, and parent identity where applicable when it consumes each core `Event(Value)` item. Core does not assign durable event identity or sequence.
 
 ### 4.4 Canonical provider model
 
@@ -209,7 +209,7 @@ Shared domain/event contracts are integration-owned. Platform modules consume Ag
 
 Implement `plans/2026-08-09_agent-run-lifecycle-events.md`.
 
-**Criteria:** structured run context reaches RSS, result/event channels remain separate, cancellation and timeout are authoritative, admission is atomic, and events are available during execution.
+**Criteria:** structured run context reaches exported `run(context)` as an ordinary argument; the core stream yields zero or more `Event` items followed by one `Complete` item or typed error; AgentService owns sequencing, persistence, and delivery; cancellation and timeout are authoritative; admission is atomic.
 
 ### Milestone A2: Durable RSS-owned state
 
@@ -275,7 +275,7 @@ Implement `plans/2026-08-09_agent-durable-state.md`.
 - A Telegram message and an API request use the same AgentService/session/run model.
 - A complete provider/tool loop is visible in RSS source.
 - Native Rust contains no provider parser, agent loop, private host function, or SQL statement.
-- Structured input fields are preserved or rejected explicitly.
+- Structured input fields are passed through the exported RSS entry argument and are preserved or rejected explicitly.
 - Events are ordered, live, durable, replayable, and bounded.
 - Parent cancellation reaches all child runs and active capabilities.
 - Restart converts interrupted runs to a documented terminal state and retains replay history.
