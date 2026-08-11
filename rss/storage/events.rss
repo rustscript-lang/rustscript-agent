@@ -1,0 +1,92 @@
+use json;
+use sqlite;
+use self::schema as schema;
+
+fn events_query_limits(max_rows: int, max_bytes: int) -> map<int> {
+    { max_rows: max_rows, max_result_bytes: if max_bytes < 4096 => { 4096 } else => { max_bytes } }
+}
+
+
+struct EventAppendInput {
+    run_id: string,
+    event_id: string,
+    event_type: string,
+    payload_json: string,
+    now_ms: int,
+    max_events: int
+}
+
+struct EventReplayInput {
+    run_id: string,
+    after_seq: int,
+    max_events: int,
+    max_bytes: int
+}
+
+struct EventPruneInput {
+    run_id: string,
+    max_events: int
+}
+
+struct CursorInput {
+    session_id: string,
+    consumer: string,
+    event_seq: int,
+    now_ms: int
+}
+
+pub fn storage_event_append(db_id: int, payload_json: string) -> map {
+    let input: EventAppendInput = json::decode::<EventAppendInput>(payload_json);
+    let statements = [
+        {
+            sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events JOIN runs owners ON owners.id = events.run_id WHERE owners.session_id = (SELECT session_id FROM runs WHERE id = ?)), 0) + 1, ?, ?, ?, ?",
+            params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
+        },
+        {
+            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END ELSE 0 END)",
+            params: [&input.run_id, &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy(), &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy()]
+        },
+        {
+            sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
+            params: [input.now_ms.copy(), &input.run_id]
+        }
+    ];
+    sqlite::transaction(db_id, statements)
+}
+
+pub fn storage_event_replay(db_id: int, payload_json: string) -> map {
+    let input: EventReplayInput = json::decode::<EventReplayInput>(payload_json);
+    sqlite::query(
+        db_id,
+        "SELECT events.run_id, events.seq, events.event_id, events.event_type, CASE WHEN length(CAST(events.payload_json AS BLOB)) > CASE WHEN ? <= 0 THEN 16384 WHEN ? > 32768 THEN 16384 WHEN ? < 128 THEN 64 ELSE ? / 2 END THEN '{\"truncated\":true,\"original_bytes\":' || length(CAST(events.payload_json AS BLOB)) || '}' ELSE events.payload_json END AS payload_json, events.created_at_ms FROM run_events events WHERE events.run_id = ? AND events.seq > ? ORDER BY events.seq ASC LIMIT (CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END) + 1",
+        [input.max_bytes.copy(), input.max_bytes.copy(), input.max_bytes.copy(), input.max_bytes.copy(), &input.run_id, input.after_seq.copy(), input.max_events.copy(), input.max_events.copy(), input.max_events.copy()],
+        events_query_limits(input.max_events.copy(), input.max_bytes.copy())
+    )
+}
+
+pub fn storage_event_prune(db_id: int, payload_json: string) -> map {
+    let input: EventPruneInput = json::decode::<EventPruneInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END ELSE 0 END)",
+        [&input.run_id, &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy(), &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy()]
+    )
+}
+
+pub fn storage_delivery_cursor_get(db_id: int, session_id: string, consumer: string, max_rows: int, max_bytes: int) -> map {
+    sqlite::query(
+        db_id,
+        "SELECT session_id, consumer, last_event_seq, updated_at_ms FROM delivery_cursors WHERE session_id = ? AND consumer = ? LIMIT ?",
+        [&session_id, &consumer, (max_rows)],
+        events_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_delivery_cursor_advance(db_id: int, payload_json: string) -> map {
+    let input: CursorInput = json::decode::<CursorInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "INSERT INTO delivery_cursors (session_id, consumer, last_event_seq, updated_at_ms) SELECT ?, ?, ?, ? WHERE ? >= 0 AND ? <= COALESCE((SELECT MAX(events.seq) FROM run_events events JOIN runs event_runs ON event_runs.id = events.run_id WHERE event_runs.session_id = ?), 0) ON CONFLICT (session_id, consumer) DO UPDATE SET last_event_seq = MAX(delivery_cursors.last_event_seq, excluded.last_event_seq), updated_at_ms = excluded.updated_at_ms",
+        [&input.session_id, &input.consumer, input.event_seq.copy(), input.now_ms.copy(), input.event_seq.copy(), input.event_seq.copy(), &input.session_id]
+    )
+}

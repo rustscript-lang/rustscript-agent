@@ -1,0 +1,215 @@
+// Agent-owned schema and migration catalog.
+// Every statement is a single SQLite statement so the generic sqlite host can
+// enforce statement, row, byte, and transaction-duration limits.
+
+pub fn schema_migrations_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at_ms INTEGER NOT NULL)"
+}
+
+fn sessions_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, profile TEXT NOT NULL, platform TEXT NOT NULL, account_id TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'closed')), system_prompt TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', toolset_hash TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}', last_message_seq INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, UNIQUE (profile, platform, account_id, chat_id, thread_id))"
+}
+
+fn messages_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')), content_json TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', tool_call_id TEXT NOT NULL DEFAULT '', parent_message_id TEXT NOT NULL DEFAULT '', token_estimate INTEGER NOT NULL DEFAULT 0, compacted INTEGER NOT NULL DEFAULT 0 CHECK (compacted IN (0, 1)), metadata_json TEXT NOT NULL DEFAULT '{}', created_at_ms INTEGER NOT NULL, UNIQUE (session_id, ordinal))"
+}
+
+fn runs_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, parent_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'waiting_approval', 'compacting', 'completed', 'failed', 'cancelled')), input_json TEXT NOT NULL DEFAULT '{}', provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', script_hash TEXT NOT NULL DEFAULT '', idempotency_scope TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', turn_count INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '', recovery_reason TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, started_at_ms INTEGER NOT NULL DEFAULT 0, finished_at_ms INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL)"
+}
+
+fn run_events_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, seq INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL, PRIMARY KEY (run_id, seq))"
+}
+
+fn approvals_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, tool_call_id TEXT NOT NULL, tool_name TEXT NOT NULL, arguments_json TEXT NOT NULL, risk_class TEXT NOT NULL CHECK (risk_class IN ('read', 'write', 'execute', 'privileged')), state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'denied', 'expired')), decision_scope TEXT NOT NULL DEFAULT '', one_time INTEGER NOT NULL DEFAULT 0 CHECK (one_time IN (0, 1)), requested_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL DEFAULT 0, resolved_at_ms INTEGER NOT NULL DEFAULT 0, resolver TEXT NOT NULL DEFAULT '', decision_reason TEXT NOT NULL DEFAULT '', UNIQUE (run_id, tool_call_id))"
+}
+
+fn compactions_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS compactions (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, generation INTEGER NOT NULL, source_start_ordinal INTEGER NOT NULL, source_end_ordinal INTEGER NOT NULL, retained_tail_ordinal INTEGER NOT NULL, summary_json TEXT NOT NULL DEFAULT '{}', token_estimate INTEGER NOT NULL DEFAULT 0, model TEXT NOT NULL DEFAULT '', state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'failed')), error_message TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL DEFAULT 0, UNIQUE (session_id, generation))"
+}
+
+fn provider_usage_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS provider_usage (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, provider TEXT NOT NULL, model TEXT NOT NULL, request_count INTEGER NOT NULL CHECK (request_count >= 0) DEFAULT 0, input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0) DEFAULT 0, output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0) DEFAULT 0, reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0) DEFAULT 0, cached_tokens INTEGER NOT NULL CHECK (cached_tokens >= 0) DEFAULT 0, usage_ids TEXT NOT NULL DEFAULT '|', created_at_ms INTEGER NOT NULL, UNIQUE (run_id, provider, model))"
+}
+
+fn child_run_links_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS child_run_links (parent_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, child_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, relation TEXT NOT NULL DEFAULT 'subagent', state TEXT NOT NULL DEFAULT 'pending', created_at_ms INTEGER NOT NULL, PRIMARY KEY (parent_run_id, child_run_id), UNIQUE (parent_run_id, ordinal))"
+}
+
+fn delivery_cursors_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS delivery_cursors (session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, consumer TEXT NOT NULL, last_event_seq INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (session_id, consumer))"
+}
+
+fn idempotency_records_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS idempotency_records (scope TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed', 'completed', 'failed', 'expired')), response_json TEXT NOT NULL DEFAULT '{}', created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL DEFAULT 0, completed_at_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scope, key))"
+}
+
+fn recovery_records_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS recovery_records (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, from_status TEXT NOT NULL, to_status TEXT NOT NULL, reason TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}', recovered_at_ms INTEGER NOT NULL, UNIQUE (run_id, reason))"
+}
+
+fn index_statement(statement_index: int) -> string {
+    if statement_index == 0 => {
+        "CREATE INDEX IF NOT EXISTS idx_sessions_identity ON sessions (profile, platform, account_id, chat_id, thread_id)"
+    } else => {
+        if statement_index == 1 => {
+            "CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions (updated_at_ms DESC)"
+        } else => {
+            if statement_index == 2 => {
+                "CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal ON messages (session_id, ordinal ASC)"
+            } else => {
+                if statement_index == 3 => {
+                    "CREATE INDEX IF NOT EXISTS idx_runs_session_updated ON runs (session_id, updated_at_ms DESC)"
+                } else => {
+                    if statement_index == 4 => {
+                        "CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs (parent_run_id, created_at_ms ASC)"
+                    } else => {
+                        if statement_index == 5 => {
+                            "CREATE INDEX IF NOT EXISTS idx_events_run_seq ON run_events (run_id, seq ASC)"
+                        } else => {
+                            if statement_index == 6 => {
+                                "CREATE INDEX IF NOT EXISTS idx_approvals_pending ON approvals (state, expires_at_ms ASC)"
+                            } else => {
+                                if statement_index == 7 => {
+                                    "CREATE INDEX IF NOT EXISTS idx_compactions_session ON compactions (session_id, generation DESC)"
+                                } else => {
+                                    if statement_index == 8 => {
+                                        "CREATE INDEX IF NOT EXISTS idx_usage_run ON provider_usage (run_id, created_at_ms ASC)"
+                                    } else => {
+                                        if statement_index == 9 => {
+                                            "CREATE TABLE IF NOT EXISTS idempotency_claims (scope TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL, claim_token TEXT NOT NULL, claimed_at_ms INTEGER NOT NULL, PRIMARY KEY (scope, key))"
+                                        } else => {
+                                            if statement_index == 10 => {
+                                                "CREATE TABLE IF NOT EXISTS idempotency_claim_history (claim_token TEXT PRIMARY KEY, scope TEXT NOT NULL, key TEXT NOT NULL, claimed_at_ms INTEGER NOT NULL)"
+                                            } else => {
+                                                "CREATE INDEX IF NOT EXISTS idx_delivery_session_consumer ON delivery_cursors (session_id, consumer)"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn schema_migration_count() -> int {
+    2
+}
+
+pub fn schema_migration_version(migration_index: int) -> int {
+    if migration_index == 0 => { 1 } else => { 2 }
+}
+
+pub fn schema_migration_name(migration_index: int) -> string {
+    if migration_index == 0 => {
+        "agent-storage-v1"
+    } else => {
+        "agent-storage-v1-indexes"
+    }
+}
+
+pub fn schema_migration_checksum(migration_index: int) -> string {
+    if migration_index == 0 => {
+        "rss-storage-v1-tables"
+    } else => {
+        "rss-storage-v1-indexes"
+    }
+}
+
+pub fn schema_migration_statement_count(migration_index: int) -> int {
+    if migration_index == 0 => { 11 } else => { 12 }
+}
+
+fn table_migration_statement(statement_index: int) -> string {
+    if statement_index == 0 => { sessions_table_sql() } else => {
+        if statement_index == 1 => { messages_table_sql() } else => {
+            if statement_index == 2 => { runs_table_sql() } else => {
+                if statement_index == 3 => { run_events_table_sql() } else => {
+                    if statement_index == 4 => { approvals_table_sql() } else => {
+                        if statement_index == 5 => { compactions_table_sql() } else => {
+                            if statement_index == 6 => { provider_usage_table_sql() } else => {
+                                if statement_index == 7 => { child_run_links_table_sql() } else => {
+                                    if statement_index == 8 => { delivery_cursors_table_sql() } else => {
+                                        if statement_index == 9 => { idempotency_records_table_sql() } else => {
+                                            recovery_records_table_sql()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn schema_migration_statement(migration_index: int, statement_index: int) -> string {
+    if migration_index == 0 => {
+        table_migration_statement(statement_index)
+    } else => {
+        index_statement(statement_index)
+    }
+}
+
+pub fn schema_migration_record_sql() -> string {
+    "INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (version) DO UPDATE SET name = excluded.name, checksum = excluded.checksum, applied_at_ms = excluded.applied_at_ms"
+}
+
+pub fn default_max_rows() -> int {
+    64
+}
+
+pub fn default_max_bytes() -> int {
+    32768
+}
+
+pub fn default_max_events() -> int {
+    128
+}
+
+pub fn default_max_messages() -> int {
+    128
+}
+
+pub fn max_rows_limit(requested: int) -> int {
+    let mut value: int = requested;
+    if value <= 0 => { value = default_max_rows(); value } else => { value };
+    if value > 512 => { 512 } else => { value }
+}
+
+pub fn max_bytes_limit(requested: int) -> int {
+    let mut value: int = requested;
+    if value <= 0 => { value = default_max_bytes(); value } else => { value };
+    if value > 2097152 => { 2097152 } else => { value }
+}
+
+pub fn max_events_limit(requested: int) -> int {
+    let mut value: int = requested;
+    if value <= 0 => { value = default_max_events(); value } else => { value };
+    if value > 256 => { 256 } else => { value }
+}
+
+pub fn max_messages_limit(requested: int) -> int {
+    let mut value: int = requested;
+    if value <= 0 => { value = default_max_messages(); value } else => { value };
+    if value > 256 => { 256 } else => { value }
+}
+
+pub fn query_limits(requested_rows: int, requested_bytes: int) -> map<int> {
+    {
+        max_rows: max_rows_limit(requested_rows),
+        max_result_bytes: max_bytes_limit(requested_bytes)
+    }
+}
+
+pub fn event_retention_limit(requested: int) -> int {
+    let value = if requested <= 0 => { 256 } else => { requested };
+    if value > 2048 => { 2048 } else => { value }
+}

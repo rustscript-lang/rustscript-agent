@@ -1,0 +1,4 @@
+use self::schema as schema;
+use self::schema::{max_rows_limit};
+schema::schema_migration_count();
+max_rows_limit(1);

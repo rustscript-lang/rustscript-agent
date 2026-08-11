@@ -1,0 +1,86 @@
+use json;
+use sqlite;
+use self::schema as schema;
+
+fn sessions_query_limits(max_rows: int, max_bytes: int) -> map<int> {
+    { max_rows: max_rows, max_result_bytes: max_bytes }
+}
+
+
+struct SessionCreateInput {
+    id: string,
+    profile: string,
+    platform: string,
+    account_id: string,
+    chat_id: string,
+    thread_id: string,
+    user_id: string,
+    generation: int,
+    system_prompt: string,
+    model: string,
+    provider: string,
+    toolset_hash: string,
+    metadata_json: string,
+    now_ms: int
+}
+
+struct SessionTouchInput {
+    session_id: string,
+    status: string,
+    generation: int,
+    system_prompt: string,
+    model: string,
+    provider: string,
+    toolset_hash: string,
+    metadata_json: string,
+    now_ms: int
+}
+
+pub fn storage_session_create(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+    let input: SessionCreateInput = json::decode::<SessionCreateInput>(payload_json);
+    let statements = [
+        {
+            sql: "INSERT OR IGNORE INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, system_prompt, model, provider, toolset_hash, metadata_json, created_at_ms, updated_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE profile = ? AND platform = ? AND account_id = ? AND chat_id = ? AND thread_id = ? AND id <> ?)",
+            params: [&input.id, &input.profile, &input.platform, &input.account_id, &input.chat_id, &input.thread_id, &input.user_id, input.generation.copy(), &input.system_prompt, &input.model, &input.provider, &input.toolset_hash, &input.metadata_json, input.now_ms.copy(), input.now_ms.copy(), &input.profile, &input.platform, &input.account_id, &input.chat_id, &input.thread_id, &input.id]
+        },
+        {
+            sql: "UPDATE sessions SET updated_at_ms = ? WHERE id = ? AND profile = ? AND platform = ? AND account_id = ? AND chat_id = ? AND thread_id = ?",
+            params: [input.now_ms.copy(), &input.id, &input.profile, &input.platform, &input.account_id, &input.chat_id, &input.thread_id]
+        }
+    ];
+    sqlite::transaction(db_id, statements);
+    sqlite::query(
+        db_id,
+        "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms FROM sessions WHERE id = ? AND profile = ? AND platform = ? AND account_id = ? AND chat_id = ? AND thread_id = ? LIMIT ?",
+        [&input.id, &input.profile, &input.platform, &input.account_id, &input.chat_id, &input.thread_id, (max_rows)],
+        sessions_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_session_get(db_id: int, session_id: string, max_rows: int, max_bytes: int) -> map {
+    sqlite::query(
+        db_id,
+        "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms FROM sessions WHERE id = ? LIMIT ?",
+        [session_id, (max_rows)],
+        sessions_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_session_list(db_id: int, profile: string, platform: string, max_rows: int, max_bytes: int) -> map {
+    sqlite::query(
+        db_id,
+        "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms FROM sessions WHERE profile = ? AND platform = ? ORDER BY updated_at_ms DESC, id ASC LIMIT ?",
+        [profile, platform, (max_rows)],
+        sessions_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_session_touch(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+    let input: SessionTouchInput = json::decode::<SessionTouchInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "UPDATE sessions SET status = ?, system_prompt = ?, model = ?, provider = ?, toolset_hash = ?, metadata_json = ?, updated_at_ms = ? WHERE id = ? AND generation = ?",
+        [&input.status, &input.system_prompt, &input.model, &input.provider, &input.toolset_hash, &input.metadata_json, input.now_ms.copy(), &input.session_id, input.generation.copy()]
+    );
+    storage_session_get(db_id, input.session_id, max_rows, max_bytes)
+}

@@ -1,0 +1,329 @@
+use json;
+use sqlite;
+use self::schema as schema;
+use self::sessions as sessions;
+use self::messages as messages;
+use self::runs as runs;
+use self::events as events;
+use self::approvals as approvals;
+use self::compactions as compactions;
+
+struct StorageCommand {
+    op: string,
+    request_id: string,
+    db_path: string,
+    db_mode: string,
+    busy_timeout_ms: int,
+    max_rows: int,
+    max_bytes: int,
+    max_events: int,
+    max_messages: int,
+    now_ms: int,
+    payload_json: string
+}
+
+
+struct StorageResult {
+    request_id: string,
+    op: string,
+    ok: bool,
+    code: string,
+    message: string,
+    data: map,
+    rows_affected: int,
+    truncated: bool,
+    next_cursor: int
+}
+
+struct StorageOpenOptions {
+    path: string,
+    mode: string,
+    limits: map<int>
+}
+
+
+struct SessionIdInput {
+    session_id: string
+}
+
+
+struct MessageIdInput {
+    message_id: string
+}
+
+
+struct MessageListInput {
+    session_id: string,
+    after_ordinal: int
+}
+
+
+struct RunIdInput {
+    run_id: string
+}
+
+
+struct SessionListInput {
+    profile: string,
+    platform: string
+}
+
+
+struct RunListInput {
+    session_id: string,
+    status: string
+}
+
+
+struct DeliveryGetInput {
+    session_id: string,
+    consumer: string
+}
+
+
+struct ApprovalIdInput {
+    approval_id: string
+}
+
+
+struct CompactionIdInput {
+    compaction_id: string
+}
+
+
+
+
+fn storage_open_options(db_path: string, db_mode: string, busy_timeout_ms: int, max_rows: int, max_bytes: int) -> StorageOpenOptions {
+    {
+        path: db_path,
+        mode: db_mode,
+        limits: {
+            busy_timeout_ms: busy_timeout_ms,
+            max_connections: 1,
+            max_rows: max_rows,
+            max_result_bytes: max_bytes,
+            max_statements: 64,
+            max_transaction_ms: 5000
+        }
+    }
+}
+
+fn storage_apply_migrations(db_id: int, now_ms: int) {
+    sqlite::execute(db_id, schema::schema_migrations_table_sql(), []);
+    let mut migration_index = 0;
+    while migration_index < schema::schema_migration_count() {
+        let mut statements = [];
+        let mut statement_index = 0;
+        while statement_index < schema::schema_migration_statement_count(migration_index) {
+            statements[statements.length] = {
+                sql: schema::schema_migration_statement(migration_index, statement_index),
+                params: []
+            };
+            statement_index += 1;
+        }
+        statements[statements.length] = {
+            sql: schema::schema_migration_record_sql(),
+            params: [
+                schema::schema_migration_version(migration_index),
+                schema::schema_migration_name(migration_index),
+                schema::schema_migration_checksum(migration_index),
+                now_ms
+            ]
+        };
+        sqlite::transaction(db_id, statements);
+        migration_index += 1;
+    }
+    true
+}
+
+fn storage_ok(request_id: string, op: string, data: map, rows_affected: int, truncated: bool, next_cursor: int) -> StorageResult {
+    {
+        request_id: request_id,
+        op: op,
+        ok: true,
+        code: "ok",
+        message: "",
+        data: data,
+        rows_affected: rows_affected,
+        truncated: truncated,
+        next_cursor: next_cursor
+    }
+}
+
+fn storage_raw_ok(request_id: string, op: string, raw_result: map) -> StorageResult {
+    let rows_affected: int = sqlite::rows_affected(raw_result);
+    let truncated: bool = sqlite::truncated(raw_result);
+    let next_cursor: int = sqlite::next_cursor(raw_result);
+    storage_ok(request_id, op, raw_result, rows_affected, truncated, next_cursor)
+}
+
+fn storage_host_contract() -> string {
+    "sqlite::open sqlite::execute sqlite::query sqlite::transaction sqlite::close"
+}
+
+fn storage_error(request_id: string, op: string, code: string, message: string) -> StorageResult {
+    {
+        request_id: request_id,
+        op: op,
+        ok: false,
+        code: code,
+        message: message,
+        data: {},
+        rows_affected: 0,
+        truncated: false,
+        next_cursor: 0
+    }
+}
+
+fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
+    let request_id = command.request_id.copy();
+    let op = command.op.copy();
+    let mut result = storage_error(request_id.copy(), op.copy(), "unknown_operation", "storage operation is not registered");
+if command.op == "migrate" => {
+        result = storage_ok(request_id, op, {schema_version: 2, host_contract: storage_host_contract()}, 0, false, 0);
+        result
+    } else => { null };
+if command.op == "session.create" => {
+        result = storage_raw_ok(request_id, op, sessions::storage_session_create(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "session.get" => {
+        let input: SessionIdInput = json::decode::<SessionIdInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, sessions::storage_session_get(db_id, input.session_id, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "session.list" => {
+        let input: SessionListInput = json::decode::<SessionListInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, sessions::storage_session_list(db_id, input.profile, input.platform, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "session.touch" => {
+        result = storage_raw_ok(request_id, op, sessions::storage_session_touch(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "message.append" => {
+        result = storage_raw_ok(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "message.get" => {
+        let input: MessageIdInput = json::decode::<MessageIdInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, messages::storage_message_get(db_id, input.message_id, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "message.list" => {
+        let input: MessageListInput = json::decode::<MessageListInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, messages::storage_message_list(db_id, input.session_id, input.after_ordinal.copy(), command.max_messages, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "message.compact" => {
+        result = storage_raw_ok(request_id, op, messages::storage_message_mark_compacted(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "run.create" => {
+        result = storage_raw_ok(request_id, op, runs::storage_run_create(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "run.get" => {
+        let input: RunIdInput = json::decode::<RunIdInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, runs::storage_run_get(db_id, input.run_id, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "run.list" => {
+        let input: RunListInput = json::decode::<RunListInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, runs::storage_run_list(db_id, input.session_id, input.status, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "run.transition" => {
+        result = storage_ok(request_id, op, runs::storage_run_transition(db_id, command.payload_json), 0, false, 0);
+        result
+    } else => { null };
+if command.op == "run.link_child" => {
+        result = storage_raw_ok(request_id, op, runs::storage_run_link_child(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "run.usage" => {
+        result = storage_raw_ok(request_id, op, runs::storage_run_record_usage(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "idempotency.begin" => {
+        result = storage_raw_ok(request_id, op, runs::storage_run_idempotency_begin(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "idempotency.complete" => {
+        result = storage_raw_ok(request_id, op, runs::storage_run_idempotency_complete(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "recovery.recover_active" => {
+        result = storage_ok(request_id, op, runs::storage_run_recover_active(db_id, command.payload_json), 0, true, 0);
+        result
+    } else => { null };
+if command.op == "event.append" => {
+        result = storage_ok(request_id, op, events::storage_event_append(db_id, command.payload_json), 0, false, 0);
+        result
+    } else => { null };
+if command.op == "event.replay" => {
+        result = storage_raw_ok(request_id, op, events::storage_event_replay(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "event.prune" => {
+        result = storage_raw_ok(request_id, op, events::storage_event_prune(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "delivery.get" => {
+        let input: DeliveryGetInput = json::decode::<DeliveryGetInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, events::storage_delivery_cursor_get(db_id, input.session_id, input.consumer, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "delivery.advance" => {
+        result = storage_raw_ok(request_id, op, events::storage_delivery_cursor_advance(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "approval.request" => {
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_request(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "approval.get" => {
+        let input: ApprovalIdInput = json::decode::<ApprovalIdInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_get(db_id, input.approval_id, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "approval.resolve" => {
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_resolve(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "approval.expire" => {
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_expire(db_id, command.payload_json));
+        result
+    } else => { null };
+if command.op == "compaction.start" => {
+        result = storage_raw_ok(request_id, op, compactions::storage_compaction_start(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "compaction.get" => {
+        let input: CompactionIdInput = json::decode::<CompactionIdInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, compactions::storage_compaction_get(db_id, input.compaction_id, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "compaction.latest" => {
+        let input: SessionIdInput = json::decode::<SessionIdInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, compactions::storage_compaction_latest(db_id, input.session_id, command.max_rows, command.max_bytes));
+        result
+    } else => { null };
+if command.op == "compaction.commit" => {
+        result = storage_ok(request_id, op, compactions::storage_compaction_commit(db_id, command.payload_json), 0, false, 0);
+        result
+    } else => { null };
+if command.op == "compaction.fail" => {
+        result = storage_raw_ok(request_id, op, compactions::storage_compaction_fail(db_id, command.payload_json));
+        result
+    } else => { null };
+    result
+}
+
+pub fn run(command: StorageCommand) -> StorageResult {
+let db_id: int = sqlite::open(storage_open_options(command.db_path.copy(), command.db_mode.copy(), command.busy_timeout_ms.copy(), command.max_rows.copy(), command.max_bytes.copy()));
+let _migration_result = if command.db_mode.copy() == "read_only" => { true } else => { storage_apply_migrations(db_id, command.now_ms.copy()) };
+let result = storage_dispatch(db_id, command);
+sqlite::close(db_id);
+result
+}

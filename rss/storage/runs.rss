@@ -1,0 +1,245 @@
+use json;
+use sqlite;
+use self::schema as schema;
+
+fn runs_query_limits(max_rows: int, max_bytes: int) -> map<int> {
+    { max_rows: max_rows, max_result_bytes: max_bytes }
+}
+
+
+struct RunCreateInput {
+    id: string,
+    session_id: string,
+    parent_run_id: string,
+    input_json: string,
+    provider: string,
+    model: string,
+    script_hash: string,
+    idempotency_scope: string,
+    idempotency_key: string,
+    now_ms: int
+}
+
+struct RunTransitionInput {
+    run_id: string,
+    from_status: string,
+    to_status: string,
+    error_code: string,
+    error_message: string,
+    recovery_reason: string,
+    now_ms: int
+}
+
+struct ChildLinkInput {
+    parent_run_id: string,
+    child_run_id: string,
+    ordinal: int,
+    relation: string,
+    state: string,
+    now_ms: int
+}
+
+struct UsageInput {
+    id: string,
+    run_id: string,
+    provider: string,
+    model: string,
+    request_count: int,
+    input_tokens: int,
+    output_tokens: int,
+    reasoning_tokens: int,
+    cached_tokens: int,
+    now_ms: int
+}
+
+struct IdempotencyBeginInput {
+    scope: string,
+    key: string,
+    request_hash: string,
+    resource_type: string,
+    resource_id: string,
+    claim_token: string,
+    now_ms: int,
+    expires_at_ms: int
+}
+
+struct IdempotencyCompleteInput {
+    scope: string,
+    key: string,
+    request_hash: string,
+    claim_token: string,
+    state: string,
+    response_json: string,
+    now_ms: int
+}
+
+struct RecoveryInput {
+    reason: string,
+    details_json: string,
+    now_ms: int,
+    max_rows: int,
+    max_bytes: int,
+    max_events: int
+}
+
+struct RecoveryBatchResult {
+    recovered: int,
+    truncated: bool
+}
+
+pub fn storage_run_create(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+    let input: RunCreateInput = json::decode::<RunCreateInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "INSERT OR IGNORE INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, updated_at_ms) SELECT ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)",
+        [&input.id, &input.session_id, &input.parent_run_id, &input.input_json, &input.provider, &input.model, &input.script_hash, &input.idempotency_scope, &input.idempotency_key, input.now_ms.copy(), input.now_ms.copy(), &input.id, &input.session_id]
+    );
+    sqlite::query(
+        db_id,
+        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? AND session_id = ? LIMIT ?",
+        [&input.id, &input.session_id, (max_rows)],
+        runs_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_run_get(db_id: int, run_id: string, max_rows: int, max_bytes: int) -> map {
+    sqlite::query(
+        db_id,
+        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT ?",
+        [run_id, (max_rows)],
+        runs_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_run_list(db_id: int, session_id: string, status: string, max_rows: int, max_bytes: int) -> map {
+    sqlite::query(
+        db_id,
+        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE session_id = ? AND (? = '' OR status = ?) ORDER BY created_at_ms DESC, id DESC LIMIT ?",
+        [session_id, status, status, (max_rows)],
+        runs_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_run_status_allowed(status: string) -> bool {
+    status == "queued" || status == "running" || status == "waiting_approval" || status == "compacting" || status == "completed" || status == "failed" || status == "cancelled"
+}
+
+pub fn storage_run_transition(db_id: int, payload_json: string) -> map {
+    let input: RunTransitionInput = json::decode::<RunTransitionInput>(payload_json);
+    assert(storage_run_status_allowed(input.to_status.copy()));
+    sqlite::transaction(db_id, [
+        {
+            sql: "UPDATE runs SET status = ?, error_code = ?, error_message = ?, recovery_reason = ?, started_at_ms = CASE WHEN ? = 'running' AND started_at_ms = 0 THEN ? ELSE started_at_ms END, finished_at_ms = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE finished_at_ms END, updated_at_ms = ? WHERE id = ? AND status = ? AND ((status = 'queued' AND ? IN ('running', 'cancelled', 'failed')) OR (status = 'running' AND ? IN ('waiting_approval', 'compacting', 'completed', 'failed', 'cancelled')) OR (status = 'waiting_approval' AND ? IN ('running', 'compacting', 'completed', 'failed', 'cancelled')) OR (status = 'compacting' AND ? IN ('running', 'completed', 'failed', 'cancelled')))",
+            params: [&input.to_status, &input.error_code, &input.error_message, &input.recovery_reason, &input.to_status, input.now_ms.copy(), &input.to_status, input.now_ms.copy(), input.now_ms.copy(), &input.run_id, &input.from_status, &input.to_status, &input.to_status, &input.to_status, &input.to_status]
+        },
+        {
+            sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT id, COALESCE((SELECT MAX(seq) FROM run_events e JOIN runs r ON r.id = e.run_id WHERE r.session_id = runs.session_id), 0) + 1, 'run-transition:' || id || ':' || ? || ':' || ? || ':' || ? || ':' || (COALESCE((SELECT MAX(seq) FROM run_events e JOIN runs r ON r.id = e.run_id WHERE r.session_id = runs.session_id), 0) + 1), 'run.status_changed', '{}', ? FROM runs WHERE id = ? AND status = ? AND updated_at_ms = ? AND changes() = 1",
+            params: [input.now_ms.copy(), &input.from_status, &input.to_status, input.now_ms.copy(), &input.run_id, &input.to_status, input.now_ms.copy()]
+        }
+    ])
+}
+
+pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
+    let input: ChildLinkInput = json::decode::<ChildLinkInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "INSERT OR IGNORE INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+        [&input.parent_run_id, &input.child_run_id, input.ordinal.copy(), &input.relation, &input.state, input.now_ms.copy()]
+    )
+}
+
+pub fn storage_run_record_usage(db_id: int, payload_json: string) -> map {
+    let input: UsageInput = json::decode::<UsageInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "INSERT INTO provider_usage (id, run_id, provider, model, request_count, input_tokens, output_tokens, reasoning_tokens, cached_tokens, created_at_ms, usage_ids) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '|' || ? || '|' WHERE ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND instr(?, '|') = 0 ON CONFLICT (run_id, provider, model) DO UPDATE SET request_count = provider_usage.request_count + excluded.request_count, input_tokens = provider_usage.input_tokens + excluded.input_tokens, output_tokens = provider_usage.output_tokens + excluded.output_tokens, reasoning_tokens = provider_usage.reasoning_tokens + excluded.reasoning_tokens, cached_tokens = provider_usage.cached_tokens + excluded.cached_tokens, usage_ids = provider_usage.usage_ids || excluded.id || '|' WHERE instr(provider_usage.usage_ids, '|' || excluded.id || '|') = 0",
+        [&input.id, &input.run_id, &input.provider, &input.model, input.request_count.copy(), input.input_tokens.copy(), input.output_tokens.copy(), input.reasoning_tokens.copy(), input.cached_tokens.copy(), input.now_ms.copy(), &input.id, input.request_count.copy(), input.input_tokens.copy(), input.output_tokens.copy(), input.reasoning_tokens.copy(), input.cached_tokens.copy(), &input.id]
+    );
+    sqlite::execute(
+        db_id,
+        "UPDATE runs SET input_tokens = COALESCE((SELECT SUM(input_tokens) FROM provider_usage WHERE run_id = ?), 0), output_tokens = COALESCE((SELECT SUM(output_tokens) FROM provider_usage WHERE run_id = ?), 0), updated_at_ms = ? WHERE id = ?",
+        [&input.run_id, &input.run_id, input.now_ms.copy(), &input.run_id]
+    );
+    sqlite::query(
+        db_id,
+        "SELECT id, input_tokens, output_tokens FROM runs WHERE id = ? LIMIT 1",
+        [&input.run_id],
+        { max_rows: 1, max_result_bytes: 4096 }
+    )
+}
+
+pub fn storage_run_idempotency_begin(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+    let input: IdempotencyBeginInput = json::decode::<IdempotencyBeginInput>(payload_json);
+    sqlite::transaction(db_id, [
+        {
+            sql: "DELETE FROM idempotency_records WHERE scope = ? AND key = ? AND ((state = 'claimed' AND expires_at_ms <= ?) OR state = 'expired')",
+            params: [&input.scope, &input.key, input.now_ms.copy()]
+        },
+        {
+            sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, created_at_ms, expires_at_ms) SELECT ?, ?, ?, ?, ?, 'claimed', ?, ? WHERE ? <> ''",
+            params: [&input.scope, &input.key, &input.request_hash, &input.resource_type, &input.resource_id, input.now_ms.copy(), input.expires_at_ms.copy(), &input.claim_token]
+        },
+        {
+            sql: "INSERT INTO idempotency_claim_history (claim_token, scope, key, claimed_at_ms) SELECT ?, ?, ?, ? WHERE changes() = 1 AND ? <> ''",
+            params: [&input.claim_token, &input.scope, &input.key, input.now_ms.copy(), &input.claim_token]
+        },
+        {
+            sql: "INSERT OR REPLACE INTO idempotency_claims (scope, key, request_hash, claim_token, claimed_at_ms) SELECT ?, ?, ?, ?, ? WHERE changes() = 1",
+            params: [&input.scope, &input.key, &input.request_hash, &input.claim_token, input.now_ms.copy()]
+        }
+    ]);
+    sqlite::query(
+        db_id,
+        "SELECT scope, key, request_hash, resource_type, resource_id, CASE WHEN request_hash = ? THEN state ELSE 'failed' END AS state, CASE WHEN request_hash = ? THEN response_json ELSE '{\"error_code\":\"idempotency_key_conflict\"}' END AS response_json, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN 1 ELSE 0 END AS acquired, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN ? ELSE '' END AS claim_token, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT ?",
+        [&input.request_hash, &input.request_hash, &input.scope, &input.key, &input.claim_token, &input.scope, &input.key, &input.claim_token, &input.claim_token, &input.scope, &input.key, (max_rows)],
+        runs_query_limits(max_rows, max_bytes)
+    )
+}
+
+pub fn storage_run_idempotency_complete(db_id: int, payload_json: string) -> map {
+    let input: IdempotencyCompleteInput = json::decode::<IdempotencyCompleteInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "UPDATE idempotency_records SET state = ?, response_json = ?, completed_at_ms = ? WHERE scope = ? AND key = ? AND request_hash = ? AND state = 'claimed' AND ? IN ('completed', 'failed') AND expires_at_ms > ? AND ? <> '' AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND request_hash = ? AND claim_token = ?)",
+        [&input.state, &input.response_json, input.now_ms.copy(), &input.scope, &input.key, &input.request_hash, &input.state, input.now_ms.copy(), &input.claim_token, &input.scope, &input.key, &input.request_hash, &input.claim_token]
+    )
+}
+
+pub fn storage_run_recover_active(db_id: int, payload_json: string) -> map {
+    let input: RecoveryInput = json::decode::<RecoveryInput>(payload_json);
+    let statements = [
+        {
+            sql: "INSERT OR IGNORE INTO recovery_records (id, run_id, from_status, to_status, reason, details_json, recovered_at_ms) SELECT 'recovery:' || id || ':' || ?, id, status, 'failed', ?, ?, ? FROM runs WHERE id IN (SELECT id FROM runs WHERE status IN ('queued', 'running', 'waiting_approval', 'compacting') ORDER BY updated_at_ms ASC, id ASC LIMIT CASE WHEN ? <= 0 THEN 64 WHEN ? > 512 THEN 512 ELSE ? END)",
+            params: [input.now_ms.copy(), &input.reason, &input.details_json, input.now_ms.copy(), input.max_rows.copy(), input.max_rows.copy(), input.max_rows.copy()]
+        },
+        {
+            sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT id, COALESCE((SELECT MAX(e.seq) FROM run_events e JOIN runs owners ON owners.id = e.run_id WHERE owners.session_id = runs.session_id), 0) + ROW_NUMBER() OVER (PARTITION BY runs.session_id ORDER BY runs.updated_at_ms ASC, runs.id ASC), 'recovery-event:' || id || ':' || ?, 'run.failed', '{\"status\":\"failed\",\"error_code\":\"gateway_restart\",\"recovery_reason\":\"gateway_restart\"}', ? FROM runs WHERE id IN (SELECT id FROM runs WHERE status IN ('queued', 'running', 'waiting_approval', 'compacting') ORDER BY updated_at_ms ASC, id ASC LIMIT CASE WHEN ? <= 0 THEN 64 WHEN ? > 512 THEN 512 ELSE ? END)",
+            params: [input.now_ms.copy(), input.now_ms.copy(), input.max_rows.copy(), input.max_rows.copy(), input.max_rows.copy()]
+        },
+        {
+            sql: "UPDATE runs SET status = 'failed', error_code = 'gateway_restart', error_message = 'run interrupted during gateway restart', recovery_reason = ?, finished_at_ms = ?, updated_at_ms = ? WHERE id IN (SELECT id FROM runs WHERE status IN ('queued', 'running', 'waiting_approval', 'compacting') ORDER BY updated_at_ms ASC, id ASC LIMIT CASE WHEN ? <= 0 THEN 64 WHEN ? > 512 THEN 512 ELSE ? END)",
+            params: [&input.reason, input.now_ms.copy(), input.now_ms.copy(), input.max_rows.copy(), input.max_rows.copy(), input.max_rows.copy()]
+        },
+        {
+            sql: "UPDATE approvals SET state = 'expired', resolved_at_ms = ? WHERE state = 'pending' AND run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",
+            params: [input.now_ms.copy(), input.now_ms.copy(), &input.reason]
+        },
+        {
+            sql: "UPDATE compactions SET state = 'failed', error_message = 'run interrupted during gateway restart', completed_at_ms = ? WHERE state = 'pending' AND run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",
+            params: [input.now_ms.copy(), input.now_ms.copy(), &input.reason]
+        },
+        {
+            sql: "UPDATE idempotency_records SET state = 'expired', completed_at_ms = ? WHERE state = 'claimed' AND resource_type = 'run' AND resource_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",
+            params: [input.now_ms.copy(), input.now_ms.copy(), &input.reason]
+        },
+        {
+            sql: "DELETE FROM idempotency_claims WHERE EXISTS (SELECT 1 FROM idempotency_records WHERE idempotency_records.scope = idempotency_claims.scope AND idempotency_records.key = idempotency_claims.key AND idempotency_records.state = 'expired')",
+            params: []
+        },
+        {
+            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq ASC) AS rn, COUNT(*) OVER (PARTITION BY run_id) AS total FROM run_events WHERE run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)) WHERE rn <= total - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END)",
+            params: [input.now_ms.copy(), &input.reason, input.max_events.copy(), input.max_events.copy(), input.max_events.copy()]
+        }
+    ];
+    sqlite::transaction(db_id, statements)
+}
