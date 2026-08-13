@@ -1,0 +1,11 @@
+{
+  "id": "chatcmpl-9xRustAgent0003",
+  "object": "chat.completion",
+  "created": 1755000002,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0
+    }
+  ]
+}

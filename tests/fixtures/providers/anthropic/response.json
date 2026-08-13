@@ -1,0 +1,17 @@
+{
+  "id": "msg_01RustAgent",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-4-5",
+  "content": [
+    {"type": "thinking", "thinking": "The user wants a mapping; consider a tool_use block."},
+    {"type": "text", "text": "The Anthropic adapter maps tool_use blocks to canonical tool calls."},
+    {"type": "tool_use", "id": "toolu_01", "name": "read_file", "input": {"path": "rss/llm/anthropic_messages.rss"}}
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 21,
+    "output_tokens": 14
+  }
+}

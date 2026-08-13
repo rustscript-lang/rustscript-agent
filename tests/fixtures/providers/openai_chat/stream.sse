@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-9xRustAgent0004","object":"chat.completion.chunk","created":1755000003,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"The "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9xRustAgent0004","object":"chat.completion.chunk","created":1755000003,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"RustScript"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9xRustAgent0004","object":"chat.completion.chunk","created":1755000003,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":" agent owns policy."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9xRustAgent0004","object":"chat.completion.chunk","created":1755000003,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-9xRustAgent0004","object":"chat.completion.chunk","created":1755000003,"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":15,"total_tokens":27}}
+
+data: [DONE]

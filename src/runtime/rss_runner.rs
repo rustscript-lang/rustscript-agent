@@ -510,7 +510,14 @@ impl AgentRunner {
                         .cancel(CancellationReason::Deadline)
                         .map_err(RunError::Setup)?;
                 }
-                match invocation.poll_next().map_err(RunError::Setup)? {
+                // The callable stream pump polls its transport driver inside
+                // the VM, so the polling thread must hold a Tokio runtime
+                // context for the duration of each poll.
+                let runtime = agent_runtime_handle();
+                let guard = runtime.enter();
+                let poll = invocation.poll_next().map_err(RunError::Setup);
+                drop(guard);
+                match poll? {
                     InvocationPoll::Pending => {
                         // The VM is paused on an outstanding host operation.
                         // Polling drives the operation; the cancellation
@@ -544,15 +551,18 @@ impl AgentRunner {
     }
 }
 
-/// Binds the restricted capability registry: JSON, the invocation stream emit
-/// builtin, generic SQLite, and the HTTP client. Ambient runtime input/emit
-/// builtins are intentionally absent from agent execution.
+/// Binds the restricted capability registry: JSON, bytes conversion, the
+/// invocation stream emit builtin, generic SQLite, and the HTTP client
+/// (buffered request plus the callable SSE stream). Ambient runtime
+/// input/emit builtins are intentionally absent from agent execution.
 pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), VmError> {
     let mut registry = HostFunctionRegistry::restricted();
     for name in [
         "json::encode",
         "json::decode",
         "stream::emit",
+        "bytes::from_utf8",
+        "bytes::to_utf8",
         "sqlite::open",
         "sqlite::execute",
         "sqlite::query",
@@ -562,6 +572,7 @@ pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), V
         "sqlite::truncated",
         "sqlite::next_cursor",
         "http::client::request",
+        "http::client::sse",
     ] {
         registry.allow_builtin(name)?;
     }

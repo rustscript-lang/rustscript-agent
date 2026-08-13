@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "This model does not support the `reasoning` parameter.",
+    "type": "invalid_request_error",
+    "param": "reasoning",
+    "code": "unsupported_parameter"
+  }
+}

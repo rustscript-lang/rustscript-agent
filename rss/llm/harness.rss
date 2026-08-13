@@ -1,0 +1,39 @@
+// Generic adapter dispatch entry used by the provider integration tests.
+// This is test/load bridging only: it selects a provider protocol adapter or
+// profile by name and forwards the canonical request. It contains no
+// protocol parsing and no agent-loop policy.
+use json;
+use self::types as types;
+use self::openai_chat as openai_chat;
+use self::openai_responses as openai_responses;
+use self::anthropic_messages as anthropic_messages;
+use super::providers::openrouter as openrouter;
+use super::providers::deepseek as deepseek;
+use super::providers::opencode_zen as opencode_zen;
+use super::providers::opencode_go as opencode_go;
+use super::providers::custom as custom;
+
+pub fn run(context: map) -> map {
+    let kind: string = context["kind"];
+    let request: map = context["request"];
+    let profile: map = context["profile"];
+    if kind == "openai_chat" => {
+        openai_chat::openai_chat_call(request, profile)
+    } else if kind == "openai_responses" => {
+        openai_responses::openai_responses_call(request, profile)
+    } else if kind == "anthropic_messages" => {
+        anthropic_messages::anthropic_messages_call(request, profile)
+    } else if kind == "profile:openrouter" => {
+        openrouter::call(request)
+    } else if kind == "profile:deepseek" => {
+        deepseek::call(request)
+    } else if kind == "profile:opencode_zen" => {
+        opencode_zen::call(request)
+    } else if kind == "profile:opencode_go" => {
+        opencode_go::call(request)
+    } else if kind == "profile:custom" => {
+        custom::call(request)
+    } else => {
+        types::fail(types::error_request("unknown_adapter", kind))
+    }
+}

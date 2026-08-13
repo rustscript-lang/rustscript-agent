@@ -1,0 +1,39 @@
+{
+  "id": "chatcmpl-9xRustAgent0002",
+  "object": "chat.completion",
+  "created": 1755000001,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_ab12",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"README.md\", \"lines\": 40}"
+            }
+          },
+          {
+            "id": "call_cd34",
+            "type": "function",
+            "function": {
+              "name": "search_files",
+              "arguments": "{\"pattern\": \"provider\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 10,
+    "total_tokens": 30
+  }
+}

@@ -1,0 +1,259 @@
+// Canonical LLM contract shared by every provider adapter (gateway-api plan
+// section 4.4): `LlmRequest`, `LlmResponse`, `Usage`, `ToolCall`,
+// `ProviderError`, and the discriminated `{ok, response, error}` call result.
+//
+// The canonical request is a dynamic map matching
+// `tests/fixtures/contracts/llm_request.json`:
+//
+//   model: string
+//   messages: [{role, content: [{type: "text", text} |
+//                                {type: "tool_result", tool_call_id, content, is_error} |
+//                                {type: "tool_call", tool_call_id, name, arguments_json}]}]
+//   tools: [{name, description, schema_json}]
+//   tool_choice: string | null
+//   reasoning: string | null
+//   sampling: {temperature: float|null, top_p: float|null}
+//   max_output_tokens: int
+//   stream: bool
+//   provider_options: {base_url, api_key, model, ...}
+//
+// Tool arguments and schemas travel as JSON strings (`arguments_json`,
+// `schema_json`) because RustScript's `json::encode` only accepts
+// struct-shaped values; the adapters splice them into the encoded wire body.
+// The canonical response carries parsed maps:
+//
+//   response: {text, tool_calls: [{id, name, arguments: map}],
+//              usage: {input_tokens, output_tokens, total_tokens},
+//              reasoning, stop_reason}
+//   error: {status, type, code, message, param, request_id}
+use json;
+
+// ---------------------------------------------------------------------------
+// Canonical response construction
+// ---------------------------------------------------------------------------
+
+pub fn usage_new(input_tokens: int, output_tokens: int, total_tokens: int) -> map {
+    {
+        input_tokens: input_tokens,
+        output_tokens: output_tokens,
+        total_tokens: total_tokens
+    }
+}
+
+pub fn tool_call_new(id: string, name: string, arguments: map) -> map {
+    { id: id, name: name, arguments: arguments }
+}
+
+pub fn response_new(
+    text: string,
+    tool_calls: array,
+    usage: map,
+    reasoning: string,
+    stop_reason: string
+) -> map {
+    {
+        text: text,
+        tool_calls: tool_calls,
+        usage: usage,
+        reasoning: reasoning,
+        stop_reason: stop_reason
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical errors
+// ---------------------------------------------------------------------------
+
+pub fn error_new(
+    status: int,
+    error_type: string,
+    code: string,
+    message: string,
+    param: string,
+    request_id: string
+) -> map {
+    {
+        status: status,
+        type: error_type,
+        code: code,
+        message: message,
+        param: param,
+        request_id: request_id
+    }
+}
+
+/// A structurally valid provider payload that does not match the protocol.
+pub fn error_malformed(status: int, message: string) -> map {
+    error_new(status, "malformed_payload", "malformed_payload", message, "", "")
+}
+
+/// A typed request/configuration error raised before any transport call.
+pub fn error_request(code: string, message: string) -> map {
+    error_new(0, "invalid_request_error", code, message, "", "")
+}
+
+// ---------------------------------------------------------------------------
+// Call results
+// ---------------------------------------------------------------------------
+
+pub fn ok(response: map) -> map {
+    { ok: true, response: response, error: {} }
+}
+
+pub fn fail(error: map) -> map {
+    { ok: false, response: {}, error: error }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical request accessors (defensive dynamic navigation)
+// ---------------------------------------------------------------------------
+
+pub fn request_string(request: map, key: string) -> string {
+    let mut text: string = "";
+    if request.has(key) {
+        if type(request[key]) == "string" {
+            let coerced: string = request[key];
+            text = coerced;
+        }
+    }
+    text
+}
+
+pub fn request_int(request: map, key: string, fallback: int) -> int {
+    let mut number: int = fallback;
+    if request.has(key) {
+        if type(request[key]) == "int" {
+            let coerced: int = request[key];
+            number = coerced;
+        }
+    }
+    number
+}
+
+pub fn request_bool(request: map, key: string, fallback: bool) -> bool {
+    let mut flag: bool = fallback;
+    if request.has(key) {
+        if type(request[key]) == "bool" {
+            let coerced: bool = request[key];
+            flag = coerced;
+        }
+    }
+    flag
+}
+
+pub fn request_array(request: map, key: string) -> array {
+    let mut items: array = [];
+    if request.has(key) {
+        if type(request[key]) == "array" {
+            let coerced: array = request[key];
+            items = coerced;
+        }
+    }
+    items
+}
+
+pub fn request_map(request: map, key: string) -> map {
+    let mut items: map = {};
+    if request.has(key) {
+        if type(request[key]) == "map" {
+            let coerced: map = request[key];
+            items = coerced;
+        }
+    }
+    items
+}
+
+/// One entry from a dynamic array, or an empty map when the index is out of
+/// range or the entry is not a map. Array index reads move the element, so
+/// the entry is copied.
+pub fn array_entry(items: array, index: int) -> map {
+    let mut result: map = {};
+    if items.has(index) {
+        if type(items[index].copy()) == "map" {
+            let coerced: map = items[index].copy();
+            result = coerced;
+        }
+    }
+    result
+}
+
+/// One message from the canonical request: `{role, content: array}`.
+pub fn message_role(message: map) -> string {
+    request_string(message, "role")
+}
+
+pub fn message_content(message: map) -> array {
+    request_array(message, "content")
+}
+
+/// One content part from a canonical message.
+pub fn part_type(part: map) -> string {
+    request_string(part, "type")
+}
+
+/// Reads one canonical tool descriptor: `{name, description, schema_json}`.
+pub fn tool_name(tool: map) -> string {
+    request_string(tool, "name")
+}
+
+pub fn tool_description(tool: map) -> string {
+    request_string(tool, "description")
+}
+
+pub fn tool_schema_json(tool: map) -> string {
+    request_string(tool, "schema_json")
+}
+
+/// Coerces one float-typed sampling entry. (Statement-if blocks that declare
+/// locals must not be followed by sibling statement-ifs in this compiler
+/// revision; each coercion therefore lives in its own helper.)
+fn coerce_float_value(value: map, key: string) -> float {
+    let mut number: float = 0.0;
+    if type(value[key]) == "float" {
+        let coerced: float = value[key];
+        number = coerced;
+    }
+    number
+}
+
+fn coerce_int_value(value: map, key: string) -> float {
+    let mut number: float = 0.0;
+    if type(value[key]) == "int" {
+        let raw: int = value[key];
+        let promoted: float = raw / 1.0;
+        number = promoted;
+    }
+    number
+}
+
+/// Optional float sampling value; `present` distinguishes absent from 0.0.
+pub fn sampling_float(sampling: map, key: string) -> map {
+    let mut present = false;
+    let mut value: float = 0.0;
+    if sampling.has(key) {
+        let number: float = if type(sampling[key]) == "float" => {
+            coerce_float_value(sampling, key)
+        } else if type(sampling[key]) == "int" => {
+            coerce_int_value(sampling, key)
+        } else => { 0.0 };
+        if type(sampling[key]) == "float" {
+            value = number;
+            present = true;
+        }
+        if type(sampling[key]) == "int" {
+            value = number;
+            present = true;
+        }
+    }
+    { present: present, value: value }
+}
+
+/// Reads `provider_options` from the canonical request.
+pub fn provider_options(request: map) -> map {
+    request_map(request, "provider_options")
+}
+
+/// Resolved profile fields: `{provider, base_url, api_key, model}`.
+pub fn profile_string(profile: map, key: string) -> string {
+    request_string(profile, key)
+}

@@ -1,0 +1,6 @@
+// Anthropic Messages adapter (protocol mapping only; no agent loop).
+use self::types as types;
+
+pub fn anthropic_messages_call(request: map, profile: map) -> map {
+    types::fail(types::error_request("not_implemented", "anthropic_messages adapter is not implemented"))
+}

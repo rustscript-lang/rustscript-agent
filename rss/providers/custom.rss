@@ -1,0 +1,39 @@
+// Explicit custom endpoint profile. The caller supplies `base_url`,
+// `api_key`, `model`, and `adapter` through provider_options; the default
+// adapter is the OpenAI Chat Completions protocol.
+use self::profile as profile;
+use super::llm::types as types;
+use super::llm::openai_chat as openai_chat;
+use super::llm::openai_responses as openai_responses;
+use super::llm::anthropic_messages as anthropic_messages;
+
+pub fn call(request: map) -> map {
+    let options: map = types::provider_options(request);
+    let override_base: string = types::request_string(options, "base_url");
+    let override_key: string = types::request_string(options, "api_key");
+    let override_model: string = types::request_string(options, "model");
+    let mut adapter: string = types::request_string(options, "adapter");
+    if adapter == "" {
+        adapter = "openai_chat";
+    }
+    let merged: map = profile::profile_merge(
+        {
+            provider: "custom",
+            base_url: "",
+            api_key: "",
+            model: "",
+            adapter: adapter,
+            capabilities: { stream: true, tools: true, usage: true, reasoning: false }
+        },
+        override_base,
+        override_key,
+        override_model
+    );
+    if adapter == "openai_responses" => {
+        openai_responses::openai_responses_call(request, merged)
+    } else if adapter == "anthropic_messages" => {
+        anthropic_messages::anthropic_messages_call(request, merged)
+    } else => {
+        openai_chat::openai_chat_call(request, merged)
+    }
+}

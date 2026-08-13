@@ -1,0 +1,40 @@
+// Shared profile wiring: merges profile metadata with per-request
+// provider_options overrides and dispatches to the profile's adapter.
+//
+// Compiler-contract note: `profile_merge` reads only its `metadata` map
+// parameter; the request's provider_options are flattened to primitives by
+// the caller (see the core callable-schema limitation).
+use json;
+use super::llm::types as types;
+
+/// Merges profile metadata with provider_options overrides. Non-empty
+/// overrides win; the merged profile carries `{provider, base_url, api_key,
+/// model}` plus adapter capability metadata; the adapter appends its
+/// protocol path.
+pub fn profile_merge(
+    metadata: map,
+    override_base: string,
+    override_key: string,
+    override_model: string
+) -> map {
+    let mut base_url: string = types::profile_string(metadata, "base_url");
+    let mut api_key: string = types::profile_string(metadata, "api_key");
+    let mut model: string = types::profile_string(metadata, "model");
+    if override_base != "" {
+        base_url = override_base;
+    }
+    if override_key != "" {
+        api_key = override_key;
+    }
+    if override_model != "" {
+        model = override_model;
+    }
+    {
+        provider: types::profile_string(metadata, "provider"),
+        base_url: base_url,
+        api_key: api_key,
+        model: model,
+        adapter: types::profile_string(metadata, "adapter"),
+        capabilities: types::request_map(metadata, "capabilities")
+    }
+}

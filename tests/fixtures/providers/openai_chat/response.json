@@ -1,0 +1,22 @@
+{
+  "id": "chatcmpl-9xRustAgent0001",
+  "object": "chat.completion",
+  "created": 1755000000,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The RustScript agent framework keeps provider policy in RSS.",
+        "reasoning_content": "User asked about the framework; summarize the ownership boundary."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 15,
+    "total_tokens": 27
+  }
+}

@@ -1,0 +1,546 @@
+// OpenAI Chat Completions adapter (protocol mapping only; no agent loop).
+//
+// Maps the canonical LlmRequest (rss/llm/types.rss) onto the
+// /chat/completions wire protocol and back. Tool schemas arrive as
+// `schema_json` strings and are spliced into the encoded wire body because
+// RustScript's json::encode only accepts struct-shaped values.
+//
+// Compiler-contract notes for this adapter module (non-root module):
+// - Script-function calls inside statement-if bodies are rejected by the
+//   runtime callable-schema guard in this compiler revision, so call
+//   dispatch uses expression-if branches and top-level statements; calls
+//   inside `while` bodies (including nested statement-ifs) are safe.
+// - Annotated locals whose initializer type the checker cannot prove (for
+//   example `json::encode` results) must live at function top level or in
+//   helpers with declared return types, never in expression-if branches.
+// - `bytes::to_utf8` requires a concretely typed argument, so the body is
+//   read into an annotated `bytes` local first.
+use json;
+use bytes;
+use http;
+use self::types as types;
+
+struct WireTextPart {
+    type: string,
+    text: string
+}
+
+struct WireFunction {
+    name: string,
+    description: string,
+    parameters: string
+}
+
+struct WireTool {
+    type: string,
+    function: WireFunction
+}
+
+struct WireFunctionCall {
+    name: string,
+    arguments: string
+}
+
+struct WireToolCall {
+    id: string,
+    type: string,
+    function: WireFunctionCall
+}
+
+struct WireMessage {
+    role: string,
+    content: string?,
+    content_parts: array<WireTextPart>?,
+    tool_call_id: string?,
+    tool_calls: array<WireToolCall>?
+}
+
+struct WireStreamOptions {
+    include_usage: bool
+}
+
+struct WireRequest {
+    model: string,
+    messages: array<WireMessage>,
+    tools: array<WireTool>?,
+    tool_choice: string?,
+    temperature: float?,
+    top_p: float?,
+    max_tokens: int?,
+    stream: bool,
+    stream_options: WireStreamOptions?,
+    reasoning_effort: string?
+}
+
+fn tool_schema_marker() -> string {
+    "__RSS_TOOL_SCHEMA__"
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+pub fn openai_chat_call(request: map, profile: map) -> map {
+    let stream: bool = types::request_bool(request, "stream", false);
+    if stream => {
+        openai_chat_stream_dispatch(request, profile)
+    } else => {
+        openai_chat_complete_dispatch(request, profile)
+    }
+}
+
+/// Reads the profile fields (the only map read in this function) and hands
+/// them to the transport as primitives. The parameter order matters: this
+/// compiler revision corrupts the runtime callable schema when a function
+/// with two map parameters string-reads its FIRST map parameter and passes
+/// the other map onward, so `profile` (the read map) sits second.
+fn openai_chat_complete_dispatch(request: map, profile: map) -> map {
+    let base_url: string = types::profile_string(profile, "base_url");
+    let api_key: string = types::profile_string(profile, "api_key");
+    let provider: string = types::profile_string(profile, "provider");
+    openai_chat_complete(request, base_url, api_key, provider)
+}
+
+fn openai_chat_complete(request: map, base_url: string, api_key: string, provider: string) -> map {
+    let model: string = types::request_string(request, "model");
+    if model == "" => {
+        types::fail(types::error_request("missing_model", "request.model is required"))
+    } else => {
+        chat_send_complete(request, model, base_url, api_key, provider)
+    }
+}
+
+/// The whole completion path: wire building, tool-schema splicing, and the
+/// buffered transport call. Every script call here is at top level or in an
+/// expression-if branch (statement-if bodies must not contain calls in this
+/// module; see the file header).
+fn chat_send_complete(
+    request: map,
+    model: string,
+    base_url: string,
+    api_key: string,
+    provider: string
+) -> map {
+    let body_text: string = chat_encode_wire(request, model, false);
+    let url: string = base_url + "/chat/completions";
+    let body: string = chat_splice_tool_schemas(
+        body_text,
+        types::request_array(request, "tools")
+    );
+    let response: map = http::client::request({
+        method: "POST",
+        url: url,
+        headers: {
+            "content-type": "application/json",
+            "authorization": "Bearer " + api_key
+        },
+        body: body
+    });
+    let status: int = response["status"].copy();
+    if status >= 200 && status < 300 => {
+        chat_parse_response(response, status, provider)
+    } else => {
+        chat_parse_error(response, status)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire request building
+// ---------------------------------------------------------------------------
+
+/// Encodes the wire request struct as JSON. `json::encode`'s return type is
+/// unknown to the type checker, so the annotated local lives here with a
+/// declared `string` return.
+fn chat_encode_wire(request: map, model: string, stream: bool) -> string {
+    let body_text: string = json::encode(chat_build_wire(request, model, stream));
+    body_text
+}
+
+fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
+    let messages: array<WireMessage> = chat_build_messages(
+        types::request_array(request, "messages")
+    );
+    let tools: array<WireTool> = chat_build_tools(types::request_array(request, "tools"));
+    let mut wire_tools: array<WireTool>? = null;
+    if tools.length > 0 {
+        wire_tools = tools;
+    }
+    let tool_choice: string = types::request_string(request, "tool_choice");
+    let reasoning: string = types::request_string(request, "reasoning");
+    let sampling: map = types::request_map(request, "sampling");
+    let temperature_raw: map = types::sampling_float(sampling, "temperature");
+    let top_p_raw: map = types::sampling_float(sampling, "top_p");
+    let temperature_present: bool = temperature_raw["present"];
+    let temperature_value: float = temperature_raw["value"];
+    let top_p_present: bool = top_p_raw["present"];
+    let top_p_value: float = top_p_raw["value"];
+    let max_output: int = types::request_int(request, "max_output_tokens", 0);
+    let mut temperature: float? = null;
+    let mut top_p: float? = null;
+    let mut max_tokens: int? = null;
+    let mut stream_options: WireStreamOptions? = null;
+    let mut reasoning_effort: string? = null;
+    if temperature_present {
+        temperature = temperature_value;
+    }
+    if top_p_present {
+        top_p = top_p_value;
+    }
+    if max_output > 0 {
+        max_tokens = max_output;
+    }
+    if stream {
+        stream_options = { include_usage: true };
+    }
+    if reasoning != "" {
+        reasoning_effort = reasoning;
+    }
+    {
+        model: model,
+        messages: messages,
+        tools: wire_tools,
+        tool_choice: tool_choice,
+        temperature: temperature,
+        top_p: top_p,
+        max_tokens: max_tokens,
+        stream: stream,
+        stream_options: stream_options,
+        reasoning_effort: reasoning_effort
+    }
+}
+
+/// Converts canonical messages into wire messages. User `tool_result` parts
+/// become dedicated `tool` role messages; assistant `tool_call` parts become
+/// assistant `tool_calls`.
+fn chat_build_messages(messages: array) -> array<WireMessage> {
+    let mut wire: array<WireMessage> = [];
+    let mut i = 0;
+    while i < messages.length {
+        let message: map = types::array_entry(messages, i);
+        if message.has("role") {
+            wire = chat_append_message_by_role(wire, message);
+        }
+        i += 1;
+    }
+    wire
+}
+
+fn chat_append_message_by_role(wire: array<WireMessage>, message: map) -> array<WireMessage> {
+    let role: string = types::message_role(message);
+    if role == "user" => {
+        chat_append_user_message(wire, message)
+    } else if role == "assistant" => {
+        chat_append_assistant_message(wire, message)
+    } else => {
+        chat_append_simple_message(wire, role, message)
+    }
+}
+
+/// Appends one `user` message plus one `tool` message per tool_result part.
+fn chat_append_user_message(wire: array<WireMessage>, message: map) -> array<WireMessage> {
+    let parts: array = types::message_content(message);
+    let mut result: array<WireMessage> = wire;
+    let mut text_parts: array<WireTextPart> = [];
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        if part.has("type") {
+            let part_type: string = types::part_type(part);
+            if part_type == "text" {
+                let text: string = types::request_string(part, "text");
+                text_parts[text_parts.length] = { type: "text", text: text };
+            }
+            if part_type == "tool_result" {
+                let tool_call_id: string = types::request_string(part, "tool_call_id");
+                let content: string = types::request_string(part, "content");
+                result[result.length] = {
+                    role: "tool",
+                    content: content,
+                    content_parts: null,
+                    tool_call_id: tool_call_id,
+                    tool_calls: null
+                };
+            }
+        }
+        i += 1;
+    }
+    let mut wire_parts: array<WireTextPart>? = null;
+    if text_parts.length > 0 {
+        wire_parts = text_parts;
+    }
+    result[result.length] = {
+        role: "user",
+        content: null,
+        content_parts: wire_parts,
+        tool_call_id: null,
+        tool_calls: null
+    };
+    result
+}
+
+/// Appends one `assistant` message with text content and/or tool_calls.
+fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> array<WireMessage> {
+    let parts: array = types::message_content(message);
+    let mut text: string = "";
+    let mut tool_calls: array<WireToolCall> = [];
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        if part.has("type") {
+            let part_type: string = types::part_type(part);
+            if part_type == "text" {
+                let text_part: string = types::request_string(part, "text");
+                text = text + text_part;
+            }
+            if part_type == "tool_call" {
+                let id: string = types::request_string(part, "tool_call_id");
+                let name: string = types::request_string(part, "name");
+                let arguments_json: string = types::request_string(part, "arguments_json");
+                tool_calls[tool_calls.length] = {
+                    id: id,
+                    type: "function",
+                    function: { name: name, arguments: arguments_json }
+                };
+            }
+        }
+        i += 1;
+    }
+    let mut content: string? = null;
+    if text != "" {
+        content = text;
+    }
+    let mut wire_calls: array<WireToolCall>? = null;
+    if tool_calls.length > 0 {
+        wire_calls = tool_calls;
+    }
+    let mut result: array<WireMessage> = wire;
+    result[result.length] = {
+        role: "assistant",
+        content: content,
+        content_parts: null,
+        tool_call_id: null,
+        tool_calls: wire_calls
+    };
+    result
+}
+
+fn chat_append_simple_message(wire: array<WireMessage>, role: string, message: map) -> array<WireMessage> {
+    let parts: array = types::message_content(message);
+    let mut text: string = "";
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        if part.has("type") {
+            if types::part_type(part) == "text" {
+                let text_part: string = types::request_string(part, "text");
+                text = text + text_part;
+            }
+        }
+        i += 1;
+    }
+    let mut result: array<WireMessage> = wire;
+    result[result.length] = {
+        role: role,
+        content: text,
+        content_parts: null,
+        tool_call_id: null,
+        tool_calls: null
+    };
+    result
+}
+
+fn chat_build_tools(tools: array) -> array<WireTool> {
+    let mut wire: array<WireTool> = [];
+    let mut i = 0;
+    while i < tools.length {
+        let tool: map = types::array_entry(tools, i);
+        if tool.has("name") {
+            let name: string = types::tool_name(tool);
+            let description: string = types::tool_description(tool);
+            wire[wire.length] = {
+                type: "function",
+                function: {
+                    name: name,
+                    description: description,
+                    parameters: tool_schema_marker()
+                }
+            };
+        }
+        i += 1;
+    }
+    wire
+}
+
+/// Replaces each tool schema marker with the tool's raw schema JSON. The
+/// marker appears once per encoded tool, so one replace pass per tool.
+fn chat_splice_tool_schemas(body: string, tools: array) -> string {
+    let mut result: string = body;
+    let mut i = 0;
+    while i < tools.length {
+        let tool: map = types::array_entry(tools, i);
+        if tool.has("schema_json") {
+            let schema_json: string = types::tool_schema_json(tool);
+            result = string_replace_literal(
+                result,
+                "\"" + tool_schema_marker() + "\"",
+                schema_json
+            );
+        }
+        i += 1;
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Response parsing
+// ---------------------------------------------------------------------------
+
+fn chat_parse_response(response: map, status: int, provider: string) -> map {
+    let body_bytes: bytes = response["body"];
+    let body_text: string = bytes::to_utf8(body_bytes);
+    let body: map = json::decode(body_text);
+    chat_parse_response_body(body, status, provider)
+}
+
+fn chat_parse_response_body(body: map, status: int, provider: string) -> map {
+    let choices: array = types::request_array(body, "choices");
+    if choices.length > 0 => {
+        chat_parse_first_choice(choices, body, status, provider)
+    } else => {
+        types::fail(types::error_malformed(
+            status,
+            "chat completion response is missing 'choices'"
+        ))
+    }
+}
+
+fn chat_parse_first_choice(choices: array, body: map, status: int, provider: string) -> map {
+    let first: map = types::array_entry(choices, 0);
+    let stop_reason: string = types::request_string(first, "finish_reason");
+    let usage: map = types::request_map(body, "usage");
+    let usage_input: int = types::request_int(usage, "prompt_tokens", 0);
+    let usage_output: int = types::request_int(usage, "completion_tokens", 0);
+    let usage_total: int = types::request_int(usage, "total_tokens", 0);
+    let message: map = types::request_map(first, "message");
+    let result: map = if first.has("message") => {
+        let tool_calls: array = types::request_array(message, "tool_calls");
+        chat_parse_message(
+            message,
+            stop_reason,
+            usage_input,
+            usage_output,
+            usage_total,
+            tool_calls,
+            provider
+        )
+    } else => {
+        types::fail(types::error_malformed(
+            status,
+            "chat completion response is missing 'choices[0].message'"
+        ))
+    };
+    result
+}
+
+fn chat_parse_message(
+    message: map,
+    stop_reason: string,
+    usage_input: int,
+    usage_output: int,
+    usage_total: int,
+    tool_calls: array,
+    provider: string
+) -> map {
+    let content: string = types::request_string(message, "content");
+    let reasoning: string = types::request_string(message, "reasoning_content");
+    let calls: array = chat_parse_tool_calls(tool_calls);
+    types::ok(types::response_new(
+        content,
+        calls,
+        types::usage_new(usage_input, usage_output, usage_total),
+        reasoning,
+        stop_reason
+    ))
+}
+
+fn chat_parse_tool_calls(tool_calls: array) -> array {
+    let mut calls: array = [];
+    let mut i = 0;
+    while i < tool_calls.length {
+        let call: map = types::array_entry(tool_calls, i);
+        if call.has("id") {
+            let id: string = types::request_string(call, "id");
+            let function: map = types::request_map(call, "function");
+            let name: string = types::request_string(function, "name");
+            let args_text: string = types::request_string(function, "arguments");
+            let mut args: map = {};
+            if args_text != "" {
+                let decoded: map = json::decode(args_text);
+                args = decoded;
+            }
+            calls[calls.length] = types::tool_call_new(id, name, args);
+        }
+        i += 1;
+    }
+    calls
+}
+
+fn chat_parse_error(response: map, status: int) -> map {
+    let body_bytes: bytes = response["body"];
+    let body_text: string = bytes::to_utf8(body_bytes);
+    let payload: map = chat_error_payload(body_text);
+    let mut error_type: string = "api_error";
+    let mut code: string = "http_error";
+    let mut message: string = "provider request failed";
+    let mut param: string = "";
+    let mut request_id: string = "";
+    let payload_type: string = types::request_string(payload, "type");
+    let payload_code: string = types::request_string(payload, "code");
+    let payload_message: string = types::request_string(payload, "message");
+    let payload_param: string = types::request_string(payload, "param");
+    let payload_request_id: string = types::request_string(payload, "request_id");
+    if payload_type != "" {
+        error_type = payload_type;
+    }
+    if payload_code != "" {
+        code = payload_code;
+    }
+    if payload_message != "" {
+        message = payload_message;
+    }
+    if payload_param != "" {
+        param = payload_param;
+    }
+    if payload_request_id != "" {
+        request_id = payload_request_id;
+    }
+    types::fail(types::error_new(status, error_type, code, message, param, request_id))
+}
+
+/// Extracts the `error` object from a non-2xx JSON body. A structurally
+/// invalid body yields an empty map and the caller falls back to the default
+/// `api_error`/`http_error` shape; a body that is not JSON at all fails the
+/// invocation (the same contract as `chat_parse_response`).
+fn chat_error_payload(body_text: string) -> map {
+    let decoded: map = json::decode(body_text);
+    if type(decoded) == "map" => {
+        types::request_map(decoded, "error")
+    } else => {
+        {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming (http::client::sse)
+// ---------------------------------------------------------------------------
+
+fn openai_chat_stream_dispatch(request: map, profile: map) -> map {
+    let base_url: string = types::profile_string(profile, "base_url");
+    let api_key: string = types::profile_string(profile, "api_key");
+    let provider: string = types::profile_string(profile, "provider");
+    openai_chat_stream(request, base_url, api_key, provider)
+}
+
+fn openai_chat_stream(request: map, base_url: string, api_key: string, provider: string) -> map {
+    types::fail(types::error_request("not_implemented", "openai_chat streaming is not implemented"))
+}

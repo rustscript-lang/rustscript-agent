@@ -1,0 +1,25 @@
+// OpenCode Go profile: OpenAI Chat Completions compatible endpoint.
+use self::profile as profile;
+use super::llm::types as types;
+use super::llm::openai_chat as openai_chat;
+
+pub fn call(request: map) -> map {
+    let options: map = types::provider_options(request);
+    let override_base: string = types::request_string(options, "base_url");
+    let override_key: string = types::request_string(options, "api_key");
+    let override_model: string = types::request_string(options, "model");
+    let merged: map = profile::profile_merge(
+        {
+            provider: "opencode_go",
+            base_url: "https://api.opencode.ai/go/v1",
+            api_key: "",
+            model: "go-1",
+            adapter: "openai_chat",
+            capabilities: { stream: true, tools: true, usage: true, reasoning: false }
+        },
+        override_base,
+        override_key,
+        override_model
+    );
+    openai_chat::openai_chat_call(request, merged)
+}
