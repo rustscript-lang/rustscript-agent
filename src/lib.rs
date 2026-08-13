@@ -10,6 +10,7 @@ pub mod config;
 pub mod domain;
 pub mod events;
 pub mod gateway;
+pub mod metrics;
 pub mod runtime;
 pub mod service;
 

@@ -3413,6 +3413,8 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
         .expect("compaction after commit");
     assert_eq!(committed_row["rows"][0][10], json!("committed"));
     let _ = std::fs::remove_file(&path);
+}
+
 // ---------------------------------------------------------------------------
 // A7: bounded rate limiting and the client-disconnect policy, exercised over
 // a real Axum HTTP/SSE server (not router oneshot) with fixture RSS.

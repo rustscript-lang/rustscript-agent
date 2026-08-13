@@ -300,3 +300,14 @@ pub(crate) fn input_text(input: &Value) -> String {
         other => other.to_string(),
     }
 }
+
+/// Redacts free-text log messages by truncating at a char boundary, so
+/// embedded payload text (which may carry sensitive values) never reaches
+/// logs unbounded. Structured ids and typed reasons are logged as fields,
+/// never payload originals.
+pub(crate) fn truncate_for_log(message: &str, max_chars: usize) -> &str {
+    match message.char_indices().nth(max_chars) {
+        Some((index, _)) => &message[..index],
+        None => message,
+    }
+}

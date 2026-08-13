@@ -89,6 +89,7 @@ pub struct GatewayPersistence {
     worker: StorageWorker,
     max_events: i64,
     broadcast_capacity: usize,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 /// One serialized storage request for the dedicated worker thread.
@@ -103,7 +104,8 @@ struct StorageRequest {
 struct StorageWorker {
     sender: Sender<StorageRequest>,
     shutdown: Sender<()>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 struct StorageRunner {
@@ -209,6 +211,16 @@ impl GatewayPersistence {
     /// be called from blocking threads (`spawn_blocking`), never directly
     /// from Tokio request threads.
     pub fn open(config: &crate::config::AgentGatewayConfig, path: &Path) -> Result<Self, String> {
+        Self::open_with_metrics(config, path, Arc::new(crate::metrics::Metrics::default()))
+    }
+
+    /// Like [`Self::open`], but shares the caller's bounded metrics registry
+    /// so every storage command is observable.
+    pub fn open_with_metrics(
+        config: &crate::config::AgentGatewayConfig,
+        path: &Path,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Self, String> {
         let runner = StorageRunner::open(config, path)?;
         let (sender, requests) = mpsc::channel::<StorageRequest>();
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
@@ -220,34 +232,56 @@ impl GatewayPersistence {
             worker: StorageWorker {
                 sender,
                 shutdown: shutdown_sender,
-                thread: Some(thread),
+                thread: std::sync::Mutex::new(Some(thread)),
+                closed: std::sync::atomic::AtomicBool::new(false),
             },
             max_events: config.max_events_per_run as i64,
             broadcast_capacity: config.broadcast_capacity,
+            metrics,
         })
+    }
+
+    /// Closes the storage worker deterministically: signals it to exit,
+    /// joins the thread, and marks it closed so every later command fails
+    /// fast with a typed error instead of hanging. Idempotent; concurrent
+    /// calls and `Drop` are safe. Queued-but-unstarted requests observe a
+    /// disconnected response channel (typed `storage_unavailable`).
+    pub fn shutdown(&self) {
+        self.worker.shutdown();
     }
 
     /// Runs one command on the dedicated storage worker and blocks (bounded)
     /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
-        let (respond, response) = mpsc::channel();
-        self.worker
-            .sender
-            .send(StorageRequest {
+        let result = if self
+            .worker
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Err("gateway storage worker is not running".to_string())
+        } else {
+            let (respond, response) = mpsc::channel();
+            let sent = self.worker.sender.send(StorageRequest {
                 op: op.to_string(),
                 payload: payload.clone(),
                 respond,
-            })
-            .map_err(|_| "gateway storage worker is not running".to_string())?;
-        response
-            .recv_timeout(STORAGE_COMMAND_TIMEOUT)
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => "gateway storage worker timed out".to_string(),
-                RecvTimeoutError::Disconnected => {
-                    "gateway storage worker exited unexpectedly".to_string()
-                }
-            })?
+            });
+            match sent {
+                Ok(()) => response
+                    .recv_timeout(STORAGE_COMMAND_TIMEOUT)
+                    .map_err(|error| match error {
+                        RecvTimeoutError::Timeout => "gateway storage worker timed out".to_string(),
+                        RecvTimeoutError::Disconnected => {
+                            "gateway storage worker exited unexpectedly".to_string()
+                        }
+                    })?,
+                Err(_) => Err("gateway storage worker is not running".to_string()),
+            }
+        };
+        self.metrics
+            .storage_op(crate::metrics::StorageOp::from_command(op), result.is_ok());
+        result
     }
 
     /// Runs one typed command and returns its `data` payload, or a typed
@@ -431,14 +465,25 @@ impl GatewayPersistence {
     }
 }
 
+impl StorageWorker {
+    /// Signals the worker to exit and joins it, exactly once (idempotent
+    /// under concurrent calls and `Drop`).
+    fn shutdown(&self) {
+        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.lock().expect("storage thread lock").take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl Drop for GatewayPersistence {
     /// Signals the worker to exit and joins it so no storage thread outlives
     /// the persistence handle.
     fn drop(&mut self) {
-        let _ = self.worker.shutdown.send(());
-        if let Some(thread) = self.worker.thread.take() {
-            let _ = thread.join();
-        }
+        self.worker.shutdown();
     }
 }
 

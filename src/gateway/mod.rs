@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use rustscript_vm::HttpConfig;
 
 use crate::config::AgentGatewayConfig;
+use crate::metrics::Metrics;
 use crate::service::AgentService;
 
 pub use api_server::build_agent_gateway_app;
@@ -28,6 +29,7 @@ pub struct AgentGatewayState {
     service: Arc<AgentService>,
     agent_source: Option<Arc<String>>,
     http_config: HttpConfig,
+    metrics: Arc<Metrics>,
 }
 
 impl AgentGatewayState {
@@ -37,12 +39,14 @@ impl AgentGatewayState {
             .validate()
             .map_err(|error| format!("invalid gateway configuration: {error}"))?;
         let store = Arc::new(RwLock::new(store::GatewayStore::default()));
+        let metrics = Arc::new(Metrics::default());
         let service = Arc::new(AgentService::new(
             Arc::new(config),
             Arc::clone(&store),
             None,
             None,
             http_config.clone(),
+            Arc::clone(&metrics),
         ));
         Ok(Self {
             config: Arc::clone(service.config()),
@@ -50,6 +54,7 @@ impl AgentGatewayState {
             service,
             agent_source: None,
             http_config,
+            metrics,
         })
     }
 
@@ -72,12 +77,14 @@ impl AgentGatewayState {
             .map_err(|error| format!("invalid gateway configuration: {error}"))?;
         let store = Arc::new(RwLock::new(store::GatewayStore::default()));
         let agent_source = Some(Arc::new(source));
+        let metrics = Arc::new(Metrics::default());
         let service = Arc::new(AgentService::new(
             Arc::new(config),
             Arc::clone(&store),
             None,
             agent_source.clone(),
             http_config.clone(),
+            Arc::clone(&metrics),
         ));
         Ok(Self {
             config: Arc::clone(service.config()),
@@ -85,6 +92,7 @@ impl AgentGatewayState {
             service,
             agent_source,
             http_config,
+            metrics,
         })
     }
 
@@ -106,9 +114,14 @@ impl AgentGatewayState {
         config
             .validate()
             .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let metrics = Arc::new(Metrics::default());
         let persistence = Arc::new(
-            store::GatewayPersistence::open(&config, path.as_ref())
-                .map_err(|error| format!("open gateway SQLite state: {error}"))?,
+            store::GatewayPersistence::open_with_metrics(
+                &config,
+                path.as_ref(),
+                Arc::clone(&metrics),
+            )
+            .map_err(|error| format!("open gateway SQLite state: {error}"))?,
         );
         let loaded_store = persistence
             .load()
@@ -121,6 +134,7 @@ impl AgentGatewayState {
             Some(persistence),
             agent_source.clone(),
             http_config.clone(),
+            Arc::clone(&metrics),
         ));
         Ok(Self {
             config: Arc::clone(service.config()),
@@ -128,6 +142,7 @@ impl AgentGatewayState {
             service,
             agent_source,
             http_config,
+            metrics,
         })
     }
 
@@ -139,9 +154,14 @@ impl AgentGatewayState {
         config
             .validate()
             .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let metrics = Arc::new(Metrics::default());
         let persistence = Arc::new(
-            store::GatewayPersistence::open(&config, path.as_ref())
-                .map_err(|error| format!("open gateway SQLite state: {error}"))?,
+            store::GatewayPersistence::open_with_metrics(
+                &config,
+                path.as_ref(),
+                Arc::clone(&metrics),
+            )
+            .map_err(|error| format!("open gateway SQLite state: {error}"))?,
         );
         let loaded_store = persistence
             .load()
@@ -153,6 +173,7 @@ impl AgentGatewayState {
             Some(persistence),
             None,
             http_config.clone(),
+            Arc::clone(&metrics),
         ));
         Ok(Self {
             config: Arc::clone(service.config()),
@@ -160,11 +181,18 @@ impl AgentGatewayState {
             service,
             agent_source: None,
             http_config,
+            metrics,
         })
     }
 
     pub fn service(&self) -> Arc<AgentService> {
         Arc::clone(&self.service)
+    }
+
+    /// The bounded metrics registry shared by the service, delivery, storage
+    /// worker, and API handlers.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// The typed storage repository handle (normalized schema), or `None`

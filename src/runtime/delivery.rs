@@ -19,9 +19,10 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::config::AgentGatewayConfig;
-use crate::domain::timestamp;
+use crate::domain::{timestamp, truncate_for_log};
 use crate::events;
 use crate::gateway::store::{GatewayEvent, GatewayPersistence, GatewayStore, RunRecord};
+use crate::metrics::Metrics;
 use crate::{RunDeliveryError, RunEventSink};
 
 /// The store/persistence/config slice the delivery task needs; built by
@@ -30,6 +31,7 @@ pub(crate) struct DeliveryContext {
     pub(crate) store: Arc<RwLock<GatewayStore>>,
     pub(crate) persistence: Option<Arc<GatewayPersistence>>,
     pub(crate) config: Arc<AgentGatewayConfig>,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 /// Bounded channel delivery sink: `blocking_send` pauses the worker (and
@@ -95,6 +97,7 @@ pub(crate) async fn run_delivery_task(
                 if outcome.schema_violation.is_none() {
                     outcome.schema_violation = Some(reason.to_string());
                 }
+                context.metrics.events_dropped();
                 continue;
             }
         };
@@ -106,6 +109,7 @@ pub(crate) async fn run_delivery_task(
             store: Arc::clone(&context.store),
             persistence: context.persistence.clone(),
             config: Arc::clone(&context.config),
+            metrics: Arc::clone(&context.metrics),
         };
         let run_id_for_block = run_id.clone();
         let event_type_for_block = event_type.clone();
@@ -167,12 +171,19 @@ pub(crate) async fn run_delivery_task(
         match delivered {
             DeliverOutcome::Published(event, sender) => {
                 outcome.delivered += 1;
+                context.metrics.events_emitted();
                 let _ = sender.send(event);
             }
             DeliverOutcome::RunEnded => break,
             DeliverOutcome::PersistFailed(error) => {
-                tracing::error!("failed to append run event durably: {error}");
+                tracing::error!(
+                    run_id,
+                    op = "event.append",
+                    error = %truncate_for_log(&error, 256),
+                    "failed to append run event durably"
+                );
                 outcome.persist_failed = true;
+                context.metrics.events_dropped();
             }
         }
     }

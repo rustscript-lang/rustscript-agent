@@ -33,12 +33,13 @@ use uuid::Uuid;
 
 use crate::config::AgentGatewayConfig;
 use crate::config::ClientDisconnectPolicy;
-use crate::domain::{RunContext, timestamp, vm_value_to_json};
+use crate::domain::{RunContext, timestamp, truncate_for_log, vm_value_to_json};
 use crate::events;
 use crate::gateway::store::{
     GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
     SessionRecord, SessionView, append_message,
 };
+use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
 use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, append_event_locked, run_delivery_task,
 };
@@ -67,6 +68,7 @@ pub struct RunHandle {
     pub(crate) cancel: RunCancellation,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) permit: Mutex<Option<OwnedSemaphorePermit>>,
+    pub(crate) started_at: Instant,
     /// Set when the one terminal transition is committed (mark_terminal).
     /// The subscriber drop guard never requests a client-disconnect
     /// cancellation for a run that already reached a terminal.
@@ -221,6 +223,7 @@ struct AgentServiceInner {
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
+    metrics: Arc<Metrics>,
 }
 
 impl AgentService {
@@ -230,6 +233,7 @@ impl AgentService {
         persistence: Option<Arc<GatewayPersistence>>,
         agent_source: Option<Arc<String>>,
         http_config: HttpConfig,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let capacity = Arc::new(Semaphore::new(config.max_concurrent_runs));
         let inner = Arc::new(AgentServiceInner {
@@ -242,6 +246,7 @@ impl AgentService {
             runs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
+            metrics,
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
         Self { inner }
@@ -298,11 +303,21 @@ impl AgentService {
             .capacity
             .clone()
             .try_acquire_owned()
-            .map_err(|_| AdmitError::RunLimitReached)?;
+            .map_err(|_| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::RunLimitReached);
+                AdmitError::RunLimitReached
+            })?;
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.admit_blocking(request, capacity_permit))
             .await
-            .map_err(|error| AdmitError::Persistence(format!("admission worker failed: {error}")))?
+            .map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Persistence);
+                AdmitError::Persistence(format!("admission worker failed: {error}"))
+            })?
     }
 
     fn admit_blocking(
@@ -324,6 +339,9 @@ impl AgentService {
         ) && let Some(existing) = store.idempotency.get(key)
         {
             if existing.request_hash != hash {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::IdempotencyConflict);
                 return Err(AdmitError::IdempotencyConflict);
             }
             let (session_id, status) = store
@@ -344,6 +362,9 @@ impl AgentService {
         let session_id = match request.session_id.clone() {
             Some(session_id) => {
                 if !store.sessions.contains_key(&session_id) {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::SessionNotFound);
                     return Err(AdmitError::SessionNotFound);
                 }
                 session_id
@@ -378,6 +399,9 @@ impl AgentService {
         if let Some(parent_run_id) = request.parent_run_id.as_deref()
             && !store.runs.contains_key(parent_run_id)
         {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::ParentNotFound);
             return Err(AdmitError::ParentNotFound);
         }
 
@@ -405,18 +429,20 @@ impl AgentService {
             "expires_at_ms": 0,
         });
 
-        let durable =
-            match self.inner.persistence.as_ref() {
-                Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
-                    match error.code.as_str() {
-                        "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
-                        _ => AdmitError::Persistence(format!(
-                            "run admission could not be durably committed: {error}"
-                        )),
-                    }
-                }),
-                None => Ok(JsonValue::Null),
-            };
+        let durable = match self.inner.persistence.as_ref() {
+            Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Persistence);
+                match error.code.as_str() {
+                    "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
+                    _ => AdmitError::Persistence(format!(
+                        "run admission could not be durably committed: {error}"
+                    )),
+                }
+            }),
+            None => Ok(JsonValue::Null),
+        };
         let data = durable?;
         // The transactional admission may have replayed an existing key (a
         // restart race the in-memory fast path cannot see).
@@ -534,12 +560,15 @@ impl AgentService {
                 notified: false,
             }),
             disconnect_policy: self.inner.config.client_disconnect_policy,
+            started_at: Instant::now(),
         });
         self.inner
             .runs
             .lock()
             .expect("runs lock")
             .insert(run_id.clone(), handle);
+        self.inner.metrics.admission_accepted();
+        self.inner.metrics.active_runs_inc();
         Ok(AdmittedRun {
             run_id: run_id.clone(),
             session_id,
@@ -594,6 +623,11 @@ impl AgentService {
             // observing the cancellation commits exactly this reason.
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
             handle.cancel.request(CancellationReason::Requested);
+            tracing::debug!(
+                run_id,
+                reason = "requested",
+                "typed cancellation requested for the run"
+            );
             Some("stopping".to_string())
         } else {
             Some(status)
@@ -613,6 +647,11 @@ impl AgentService {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        tracing::info!(
+            runs = handles.len(),
+            reason = "resource_closed",
+            "halting the gateway: cancelling every active run"
+        );
         for handle in handles {
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("resource_closed");
             handle.cancel.request(CancellationReason::ResourceClosed);
@@ -622,8 +661,10 @@ impl AgentService {
     /// Marks a run terminal: records the terminal time for TTL retention,
     /// releases the capacity permit, and sets the atomic terminal flag the
     /// subscriber drop guard consults before any client-disconnect
-    /// cancellation. Called by the worker (or the bounded terminal retry
-    /// loop) after the one terminal commit.
+    /// cancellation. The first call also releases the active gauge and
+    /// records the run duration into the fixed histogram buckets. Called
+    /// by the worker (or the bounded terminal retry loop) after the one
+    /// terminal commit.
     pub fn mark_terminal(&self, run_id: &str) {
         if let Some(handle) = self
             .inner
@@ -634,8 +675,17 @@ impl AgentService {
             .cloned()
         {
             handle.terminal.store(true, Ordering::Release);
-            *handle.terminal_at.lock().expect("terminal lock") = Some(Instant::now());
+            let now = Instant::now();
+            let mut terminal_at = handle.terminal_at.lock().expect("terminal lock");
+            if terminal_at.is_none() {
+                self.inner
+                    .metrics
+                    .record_run_duration(handle.started_at.elapsed().as_secs_f64());
+            }
+            *terminal_at = Some(now);
+            drop(terminal_at);
             handle.permit.lock().expect("permit lock").take();
+            self.inner.metrics.active_runs_dec();
         }
     }
 
@@ -654,6 +704,11 @@ impl AgentService {
             .lock()
             .expect("pending lock")
             .insert(run_id.to_string(), pending);
+        self.inner.metrics.runs_terminal_pending_inc();
+        tracing::warn!(
+            run_id,
+            "run terminal parked as pending for the bounded durable retry"
+        );
     }
 
     /// Removes and returns one pending terminal entry (the retry loop owns
@@ -674,6 +729,7 @@ impl AgentService {
             .lock()
             .expect("pending lock")
             .insert(run_id.to_string(), pending);
+        self.inner.metrics.runs_terminal_pending_inc();
     }
 
     /// Number of runs awaiting a durable terminal commit retry (observable
@@ -686,6 +742,12 @@ impl AgentService {
     /// prove terminal-pending runs never hold permits).
     pub fn available_capacity(&self) -> usize {
         self.inner.capacity.available_permits()
+    }
+
+    /// The bounded metrics registry shared by the service, delivery, storage
+    /// worker, and API handlers.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.inner.metrics)
     }
 
     /// Drives one admitted run to its single terminal transition.
@@ -739,6 +801,7 @@ impl AgentService {
                     store: Arc::clone(&self.inner.store),
                     persistence: self.inner.persistence.clone(),
                     config: Arc::clone(&self.inner.config),
+                    metrics: Arc::clone(&self.inner.metrics),
                 },
                 run_id.clone(),
                 receiver,
@@ -763,6 +826,11 @@ impl AgentService {
                     // The timeout is authoritative: cancel with the typed
                     // deadline reason and wait only the configured grace for
                     // worker exit.
+                    tracing::warn!(
+                        run_id,
+                        reason = "deadline",
+                        "run timeout reached; cancelling with the typed deadline reason"
+                    );
                     cancellation.request(CancellationReason::Deadline);
                     let _ = tokio::time::timeout(self.inner.config.cancellation_grace, &mut worker)
                         .await;
@@ -848,6 +916,7 @@ impl AgentService {
                 .await
             {
                 TerminalOutcome::Committed => {
+                    self.inner.metrics.runs_terminal(TerminalStatus::Completed);
                     self.mark_terminal(run_id);
                     return;
                 }
@@ -873,13 +942,16 @@ impl AgentService {
                 }
                 TerminalOutcome::TerminalPersistFailed { error, pending } => {
                     if attempt + 1 < attempts {
+                        self.inner.metrics.terminal_persist_backoff();
                         tokio::time::sleep(self.inner.config.terminal_persist_retry_delay).await;
                     } else {
                         tracing::error!(
                             run_id,
-                            "completed terminal could not be persisted after bounded retries: {error}; \
+                            error = %truncate_for_log(&error, 256),
+                            "completed terminal could not be persisted after bounded retries; \
                              parked as pending"
                         );
+                        self.inner.metrics.runs_terminal(TerminalStatus::Completed);
                         self.register_pending_terminal(run_id, *pending);
                         self.mark_terminal(run_id);
                         self.spawn_terminal_retry(run_id.to_string());
@@ -1006,18 +1078,24 @@ impl AgentService {
         for attempt in 0..attempts {
             match self.commit_cancelled_once(run_id, reason).await {
                 TerminalOutcome::Committed => {
+                    self.inner.metrics.runs_terminal(TerminalStatus::Cancelled);
+                    tracing::info!(run_id, reason, "cancelled terminal committed durably");
                     self.mark_terminal(run_id);
                     return;
                 }
                 TerminalOutcome::TerminalPersistFailed { error, pending } => {
                     if attempt + 1 < attempts {
+                        self.inner.metrics.terminal_persist_backoff();
                         tokio::time::sleep(self.inner.config.terminal_persist_retry_delay).await;
                     } else {
                         tracing::error!(
                             run_id,
-                            "failed to commit cancellation durably after bounded retries: {error}; \
+                            reason,
+                            error = %truncate_for_log(&error, 256),
+                            "failed to commit cancellation durably after bounded retries; \
                              retrying within the bounded window"
                         );
+                        self.inner.metrics.runs_terminal(TerminalStatus::Cancelled);
                         self.register_pending_terminal(run_id, *pending);
                         self.mark_terminal(run_id);
                         self.spawn_terminal_retry(run_id.to_string());
@@ -1104,18 +1182,22 @@ impl AgentService {
         for attempt in 0..attempts {
             match self.commit_failed_once(run_id, data.clone()).await {
                 TerminalOutcome::Committed => {
+                    self.inner.metrics.runs_terminal(TerminalStatus::Failed);
                     self.mark_terminal(run_id);
                     return;
                 }
                 TerminalOutcome::TerminalPersistFailed { error, pending } => {
                     if attempt + 1 < attempts {
+                        self.inner.metrics.terminal_persist_backoff();
                         tokio::time::sleep(self.inner.config.terminal_persist_retry_delay).await;
                     } else {
                         tracing::error!(
                             run_id,
-                            "failed to commit failure durably after bounded retries: {error}; \
+                            error = %truncate_for_log(&error, 256),
+                            "failed to commit failure durably after bounded retries; \
                              retrying within the bounded window"
                         );
+                        self.inner.metrics.runs_terminal(TerminalStatus::Failed);
                         self.register_pending_terminal(run_id, *pending);
                         self.mark_terminal(run_id);
                         self.spawn_terminal_retry(run_id.to_string());
@@ -1238,6 +1320,7 @@ impl AgentService {
             let Some(pending) = service.take_pending_terminal(&run_id_for_block) else {
                 return PendingRetryOutcome::Gone;
             };
+            service.inner.metrics.runs_terminal_pending_dec();
             let Some(run) = store.runs.get_mut(&run_id_for_block) else {
                 return PendingRetryOutcome::Gone;
             };
@@ -1251,6 +1334,14 @@ impl AgentService {
                 // is released via its TTL and the durable side is repaired by
                 // restart recovery.
                 close_run_stream(run);
+                service
+                    .inner
+                    .metrics
+                    .terminal_retry(TerminalRetryOutcome::Expired);
+                tracing::warn!(
+                    run_id = %run_id_for_block,
+                    "terminal retry window expired; durable side left for restart recovery"
+                );
                 return PendingRetryOutcome::Expired;
             }
             let previous_status = run.status.clone();
@@ -1314,6 +1405,15 @@ impl AgentService {
                             let _ = sender.send(reconciled.clone());
                         }
                     }
+                    service
+                        .inner
+                        .metrics
+                        .terminal_retry(TerminalRetryOutcome::Committed);
+                    tracing::info!(
+                        run_id = %run_id_for_block,
+                        status = %pending.to_status,
+                        "pending terminal committed durably by the bounded retry"
+                    );
                     PendingRetryOutcome::Committed
                 }
                 Err(error) if error.code == "transition_conflict" => {
@@ -1331,12 +1431,22 @@ impl AgentService {
                     if let Some(run) = store.runs.get_mut(&run_id_for_block) {
                         close_run_stream(run);
                     }
+                    service
+                        .inner
+                        .metrics
+                        .terminal_retry(TerminalRetryOutcome::Conflict);
+                    tracing::warn!(
+                        run_id = %run_id_for_block,
+                        "pending terminal dropped on a durable transition conflict \
+                         (no fabricated terminal)"
+                    );
                     PendingRetryOutcome::Conflict
                 }
                 Err(error) => {
                     tracing::error!(
-                        "terminal retry for {run_id_for_block} failed: {error}; \
-                         will retry on the next janitor tick"
+                        run_id = %run_id_for_block,
+                        error = %truncate_for_log(&error.message, 256),
+                        "terminal retry failed; will retry on the next janitor tick"
                     );
                     rollback_pending_retry(
                         &mut store,
@@ -1347,6 +1457,10 @@ impl AgentService {
                         previous_session_updated,
                     );
                     service.put_pending_terminal(&run_id_for_block, pending);
+                    service
+                        .inner
+                        .metrics
+                        .terminal_retry(TerminalRetryOutcome::RetryFailed);
                     PendingRetryOutcome::RetryFailed
                 }
             }

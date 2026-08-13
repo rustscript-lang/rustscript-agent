@@ -19,7 +19,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{
         HeaderMap, StatusCode,
-        header::{AUTHORIZATION, RETRY_AFTER},
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     },
     middleware::{self, Next},
     response::{
@@ -149,6 +149,7 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
     let guard_config = Arc::clone(&state.config);
     Router::new()
         .route("/health/detailed", get(health_detailed_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(models_handler))
         .route(
             "/api/sessions",
@@ -386,21 +387,28 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 async fn health_detailed_handler(State(state): State<AgentGatewayState>) -> impl IntoResponse {
-    let active_agents = state
-        .store
-        .read()
-        .runs
-        .values()
-        .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
-        .count();
+    // Both values come from the same atomic gauge snapshot the /metrics
+    // scrape renders, so health and metrics can never disagree (one source
+    // of truth) and neither endpoint ever touches the store.
+    let snapshot = state.metrics.snapshot();
     Json(json!({
         "status": "ok",
-        "active_agents": active_agents,
+        "active_agents": snapshot.active_runs.max(0),
         // Runs whose terminal commit is awaiting the bounded durable retry
         // (observable instead of a silent leak).
-        "terminal_pending": state.service.pending_terminal_count(),
+        "terminal_pending": snapshot.runs_terminal_pending.max(0),
         "agent": state.config.agent_name,
     }))
+}
+
+/// Prometheus text exposition of the bounded registry. Reads atomics only;
+/// the scrape never blocks on the store or the storage worker.
+async fn metrics_handler(State(state): State<AgentGatewayState>) -> Response {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.metrics.render_prometheus(),
+    )
+        .into_response()
 }
 
 async fn models_handler(State(state): State<AgentGatewayState>) -> impl IntoResponse {
@@ -1006,7 +1014,7 @@ async fn run_events_handler(
     Path(run_id): Path<String>,
     Query(query): Query<EventQuery>,
 ) -> Response {
-    let (history, receiver) = {
+    let (history, receiver, subscriber_guard) = {
         let store = state.store.read();
         let Some(run) = store.runs.get(&run_id) else {
             return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
@@ -1021,20 +1029,25 @@ async fn run_events_handler(
                 &format!("event cursor is older than retained history; earliest_seq={earliest}"),
             );
         }
+        let receiver = run.sender.as_ref().map(|sender| sender.subscribe());
+        let subscriber_guard = receiver.as_ref().map(|_| state.metrics.subscriber_guard());
         (
             run.events
                 .iter()
                 .filter(|event| query.after_seq.is_none_or(|cursor| event.seq > cursor))
                 .cloned()
                 .collect(),
-            run.sender.as_ref().map(|sender| sender.subscribe()),
+            receiver,
+            subscriber_guard,
         )
     };
     // Track this SSE connection as a live subscriber for the duration of
     // the stream; the drop guard (moved into the stream state) decides the
-    // client-disconnect policy when the connection ends.
+    // client-disconnect policy when the connection ends. The metrics guard
+    // (RAII connection gauge + lag recording) rides the same stream state
+    // and drops together with the service guard.
     let guard = state.service.attach_subscriber(&run_id);
-    let stream = event_stream(history, receiver, guard);
+    let stream = event_stream(history, receiver, guard, subscriber_guard);
     Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -1368,10 +1381,11 @@ fn event_stream(
     history: Vec<GatewayEvent>,
     receiver: Option<broadcast::Receiver<GatewayEvent>>,
     guard: Option<SubscriberGuard>,
+    subscriber_guard: Option<crate::metrics::SubscriberGuard>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(
-        (history.into_iter(), receiver, guard, false),
-        |(mut history, receiver, mut guard, mut done)| async move {
+        (history.into_iter(), receiver, guard, subscriber_guard, false),
+        |(mut history, receiver, mut guard, subscriber_guard, mut done)| async move {
             if let Some(event) = history.next() {
                 done |= event.is_terminal();
                 // A stream that ends because a terminal was delivered must
@@ -1381,7 +1395,10 @@ fn event_stream(
                 {
                     guard.disarm();
                 }
-                return Some((Ok(event.into_sse()), (history, receiver, guard, done)));
+                return Some((
+                    Ok(event.into_sse()),
+                    (history, receiver, guard, subscriber_guard, done),
+                ));
             }
             if done {
                 return None;
@@ -1392,22 +1409,35 @@ fn event_stream(
             match receiver.recv().await {
                 Ok(event) => {
                     done |= event.is_terminal();
-                    if event.is_terminal()
-                        && let Some(guard) = guard.as_mut()
-                    {
-                        guard.disarm();
-                    }
-                    Some((Ok(event.into_sse()), (history, Some(receiver), guard, done)))
+                if event.is_terminal()
+                    && let Some(guard) = guard.as_mut()
+                {
+                    guard.disarm();
                 }
-                Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                    // The subscriber fell behind and the stream ends without
-                    // a terminal: the guard stays armed, so a
-                    // cancel-on-disconnect run treats this as a disconnect.
+                Some((
+                    Ok(event.into_sse()),
+                    (history, Some(receiver), guard, subscriber_guard, done),
+                ))
+            }
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                // The subscriber fell behind the bounded broadcast
+                // buffer; the dropped count is observable, the stream
+                // ends instead of presenting a gap as if nothing
+                // happened, and the client reconnects for a full replay.
+                // The service guard stays armed: without a delivered
+                // terminal, a cancel-on-disconnect run treats this as a
+                // disconnect.
+                if let Some(guard) = &subscriber_guard {
+                    guard.record_lag(dropped);
+                }
                     done = true;
                     let event = Event::default()
                         .event("error")
                         .data(json!({"code":"event_lagged","dropped":dropped}).to_string());
-                    Some((Ok(event), (history, Some(receiver), guard, done)))
+                Some((
+                    Ok(event),
+                    (history, Some(receiver), guard, subscriber_guard, done),
+                ))
                 }
                 Err(broadcast::error::RecvError::Closed) => None,
             }
