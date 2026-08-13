@@ -86,7 +86,8 @@ pub struct TgSentMessage {
 /// Typed Bot API failure. `RateLimited` carries the server's `retry_after`
 /// hint; `Server` is an HTTP 5xx after the bounded retry budget; `Api` is any
 /// other 4xx/API-level error (never retried); `Transport` is a network or
-/// timeout failure.
+/// timeout failure; `ResponseTooLarge` is a response body beyond the
+/// configured `max_response_body_bytes` cap (never buffered).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TelegramError {
     Api {
@@ -100,6 +101,9 @@ pub enum TelegramError {
         status: u16,
     },
     Transport(String),
+    ResponseTooLarge {
+        limit: u64,
+    },
 }
 
 impl std::fmt::Display for TelegramError {
@@ -117,6 +121,10 @@ impl std::fmt::Display for TelegramError {
             }
             Self::Server { status } => write!(formatter, "Telegram server error (HTTP {status})"),
             Self::Transport(message) => write!(formatter, "Telegram transport error: {message}"),
+            Self::ResponseTooLarge { limit } => write!(
+                formatter,
+                "Telegram response body exceeds the {limit}-byte cap"
+            ),
         }
     }
 }
@@ -349,6 +357,7 @@ pub struct TelegramApi {
     max_429_retries: usize,
     max_429_backoff: Duration,
     max_5xx_retries: usize,
+    max_response_body_bytes: u64,
 }
 
 impl std::fmt::Debug for TelegramApi {
@@ -361,6 +370,7 @@ impl std::fmt::Debug for TelegramApi {
             .field("max_429_retries", &self.max_429_retries)
             .field("max_429_backoff", &self.max_429_backoff)
             .field("max_5xx_retries", &self.max_5xx_retries)
+            .field("max_response_body_bytes", &self.max_response_body_bytes)
             .finish()
     }
 }
@@ -380,6 +390,7 @@ impl TelegramApi {
             max_429_retries: config.max_429_retries,
             max_429_backoff: config.max_429_backoff,
             max_5xx_retries: config.max_5xx_retries,
+            max_response_body_bytes: config.max_response_body_bytes as u64,
         }
     }
 
@@ -503,13 +514,31 @@ impl TelegramApi {
                 TelegramError::Transport(message)
             })?;
         let status = response.status();
+        // Collect the body under the configured cap: a body that exceeds it
+        // (declared Content-Length or streamed chunks) aborts immediately
+        // with a typed over-limit failure and is never buffered whole.
+        let limited = http_body_util::Limited::new(
+            response.into_body(),
+            self.max_response_body_bytes as usize,
+        );
         let bytes = timeout(
             self.request_timeout,
-            http_body_util::BodyExt::collect(response.into_body()),
+            http_body_util::BodyExt::collect(limited),
         )
         .await
         .map_err(|_| TelegramError::Transport("Bot API response timed out".to_string()))?
-        .map_err(|error| TelegramError::Transport(format!("read Bot API response: {error}")))?
+        .map_err(|error| {
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                TelegramError::ResponseTooLarge {
+                    limit: self.max_response_body_bytes,
+                }
+            } else {
+                TelegramError::Transport(format!("read Bot API response: {error}"))
+            }
+        })?
         .to_bytes();
         if status == hyper::StatusCode::TOO_MANY_REQUESTS {
             // Prefer the body's retry_after hint; fall back to the header or 1.

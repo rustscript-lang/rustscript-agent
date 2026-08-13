@@ -17,6 +17,7 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
+use futures_util::StreamExt;
 use rustscript_agent::config::TelegramConfig;
 use rustscript_agent::gateway::telegram::{TelegramApi, TelegramError};
 use serde_json::{Value, json};
@@ -51,6 +52,12 @@ pub struct FixtureState {
     pub updates: Arc<Mutex<VecDeque<Value>>>,
     pub failures: Arc<Mutex<HashMap<String, VecDeque<FailureScript>>>>,
     pub next_message_id: Arc<AtomicI64>,
+    /// Bot tokens seen on the `/bot{token}/{method}` path (the fixture
+    /// verifies every request carries the token path).
+    pub tokens: Arc<Mutex<Vec<String>>>,
+    /// When set, every Bot API method responds with a large chunked body
+    /// (used to exercise the client's bounded response cap).
+    pub huge_chunked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FixtureState {
@@ -111,10 +118,24 @@ fn fixture_ok_result(result: Value) -> axum::response::Response {
 
 async fn bot_api_handler(
     State(state): State<FixtureState>,
-    Path((_token, method)): Path<(String, String)>,
+    Path((token, method)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     body: String,
 ) -> axum::response::Response {
+    state
+        .tokens
+        .lock()
+        .expect("tokens lock")
+        .push(token.clone());
+    if state.huge_chunked.load(Ordering::SeqCst) {
+        // A bounded-but-oversized chunked body: 256 × 1 KiB. The client
+        // must abort at its cap; the fixture must survive the abort.
+        let chunks = futures_util::stream::repeat_with(|| {
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'x'; 1024]))
+        })
+        .take(256);
+        return axum::response::Response::new(axum::body::Body::from_stream(chunks));
+    }
     let parsed: Value = if body.trim().is_empty() {
         Value::Null
     } else {
@@ -241,6 +262,7 @@ fn test_config(api_base: &str) -> TelegramConfig {
         max_429_backoff: std::time::Duration::from_secs(1),
         max_5xx_retries: 2,
         max_edit_interval: std::time::Duration::ZERO,
+        max_response_body_bytes: 1024 * 1024,
         dedup_capacity: 64,
         allowed_accounts: vec!["fixture_bot".to_string()],
         allowed_chats: vec![555, -1001234],
@@ -414,6 +436,63 @@ async fn client_other_4xx_is_typed_and_not_retried() {
         1,
         "non-429 4xx errors must not be retried"
     );
+}
+
+#[tokio::test]
+async fn client_response_over_the_body_cap_is_a_typed_error_and_the_fixture_survives() {
+    let (base, state) = spawn_fixture().await;
+    state.huge_chunked.store(true, Ordering::SeqCst);
+    let config = TelegramConfig {
+        max_response_body_bytes: 1024,
+        ..test_config(&base)
+    };
+    let api = TelegramApi::new(&config);
+    let error = api
+        .get_updates(None, 5, 50)
+        .await
+        .expect_err("the chunked body exceeds the cap");
+    assert!(
+        matches!(error, TelegramError::ResponseTooLarge { limit: 1024 }),
+        "over-limit bodies must be a typed response-too-large failure: {error:?}"
+    );
+    // The fixture must have seen the token path even for the aborted
+    // request, and must keep serving after the client abort (panic-safe).
+    assert!(
+        state
+            .tokens
+            .lock()
+            .expect("tokens lock")
+            .iter()
+            .any(|token| token == "123456:TEST-SECRET-TOKEN"),
+        "every request must carry the /bot<token>/<method> path"
+    );
+    state.huge_chunked.store(false, Ordering::SeqCst);
+    let me = api
+        .get_me()
+        .await
+        .expect("the fixture must keep serving after the client abort");
+    assert_eq!(me.username.as_deref(), Some("fixture_bot"));
+}
+
+#[tokio::test]
+async fn client_requests_carry_the_bot_token_path() {
+    let (base, state) = spawn_fixture().await;
+    let api = TelegramApi::new(&test_config(&base));
+    api.get_me().await.expect("getMe should succeed");
+    api.send_message(555, None, "token path check")
+        .await
+        .expect("sendMessage should succeed");
+    let tokens = state.tokens.lock().expect("tokens lock");
+    assert!(
+        !tokens.is_empty(),
+        "the fixture must have observed at least one request"
+    );
+    for token in tokens.iter() {
+        assert_eq!(
+            token, "123456:TEST-SECRET-TOKEN",
+            "every request must hit the /bot<token>/<method> path"
+        );
+    }
 }
 
 #[tokio::test]

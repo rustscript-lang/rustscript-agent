@@ -40,6 +40,9 @@ pub struct TelegramConfig {
     /// Minimum interval between `editMessageText` calls (delta throttle);
     /// zero edits on every delta.
     pub max_edit_interval: Duration,
+    /// Bounded cap on one Bot API response body; a body that exceeds it is
+    /// a typed [`TelegramError::ResponseTooLarge`] and is never buffered.
+    pub max_response_body_bytes: usize,
     /// Bounded capacity of the update_id/message_id dedup windows.
     pub dedup_capacity: usize,
     /// Allowed bot account usernames (case-insensitive); empty denies all.
@@ -64,6 +67,7 @@ impl std::fmt::Debug for TelegramConfig {
             .field("max_429_backoff", &self.max_429_backoff)
             .field("max_5xx_retries", &self.max_5xx_retries)
             .field("max_edit_interval", &self.max_edit_interval)
+            .field("max_response_body_bytes", &self.max_response_body_bytes)
             .field("dedup_capacity", &self.dedup_capacity)
             .field("allowed_accounts", &self.allowed_accounts)
             .field("allowed_chats", &self.allowed_chats)
@@ -126,6 +130,9 @@ impl TelegramConfig {
         if self.dedup_capacity == 0 {
             return Err("telegram dedup_capacity must be positive".to_string());
         }
+        if self.max_response_body_bytes == 0 {
+            return Err("telegram max_response_body_bytes must be positive".to_string());
+        }
         Ok(())
     }
 }
@@ -142,6 +149,7 @@ impl Default for TelegramConfig {
             max_429_backoff: Duration::from_secs(30),
             max_5xx_retries: 3,
             max_edit_interval: Duration::from_millis(300),
+            max_response_body_bytes: 1024 * 1024,
             dedup_capacity: 512,
             allowed_accounts: Vec::new(),
             allowed_chats: Vec::new(),
@@ -611,5 +619,18 @@ mod tests {
         explicit
             .validate()
             .expect("allow_insecure_localhost permits localhost http");
+    }
+
+    #[test]
+    fn telegram_max_response_body_bytes_must_be_positive() {
+        let config = TelegramConfig {
+            bot_token: "123:abc".to_string(),
+            max_response_body_bytes: 0,
+            ..TelegramConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "max_response_body_bytes must be a validated positive bound"
+        );
     }
 }
