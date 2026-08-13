@@ -685,9 +685,11 @@ impl AgentService {
     /// releases the capacity permit, and sets the atomic terminal flag the
     /// subscriber drop guard consults before any client-disconnect
     /// cancellation. The first call also releases the active gauge and
-    /// records the run duration into the fixed histogram buckets. Called
-    /// by the worker (or the bounded terminal retry loop) after the one
-    /// terminal commit.
+    /// records the run duration into the fixed histogram buckets; a
+    /// repeated call for the same run (the bounded durable retry path can
+    /// re-enter) must never double-decrement the gauge. Called by the
+    /// worker (or the bounded terminal retry loop) after the one terminal
+    /// commit.
     pub fn mark_terminal(&self, run_id: &str) {
         if let Some(handle) = self
             .inner
@@ -704,11 +706,13 @@ impl AgentService {
                 self.inner
                     .metrics
                     .record_run_duration(handle.started_at.elapsed().as_secs_f64());
+                // The gauge release belongs to the same first-call guard:
+                // the run transitions out of the active gauge exactly once.
+                self.inner.metrics.active_runs_dec();
             }
             *terminal_at = Some(now);
             drop(terminal_at);
             handle.permit.lock().expect("permit lock").take();
-            self.inner.metrics.active_runs_dec();
         }
     }
 
@@ -919,8 +923,6 @@ impl AgentService {
             .await;
     }
 
-    /// Durably commits the completed terminal. The assistant message,
-    /// `message.delta`, and `run.completed` form one atomic delta: the whole
     /// Durably commits the completed terminal. The assistant message,
     /// `message.delta`, and `run.completed` form one atomic delta: the whole
     /// delta is persisted through the typed `run.terminal` transaction under

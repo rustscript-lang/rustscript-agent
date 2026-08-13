@@ -1027,7 +1027,10 @@ async fn run_events_handler(
         };
         if let Some(cursor) = query.after_seq
             && let Some(earliest) = run.events.first().map(|event| event.seq)
-            && cursor + 1 < earliest
+            // Saturating: a u64::MAX cursor means "everything after the
+            // maximum sequence" (an empty replay), never an overflow panic
+            // or a wrapped cursor that looks older than retained history.
+            && cursor.saturating_add(1) < earliest
         {
             return json_error(
                 StatusCode::CONFLICT,

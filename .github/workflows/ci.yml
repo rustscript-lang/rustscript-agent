@@ -23,9 +23,10 @@ env:
   # revision. CI checks out the core at this revision so `--locked` builds
   # resolve. Bump this only together with a Cargo.lock refresh.
   RUSTSCRIPT_CORE_REF: 06b37fd155be2b81ba4b41dbb6514e7b283f4f10
-  # Integration tests place temporary SQLite state here. The tests honor
-  # this variable; without it they fall back to /mnt/TEMP/rustscript/...
-  # which is the local-development default and not writable on CI runners.
+  # Integration tests place temporary SQLite state and fixture scripts
+  # here. Every suite honors this variable; without it they fall back to
+  # /mnt/TEMP/rustscript/... which is the local-development default and
+  # not writable on CI runners.
   RUSTSCRIPT_AGENT_TEST_TMP: ${{ runner.temp }}/rustscript-agent-tests
 
 jobs:

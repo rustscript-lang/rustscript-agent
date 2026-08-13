@@ -134,14 +134,19 @@ fn compaction_row_matches(
 /// the new payload (the retry-after-failure / restart-recovery path). The
 /// reset keeps the row's audit identity (the caller's id equals the row's
 /// id — enforced by `storage_compaction_start`) and clears the stale
-/// `completed_at_ms`, so a later commit records only its own time. When no
+/// `completed_at_ms`, so a later commit records only its own time. The
+/// conflict clause additionally requires `compactions.id = excluded.id`:
+/// the typed different-id precheck closes the in-process race, and this
+/// SQL-level guard closes the cross-process window where two processes
+/// both passed the precheck before either row existed — a different-id
+/// conflict must never silently replace the failed row's identity. When no
 /// row exists after the insert, the guards rejected the start: that is a
 /// typed `compaction_start_rejected`, never a silent success.
 fn compaction_start_insert(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: CompactionStartInput = json::decode::<CompactionStartInput>(payload_json);
     sqlite::execute(
         db_id,
-        "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms, completed_at_ms = 0 WHERE compactions.state = 'failed'",
+        "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms, completed_at_ms = 0 WHERE compactions.state = 'failed' AND compactions.id = excluded.id",
         [&input.id, &input.session_id, &input.run_id, input.generation.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.retained_tail_ordinal.copy(), &input.summary_json, input.token_estimate.copy(), &input.model, input.now_ms.copy(), &input.session_id, input.generation.copy(), &input.run_id, &input.session_id, input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), &input.id, &input.session_id]
     );
     let inserted: map = sqlite::query(
@@ -271,6 +276,15 @@ pub fn storage_compaction_latest(db_id: int, session_id: string, max_rows: int, 
 
 pub fn storage_compaction_commit(db_id: int, payload_json: string) -> array {
     let input: CompactionCommitInput = json::decode::<CompactionCommitInput>(payload_json);
+    // The three statements run IN ORDER on one connection inside the
+    // transaction, and statement 2's `changes() = 1` guard reads the
+    // modified-row count of the PREVIOUS statement (statement 1's
+    // compaction UPDATE). The dependency is intentional and precise:
+    // messages are marked compacted only when the compaction row commit
+    // itself changed exactly one row (the pending -> committed
+    // transition), so a no-op or conflicting commit can never sweep
+    // messages. Statement 3 re-verifies the committed row directly
+    // (EXISTS ... state = 'committed') instead of relying on changes().
     let statements = [
         {
             sql: "UPDATE compactions SET state = 'committed', completed_at_ms = ? WHERE id = ? AND state = 'pending' AND session_id = ? AND source_start_ordinal = ? AND source_end_ordinal = ? AND generation = ? AND ? >= 0 AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = compactions.session_id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = compactions.session_id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM runs WHERE runs.id = compactions.run_id AND runs.session_id = ? AND runs.status = 'compacting') AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = ? AND sessions.generation = ? - 1)",
@@ -290,6 +304,13 @@ pub fn storage_compaction_commit(db_id: int, payload_json: string) -> array {
 
 pub fn storage_compaction_fail(db_id: int, payload_json: string) -> map {
     let input: CompactionFailInput = json::decode::<CompactionFailInput>(payload_json);
+    // Deliberately a silent no-op when no pending row matches (P3
+    // evaluation: every caller treats fail as best-effort — the compact
+    // policy emits it after an interruption, and restart recovery sweeps
+    // pending rows with its own unconditional UPDATE — so a missing row
+    // means the failure was already recorded or the row was never
+    // created; surfacing a typed error would break those callers without
+    // adding safety).
     sqlite::execute(
         db_id,
         "UPDATE compactions SET state = 'failed', error_message = ?, completed_at_ms = ? WHERE id = ? AND state = 'pending'",

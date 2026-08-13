@@ -1766,6 +1766,211 @@ fn orphan_references_are_rejected_with_typed_errors() {
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
 
+/// P3: the compaction guarded insert's `ON CONFLICT ... DO UPDATE` must
+/// also require the existing row to carry the SAME id
+/// (`compactions.id = excluded.id`). The typed different-id precheck closes
+/// the in-process race; this SQL-level guard closes the cross-process
+/// window where two processes both passed the precheck before either row
+/// existed — the update must never silently replace a failed row's audit
+/// identity. Both clauses below are the production
+/// `compaction_start_insert` statement (rss/storage/compactions.rss) with
+/// literal parameters, differing only in the id guard, so the semantics are
+/// exercised against real SQLite exactly as shipped.
+#[test]
+fn compaction_conflict_update_requires_the_same_id() {
+    let root = temporary_root("compaction-race-guard");
+    let runner = storage_runner(&root);
+    let db_name = "race-guard.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-1",
+        "run.create",
+        run_payload("run-1", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-running",
+        "run.transition",
+        transition_payload("run-1", "queued", "running", 4),
+        4,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-compacting",
+        "run.transition",
+        transition_payload("run-1", "running", "compacting", 5),
+        5,
+    );
+    for ordinal in 1..=3 {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("message-append-{ordinal}"),
+            "message.append",
+            message_payload(
+                &format!("message-{ordinal}"),
+                "session-1",
+                ordinal,
+                5 + ordinal,
+            ),
+            5 + ordinal,
+        );
+    }
+    // The typed path creates the pending row (id compaction-1) and fails it.
+    let started = run_storage(
+        &runner,
+        db_name,
+        "start",
+        "compaction.start",
+        json!({
+            "id": "compaction-1",
+            "session_id": "session-1",
+            "run_id": "run-1",
+            "generation": 2,
+            "source_start_ordinal": 1,
+            "source_end_ordinal": 3,
+            "retained_tail_ordinal": 3,
+            "summary_json": "{}",
+            "token_estimate": 0,
+            "model": "m",
+            "now_ms": 1000,
+        }),
+        1000,
+    );
+    assert_eq!(started["ok"], json!(true));
+    run_storage(
+        &runner,
+        db_name,
+        "fail",
+        "compaction.fail",
+        json!({
+            "id": "compaction-1",
+            "error_message": "boom",
+            "completed_at_ms": 1000,
+        }),
+        1000,
+    );
+
+    // A second process's guarded insert for the SAME session+generation but
+    // a DIFFERENT id. Both clause variants below mirror the production
+    // statement; the first one intentionally drops the id guard to prove the
+    // setup detects a clobber (sensitivity), the second carries the shipped
+    // guard and must leave the failed row untouched.
+    let insert_head = concat!(
+        "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) ",
+        "SELECT 'compaction-2', 'session-1', 'run-1', 2, 1, 3, 3, '{}', 0, 'm', 'pending', 1000 ",
+        "FROM sessions JOIN runs ON runs.session_id = sessions.id ",
+        "WHERE sessions.id = 'session-1' AND sessions.generation + 1 = 2 AND runs.id = 'run-1' AND runs.session_id = 'session-1' AND runs.status = 'compacting' ",
+        "AND 1 >= 0 AND 3 >= 1 AND 3 >= 1 AND 3 <= 3 ",
+        "AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = 1) ",
+        "AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = 3) ",
+        "AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = 'compaction-2' AND existing.session_id <> 'session-1') ",
+        "ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms, completed_at_ms = 0 ",
+        "WHERE compactions.state = 'failed'"
+    );
+    let unguarded = query_sql_runner(
+        &root,
+        "race-unguarded",
+        &[insert_head],
+        "SELECT id, state FROM compactions WHERE session_id = 'session-1' AND generation = 2",
+    );
+    let inspected = unguarded
+        .run_with_context(Value::map(vec![(
+            Value::string("db_name"),
+            Value::string(db_name),
+        )]))
+        .expect("unguarded insert should run");
+    let Value::Map(inspected) = inspected else {
+        panic!("inspection should return a map");
+    };
+    let rows = vm_value_to_json(&Value::Map(inspected))["rows"]
+        .as_array()
+        .expect("inspection rows")
+        .clone();
+    assert_eq!(
+        rows[0][0],
+        json!("compaction-2"),
+        "without the id guard the different-id insert would clobber the failed row"
+    );
+    assert_eq!(rows[0][1], json!("pending"));
+
+    // Restore the failed row's identity so the guarded clause can be
+    // exercised in isolation.
+    let restore = query_sql_runner(
+        &root,
+        "race-restore",
+        &[
+            "UPDATE compactions SET id = 'compaction-1', state = 'failed', error_message = 'boom', completed_at_ms = 1000 WHERE session_id = 'session-1' AND generation = 2",
+        ],
+        "SELECT id, state FROM compactions WHERE session_id = 'session-1' AND generation = 2",
+    );
+    let inspected = restore
+        .run_with_context(Value::map(vec![(
+            Value::string("db_name"),
+            Value::string(db_name),
+        )]))
+        .expect("restore should run");
+    let Value::Map(inspected) = inspected else {
+        panic!("inspection should return a map");
+    };
+    let rows = vm_value_to_json(&Value::Map(inspected))["rows"]
+        .as_array()
+        .expect("inspection rows")
+        .clone();
+    assert_eq!(rows[0][0], json!("compaction-1"));
+    assert_eq!(rows[0][1], json!("failed"));
+
+    // The shipped clause: the conflict fires on the unique key, but the DO
+    // UPDATE must not clobber the failed row because excluded.id differs.
+    let guarded_sql = format!("{insert_head} AND compactions.id = excluded.id");
+    let guarded = query_sql_runner(
+        &root,
+        "race-guarded",
+        &[guarded_sql.as_str()],
+        "SELECT id, state, error_message FROM compactions WHERE session_id = 'session-1' AND generation = 2",
+    );
+    let inspected = guarded
+        .run_with_context(Value::map(vec![(
+            Value::string("db_name"),
+            Value::string(db_name),
+        )]))
+        .expect("guarded insert should run");
+    let Value::Map(inspected) = inspected else {
+        panic!("inspection should return a map");
+    };
+    let rows = vm_value_to_json(&Value::Map(inspected))["rows"]
+        .as_array()
+        .expect("inspection rows")
+        .clone();
+    assert_eq!(rows.len(), 1, "exactly one compaction row must remain");
+    assert_eq!(
+        rows[0][0],
+        json!("compaction-1"),
+        "the different-id insert must not clobber the failed row's audit identity"
+    );
+    assert_eq!(rows[0][1], json!("failed"), "the row must stay failed");
+    assert_eq!(
+        rows[0][2],
+        json!("boom"),
+        "the failure message must survive"
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
 /// P3: a run.transition that matches no row is a typed `transition_conflict`,
 /// never a silent success.
 #[test]

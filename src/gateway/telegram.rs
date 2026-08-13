@@ -780,7 +780,7 @@ struct AdapterRuntime {
     epochs: Arc<Mutex<EpochState>>,
     /// Metric: delivery cursor advance failures (at-least-once delivery
     /// hook — see [`advance_cursor`]). The bounded metrics registry's
-    /// `agent_storage_ops_total{op="delivery.advance",result="error"}`
+    /// `agent_storage_ops_total{op="delivery.advance",outcome="error"}`
     /// counter is the source of truth for every storage command failure;
     /// this adapter-scoped counter mirrors the same events at the same call
     /// sites and exists so tests can observe one adapter's delivery health
@@ -2060,7 +2060,6 @@ async fn run_renderer(
                 &epochs,
                 &session_id,
                 epoch,
-                &advance_failures,
             )
             .await;
             return;
@@ -2167,7 +2166,6 @@ async fn run_renderer(
         &epochs,
         &session_id,
         epoch,
-        &advance_failures,
     )
     .await;
 }
@@ -2179,7 +2177,6 @@ async fn run_renderer(
 /// never reach a recreated session): the epoch is checked before EVERY
 /// action and again after every network return, so a `/new` that bumps the
 /// epoch while an action is in flight stops every subsequent action.
-#[allow(clippy::too_many_arguments)]
 async fn flush_renderer(
     api: &TelegramApi,
     renderer: &mut EventRenderer,
@@ -2188,7 +2185,6 @@ async fn flush_renderer(
     epochs: &Arc<Mutex<EpochState>>,
     session_id: &str,
     epoch: u64,
-    _advance_failures: &Arc<AtomicU64>,
 ) {
     for action in renderer.flush() {
         // Before the action: the session may have been reset while this

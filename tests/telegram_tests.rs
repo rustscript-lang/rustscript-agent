@@ -674,12 +674,48 @@ use rustscript_agent::{
 };
 use uuid::Uuid;
 
-/// Temporary gateway SQLite path under /mnt/TEMP/rustscript (workspace
-/// rule: all development temporary state lives there).
+/// Base directory for this suite's temporary artifacts. Honors
+/// `RUSTSCRIPT_AGENT_TEST_TMP` (CI sets it to a runner-local directory and
+/// this suite owns the unique `telegram-tests` subdir there); without it,
+/// development state stays under /mnt/TEMP/rustscript (workspace rule).
+fn telegram_test_root() -> std::path::PathBuf {
+    std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/mnt/TEMP/rustscript"))
+        .join("telegram-tests")
+}
+
+/// Temporary gateway SQLite path (a fresh unique name per call, so parallel
+/// tests can never collide).
 fn telegram_db_path(label: &str) -> std::path::PathBuf {
-    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/telegram-tests");
-    std::fs::create_dir_all(&root).expect("telegram test root should be created");
+    telegram_db_path_in(&telegram_test_root(), label)
+}
+
+/// The path builder itself: the base directory is explicit so the unit test
+/// below pins the layout without touching the process-global env var
+/// (parallel tests must never set it).
+fn telegram_db_path_in(root: &std::path::Path, label: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(root).expect("telegram test root should be created");
     root.join(format!("{label}-{}.db", Uuid::new_v4()))
+}
+
+#[test]
+fn telegram_test_artifacts_land_under_an_explicit_root() {
+    let base = std::env::temp_dir().join(format!("telegram-root-{}", Uuid::new_v4()));
+    let db = telegram_db_path_in(&base, "layout");
+    assert!(
+        db.starts_with(&base),
+        "the database must live under the explicit root, got {db:?}"
+    );
+    assert_eq!(db.parent(), Some(base.as_path()));
+    assert!(
+        db.file_name()
+            .expect("db file name")
+            .to_string_lossy()
+            .starts_with("layout-"),
+        "the label must prefix the unique file name"
+    );
+    std::fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
 /// Polls until `condition` holds, panicking after the timeout.
@@ -2304,7 +2340,7 @@ async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
     let (base, state) = spawn_fixture().await;
     push_update(&state, fixture_json("updates_dm.json"));
     let db = telegram_db_path("binary");
-    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/telegram-tests");
+    let root = telegram_test_root();
     std::fs::create_dir_all(&root).expect("telegram test root");
     let script = root.join(format!("binary-{}.rss", Uuid::new_v4()));
     std::fs::write(&script, ECHO_SOURCE).expect("write agent script");
@@ -2424,7 +2460,7 @@ fn install_log_capture() -> Arc<Mutex<Vec<String>>> {
 #[tokio::test]
 async fn gateway_binary_survives_telegram_startup_failure_and_serves_the_api() {
     let db = telegram_db_path("binary-degraded");
-    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/telegram-tests");
+    let root = telegram_test_root();
     std::fs::create_dir_all(&root).expect("telegram test root");
     let script = root.join(format!("binary-degraded-{}.rss", Uuid::new_v4()));
     std::fs::write(&script, ECHO_SOURCE).expect("write agent script");

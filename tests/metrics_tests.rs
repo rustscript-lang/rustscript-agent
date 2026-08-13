@@ -21,12 +21,41 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Temporary gateway SQLite path under /mnt/TEMP/rustscript (workspace
-/// rule: all development temporary state lives there).
+/// Base directory for this suite's temporary SQLite state. Honors
+/// `RUSTSCRIPT_AGENT_TEST_TMP` (CI sets it to a runner-local directory and
+/// this suite owns the unique `metrics-tests` subdir there); without it,
+/// development state stays under /mnt/TEMP/rustscript/gateway-tests
+/// (workspace rule).
+fn metrics_test_root() -> std::path::PathBuf {
+    std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+        .map(|tmp| std::path::PathBuf::from(tmp).join("metrics-tests"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/mnt/TEMP/rustscript/gateway-tests"))
+}
+
+/// Temporary gateway SQLite path (a fresh unique name per call, so parallel
+/// tests can never collide).
 fn gateway_db_path(label: &str) -> std::path::PathBuf {
-    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/gateway-tests");
-    std::fs::create_dir_all(&root).expect("gateway test root should be created");
+    gateway_db_path_in(&metrics_test_root(), label)
+}
+
+/// The path builder itself: the base directory is explicit so the unit test
+/// below pins the layout without touching the process-global env var
+/// (parallel tests must never set it).
+fn gateway_db_path_in(root: &std::path::Path, label: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(root).expect("gateway test root should be created");
     root.join(format!("{label}-{}.db", Uuid::new_v4()))
+}
+
+#[test]
+fn metrics_test_artifacts_land_under_an_explicit_root() {
+    let base = std::env::temp_dir().join(format!("metrics-root-{}", Uuid::new_v4()));
+    let db = gateway_db_path_in(&base, "layout");
+    assert!(
+        db.starts_with(&base),
+        "the database must live under the explicit root, got {db:?}"
+    );
+    assert_eq!(db.parent(), Some(base.as_path()));
+    std::fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
 async fn json_request(
@@ -1180,5 +1209,49 @@ async fn stop_and_halt_log_structured_typed_reasons() {
             .iter()
             .any(|entry| entry.contains("reason") && entry.contains("resource_closed")),
         "halt must log the typed resource-closed reason as a structured field, got: {captured:?}"
+    );
+}
+
+/// P3: `mark_terminal` can be re-entered for the same run (the bounded
+/// durable retry path), so the active gauge release belongs to the
+/// first-call guard: a repeated terminal call must never decrement the
+/// gauge twice (which would push it below zero).
+#[tokio::test]
+async fn repeated_mark_terminal_never_double_decrements_the_active_gauge() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"done\"; }",
+    )
+    .expect("RSS source should compile");
+    let service = state.service();
+    let metrics = state.metrics();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"probe": "terminal-twice"}),
+            platform: "probe".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admission should succeed");
+    assert_eq!(
+        metrics.snapshot().active_runs,
+        1,
+        "admission must hold exactly one active run"
+    );
+
+    service.mark_terminal(&admitted.run_id);
+    assert_eq!(
+        metrics.snapshot().active_runs,
+        0,
+        "the first terminal call must release the active gauge"
+    );
+
+    // The durable retry path can re-enter mark_terminal for the same run;
+    // a repeat must never decrement the gauge below zero.
+    service.mark_terminal(&admitted.run_id);
+    assert_eq!(
+        metrics.snapshot().active_runs,
+        0,
+        "a repeated terminal call must not double-decrement the active gauge"
     );
 }

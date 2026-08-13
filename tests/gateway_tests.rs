@@ -4012,6 +4012,70 @@ async fn keep_running_default_survives_disconnect_and_events_replay_by_cursor() 
     );
 }
 
+/// P3: an `after_seq` of u64::MAX must not overflow the retained-history
+/// check: the cursor is saturated, so the request answers with the empty
+/// replay (no event can follow the maximum sequence) instead of panicking
+/// or wrapping into a bogus `event_cursor_too_old` conflict. The SSE stream
+/// stays open after the empty replay (live subscription semantics — clients
+/// never wait for EOF), so the body is read with a bounded window.
+#[tokio::test]
+async fn max_u64_event_cursor_is_rejected_without_overflow() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"done\"; }",
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "cursor-max"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+
+    // Wait for the terminal so retained history exists (earliest seq 1)
+    // and the terminal event is replayable.
+    let text = read_run_events(&app, run_id).await;
+    assert!(text.contains("event: run.completed"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!(
+                    "/v1/runs/{run_id}/events?after_seq=18446744073709551615"
+                ))
+                .body(Body::empty())
+                .expect("SSE request should build"),
+        )
+        .await
+        .expect("the router must answer the saturated cursor, not panic");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a saturated cursor must answer 200, not panic or wrap"
+    );
+    // Nothing can be replayed after u64::MAX: whatever arrives within the
+    // bounded window must not contain any event.
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024);
+    let body = tokio::time::timeout(std::time::Duration::from_millis(1500), body).await;
+    let text = match body {
+        Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(Err(error)) => panic!("SSE body should be readable: {error}"),
+        Err(_) => String::new(),
+    };
+    assert!(
+        !text.contains("event: run.completed"),
+        "no retained event can follow u64::MAX, got: {text:?}"
+    );
+    assert!(!text.contains("event: run.started"));
+}
+
 #[tokio::test]
 async fn cancel_on_disconnect_cancels_when_last_subscriber_disconnects() {
     let state = AgentGatewayState::with_agent_source(

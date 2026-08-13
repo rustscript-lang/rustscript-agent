@@ -940,15 +940,52 @@ fn compact_fixture_context_deserializes() {
 // Compaction execution through the A2 typed storage service
 // ---------------------------------------------------------------------------
 
+/// Base directory for this suite's temporary storage state. Honors
+/// `RUSTSCRIPT_AGENT_TEST_TMP` (CI sets it to a runner-local directory and
+/// this suite owns the unique `agent-tests` subdir there); without it,
+/// development state stays under /mnt/TEMP/rustscript (workspace rule).
+fn agent_test_root() -> PathBuf {
+    std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/mnt/TEMP/rustscript"))
+        .join("agent-tests")
+}
+
 fn temporary_root(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after the Unix epoch")
         .as_nanos();
-    let root = PathBuf::from("/mnt/TEMP/rustscript/agent-tests")
-        .join(format!("{label}-{}-{nonce}", std::process::id()));
-    fs::create_dir_all(&root).expect("temporary storage root should be created");
-    root
+    temporary_root_in(&agent_test_root(), label, nonce)
+}
+
+/// The path builder itself: the base directory is explicit so the unit test
+/// below pins the layout without touching the process-global env var
+/// (parallel tests must never set it). The pid + nanosecond nonce keeps
+/// concurrent tests in this process from colliding.
+fn temporary_root_in(root: &std::path::Path, label: &str, nonce: u128) -> PathBuf {
+    let path = root.join(format!("{label}-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&path).expect("temporary storage root should be created");
+    path
+}
+
+#[test]
+fn agent_test_artifacts_land_under_an_explicit_root() {
+    let base = std::env::temp_dir().join(format!("agent-root-{}", std::process::id()));
+    let root = temporary_root_in(&base, "layout", 1);
+    assert!(
+        root.starts_with(&base),
+        "the storage root must live under the explicit root, got {root:?}"
+    );
+    assert!(
+        root.file_name()
+            .expect("root name")
+            .to_string_lossy()
+            .starts_with("layout-"),
+        "the label must prefix the unique directory name"
+    );
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+    fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
 fn storage_command(
