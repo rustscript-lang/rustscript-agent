@@ -1548,3 +1548,900 @@ async fn production_load_drains_beyond_page_and_byte_boundaries() {
     drop(restored_app);
     let _ = std::fs::remove_file(&path);
 }
+
+/// Polls a condition until it holds or the timeout expires.
+async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// P2: a terminal commit that fails while storage is down must not leak the
+/// run's handle/SSE/permit. The run enters an observable terminal-pending
+/// state, its admission permit is released as soon as it stops executing,
+/// and a bounded retry commits the terminal exactly once once storage
+/// recovers (durable commit first, publish only after).
+#[tokio::test]
+async fn terminal_commit_is_retried_after_storage_recovers_exactly_once() {
+    let path = gateway_db_path("terminal-retry");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            janitor_interval: std::time::Duration::from_millis(100),
+            terminal_commit_retry_window: std::time::Duration::from_secs(10),
+            ..AgentGatewayConfig::default()
+        },
+        r#"
+        pub fn run(input: map) -> string {
+            while true {
+                1;
+            }
+            "unreachable";
+        }
+        "#,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "retry-me"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    // Storage goes down: replace the SQLite file with a directory so every
+    // storage command fails (the worker opens the DB per command).
+    let broken = path.with_extension("db.broken");
+    std::fs::rename(&path, &broken).expect("move the db aside");
+    std::fs::create_dir(&path).expect("break storage with a directory");
+
+    // Stop the active run; its terminal commit (cancelled) cannot be
+    // persisted, so the run must enter the observable terminal-pending state
+    // instead of silently staying "started" forever.
+    let (stop_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+
+    let pending = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 1
+    })
+    .await;
+    assert!(
+        pending,
+        "the run must enter the terminal-pending retry state"
+    );
+
+    // The admission permit is released as soon as the run stops executing,
+    // so a sustained storage outage can never permanently exhaust capacity.
+    assert_eq!(
+        service.available_capacity(),
+        AgentGatewayConfig::default().max_concurrent_runs,
+        "a terminal-pending run must not hold the admission permit"
+    );
+
+    // Storage recovers; the bounded retry commits the terminal durably and
+    // only then publishes it (exactly once).
+    std::fs::remove_dir(&path).expect("restore storage");
+    std::fs::rename(&broken, &path).expect("restore the db file");
+
+    let text = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        read_run_events(&app, &run_id),
+    )
+    .await
+    .expect("the terminal retry must publish within the bounded window");
+    assert_eq!(
+        text.matches("event: run.cancelled").count(),
+        1,
+        "exactly one terminal commit after recovery, got: {text}"
+    );
+    assert_eq!(
+        text.matches("event: run.completed").count() + text.matches("event: run.failed").count(),
+        0,
+        "no other terminal may be published, got: {text}"
+    );
+
+    let resolved = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 0
+    })
+    .await;
+    assert!(resolved, "the retry must remove the pending terminal entry");
+
+    // Restart round trip: the durable side also holds exactly one terminal
+    // (no duplicate, no recovery event for an already-terminal run).
+    drop(app);
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let text = read_run_events(&restored_app, &run_id).await;
+    assert_eq!(
+        text.matches("event: run.cancelled").count(),
+        1,
+        "restart must not duplicate or recover the terminal, got: {text}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P2: when storage stays down for the whole retry window, the run must
+/// not leak anything: the retry stops (bounded), the admission permit stays
+/// released, the SSE stream ends without a fabricated terminal, the handle
+/// is released via its TTL, and the durable side is repaired exactly once
+/// by restart recovery.
+#[tokio::test]
+async fn terminal_commit_window_expiry_releases_capacity_and_restart_recovery_repairs() {
+    let path = gateway_db_path("terminal-expiry");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            janitor_interval: std::time::Duration::from_millis(100),
+            terminal_commit_retry_window: std::time::Duration::from_millis(400),
+            terminal_run_ttl: std::time::Duration::from_millis(500),
+            ..AgentGatewayConfig::default()
+        },
+        r#"
+        pub fn run(input: map) -> string {
+            while true {
+                1;
+            }
+            "unreachable";
+        }
+        "#,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "expire-me"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    // Storage goes down before the terminal commit.
+    let broken = path.with_extension("db.broken");
+    std::fs::rename(&path, &broken).expect("move the db aside");
+    std::fs::create_dir(&path).expect("break storage with a directory");
+    let (stop_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+
+    let pending = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 1
+    })
+    .await;
+    assert!(
+        pending,
+        "the run must enter the terminal-pending retry state"
+    );
+
+    // The pending terminal is observable through the health endpoint.
+    let (health_status, health) = json_request(
+        &app,
+        axum::http::Method::GET,
+        "/health/detailed",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(health_status, StatusCode::OK);
+    assert_eq!(health["terminal_pending"], json!(1));
+
+    // The window expires while storage is still down: the retry stops and
+    // the live stream ends without ever fabricating a terminal event.
+    let expired = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 0
+    })
+    .await;
+    assert!(expired, "the bounded retry window must expire");
+    let text = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_run_events(&app, &run_id),
+    )
+    .await
+    .expect("the SSE stream must end once the retry window expires");
+    assert!(
+        !text.contains("event: run.cancelled")
+            && !text.contains("event: run.completed")
+            && !text.contains("event: run.failed"),
+        "no terminal event may be published after expiry, got: {text}"
+    );
+
+    // Capacity is never exhausted and the handle is TTL-released.
+    assert_eq!(
+        service.available_capacity(),
+        AgentGatewayConfig::default().max_concurrent_runs
+    );
+    let released = wait_until(std::time::Duration::from_secs(10), || {
+        service.handle_count() == 0
+    })
+    .await;
+    assert!(released, "the terminal-pending handle must be TTL-released");
+
+    // Storage recovers; restart recovery fails the interrupted run exactly
+    // once, so the durable side reaches a real terminal state.
+    std::fs::remove_dir(&path).expect("restore storage");
+    std::fs::rename(&broken, &path).expect("restore the db file");
+    drop(app);
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let text = read_run_events(&restored_app, &run_id).await;
+    assert_eq!(
+        text.matches("event: run.failed").count(),
+        1,
+        "restart recovery must fail the interrupted run exactly once, got: {text}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Gated HTTP fixture: accepts one connection, reads the request headers,
+/// then blocks until released so the test can break storage while the
+/// worker is mid-flight.
+fn spawn_gated_fixture() -> (
+    u16,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{BufRead as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("fixture accept");
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).expect("read request head");
+            if read == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        drop(reader);
+        release_rx.recv().expect("fixture release");
+        let mut stream = stream;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .expect("write fixture response");
+    });
+    (port, release_tx, handle)
+}
+
+/// P2: the completed terminal (assistant message + delta + completed
+/// events) is rebuilt and committed exactly once by the bounded retry after
+/// storage recovers; the durable reload sees one terminal and the assistant
+/// message.
+#[tokio::test]
+async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
+    let (port, release, fixture) = spawn_gated_fixture();
+    let http = rustscript_vm::HttpConfig {
+        allowed_schemes: vec!["http".to_string()],
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..rustscript_vm::HttpConfig::default()
+    };
+
+    let path = gateway_db_path("terminal-retry-completed");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            janitor_interval: std::time::Duration::from_millis(100),
+            terminal_commit_retry_window: std::time::Duration::from_secs(10),
+            http,
+            ..AgentGatewayConfig::default()
+        },
+        format!(
+            r#"
+            use http;
+            pub fn run(input: map) -> map {{
+                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+            }}
+            "#
+        ),
+        &path,
+    )
+    .expect("SQLite state should open");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "completed-retry"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    // The admission auto-created a session; fetch its id for message checks.
+    let (sessions_status, sessions) = json_request(
+        &app,
+        axum::http::Method::GET,
+        "/api/sessions?limit=10&offset=0",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(sessions_status, StatusCode::OK);
+    let session_id = sessions["data"][0]["id"]
+        .as_str()
+        .expect("admission session id")
+        .to_string();
+
+    // The worker is blocked inside the HTTP call: break storage now, then
+    // release the fixture so the completed terminal commit fails durably.
+    let broken = path.with_extension("db.broken");
+    std::fs::rename(&path, &broken).expect("move the db aside");
+    std::fs::create_dir(&path).expect("break storage with a directory");
+    release.send(()).expect("release the fixture");
+
+    let pending = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 1
+    })
+    .await;
+    assert!(
+        pending,
+        "the completed run must enter the terminal-pending retry state"
+    );
+    assert_eq!(
+        service.available_capacity(),
+        AgentGatewayConfig::default().max_concurrent_runs,
+        "a terminal-pending run must not hold the admission permit"
+    );
+
+    // Storage recovers; the retry re-appends the assistant message and both
+    // terminal events, commits them durably, then publishes exactly once.
+    std::fs::remove_dir(&path).expect("restore storage");
+    std::fs::rename(&broken, &path).expect("restore the db file");
+    let text = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        read_run_events(&app, &run_id),
+    )
+    .await
+    .expect("the completed terminal retry must publish within the bounded window");
+    assert_eq!(
+        text.matches("event: run.completed").count(),
+        1,
+        "exactly one completed terminal after recovery, got: {text}"
+    );
+    assert_eq!(
+        text.matches("event: message.delta").count(),
+        1,
+        "the terminal delta replays once, got: {text}"
+    );
+
+    let resolved = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 0
+    })
+    .await;
+    assert!(resolved, "the retry must remove the pending terminal entry");
+
+    // In-memory session now holds the user message plus the assistant reply.
+    let (messages_status, messages) = json_request(
+        &app,
+        axum::http::Method::GET,
+        &format!("/api/sessions/{session_id}/messages"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(messages_status, StatusCode::OK);
+    assert_eq!(
+        messages["data"].as_array().map(Vec::len),
+        Some(2),
+        "the retried terminal must restore the assistant message"
+    );
+
+    // Restart round trip: the durable side holds the same single terminal
+    // and both messages.
+    drop(app);
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let text = read_run_events(&restored_app, &run_id).await;
+    assert_eq!(
+        text.matches("event: run.completed").count(),
+        1,
+        "restart must not duplicate the completed terminal, got: {text}"
+    );
+    let (messages_status, messages) = json_request(
+        &restored_app,
+        axum::http::Method::GET,
+        &format!("/api/sessions/{session_id}/messages"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(messages_status, StatusCode::OK);
+    assert_eq!(
+        messages["data"].as_array().map(Vec::len),
+        Some(2),
+        "the durable reload must keep both messages"
+    );
+    fixture.join().expect("fixture thread");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P2: when the durable side already reached a different terminal (restart
+/// recovery ran while the retry was pending), the retry must not publish a
+/// fabricated terminal: it drops the pending entry, closes the stream, and
+/// the durable recovery terminal stays the single source of truth.
+#[tokio::test]
+async fn terminal_retry_conflict_never_publishes_a_fabricated_terminal() {
+    let path = gateway_db_path("terminal-retry-conflict");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            janitor_interval: std::time::Duration::from_secs(2),
+            terminal_commit_retry_window: std::time::Duration::from_secs(30),
+            ..AgentGatewayConfig::default()
+        },
+        r#"
+        pub fn run(input: map) -> string {
+            while true {
+                1;
+            }
+            "unreachable";
+        }
+        "#,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "conflict-me"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    let broken = path.with_extension("db.broken");
+    std::fs::rename(&path, &broken).expect("move the db aside");
+    std::fs::create_dir(&path).expect("break storage with a directory");
+    let (stop_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+    let pending = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 1
+    })
+    .await;
+    assert!(
+        pending,
+        "the run must enter the terminal-pending retry state"
+    );
+
+    // Storage recovers, but a restart recovery runs first (a second gateway
+    // loads the same state and durably fails the interrupted run). The next
+    // retry tick then hits the typed transition conflict.
+    std::fs::remove_dir(&path).expect("restore storage");
+    std::fs::rename(&broken, &path).expect("restore the db file");
+    let recovered = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload and recover");
+    let recovered_app = build_agent_gateway_app(recovered);
+    let recovered_text = read_run_events(&recovered_app, &run_id).await;
+    assert_eq!(
+        recovered_text.matches("event: run.failed").count(),
+        1,
+        "restart recovery fails the interrupted run exactly once"
+    );
+    drop(recovered_app);
+
+    // The retry sees the durable conflict: the pending entry is dropped and
+    // the live stream ends without publishing any terminal.
+    let resolved = wait_until(std::time::Duration::from_secs(15), || {
+        service.pending_terminal_count() == 0
+    })
+    .await;
+    assert!(
+        resolved,
+        "the conflicting retry must drop the pending terminal entry"
+    );
+    let text = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_run_events(&app, &run_id),
+    )
+    .await
+    .expect("the SSE stream must end after the conflict");
+    assert!(
+        !text.contains("event: run.cancelled")
+            && !text.contains("event: run.completed")
+            && !text.contains("event: run.failed"),
+        "no fabricated terminal may be published, got: {text}"
+    );
+    assert_eq!(
+        service.available_capacity(),
+        AgentGatewayConfig::default().max_concurrent_runs
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P3: the service-owned terminal events (`message.delta` +
+/// `run.completed`) must honor the configured per-run retention and byte
+/// bounds, not hardcoded constants.
+#[tokio::test]
+async fn terminal_events_respect_the_configured_per_run_bounds() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            max_events_per_run: 4,
+            max_event_bytes: 64,
+            ..AgentGatewayConfig::default()
+        },
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "model.delta", "delta": "d1"});
+            stream::emit({"type": "model.delta", "delta": "d2"});
+            stream::emit({"type": "model.delta", "delta": "d3"});
+            stream::emit({"type": "model.delta", "delta": "d4"});
+            stream::emit({"type": "model.delta", "delta": "d5"});
+            stream::emit({"type": "model.delta", "delta": "d6"});
+            "done";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "bounded"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    // Wait until the run is no longer active, then subscribe: the SSE body
+    // is then exactly the retained history (no live events).
+    let finished = wait_until(std::time::Duration::from_secs(10), || {
+        service.available_capacity() == AgentGatewayConfig::default().max_concurrent_runs
+    })
+    .await;
+    assert!(finished, "the run must finish");
+    let text = read_run_events(&app, run_id).await;
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("event: "))
+            .count(),
+        4,
+        "retained history must honor the configured per-run bound, got: {text}"
+    );
+    assert_eq!(
+        text.lines().rev().find(|line| line.starts_with("event: ")),
+        Some("event: run.completed"),
+        "the terminal commit must stay the last retained event, got: {text}"
+    );
+    assert!(
+        text.contains("truncated"),
+        "the terminal events must honor the configured byte bound, got: {text}"
+    );
+    let _ = state;
+}
+
+/// P3: `stop` must not occupy a Tokio request thread while the store write
+/// lock is held by a storage-stalled mutation: it runs on a blocking
+/// thread, so an unrelated request completes while the stop is pending
+/// (single-threaded runtime: a blocking stop would stall everything).
+#[tokio::test(flavor = "current_thread")]
+async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
+    let path = gateway_db_path("stop-stall");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"done\"; }",
+        &path,
+    )
+    .expect("SQLite state should open");
+    let service = state.service();
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let app = build_agent_gateway_app(state);
+
+    // Admit and finish a run while storage is healthy.
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "stop-stall"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    let finished = wait_until(std::time::Duration::from_secs(10), || {
+        service.available_capacity() == AgentGatewayConfig::default().max_concurrent_runs
+    })
+    .await;
+    assert!(finished, "the run must finish before the stall");
+
+    // Seed enough state that a full reload occupies the storage worker for
+    // a while, then stall the worker with that reload. Large session
+    // prompts make the reload byte-bound (one row per page), so a handful
+    // of commands produce a multi-second reload.
+    let big_prompt = "x".repeat(900_000);
+    let mut now = 5_000_000u64;
+    for index in 0..250 {
+        persistence
+            .session_create(&json!({
+                "id": format!("stall-session-{index:04}"),
+                "profile": "gateway",
+                "platform": "test",
+                "account_id": format!("account-{index:04}"),
+                "chat_id": format!("chat-{index:04}"),
+                "thread_id": "",
+                "user_id": "",
+                "generation": 1,
+                "system_prompt": big_prompt,
+                "model": "m",
+                "provider": "p",
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now,
+            }))
+            .expect("session create should commit");
+        now += 1;
+    }
+    let slow_persistence = persistence.clone();
+    let slow_load = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        slow_persistence.load().expect("reload should succeed");
+        started.elapsed()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Hold the store write lock behind the stalled worker with a session
+    // create, then request a stop: the stop must wait on a blocking thread.
+    let stall_app = app.clone();
+    let session_hold = tokio::spawn(async move {
+        json_request(
+            &stall_app,
+            axum::http::Method::POST,
+            "/api/sessions",
+            json!({"id": "lock-holder", "source": "test"}),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // The stop request: while it is pending, an unrelated request spawned
+    // alongside it must still complete within a strict budget. On a
+    // single-threaded runtime a stop that occupies the request thread would
+    // starve the probe until the stall drains; a blocking-thread stop lets
+    // it through. The probe's brief sleep makes the ordering of the two
+    // tasks irrelevant: whichever runs first, the probe cannot finish
+    // before the stall drains if the stop occupies the request thread.
+    let stop_app = app.clone();
+    let stop = tokio::spawn(async move {
+        json_request(
+            &stop_app,
+            axum::http::Method::POST,
+            &format!("/v1/runs/{run_id}/stop"),
+            Value::Null,
+        )
+        .await
+    });
+    let probe_app = app.clone();
+    let probe = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        json_request(
+            &probe_app,
+            axum::http::Method::GET,
+            "/v1/models",
+            Value::Null,
+        )
+        .await
+    });
+    let models = tokio::time::timeout(std::time::Duration::from_millis(600), probe).await;
+    assert!(
+        models.is_ok(),
+        "the request runtime must stay responsive while stop waits"
+    );
+    assert_eq!(
+        models
+            .expect("models response")
+            .expect("probe task must not panic")
+            .0,
+        StatusCode::OK
+    );
+
+    let slow: std::time::Duration =
+        tokio::time::timeout(std::time::Duration::from_secs(120), slow_load)
+            .await
+            .expect("the reload must finish")
+            .expect("reload task must not panic");
+    assert!(
+        slow >= std::time::Duration::from_millis(1200),
+        "the seeded reload must actually occupy the worker for a while (took {slow:?})"
+    );
+
+    let (stop_status, stop_body) = tokio::time::timeout(std::time::Duration::from_secs(60), stop)
+        .await
+        .expect("the stop must finish once the stall drains")
+        .expect("stop task must not panic");
+    assert_eq!(stop_status, StatusCode::OK);
+    assert_eq!(stop_body["status"], "completed");
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(60), session_hold)
+        .await
+        .expect("the session create must finish once the stall drains")
+        .expect("session create task must not panic");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P3: the gateway job delete reports the real durable `rows_affected`
+/// instead of a hardcoded success, and a missing job stays a typed 404.
+#[tokio::test]
+async fn job_delete_reports_the_real_durable_rows_affected() {
+    let path = gateway_db_path("job-delete");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+
+    let (create_status, job) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/api/jobs",
+        json!({"name": "nightly", "prompt": "run"}),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+    let job_id = job["job"]["id"].as_str().expect("job id").to_string();
+
+    let (delete_status, deleted) = json_request(
+        &app,
+        axum::http::Method::DELETE,
+        &format!("/api/jobs/{job_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(deleted["deleted"], json!(true));
+    assert_eq!(
+        deleted["rows_affected"],
+        json!(1),
+        "the delete must report the real durable row count, got: {deleted}"
+    );
+
+    let (list_status, jobs) =
+        json_request(&app, axum::http::Method::GET, "/api/jobs", Value::Null).await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(jobs["jobs"].as_array().map(Vec::len), Some(0));
+
+    let (missing_status, _) = json_request(
+        &app,
+        axum::http::Method::DELETE,
+        &format!("/api/jobs/{job_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P3: run idempotency currently uses the single `api:chat` scope; the
+/// replay contract is tested explicitly — same key + same request replays
+/// the same run (also after a restart, proving the durable scope), same key
+/// + different request is a typed conflict.
+#[tokio::test]
+async fn idempotent_run_replay_uses_the_single_api_chat_scope() {
+    let path = gateway_db_path("idempotency");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"done\"; }",
+        &path,
+    )
+    .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+
+    let body = json!({"input": "idempotent"});
+    let request = |payload: Value| {
+        app.clone().oneshot(
+            Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/runs")
+                .header("idempotency-key", "chat-key-1")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request should build"),
+        )
+    };
+    let read = |response: axum::response::Response| async move {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should be readable");
+        (
+            status,
+            serde_json::from_slice::<Value>(&bytes).expect("response should be JSON"),
+        )
+    };
+
+    let (first_status, first) =
+        read(request(body.clone()).await.expect("router should respond")).await;
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    let run_id = first["run_id"].as_str().expect("run id").to_string();
+
+    // Same key + same request: the same run is replayed, never re-admitted.
+    let (replay_status, replay) =
+        read(request(body.clone()).await.expect("router should respond")).await;
+    assert_eq!(replay_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        replay["run_id"],
+        json!(run_id),
+        "the idempotency scope must replay the same run"
+    );
+
+    // Same key + different request: a typed conflict.
+    let (conflict_status, conflict) = read(
+        request(json!({"input": "different"}))
+            .await
+            .expect("router should respond"),
+    )
+    .await;
+    assert_eq!(conflict_status, StatusCode::CONFLICT);
+    assert_eq!(conflict["error"]["code"], "idempotency_key_reused");
+
+    // The durable idempotency record lives under the single `api:chat`
+    // scope, so the replay also works after a restart.
+    drop(app);
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let replay = restored_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/runs")
+                .header("idempotency-key", "chat-key-1")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("restored router should respond");
+    let replay_status = replay.status();
+    let bytes = to_bytes(replay.into_body(), 1024 * 1024)
+        .await
+        .expect("response body should be readable");
+    let replay: Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+    assert_eq!(replay_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        replay["run_id"],
+        json!(run_id),
+        "the durable api:chat scope must replay the same run after restart"
+    );
+    let _ = std::fs::remove_file(&path);
+}

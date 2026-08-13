@@ -4,9 +4,15 @@
 //! One reservation covers capacity (a semaphore permit), session
 //! resolution/creation, the run ID, and the cancellation/delivery state; any
 //! failure rolls back every intermediate step, so a rejected admission leaves
-//! no session or run behind. Stop, timeout, disconnect, and gateway halt
+//! Stop, timeout, disconnect, and gateway halt
 //! map to typed core cancellation reasons. Terminal lifecycle handles are
-//! bounded by a configured TTL.
+//! bounded by a configured TTL. A terminal commit that fails while storage
+//! is down registers the run as observably `terminal_pending` (never a
+//! false terminal): the admission permit is released immediately, and a
+//! bounded retry loop commits the typed terminal exactly once when storage
+//! recovers. After the retry window the durable side is left for restart
+//! recovery, so a sustained outage can neither exhaust capacity nor leak
+//! handles or live streams forever.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
@@ -21,9 +27,25 @@ use uuid::Uuid;
 use crate::RunCancellation;
 use crate::gateway::{AgentGatewayConfig, timestamp};
 use crate::gateway_store::{
-    GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage, SessionRecord,
-    SessionView,
+    GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
+    SessionRecord, SessionView,
 };
+
+/// One run whose terminal state could not be committed durably. The worker
+/// has already exited; a bounded retry loop (janitor cadence) commits the
+/// typed terminal exactly once when storage recovers — durable commit
+/// first, publish and permit release only after. The deadline bounds the
+/// retry so a sustained outage cannot exhaust admission capacity or
+/// accumulate retry state forever; the durable side is repaired by restart
+/// recovery once the window expires.
+#[derive(Clone)]
+pub struct PendingTerminal {
+    pub(crate) to_status: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) events: Vec<GatewayEvent>,
+    pub(crate) assistant_message: Option<SessionMessage>,
+    pub(crate) deadline: std::time::Instant,
+}
 
 /// One admitted run's lifecycle state: typed cancellation, delivery permit,
 /// and bounded terminal retention.
@@ -103,6 +125,7 @@ struct AgentServiceInner {
     http_config: HttpConfig,
     capacity: Arc<Semaphore>,
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
+    pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
 }
 
@@ -123,6 +146,7 @@ impl AgentService {
             http_config,
             capacity,
             runs: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
@@ -383,7 +407,7 @@ impl AgentService {
             parent_run_id: request.parent_run_id.clone(),
             status: "started".to_string(),
             events: vec![started_event],
-            sender,
+            sender: Some(sender),
             cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         store.runs.insert(run_id.clone(), run);
@@ -478,6 +502,55 @@ impl AgentService {
             *handle.terminal_at.lock().expect("terminal lock") = Some(Instant::now());
             handle.permit.lock().expect("permit lock").take();
         }
+    }
+
+    /// Records one run's terminal state for the bounded durable-first retry
+    /// loop. The worker already rolled the in-memory terminal mutation back;
+    /// this marks the run observably `terminal_pending` (never a false
+    /// terminal) and hands the prebuilt typed terminal to the retry loop.
+    /// Lock order: store write lock, then the pending map.
+    pub(crate) fn register_pending_terminal(&self, run_id: &str, pending: PendingTerminal) {
+        let mut store = self.inner.store.write();
+        if let Some(run) = store.runs.get_mut(run_id) {
+            run.status = "terminal_pending".to_string();
+        }
+        self.inner
+            .pending
+            .lock()
+            .expect("pending lock")
+            .insert(run_id.to_string(), pending);
+    }
+
+    /// Removes and returns one pending terminal entry (the retry loop owns
+    /// the entry while it attempts the durable commit).
+    pub(crate) fn take_pending_terminal(&self, run_id: &str) -> Option<PendingTerminal> {
+        self.inner
+            .pending
+            .lock()
+            .expect("pending lock")
+            .remove(run_id)
+    }
+
+    /// Re-inserts a pending terminal entry whose retry attempt failed (the
+    /// storage outage is still ongoing).
+    pub(crate) fn put_pending_terminal(&self, run_id: &str, pending: PendingTerminal) {
+        self.inner
+            .pending
+            .lock()
+            .expect("pending lock")
+            .insert(run_id.to_string(), pending);
+    }
+
+    /// Number of runs awaiting a durable terminal commit retry (observable
+    /// health state; bounded by the retry window).
+    pub fn pending_terminal_count(&self) -> usize {
+        self.inner.pending.lock().expect("pending lock").len()
+    }
+
+    /// Remaining admission capacity (observable; used by health and tests to
+    /// prove terminal-pending runs never hold permits).
+    pub fn available_capacity(&self) -> usize {
+        self.inner.capacity.available_permits()
     }
 }
 

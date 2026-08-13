@@ -8,27 +8,42 @@
 use json;
 use sqlite;
 
+/// The `load.all` command payload: page bounds and the hard total-row cap.
+/// `load_cap` is what turns an absurd state into the typed `load_too_large`
+/// error (the production gateway sends 1,000,000); tests parameterize it.
+struct LoadAllInput {
+    max_rows: int,
+    max_bytes: int,
+    load_cap: int
+}
+
 pub fn storage_load_all(db_id: int, payload_json: string) -> map {
+    let input: LoadAllInput = json::decode::<LoadAllInput>(payload_json);
     let page_size: int = 512;
+    let load_cap: int = input.load_cap.copy();
     let sessions = load_page(
         db_id,
         "SELECT rowid AS _cursor, id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms, title, end_reason FROM sessions WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
-        page_size
+        page_size,
+        load_cap
     );
     let runs = load_page(
         db_id,
         "SELECT rowid AS _cursor, id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
-        page_size
+        page_size,
+        load_cap
     );
     let jobs = load_page(
         db_id,
         "SELECT rowid AS _cursor, id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
-        page_size
+        page_size,
+        load_cap
     );
     let idempotency = load_page(
         db_id,
         "SELECT rowid AS _cursor, scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
-        page_size
+        page_size,
+        load_cap
     );
     let mut failed: bool = false;
     let mut failure_message: string = "";
@@ -95,7 +110,7 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
                 if truncated == false {
                     page_done = true;
                 }
-                if messages.length > 1000000 {
+                if messages.length > load_cap {
                     failed = true;
                     failure_message = "gateway message state exceeds the load cap";
                     page_done = true;
@@ -140,7 +155,7 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
                 if truncated == false {
                     event_page_done = true;
                 }
-                if events.length > 1000000 {
+                if events.length > load_cap {
                     failed = true;
                     failure_message = "gateway event state exceeds the load cap";
                     event_page_done = true;
@@ -183,7 +198,7 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
     result
 }
 
-fn load_page(db_id: int, sql: string, page_size: int) -> map {
+fn load_page(db_id: int, sql: string, page_size: int, load_cap: int) -> map {
     let mut rows = [];
     let mut columns = [];
     let mut last_rowid: int = 0;
@@ -221,7 +236,7 @@ fn load_page(db_id: int, sql: string, page_size: int) -> map {
         if truncated == false {
             done = true;
         }
-        if rows.length > 1000000 {
+        if rows.length > load_cap {
             overload = true;
             done = true;
         }

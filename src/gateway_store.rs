@@ -43,6 +43,10 @@ const LOAD_PAGE_ROWS: i64 = 512;
 /// Per-page byte budget of the cursor-paginated `load.all` dump.
 const LOAD_PAGE_BYTES: i64 = 2 * 1024 * 1024;
 
+/// Hard total-row cap of the `load.all` dump: a state larger than this is
+/// a typed `load_too_large` error, never a silent truncation.
+const LOAD_CAP_ROWS: i64 = 1_000_000;
+
 /// Column orders of the `load.all` rows (part of the command contract; see
 /// `rss/storage/load.rss`).
 /// sessions:   id, profile, platform, account_id, chat_id, thread_id,
@@ -412,7 +416,11 @@ impl GatewayPersistence {
         let data = self
             .command_data(
                 "load.all",
-                &json!({ "max_rows": LOAD_PAGE_ROWS, "max_bytes": LOAD_PAGE_BYTES }),
+                &json!({
+                    "max_rows": LOAD_PAGE_ROWS,
+                    "max_bytes": LOAD_PAGE_BYTES,
+                    "load_cap": LOAD_CAP_ROWS,
+                }),
             )
             .map_err(|error| format!("load gateway state: {error}"))?;
         GatewayStore::from_load(&data)
@@ -457,7 +465,10 @@ pub(crate) struct RunRecord {
     pub(crate) parent_run_id: Option<String>,
     pub(crate) status: String,
     pub(crate) events: Vec<GatewayEvent>,
-    pub(crate) sender: broadcast::Sender<GatewayEvent>,
+    /// Live delivery channel; `None` once the run's stream was closed (the
+    /// bounded terminal retry expired) so SSE subscribers are never held
+    /// forever without a terminal event.
+    pub(crate) sender: Option<broadcast::Sender<GatewayEvent>>,
     /// Legacy boolean stop flag kept for in-memory compatibility; the
     /// authoritative typed cancellation lives in the service RunHandle.
     #[allow(dead_code)]
@@ -651,7 +662,7 @@ impl GatewayStore {
                 parent_run_id: optional_string(&row, 2),
                 status: memory_status(&string_cell(&row, 3, "run status")?).to_string(),
                 events: Vec::new(),
-                sender,
+                sender: Some(sender),
                 cancel_requested: Arc::new(AtomicBool::new(false)),
             };
             if runs.insert(run_id.clone(), run).is_some() {

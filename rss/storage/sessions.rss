@@ -85,10 +85,15 @@ pub fn storage_session_list(db_id: int, profile: string, platform: string, max_r
 
 pub fn storage_session_touch(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: SessionTouchInput = json::decode::<SessionTouchInput>(payload_json);
+    // The touch is keyed by session id only: a caller that carries a stale
+    // `generation` (for example after a compaction bumped the durable
+    // generation) must never silently no-op. `generation` stays in the
+    // input contract for payload compatibility but does not gate the
+    // update; compaction owns generation bumps.
     sqlite::execute(
         db_id,
-        "UPDATE sessions SET status = ?, system_prompt = ?, model = ?, provider = ?, toolset_hash = ?, metadata_json = ?, title = ?, end_reason = ?, updated_at_ms = ? WHERE id = ? AND generation = ?",
-        [&input.status, &input.system_prompt, &input.model, &input.provider, &input.toolset_hash, &input.metadata_json, &input.title, &input.end_reason, input.now_ms.copy(), &input.session_id, input.generation.copy()]
+        "UPDATE sessions SET status = ?, system_prompt = ?, model = ?, provider = ?, toolset_hash = ?, metadata_json = ?, title = ?, end_reason = ?, updated_at_ms = ? WHERE id = ?",
+        [&input.status, &input.system_prompt, &input.model, &input.provider, &input.toolset_hash, &input.metadata_json, &input.title, &input.end_reason, input.now_ms.copy(), &input.session_id]
     );
     storage_session_get(db_id, input.session_id, max_rows, max_bytes)
 }

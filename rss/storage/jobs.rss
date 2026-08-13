@@ -58,12 +58,14 @@ pub fn storage_job_update(db_id: int, payload_json: string, max_rows: int, max_b
 
 pub fn storage_job_delete(db_id: int, payload_json: string) -> map {
     let input: JobIdInput = json::decode::<JobIdInput>(payload_json);
-    sqlite::execute(
+    // Report the REAL rows affected: deleting a missing job is a typed
+    // zero-row result, never a hardcoded success.
+    let result: map = sqlite::execute(
         db_id,
         "DELETE FROM jobs WHERE id = ?",
         [&input.job_id]
     );
-    { ok: true, result: { rows_affected: 1, last_insert_rowid: 0 } }
+    { ok: true, result: result }
 }
 
 pub fn storage_job_get(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {

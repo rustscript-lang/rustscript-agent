@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::service::PendingTerminal;
 use crate::{AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink, events};
 
 use crate::gateway_store::{
@@ -53,6 +54,11 @@ pub struct AgentGatewayConfig {
     pub terminal_run_ttl: Duration,
     pub cancellation_grace: Duration,
     pub janitor_interval: Duration,
+    /// Bounded window during which a terminal commit that failed while
+    /// storage was down is retried (janitor cadence). After the window the
+    /// run's permit/handle/stream are released and the durable side is left
+    /// for restart recovery, so a sustained outage cannot exhaust capacity.
+    pub terminal_commit_retry_window: Duration,
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
     pub fuel: Option<u64>,
@@ -85,6 +91,9 @@ impl AgentGatewayConfig {
         if self.janitor_interval.is_zero() {
             return Err("janitor_interval must be positive".to_string());
         }
+        if self.terminal_commit_retry_window.is_zero() {
+            return Err("terminal_commit_retry_window must be positive".to_string());
+        }
         Ok(())
     }
 }
@@ -107,6 +116,7 @@ impl Default for AgentGatewayConfig {
             terminal_run_ttl: Duration::from_secs(60),
             cancellation_grace: Duration::from_secs(5),
             janitor_interval: Duration::from_secs(5),
+            terminal_commit_retry_window: Duration::from_secs(300),
             http: HttpConfig::default(),
             sqlite,
             fuel: Some(10_000_000),
@@ -436,6 +446,9 @@ async fn health_detailed_handler(State(state): State<AgentGatewayState>) -> impl
     Json(json!({
         "status": "ok",
         "active_agents": active_agents,
+        // Runs whose terminal commit is awaiting the bounded durable retry
+        // (observable instead of a silent leak).
+        "terminal_pending": state.service.pending_terminal_count(),
         "agent": state.config.agent_name,
     }))
 }
@@ -1066,7 +1079,7 @@ async fn run_events_handler(
                 .filter(|event| query.after_seq.is_none_or(|cursor| event.seq > cursor))
                 .cloned()
                 .collect(),
-            run.sender.subscribe(),
+            run.sender.as_ref().map(|sender| sender.subscribe()),
         )
     };
     let stream = event_stream(history, receiver);
@@ -1083,7 +1096,15 @@ async fn stop_run_handler(
     State(state): State<AgentGatewayState>,
     Path(run_id): Path<String>,
 ) -> Response {
-    let Some(status) = state.service.stop(&run_id) else {
+    // The stop takes the store write lock; run it on a blocking thread so a
+    // storage-stalled mutation never occupies a Tokio request thread.
+    let state_for_block = state.clone();
+    let run_id_for_block = run_id.clone();
+    let status =
+        tokio::task::spawn_blocking(move || state_for_block.service.stop(&run_id_for_block))
+            .await
+            .expect("stop task must not panic");
+    let Some(status) = status else {
         return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
     };
     // `stopping` is an in-memory cancel state; the normalized schema keeps
@@ -1228,19 +1249,38 @@ async fn delete_job_handler(
         let Some(job) = store.jobs.remove(&job_id) else {
             return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
         };
+        // Durable first: the typed `job.delete` reports the real
+        // `rows_affected`. Zero rows means the durable side never had the
+        // job (a divergence), so the in-memory removal is rolled back and
+        // the caller gets the honest not-found response.
         let durable = match persistence {
-            Some(persistence) => persistence.job_delete(&job_id).map(|_| ()),
-            None => Ok(()),
+            Some(persistence) => persistence.job_delete(&job_id),
+            None => Ok(json!({"rows_affected": 1})),
         };
-        if let Err(error) = durable {
-            store.jobs.insert(job_id, job);
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "persistence_unavailable",
-                &format!("failed to persist job deletion: {error}"),
-            );
+        match durable {
+            Ok(data) => {
+                let affected = data
+                    .get("rows_affected")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1);
+                if affected == 0 {
+                    store.jobs.insert(job_id.clone(), job);
+                    return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({"ok": true, "deleted": true, "rows_affected": affected}),
+                )
+            }
+            Err(error) => {
+                store.jobs.insert(job_id, job);
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "persistence_unavailable",
+                    &format!("failed to persist job deletion: {error}"),
+                )
+            }
         }
-        json_response(StatusCode::OK, json!({"ok":true}))
     })
     .await
 }
@@ -1290,7 +1330,19 @@ async fn interrupt_subagent_handler(
     State(state): State<AgentGatewayState>,
     Path(subagent_id): Path<String>,
 ) -> Response {
-    if state.service.stop(&subagent_id).is_none() {
+    // Same blocking-thread rule as stop: the interrupt takes the store
+    // write lock and must never occupy a Tokio request thread.
+    let state_for_block = state.clone();
+    let subagent_id_for_block = subagent_id.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        state_for_block
+            .service
+            .stop(&subagent_id_for_block)
+            .is_some()
+    })
+    .await
+    .expect("interrupt task must not panic");
+    if !found {
         return json_error(
             StatusCode::NOT_FOUND,
             "subagent_not_found",
@@ -1470,8 +1522,14 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
     // transaction (`run.terminal`) while the store write lock is held on a
     // blocking thread; only after the durable commit succeeds are the
     // terminal events published to live subscribers. A failed commit rolls
-    // the in-memory mutation back and retries as a typed run.failed.
+    // the in-memory mutation back and hands the prebuilt terminal to the
+    // bounded retry loop (`terminal_pending`), which commits it exactly once
+    // when storage recovers — the run is never left "started" forever and
+    // no false terminal is ever published.
     let run_id_for_commit = run_id.clone();
+    let retry_window = state.config.terminal_commit_retry_window;
+    let max_event_bytes = state.config.max_event_bytes;
+    let max_events_per_run = state.config.max_events_per_run;
     let outcome = store_mutation(state.clone(), move |store, persistence| {
         let run_active = store
             .runs
@@ -1502,11 +1560,15 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
             run,
             "message.delta",
             json!({"message_id":message.id, "delta":output_text, "role":"assistant"}),
+            max_event_bytes,
+            max_events_per_run,
         );
         let completed_event = make_event_locked(
             run,
             "run.completed",
             json!({"status":"completed", "output":{"message":message}, "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}),
+            max_event_bytes,
+            max_events_per_run,
         );
         run.status = "completed".to_string();
         let durable = terminal_commit(
@@ -1519,13 +1581,16 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
         );
         match durable {
             Ok(()) => {
-                let _ = run.sender.send(delta_event);
-                let _ = run.sender.send(completed_event);
+                if let Some(sender) = &run.sender {
+                    let _ = sender.send(delta_event);
+                    let _ = sender.send(completed_event);
+                }
                 TerminalOutcome::Committed
             }
             Err(error) => {
-                // Roll the in-memory terminal state back: the run stays
-                // active and the retry path below commits a typed failure.
+                // Roll the in-memory terminal state back: the run becomes
+                // observably terminal-pending and the retry loop below owns
+                // the exact same terminal (events, message, status).
                 run.status = previous_status;
                 run.events.truncate(previous_events);
                 let session = store
@@ -1535,7 +1600,16 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
                 session.messages.pop();
                 session.view.message_count = session.messages.len();
                 session.view.updated_at = previous_session_updated;
-                TerminalOutcome::TerminalPersistFailed(error)
+                TerminalOutcome::TerminalPersistFailed {
+                    error: error.to_string(),
+                    pending: Box::new(PendingTerminal {
+                        to_status: "completed".to_string(),
+                        session_id: Some(session_id),
+                        events: vec![delta_event, completed_event],
+                        assistant_message: Some(message),
+                        deadline: std::time::Instant::now() + retry_window,
+                    }),
+                }
             }
         }
     })
@@ -1553,18 +1627,14 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
             )
             .await;
         }
-        TerminalOutcome::TerminalPersistFailed(error) => {
-            tracing::error!("failed to commit terminal state durably: {error}");
-            finish_failed(
-                state.clone(),
-                run_id.clone(),
-                json!({
-                    "status": "failed",
-                    "error_code": "persistence_unavailable",
-                    "error_message": "terminal state could not be committed durably",
-                }),
-            )
-            .await;
+        TerminalOutcome::TerminalPersistFailed { error, pending } => {
+            tracing::error!(
+                "failed to commit terminal state durably for {run_id}: {error}; \
+                 retrying within the bounded window"
+            );
+            state.service.register_pending_terminal(&run_id, *pending);
+            state.service.mark_terminal(&run_id);
+            spawn_terminal_retry(state, run_id);
         }
     }
 }
@@ -1623,22 +1693,33 @@ enum TerminalOutcome {
     /// The run's session vanished before the commit.
     SessionMissing,
     /// The durable commit failed; the in-memory terminal state was rolled
-    /// back and the run remains active.
-    TerminalPersistFailed(String),
+    /// back and the prebuilt typed terminal is handed to the bounded retry
+    /// loop (`register_pending_terminal`), never a false terminal.
+    TerminalPersistFailed {
+        error: String,
+        pending: Box<PendingTerminal>,
+    },
 }
 
 /// Cancels a run with the typed reason through a durable-first terminal
 /// commit: `run.terminal` commits the cancellation event and the status
 /// change in one transaction, and only then is the event published. A
-/// failed commit rolls the in-memory state back and logs (restart recovery
-/// repairs the durable side).
+/// failed commit rolls the in-memory state back and hands the cancellation
+/// to the bounded retry loop (`terminal_pending`), which commits and
+/// publishes it exactly once when storage recovers.
 async fn finish_cancelled(state: AgentGatewayState, run_id: String, reason: String) {
     let run_id_for_commit = run_id.clone();
+    let retry_window = state.config.terminal_commit_retry_window;
+    let max_event_bytes = state.config.max_event_bytes;
+    let max_events_per_run = state.config.max_events_per_run;
     let outcome = store_mutation(state.clone(), move |store, persistence| {
         let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
             return TerminalOutcome::NotActive;
         };
-        if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+        if matches!(
+            run.status.as_str(),
+            "completed" | "failed" | "cancelled" | "terminal_pending"
+        ) {
             return TerminalOutcome::NotActive;
         }
         let previous_status = run.status.clone();
@@ -1647,25 +1728,44 @@ async fn finish_cancelled(state: AgentGatewayState, run_id: String, reason: Stri
             run,
             "run.cancelled",
             json!({"status":"cancelled", "reason":reason}),
+            max_event_bytes,
+            max_events_per_run,
         );
         run.status = "cancelled".to_string();
         match terminal_commit(persistence, run, "", "cancelled", &[&event], None) {
             Ok(()) => {
-                let _ = run.sender.send(event);
+                if let Some(sender) = &run.sender {
+                    let _ = sender.send(event);
+                }
                 TerminalOutcome::Committed
             }
             Err(error) => {
                 run.status = previous_status;
                 run.events.truncate(previous_events);
-                TerminalOutcome::TerminalPersistFailed(error)
+                TerminalOutcome::TerminalPersistFailed {
+                    error: error.to_string(),
+                    pending: Box::new(PendingTerminal {
+                        to_status: "cancelled".to_string(),
+                        session_id: None,
+                        events: vec![event],
+                        assistant_message: None,
+                        deadline: std::time::Instant::now() + retry_window,
+                    }),
+                }
             }
         }
     })
     .await;
     match outcome {
         TerminalOutcome::Committed => state.service.mark_terminal(&run_id),
-        TerminalOutcome::TerminalPersistFailed(error) => {
-            tracing::error!("failed to commit cancellation durably for {run_id}: {error}");
+        TerminalOutcome::TerminalPersistFailed { error, pending } => {
+            tracing::error!(
+                "failed to commit cancellation durably for {run_id}: {error}; \
+                 retrying within the bounded window"
+            );
+            state.service.register_pending_terminal(&run_id, *pending);
+            state.service.mark_terminal(&run_id);
+            spawn_terminal_retry(state, run_id);
         }
         _ => {}
     }
@@ -1683,39 +1783,80 @@ fn failed_payload(error: String) -> Value {
 /// Fails a run through a durable-first terminal commit: `run.terminal`
 /// commits the failure event and the status change in one transaction, and
 /// only then is the event published. A failed commit rolls the in-memory
-/// state back and logs (restart recovery repairs the durable side).
+/// state back and hands the failure to the bounded retry loop
+/// (`terminal_pending`), which commits and publishes it exactly once when
+/// storage recovers.
 async fn finish_failed(state: AgentGatewayState, run_id: String, data: Value) {
     let run_id_for_commit = run_id.clone();
+    let retry_window = state.config.terminal_commit_retry_window;
+    let max_event_bytes = state.config.max_event_bytes;
+    let max_events_per_run = state.config.max_events_per_run;
     let outcome = store_mutation(state.clone(), move |store, persistence| {
         let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
             return TerminalOutcome::NotActive;
         };
-        if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+        if matches!(
+            run.status.as_str(),
+            "completed" | "failed" | "cancelled" | "terminal_pending"
+        ) {
             return TerminalOutcome::NotActive;
         }
         let previous_status = run.status.clone();
         let previous_events = run.events.len();
-        let event = make_event_locked(run, "run.failed", data);
+        let event = make_event_locked(run, "run.failed", data, max_event_bytes, max_events_per_run);
         run.status = "failed".to_string();
         match terminal_commit(persistence, run, "", "failed", &[&event], None) {
             Ok(()) => {
-                let _ = run.sender.send(event);
+                if let Some(sender) = &run.sender {
+                    let _ = sender.send(event);
+                }
                 TerminalOutcome::Committed
             }
             Err(error) => {
                 run.status = previous_status;
                 run.events.truncate(previous_events);
-                TerminalOutcome::TerminalPersistFailed(error)
+                TerminalOutcome::TerminalPersistFailed {
+                    error: error.to_string(),
+                    pending: Box::new(PendingTerminal {
+                        to_status: "failed".to_string(),
+                        session_id: None,
+                        events: vec![event],
+                        assistant_message: None,
+                        deadline: std::time::Instant::now() + retry_window,
+                    }),
+                }
             }
         }
     })
     .await;
     match outcome {
         TerminalOutcome::Committed => state.service.mark_terminal(&run_id),
-        TerminalOutcome::TerminalPersistFailed(error) => {
-            tracing::error!("failed to commit failure durably for {run_id}: {error}");
+        TerminalOutcome::TerminalPersistFailed { error, pending } => {
+            tracing::error!(
+                "failed to commit failure durably for {run_id}: {error}; \
+                 retrying within the bounded window"
+            );
+            state.service.register_pending_terminal(&run_id, *pending);
+            state.service.mark_terminal(&run_id);
+            spawn_terminal_retry(state, run_id);
         }
         _ => {}
+    }
+}
+
+/// A typed failure of one `run.terminal` commit attempt. The `code` lets
+/// the bounded retry loop distinguish a durable terminal conflict (the run
+/// already reached a terminal state durably) from an unavailable-storage
+/// failure that should be retried.
+#[derive(Debug)]
+struct TerminalCommitError {
+    code: String,
+    message: String,
+}
+
+impl std::fmt::Display for TerminalCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
     }
 }
 
@@ -1733,7 +1874,7 @@ fn terminal_commit(
     to_status: &str,
     events: &[&GatewayEvent],
     assistant_message: Option<&SessionMessage>,
-) -> Result<(), String> {
+) -> Result<(), TerminalCommitError> {
     let Some(persistence) = persistence else {
         return Ok(());
     };
@@ -1773,30 +1914,45 @@ fn terminal_commit(
     });
     let data = persistence
         .run_terminal(&payload)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| TerminalCommitError {
+            code: error.code.clone(),
+            message: error.message.clone(),
+        })?;
     // Reconcile the in-memory terminal event sequences with the
     // transactionally allocated durable sequences.
     let rows = data
         .get("events")
         .and_then(|events| events.get("rows"))
         .and_then(Value::as_array)
-        .ok_or_else(|| "run.terminal result omitted events".to_string())?;
+        .ok_or_else(|| TerminalCommitError {
+            code: "terminal_commit_invalid".to_string(),
+            message: "run.terminal result omitted events".to_string(),
+        })?;
     if rows.len() < event_count {
-        return Err(format!(
-            "run.terminal appended {} events, expected at least {event_count}",
-            rows.len()
-        ));
+        return Err(TerminalCommitError {
+            code: "terminal_commit_invalid".to_string(),
+            message: format!(
+                "run.terminal appended {} events, expected at least {event_count}",
+                rows.len()
+            ),
+        });
     }
     let offset = rows.len() - event_count;
     for (index, event) in events.iter().enumerate() {
         let row = rows
             .get(offset + index)
             .and_then(Value::as_array)
-            .ok_or_else(|| "run.terminal returned a malformed event row".to_string())?;
+            .ok_or_else(|| TerminalCommitError {
+                code: "terminal_commit_invalid".to_string(),
+                message: "run.terminal returned a malformed event row".to_string(),
+            })?;
         let seq = row
             .first()
             .and_then(Value::as_u64)
-            .ok_or_else(|| "run.terminal returned a malformed event sequence".to_string())?;
+            .ok_or_else(|| TerminalCommitError {
+                code: "terminal_commit_invalid".to_string(),
+                message: "run.terminal returned a malformed event sequence".to_string(),
+            })?;
         if let Some(in_memory) = run
             .events
             .iter_mut()
@@ -1808,14 +1964,217 @@ fn terminal_commit(
     Ok(())
 }
 
+/// Outcome of one bounded terminal retry attempt.
+enum PendingRetryOutcome {
+    /// The terminal was committed durably and published (exactly once).
+    Committed,
+    /// The run or its pending entry no longer exists; nothing to do.
+    Gone,
+    /// The durable side already holds a different terminal (for example
+    /// restart recovery); the pending terminal must not be published.
+    Conflict,
+    /// The bounded retry window expired; the retry loop stops, the live
+    /// stream is closed, and the durable side is left for restart recovery.
+    Expired,
+    /// Storage is still unavailable; retry again on the next tick.
+    RetryFailed,
+}
+
+/// Retries one run's pending terminal commit. Runs on a blocking thread
+/// with the store write lock held (durable-before-visible). On success the
+/// terminal events are published exactly once and the run record reaches
+/// its true terminal state; on a typed transition conflict the pending
+/// terminal is dropped without publishing (never a fabricated terminal).
+async fn retry_pending_terminal(state: AgentGatewayState, run_id: &str) -> PendingRetryOutcome {
+    let run_id_for_block = run_id.to_string();
+    store_mutation(state.clone(), move |store, persistence| {
+        // The retry owns the pending entry while it attempts the commit.
+        let Some(pending) = state.service.take_pending_terminal(&run_id_for_block) else {
+            return PendingRetryOutcome::Gone;
+        };
+        let Some(run) = store.runs.get_mut(&run_id_for_block) else {
+            return PendingRetryOutcome::Gone;
+        };
+        if run.status != "terminal_pending" {
+            return PendingRetryOutcome::Gone;
+        }
+        if std::time::Instant::now() >= pending.deadline {
+            // Bounded: after the window no more events can ever be published
+            // for this run in this process. Close the live stream so SSE
+            // subscribers are not held forever; the handle is released via
+            // its TTL and the durable side is repaired by restart recovery.
+            close_run_stream(run);
+            return PendingRetryOutcome::Expired;
+        }
+        let previous_status = run.status.clone();
+        let previous_events = run.events.len();
+        // Rebuild the terminal's assistant message under the same lock
+        // (durable-before-visible: it is appended in memory only after the
+        // durable commit succeeds).
+        let message = pending.assistant_message.clone();
+        let mut previous_session_updated = None;
+        if let Some(message) = &message {
+            let Some(session_id) = pending.session_id.as_deref() else {
+                return PendingRetryOutcome::Gone;
+            };
+            let Some(session) = store.sessions.get_mut(session_id) else {
+                return PendingRetryOutcome::Gone;
+            };
+            previous_session_updated = Some(session.view.updated_at);
+            session.messages.push(message.clone());
+            session.view.message_count = session.messages.len();
+            session.view.updated_at = timestamp();
+        }
+        let events = pending.events.iter().collect::<Vec<_>>();
+        let durable = {
+            let run = store
+                .runs
+                .get_mut(&run_id_for_block)
+                .expect("run presence was checked above");
+            for event in &pending.events {
+                run.events.push(event.clone());
+            }
+            let max_events = state.config.max_events_per_run;
+            if run.events.len() > max_events {
+                let excess = run.events.len() - max_events;
+                run.events.drain(0..excess);
+            }
+            run.status = pending.to_status.clone();
+            terminal_commit(
+                persistence,
+                run,
+                pending.session_id.as_deref().unwrap_or(""),
+                &pending.to_status,
+                &events,
+                message.as_ref(),
+            )
+        };
+        match durable {
+            Ok(()) => {
+                let run = store
+                    .runs
+                    .get_mut(&run_id_for_block)
+                    .expect("run presence was checked above");
+                // Publish the reconciled copies (sequences were updated in
+                // place by the commit), exactly once per event.
+                for event in &pending.events {
+                    if let Some(reconciled) = run
+                        .events
+                        .iter()
+                        .find(|candidate| candidate.event_id == event.event_id)
+                        && let Some(sender) = &run.sender
+                    {
+                        let _ = sender.send(reconciled.clone());
+                    }
+                }
+                PendingRetryOutcome::Committed
+            }
+            Err(error) if error.code == "transition_conflict" => {
+                // The durable side already reached a different terminal
+                // (e.g. restart recovery); publishing ours would fabricate
+                // a terminal that never happened durably.
+                rollback_pending_retry(
+                    store,
+                    &run_id_for_block,
+                    &pending,
+                    previous_status,
+                    previous_events,
+                    previous_session_updated,
+                );
+                if let Some(run) = store.runs.get_mut(&run_id_for_block) {
+                    close_run_stream(run);
+                }
+                PendingRetryOutcome::Conflict
+            }
+            Err(error) => {
+                tracing::error!(
+                    "terminal retry for {run_id_for_block} failed: {error}; \
+                     will retry on the next janitor tick"
+                );
+                rollback_pending_retry(
+                    store,
+                    &run_id_for_block,
+                    &pending,
+                    previous_status,
+                    previous_events,
+                    previous_session_updated,
+                );
+                state
+                    .service
+                    .put_pending_terminal(&run_id_for_block, pending);
+                PendingRetryOutcome::RetryFailed
+            }
+        }
+    })
+    .await
+}
+
+/// Rolls one failed retry attempt back to the observable terminal-pending
+/// state (or the durable-terminal-elsewhere state), mirroring the worker's
+/// rollback so no unpersisted terminal is ever visible.
+#[allow(clippy::too_many_arguments)]
+fn rollback_pending_retry(
+    store: &mut GatewayStore,
+    run_id: &str,
+    pending: &PendingTerminal,
+    previous_status: String,
+    previous_events: usize,
+    previous_session_updated: Option<u64>,
+) {
+    if let Some(run) = store.runs.get_mut(run_id) {
+        run.status = previous_status;
+        run.events.truncate(previous_events);
+    }
+    if let (Some(session_id), Some(updated_at)) =
+        (pending.session_id.as_deref(), previous_session_updated)
+        && let Some(session) = store.sessions.get_mut(session_id)
+    {
+        session.messages.pop();
+        session.view.message_count = session.messages.len();
+        session.view.updated_at = updated_at;
+    }
+}
+
+/// Closes a run's live delivery stream: existing subscribers observe
+/// `Closed` and the SSE stream ends instead of hanging forever, and new
+/// subscribers replay history and then end.
+fn close_run_stream(run: &mut RunRecord) {
+    run.sender = None;
+}
+
+/// Spawns the bounded retry loop for one run's pending terminal. The loop
+/// retries on the janitor cadence until the terminal commits durably (then
+/// publishes and releases the permit), the run disappears, the durable side
+/// reports a terminal conflict, or the retry window expires.
+fn spawn_terminal_retry(state: AgentGatewayState, run_id: String) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(state.config.janitor_interval);
+        loop {
+            interval.tick().await;
+            match retry_pending_terminal(state.clone(), &run_id).await {
+                PendingRetryOutcome::Committed
+                | PendingRetryOutcome::Gone
+                | PendingRetryOutcome::Conflict
+                | PendingRetryOutcome::Expired => return,
+                PendingRetryOutcome::RetryFailed => continue,
+            }
+        }
+    });
+}
+
 /// Appends one service-owned event to the run's retained history and
 /// returns it WITHOUT publishing: callers publish only after the durable
-/// commit succeeds (durable-before-visible).
-fn make_event_locked(run: &mut RunRecord, event: &str, mut data: Value) -> GatewayEvent {
-    const MAX_EVENT_BYTES: usize = 32 * 1024;
-    const MAX_EVENTS_PER_RUN: usize = 240;
+/// commit succeeds (durable-before-visible). Retention and byte bounds come
+/// from the validated configuration.
+fn make_event_locked(
+    run: &mut RunRecord,
+    event: &str,
+    mut data: Value,
+    max_event_bytes: usize,
+    max_events_per_run: usize,
+) -> GatewayEvent {
     if serde_json::to_vec(&data)
-        .map(|payload| payload.len() > MAX_EVENT_BYTES)
+        .map(|payload| payload.len() > max_event_bytes)
         .unwrap_or(true)
     {
         data = json!({"truncated":true,"original_bytes":"over_limit"});
@@ -1830,8 +2189,8 @@ fn make_event_locked(run: &mut RunRecord, event: &str, mut data: Value) -> Gatew
         data,
     };
     run.events.push(event.clone());
-    if run.events.len() > MAX_EVENTS_PER_RUN {
-        let excess = run.events.len() - MAX_EVENTS_PER_RUN;
+    if run.events.len() > max_events_per_run {
+        let excess = run.events.len() - max_events_per_run;
         run.events.drain(0..excess);
     }
     event
@@ -1934,7 +2293,10 @@ async fn run_delivery_task(
             let Some(run) = store.runs.get_mut(&run_id_for_block) else {
                 return DeliverOutcome::RunEnded;
             };
-            if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+            if matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "cancelled" | "terminal_pending"
+            ) {
                 return DeliverOutcome::RunEnded;
             }
             let event = append_script_event_locked(
@@ -1964,7 +2326,13 @@ async fn run_delivery_task(
                 None => Ok(()),
             };
             match durable {
-                Ok(()) => DeliverOutcome::Published(event, run.sender.clone()),
+                Ok(()) => DeliverOutcome::Published(
+                    event,
+                    run.sender
+                        .as_ref()
+                        .cloned()
+                        .expect("the delivery channel exists while the run is active"),
+                ),
                 Err(error) => {
                     run.events
                         .retain(|existing| existing.event_id != event.event_id);
@@ -2118,11 +2486,11 @@ fn vm_map_key_to_string(value: &VmValue) -> String {
 
 fn event_stream(
     history: Vec<GatewayEvent>,
-    receiver: broadcast::Receiver<GatewayEvent>,
+    receiver: Option<broadcast::Receiver<GatewayEvent>>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(
         (history.into_iter(), receiver, false),
-        |(mut history, mut receiver, mut done)| async move {
+        |(mut history, receiver, mut done)| async move {
             if let Some(event) = history.next() {
                 done |= event.is_terminal();
                 return Some((Ok(event.into_sse()), (history, receiver, done)));
@@ -2130,17 +2498,20 @@ fn event_stream(
             if done {
                 return None;
             }
+            // A run whose live stream was closed (bounded terminal retry
+            // expiry) ends the SSE after its retained history.
+            let mut receiver = receiver?;
             match receiver.recv().await {
                 Ok(event) => {
                     done |= event.is_terminal();
-                    Some((Ok(event.into_sse()), (history, receiver, done)))
+                    Some((Ok(event.into_sse()), (history, Some(receiver), done)))
                 }
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {
                     done = true;
                     let event = Event::default()
                         .event("error")
                         .data(json!({"code":"event_lagged","dropped":dropped}).to_string());
-                    Some((Ok(event), (history, receiver, done)))
+                    Some((Ok(event), (history, Some(receiver), done)))
                 }
                 Err(broadcast::error::RecvError::Closed) => None,
             }

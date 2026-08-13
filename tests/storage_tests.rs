@@ -2363,7 +2363,11 @@ fn load_all_paginates_beyond_single_page_and_byte_limits() {
         db_name,
         "load-all-1",
         "load.all",
-        json!({"max_rows": 512, "max_bytes": 2 * 1024 * 1024}),
+        json!({
+            "max_rows": 512,
+            "max_bytes": 2 * 1024 * 1024,
+            "load_cap": 1_000_000,
+        }),
         now_ms,
     );
     assert_eq!(loaded["ok"], json!(true));
@@ -2650,4 +2654,192 @@ fn recovery_reports_recovered_count_for_batched_loops() {
     assert_eq!(second["recovered"], json!(0), "second recovery is a no-op");
 
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P3: `session.touch` must not no-op when the caller's payload carries a
+/// generation that differs from the durable one (a compaction bumped it):
+/// the touch is keyed by session id only, so a stale caller can never
+/// silently lose an update.
+#[test]
+fn session_touch_is_not_a_noop_after_a_generation_bump() {
+    let root = temporary_root("touch-generation");
+    let runner = storage_runner(&root);
+    let db_name = "touch-generation.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    // The durable session starts at generation 1; a caller with a stale
+    // generation (for example after a compaction bumped it) touches again.
+    let result = run_storage(
+        &runner,
+        db_name,
+        "session-touch-1",
+        "session.touch",
+        json!({
+            "session_id": "session-1",
+            "status": "active",
+            "generation": 7,
+            "system_prompt": "updated",
+            "model": "test-model",
+            "provider": "test-provider",
+            "toolset_hash": "test-tools",
+            "metadata_json": "{}",
+            "title": "touched",
+            "end_reason": "",
+            "now_ms": 100,
+        }),
+        100,
+    );
+    let row = first_query_row(&result);
+    assert_eq!(
+        row["updated_at_ms"],
+        json!(100),
+        "the touch must land regardless of the caller's generation"
+    );
+    assert_eq!(row["title"], json!("touched"));
+    assert_eq!(row["system_prompt"], json!("updated"));
+    fs::remove_dir_all(root).expect("temporary root should be removed");
+}
+
+/// P3: the hard 1M-row load cap is a parameterized command bound: a load
+/// over the configured cap fails with the typed `load_too_large` error
+/// instead of silently truncating, and a load under the cap succeeds.
+#[test]
+fn load_all_enforces_a_parameterized_load_cap() {
+    let root = temporary_root("load-cap");
+    let runner = storage_runner(&root);
+    let db_name = "load-cap.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    let mut now_ms = 2;
+    for index in 0..12 {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("session-create-{index}"),
+            "session.create",
+            json!({
+                "id": format!("cap-session-{index:02}"),
+                "profile": "default",
+                "platform": "test",
+                "account_id": format!("account-{index:02}"),
+                "chat_id": format!("chat-{index:02}"),
+                "thread_id": "",
+                "user_id": "user-1",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "test-model",
+                "provider": "test-provider",
+                "toolset_hash": "test-tools",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now_ms,
+            }),
+            now_ms,
+        );
+        now_ms += 1;
+    }
+    let overloaded = run_storage(
+        &runner,
+        db_name,
+        "load-cap-small",
+        "load.all",
+        json!({
+            "max_rows": 512,
+            "max_bytes": 2 * 1024 * 1024,
+            "load_cap": 4,
+        }),
+        now_ms,
+    );
+    assert_eq!(
+        overloaded["ok"],
+        json!(false),
+        "a load over the cap must be rejected, got: {overloaded}"
+    );
+    assert_eq!(
+        overloaded["code"],
+        json!("load_too_large"),
+        "the rejection must be typed, got: {overloaded}"
+    );
+    let ok = run_storage(
+        &runner,
+        db_name,
+        "load-cap-large",
+        "load.all",
+        json!({
+            "max_rows": 512,
+            "max_bytes": 2 * 1024 * 1024,
+            "load_cap": 100,
+        }),
+        now_ms,
+    );
+    assert_eq!(ok["ok"], json!(true), "a load under the cap must succeed");
+    fs::remove_dir_all(root).expect("temporary root should be removed");
+}
+
+/// P3: `job.delete` reports the real durable `rows_affected`: deleting an
+/// existing job reports 1, deleting a missing job reports 0 (never a
+/// hardcoded success).
+#[test]
+fn job_delete_reports_real_rows_affected() {
+    let root = temporary_root("job-delete");
+    let runner = storage_runner(&root);
+    let db_name = "job-delete.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "job-create-1",
+        "job.create",
+        json!({
+            "id": "job-1",
+            "name": "nightly",
+            "schedule_json": "{}",
+            "prompt": "run",
+            "deliver_json": "{}",
+            "skills_json": "[]",
+            "repeat_count": 0,
+            "enabled": 1,
+            "now_ms": 2,
+        }),
+        2,
+    );
+    let deleted = run_storage(
+        &runner,
+        db_name,
+        "job-delete-1",
+        "job.delete",
+        json!({"job_id": "job-1"}),
+        3,
+    );
+    assert_eq!(
+        deleted["ok"],
+        json!(true),
+        "deleting an existing job must succeed"
+    );
+    assert_eq!(
+        deleted["rows_affected"],
+        json!(1),
+        "the first delete must report one affected row, got: {deleted}"
+    );
+    let missing = run_storage(
+        &runner,
+        db_name,
+        "job-delete-2",
+        "job.delete",
+        json!({"job_id": "job-1"}),
+        4,
+    );
+    assert_eq!(
+        missing["rows_affected"],
+        json!(0),
+        "deleting a missing job must report zero affected rows, got: {missing}"
+    );
+    fs::remove_dir_all(root).expect("temporary root should be removed");
 }
