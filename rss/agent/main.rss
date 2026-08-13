@@ -1,0 +1,294 @@
+// A5 serial loop policy skeleton (pure decision policy; no provider
+// transport, no storage, no tool runner).
+//
+// The exported `run(context)` is a state-machine step function: ONE typed
+// context map in, ONE discriminated decision map out. The future
+// script-owned runner (A7/A8) will drive this policy around real provider
+// calls; in this skeleton the policy NEVER calls a provider or dispatches a
+// tool. A provider call that would succeed and a tool dispatch that would
+// run are both returned as typed BLOCKED capability states, so no success is
+// ever fabricated and no private builtin is added. Parallel/subagent/task
+// execution is rejected outright (A6 excluded).
+//
+// Context (all fields typed; missing fields fall back to documented
+// defaults):
+//
+//   turn: int            completed turns so far (0 initially)
+//   max_turns: int       turns allowed before the run terminates
+//   retry_count: int     retries already consumed on the current turn
+//   max_retries: int     retries allowed per turn
+//   phase: string        "start" | "provider_result"
+//   model: string        model name carried by model.* event descriptors
+//   provider: map        canonical call result {ok, response, error}
+//                        (rss/llm/types.rss shape); ignored in phase "start"
+//   config: map          {base_retry_delay_ms, max_retry_delay_ms,
+//                         parallel, task}
+//
+// Decisions (kind discriminator):
+//
+//   blocked      -> capability "provider.call" | "tool.dispatch" with a
+//                   typed reason; events carry the canonical descriptors to
+//                   emit before the (blocked) action
+//   retry        -> delay_ms (exponential backoff, capped), retry_count
+//                   (incremented), turn unchanged
+//   next.turn    -> turn + 1 (a turn without tool calls completed)
+//   run.completed-> terminal decision after the last allowed turn (the
+//                   service commits the service-owned run.completed event)
+//   run.failed   -> terminal decision carrying the typed ProviderError
+//                   {status, type, code, message, param, request_id} and a
+//                   reason ("non_retryable" | "max_retries_exceeded"); the
+//                   service commits the service-owned run.failed event
+//   rejected     -> typed rejection (parallel_not_supported,
+//                   task_not_supported, unknown_phase)
+//
+// Every decision carries an `events` array of canonical event descriptors:
+//
+//   model.started:    {type: "model.started", turn, model}
+//   model.completed:  {type: "model.completed", turn, text, tool_calls}
+//
+// run.failed / run.completed are SERVICE-OWNED event types (src/events.rs);
+// the policy only describes the terminal decision, it never emits them.
+//
+// Compiler-contract notes: every helper takes at most ONE map parameter
+// (the two-map-parameter trigger documented in the A3 core blocker plan is
+// avoided entirely), all helpers are same-module, and arrays passed onward
+// are built in this module (no cross-module accessor array values).
+
+// ---------------------------------------------------------------------------
+// Typed context accessors (same-module; defensive dynamic navigation)
+// ---------------------------------------------------------------------------
+
+fn ctx_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Decision builders
+// ---------------------------------------------------------------------------
+
+fn blocked_decision(capability: string, reason: string, turn: int, events: array) -> map {
+    {
+        kind: "blocked",
+        capability: capability,
+        reason: reason,
+        turn: turn,
+        events: events
+    }
+}
+
+fn retry_decision(delay_ms: int, retry_count: int, turn: int) -> map {
+    { kind: "retry", delay_ms: delay_ms, retry_count: retry_count, turn: turn, events: [] }
+}
+
+fn next_turn_decision(turn: int, events: array) -> map {
+    { kind: "next.turn", turn: turn, events: events }
+}
+
+fn run_completed_decision(turn: int, events: array) -> map {
+    { kind: "run.completed", turn: turn, events: events }
+}
+
+fn run_failed_decision(turn: int, reason: string, error: map) -> map {
+    { kind: "run.failed", turn: turn, reason: reason, error: error, events: [] }
+}
+
+fn rejected_decision(code: string, message: string, turn: int) -> map {
+    { kind: "rejected", code: code, message: message, turn: turn, events: [] }
+}
+
+// ---------------------------------------------------------------------------
+// Retry classification and backoff
+// ---------------------------------------------------------------------------
+
+/// Typed ProviderError classification: rate limits (429), request timeouts
+/// (408), server errors (5xx), and the canonical `rate_limit_error` /
+/// `server_error` error types are retryable; everything else (including the
+/// typed `invalid_request_error` family) is not.
+fn error_is_retryable(error: map) -> bool {
+    let status: int = ctx_int(error, "status", 0);
+    let error_type: string = ctx_string(error, "type", "");
+    let mut retryable = false;
+    if status == 429 {
+        retryable = true;
+    }
+    if status == 408 {
+        retryable = true;
+    }
+    if status >= 500 {
+        if status <= 599 {
+            retryable = true;
+        }
+    }
+    if error_type == "rate_limit_error" {
+        retryable = true;
+    }
+    if error_type == "server_error" {
+        retryable = true;
+    }
+    retryable
+}
+
+/// Exponential backoff for the attempt AFTER `retry_count` failures:
+/// `min(base * 2^retry_count, cap)`.
+fn backoff_delay_ms(base: int, retry_count: int, cap: int) -> int {
+    let mut delay: int = base;
+    let mut step = 0;
+    while step < retry_count {
+        if delay < cap {
+            delay = delay * 2;
+            if delay > cap {
+                delay = cap;
+            }
+        }
+        step += 1;
+    }
+    delay
+}
+
+// ---------------------------------------------------------------------------
+// Phase handlers
+// ---------------------------------------------------------------------------
+
+/// Phase "start": emit `model.started` for the upcoming turn and attempt the
+/// provider call. The call itself is a typed blocked capability in this
+/// skeleton (the A3 core blocker holds the adapters); the harness injects
+/// synthetic results instead of the policy fabricating success.
+fn start_phase(turn: int, max_turns: int, model: string) -> map {
+    let mut decision: map = run_completed_decision(turn, []);
+    if turn < max_turns {
+        let mut events: array = [];
+        events[events.length] = { type: "model.started", turn: turn, model: model };
+        decision = blocked_decision(
+            "provider.call",
+            "serial loop skeleton: provider call is a typed blocked capability while the A3 core blocker stands",
+            turn,
+            events
+        );
+    }
+    decision
+}
+
+/// Phase "provider_result": decide from the canonical typed call result.
+fn provider_result(turn: int, max_turns: int, retry_count: int, max_retries: int, provider: map, config: map) -> map {
+    let ok_flag: bool = ctx_bool(provider, "ok", false);
+    let mut decision: map = rejected_decision("unknown_phase", "provider result is not decidable", turn);
+    if ok_flag == true {
+        let response: map = ctx_map(provider, "response");
+        let text: string = ctx_string(response, "text", "");
+        let tool_calls: array = ctx_array(response, "tool_calls");
+        let mut events: array = [];
+        events[events.length] = {
+            type: "model.completed",
+            turn: turn,
+            text: text,
+            tool_calls: tool_calls.length
+        };
+        if tool_calls.length > 0 {
+            decision = blocked_decision(
+                "tool.dispatch",
+                "serial loop skeleton: tool dispatch is a typed blocked capability; no tool runner is wired",
+                turn,
+                events
+            );
+        } else {
+            let next_turn: int = turn + 1;
+            if next_turn >= max_turns {
+                decision = run_completed_decision(next_turn, events);
+            } else {
+                decision = next_turn_decision(next_turn, events);
+            }
+        }
+    } else {
+        let error: map = ctx_map(provider, "error");
+        if !error_is_retryable(error) {
+            decision = run_failed_decision(turn, "non_retryable", error);
+        } else if retry_count >= max_retries {
+            decision = run_failed_decision(turn, "max_retries_exceeded", error);
+        } else {
+            let base: int = ctx_int(config, "base_retry_delay_ms", 1000);
+            let cap: int = ctx_int(config, "max_retry_delay_ms", 30000);
+            let delay: int = backoff_delay_ms(base, retry_count, cap);
+            decision = retry_decision(delay, retry_count + 1, turn);
+        }
+    }
+    decision
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+pub fn run(context: map) -> map {
+    let turn: int = ctx_int(context, "turn", 0);
+    let max_turns: int = ctx_int(context, "max_turns", 1);
+    let retry_count: int = ctx_int(context, "retry_count", 0);
+    let max_retries: int = ctx_int(context, "max_retries", 0);
+    let phase: string = ctx_string(context, "phase", "");
+    let model: string = ctx_string(context, "model", "");
+    let provider: map = ctx_map(context, "provider");
+    let config: map = ctx_map(context, "config");
+    let parallel: bool = ctx_bool(config, "parallel", false);
+    let task: bool = ctx_bool(config, "task", false);
+    let mut decision: map = rejected_decision("unknown_phase", "run phase is not recognized by the serial loop policy", turn);
+    if parallel == true {
+        decision = rejected_decision("parallel_not_supported", "parallel/subagent execution is excluded from the serial loop policy", turn);
+    } else if task == true {
+        decision = rejected_decision("task_not_supported", "task delegation is excluded from the serial loop policy", turn);
+    } else if phase == "start" {
+        decision = start_phase(turn, max_turns, model);
+    } else if phase == "provider_result" {
+        decision = provider_result(turn, max_turns, retry_count, max_retries, provider, config);
+    }
+    decision
+}

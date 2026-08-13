@@ -1,0 +1,15 @@
+{
+  "turn": 0,
+  "max_turns": 3,
+  "retry_count": 0,
+  "max_retries": 2,
+  "phase": "start",
+  "model": "test-model",
+  "provider": {},
+  "config": {
+    "base_retry_delay_ms": 100,
+    "max_retry_delay_ms": 400,
+    "parallel": false,
+    "task": false
+  }
+}
