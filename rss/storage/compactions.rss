@@ -37,6 +37,127 @@ struct CompactionFailInput {
     completed_at_ms: int
 }
 
+/// True when the input id is already used by a compaction row for a
+/// DIFFERENT session or generation: reusing an id across sessions or
+/// generations is a typed conflict, never a SQLite constraint error.
+fn compaction_id_conflict(db_id: int, input_id: string, input_session_id: string, input_generation: int) -> bool {
+    let by_id: map = sqlite::query(
+        db_id,
+        "SELECT id, session_id, generation FROM compactions WHERE id = ? LIMIT 1",
+        [input_id],
+        { max_rows: 1, max_result_bytes: 4096 }
+    );
+    let by_id_rows: array = by_id["rows"];
+    let mut conflict = false;
+    if by_id_rows.length > 0 {
+        let by_id_row: array = by_id_rows[0];
+        if by_id_row[1] != input_session_id {
+            conflict = true;
+        }
+        if by_id_row[2] != input_generation {
+            conflict = true;
+        }
+    }
+    conflict
+}
+
+/// The existing compaction row for the target (session_id, generation), if
+/// any (the unique key of the compactions table).
+fn compaction_existing_row(db_id: int, session_id: string, generation: int, max_rows: int, max_bytes: int) -> map {
+    sqlite::query(
+        db_id,
+        "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE session_id = ? AND generation = ? LIMIT 1",
+        [session_id, generation],
+        compactions_query_limits(max_rows, max_bytes)
+    )
+}
+
+/// True when the existing pending row carries the exact same plan payload as
+/// the start input (id, run, generation, range, summary, model, token
+/// estimate): the idempotent-resume condition.
+fn compaction_row_matches(
+    row_id: string,
+    row_run_id: string,
+    row_generation: int,
+    row_source_start: int,
+    row_source_end: int,
+    row_retained_tail: int,
+    row_summary: string,
+    row_token_estimate: int,
+    row_model: string,
+    input_id: string,
+    input_run_id: string,
+    input_generation: int,
+    input_source_start: int,
+    input_source_end: int,
+    input_retained_tail: int,
+    input_summary: string,
+    input_token_estimate: int,
+    input_model: string
+) -> bool {
+    let mut matches = true;
+    if row_id != input_id {
+        matches = false;
+    }
+    if row_run_id != input_run_id {
+        matches = false;
+    }
+    if row_generation != input_generation {
+        matches = false;
+    }
+    if row_source_start != input_source_start {
+        matches = false;
+    }
+    if row_source_end != input_source_end {
+        matches = false;
+    }
+    if row_retained_tail != input_retained_tail {
+        matches = false;
+    }
+    if row_summary != input_summary {
+        matches = false;
+    }
+    if row_token_estimate != input_token_estimate {
+        matches = false;
+    }
+    if row_model != input_model {
+        matches = false;
+    }
+    matches
+}
+
+/// The guarded insert: creates the pending row only when every start guard
+/// holds (session + run exist, run is `compacting`, the session generation
+/// is exactly one below the plan generation, the range is ordered with the
+/// retained-tail marker inside it, and messages exist at both endpoints),
+/// and resets a FAILED row for the same session+generation to pending with
+/// the new payload (the retry-after-failure / restart-recovery path).
+/// When no row exists after the insert, the guards rejected the start: that
+/// is a typed `compaction_start_rejected`, never a silent success.
+fn compaction_start_insert(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+    let input: CompactionStartInput = json::decode::<CompactionStartInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms WHERE compactions.state = 'failed'",
+        [&input.id, &input.session_id, &input.run_id, input.generation.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.retained_tail_ordinal.copy(), &input.summary_json, input.token_estimate.copy(), &input.model, input.now_ms.copy(), &input.session_id, input.generation.copy(), &input.run_id, &input.session_id, input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), &input.id, &input.session_id]
+    );
+    let inserted: map = sqlite::query(
+        db_id,
+        "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE id = ? AND session_id = ? LIMIT ?",
+        [&input.id, &input.session_id, (max_rows)],
+        compactions_query_limits(max_rows, max_bytes)
+    );
+    let inserted_copy: map = inserted.copy();
+    let inserted_rows: array = inserted["rows"];
+    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
+    if inserted_rows.length == 0 {
+        result = { ok: false, code: "compaction_start_rejected", message: "compaction start guard conditions were not met (run status, session generation, range ordering, or message endpoints)", result: { columns: [], rows: [] } };
+    } else {
+        result = { ok: true, code: "ok", message: "", result: inserted_copy };
+    }
+    result
+}
+
 pub fn storage_compaction_start(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: CompactionStartInput = json::decode::<CompactionStartInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
@@ -46,22 +167,73 @@ pub fn storage_compaction_start(db_id: int, payload_json: string, max_rows: int,
         if !existence::run_exists(db_id, input.run_id.copy()) {
             result = { ok: false, code: "run_not_found", message: "compaction start references an unknown session or run", result: { columns: [], rows: [] } };
         } else {
-            sqlite::execute(
-                db_id,
-                "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms WHERE compactions.state = 'failed'",
-                [&input.id, &input.session_id, &input.run_id, input.generation.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.retained_tail_ordinal.copy(), &input.summary_json, input.token_estimate.copy(), &input.model, input.now_ms.copy(), &input.session_id, input.generation.copy(), &input.run_id, &input.session_id, input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), &input.id, &input.session_id]
-            );
-            result = {
-                ok: true,
-                code: "ok",
-                message: "",
-                result: sqlite::query(
-                    db_id,
-                    "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE id = ? AND session_id = ? LIMIT ?",
-                    [&input.id, &input.session_id, (max_rows)],
-                    compactions_query_limits(max_rows, max_bytes)
-                )
-            };
+            if compaction_id_conflict(db_id, input.id.copy(), input.session_id.copy(), input.generation.copy()) {
+                result = { ok: false, code: "compaction_id_conflict", message: "compaction id is already in use for a different session or generation", result: { columns: [], rows: [] } };
+            } else {
+                // Durable recovery: an existing row for the target
+                // (session_id, generation) decides the outcome BEFORE any
+                // insert, so a crash between start and commit can never
+                // leave the session stuck and no rejection is ever silent.
+                let existing: map = compaction_existing_row(db_id, input.session_id.copy(), input.generation.copy(), max_rows, max_bytes);
+                let existing_copy: map = existing.copy();
+                let existing_rows: array = existing["rows"];
+                if existing_rows.length > 0 {
+                    let existing_row: array = existing_rows[0];
+                    let existing_state: string = existing_row[10];
+                    if existing_state == "committed" {
+                        result = { ok: false, code: "compaction_already_committed", message: "a compaction for this session+generation is already committed", result: { columns: [], rows: [] } };
+                    } else {
+                        if existing_state == "pending" {
+                            // Same payload -> idempotent resume: return the
+                            // existing pending row so the caller can proceed
+                            // to message.compact + compaction.commit.
+                            // Different payload -> typed conflict: never a
+                            // silent ok with an empty row set, never a
+                            // clobber of the pending record.
+                            let existing_id: string = existing_row[0];
+                            let existing_run_id: string = existing_row[2];
+                            let existing_generation: int = existing_row[3];
+                            let existing_source_start: int = existing_row[4];
+                            let existing_source_end: int = existing_row[5];
+                            let existing_retained_tail: int = existing_row[6];
+                            let existing_summary: string = existing_row[7];
+                            let existing_token_estimate: int = existing_row[8];
+                            let existing_model: string = existing_row[9];
+                            if compaction_row_matches(
+                                existing_id,
+                                existing_run_id,
+                                existing_generation,
+                                existing_source_start,
+                                existing_source_end,
+                                existing_retained_tail,
+                                existing_summary,
+                                existing_token_estimate,
+                                existing_model,
+                                input.id.copy(),
+                                input.run_id.copy(),
+                                input.generation.copy(),
+                                input.source_start_ordinal.copy(),
+                                input.source_end_ordinal.copy(),
+                                input.retained_tail_ordinal.copy(),
+                                input.summary_json.copy(),
+                                input.token_estimate.copy(),
+                                input.model.copy()
+                            ) {
+                                result = { ok: true, code: "ok", message: "pending compaction already exists for this payload", result: existing_copy };
+                            } else {
+                                result = { ok: false, code: "compaction_pending_conflict", message: "a pending compaction for this session+generation already exists with a different plan", result: { columns: [], rows: [] } };
+                            }
+                        } else {
+                            // state == "failed": the guarded insert resets
+                            // the row to pending (retry after a typed failure
+                            // or restart recovery).
+                            result = compaction_start_insert(db_id, payload_json, max_rows, max_bytes);
+                        }
+                    }
+                } else {
+                    result = compaction_start_insert(db_id, payload_json, max_rows, max_bytes);
+                }
+            }
         }
     }
     result

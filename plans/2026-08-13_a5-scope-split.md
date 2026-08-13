@@ -213,7 +213,7 @@ restricted registry; the registry is not extended.
 ```bash
 cd /mnt/TEMP/rustscript/agent-roadmap/a5
 export CARGO_TARGET_DIR=/mnt/TEMP/rustscript/target-a5
-cargo test --locked --test agent_loop_tests          # 25 passed
+cargo test --locked --test agent_loop_tests          # 39 passed (post-fix)
 cargo test --locked --test storage_tests             # A2 regression
 cargo test --locked --test runner_tests              # A0/A1 regression
 cargo test --locked --all-targets                    # full default scope
@@ -226,3 +226,89 @@ git diff --check
 
 All temp/target/log artifacts live under `/mnt/TEMP/rustscript/`
 (`target-a5`, `agent-tests/`).
+
+## 8. Post-review fix commit (2026-08-14)
+
+`fix(agent): ...` on top of the two policy commits repairs the review
+findings. The PRODUCTION ENTRY remains NOT wired: the policies are still
+exercised through the test harness only (`AgentRunner` + typed contexts +
+typed storage commands); no gateway/service code calls `main.rss` or
+`compact.rss` yet. The A3 core blocker (provider adapters' buffered
+response parsing, streaming aggregation, `http::client::sse` exposure) and
+the A4/A6 user exclusions are unchanged and still block the full
+script-owned runner loop (A7/A8 later scope).
+
+### P1 — compaction crash window (durable recovery)
+
+`compaction.start` now implements the durable recovery contract in the A2
+storage layer (`rss/storage/compactions.rss`; the schema is unchanged, no
+migration):
+
+- **Idempotent resume**: same `session_id + generation` with a PENDING row
+  and the SAME payload (id, run, generation, range, summary, model, token
+  estimate) returns the existing pending row — a crash between start and
+  commit is safely resumed by the caller without any state change.
+- **Typed conflicts**: PENDING with a DIFFERENT payload → `ok:false`
+  `compaction_pending_conflict`; COMMITTED → `ok:false`
+  `compaction_already_committed`; an id already used for a different
+  session/generation → `ok:false` `compaction_id_conflict` (never a SQLite
+  constraint error). FAILED rows are reset to pending by the guarded insert
+  (retry path, same row keeps its audit identity).
+- **Guard rejection is typed**: when no row exists after the guarded
+  insert, `compaction.start` returns `ok:false`
+  `compaction_start_rejected` — never `ok:true` with an empty row set.
+- **Restart recovery** (already wired in `recovery.recover_active`, now
+  proven): the gateway production restart path
+  (`GatewayPersistence::open().load()`) fails interrupted runs AND their
+  pending compactions, so a session is never stuck; a fresh run in
+  `compacting` + a retry start + commit advances the session generation
+  exactly once.
+
+Tests (real SQLite through the storage service and through the gateway
+production path): idempotent resume + exactly-once commit, pending
+conflict, committed conflict, id conflict, every guard rejection typed
+(run status / generation / range / message endpoints), and the crash-window
+recovery flow (start → recovery → failed row → retry → commit, generation
+advances exactly once).
+
+### P2 — start guard rejection observability and backoff boundaries
+
+- Guard rejections are typed error envelopes (see P1); a caller can never
+  claim a durable record that does not exist.
+- `backoff_delay_ms` (`rss/agent/main.rss`) is
+  `min(max(base, 0) * 2^retry_count, max(cap, 0))` with defined edge
+  semantics: negative/zero inputs clamp to 0, base above cap clamps to the
+  cap on entry, doubling SATURATES at the cap without overflow, and the
+  loop terminates for any i64 inputs (huge retry counts included). Tests:
+  base > cap, cap near i64::MAX, zero/negative inputs, retry_count 100k.
+
+### P3 — policy precision
+
+- Corrected the inaccurate single-map compiler-contract comment in
+  `main.rss` (`provider_result` legitimately takes the canonical
+  `provider` + `config` pair; the two-map trigger is avoided because no map
+  is passed onward).
+- Documented the full-compaction rule in `compact.rss`: the fixpoint
+  reaches the last message only when the last message is a tool result
+  whose call sits in the prefix, so the retained tail is empty ONLY in that
+  forced case; otherwise the tail keeps the configured window. Documented
+  the O(n³) worst-case fixpoint bound (histories are bounded by
+  `max_context_messages`).
+- The tool-call cycle now CONSUMES the turn budget: a blocked
+  `tool.dispatch` carries `turn + 1`, so a runaway tool loop terminates at
+  `max_turns` (the completed model call's event keeps its own turn). The
+  `tool_calls` event field is pinned to the exact count of
+  `response.tool_calls` entries (multi-call tested).
+- New coverage: multi-call pair preservation, missing tool result (call
+  compacted as-is), boundary == n (documented empty-tail rule).
+
+### Updated criteria
+
+| Criterion | Status |
+|---|---|
+| Compaction start durable recovery (idempotent resume, typed conflicts, typed rejections) | GREEN (6 new suites, real SQLite + gateway production path) |
+| Crash window: pending failed by restart recovery, retry start/commit, exactly-once generation | GREEN |
+| Backoff edge semantics (clamp, saturate, zero/negative, huge inputs) | GREEN (3 new suites) |
+| Tool-call cycle bounded by max_turns; tool_calls count pinned | GREEN (2 new suites + updated) |
+| Full-compaction rule and O(n³) bound documented | GREEN (doc + boundary test) |
+| Production entry (policy wired into gateway/service) | NOT WIRED (unchanged; A3/A4 blockers stand) |

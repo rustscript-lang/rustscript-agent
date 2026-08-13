@@ -3231,3 +3231,186 @@ async fn legacy_chat_timeout_is_bounded_while_the_worker_is_blocked() {
     release_tx.send(()).expect("release the held HTTP call");
     fixture.join().expect("fixture thread");
 }
+
+/// P1 (production path): the gateway's real restart load path fails the
+/// pending compaction of an interrupted run, so the session is never stuck:
+/// after reopen, a fresh compaction starts (the failed row is reset) and
+/// commits with exactly-once generation.
+#[tokio::test]
+async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
+    let path = gateway_db_path("compaction-crash-window");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let now = 2_000_000u64;
+    persistence
+        .admission_create(&json!({
+            "session_id": "crash-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "crash-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "crash-run",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "crash-message",
+            "message_run_id": "crash-run",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "crash-run",
+            "request_hash": "",
+            "event_id": "crash-event",
+            "now_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("admission should commit");
+    for (message_id, content) in [
+        ("crash-message-2", r#"[{"type":"text","text":"more"}]"#),
+        ("crash-message-3", r#"[{"type":"text","text":"done"}]"#),
+    ] {
+        persistence
+            .message_append(&json!({
+                "id": message_id,
+                "session_id": "crash-session",
+                "role": "user",
+                "content_json": content,
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": now + 1,
+            }))
+            .expect("message should append");
+    }
+    // Admission leaves the run `running`; move it to compacting.
+    persistence
+        .run_transition(&json!({
+            "run_id": "crash-run",
+            "from_status": "running",
+            "to_status": "compacting",
+            "error_code": "",
+            "error_message": "",
+            "recovery_reason": "",
+            "now_ms": now + 3,
+        }))
+        .expect("run should transition to compacting");
+    let compaction = persistence
+        .compaction_start(&json!({
+            "id": "compaction-1",
+            "session_id": "crash-session",
+            "run_id": "crash-run",
+            "generation": 2,
+            "source_start_ordinal": 1,
+            "source_end_ordinal": 3,
+            "retained_tail_ordinal": 3,
+            "summary_json": "{\"summary\":\"compacted\"}",
+            "token_estimate": 10,
+            "model": "m",
+            "now_ms": now + 4,
+        }))
+        .expect("compaction should start");
+    assert_eq!(compaction["rows"][0][0], json!("compaction-1"));
+    assert_eq!(compaction["rows"][0][10], json!("pending"));
+    drop(state);
+
+    // Production reopen: the restart load path fails the interrupted run
+    // AND its pending compaction.
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_persistence = restored
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let failed = restored_persistence
+        .compaction_get("compaction-1")
+        .expect("compaction should be observable after restart");
+    assert_eq!(
+        failed["rows"][0][10],
+        json!("failed"),
+        "restart recovery must fail the pending compaction of the interrupted run"
+    );
+    let run = restored_persistence
+        .run_get("crash-run")
+        .expect("run should be observable after restart");
+    assert_eq!(run["rows"][0][3], json!("failed"));
+
+    // The session is not stuck: a fresh run enters compacting and the SAME
+    // compaction id is retried (the failed row is reset to pending and
+    // commits; the single row keeps its audit identity).
+    restored_persistence
+        .admission_create(&json!({
+            "session_id": "crash-session",
+            "session_new": 0,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "crash-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "crash-run-2",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"retry\"}",
+            "message_id": "crash-message-retry",
+            "message_run_id": "crash-run-2",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "crash-run-2",
+            "request_hash": "",
+            "event_id": "crash-event-retry",
+            "now_ms": now + 5,
+            "expires_at_ms": 0,
+        }))
+        .expect("retry admission should commit");
+    // Admission leaves the run `running`; move it to compacting.
+    restored_persistence
+        .run_transition(&json!({
+            "run_id": "crash-run-2",
+            "from_status": "running",
+            "to_status": "compacting",
+            "error_code": "",
+            "error_message": "",
+            "recovery_reason": "",
+            "now_ms": now + 7,
+        }))
+        .expect("retry run should transition to compacting");
+    let restarted = restored_persistence
+        .compaction_start(&json!({
+            "id": "compaction-1",
+            "session_id": "crash-session",
+            "run_id": "crash-run-2",
+            "generation": 2,
+            "source_start_ordinal": 1,
+            "source_end_ordinal": 3,
+            "retained_tail_ordinal": 3,
+            "summary_json": "{\"summary\":\"compacted\"}",
+            "token_estimate": 10,
+            "model": "m",
+            "now_ms": now + 8,
+        }))
+        .expect("a fresh compaction should start after recovery");
+    assert_eq!(restarted["rows"][0][0], json!("compaction-1"));
+    assert_eq!(restarted["rows"][0][10], json!("pending"));
+    let committed = restored_persistence
+        .compaction_commit(&json!({
+            "id": "compaction-1",
+            "session_id": "crash-session",
+            "start_ordinal": 1,
+            "end_ordinal": 3,
+            "generation": 2,
+            "completed_at_ms": now + 9,
+        }))
+        .expect("the retry compaction should commit");
+    assert_eq!(committed["results"][0]["rows_affected"], json!(1));
+    let committed_row = restored_persistence
+        .compaction_get("compaction-1")
+        .expect("compaction after commit");
+    assert_eq!(committed_row["rows"][0][10], json!("committed"));
+    let _ = std::fs::remove_file(&path);
+}

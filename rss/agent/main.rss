@@ -28,7 +28,12 @@
 //
 //   blocked      -> capability "provider.call" | "tool.dispatch" with a
 //                   typed reason; events carry the canonical descriptors to
-//                   emit before the (blocked) action
+//                   emit before the (blocked) action. A blocked
+//                   "tool.dispatch" decision carries turn + 1: a tool-call
+//                   cycle CONSUMES the turn budget, so a runaway tool loop
+//                   terminates once the next start phase is refused at
+//                   max_turns (the completed model call's event still
+//                   carries the turn it started in).
 //   retry        -> delay_ms (exponential backoff, capped), retry_count
 //                   (incremented), turn unchanged
 //   next.turn    -> turn + 1 (a turn without tool calls completed)
@@ -46,13 +51,27 @@
 //   model.started:    {type: "model.started", turn, model}
 //   model.completed:  {type: "model.completed", turn, text, tool_calls}
 //
+// `tool_calls` on model.completed is pinned to the exact number of
+// `tool_call` entries in the canonical `response.tool_calls` array: 0 for a
+// text-only completion, N for N calls in one response.
+//
+// Backoff is `min(max(base, 0) * 2^retry_count, max(cap, 0))` with defined
+// edge semantics: negative or zero inputs clamp to 0 (a zero delay is a
+// valid immediate retry), a base above the cap clamps to the cap on entry,
+// and doubling SATURATES at the cap so no i64 input can overflow.
+//
 // run.failed / run.completed are SERVICE-OWNED event types (src/events.rs);
 // the policy only describes the terminal decision, it never emits them.
 //
-// Compiler-contract notes: every helper takes at most ONE map parameter
-// (the two-map-parameter trigger documented in the A3 core blocker plan is
-// avoided entirely), all helpers are same-module, and arrays passed onward
-// are built in this module (no cross-module accessor array values).
+// Compiler-contract notes: all helpers are same-module, and arrays passed
+// onward are built in this module (no cross-module accessor array values).
+// Every helper takes at most ONE map parameter EXCEPT `provider_result`,
+// which takes the canonical `provider` + `config` pair. The two-map trigger
+// documented in the A3 core blocker plan fires only when a function with
+// two map parameters reads the FIRST map's fields and passes the SECOND map
+// onward to another script function; `provider_result` reads fields of both
+// maps but never passes a map onward — only scalars and the in-module
+// events array cross call boundaries.
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -180,16 +199,33 @@ fn error_is_retryable(error: map) -> bool {
 }
 
 /// Exponential backoff for the attempt AFTER `retry_count` failures:
-/// `min(base * 2^retry_count, cap)`.
+/// `min(max(base, 0) * 2^retry_count, max(cap, 0))` with defined edge
+/// semantics. Negative or zero inputs clamp to 0 (a zero delay is a valid
+/// immediate retry), a base above the cap clamps to the cap on entry, and
+/// doubling SATURATES at the cap: the loop breaks once the delay reaches
+/// the cap or the zero fixed point, so the delay never overflows and the
+/// function terminates for ANY i64 inputs (including a huge retry_count).
 fn backoff_delay_ms(base: int, retry_count: int, cap: int) -> int {
     let mut delay: int = base;
+    let mut ceiling: int = cap;
+    if delay < 0 {
+        delay = 0;
+    }
+    if ceiling < 0 {
+        ceiling = 0;
+    }
+    if delay > ceiling {
+        delay = ceiling;
+    }
     let mut step = 0;
     while step < retry_count {
-        if delay < cap {
+        if delay >= ceiling || delay == 0 {
+            break;
+        }
+        if delay > ceiling / 2 {
+            delay = ceiling;
+        } else {
             delay = delay * 2;
-            if delay > cap {
-                delay = cap;
-            }
         }
         step += 1;
     }
@@ -235,10 +271,15 @@ fn provider_result(turn: int, max_turns: int, retry_count: int, max_retries: int
             tool_calls: tool_calls.length
         };
         if tool_calls.length > 0 {
+            // A tool-call cycle consumes the turn budget: the dispatch
+            // decision carries the turn the run continues at after the
+            // tools finish (turn + 1), so a runaway tool loop terminates
+            // once the next start phase is refused at max_turns.
+            let next_turn: int = turn + 1;
             decision = blocked_decision(
                 "tool.dispatch",
-                "serial loop skeleton: tool dispatch is a typed blocked capability; no tool runner is wired",
-                turn,
+                "serial loop skeleton: tool dispatch is a typed blocked capability; no tool runner is wired; the tool cycle consumes the turn budget",
+                next_turn,
                 events
             );
         } else {

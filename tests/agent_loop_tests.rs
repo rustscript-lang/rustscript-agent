@@ -281,7 +281,16 @@ fn loop_success_with_tool_calls_blocks_tool_dispatch() {
     );
     assert_eq!(decision["kind"], json!("blocked"));
     assert_eq!(decision["capability"], json!("tool.dispatch"));
-    assert_eq!(decision["turn"], json!(0));
+    assert_eq!(
+        decision["turn"],
+        json!(1),
+        "the tool cycle consumes the turn budget: the run continues at turn + 1"
+    );
+    assert_eq!(
+        decision["events"][0]["turn"],
+        json!(0),
+        "the completed model call still belongs to the turn it started in"
+    );
     assert!(
         decision["reason"]
             .as_str()
@@ -1489,6 +1498,875 @@ fn compaction_failure_marks_failed_and_preserves_history() {
         session_row["generation"],
         json!(1),
         "generation must not advance"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+// ---------------------------------------------------------------------------
+// Post-review edge suites: backoff boundaries, tool-cycle turn budget
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_backoff_base_above_cap_clamps_to_cap() {
+    let runner = loop_runner();
+    let config = json!({
+        "base_retry_delay_ms": 1000,
+        "max_retry_delay_ms": 400,
+        "parallel": false,
+        "task": false
+    });
+    let first = decide(
+        &runner,
+        loop_context(
+            "provider_result",
+            0,
+            3,
+            0,
+            2,
+            provider_error(503, "server_error", "unavailable", "busy"),
+            config.clone(),
+        ),
+    );
+    assert_eq!(first["kind"], json!("retry"));
+    assert_eq!(
+        first["delay_ms"],
+        json!(400),
+        "a base above the cap must clamp to the cap on entry"
+    );
+    let second = decide(
+        &runner,
+        loop_context(
+            "provider_result",
+            0,
+            3,
+            1,
+            2,
+            provider_error(503, "server_error", "unavailable", "busy"),
+            config,
+        ),
+    );
+    assert_eq!(second["delay_ms"], json!(400), "doubling stays capped");
+}
+
+#[test]
+fn loop_backoff_saturates_without_overflow_for_huge_inputs() {
+    let runner = loop_runner();
+    // A base just above half of i64::MAX must saturate at the cap on the
+    // first doubling instead of overflowing the signed range.
+    let near_max = i64::MAX / 2 + 1;
+    let decision = decide(
+        &runner,
+        loop_context(
+            "provider_result",
+            0,
+            3,
+            1,
+            2,
+            provider_error(429, "rate_limit_error", "rl", "slow"),
+            json!({
+                "base_retry_delay_ms": near_max,
+                "max_retry_delay_ms": i64::MAX,
+                "parallel": false,
+                "task": false
+            }),
+        ),
+    );
+    assert_eq!(decision["kind"], json!("retry"));
+    assert_eq!(
+        decision["delay_ms"],
+        json!(i64::MAX),
+        "doubling must saturate at the cap, never overflow"
+    );
+    // A very large retry count must terminate with the capped delay.
+    let many = decide(
+        &runner,
+        loop_context(
+            "provider_result",
+            0,
+            3,
+            100_000,
+            100_001,
+            provider_error(503, "server_error", "unavailable", "busy"),
+            json!({
+                "base_retry_delay_ms": 100,
+                "max_retry_delay_ms": 400,
+                "parallel": false,
+                "task": false
+            }),
+        ),
+    );
+    assert_eq!(many["kind"], json!("retry"));
+    assert_eq!(many["delay_ms"], json!(400), "delay saturates at the cap");
+    assert_eq!(many["retry_count"], json!(100_001));
+}
+
+#[test]
+fn loop_backoff_zero_and_negative_inputs_are_clamped() {
+    let runner = loop_runner();
+    // Zero base: an immediate retry (delay 0), defined and bounded.
+    let zero = decide(
+        &runner,
+        loop_context(
+            "provider_result",
+            0,
+            3,
+            0,
+            2,
+            provider_error(429, "rate_limit_error", "rl", "slow"),
+            json!({
+                "base_retry_delay_ms": 0,
+                "max_retry_delay_ms": 400,
+                "parallel": false,
+                "task": false
+            }),
+        ),
+    );
+    assert_eq!(zero["kind"], json!("retry"));
+    assert_eq!(zero["delay_ms"], json!(0));
+    // Negative base and negative cap clamp to zero.
+    let negative = decide(
+        &runner,
+        loop_context(
+            "provider_result",
+            0,
+            3,
+            0,
+            2,
+            provider_error(429, "rate_limit_error", "rl", "slow"),
+            json!({
+                "base_retry_delay_ms": -500,
+                "max_retry_delay_ms": -1,
+                "parallel": false,
+                "task": false
+            }),
+        ),
+    );
+    assert_eq!(negative["delay_ms"], json!(0));
+    // A zero cap clamps any base to zero.
+    let zero_cap = decide(
+        &runner,
+        loop_context(
+            "provider_result",
+            0,
+            3,
+            0,
+            2,
+            provider_error(429, "rate_limit_error", "rl", "slow"),
+            json!({
+                "base_retry_delay_ms": 100,
+                "max_retry_delay_ms": 0,
+                "parallel": false,
+                "task": false
+            }),
+        ),
+    );
+    assert_eq!(zero_cap["delay_ms"], json!(0));
+}
+
+#[test]
+fn loop_tool_cycles_consume_turn_budget_and_terminate() {
+    let runner = loop_runner();
+    // max_turns = 2: every provider result asks for tools; each tool-call
+    // cycle consumes the turn budget, so the run must terminate once the
+    // budget is exhausted instead of looping forever inside turn 0.
+    let first = decide(
+        &runner,
+        provider_context(
+            0,
+            2,
+            0,
+            2,
+            provider_ok("t", json!([{"id": "c1", "name": "n", "arguments": {}}])),
+        ),
+    );
+    assert_eq!(first["kind"], json!("blocked"));
+    assert_eq!(first["capability"], json!("tool.dispatch"));
+    assert_eq!(
+        first["turn"],
+        json!(1),
+        "the tool cycle consumes the turn budget"
+    );
+    assert_eq!(
+        first["events"][0]["turn"],
+        json!(0),
+        "the completed model call belongs to the turn it started in"
+    );
+    assert_eq!(first["events"][0]["tool_calls"], json!(1));
+
+    let second = decide(
+        &runner,
+        provider_context(
+            1,
+            2,
+            0,
+            2,
+            provider_ok("t", json!([{"id": "c2", "name": "n", "arguments": {}}])),
+        ),
+    );
+    assert_eq!(second["kind"], json!("blocked"));
+    assert_eq!(second["turn"], json!(2));
+
+    // The budget is exhausted: the next start phase terminates the run.
+    let completed = decide(&runner, start_context(2, 2, loop_config(false, false)));
+    assert_eq!(completed["kind"], json!("run.completed"));
+    assert_eq!(completed["turn"], json!(2));
+}
+
+#[test]
+fn loop_multi_call_response_pins_tool_call_count() {
+    let runner = loop_runner();
+    // tool_calls on model.completed is the exact number of tool_call
+    // entries in the response array (pinned semantics: 0 for text-only,
+    // N for N calls in one response).
+    let decision = decide(
+        &runner,
+        provider_context(
+            0,
+            3,
+            0,
+            2,
+            provider_ok(
+                "two tools",
+                json!([
+                    {"id": "call-1", "name": "read_file", "arguments": {}},
+                    {"id": "call-2", "name": "search_files", "arguments": {}}
+                ]),
+            ),
+        ),
+    );
+    assert_eq!(decision["kind"], json!("blocked"));
+    assert_eq!(decision["capability"], json!("tool.dispatch"));
+    assert_eq!(decision["events"][0]["tool_calls"], json!(2));
+    assert_eq!(
+        decision["turn"],
+        json!(1),
+        "the tool cycle consumes the turn budget"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Post-review edge suites: compaction prefix boundaries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compact_plan_multi_call_message_pulls_all_results_into_prefix() {
+    let runner = compact_runner();
+    // One assistant message issues TWO tool calls; call-1's result sits
+    // inside the naive prefix while call-2's result straddles the boundary.
+    // The fixpoint must pull BOTH results in (multi-call pairing).
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                json!({"ordinal": 2, "role": "assistant", "tool_call_id": "", "content": [
+                    {"type": "tool_call", "tool_call_id": "call-1", "name": "read_file", "arguments_json": "{}"},
+                    {"type": "tool_call", "tool_call_id": "call-2", "name": "search_files", "arguments_json": "{}"}
+                ]}),
+                msg_user(3, "more"),
+                msg_tool_result(4, "call-1"),
+                msg_user(5, "next"),
+                msg_tool_result(6, "call-2"),
+                msg_user(7, "done")
+            ]),
+            5,
+            2,
+        ),
+    );
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_start_ordinal"], json!(1));
+    assert_eq!(
+        plan["source_end_ordinal"],
+        json!(6),
+        "both results of the multi-call message must land in the prefix"
+    );
+    assert_eq!(plan["retained_tail_ordinal"], json!(6));
+}
+
+#[test]
+fn compact_plan_missing_tool_result_compacts_call_as_is() {
+    let runner = compact_runner();
+    // An assistant tool-call message whose result never arrived has nothing
+    // to preserve: the boundary stays at the naive position and the call is
+    // compacted as-is (pairs are never SPLIT; a call with no result in the
+    // history is compacted whole).
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                msg_tool_call(2, "call-1"),
+                msg_user(3, "more"),
+                msg_user(4, "next")
+            ]),
+            2,
+            1,
+        ),
+    );
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_start_ordinal"], json!(1));
+    assert_eq!(plan["source_end_ordinal"], json!(3));
+    assert_eq!(plan["retained_tail_ordinal"], json!(3));
+}
+
+#[test]
+fn compact_plan_full_compaction_documents_empty_tail_rule() {
+    let runner = compact_runner();
+    // Pair preservation can force the boundary onto the last message: the
+    // only way the fixpoint reaches the end is a tool result whose call
+    // sits in the prefix, and keeping that single result as the sole tail
+    // would split the pair. This is the documented full-compaction rule:
+    // the retained tail is empty ONLY in this forced case (see compact.rss).
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                msg_user(2, "more"),
+                msg_tool_call(3, "call-1"),
+                msg_user(4, "next"),
+                msg_user(5, "again"),
+                msg_tool_result(6, "call-1")
+            ]),
+            4,
+            2,
+        ),
+    );
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_start_ordinal"], json!(1));
+    assert_eq!(
+        plan["source_end_ordinal"],
+        json!(6),
+        "the boundary is forced onto the last message"
+    );
+    assert_eq!(plan["retained_tail_ordinal"], json!(6));
+    // The retained tail is every message AFTER source_end_ordinal: empty.
+    let source_end = plan["source_end_ordinal"].as_i64().expect("source end");
+    let tail_count = json!([
+        msg_user(1, "hello"),
+        msg_user(2, "more"),
+        msg_tool_call(3, "call-1"),
+        msg_user(4, "next"),
+        msg_user(5, "again"),
+        msg_tool_result(6, "call-1")
+    ])
+    .as_array()
+    .expect("messages")
+    .iter()
+    .filter(|message| message["ordinal"].as_i64().unwrap_or(0) > source_end)
+    .count();
+    assert_eq!(
+        tail_count, 0,
+        "documented full compaction: no retained tail in the forced case"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Post-review edge suites: compaction.start durable recovery contract
+// ---------------------------------------------------------------------------
+
+/// `compaction.start` with the same session+generation and the SAME payload
+/// is an idempotent resume: it returns the existing pending row (never a
+/// duplicate insert, never a silent empty result), and the caller can
+/// proceed straight to `message.compact` + `compaction.commit`.
+#[test]
+fn compaction_start_is_idempotent_for_same_pending_payload() {
+    let root = temporary_root("compaction-idempotent");
+    let storage = storage_runner(&root);
+    let db_name = "idempotent.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    let start_payload = plan["commands"][0]["payload"].clone();
+
+    let first = run_storage(
+        &storage,
+        db_name,
+        "start-1",
+        "compaction.start",
+        start_payload.clone(),
+        1000,
+    );
+    assert_eq!(first["ok"], json!(true));
+    let first_row = first_query_row(&first);
+    assert_eq!(first_row["id"], json!("compaction-1"));
+    assert_eq!(first_row["state"], json!("pending"));
+
+    // Crash-and-retry with the same payload resumes the SAME pending row.
+    let resumed = run_storage(
+        &storage,
+        db_name,
+        "start-2",
+        "compaction.start",
+        start_payload.clone(),
+        1000,
+    );
+    assert_eq!(resumed["ok"], json!(true));
+    let resumed_row = first_query_row(&resumed);
+    assert_eq!(resumed_row["id"], json!("compaction-1"));
+    assert_eq!(resumed_row["state"], json!("pending"));
+    assert_eq!(
+        resumed_row["source_end_ordinal"],
+        json!(3),
+        "the resumed row must be the original durable record"
+    );
+
+    // The resumed plan executes to completion exactly once.
+    execute_plan(&storage, db_name, &plan).expect("resumed plan should execute");
+
+    let compaction = run_storage(
+        &storage,
+        db_name,
+        "compaction-get",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        1000,
+    );
+    let row = first_query_row(&compaction);
+    assert_eq!(row["state"], json!("committed"));
+
+    // A second commit matches no pending row: exactly-once generation.
+    let again = run_storage(
+        &storage,
+        db_name,
+        "commit-again",
+        "compaction.commit",
+        plan["commands"][2]["payload"].clone(),
+        1000,
+    );
+    assert_eq!(
+        again["data"]["results"][0]["rows_affected"],
+        json!(0),
+        "a repeated commit must match nothing"
+    );
+    let session = run_storage(
+        &storage,
+        db_name,
+        "session-get",
+        "session.get",
+        json!({"session_id": "session-1"}),
+        1000,
+    );
+    let session_row = first_query_row(&session);
+    assert_eq!(
+        session_row["generation"],
+        json!(2),
+        "the session generation must advance exactly once"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+/// `compaction.start` with the same session+generation but a DIFFERENT
+/// payload (a different id, or a different range under the same id) is a
+/// typed conflict: never a silent `ok` with an empty row set, and never a
+/// clobber of the pending record.
+#[test]
+fn compaction_start_rejects_different_payload_on_pending() {
+    let root = temporary_root("compaction-conflict");
+    let storage = storage_runner(&root);
+    let db_name = "conflict.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    let start_payload = plan["commands"][0]["payload"].clone();
+    run_storage(
+        &storage,
+        db_name,
+        "start-1",
+        "compaction.start",
+        start_payload.clone(),
+        1000,
+    );
+
+    // Different id, same session+generation: typed conflict.
+    let mut other_id = start_payload.clone();
+    other_id["id"] = json!("compaction-2");
+    let conflicting = run_storage(
+        &storage,
+        db_name,
+        "start-other-id",
+        "compaction.start",
+        other_id,
+        1000,
+    );
+    assert_eq!(conflicting["ok"], json!(false));
+    assert_eq!(conflicting["code"], json!("compaction_pending_conflict"));
+
+    // Same id, different range: typed conflict.
+    let mut other_range = start_payload.clone();
+    other_range["source_end_ordinal"] = json!(5);
+    other_range["retained_tail_ordinal"] = json!(5);
+    let conflicting_range = run_storage(
+        &storage,
+        db_name,
+        "start-other-range",
+        "compaction.start",
+        other_range,
+        1000,
+    );
+    assert_eq!(conflicting_range["ok"], json!(false));
+    assert_eq!(
+        conflicting_range["code"],
+        json!("compaction_pending_conflict")
+    );
+
+    // The original pending record is untouched and still commit-able.
+    let original = run_storage(
+        &storage,
+        db_name,
+        "compaction-get",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        1000,
+    );
+    let row = first_query_row(&original);
+    assert_eq!(row["state"], json!("pending"));
+    assert_eq!(row["source_end_ordinal"], json!(3));
+    execute_plan(&storage, db_name, &plan).expect("original plan should still execute");
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+/// `compaction.start` targeting an already-committed session+generation is a
+/// typed rejection: the caller must advance its session generation first.
+#[test]
+fn compaction_start_rejects_committed_generation() {
+    let root = temporary_root("compaction-committed");
+    let storage = storage_runner(&root);
+    let db_name = "committed.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    execute_plan(&storage, db_name, &plan).expect("plan should execute and commit");
+
+    let restart = run_storage(
+        &storage,
+        db_name,
+        "start-after-commit",
+        "compaction.start",
+        plan["commands"][0]["payload"].clone(),
+        1000,
+    );
+    assert_eq!(restart["ok"], json!(false));
+    assert_eq!(restart["code"], json!("compaction_already_committed"));
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+/// Reusing a compaction id for a DIFFERENT session or generation is a typed
+/// conflict, never a SQLite constraint error or a silent empty result.
+#[test]
+fn compaction_start_id_conflict_is_typed() {
+    let root = temporary_root("compaction-id-conflict");
+    let storage = storage_runner(&root);
+    let db_name = "id-conflict.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    let start_payload = plan["commands"][0]["payload"].clone();
+    run_storage(
+        &storage,
+        db_name,
+        "start-1",
+        "compaction.start",
+        start_payload.clone(),
+        1000,
+    );
+
+    let mut other_generation = start_payload.clone();
+    other_generation["generation"] = json!(3);
+    let conflicting = run_storage(
+        &storage,
+        db_name,
+        "start-id-reuse",
+        "compaction.start",
+        other_generation,
+        1000,
+    );
+    assert_eq!(conflicting["ok"], json!(false));
+    assert_eq!(conflicting["code"], json!("compaction_id_conflict"));
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+/// Every `compaction.start` guard rejection is a typed error envelope, never
+/// an `ok: true` with an empty row set: the caller can never claim a durable
+/// record that does not exist.
+#[test]
+fn compaction_start_guard_rejections_are_typed_not_silent() {
+    // Run status guard: the run left `compacting` before the start.
+    let root_status = temporary_root("compaction-guard-status");
+    let storage_status = storage_runner(&root_status);
+    let db_status = "guard-status.db";
+    seed_compaction_history(&storage_status, db_status);
+    run_storage(
+        &storage_status,
+        db_status,
+        "run-leaves-compacting",
+        "run.transition",
+        transition_payload("run-1", "compacting", "running", 1000),
+        1000,
+    );
+    let compact = compact_runner();
+    let plan_status = decide(
+        &compact,
+        durable_history_context(&storage_status, db_status),
+    );
+    let rejected = run_storage(
+        &storage_status,
+        db_status,
+        "start-guard-status",
+        "compaction.start",
+        plan_status["commands"][0]["payload"].clone(),
+        1000,
+    );
+    assert_eq!(rejected["ok"], json!(false));
+    assert_eq!(rejected["code"], json!("compaction_start_rejected"));
+    assert_eq!(
+        rejected["data"]["rows"],
+        JsonValue::Null,
+        "a rejected start must not claim any row"
+    );
+    fs::remove_dir_all(&root_status).expect("temporary storage root should be removed");
+
+    // Generation guard: the plan targets a generation the session is not at.
+    let root_generation = temporary_root("compaction-guard-generation");
+    let storage_generation = storage_runner(&root_generation);
+    let db_generation = "guard-generation.db";
+    seed_compaction_history(&storage_generation, db_generation);
+    let mut wrong_generation = plan_status["commands"][0]["payload"].clone();
+    wrong_generation["generation"] = json!(5);
+    let rejected_generation = run_storage(
+        &storage_generation,
+        db_generation,
+        "start-guard-generation",
+        "compaction.start",
+        wrong_generation,
+        1000,
+    );
+    assert_eq!(rejected_generation["ok"], json!(false));
+    assert_eq!(
+        rejected_generation["code"],
+        json!("compaction_start_rejected")
+    );
+    fs::remove_dir_all(&root_generation).expect("temporary storage root should be removed");
+
+    // Range guard: the retained-tail marker falls outside the source range.
+    let root_range = temporary_root("compaction-guard-range");
+    let storage_range = storage_runner(&root_range);
+    let db_range = "guard-range.db";
+    seed_compaction_history(&storage_range, db_range);
+    let mut wrong_range = plan_status["commands"][0]["payload"].clone();
+    wrong_range["source_start_ordinal"] = json!(5);
+    wrong_range["source_end_ordinal"] = json!(3);
+    wrong_range["retained_tail_ordinal"] = json!(1);
+    let rejected_range = run_storage(
+        &storage_range,
+        db_range,
+        "start-guard-range",
+        "compaction.start",
+        wrong_range,
+        1000,
+    );
+    assert_eq!(rejected_range["ok"], json!(false));
+    assert_eq!(rejected_range["code"], json!("compaction_start_rejected"));
+    fs::remove_dir_all(&root_range).expect("temporary storage root should be removed");
+
+    // Message-endpoint guard: no message exists at the source end ordinal.
+    let root_endpoints = temporary_root("compaction-guard-endpoints");
+    let storage_endpoints = storage_runner(&root_endpoints);
+    let db_endpoints = "guard-endpoints.db";
+    seed_compaction_history(&storage_endpoints, db_endpoints);
+    let mut wrong_endpoints = plan_status["commands"][0]["payload"].clone();
+    wrong_endpoints["source_end_ordinal"] = json!(9);
+    wrong_endpoints["retained_tail_ordinal"] = json!(9);
+    let rejected_endpoints = run_storage(
+        &storage_endpoints,
+        db_endpoints,
+        "start-guard-endpoints",
+        "compaction.start",
+        wrong_endpoints,
+        1000,
+    );
+    assert_eq!(rejected_endpoints["ok"], json!(false));
+    assert_eq!(
+        rejected_endpoints["code"],
+        json!("compaction_start_rejected")
+    );
+    fs::remove_dir_all(&root_endpoints).expect("temporary storage root should be removed");
+}
+
+/// P1 crash window: a process that dies between `compaction.start` and
+/// `compaction.commit` leaves a `pending` row. Restart recovery fails both
+/// the interrupted run and its pending compaction, so the session is never
+/// stuck: a fresh compaction can start (the failed row is reset) and commit,
+/// and the session generation advances exactly once.
+#[test]
+fn restart_recovery_fails_pending_compaction_then_new_start_commits() {
+    let root = temporary_root("compaction-crash-window");
+    let storage = storage_runner(&root);
+    let db_name = "crash-window.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    let start_payload = plan["commands"][0]["payload"].clone();
+    run_storage(
+        &storage,
+        db_name,
+        "start-before-crash",
+        "compaction.start",
+        start_payload.clone(),
+        1000,
+    );
+
+    // Simulate the process interrupt/reopen: the gateway startup recovery
+    // fails every interrupted active run and its pending compaction.
+    let recovery = run_storage(
+        &storage,
+        db_name,
+        "recovery-after-crash",
+        "recovery.recover_active",
+        json!({
+            "reason": "gateway_restart",
+            "details_json": "{}",
+            "now_ms": 2000,
+            "max_rows": 128,
+            "max_bytes": 65_536,
+            "max_events": 128,
+        }),
+        2000,
+    );
+    assert_eq!(recovery["ok"], json!(true));
+    assert_eq!(recovery["recovered"], json!(1));
+
+    let run = run_storage(
+        &storage,
+        db_name,
+        "run-after-recovery",
+        "run.get",
+        json!({"run_id": "run-1"}),
+        2000,
+    );
+    let run_row = first_query_row(&run);
+    assert_eq!(run_row["status"], json!("failed"));
+    assert_eq!(run_row["recovery_reason"], json!("gateway_restart"));
+
+    let failed = run_storage(
+        &storage,
+        db_name,
+        "compaction-after-recovery",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        2000,
+    );
+    let failed_row = first_query_row(&failed);
+    assert_eq!(failed_row["state"], json!("failed"));
+    assert_eq!(
+        failed_row["error_message"],
+        json!("run interrupted during gateway restart"),
+        "the pending compaction must be durably failed by restart recovery"
+    );
+
+    // The session is NOT stuck: the runner starts a fresh compaction run
+    // (the recovered run is terminal) and retries the SAME compaction id —
+    // the failed row is reset to pending — commits, and the session
+    // generation advances exactly once. The single row per
+    // (session, generation) keeps its audit identity across
+    // failed -> pending -> committed.
+    run_storage(
+        &storage,
+        db_name,
+        "run-2",
+        "run.create",
+        run_payload("run-2", "session-1", 2000),
+        2000,
+    );
+    run_storage(
+        &storage,
+        db_name,
+        "run-2-running",
+        "run.transition",
+        transition_payload("run-2", "queued", "running", 2000),
+        2000,
+    );
+    run_storage(
+        &storage,
+        db_name,
+        "run-2-compacting",
+        "run.transition",
+        transition_payload("run-2", "running", "compacting", 2000),
+        2000,
+    );
+    let mut retry_payload = start_payload.clone();
+    retry_payload["run_id"] = json!("run-2");
+    let restarted = run_storage(
+        &storage,
+        db_name,
+        "start-after-recovery",
+        "compaction.start",
+        retry_payload,
+        2000,
+    );
+    assert_eq!(restarted["ok"], json!(true));
+    let restarted_row = first_query_row(&restarted);
+    assert_eq!(restarted_row["id"], json!("compaction-1"));
+    assert_eq!(restarted_row["state"], json!("pending"));
+
+    run_storage(
+        &storage,
+        db_name,
+        "sweep-after-recovery",
+        "message.compact",
+        plan["commands"][1]["payload"].clone(),
+        2000,
+    );
+    let mut commit_payload = plan["commands"][2]["payload"].clone();
+    commit_payload["completed_at_ms"] = json!(2000);
+    let committed = run_storage(
+        &storage,
+        db_name,
+        "commit-after-recovery",
+        "compaction.commit",
+        commit_payload,
+        2000,
+    );
+    assert_eq!(
+        committed["data"]["results"][0]["rows_affected"],
+        json!(1),
+        "the retry compaction must commit"
+    );
+
+    // The retried row went failed -> pending -> committed with the same id.
+    let committed_row = run_storage(
+        &storage,
+        db_name,
+        "compaction-committed",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        2000,
+    );
+    assert_eq!(first_query_row(&committed_row)["state"], json!("committed"));
+
+    let session = run_storage(
+        &storage,
+        db_name,
+        "session-after-recovery",
+        "session.get",
+        json!({"session_id": "session-1"}),
+        2000,
+    );
+    let session_row = first_query_row(&session);
+    assert_eq!(
+        session_row["generation"],
+        json!(2),
+        "exactly-once generation across the crash window"
     );
 
     fs::remove_dir_all(&root).expect("temporary storage root should be removed");

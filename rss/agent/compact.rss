@@ -62,6 +62,22 @@
 // message, so a pushed boundary can only pull tool messages into the prefix
 // and the fixpoint terminates.
 //
+// Full-compaction rule (documented): pair preservation can force the
+// boundary onto the LAST message — the fixpoint reaches `n` only when the
+// last message is a tool result whose assistant call sits in the prefix,
+// and keeping that single result as the sole tail would split the pair. In
+// that forced case the compaction covers the ENTIRE history and the
+// retained tail is empty; in every other case the tail keeps at least the
+// configured `retained_tail` messages. A tool call with NO result anywhere
+// in the history has nothing to preserve and is compacted as-is (pairs are
+// never SPLIT; the rule is only about keeping calls together with results
+// that exist).
+//
+// Complexity bound (documented): the fixpoint is O(n^3) worst case — up to
+// `n` passes over up to `n` prefix messages, each scanning up to `n` suffix
+// messages — and typically converges in a couple of passes (O(n^2)); the
+// message histories here are bounded by `max_context_messages`.
+//
 // Failure path: `run` with `command: "fail"` returns
 // {op: "compaction.fail", payload: {id, error_message, completed_at_ms}}.
 //
