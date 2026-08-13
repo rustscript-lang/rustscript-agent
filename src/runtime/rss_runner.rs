@@ -382,13 +382,6 @@ impl AgentRunner {
         self.run_invocation(&mut vm, callable, context, None, None)
     }
 
-    /// Compatibility alias for callers that pass a single structured input
-    /// value; the value is forwarded as the exported `run(context)` argument
-    /// (there is no ambient runtime input).
-    pub fn run_with_input(&self, input: Value) -> std::result::Result<Value, RunError> {
-        self.run_with_context(input)
-    }
-
     /// Runs the exported `run(context)` entry, delivering each `Event(Value)`
     /// item through the sink before the terminal item. Blocking inside
     /// `deliver` pauses polling and therefore script execution.

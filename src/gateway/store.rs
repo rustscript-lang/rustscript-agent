@@ -166,7 +166,7 @@ impl StorageRunner {
         ]);
         let result = self
             .runner
-            .run_with_input(input)
+            .run_with_context(input)
             .map_err(|error| format!("run RSS storage operation {op}: {error}"))?;
         let VmValue::Map(result) = result else {
             return Err(format!(

@@ -820,9 +820,12 @@ async fn create_run_handler(
         // A worker that exits without committing a terminal (for example a
         // panic) must fail the run rather than leave it started forever; the
         // terminal guard inside the commit functions makes this idempotent.
-        let outcome =
-            tokio::task::spawn(service.clone().run_worker(worker_run_id.clone(), agent_input))
-                .await;
+        let outcome = tokio::task::spawn(
+            service
+                .clone()
+                .run_worker(worker_run_id.clone(), agent_input),
+        )
+        .await;
         if outcome.is_err() {
             service.finish_failed(
                 &worker_run_id,
