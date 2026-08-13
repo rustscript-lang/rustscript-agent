@@ -970,6 +970,55 @@ async fn adapter_shutdown_is_bounded() {
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
+#[tokio::test]
+async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
+    let (base, state) = spawn_fixture().await;
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("binary");
+    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/telegram-tests");
+    std::fs::create_dir_all(&root).expect("telegram test root");
+    let script = root.join(format!("binary-{}.rss", Uuid::new_v4()));
+    std::fs::write(&script, ECHO_SOURCE).expect("write agent script");
+    let bin = env!("CARGO_BIN_EXE_rustscript-agent-gateway");
+    let mut child = tokio::process::Command::new(bin)
+        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+        .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
+        .env("RUSTSCRIPT_AGENT_SCRIPT", &script)
+        .env(
+            "RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN",
+            "123456:TEST-SECRET-TOKEN",
+        )
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_API_BASE", &base)
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_ACCOUNTS", "fixture_bot")
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_CHATS", "555")
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS", "555")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gateway binary should spawn");
+    // The binary's Telegram adapter must process the queued update through
+    // the shared AgentService and render it to the fixture.
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.sent_texts().iter().any(|text| text == "hello world")
+    })
+    .await;
+    // Graceful stop: SIGINT halts the service and shuts the adapter down
+    // (bounded), then the process exits.
+    let pid = child.id().expect("child pid");
+    std::process::Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .expect("send SIGINT");
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait())
+        .await
+        .expect("the gateway must exit within the bound after SIGINT")
+        .expect("child wait");
+    assert!(exited.success(), "graceful shutdown must exit cleanly");
+    std::fs::remove_file(&script).expect("temporary script should be removed");
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
 // ---------------------------------------------------------------------------
 // Token redaction in logs.
 // ---------------------------------------------------------------------------

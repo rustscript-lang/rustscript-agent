@@ -154,6 +154,10 @@ pub struct AgentGatewayConfig {
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
     pub fuel: Option<u64>,
+    /// Optional Telegram adapter configuration. When present, the gateway
+    /// binary starts the Telegram poller alongside the API server on the
+    /// same AgentService/store.
+    pub telegram: Option<TelegramConfig>,
 }
 
 impl AgentGatewayConfig {
@@ -199,6 +203,11 @@ impl AgentGatewayConfig {
             return Err("sse_keepalive_interval must be positive".to_string());
         }
         self.rate_limit.validate()?;
+        if let Some(telegram) = &self.telegram {
+            telegram
+                .validate()
+                .map_err(|error| format!("invalid Telegram configuration: {error}"))?;
+        }
         Ok(())
     }
 }
@@ -337,6 +346,7 @@ impl Default for AgentGatewayConfig {
             http: HttpConfig::default(),
             sqlite,
             fuel: Some(10_000_000),
+            telegram: None,
         }
     }
 }
@@ -350,6 +360,30 @@ mod tests {
         AgentGatewayConfig::default()
             .validate()
             .expect("default configuration must validate");
+    }
+
+    #[test]
+    fn telegram_option_validates_when_present() {
+        let base = AgentGatewayConfig::default();
+        let invalid = AgentGatewayConfig {
+            telegram: Some(TelegramConfig {
+                bot_token: String::new(),
+                ..TelegramConfig::default()
+            }),
+            ..base.clone()
+        };
+        assert!(
+            invalid.validate().is_err(),
+            "a configured telegram adapter must validate its own bounds"
+        );
+        let valid = AgentGatewayConfig {
+            telegram: Some(TelegramConfig {
+                bot_token: "123:abc".to_string(),
+                ..TelegramConfig::default()
+            }),
+            ..base
+        };
+        valid.validate().expect("valid telegram config must pass");
     }
 
     #[test]

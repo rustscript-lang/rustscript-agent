@@ -1,6 +1,9 @@
-use std::{env, fs, net::SocketAddr};
+use std::{env, fs, net::SocketAddr, time::Duration};
 
-use rustscript_agent::{AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app};
+use rustscript_agent::{
+    AgentGatewayConfig, AgentGatewayState, TelegramConfig, build_agent_gateway_app,
+    gateway::telegram::spawn_telegram_adapter,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,8 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    let telegram = telegram_config()?;
     let mut config = AgentGatewayConfig {
         bearer_token,
+        telegram: telegram.clone(),
         ..AgentGatewayConfig::default()
     };
     if let Some(hosts) = env_value("RUSTSCRIPT_AGENT_ALLOW_HOSTS", "PD_EDGE_AGENT_ALLOW_HOSTS")? {
@@ -156,6 +161,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rustscript-agent-gateway listening on http://{}",
         listener.local_addr()?
     );
+    // Optional Telegram adapter: same AgentService/store as the API server.
+    let mut telegram_adapter = None;
+    if let Some(telegram) = telegram {
+        match spawn_telegram_adapter(state.clone(), telegram).await {
+            Ok(adapter) => {
+                eprintln!("rustscript-agent-gateway telegram adapter started");
+                telegram_adapter = Some(adapter);
+            }
+            Err(error) => return Err(format!("start telegram adapter: {error}").into()),
+        }
+    }
     let app = build_agent_gateway_app(state.clone());
     tokio::select! {
         // ConnectInfo carries the peer address so the rate limiter can key
@@ -168,9 +184,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             signal?;
             eprintln!("halting: cancelling active runs with the typed resource-closed reason");
             state.service().halt();
+            // Bounded Telegram shutdown: stop the poller, wait for the final
+            // offset persist (join bounded at 60s).
+            if let Some(adapter) = telegram_adapter.take() {
+                adapter.shutdown().await;
+            }
         }
     }
     Ok(())
+}
+
+/// Builds the optional Telegram adapter configuration from the environment.
+/// The token is required when Telegram is enabled; the allowlists default to
+/// empty (deny-by-default). The token is never echoed by this binary.
+fn telegram_config() -> Result<Option<TelegramConfig>, Box<dyn std::error::Error>> {
+    let Some(token) = env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN",
+        "PD_EDGE_AGENT_TELEGRAM_BOT_TOKEN",
+    )?
+    else {
+        return Ok(None);
+    };
+    if token.trim().is_empty() {
+        return Err("RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN must not be blank".into());
+    }
+    let mut config = TelegramConfig {
+        bot_token: token,
+        ..TelegramConfig::default()
+    };
+    if let Some(api_base) = env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_API_BASE",
+        "PD_EDGE_AGENT_TELEGRAM_API_BASE",
+    )? {
+        config.api_base = api_base;
+    }
+    if let Some(accounts) = env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_ACCOUNTS",
+        "PD_EDGE_AGENT_TELEGRAM_ALLOWED_ACCOUNTS",
+    )? {
+        config.allowed_accounts = split_list(&accounts);
+    }
+    if let Some(chats) = env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_CHATS",
+        "PD_EDGE_AGENT_TELEGRAM_ALLOWED_CHATS",
+    )? {
+        config.allowed_chats = parse_i64_list(&chats, "RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_CHATS")?;
+    }
+    if let Some(users) = env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS",
+        "PD_EDGE_AGENT_TELEGRAM_ALLOWED_USERS",
+    )? {
+        config.allowed_users = parse_i64_list(&users, "RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS")?;
+    }
+    if let Some(seconds) = env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_POLL_TIMEOUT_SECS",
+        "PD_EDGE_AGENT_TELEGRAM_POLL_TIMEOUT_SECS",
+    )? {
+        config.poll_timeout = Duration::from_secs(seconds.parse().map_err(
+            |_| "RUSTSCRIPT_AGENT_TELEGRAM_POLL_TIMEOUT_SECS must be an integer number of seconds",
+        )?);
+    }
+    config
+        .validate()
+        .map_err(|error| -> Box<dyn std::error::Error> {
+            format!("invalid Telegram configuration: {error}").into()
+        })?;
+    Ok(Some(config))
+}
+
+fn parse_i64_list(value: &str, name: &str) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let mut parsed = Vec::new();
+    for item in split_list(value) {
+        parsed.push(
+            item.parse::<i64>()
+                .map_err(|_| format!("{name} contains a non-integer entry: {item}"))?,
+        );
+    }
+    Ok(parsed)
 }
 
 fn env_value(primary: &str, legacy: &str) -> Result<Option<String>, env::VarError> {
