@@ -887,6 +887,65 @@ async fn adapter_renders_delta_edits_and_status_lines_from_agent_events() {
 }
 
 #[tokio::test]
+async fn adapter_status_sends_never_rewrite_the_delta_edit_target() {
+    let (base, state) = spawn_fixture().await;
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("edit-target");
+    let gateway = test_state(EVENTS_SOURCE, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    // The opening delta is the first sendMessage, so the fixture returns
+    // message id 1 for it; every editMessageText must keep targeting that
+    // delta message even though tool/approval/terminal status lines were
+    // sent in between (those sends return ids 2, 3, ... and must never
+    // become the edit target).
+    // Snapshot under the lock and drop the guard: the adapter keeps
+    // talking to the fixture, which needs the same lock.
+    let requests = state.requests.lock().expect("requests lock").clone();
+    let mut edit_targets = Vec::new();
+    for request in requests.iter() {
+        if request.method == "editMessageText" {
+            edit_targets.push(
+                request
+                    .body
+                    .get("message_id")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1),
+            );
+        }
+    }
+    assert!(
+        !edit_targets.is_empty(),
+        "the interleaved run must produce edits"
+    );
+    for target in edit_targets {
+        assert_eq!(
+            target, 1,
+            "every edit must target the delta message, never a status line"
+        );
+    }
+    let sends = state.sent_texts();
+    assert!(
+        sends
+            .iter()
+            .any(|text| text == "[tool] web_search requested")
+            && sends
+                .iter()
+                .any(|text| text == "[approval] web_search requires approval (pending)")
+            && sends
+                .iter()
+                .any(|text| text == "[approval] web_search: approved")
+            && sends.iter().any(|text| text == "[done]"),
+        "the status lines must still be delivered as separate sends: {sends:?}"
+    );
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test]
 async fn adapter_chunks_oversized_output_at_4096_utf16() {
     let (base, state) = spawn_fixture().await;
     push_update(&state, fixture_json("updates_dm.json"));

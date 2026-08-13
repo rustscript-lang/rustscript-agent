@@ -24,8 +24,20 @@ pub const TELEGRAM_MAX_UTF16: usize = 4096;
 /// One bounded output action for the Bot API.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderAction {
-    Send { text: String },
-    Edit { message_id: i64, text: String },
+    /// A status line (tool/approval/terminal/compact); its reply id is
+    /// never reported as the delta edit target.
+    Send {
+        text: String,
+    },
+    /// A delta-owned chunk; the driver reports its reply id via
+    /// [`EventRenderer::note_sent`], making it the delta edit target.
+    SendDelta {
+        text: String,
+    },
+    Edit {
+        message_id: i64,
+        text: String,
+    },
 }
 
 /// Pure per-run render state: the message being delta-edited and the
@@ -97,22 +109,22 @@ impl EventRenderer {
                 text: chunks[0].clone(),
             });
             for chunk in &chunks[1..] {
-                actions.push(RenderAction::Send {
+                actions.push(RenderAction::SendDelta {
                     text: chunk.clone(),
                 });
             }
         } else {
             for chunk in chunks {
-                actions.push(RenderAction::Send { text: chunk });
+                actions.push(RenderAction::SendDelta { text: chunk });
             }
         }
         actions
     }
 
     /// Appends one delta and returns the full accumulated text as an edit of
-    /// the current message (or a send when no message exists yet). When the
-    /// accumulated text crosses the cap, the overflow becomes fresh messages
-    /// and the last chunk becomes the new edit target.
+    /// the current message (or a delta send when no message exists yet).
+    /// When the accumulated text crosses the cap, the overflow becomes fresh
+    /// delta messages and the last chunk becomes the new edit target.
     fn on_delta(&mut self, delta: String) -> Vec<RenderAction> {
         if delta.is_empty() {
             return Vec::new();
@@ -126,21 +138,21 @@ impl EventRenderer {
                 text: chunks[0].clone(),
             });
             for chunk in &chunks[1..] {
-                actions.push(RenderAction::Send {
+                actions.push(RenderAction::SendDelta {
                     text: chunk.clone(),
                 });
             }
         } else {
             for chunk in &chunks {
-                actions.push(RenderAction::Send {
+                actions.push(RenderAction::SendDelta {
                     text: chunk.clone(),
                 });
             }
         }
         self.current_text = chunks[chunks.len() - 1].clone();
         if self.current_message_id.is_none() {
-            // The driver reports the last Send's id via note_sent; that
-            // message becomes the new edit target.
+            // The driver reports the last delta send's id via note_sent;
+            // that message becomes the new edit target.
             self.current_message_id = None;
         }
         actions
@@ -258,7 +270,7 @@ mod tests {
         let actions = renderer.on_event("model.delta", &json!({"delta": "Hel"}));
         assert_eq!(
             actions,
-            vec![RenderAction::Send {
+            vec![RenderAction::SendDelta {
                 text: "Hel".to_string()
             }],
             "the first delta sends the opening message"
@@ -292,12 +304,12 @@ mod tests {
         let actions = renderer.on_event("model.delta", &json!({"delta": big}));
         assert_eq!(actions.len(), 2, "one send for the head, one for the tail");
         match &actions[0] {
-            RenderAction::Send { text } => assert_eq!(text.len(), 4096),
-            other => panic!("expected a send for the first chunk: {other:?}"),
+            RenderAction::SendDelta { text } => assert_eq!(text.len(), 4096),
+            other => panic!("expected a delta send for the first chunk: {other:?}"),
         }
         match &actions[1] {
-            RenderAction::Send { text } => assert_eq!(text, "y"),
-            other => panic!("expected a send for the overflow: {other:?}"),
+            RenderAction::SendDelta { text } => assert_eq!(text, "y"),
+            other => panic!("expected a delta send for the overflow: {other:?}"),
         }
         // The last send becomes the new edit target.
         renderer.note_sent(7);
@@ -387,6 +399,64 @@ mod tests {
             vec![RenderAction::Edit {
                 message_id: 9,
                 text: "ab".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn status_sends_never_claim_the_delta_edit_target() {
+        // The delta edit target is tracked independently: a status line
+        // between deltas renders as a plain send and must never become the
+        // target of the next delta edit (the driver only reports delta
+        // sends via note_sent).
+        let mut renderer = EventRenderer::new();
+        let actions = renderer.on_event("model.delta", &json!({"delta": "Hel"}));
+        assert_eq!(
+            actions,
+            vec![RenderAction::SendDelta {
+                text: "Hel".to_string()
+            }],
+            "the first delta opens a message owned by the delta stream"
+        );
+        renderer.note_sent(41);
+        for (event_type, data, expected) in [
+            (
+                "tool.requested",
+                json!({"tool_call": {"id": "t1", "name": "web_search"}}),
+                "[tool] web_search requested",
+            ),
+            (
+                "approval.resolved",
+                json!({"tool_call": {"id": "t1", "name": "web_search"}, "state": "approved"}),
+                "[approval] web_search: approved",
+            ),
+            ("run.completed", json!({"status": "completed"}), "[done]"),
+        ] {
+            let actions = renderer.on_event(event_type, &data);
+            assert_eq!(
+                actions,
+                vec![RenderAction::Send {
+                    text: expected.to_string()
+                }],
+                "{event_type} must render a plain status send"
+            );
+        }
+        let actions = renderer.on_event("model.delta", &json!({"delta": "lo"}));
+        assert_eq!(
+            actions,
+            vec![RenderAction::Edit {
+                message_id: 41,
+                text: "Hello".to_string()
+            }],
+            "the delta stream keeps editing its own message, not a status line"
+        );
+        // The terminal flush still finalizes the delta message.
+        let actions = renderer.on_event("message.delta", &json!({"delta": "final"}));
+        assert_eq!(
+            actions,
+            vec![RenderAction::Edit {
+                message_id: 41,
+                text: "final".to_string()
             }]
         );
     }

@@ -1756,6 +1756,11 @@ async fn run_renderer(
                     break;
                 }
             }
+            RenderAction::SendDelta { text } => {
+                if api.send_message(chat_id, thread_id, &text).await.is_err() {
+                    break;
+                }
+            }
             RenderAction::Edit { message_id, text } => {
                 if api
                     .edit_message_text(chat_id, message_id, &text)
@@ -1791,7 +1796,13 @@ async fn render_event(
     let throttle_edits = event_type == "model.delta";
     for action in renderer.on_event(event_type, data) {
         let result = match action {
-            RenderAction::Send { text } => {
+            // Status lines never claim the delta edit target: only delta
+            // sends report their reply id via note_sent.
+            RenderAction::Send { text } => api
+                .send_message(chat_id, thread_id, &text)
+                .await
+                .map(|_| ()),
+            RenderAction::SendDelta { text } => {
                 match api.send_message(chat_id, thread_id, &text).await {
                     Ok(sent) => {
                         renderer.note_sent(sent.message_id);
