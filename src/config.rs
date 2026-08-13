@@ -19,6 +19,7 @@ pub struct AgentGatewayConfig {
     pub max_concurrent_runs: usize,
     pub run_timeout: Duration,
     pub event_channel_capacity: usize,
+    pub broadcast_capacity: usize,
     pub max_events_per_run: usize,
     pub max_event_bytes: usize,
     pub terminal_run_ttl: Duration,
@@ -37,6 +38,9 @@ pub struct AgentGatewayConfig {
 impl AgentGatewayConfig {
     /// Validates that every lifecycle bound is positive.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_body_bytes == 0 {
+            return Err("max_body_bytes must be positive".to_string());
+        }
         if self.max_concurrent_runs == 0 {
             return Err("max_concurrent_runs must be positive".to_string());
         }
@@ -45,6 +49,9 @@ impl AgentGatewayConfig {
         }
         if self.event_channel_capacity == 0 {
             return Err("event_channel_capacity must be positive".to_string());
+        }
+        if self.broadcast_capacity == 0 {
+            return Err("broadcast_capacity must be positive".to_string());
         }
         if self.max_events_per_run == 0 {
             return Err("max_events_per_run must be positive".to_string());
@@ -81,6 +88,7 @@ impl Default for AgentGatewayConfig {
             max_concurrent_runs: 8,
             run_timeout: Duration::from_secs(900),
             event_channel_capacity: 64,
+            broadcast_capacity: 64,
             max_events_per_run: 240,
             max_event_bytes: 32 * 1024,
             terminal_run_ttl: Duration::from_secs(60),
@@ -91,5 +99,41 @@ impl Default for AgentGatewayConfig {
             sqlite,
             fuel: Some(10_000_000),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_validates() {
+        AgentGatewayConfig::default()
+            .validate()
+            .expect("default configuration must validate");
+    }
+
+    #[test]
+    fn max_body_bytes_must_be_positive() {
+        let config = AgentGatewayConfig {
+            max_body_bytes: 0,
+            ..AgentGatewayConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "max_body_bytes must be a validated positive bound"
+        );
+    }
+
+    #[test]
+    fn broadcast_capacity_must_be_positive() {
+        let config = AgentGatewayConfig {
+            broadcast_capacity: 0,
+            ..AgentGatewayConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "broadcast_capacity must be a validated positive bound"
+        );
     }
 }

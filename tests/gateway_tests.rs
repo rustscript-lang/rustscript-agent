@@ -88,7 +88,8 @@ async fn json_request(
 
 #[tokio::test]
 async fn health_models_and_sessions_follow_hermes_envelopes() {
-    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
 
     let (health_status, health) = json_request(
@@ -137,7 +138,8 @@ async fn health_models_and_sessions_follow_hermes_envelopes() {
 
 #[tokio::test]
 async fn run_returns_202_and_sse_contains_terminal_events() {
-    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
 
     let (session_status, session) = json_request(
@@ -199,7 +201,8 @@ async fn bearer_auth_is_enforced_when_configured() {
     let state = AgentGatewayState::new(AgentGatewayConfig {
         bearer_token: Some("test-token".to_string()),
         ..AgentGatewayConfig::default()
-    });
+    })
+    .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
 
     let unauthorized = app
@@ -231,7 +234,8 @@ async fn bearer_auth_is_enforced_when_configured() {
 
 #[tokio::test]
 async fn jobs_and_subagent_interrupt_follow_hermes_shapes() {
-    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
 
     let (create_status, created) = json_request(
@@ -421,7 +425,8 @@ async fn configured_rss_source_runs_inside_the_vm() {
 
 #[tokio::test]
 async fn active_run_can_be_interrupted_as_a_subagent() {
-    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
     let (status, run) = json_request(
         &app,
@@ -2602,9 +2607,22 @@ async fn session_count(app: &axum::Router) -> usize {
     sessions["data"].as_array().map(Vec::len).unwrap_or(0)
 }
 
+#[test]
+fn invalid_config_is_rejected_by_the_constructor() {
+    let config = AgentGatewayConfig {
+        max_body_bytes: 0,
+        ..AgentGatewayConfig::default()
+    };
+    assert!(
+        AgentGatewayState::new(config).is_err(),
+        "an invalid configuration must be rejected, not panic"
+    );
+}
+
 #[tokio::test]
 async fn idempotency_conflict_creates_no_session() {
-    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
 
     let (first_status, _) =
@@ -2625,7 +2643,8 @@ async fn idempotency_conflict_creates_no_session() {
 
 #[tokio::test]
 async fn idempotent_replay_returns_the_original_run_and_creates_no_session() {
-    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
 
     let (first_status, first) =
@@ -2650,7 +2669,8 @@ async fn idempotent_replay_returns_the_original_run_and_creates_no_session() {
 
 #[tokio::test]
 async fn missing_parent_rejects_without_creating_a_session() {
-    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("gateway config must validate");
     let app = build_agent_gateway_app(state);
 
     let (status, body) = json_request(

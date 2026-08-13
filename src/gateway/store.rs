@@ -88,6 +88,7 @@ impl std::error::Error for StorageError {}
 pub struct GatewayPersistence {
     worker: StorageWorker,
     max_events: i64,
+    broadcast_capacity: usize,
 }
 
 /// One serialized storage request for the dedicated worker thread.
@@ -222,6 +223,7 @@ impl GatewayPersistence {
                 thread: Some(thread),
             },
             max_events: config.max_events_per_run as i64,
+            broadcast_capacity: config.broadcast_capacity,
         })
     }
 
@@ -425,7 +427,7 @@ impl GatewayPersistence {
                 }),
             )
             .map_err(|error| format!("load gateway state: {error}"))?;
-        GatewayStore::from_load(&data)
+        GatewayStore::from_load(&data, self.broadcast_capacity)
     }
 }
 
@@ -584,7 +586,7 @@ impl GatewayStore {
     /// session/message references, unknown parent runs, and event sequence
     /// gaps are all rejected (agent correctness never depends on SQLite
     /// foreign-key enforcement, which the core host does not enable).
-    fn from_load(data: &Value) -> Result<Self, String> {
+    fn from_load(data: &Value, broadcast_capacity: usize) -> Result<Self, String> {
         let session_rows = load_rows(data, "sessions")?;
         let message_rows = load_rows(data, "messages")?;
         let run_rows = load_rows(data, "runs")?;
@@ -657,7 +659,7 @@ impl GatewayStore {
             if !sessions.contains_key(&session_id) {
                 return Err(format!("run references unknown session: {session_id}"));
             }
-            let (sender, _) = broadcast::channel(64);
+            let (sender, _) = broadcast::channel(broadcast_capacity);
             let run = RunRecord {
                 run_id: run_id.clone(),
                 session_id,

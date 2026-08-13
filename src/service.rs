@@ -407,7 +407,7 @@ impl AgentService {
         session.view.message_count = session.messages.len();
         session.view.updated_at = now;
 
-        let (sender, _) = tokio::sync::broadcast::channel(32);
+        let (sender, _) = tokio::sync::broadcast::channel(self.inner.config.broadcast_capacity);
         let started_event = GatewayEvent {
             event_id: event_id.clone(),
             seq: 1,

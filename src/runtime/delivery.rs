@@ -211,3 +211,43 @@ pub(crate) fn append_event_locked(
     }
     event
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_bounded_channel_blocks_delivery_until_capacity_returns() {
+        // The service-level delivery sink must pause the worker when the
+        // bounded delivery path is full (backpressure): a delivery attempt
+        // stays blocked until the receiver drains capacity. The sink uses
+        // blocking_send, so the deliveries run on a plain thread (the sink
+        // is only ever used from blocking worker threads).
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut sink = ChannelEventSink(sender);
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sink.deliver(VmValue::Int(1)).expect("the first event fits");
+            let _ = blocked_tx.send(());
+            sink.deliver(VmValue::Int(2))
+                .expect("delivery must resume after capacity returns");
+        });
+        blocked_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the worker must fill the bounded channel");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !worker.is_finished(),
+            "a full bounded delivery path must block the worker (backpressure)"
+        );
+        assert_eq!(
+            receiver.recv().await.expect("receiver must drain"),
+            VmValue::Int(1)
+        );
+        worker.join().expect("blocked delivery worker");
+        assert_eq!(
+            receiver.recv().await.expect("second event must arrive"),
+            VmValue::Int(2)
+        );
+    }
+}

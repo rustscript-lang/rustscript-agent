@@ -88,7 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, Some(path)) => {
             AgentGatewayState::with_sqlite_path(config, path).map_err(std::io::Error::other)?
         }
-        (None, None) => AgentGatewayState::new(config),
+        (None, None) => {
+            AgentGatewayState::new(config).map_err(std::io::Error::other)?
+        }
     };
 
     let listener = tokio::net::TcpListener::bind(address).await?;
