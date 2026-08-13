@@ -12,6 +12,8 @@ pub mod runtime;
 
 #[path = "gateway_store.rs"]
 pub(crate) mod gateway_store;
+
+pub use gateway_store::GatewayPersistence;
 pub mod service;
 
 pub use gateway::{AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app};

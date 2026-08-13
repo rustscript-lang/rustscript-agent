@@ -1,13 +1,16 @@
 //! Gateway durable state: a dedicated storage worker thread executes every
-//! RSS storage command off the Tokio request threads, and mutations are
-//! committed one typed command at a time (never a delete-all + insert-snapshot
-//! replacement).
+//! RSS storage command off the Tokio request threads against the normalized
+//! typed schema (`rss/storage/main.rss`), never the legacy blob adapter
+//! (`rss/storage/gateway.rss`, retained only as an explicit migration
+//! fixture).
 //!
-//! The worker owns the compiled `gateway.rss` program and serializes all
+//! The worker owns the compiled `main.rss` program and serializes all
 //! SQLite access through one connection per command. Callers submit a
 //! request and block on the bounded response; the worker performs the RSS
-//! invocation. `load()` reconstructs the in-memory store from the durable
-//! tables and re-normalizes it with per-record upserts.
+//! invocation. `load()` migrates, runs transactional restart recovery in
+//! bounded batches, then reconstructs the in-memory store from a
+//! cursor-paginated dump — a load larger than any single page or byte limit
+//! is drained completely, never silently truncated.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,8 +26,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
-use axum::response::sse::Event;
-
 use crate::gateway::{timestamp, vm_value_to_json};
 use crate::{AgentConfig, AgentRunner};
 
@@ -32,15 +33,60 @@ use crate::{AgentConfig, AgentRunner};
 /// every RSS op is bounded, so this only guards against a wedged worker.
 const STORAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) struct GatewayPersistence {
+/// One recovery batch processes at most this many interrupted runs; the
+/// gateway loops until a batch reports zero recovered.
+const RECOVERY_BATCH: i64 = 512;
+
+/// Page size used by the cursor-paginated `load.all` dump.
+const LOAD_PAGE_ROWS: i64 = 512;
+
+/// Per-page byte budget of the cursor-paginated `load.all` dump.
+const LOAD_PAGE_BYTES: i64 = 2 * 1024 * 1024;
+
+/// Column orders of the `load.all` rows (part of the command contract; see
+/// `rss/storage/load.rss`).
+/// sessions:   id, profile, platform, account_id, chat_id, thread_id,
+///             user_id, generation, status, system_prompt, model, provider,
+///             toolset_hash, metadata_json, last_message_seq, created_at_ms,
+///             updated_at_ms, title, end_reason
+/// messages:   ordinal, id, session_id, role, content_json, name,
+///             tool_call_id, parent_message_id, token_estimate, compacted,
+///             metadata_json, run_id, finish_reason, created_at_ms
+/// runs:       id, session_id, parent_run_id, status, input_json, provider,
+///             model, script_hash, idempotency_scope, idempotency_key,
+///             turn_count, input_tokens, output_tokens, error_code,
+///             error_message, recovery_reason, created_at_ms, started_at_ms,
+///             finished_at_ms, updated_at_ms
+/// events:     seq, run_id, event_id, event_type, payload_json, created_at_ms
+/// jobs:       id, name, schedule_json, prompt, deliver_json, skills_json,
+///             repeat_count, enabled, output_json, created_at_ms,
+///             updated_at_ms, last_run_at_ms
+/// idempotency: scope, key, request_hash, resource_type, resource_id, state,
+///              response_json, created_at_ms, expires_at_ms, completed_at_ms
+///
+/// A typed storage command failure carrying the RSS error code.
+#[derive(Debug, Clone)]
+pub struct StorageError {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+pub struct GatewayPersistence {
     worker: StorageWorker,
+    max_events: i64,
 }
 
 /// One serialized storage request for the dedicated worker thread.
 struct StorageRequest {
     op: String,
-    kind: String,
-    record_id: String,
     payload: Value,
     respond: Sender<Result<Value, String>>,
 }
@@ -71,7 +117,7 @@ impl StorageRunner {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("rss")
             .join("storage")
-            .join("gateway.rss");
+            .join("main.rss");
         let runner = AgentRunner::from_file(source, agent_config)
             .map_err(|error| format!("compile RSS storage program: {error}"))?;
         let db_path = path
@@ -86,17 +132,9 @@ impl StorageRunner {
         })
     }
 
-    fn command(
-        &self,
-        op: &str,
-        kind: &str,
-        record_id: &str,
-        payload: &Value,
-    ) -> Result<Value, String> {
+    fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
         let input = VmValue::map(vec![
             (VmValue::string("op"), VmValue::string(op)),
-            (VmValue::string("kind"), VmValue::string(kind)),
-            (VmValue::string("record_id"), VmValue::string(record_id)),
             (
                 VmValue::string("request_id"),
                 VmValue::string(uuid::Uuid::new_v4().to_string()),
@@ -110,8 +148,8 @@ impl StorageRunner {
                 VmValue::string("read_write_create"),
             ),
             (VmValue::string("busy_timeout_ms"), VmValue::Int(5_000)),
-            (VmValue::string("max_rows"), VmValue::Int(10_000)),
-            (VmValue::string("max_bytes"), VmValue::Int(4 * 1024 * 1024)),
+            (VmValue::string("max_rows"), VmValue::Int(LOAD_PAGE_ROWS)),
+            (VmValue::string("max_bytes"), VmValue::Int(LOAD_PAGE_BYTES)),
             (VmValue::string("max_events"), VmValue::Int(self.max_events)),
             (VmValue::string("max_messages"), VmValue::Int(128)),
             (VmValue::string("now_ms"), VmValue::Int(timestamp() as i64)),
@@ -143,12 +181,7 @@ fn storage_worker_loop(
     loop {
         match requests.recv_timeout(Duration::from_millis(200)) {
             Ok(request) => {
-                let result = runner.command(
-                    &request.op,
-                    &request.kind,
-                    &request.record_id,
-                    &request.payload,
-                );
+                let result = runner.command(&request.op, &request.payload);
                 let _ = request.respond.send(result);
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -162,10 +195,13 @@ fn storage_worker_loop(
 }
 
 impl GatewayPersistence {
-    pub(crate) fn open(
-        config: &crate::gateway::AgentGatewayConfig,
-        path: &Path,
-    ) -> Result<Self, String> {
+    /// Opens the normalized typed storage repository: compiles `main.rss`
+    /// and spawns the dedicated worker thread. Typed repository commands
+    /// (admission, sessions, messages, runs, events, jobs, approvals,
+    /// compactions) block on the worker's bounded response and are meant to
+    /// be called from blocking threads (`spawn_blocking`), never directly
+    /// from Tokio request threads.
+    pub fn open(config: &crate::gateway::AgentGatewayConfig, path: &Path) -> Result<Self, String> {
         let runner = StorageRunner::open(config, path)?;
         let (sender, requests) = mpsc::channel::<StorageRequest>();
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
@@ -179,26 +215,19 @@ impl GatewayPersistence {
                 shutdown: shutdown_sender,
                 thread: Some(thread),
             },
+            max_events: config.max_events_per_run as i64,
         })
     }
 
     /// Runs one command on the dedicated storage worker and blocks (bounded)
-    /// for the response. The worker thread executes the RSS program; request
+    /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
-    fn command(
-        &self,
-        op: &str,
-        kind: &str,
-        record_id: &str,
-        payload: &Value,
-    ) -> Result<Value, String> {
+    fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
         let (respond, response) = mpsc::channel();
         self.worker
             .sender
             .send(StorageRequest {
                 op: op.to_string(),
-                kind: kind.to_string(),
-                record_id: record_id.to_string(),
                 payload: payload.clone(),
                 respond,
             })
@@ -213,192 +242,180 @@ impl GatewayPersistence {
             })?
     }
 
-    /// Upserts one record through the typed per-record command.
-    pub(crate) fn put(&self, kind: &str, record_id: &str, payload: &Value) -> Result<(), String> {
-        let result = self.command("put", kind, record_id, payload)?;
+    /// Runs one typed command and returns its `data` payload, or a typed
+    /// [`StorageError`] carrying the RSS error code.
+    fn command_data(&self, op: &str, payload: &Value) -> Result<Value, StorageError> {
+        let result = self.command(op, payload).map_err(|message| StorageError {
+            code: "storage_unavailable".to_string(),
+            message,
+        })?;
         if result.get("ok") != Some(&Value::Bool(true)) {
-            return Err(format!("put {kind}/{record_id} failed: {result}"));
+            return Err(StorageError {
+                code: result
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage_error")
+                    .to_string(),
+                message: result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("storage command failed")
+                    .to_string(),
+            });
         }
-        Ok(())
+        Ok(result.get("data").cloned().unwrap_or(Value::Null))
     }
 
-    /// Deletes one record (events delete by run prefix) through the typed
-    /// per-record command.
-    pub(crate) fn delete(&self, kind: &str, record_id: &str) -> Result<(), String> {
-        let result = self.command("delete", kind, record_id, &Value::Null)?;
-        if result.get("ok") != Some(&Value::Bool(true)) {
-            return Err(format!("delete {kind}/{record_id} failed: {result}"));
-        }
-        Ok(())
+    // ------------------------------------------------------------------
+    // Typed repository commands (production read/write path).
+    // ------------------------------------------------------------------
+
+    /// One atomic admission: session (created or touched), first user
+    /// message, run, child link, idempotency record, run.started event, and
+    /// retention floor commit in a single transaction. The returned data
+    /// carries `replayed`, `run`, `session`, `message`, and `idempotency`.
+    pub fn admission_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("admission.create", payload)
     }
 
-    pub(crate) fn load(&self) -> Result<GatewayStore, String> {
-        let result = self.command("load", "", "", &json!({}))?;
-        if result.get("ok") != Some(&Value::Bool(true)) {
-            return Err(format!("load gateway state failed: {result}"));
-        }
-        let data = result
-            .get("data")
-            .cloned()
-            .ok_or_else(|| "gateway state result omitted data".to_string())?;
-        let mut snapshot = PersistedState {
-            sessions: BTreeMap::new(),
-            runs: HashMap::new(),
-            jobs: BTreeMap::new(),
-            idempotency: HashMap::new(),
-        };
-        let mut events_by_run: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
-        let mut seen_sessions = HashSet::new();
-        let mut seen_runs = HashSet::new();
-        let mut seen_jobs = HashSet::new();
-        let mut seen_idempotency = HashSet::new();
-        let mut seen_event_ids = HashSet::new();
-        let rows = data
-            .get("rows")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "gateway state result omitted rows".to_string())?;
-        for row in rows {
-            let Some(row) = row.as_array() else { continue };
-            let (Some(kind), Some(record_id), Some(payload)) = (
-                row.first().and_then(Value::as_str),
-                row.get(1).and_then(Value::as_str),
-                row.get(2).and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            match kind {
-                "session" => {
-                    let session: SessionRecord = serde_json::from_str(payload)
-                        .map_err(|error| format!("decode session: {error}"))?;
-                    if session.view.id != record_id || !seen_sessions.insert(record_id) {
-                        return Err(format!("invalid or duplicate session row: {record_id}"));
-                    }
-                    snapshot.sessions.insert(record_id.to_string(), session);
-                }
-                "run" => {
-                    let run: PersistedRun = serde_json::from_str(payload)
-                        .map_err(|error| format!("decode run: {error}"))?;
-                    if run.run_id != record_id || !seen_runs.insert(record_id) {
-                        return Err(format!("invalid or duplicate run row: {record_id}"));
-                    }
-                    snapshot.runs.insert(record_id.to_string(), run);
-                }
-                "job" => {
-                    let job: JobRecord = serde_json::from_str(payload)
-                        .map_err(|error| format!("decode job: {error}"))?;
-                    if job.view.id != record_id || !seen_jobs.insert(record_id) {
-                        return Err(format!("invalid or duplicate job row: {record_id}"));
-                    }
-                    snapshot.jobs.insert(record_id.to_string(), job);
-                }
-                "event" => {
-                    let event: GatewayEvent = serde_json::from_str(payload)
-                        .map_err(|error| format!("decode event: {error}"))?;
-                    let run_id = record_id
-                        .split_once(':')
-                        .map(|(run_id, _)| run_id)
-                        .unwrap_or(record_id);
-                    if event.run_id != run_id || !seen_event_ids.insert(event.event_id.clone()) {
-                        return Err(format!("invalid or duplicate event row: {record_id}"));
-                    }
-                    events_by_run
-                        .entry(run_id.to_string())
-                        .or_default()
-                        .push(event);
-                }
-                "idempotency" => {
-                    let idempotency: IdempotencyRecord = serde_json::from_str(payload)
-                        .map_err(|error| format!("decode idempotency record: {error}"))?;
-                    if !seen_idempotency.insert(record_id) {
-                        return Err(format!("duplicate idempotency row: {record_id}"));
-                    }
-                    snapshot
-                        .idempotency
-                        .insert(record_id.to_string(), idempotency);
-                }
-                _ => {}
-            }
-        }
-        for (run_id, mut events) in events_by_run {
-            events.sort_by_key(|event| event.seq);
-            // Retained history may begin at first_seq > 1 (retention floor);
-            // only adjacency must hold.
-            let first_seq = events.first().map(|event| event.seq).unwrap_or(1);
-            for (index, event) in events.iter().enumerate() {
-                let expected_seq = first_seq + index as u64;
-                if event.seq != expected_seq {
-                    return Err(format!(
-                        "event sequence gap for run {run_id}: expected {expected_seq}, got {}",
-                        event.seq
-                    ));
-                }
-            }
-            let session_id = snapshot
-                .runs
-                .get(&run_id)
-                .ok_or_else(|| format!("event references unknown run: {run_id}"))?
-                .session_id
-                .clone();
-            if !snapshot.sessions.contains_key(&session_id) {
-                return Err(format!("run references unknown session: {session_id}"));
-            }
-            snapshot
-                .runs
-                .get_mut(&run_id)
-                .expect("run was validated above")
-                .events = events;
-        }
-        let store = GatewayStore::from_snapshot(snapshot);
-        // Re-normalize durably with per-record upserts (sequence fixes and
-        // restart terminal transitions), never a full snapshot replacement.
-        self.normalize(&store)?;
-        Ok(store)
+    pub fn session_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("session.create", payload)
     }
 
-    /// Writes the normalized store back one record at a time. Ordering
-    /// matters for reload validation: sessions, then runs, then events, then
-    /// idempotency records.
-    fn normalize(&self, store: &GatewayStore) -> Result<(), String> {
-        for (id, session) in &store.sessions {
-            self.put(
-                "session",
-                id,
-                &serde_json::to_value(session)
-                    .map_err(|error| format!("encode session {id}: {error}"))?,
-            )?;
+    pub fn session_touch(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("session.touch", payload)
+    }
+
+    /// Cascades one session (messages, runs, events, links, approvals,
+    /// compactions, delivery cursors, idempotency) in one transaction.
+    pub fn session_delete(&self, session_id: &str) -> Result<Value, StorageError> {
+        self.command_data("session.delete", &json!({ "session_id": session_id }))
+    }
+
+    pub fn message_append(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("message.append", payload)
+    }
+
+    /// Appends one run event with transactional sequence allocation and
+    /// retention pruning.
+    pub fn event_append(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("event.append", payload)
+    }
+
+    /// One atomic terminal commit: run status transition plus terminal
+    /// events (and optional assistant message) in a single transaction.
+    /// The returned data carries the run row and the run's event rows.
+    pub fn run_terminal(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("run.terminal", payload)
+    }
+
+    /// A guarded typed run status transition (0 rows is a typed
+    /// `transition_conflict`).
+    pub fn run_transition(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("run.transition", payload)
+    }
+
+    pub fn run_get(&self, run_id: &str) -> Result<Value, StorageError> {
+        self.command_data("run.get", &json!({ "run_id": run_id }))
+    }
+
+    /// Replays one run's retained events with precise
+    /// oldest/high-water cursors (`cursor_too_old` below the floor).
+    pub fn event_replay(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("event.replay", payload)
+    }
+
+    pub fn job_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("job.create", payload)
+    }
+
+    pub fn job_update(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("job.update", payload)
+    }
+
+    pub fn job_delete(&self, job_id: &str) -> Result<Value, StorageError> {
+        self.command_data("job.delete", &json!({ "job_id": job_id }))
+    }
+
+    pub fn approval_request(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("approval.request", payload)
+    }
+
+    pub fn approval_get(&self, approval_id: &str) -> Result<Value, StorageError> {
+        self.command_data("approval.get", &json!({ "approval_id": approval_id }))
+    }
+
+    pub fn approval_resolve(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("approval.resolve", payload)
+    }
+
+    pub fn approval_expire(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("approval.expire", payload)
+    }
+
+    pub fn compaction_start(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("compaction.start", payload)
+    }
+
+    pub fn compaction_get(&self, compaction_id: &str) -> Result<Value, StorageError> {
+        self.command_data("compaction.get", &json!({ "compaction_id": compaction_id }))
+    }
+
+    pub fn compaction_latest(&self, session_id: &str) -> Result<Value, StorageError> {
+        self.command_data("compaction.latest", &json!({ "session_id": session_id }))
+    }
+
+    pub fn compaction_commit(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("compaction.commit", payload)
+    }
+
+    pub fn compaction_fail(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("compaction.fail", payload)
+    }
+
+    /// Restart recovery: migrates the schema, recovers every interrupted
+    /// active run to the documented terminal restart state in transactional
+    /// bounded batches (exactly once per run, guarded by
+    /// `recovery_records`), and rebuilds the in-memory store from the
+    /// cursor-paginated normalized dump.
+    pub fn load(&self) -> Result<GatewayStore, String> {
+        let migrated = self
+            .command_data("migrate", &json!({}))
+            .map_err(|error| format!("migrate gateway state: {error}"))?;
+        if migrated.get("schema_version") != Some(&json!(4)) {
+            return Err(format!(
+                "gateway schema migrated to an unexpected version: {migrated}"
+            ));
         }
-        for run in store.runs.values() {
-            self.put(
-                "run",
-                &run.run_id,
-                &persisted_run_value(run)
-                    .map_err(|error| format!("encode run {}: {error}", run.run_id))?,
-            )?;
-            for event in &run.events {
-                self.put(
-                    "event",
-                    &event_record_id(&run.run_id, event.seq),
-                    &serde_json::to_value(event)
-                        .map_err(|error| format!("encode event {}: {error}", event.event_id))?,
-                )?;
+        let mut recovered = 1i64;
+        let mut rounds = 0u32;
+        while recovered > 0 {
+            let result = self
+                .command_data(
+                    "recovery.recover_active",
+                    &json!({
+                        "reason": "gateway_restart",
+                        "details_json": "{}",
+                        "now_ms": timestamp(),
+                        "max_rows": RECOVERY_BATCH,
+                        "max_bytes": LOAD_PAGE_BYTES,
+                        "max_events": self.max_events,
+                    }),
+                )
+                .map_err(|error| format!("recover interrupted runs: {error}"))?;
+            recovered = result.get("recovered").and_then(Value::as_i64).unwrap_or(0);
+            rounds += 1;
+            if rounds > 10_000 {
+                return Err("restart recovery did not converge".to_string());
             }
         }
-        for (id, job) in &store.jobs {
-            self.put(
-                "job",
-                id,
-                &serde_json::to_value(job).map_err(|error| format!("encode job {id}: {error}"))?,
-            )?;
-        }
-        for (id, record) in &store.idempotency {
-            self.put(
-                "idempotency",
-                id,
-                &serde_json::to_value(record)
-                    .map_err(|error| format!("encode idempotency record {id}: {error}"))?,
-            )?;
-        }
-        Ok(())
+        let data = self
+            .command_data(
+                "load.all",
+                &json!({ "max_rows": LOAD_PAGE_ROWS, "max_bytes": LOAD_PAGE_BYTES }),
+            )
+            .map_err(|error| format!("load gateway state: {error}"))?;
+        GatewayStore::from_load(&data)
     }
 }
 
@@ -413,27 +430,8 @@ impl Drop for GatewayPersistence {
     }
 }
 
-/// Serializes one run record without its event rows (events are separate
-/// records); the `events` field deserializes as empty on reload.
-pub(crate) fn persisted_run_value(run: &RunRecord) -> Result<Value, String> {
-    serde_json::to_value(PersistedRun {
-        run_id: run.run_id.clone(),
-        session_id: run.session_id.clone(),
-        parent_run_id: run.parent_run_id.clone(),
-        status: run.status.clone(),
-        events: Vec::new(),
-    })
-    .map_err(|error| format!("encode run {}: {error}", run.run_id))
-}
-
-/// Durable record id for one event row: zero-padded sequence keeps the load
-/// dump ordered by run and sequence.
-pub(crate) fn event_record_id(run_id: &str, seq: u64) -> String {
-    format!("{run_id}:{seq:020}")
-}
-
 #[derive(Default)]
-pub(crate) struct GatewayStore {
+pub struct GatewayStore {
     pub(crate) sessions: BTreeMap<String, SessionRecord>,
     pub(crate) runs: HashMap<String, RunRecord>,
     pub(crate) jobs: BTreeMap<String, JobRecord>,
@@ -446,89 +444,13 @@ pub(crate) struct IdempotencyRecord {
     pub(crate) run_id: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct PersistedState {
-    sessions: BTreeMap<String, SessionRecord>,
-    #[serde(default)]
-    runs: HashMap<String, PersistedRun>,
-    jobs: BTreeMap<String, JobRecord>,
-    #[serde(default)]
-    idempotency: HashMap<String, IdempotencyRecord>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedRun {
-    run_id: String,
-    session_id: String,
-    parent_run_id: Option<String>,
-    status: String,
-    #[serde(default)]
-    events: Vec<GatewayEvent>,
-}
-
-impl GatewayStore {
-    fn from_snapshot(snapshot: PersistedState) -> Self {
-        let runs = snapshot
-            .runs
-            .into_iter()
-            .map(|(run_id, persisted)| {
-                let (sender, _) = broadcast::channel(64);
-                let mut status = persisted.status;
-                let mut events = persisted.events;
-                for (index, event) in events.iter_mut().enumerate() {
-                    if event.seq == 0 {
-                        event.seq = (index + 1) as u64;
-                    }
-                    if event.event_id.is_empty() {
-                        event.event_id = format!("{}-{}", persisted.run_id, event.seq);
-                    }
-                }
-                if matches!(status.as_str(), "started" | "stopping")
-                    && !events.iter().any(GatewayEvent::is_terminal)
-                {
-                    status = "failed".to_string();
-                    events.push(GatewayEvent {
-                        event_id: format!("{}-{}", persisted.run_id, events.len() + 1),
-                        seq: events.len() as u64 + 1,
-                        event: "run.failed".to_string(),
-                        run_id: persisted.run_id.clone(),
-                        timestamp: timestamp(),
-                        data: json!({
-                            "status": "failed",
-                            "error_code": "gateway_restart",
-                            "error_message": "run interrupted during gateway restart"
-                        }),
-                    });
-                }
-                (
-                    run_id,
-                    RunRecord {
-                        run_id: persisted.run_id,
-                        session_id: persisted.session_id,
-                        parent_run_id: persisted.parent_run_id,
-                        status,
-                        events,
-                        sender,
-                        cancel_requested: Arc::new(AtomicBool::new(false)),
-                    },
-                )
-            })
-            .collect();
-        Self {
-            sessions: snapshot.sessions,
-            runs,
-            jobs: snapshot.jobs,
-            idempotency: snapshot.idempotency,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SessionRecord {
     pub(crate) view: SessionView,
     pub(crate) messages: Vec<SessionMessage>,
 }
 
+#[derive(Clone)]
 pub(crate) struct RunRecord {
     pub(crate) run_id: String,
     pub(crate) session_id: String,
@@ -536,7 +458,7 @@ pub(crate) struct RunRecord {
     pub(crate) status: String,
     pub(crate) events: Vec<GatewayEvent>,
     pub(crate) sender: broadcast::Sender<GatewayEvent>,
-    /// Legacy boolean stop flag kept for persisted-state compatibility; the
+    /// Legacy boolean stop flag kept for in-memory compatibility; the
     /// authoritative typed cancellation lives in the service RunHandle.
     #[allow(dead_code)]
     pub(crate) cancel_requested: Arc<AtomicBool>,
@@ -607,7 +529,7 @@ impl GatewayEvent {
         )
     }
 
-    pub(crate) fn into_sse(self) -> Event {
+    pub(crate) fn into_sse(self) -> axum::response::sse::Event {
         let event_name = self.event.clone();
         let mut payload = serde_json::Map::new();
         payload.insert("event_id".to_string(), Value::String(self.event_id.clone()));
@@ -623,6 +545,271 @@ impl GatewayEvent {
         }
         let data =
             serde_json::to_string(&Value::Object(payload)).unwrap_or_else(|_| "{}".to_string());
-        Event::default().event(event_name).data(data)
+        axum::response::sse::Event::default()
+            .event(event_name)
+            .data(data)
     }
+}
+
+/// Maps a normalized run status back to the gateway's in-memory status
+/// vocabulary. The DB persists only `running` for active runs (a gateway
+/// `stopping` state is in-memory only); restart recovery converts every
+/// non-terminal DB status to `failed` before load, so any leftover active
+/// status maps defensively to `started`.
+fn memory_status(db_status: &str) -> &'static str {
+    match db_status {
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "started",
+    }
+}
+
+impl GatewayStore {
+    /// Rebuilds the in-memory store from the normalized `load.all` dump.
+    /// Validation is explicit and hard-failing: duplicate ids, unknown
+    /// session/message references, unknown parent runs, and event sequence
+    /// gaps are all rejected (agent correctness never depends on SQLite
+    /// foreign-key enforcement, which the core host does not enable).
+    fn from_load(data: &Value) -> Result<Self, String> {
+        let session_rows = load_rows(data, "sessions")?;
+        let message_rows = load_rows(data, "messages")?;
+        let run_rows = load_rows(data, "runs")?;
+        let event_rows = load_rows(data, "events")?;
+        let job_rows = load_rows(data, "jobs")?;
+        let idempotency_rows = load_rows(data, "idempotency")?;
+
+        let mut sessions = BTreeMap::new();
+        for row in session_rows {
+            let id = string_cell(&row, 0, "session id")?;
+            let view = SessionView {
+                id: id.clone(),
+                object: "hermes.session".to_string(),
+                title: optional_string(&row, 17),
+                model: string_cell(&row, 10, "session model")?,
+                provider: optional_string(&row, 11),
+                source: string_cell(&row, 2, "session platform")?,
+                system_prompt: optional_string(&row, 9),
+                created_at: int_cell(&row, 15, "session created_at")? as u64,
+                updated_at: int_cell(&row, 16, "session updated_at")? as u64,
+                message_count: 0,
+                end_reason: optional_string(&row, 18),
+            };
+            if sessions
+                .insert(
+                    id.clone(),
+                    SessionRecord {
+                        view,
+                        messages: Vec::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(format!("duplicate session row: {id}"));
+            }
+        }
+        let mut messages_by_session: HashMap<String, Vec<SessionMessage>> = HashMap::new();
+        for row in message_rows {
+            let session_id = string_cell(&row, 2, "message session id")?;
+            if !sessions.contains_key(&session_id) {
+                return Err(format!("message references unknown session: {session_id}"));
+            }
+            let message = SessionMessage {
+                id: string_cell(&row, 1, "message id")?,
+                session_id: session_id.clone(),
+                role: string_cell(&row, 3, "message role")?,
+                content: json_cell(&row, 4, "message content")?,
+                created_at: int_cell(&row, 13, "message created_at")? as u64,
+                run_id: optional_string(&row, 11),
+                finish_reason: optional_string(&row, 12),
+            };
+            messages_by_session
+                .entry(session_id)
+                .or_default()
+                .push(message);
+        }
+        for (session_id, mut messages) in messages_by_session {
+            messages.sort_by_key(|message| message.created_at);
+            let session = sessions
+                .get_mut(&session_id)
+                .expect("session presence was validated above");
+            session.messages = messages;
+            session.view.message_count = session.messages.len();
+        }
+
+        let mut runs = HashMap::new();
+        for row in run_rows {
+            let run_id = string_cell(&row, 0, "run id")?;
+            let session_id = string_cell(&row, 1, "run session id")?;
+            if !sessions.contains_key(&session_id) {
+                return Err(format!("run references unknown session: {session_id}"));
+            }
+            let (sender, _) = broadcast::channel(64);
+            let run = RunRecord {
+                run_id: run_id.clone(),
+                session_id,
+                parent_run_id: optional_string(&row, 2),
+                status: memory_status(&string_cell(&row, 3, "run status")?).to_string(),
+                events: Vec::new(),
+                sender,
+                cancel_requested: Arc::new(AtomicBool::new(false)),
+            };
+            if runs.insert(run_id.clone(), run).is_some() {
+                return Err(format!("duplicate run row: {run_id}"));
+            }
+        }
+        // Parent references must exist (the RSS layer enforces this on
+        // write; load re-validates so correctness never depends on FK).
+        for run in runs.values() {
+            if let Some(parent) = run.parent_run_id.as_deref()
+                && !runs.contains_key(parent)
+            {
+                return Err(format!("run references unknown parent run: {parent}"));
+            }
+        }
+        let mut events_by_run: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
+        for row in event_rows {
+            let run_id = string_cell(&row, 1, "event run id")?;
+            if !runs.contains_key(&run_id) {
+                return Err(format!("event references unknown run: {run_id}"));
+            }
+            let event = GatewayEvent {
+                event_id: string_cell(&row, 2, "event id")?,
+                seq: int_cell(&row, 0, "event seq")? as u64,
+                event: string_cell(&row, 3, "event type")?,
+                run_id: run_id.clone(),
+                timestamp: int_cell(&row, 5, "event created_at")? as u64,
+                data: json_cell(&row, 4, "event payload")?,
+            };
+            events_by_run.entry(run_id).or_default().push(event);
+        }
+        for (run_id, mut events) in events_by_run {
+            events.sort_by_key(|event| event.seq);
+            let mut seen = HashSet::new();
+            let first_seq = events.first().map(|event| event.seq).unwrap_or(1);
+            for (index, event) in events.iter().enumerate() {
+                let expected_seq = first_seq + index as u64;
+                if event.seq != expected_seq || !seen.insert(event.event_id.clone()) {
+                    return Err(format!(
+                        "event sequence gap or duplicate for run {run_id}: expected {expected_seq}, got {}",
+                        event.seq
+                    ));
+                }
+            }
+            runs.get_mut(&run_id)
+                .expect("run presence was validated above")
+                .events = events;
+        }
+
+        let mut jobs = BTreeMap::new();
+        for row in job_rows {
+            let id = string_cell(&row, 0, "job id")?;
+            let repeat = int_cell(&row, 6, "job repeat")?;
+            let job = JobRecord {
+                view: JobView {
+                    id: id.clone(),
+                    name: string_cell(&row, 1, "job name")?,
+                    schedule: json_cell(&row, 2, "job schedule")?,
+                    prompt: string_cell(&row, 3, "job prompt")?,
+                    deliver: json_cell(&row, 4, "job deliver")?,
+                    skills: json_array_strings(&row, 5, "job skills")?,
+                    repeat: (repeat > 0).then_some(repeat),
+                    enabled: int_cell(&row, 7, "job enabled")? != 0,
+                    created_at: int_cell(&row, 9, "job created_at")? as u64,
+                    updated_at: int_cell(&row, 10, "job updated_at")? as u64,
+                    last_run_at: {
+                        let value = int_cell(&row, 11, "job last_run_at")?;
+                        (value > 0).then_some(value as u64)
+                    },
+                },
+                output: json_optional_cell(&row, 8, "job output")?,
+            };
+            if jobs.insert(id.clone(), job).is_some() {
+                return Err(format!("duplicate job row: {id}"));
+            }
+        }
+
+        let mut idempotency = HashMap::new();
+        for row in idempotency_rows {
+            let key = string_cell(&row, 1, "idempotency key")?;
+            let state = string_cell(&row, 5, "idempotency state")?;
+            if state == "completed" {
+                let record = IdempotencyRecord {
+                    request_hash: string_cell(&row, 2, "idempotency request hash")?,
+                    run_id: string_cell(&row, 4, "idempotency resource id")?,
+                };
+                if idempotency.insert(key.clone(), record).is_some() {
+                    return Err(format!("duplicate idempotency row: {key}"));
+                }
+            }
+        }
+
+        Ok(Self {
+            sessions,
+            runs,
+            jobs,
+            idempotency,
+        })
+    }
+}
+
+fn load_rows(data: &Value, key: &str) -> Result<Vec<Vec<Value>>, String> {
+    data.get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("load.all result omitted {key} rows"))?
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .cloned()
+                .ok_or_else(|| format!("load.all {key} row is not an array"))
+        })
+        .collect()
+}
+
+fn string_cell(row: &[Value], index: usize, label: &str) -> Result<String, String> {
+    row.get(index)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("load.all row missing {label}"))
+}
+
+fn optional_string(row: &[Value], index: usize) -> Option<String> {
+    row.get(index)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn int_cell(row: &[Value], index: usize, label: &str) -> Result<i64, String> {
+    row.get(index)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("load.all row missing {label}"))
+}
+
+fn json_cell(row: &[Value], index: usize, label: &str) -> Result<Value, String> {
+    let text = string_cell(row, index, label)?;
+    serde_json::from_str(&text).map_err(|error| format!("decode {label}: {error}"))
+}
+
+fn json_optional_cell(row: &[Value], index: usize, label: &str) -> Result<Option<Value>, String> {
+    match row.get(index).and_then(Value::as_str) {
+        Some("") | None => Ok(None),
+        Some(text) => serde_json::from_str(text)
+            .map(Some)
+            .map_err(|error| format!("decode {label}: {error}")),
+    }
+}
+
+fn json_array_strings(row: &[Value], index: usize, label: &str) -> Result<Vec<String>, String> {
+    let value = json_cell(row, index, label)?;
+    value
+        .as_array()
+        .ok_or_else(|| format!("{label} is not an array"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| format!("{label} contains a non-string"))
+        })
+        .collect()
 }

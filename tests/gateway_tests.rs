@@ -2,10 +2,20 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use rustscript_agent::{AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app};
+use rustscript_agent::{
+    AgentGatewayConfig, AgentGatewayState, GatewayPersistence, build_agent_gateway_app,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// Temporary gateway SQLite path under /mnt/TEMP/rustscript (workspace
+/// rule: all development temporary state lives there).
+fn gateway_db_path(label: &str) -> std::path::PathBuf {
+    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/gateway-tests");
+    std::fs::create_dir_all(&root).expect("gateway test root should be created");
+    root.join(format!("{label}-{}.db", Uuid::new_v4()))
+}
 
 async fn json_request(
     app: &axum::Router,
@@ -275,7 +285,7 @@ async fn jobs_and_subagent_interrupt_follow_hermes_shapes() {
 
 #[tokio::test]
 async fn sessions_and_jobs_reload_from_sqlite_state() {
-    let path = std::env::temp_dir().join(format!("rustscript-agent-gateway-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("reload");
     let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
         .expect("SQLite state should open");
     let app = build_agent_gateway_app(state);
@@ -491,7 +501,7 @@ async fn invalid_script_event_fails_the_run_with_a_typed_code() {
 
 #[tokio::test]
 async fn script_events_are_appended_durably_before_live_publish() {
-    let path = std::env::temp_dir().join(format!("rustscript-agent-events-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("events");
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig::default(),
         r#"
@@ -887,7 +897,7 @@ async fn no_events_are_published_after_the_terminal_commit() {
 /// the durable cascade removes every row the reload path validates.
 #[tokio::test]
 async fn deleted_session_does_not_resurrect_after_restart() {
-    let path = std::env::temp_dir().join(format!("rustscript-agent-delete-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("delete");
     let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
         .expect("SQLite state should open");
     let app = build_agent_gateway_app(state);
@@ -939,8 +949,7 @@ async fn deleted_session_does_not_resurrect_after_restart() {
 
 #[tokio::test]
 async fn event_retention_respects_the_configured_per_run_limit() {
-    let path =
-        std::env::temp_dir().join(format!("rustscript-agent-retention-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("retention");
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig {
             max_events_per_run: 3,
@@ -985,4 +994,557 @@ async fn event_retention_respects_the_configured_per_run_limit() {
     );
     assert!(replayed.contains("run.completed"));
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+/// P1-2 (production path, fault injection): a durable admission failure
+/// (disk made read-only mid-flight) leaves no partial state that a restart
+/// could resurrect. The single-transaction `admission.create` rolls back
+/// the whole admission; reloading after the fault shows exactly the
+/// pre-fault state.
+#[tokio::test]
+async fn failed_admission_leaves_no_resurrecting_partial_state() {
+    let path = gateway_db_path("admission-fault");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let now = 1_000_000u64;
+    let admit = |run_id: &str, message_id: &str, event_id: &str, now: u64| {
+        json!({
+            "session_id": "fault-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "fault-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": run_id,
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hello\"}",
+            "message_id": message_id,
+            "message_run_id": run_id,
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "event_id": event_id,
+            "now_ms": now,
+            "expires_at_ms": 0,
+        })
+    };
+    // Pre-fault admission commits fully.
+    persistence
+        .admission_create(&admit("run-1", "message-1", "event-1", now))
+        .expect("first admission should commit");
+
+    // Fault: the database file becomes read-only, so the next admission
+    // cannot commit durably (every storage command opens the file for
+    // read-write and fails).
+    let mut permissions = std::fs::metadata(&path).expect("db metadata").permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).expect("make db read-only");
+
+    let failed = persistence.admission_create(&admit("run-2", "message-2", "event-2", now + 1));
+    assert!(
+        failed.is_err(),
+        "admission must fail while the database is read-only, got {failed:?}"
+    );
+    drop(state);
+
+    // Heal the fault and restart: only the pre-fault run exists; the
+    // half-admitted run never resurrects.
+    let mut permissions = std::fs::metadata(&path).expect("db metadata").permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).expect("restore db writability");
+
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload after the fault");
+    let restored_persistence = restored
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let run_1 = restored_persistence
+        .run_get("run-1")
+        .expect("pre-fault run must survive");
+    assert_eq!(
+        run_1["rows"][0][0],
+        json!("run-1"),
+        "the pre-fault run is intact"
+    );
+    let run_2 = restored_persistence.run_get("run-2").expect("run.get");
+    assert!(
+        run_2["rows"].as_array().is_some_and(Vec::is_empty),
+        "the failed admission must not resurrect after restart"
+    );
+    drop(restored);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P2-3: request runtimes are not saturated by storage stalls. While the
+/// storage worker is blocked on an exclusive SQLite lock held by another
+/// connection, an unrelated request completes immediately; the stalled
+/// admission finishes once the lock is released. (On a current-thread
+/// runtime, inline blocking storage calls would stall every request.)
+#[tokio::test]
+async fn request_runtime_stays_responsive_during_storage_stall() {
+    let path = gateway_db_path("stall");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"stalled\"; }",
+        &path,
+    )
+    .expect("SQLite state should open");
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    // Seed enough state that a full reload (migrate + recovery + load.all)
+    // takes a couple of seconds on the dedicated storage worker.
+    let mut now = 4_000_000u64;
+    for index in 0..1500 {
+        persistence
+            .session_create(&json!({
+                "id": format!("stall-session-{index:04}"),
+                "profile": "gateway",
+                "platform": "test",
+                "account_id": format!("account-{index:04}"),
+                "chat_id": format!("chat-{index:04}"),
+                "thread_id": "",
+                "user_id": "",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "m",
+                "provider": "p",
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now,
+            }))
+            .expect("session create should commit");
+        now += 1;
+    }
+    drop(state);
+    let app = build_agent_gateway_app(
+        AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+            .expect("SQLite state should open"),
+    );
+
+    // The dedicated storage worker is busy for a while with a full reload
+    // on a blocking thread; an admission submitted meanwhile queues behind
+    // it. Request runtimes must stay free: an unrelated request completes
+    // immediately, and the admission only finishes once the worker drains.
+    let slow_state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("second gateway should open");
+    let slow_persistence = slow_state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let slow_load = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        slow_persistence.load().expect("reload should succeed");
+        started.elapsed()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let stall_app = app.clone();
+    let admission = tokio::spawn(async move {
+        json_request(
+            &stall_app,
+            axum::http::Method::POST,
+            "/v1/runs",
+            json!({"input":"stall"}),
+        )
+        .await
+    });
+
+    // While the admission is queued behind the storage worker's slow
+    // reload, an unrelated request must complete promptly: the runtime is
+    // not occupied by the storage stall.
+    let models = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        json_request(&app, axum::http::Method::GET, "/v1/models", Value::Null),
+    )
+    .await;
+    assert!(
+        models.is_ok(),
+        "an unrelated request must complete while storage is stalled"
+    );
+    assert_eq!(models.expect("models response").0, StatusCode::OK);
+
+    let admitted = tokio::time::timeout(std::time::Duration::from_secs(60), admission)
+        .await
+        .expect("admission must finish once the worker drains")
+        .expect("admission task must not panic");
+    assert_eq!(admitted.0, StatusCode::ACCEPTED);
+    let slow: std::time::Duration =
+        tokio::time::timeout(std::time::Duration::from_secs(60), slow_load)
+            .await
+            .expect("slow reload must finish")
+            .expect("reload task must not panic");
+    assert!(
+        slow >= std::time::Duration::from_millis(300),
+        "the seeded reload must actually occupy the worker for a while (took {slow:?})"
+    );
+    drop(slow_state);
+    drop(app);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn interrupted_run_receives_exactly_one_terminal_recovery_event() {
+    let path = gateway_db_path("recovery");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        r#"
+        pub fn run(input: map) -> string {
+            while true {
+                1;
+            }
+            "unreachable";
+        }
+        "#,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"crash-me"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    // Crash window: the gateway is dropped while the run is active (its
+    // terminal state was never committed).
+    drop(app);
+
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let text = read_run_events(&restored_app, &run_id).await;
+    assert!(
+        text.contains("run.started"),
+        "prior events stay replayable, got: {text}"
+    );
+    assert_eq!(
+        text.matches("event: run.failed").count(),
+        1,
+        "exactly one recovery terminal event, got: {text}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P2-2 (production path): admission persists `run.started` durably at
+/// sequence 1 before anything is visible; a restart replays it before any
+/// script event.
+#[tokio::test]
+async fn admission_persists_run_started_before_any_script_event() {
+    let path = gateway_db_path("started-first");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "model.started", "model": "local"});
+            "done";
+        }
+        "#,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"started-first"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    // Wait for the run to finish (the terminal event only appears after the
+    // durable commit), then restart.
+    let live_text = read_run_events(&app, &run_id).await;
+    assert!(live_text.contains("run.completed"));
+    drop(app);
+
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let text = read_run_events(&restored_app, &run_id).await;
+    let started = text.find("run.started").expect("run.started replays");
+    let script = text.find("model.started").expect("script event replays");
+    assert!(
+        started < script,
+        "run.started (seq 1) must precede script events, got: {text}"
+    );
+    assert!(text.contains("run.completed"));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P1-4: the typed approval/compaction repository APIs are real production
+/// commands with restart round-trips (for A4/A5 consumption), not dead RSS.
+#[tokio::test]
+async fn approval_and_compaction_repository_round_trip_restart() {
+    let path = gateway_db_path("approval-compaction");
+    let config = AgentGatewayConfig::default();
+    let now = 2_000_000u64;
+
+    let first = GatewayPersistence::open(&config, &path).expect("repository should open");
+    first
+        .admission_create(&json!({
+            "session_id": "repo-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "repo-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "repo-run",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "repo-message",
+            "message_run_id": "repo-run",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "event_id": "repo-event",
+            "now_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("admission should commit");
+    let approval = first
+        .approval_request(&json!({
+            "id": "approval-1",
+            "run_id": "repo-run",
+            "session_id": "repo-session",
+            "tool_call_id": "tool-1",
+            "tool_name": "shell",
+            "arguments_json": "{\"cmd\":\"ls\"}",
+            "risk_class": "execute",
+            "decision_scope": "",
+            "one_time": 0,
+            "requested_at_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("approval should be requested");
+    assert_eq!(approval["rows"][0][0], json!("approval-1"));
+    assert_eq!(approval["rows"][0][7], json!("pending"));
+    first
+        .run_transition(&json!({
+            "run_id": "repo-run",
+            "from_status": "running",
+            "to_status": "compacting",
+            "error_code": "",
+            "error_message": "",
+            "recovery_reason": "",
+            "now_ms": now + 1,
+        }))
+        .expect("run should transition to compacting");
+    let compaction = first
+        .compaction_start(&json!({
+            "id": "compaction-1",
+            "session_id": "repo-session",
+            "run_id": "repo-run",
+            "generation": 2,
+            "source_start_ordinal": 1,
+            "source_end_ordinal": 1,
+            "retained_tail_ordinal": 1,
+            "summary_json": "{\"summary\":\"compacted\"}",
+            "token_estimate": 10,
+            "model": "m",
+            "now_ms": now + 2,
+        }))
+        .expect("compaction should start");
+    assert_eq!(compaction["rows"][0][0], json!("compaction-1"));
+    assert_eq!(compaction["rows"][0][10], json!("pending"));
+    drop(first);
+
+    // Restart round-trip: a fresh repository instance reads the same
+    // durable objects and can resolve/commit them.
+    let second = GatewayPersistence::open(&config, &path).expect("repository should reopen");
+    let approval_again = second
+        .approval_get("approval-1")
+        .expect("approval should survive restart");
+    assert_eq!(approval_again["rows"][0][7], json!("pending"));
+    second
+        .approval_resolve(&json!({
+            "id": "approval-1",
+            "state": "approved",
+            "resolver": "test-user",
+            "decision_reason": "ok",
+            "resolved_at_ms": now + 3,
+        }))
+        .expect("approval should resolve");
+    let compaction_again = second
+        .compaction_get("compaction-1")
+        .expect("compaction should survive restart");
+    assert_eq!(compaction_again["rows"][0][10], json!("pending"));
+    second
+        .compaction_commit(&json!({
+            "id": "compaction-1",
+            "session_id": "repo-session",
+            "start_ordinal": 1,
+            "end_ordinal": 1,
+            "generation": 2,
+            "completed_at_ms": now + 4,
+        }))
+        .expect("compaction should commit");
+    let committed = second
+        .compaction_get("compaction-1")
+        .expect("compaction after commit");
+    assert_eq!(committed["rows"][0][10], json!("committed"));
+    drop(second);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P1-1 (production path): the gateway's real restart load path drains
+/// more state than any single page or byte budget — 600 sessions and one
+/// run with 600 messages + 600 events all reload after restart, with no
+/// silent truncation.
+#[tokio::test]
+async fn production_load_drains_beyond_page_and_byte_boundaries() {
+    let path = gateway_db_path("load-boundary");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let mut now = 3_000_000u64;
+    for index in 0..600 {
+        persistence
+            .session_create(&json!({
+                "id": format!("session-{index:03}"),
+                "profile": "gateway",
+                "platform": "test",
+                "account_id": format!("account-{index:03}"),
+                "chat_id": format!("chat-{index:03}"),
+                "thread_id": "",
+                "user_id": "",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "m",
+                "provider": "p",
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": format!("title-{index:03}"),
+                "end_reason": "",
+                "now_ms": now,
+            }))
+            .expect("session create should commit");
+        now += 1;
+    }
+    persistence
+        .admission_create(&json!({
+            "session_id": "session-000",
+            "session_new": 0,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-000",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "run-boundary",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "message-admission",
+            "message_run_id": "run-boundary",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "event_id": "event-started",
+            "now_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("admission should commit");
+    now += 1;
+    for ordinal in 1..=600 {
+        persistence
+            .message_append(&json!({
+                "id": format!("message-{ordinal:03}"),
+                "session_id": "session-000",
+                "role": "user",
+                "content_json": format!("{{\"text\":\"message {ordinal}\"}}"),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 0,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": now,
+            }))
+            .expect("message append should commit");
+        now += 1;
+    }
+    for seq in 2..=600 {
+        persistence
+            .event_append(&json!({
+                "run_id": "run-boundary",
+                "event_id": format!("event-{seq:03}"),
+                "event_type": "model.delta",
+                "payload_json": format!("{{\"delta\":\"{seq}\"}}"),
+                "now_ms": now,
+                "max_events": 2048,
+            }))
+            .expect("event append should commit");
+        now += 1;
+    }
+    drop(state);
+
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_persistence = restored
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let replay = restored_persistence
+        .event_replay(&json!({
+            "run_id": "run-boundary",
+            "after_seq": 362,
+            "max_events": 2048,
+            "max_bytes": 2 * 1024 * 1024,
+        }))
+        .expect("replay should load every retained event");
+    assert_eq!(
+        replay["rows"].as_array().map(Vec::len),
+        Some(240),
+        "the retained tail (240 events after restart recovery pruning) must load"
+    );
+    let restored_app = build_agent_gateway_app(restored);
+    let (sessions_status, sessions) = json_request(
+        &restored_app,
+        axum::http::Method::GET,
+        "/api/sessions?limit=200&offset=0",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(sessions_status, StatusCode::OK);
+    assert!(
+        sessions["data"]
+            .as_array()
+            .is_some_and(|data| data.len() == 200),
+        "sessions must load across pages without truncation"
+    );
+    assert_eq!(sessions["has_more"], json!(true), "600 > 200 page size");
+    let (messages_status, messages) = json_request(
+        &restored_app,
+        axum::http::Method::GET,
+        "/api/sessions/session-000/messages",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(messages_status, StatusCode::OK);
+    assert_eq!(
+        messages["data"].as_array().map(Vec::len),
+        Some(601),
+        "admission message + 600 appends all reload"
+    );
+    drop(restored_app);
+    let _ = std::fs::remove_file(&path);
 }

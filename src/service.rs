@@ -19,10 +19,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::RunCancellation;
-use crate::gateway::{AgentGatewayConfig, append_message, emit_event_locked, timestamp};
+use crate::gateway::{AgentGatewayConfig, timestamp};
 use crate::gateway_store::{
-    GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionRecord, SessionView,
-    event_record_id, persisted_run_value,
+    GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage, SessionRecord,
+    SessionView,
 };
 
 /// One admitted run's lifecycle state: typed cancellation, delivery permit,
@@ -155,276 +155,267 @@ impl AgentService {
         self.inner.runs.lock().expect("runs lock").len()
     }
 
-    /// Commits one per-record mutation through the dedicated storage worker.
-    /// With no SQLite persistence configured this is a no-op.
-    pub(crate) fn durable_put(
-        &self,
-        kind: &str,
-        record_id: &str,
-        payload: &JsonValue,
-    ) -> Result<(), String> {
-        match self.inner.persistence.as_ref() {
-            Some(persistence) => persistence.put(kind, record_id, payload),
-            None => Ok(()),
-        }
-    }
-
-    /// Deletes one durable record (event deletes cascade by run prefix).
-    /// With no SQLite persistence configured this is a no-op.
-    pub(crate) fn durable_delete(&self, kind: &str, record_id: &str) -> Result<(), String> {
-        match self.inner.persistence.as_ref() {
-            Some(persistence) => persistence.delete(kind, record_id),
-            None => Ok(()),
-        }
+    /// The persistence handle for typed repository commands; `None` when no
+    /// SQLite path is configured (in-memory only mode).
+    pub(crate) fn persistence_handle(&self) -> Option<Arc<GatewayPersistence>> {
+        self.inner.persistence.clone()
     }
 
     /// Atomically admits one run: capacity permit, idempotency, parent check,
     /// session resolution/creation, run ID, cancellation/delivery state, and
-    /// durable commit. On any failure every intermediate step is rolled back
-    /// and the capacity permit is released.
-    pub fn admit(&self, request: AdmitRunRequest) -> Result<AdmittedRun, AdmitError> {
+    /// one transactional durable admission command. The whole critical
+    /// section (store write lock plus the blocking storage worker round-trip)
+    /// runs on a blocking thread so Tokio request threads are never occupied
+    /// by storage stalls. In-memory state is applied only after the durable
+    /// commit succeeded, so a failed admission leaves nothing behind — in
+    /// memory or on disk.
+    pub async fn admit(&self, request: AdmitRunRequest) -> Result<AdmittedRun, AdmitError> {
         let capacity_permit = self
             .inner
             .capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| AdmitError::RunLimitReached)?;
-        let mut permit = Some(capacity_permit);
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.admit_blocking(request, capacity_permit))
+            .await
+            .map_err(|error| AdmitError::Persistence(format!("admission worker failed: {error}")))?
+    }
 
+    fn admit_blocking(
+        &self,
+        request: AdmitRunRequest,
+        capacity_permit: OwnedSemaphorePermit,
+    ) -> Result<AdmittedRun, AdmitError> {
         let run_id = Uuid::new_v4().to_string();
-        let cancel = RunCancellation::with_timeout(self.inner.config.run_timeout);
+        let now = timestamp();
+        let message_id = Uuid::new_v4().to_string();
+        let event_id = Uuid::new_v4().to_string();
         let mut store = self.inner.store.write();
-        let previous_session: Option<(String, Option<SessionRecord>)>;
+
+        // Idempotent replay fast path (authoritative under the write lock):
+        // an admitted key returns the existing run without creating anything.
+        if let (Some(key), Some(hash)) = (
+            request.idempotency_key.as_deref(),
+            request.idempotency_hash.as_deref(),
+        ) && let Some(existing) = store.idempotency.get(key)
+        {
+            if existing.request_hash != hash {
+                return Err(AdmitError::IdempotencyConflict);
+            }
+            let (session_id, status) = store
+                .runs
+                .get(&existing.run_id)
+                .map(|run| (run.session_id.clone(), run.status.clone()))
+                .unwrap_or((String::new(), "unknown".to_string()));
+            return Ok(AdmittedRun {
+                run_id: existing.run_id.clone(),
+                session_id,
+                status,
+                replayed: true,
+            });
+        }
+
+        // Session resolution: reuse an existing session or prepare a new one
+        // (applied in memory only after the durable commit).
         let session_id = match request.session_id.clone() {
             Some(session_id) => {
                 if !store.sessions.contains_key(&session_id) {
                     return Err(AdmitError::SessionNotFound);
                 }
-                previous_session = None;
                 session_id
             }
-            None => {
-                let id = Uuid::new_v4().to_string();
-                let now = timestamp();
-                let view = SessionView {
-                    id: id.clone(),
-                    object: "hermes.session".to_string(),
-                    title: None,
-                    model: request
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| self.inner.config.model.clone()),
-                    provider: request
-                        .provider
-                        .clone()
-                        .or_else(|| self.inner.config.provider.clone()),
-                    source: "yahu".to_string(),
-                    system_prompt: request.instructions.clone(),
-                    created_at: now,
-                    updated_at: now,
-                    message_count: 0,
-                    end_reason: None,
-                };
-                store.sessions.insert(
-                    id.clone(),
-                    SessionRecord {
-                        view,
-                        messages: Vec::new(),
-                    },
-                );
-                previous_session = Some((id.clone(), None));
-                id
-            }
+            None => Uuid::new_v4().to_string(),
         };
-
-        let result = (|| {
-            if let (Some(key), Some(hash)) = (
-                request.idempotency_key.as_deref(),
-                request.idempotency_hash.as_deref(),
-            ) && let Some(existing) = store.idempotency.get(key)
-            {
-                if existing.request_hash != hash {
-                    return Err(AdmitError::IdempotencyConflict);
-                }
-                let (run_id, status) = store
-                    .runs
-                    .get(&existing.run_id)
-                    .map(|run| (run.run_id.clone(), run.status.clone()))
-                    .unwrap_or((existing.run_id.clone(), "unknown".to_string()));
-                return Ok(AdmittedRun {
-                    run_id,
-                    session_id,
-                    status,
-                    replayed: true,
-                });
-            }
-            if let Some(parent_run_id) = request.parent_run_id.as_deref()
-                && !store.runs.contains_key(parent_run_id)
-            {
-                return Err(AdmitError::ParentNotFound);
-            }
-            if let Some(session) = store.sessions.get_mut(&session_id) {
-                if let Some(model) = request.model.clone() {
-                    session.view.model = model;
-                }
-                if let Some(provider) = request.provider.clone() {
-                    session.view.provider = Some(provider);
-                }
-                if request.instructions.is_some() {
-                    session.view.system_prompt = request.instructions.clone();
-                }
-                append_message(
-                    &mut session.view,
-                    &mut session.messages,
-                    "user",
-                    request.input.clone(),
-                    Some(run_id.clone()),
-                    None,
-                );
-            }
-            let (sender, _) = tokio::sync::broadcast::channel(32);
-            let run = RunRecord {
-                run_id: run_id.clone(),
-                session_id: session_id.clone(),
-                parent_run_id: request.parent_run_id.clone(),
-                status: "started".to_string(),
-                events: Vec::new(),
-                sender,
-                cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        let session_new = !store.sessions.contains_key(&session_id);
+        let new_session_view = if session_new {
+            let view = SessionView {
+                id: session_id.clone(),
+                object: "hermes.session".to_string(),
+                title: None,
+                model: request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.inner.config.model.clone()),
+                provider: request
+                    .provider
+                    .clone()
+                    .or_else(|| self.inner.config.provider.clone()),
+                source: request.platform.clone(),
+                system_prompt: request.instructions.clone(),
+                created_at: now,
+                updated_at: now,
+                message_count: 0,
+                end_reason: None,
             };
-            store.runs.insert(run_id.clone(), run);
-            if let Some(run) = store.runs.get_mut(&run_id) {
-                emit_event_locked(
-                    run,
-                    "run.started",
-                    json!({"status":"started","session_id":session_id}),
-                );
-            }
-            if let (Some(key), Some(hash)) = (
-                request.idempotency_key.as_deref(),
-                request.idempotency_hash.as_deref(),
-            ) {
-                store.idempotency.insert(
-                    key.to_string(),
-                    IdempotencyRecord {
-                        request_hash: hash.to_string(),
-                        run_id: run_id.clone(),
-                    },
-                );
-            }
-            // Durable-before-visible: commit every mutation through the
-            // dedicated storage worker while the store write lock is held.
-            // On failure, roll back all in-memory steps so a rejected
-            // admission leaves no session, run, or idempotency record behind.
-            if let Err(error) =
-                self.durable_admission_locked(&store, &session_id, &run_id, &request)
-            {
-                store.runs.remove(&run_id);
-                if let Some(key) = request.idempotency_key.as_deref() {
-                    store.idempotency.remove(key);
-                }
-                if let Some((session_id, previous)) = previous_session.clone() {
-                    match previous {
-                        Some(session) => {
-                            store.sessions.insert(session_id, session);
-                        }
-                        None => {
-                            store.sessions.remove(&session_id);
-                        }
-                    }
-                }
-                return Err(AdmitError::Persistence(format!(
-                    "run admission could not be durably committed: {error}"
-                )));
-            }
-            let handle = Arc::new(RunHandle {
-                cancel: cancel.clone(),
-                terminal_at: Mutex::new(None),
-                permit: Mutex::new(permit.take()),
-            });
-            self.inner
-                .runs
-                .lock()
-                .expect("runs lock")
-                .insert(run_id.clone(), handle);
-            Ok(AdmittedRun {
-                run_id: run_id.clone(),
-                session_id,
-                status: "started".to_string(),
-                replayed: false,
-            })
-        })();
-
-        match result {
-            Ok(admitted) => Ok(admitted),
-            Err(error) => {
-                // Roll back a session created for a rejected admission
-                // (idempotency conflict / parent missing) so no partial
-                // session outlives the failure.
-                if let Some((session_id, previous)) = previous_session {
-                    let mut store = self.inner.store.write();
-                    match previous {
-                        Some(session) => {
-                            store.sessions.insert(session_id, session);
-                        }
-                        None => {
-                            store.sessions.remove(&session_id);
-                        }
-                    }
-                }
-                if let Some(permit) = permit.take() {
-                    drop(permit);
-                }
-                Err(error)
-            }
-        }
-    }
-
-    /// Durable-before-visible commit for one admission: session (with the
-    /// appended user message), run, the `run.started` event, and the
-    /// idempotency record. Callers hold the store write lock.
-    fn durable_admission_locked(
-        &self,
-        store: &GatewayStore,
-        session_id: &str,
-        run_id: &str,
-        request: &AdmitRunRequest,
-    ) -> Result<(), String> {
-        let Some(persistence) = self.inner.persistence.as_ref() else {
-            return Ok(());
+            Some(view)
+        } else {
+            None
         };
+        if let Some(parent_run_id) = request.parent_run_id.as_deref()
+            && !store.runs.contains_key(parent_run_id)
+        {
+            return Err(AdmitError::ParentNotFound);
+        }
+
+        let payload = json!({
+            "session_id": session_id,
+            "session_new": if session_new { 1 } else { 0 },
+            "profile": "gateway",
+            "platform": request.platform,
+            "account_id": session_id,
+            "model": request.model.clone().unwrap_or_default(),
+            "provider": request.provider.clone().unwrap_or_default(),
+            "system_prompt": request.instructions.clone().unwrap_or_default(),
+            "run_id": run_id,
+            "parent_run_id": request.parent_run_id.clone().unwrap_or_default(),
+            "input_json": serde_json::to_string(&request.input)
+                .unwrap_or_else(|_| "null".to_string()),
+            "message_id": message_id,
+            "message_run_id": run_id,
+            "script_hash": "",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
+            "request_hash": request.idempotency_hash.clone().unwrap_or_default(),
+            "event_id": event_id,
+            "now_ms": now,
+            "expires_at_ms": 0,
+        });
+
+        let durable =
+            match self.inner.persistence.as_ref() {
+                Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
+                    match error.code.as_str() {
+                        "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
+                        _ => AdmitError::Persistence(format!(
+                            "run admission could not be durably committed: {error}"
+                        )),
+                    }
+                }),
+                None => Ok(JsonValue::Null),
+            };
+        let data = durable?;
+        // The transactional admission may have replayed an existing key (a
+        // restart race the in-memory fast path cannot see).
+        if data.get("replayed") == Some(&JsonValue::Bool(true)) {
+            let run_row = data
+                .get("run")
+                .and_then(|run| run.get("rows"))
+                .and_then(JsonValue::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(JsonValue::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    AdmitError::Persistence(
+                        "replayed admission omitted the existing run".to_string(),
+                    )
+                })?;
+            let replayed_run_id = run_row
+                .first()
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let replayed_session = run_row
+                .get(1)
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let replayed_status = run_row
+                .get(3)
+                .and_then(JsonValue::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            return Ok(AdmittedRun {
+                run_id: replayed_run_id,
+                session_id: replayed_session,
+                status: replayed_status,
+                replayed: true,
+            });
+        }
+
+        // Durable commit succeeded: apply the matching in-memory state.
+        if session_new {
+            store.sessions.insert(
+                session_id.clone(),
+                SessionRecord {
+                    view: new_session_view.expect("new session view was prepared"),
+                    messages: Vec::new(),
+                },
+            );
+        }
         let session = store
             .sessions
-            .get(session_id)
-            .ok_or_else(|| "admission session missing".to_string())?;
-        persistence.put(
-            "session",
-            session_id,
-            &serde_json::to_value(session).map_err(|error| format!("encode session: {error}"))?,
-        )?;
-        let run = store
+            .get_mut(&session_id)
+            .expect("admission session exists after commit");
+        if let Some(model) = request.model.clone() {
+            session.view.model = model;
+        }
+        if request.provider.is_some() {
+            session.view.provider = request.provider.clone();
+        }
+        if request.instructions.is_some() {
+            session.view.system_prompt = request.instructions.clone();
+        }
+        session.messages.push(SessionMessage {
+            id: message_id.clone(),
+            session_id: session_id.clone(),
+            role: "user".to_string(),
+            content: request.input.clone(),
+            created_at: now,
+            run_id: Some(run_id.clone()),
+            finish_reason: None,
+        });
+        session.view.message_count = session.messages.len();
+        session.view.updated_at = now;
+
+        let (sender, _) = tokio::sync::broadcast::channel(32);
+        let started_event = crate::gateway_store::GatewayEvent {
+            event_id: event_id.clone(),
+            seq: 1,
+            event: "run.started".to_string(),
+            run_id: run_id.clone(),
+            timestamp: now,
+            data: json!({"status": "running", "session_id": session_id}),
+        };
+        let run = RunRecord {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            parent_run_id: request.parent_run_id.clone(),
+            status: "started".to_string(),
+            events: vec![started_event],
+            sender,
+            cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        store.runs.insert(run_id.clone(), run);
+        if let (Some(key), Some(hash)) = (
+            request.idempotency_key.as_deref(),
+            request.idempotency_hash.as_deref(),
+        ) {
+            store.idempotency.insert(
+                key.to_string(),
+                IdempotencyRecord {
+                    request_hash: hash.to_string(),
+                    run_id: run_id.clone(),
+                },
+            );
+        }
+
+        let handle = Arc::new(RunHandle {
+            cancel: RunCancellation::with_timeout(self.inner.config.run_timeout),
+            terminal_at: Mutex::new(None),
+            permit: Mutex::new(Some(capacity_permit)),
+        });
+        self.inner
             .runs
-            .get(run_id)
-            .ok_or_else(|| "admission run missing".to_string())?;
-        persistence.put("run", run_id, &persisted_run_value(run)?)?;
-        for event in &run.events {
-            persistence.put(
-                "event",
-                &event_record_id(run_id, event.seq),
-                &serde_json::to_value(event).map_err(|error| format!("encode event: {error}"))?,
-            )?;
-        }
-        if let Some(key) = request.idempotency_key.as_deref()
-            && let Some(record) = store.idempotency.get(key)
-        {
-            persistence.put(
-                "idempotency",
-                key,
-                &serde_json::to_value(record)
-                    .map_err(|error| format!("encode idempotency: {error}"))?,
-            )?;
-        }
-        Ok(())
+            .lock()
+            .expect("runs lock")
+            .insert(run_id.clone(), handle);
+        Ok(AdmittedRun {
+            run_id: run_id.clone(),
+            session_id,
+            status: "started".to_string(),
+            replayed: false,
+        })
     }
 
     /// Requests a typed stop for an active run. Idempotent: the first request

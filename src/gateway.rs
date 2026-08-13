@@ -30,7 +30,7 @@ use crate::{AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEven
 
 use crate::gateway_store::{
     GatewayEvent, GatewayPersistence, GatewayStore, JobRecord, JobView, RunRecord, SessionMessage,
-    SessionRecord, SessionView, event_record_id, persisted_run_value,
+    SessionRecord, SessionView,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -243,27 +243,29 @@ impl AgentGatewayState {
         Arc::clone(&self.service)
     }
 
-    /// Commits one durable record (no-op without SQLite persistence).
-    fn durable_put(&self, kind: &str, record_id: &str, payload: &Value) -> Result<(), String> {
-        self.service.durable_put(kind, record_id, payload)
-    }
-
-    /// Deletes one durable record (no-op without SQLite persistence).
-    fn durable_delete(&self, kind: &str, record_id: &str) -> Result<(), String> {
-        self.service.durable_delete(kind, record_id)
+    /// The typed storage repository handle (normalized schema), or `None`
+    /// when no SQLite path is configured (in-memory only mode).
+    pub fn persistence(&self) -> Option<Arc<GatewayPersistence>> {
+        self.service.persistence_handle()
     }
 }
 
-/// Serializes a durable record; encode failures become an internal error
-/// response instead of a panic or a dangling in-memory mutation.
-fn encode_record<T: serde::Serialize>(value: &T) -> Result<Value, Box<Response>> {
-    serde_json::to_value(value).map_err(|error| {
-        Box::new(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "invalid_state",
-            &format!("failed to encode durable record: {error}"),
-        ))
+/// Runs one store mutation on a blocking thread with the store write lock
+/// held, so the blocking storage worker round-trip never occupies a Tokio
+/// runtime thread (request runtimes stay responsive during storage stalls)
+/// and durable-before-visible ordering is preserved. The closure receives
+/// the write lock guard and the optional repository handle.
+async fn store_mutation<T: Send + 'static>(
+    state: AgentGatewayState,
+    mutation: impl FnOnce(&mut GatewayStore, Option<&GatewayPersistence>) -> T + Send + 'static,
+) -> T {
+    tokio::task::spawn_blocking(move || {
+        let mut store = state.store.write();
+        let persistence = state.service.persistence_handle();
+        mutation(&mut store, persistence.as_deref())
     })
+    .await
+    .expect("store mutation task must complete")
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,55 +456,79 @@ async fn create_session_handler(
     State(state): State<AgentGatewayState>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Response {
-    let id = request
-        .session_id
-        .or(request.id)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let now = timestamp();
-    let view = SessionView {
-        id: id.clone(),
-        object: "hermes.session".to_string(),
-        title: request.title,
-        model: request.model.unwrap_or_else(|| state.config.model.clone()),
-        provider: request.provider.or_else(|| state.config.provider.clone()),
-        source: request.source.unwrap_or_else(|| "yahu".to_string()),
-        system_prompt: request.system_prompt,
-        created_at: now,
-        updated_at: now,
-        message_count: 0,
-        end_reason: None,
-    };
-    let mut store = state.store.write();
-    if store.sessions.contains_key(&id) {
-        return json_error(
-            StatusCode::CONFLICT,
-            "session_exists",
-            "session already exists",
-        );
-    }
-    let session = SessionRecord {
-        view: view.clone(),
-        messages: Vec::new(),
-    };
-    // Durable before visible: the session row is committed through the
-    // storage worker while the write lock is held; a failed commit leaves
-    // no in-memory session behind.
-    let payload = match encode_record(&session) {
-        Ok(payload) => payload,
-        Err(response) => return *response,
-    };
-    if let Err(error) = state.durable_put("session", &id, &payload) {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist session: {error}"),
-        );
-    }
-    store.sessions.insert(id, session);
-    json_response(
-        StatusCode::CREATED,
-        json!({"object":"hermes.session", "session":view, "data":view}),
-    )
+    store_mutation(state.clone(), move |store, persistence| {
+        let id = request
+            .session_id
+            .or(request.id)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let now = timestamp();
+        let view = SessionView {
+            id: id.clone(),
+            object: "hermes.session".to_string(),
+            title: request.title.clone(),
+            model: request
+                .model
+                .clone()
+                .unwrap_or_else(|| state.config.model.clone()),
+            provider: request
+                .provider
+                .clone()
+                .or_else(|| state.config.provider.clone()),
+            source: request.source.clone().unwrap_or_else(|| "yahu".to_string()),
+            system_prompt: request.system_prompt.clone(),
+            created_at: now,
+            updated_at: now,
+            message_count: 0,
+            end_reason: None,
+        };
+        if store.sessions.contains_key(&id) {
+            return json_error(
+                StatusCode::CONFLICT,
+                "session_exists",
+                "session already exists",
+            );
+        }
+        // Durable before visible: the normalized session row is committed
+        // through the typed `session.create` command while the write lock is
+        // held; a failed commit leaves no in-memory session behind.
+        if let Some(persistence) = persistence {
+            let payload = json!({
+                "id": id,
+                "profile": "gateway",
+                "platform": view.source,
+                "account_id": id,
+                "chat_id": "",
+                "thread_id": "",
+                "user_id": "",
+                "generation": 1,
+                "system_prompt": view.system_prompt.clone().unwrap_or_default(),
+                "model": view.model,
+                "provider": view.provider.clone().unwrap_or_default(),
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": view.title.clone().unwrap_or_default(),
+                "end_reason": view.end_reason.clone().unwrap_or_default(),
+                "now_ms": now,
+            });
+            if let Err(error) = persistence.session_create(&payload) {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "persistence_unavailable",
+                    &format!("failed to persist session: {error}"),
+                );
+            }
+        }
+        let session = SessionRecord {
+            view: view.clone(),
+            messages: Vec::new(),
+        };
+        store.sessions.insert(id, session);
+        json_response(
+            StatusCode::CREATED,
+            json!({"object":"hermes.session", "session":view, "data":view}),
+        )
+    })
+    .await
 }
 
 async fn list_sessions_handler(
@@ -583,95 +609,109 @@ async fn update_session_handler(
     Path(session_id): Path<String>,
     Json(request): Json<UpdateSessionRequest>,
 ) -> Response {
-    if request.title.as_deref().is_some_and(str::is_empty) {
-        return json_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_title",
-            "title is empty",
-        );
-    }
-    let mut store = state.store.write();
-    let Some(session) = store.sessions.get_mut(&session_id) else {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            "session_not_found",
-            "session not found",
-        );
-    };
-    let previous = session.clone();
-    if let Some(title) = request.title {
-        session.view.title = Some(title);
-    }
-    if request.end_reason.is_some() {
-        session.view.end_reason = request.end_reason;
-    }
-    session.view.updated_at = timestamp();
-    let view = session.view.clone();
-    let payload = match encode_record(&*session) {
-        Ok(payload) => payload,
-        Err(response) => return *response,
-    };
-    if let Err(error) = state.durable_put("session", &session_id, &payload) {
-        *session = previous;
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist session: {error}"),
-        );
-    }
-    json_response(
-        StatusCode::OK,
-        json!({"object":"hermes.session", "session":view, "data":view}),
-    )
+    store_mutation(state.clone(), move |store, persistence| {
+        if request.title.as_deref().is_some_and(str::is_empty) {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_title",
+                "title is empty",
+            );
+        }
+        let Some(session) = store.sessions.get_mut(&session_id) else {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "session not found",
+            );
+        };
+        let previous = session.clone();
+        if let Some(title) = request.title.clone() {
+            session.view.title = Some(title);
+        }
+        if let Some(end_reason) = request.end_reason.clone() {
+            session.view.end_reason = Some(end_reason);
+        }
+        session.view.updated_at = timestamp();
+        let view = session.view.clone();
+        // Durable before visible: `session.touch` commits the update; a
+        // failed commit restores the previous in-memory session.
+        if let Some(persistence) = persistence {
+            let payload = json!({
+                "session_id": session_id,
+                "status": "active",
+                "generation": 1,
+                "system_prompt": view.system_prompt.clone().unwrap_or_default(),
+                "model": view.model,
+                "provider": view.provider.clone().unwrap_or_default(),
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": view.title.clone().unwrap_or_default(),
+                "end_reason": view.end_reason.clone().unwrap_or_default(),
+                "now_ms": timestamp(),
+            });
+            if let Err(error) = persistence.session_touch(&payload) {
+                *session = previous;
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "persistence_unavailable",
+                    &format!("failed to persist session: {error}"),
+                );
+            }
+        }
+        json_response(
+            StatusCode::OK,
+            json!({"object":"hermes.session", "session":view, "data":view}),
+        )
+    })
+    .await
 }
 
 async fn delete_session_handler(
     State(state): State<AgentGatewayState>,
     Path(session_id): Path<String>,
 ) -> Response {
-    let mut store = state.store.write();
-    let Some(session) = store.sessions.remove(&session_id) else {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            "session_not_found",
-            "session not found",
-        );
-    };
-    // Cascade: the session's runs and their retained events must not dangle
-    // (reload validates every run's session reference), in memory and
-    // durably.
-    let run_ids: Vec<String> = store
-        .runs
-        .values()
-        .filter(|run| run.session_id == session_id)
-        .map(|run| run.run_id.clone())
-        .collect();
-    let removed_runs: HashMap<String, RunRecord> = run_ids
-        .iter()
-        .filter_map(|run_id| store.runs.remove(run_id).map(|run| (run_id.clone(), run)))
-        .collect();
-    let durable = (|| -> Result<(), String> {
-        for run_id in &run_ids {
-            state.durable_delete("event", run_id)?;
-            state.durable_delete("run", run_id)?;
+    store_mutation(state.clone(), move |store, persistence| {
+        let Some(session) = store.sessions.remove(&session_id) else {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "session not found",
+            );
+        };
+        // Cascade: the session's runs and their retained events must not
+        // dangle (reload validates every run's session reference), in
+        // memory and durably. The typed `session.delete` removes every
+        // dependent row in one transaction.
+        let removed_runs: HashMap<String, RunRecord> = store
+            .runs
+            .iter()
+            .filter(|(_, run)| run.session_id == session_id)
+            .map(|(run_id, run)| (run_id.clone(), run.clone()))
+            .collect();
+        for run_id in removed_runs.keys() {
+            store.runs.remove(run_id);
         }
-        state.durable_delete("session", &session_id)
-    })();
-    if let Err(error) = durable {
-        store.sessions.insert(session_id.clone(), session);
-        for (run_id, run) in removed_runs {
-            store.runs.insert(run_id, run);
+        let durable = match persistence {
+            Some(persistence) => persistence.session_delete(&session_id).map(|_| ()),
+            None => Ok(()),
+        };
+        if let Err(error) = durable {
+            store.sessions.insert(session_id.clone(), session);
+            for (run_id, run) in removed_runs {
+                store.runs.insert(run_id, run);
+            }
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "persistence_unavailable",
+                &format!("failed to persist session deletion: {error}"),
+            );
         }
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist session deletion: {error}"),
-        );
-    }
-    json_response(
-        StatusCode::OK,
-        json!({"object":"hermes.session.deleted", "id":session_id, "deleted":true}),
-    )
+        json_response(
+            StatusCode::OK,
+            json!({"object":"hermes.session.deleted", "id":session_id, "deleted":true}),
+        )
+    })
+    .await
 }
 
 async fn session_messages_handler(
@@ -764,61 +804,105 @@ async fn session_chat_handler(
         }
     };
 
-    let mut store = state.store.write();
-    let Some(session) = store.sessions.get_mut(&session_id) else {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            "session_not_found",
-            "session not found",
+    // The legacy chat path appends both messages through the normalized
+    // typed commands (session touch, then the two message rows); a failure
+    // restores the previous in-memory session.
+    store_mutation(state.clone(), move |store, persistence| {
+        let Some(session) = store.sessions.get_mut(&session_id) else {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "session not found",
+            );
+        };
+        let previous = session.clone();
+        if let Some(model) = request.model.clone() {
+            session.view.model = model;
+        }
+        if request.provider.is_some() {
+            session.view.provider = request.provider.clone();
+        }
+        if request.instructions.is_some() {
+            session.view.system_prompt = request.instructions.clone();
+        }
+        let user_message = append_message(
+            &mut session.view,
+            &mut session.messages,
+            "user",
+            input,
+            None,
+            None,
         );
-    };
-    let previous = session.clone();
-    if let Some(model) = request.model {
-        session.view.model = model;
-    }
-    if request.provider.is_some() {
-        session.view.provider = request.provider;
-    }
-    if request.instructions.is_some() {
-        session.view.system_prompt = request.instructions;
-    }
-    append_message(
-        &mut session.view,
-        &mut session.messages,
-        "user",
-        input,
-        None,
-        None,
-    );
-    let message = append_message(
-        &mut session.view,
-        &mut session.messages,
-        "assistant",
-        output,
-        None,
-        Some("stop".to_string()),
-    );
-    let payload = match encode_record(&*session) {
-        Ok(payload) => payload,
-        Err(response) => return *response,
-    };
-    if let Err(error) = state.durable_put("session", &session_id, &payload) {
-        *session = previous;
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist session: {error}"),
+        let assistant_message = append_message(
+            &mut session.view,
+            &mut session.messages,
+            "assistant",
+            output,
+            None,
+            Some("stop".to_string()),
         );
-    }
-    json_response(
-        StatusCode::OK,
-        json!({
-            "object":"hermes.session.chat.completion",
-            "session_id":session_id,
-            "message":message,
-            "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},
-        }),
-    )
+        let durable = (|| -> Result<(), String> {
+            let Some(persistence) = persistence else {
+                return Ok(());
+            };
+            let view = session.view.clone();
+            let touch = json!({
+                "session_id": session_id,
+                "status": "active",
+                "generation": 1,
+                "system_prompt": view.system_prompt.clone().unwrap_or_default(),
+                "model": view.model,
+                "provider": view.provider.clone().unwrap_or_default(),
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": view.title.clone().unwrap_or_default(),
+                "end_reason": view.end_reason.clone().unwrap_or_default(),
+                "now_ms": timestamp(),
+            });
+            persistence
+                .session_touch(&touch)
+                .map_err(|error| error.to_string())?;
+            for (message, role) in [(&user_message, "user"), (&assistant_message, "assistant")] {
+                let payload = json!({
+                    "id": message.id,
+                    "session_id": session_id,
+                    "role": role,
+                    "content_json": serde_json::to_string(&message.content)
+                        .unwrap_or_else(|_| "null".to_string()),
+                    "name": "",
+                    "tool_call_id": "",
+                    "parent_message_id": "",
+                    "token_estimate": 0,
+                    "metadata_json": "{}",
+                    "run_id": message.run_id.clone().unwrap_or_default(),
+                    "finish_reason": message.finish_reason.clone().unwrap_or_default(),
+                    "now_ms": timestamp(),
+                });
+                persistence
+                    .message_append(&payload)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = durable {
+            *session = previous;
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "persistence_unavailable",
+                &format!("failed to persist session: {error}"),
+            );
+        }
+        json_response(
+            StatusCode::OK,
+            json!({
+                "object":"hermes.session.chat.completion",
+                "session_id":session_id,
+                "message":assistant_message,
+                "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},
+            }),
+        )
+    })
+    .await
 }
 
 async fn create_run_handler(
@@ -864,17 +948,21 @@ async fn create_run_handler(
 
     // Atomic admission: one reservation covers capacity, session, run ID,
     // cancellation and delivery state; rejection leaves nothing behind.
-    let admitted = match state.service.admit(crate::service::AdmitRunRequest {
-        input,
-        session_id: request.session_id.clone(),
-        model: request.model.clone(),
-        provider: request.provider.clone(),
-        parent_run_id: request.parent_run_id.clone(),
-        instructions: request.instructions.clone(),
-        platform: "api_server".to_string(),
-        idempotency_key,
-        idempotency_hash: request_hash,
-    }) {
+    let admitted = match state
+        .service
+        .admit(crate::service::AdmitRunRequest {
+            input,
+            session_id: request.session_id.clone(),
+            model: request.model.clone(),
+            provider: request.provider.clone(),
+            parent_run_id: request.parent_run_id.clone(),
+            instructions: request.instructions.clone(),
+            platform: "api_server".to_string(),
+            idempotency_key,
+            idempotency_hash: request_hash,
+        })
+        .await
+    {
         Ok(admitted) => admitted,
         Err(crate::service::AdmitError::RunLimitReached) => {
             return json_error(
@@ -939,10 +1027,11 @@ async fn create_run_handler(
         .await;
         if outcome.is_err() {
             finish_failed(
-                &worker_state,
-                &worker_run_id,
+                worker_state,
+                worker_run_id,
                 failed_payload("agent worker exited without a terminal outcome".to_string()),
-            );
+            )
+            .await;
         }
     });
     json_response(
@@ -997,85 +1086,62 @@ async fn stop_run_handler(
     let Some(status) = state.service.stop(&run_id) else {
         return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
     };
-    if let Err(error) = durable_run_status(&state, &run_id) {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &error,
-        );
-    }
+    // `stopping` is an in-memory cancel state; the normalized schema keeps
+    // the run `running` until the one terminal commit, so there is nothing
+    // to persist here. A gateway crash mid-stop is repaired by restart
+    // recovery exactly once.
     json_response(StatusCode::OK, json!({"run_id":run_id, "status":status}))
-}
-
-/// Persists the current run status through the storage worker while holding
-/// the store write lock, reverting a `started -> stopping` transition on
-/// failure so no unpersisted mutation stays visible.
-fn durable_run_status(state: &AgentGatewayState, run_id: &str) -> Result<(), String> {
-    let mut store = state.store.write();
-    let Some(run) = store.runs.get(run_id) else {
-        return Err("run not found".to_string());
-    };
-    if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
-        // The terminal commit (with its events) is already durable.
-        return Ok(());
-    }
-    let payload = persisted_run_value(run)?;
-    if let Err(error) = state.durable_put("run", run_id, &payload) {
-        if let Some(run) = store.runs.get_mut(run_id)
-            && run.status == "stopping"
-        {
-            run.status = "started".to_string();
-        }
-        return Err(format!("failed to persist run state: {error}"));
-    }
-    Ok(())
 }
 
 async fn create_job_handler(
     State(state): State<AgentGatewayState>,
     Json(request): Json<JobRequest>,
 ) -> Response {
-    let id = request
-        .job_id
-        .or(request.id)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let now = timestamp();
-    let view = JobView {
-        id: id.clone(),
-        name: request
-            .name
-            .unwrap_or_else(|| "rustscript-agent".to_string()),
-        schedule: request.schedule.unwrap_or(Value::Null),
-        prompt: request.prompt.unwrap_or_default(),
-        deliver: request.deliver.unwrap_or(Value::Null),
-        skills: request.skills.unwrap_or_default(),
-        repeat: request.repeat,
-        enabled: request.enabled.unwrap_or(true),
-        created_at: now,
-        updated_at: now,
-        last_run_at: None,
-    };
-    let mut store = state.store.write();
-    if store.jobs.contains_key(&id) {
-        return json_error(StatusCode::CONFLICT, "job_exists", "job already exists");
-    }
-    let job = JobRecord {
-        view: view.clone(),
-        output: None,
-    };
-    let payload = match encode_record(&job) {
-        Ok(payload) => payload,
-        Err(response) => return *response,
-    };
-    if let Err(error) = state.durable_put("job", &id, &payload) {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist job: {error}"),
-        );
-    }
-    store.jobs.insert(id, job);
-    json_response(StatusCode::CREATED, json!({"job":view}))
+    store_mutation(state.clone(), move |store, persistence| {
+        let id = request
+            .job_id
+            .or(request.id)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let now = timestamp();
+        let view = JobView {
+            id: id.clone(),
+            name: request
+                .name
+                .clone()
+                .unwrap_or_else(|| "rustscript-agent".to_string()),
+            schedule: request.schedule.clone().unwrap_or(Value::Null),
+            prompt: request.prompt.clone().unwrap_or_default(),
+            deliver: request.deliver.clone().unwrap_or(Value::Null),
+            skills: request.skills.clone().unwrap_or_default(),
+            repeat: request.repeat,
+            enabled: request.enabled.unwrap_or(true),
+            created_at: now,
+            updated_at: now,
+            last_run_at: None,
+        };
+        if store.jobs.contains_key(&id) {
+            return json_error(StatusCode::CONFLICT, "job_exists", "job already exists");
+        }
+        let job = JobRecord {
+            view: view.clone(),
+            output: None,
+        };
+        // Durable before visible: the normalized job row is committed
+        // through the typed `job.create` command.
+        if let Some(persistence) = persistence {
+            let payload = job_payload(&view, now);
+            if let Err(error) = persistence.job_create(&payload) {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "persistence_unavailable",
+                    &format!("failed to persist job: {error}"),
+                );
+            }
+        }
+        store.jobs.insert(id, job);
+        json_response(StatusCode::CREATED, json!({"job":view}))
+    })
+    .await
 }
 
 async fn list_jobs_handler(
@@ -1110,66 +1176,73 @@ async fn update_job_handler(
     Path(job_id): Path<String>,
     Json(request): Json<JobRequest>,
 ) -> Response {
-    let mut store = state.store.write();
-    let Some(job) = store.jobs.get_mut(&job_id) else {
-        return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
-    };
-    if let Some(name) = request.name {
-        job.view.name = name;
-    }
-    if let Some(schedule) = request.schedule {
-        job.view.schedule = schedule;
-    }
-    if let Some(prompt) = request.prompt {
-        job.view.prompt = prompt;
-    }
-    if let Some(deliver) = request.deliver {
-        job.view.deliver = deliver;
-    }
-    if let Some(skills) = request.skills {
-        job.view.skills = skills;
-    }
-    if request.repeat.is_some() {
-        job.view.repeat = request.repeat;
-    }
-    if let Some(enabled) = request.enabled {
-        job.view.enabled = enabled;
-    }
-    job.view.updated_at = timestamp();
-    let view = job.view.clone();
-    let previous = job.clone();
-    let payload = match encode_record(&*job) {
-        Ok(payload) => payload,
-        Err(response) => return *response,
-    };
-    if let Err(error) = state.durable_put("job", &job_id, &payload) {
-        *job = previous;
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist job: {error}"),
-        );
-    }
-    json_response(StatusCode::OK, json!({"job":view}))
+    store_mutation(state.clone(), move |store, persistence| {
+        let Some(job) = store.jobs.get_mut(&job_id) else {
+            return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
+        };
+        if let Some(name) = request.name.clone() {
+            job.view.name = name;
+        }
+        if let Some(schedule) = request.schedule.clone() {
+            job.view.schedule = schedule;
+        }
+        if let Some(prompt) = request.prompt.clone() {
+            job.view.prompt = prompt;
+        }
+        if let Some(deliver) = request.deliver.clone() {
+            job.view.deliver = deliver;
+        }
+        if let Some(skills) = request.skills.clone() {
+            job.view.skills = skills;
+        }
+        if request.repeat.is_some() {
+            job.view.repeat = request.repeat;
+        }
+        if let Some(enabled) = request.enabled {
+            job.view.enabled = enabled;
+        }
+        job.view.updated_at = timestamp();
+        let view = job.view.clone();
+        let previous = job.clone();
+        if let Some(persistence) = persistence {
+            let payload = job_payload(&view, view.updated_at);
+            if let Err(error) = persistence.job_update(&payload) {
+                *job = previous;
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "persistence_unavailable",
+                    &format!("failed to persist job: {error}"),
+                );
+            }
+        }
+        json_response(StatusCode::OK, json!({"job":view}))
+    })
+    .await
 }
 
 async fn delete_job_handler(
     State(state): State<AgentGatewayState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    let mut store = state.store.write();
-    let Some(job) = store.jobs.remove(&job_id) else {
-        return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
-    };
-    if let Err(error) = state.durable_delete("job", &job_id) {
-        store.jobs.insert(job_id, job);
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist job deletion: {error}"),
-        );
-    }
-    json_response(StatusCode::OK, json!({"ok":true}))
+    store_mutation(state.clone(), move |store, persistence| {
+        let Some(job) = store.jobs.remove(&job_id) else {
+            return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
+        };
+        let durable = match persistence {
+            Some(persistence) => persistence.job_delete(&job_id).map(|_| ()),
+            None => Ok(()),
+        };
+        if let Err(error) = durable {
+            store.jobs.insert(job_id, job);
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "persistence_unavailable",
+                &format!("failed to persist job deletion: {error}"),
+            );
+        }
+        json_response(StatusCode::OK, json!({"ok":true}))
+    })
+    .await
 }
 
 async fn latest_job_output_handler(
@@ -1187,14 +1260,14 @@ async fn pause_job_handler(
     State(state): State<AgentGatewayState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    set_job_enabled(&state, &job_id, false)
+    set_job_enabled(state, job_id, false).await
 }
 
 async fn resume_job_handler(
     State(state): State<AgentGatewayState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    set_job_enabled(&state, &job_id, true)
+    set_job_enabled(state, job_id, true).await
 }
 
 async fn run_job_handler(
@@ -1224,13 +1297,6 @@ async fn interrupt_subagent_handler(
             "subagent not found",
         );
     }
-    if let Err(error) = durable_run_status(&state, &subagent_id) {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &error,
-        );
-    }
     json_response(
         StatusCode::ACCEPTED,
         json!({
@@ -1241,35 +1307,45 @@ async fn interrupt_subagent_handler(
     )
 }
 
-fn set_job_enabled(state: &AgentGatewayState, job_id: &str, enabled: bool) -> Response {
-    let mut store = state.store.write();
-    let Some(job) = store.jobs.get_mut(job_id) else {
-        return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
-    };
-    let previous = job.clone();
-    job.view.enabled = enabled;
-    job.view.updated_at = timestamp();
-    let view = job.view.clone();
-    let payload = match serde_json::to_value(&*job) {
-        Ok(payload) => payload,
-        Err(error) => {
-            *job = previous;
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid_job_state",
-                &format!("failed to encode job: {error}"),
-            );
+async fn set_job_enabled(state: AgentGatewayState, job_id: String, enabled: bool) -> Response {
+    store_mutation(state.clone(), move |store, persistence| {
+        let Some(job) = store.jobs.get_mut(&job_id) else {
+            return json_error(StatusCode::NOT_FOUND, "job_not_found", "job not found");
+        };
+        let previous = job.clone();
+        job.view.enabled = enabled;
+        job.view.updated_at = timestamp();
+        let view = job.view.clone();
+        if let Some(persistence) = persistence {
+            let payload = job_payload(&view, view.updated_at);
+            if let Err(error) = persistence.job_update(&payload) {
+                *job = previous;
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "persistence_unavailable",
+                    &format!("failed to persist job: {error}"),
+                );
+            }
         }
-    };
-    if let Err(error) = state.durable_put("job", job_id, &payload) {
-        *job = previous;
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
-            &format!("failed to persist job: {error}"),
-        );
-    }
-    json_response(StatusCode::OK, json!({"job":view}))
+        json_response(StatusCode::OK, json!({"job":view}))
+    })
+    .await
+}
+
+/// Serializes one job view into the normalized `job.create`/`job.update`
+/// command payload (schedules and deliveries are JSON-encoded text).
+fn job_payload(view: &JobView, now: u64) -> Value {
+    json!({
+        "id": view.id,
+        "name": view.name,
+        "schedule_json": serde_json::to_string(&view.schedule).unwrap_or_else(|_| "{}".to_string()),
+        "prompt": view.prompt,
+        "deliver_json": serde_json::to_string(&view.deliver).unwrap_or_else(|_| "{}".to_string()),
+        "skills_json": serde_json::to_string(&view.skills).unwrap_or_else(|_| "[]".to_string()),
+        "repeat_count": view.repeat.unwrap_or(0),
+        "enabled": if view.enabled { 1 } else { 0 },
+        "now_ms": now,
+    })
 }
 
 /// Outcome of the RSS worker: a completed value, a typed cancellation, or a
@@ -1296,7 +1372,7 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
     let cancellation = handle.cancel.clone();
 
     if cancellation.requested().is_some() {
-        finish_cancelled(&state, &run_id, "requested");
+        finish_cancelled(state.clone(), run_id.clone(), "requested".to_string()).await;
         return;
     }
 
@@ -1348,29 +1424,35 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
         match outcome {
             WorkerOutcome::Completed(value) => {
                 if let Some(reason) = delivery_outcome.schema_violation {
-                    finish_failed(&state, &run_id, events::schema_violation_error(&reason));
+                    finish_failed(
+                        state.clone(),
+                        run_id.clone(),
+                        events::schema_violation_error(&reason),
+                    )
+                    .await;
                     return;
                 }
                 if delivery_outcome.persist_failed {
                     finish_failed(
-                        &state,
-                        &run_id,
+                        state.clone(),
+                        run_id.clone(),
                         json!({
                             "status": "failed",
                             "error_code": "persistence_unavailable",
                             "error_message": "a run event could not be appended durably",
                         }),
-                    );
+                    )
+                    .await;
                     return;
                 }
                 vm_value_to_json(&value).to_string()
             }
             WorkerOutcome::Cancelled(reason) => {
-                finish_cancelled(&state, &run_id, reason);
+                finish_cancelled(state.clone(), run_id.clone(), reason.to_string()).await;
                 return;
             }
             WorkerOutcome::Failed(error) => {
-                finish_failed(&state, &run_id, failed_payload(error));
+                finish_failed(state.clone(), run_id.clone(), failed_payload(error)).await;
                 return;
             }
         }
@@ -1379,74 +1461,112 @@ async fn run_local_agent(state: AgentGatewayState, run_id: String, text: String)
     };
 
     if cancellation.requested().is_some() {
-        finish_cancelled(&state, &run_id, "requested");
+        finish_cancelled(state.clone(), run_id.clone(), "requested".to_string()).await;
         return;
     }
 
-    let mut store = state.store.write();
-    let run_active = store
-        .runs
-        .get(&run_id)
-        .is_some_and(|run| run.status == "started" && cancellation.requested().is_none());
-    if !run_active {
-        drop(store);
-        finish_cancelled(&state, &run_id, "requested");
-        return;
-    }
-    if !store.sessions.contains_key(&session_id) {
-        drop(store);
-        finish_failed(
-            &state,
-            &run_id,
-            failed_payload("session not found".to_string()),
-        );
-        return;
-    }
-
-    let message = {
-        let session = store
-            .sessions
-            .get_mut(&session_id)
-            .expect("session was checked above");
-        append_message(
+    // Durable-before-visible terminal commit: the assistant message, the
+    // two terminal events, and the run status change are committed in ONE
+    // transaction (`run.terminal`) while the store write lock is held on a
+    // blocking thread; only after the durable commit succeeds are the
+    // terminal events published to live subscribers. A failed commit rolls
+    // the in-memory mutation back and retries as a typed run.failed.
+    let run_id_for_commit = run_id.clone();
+    let outcome = store_mutation(state.clone(), move |store, persistence| {
+        let run_active = store
+            .runs
+            .get(&run_id_for_commit)
+            .is_some_and(|run| run.status == "started");
+        if !run_active {
+            return TerminalOutcome::NotActive;
+        }
+        let Some(session) = store.sessions.get_mut(&session_id) else {
+            return TerminalOutcome::SessionMissing;
+        };
+        let previous_session_updated = session.view.updated_at;
+        let message = append_message(
             &mut session.view,
             &mut session.messages,
             "assistant",
             Value::String(output_text.clone()),
-            Some(run_id.clone()),
+            Some(run_id_for_commit.clone()),
             Some("stop".to_string()),
-        )
-    };
-    let run = store.runs.get_mut(&run_id).expect("run was checked above");
-    emit_event_locked(
-        run,
-        "message.delta",
-        json!({"message_id":message.id, "delta":output_text, "role":"assistant"}),
-    );
-    emit_event_locked(
-        run,
-        "run.completed",
-        json!({"status":"completed", "output":{"message":message}, "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}),
-    );
-    run.status = "completed".to_string();
-    // Durable before visible: the session (with the assistant message), the
-    // run record, and the two terminal events are committed through the
-    // storage worker while the write lock is held.
-    if let Some(session) = store.sessions.get(&session_id) {
-        match serde_json::to_value(session) {
-            Ok(payload) => {
-                if let Err(error) = state.durable_put("session", &session_id, &payload) {
-                    tracing::error!("failed to commit session state durably: {error}");
-                }
+        );
+        let run = store
+            .runs
+            .get_mut(&run_id_for_commit)
+            .expect("run was checked above");
+        let previous_status = run.status.clone();
+        let previous_events = run.events.len();
+        let delta_event = make_event_locked(
+            run,
+            "message.delta",
+            json!({"message_id":message.id, "delta":output_text, "role":"assistant"}),
+        );
+        let completed_event = make_event_locked(
+            run,
+            "run.completed",
+            json!({"status":"completed", "output":{"message":message}, "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}),
+        );
+        run.status = "completed".to_string();
+        let durable = terminal_commit(
+            persistence,
+            run,
+            &session_id,
+            "completed",
+            &[&delta_event, &completed_event],
+            Some(&message),
+        );
+        match durable {
+            Ok(()) => {
+                let _ = run.sender.send(delta_event);
+                let _ = run.sender.send(completed_event);
+                TerminalOutcome::Committed
             }
             Err(error) => {
-                tracing::error!("failed to encode session state durably: {error}");
+                // Roll the in-memory terminal state back: the run stays
+                // active and the retry path below commits a typed failure.
+                run.status = previous_status;
+                run.events.truncate(previous_events);
+                let session = store
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("session was checked above");
+                session.messages.pop();
+                session.view.message_count = session.messages.len();
+                session.view.updated_at = previous_session_updated;
+                TerminalOutcome::TerminalPersistFailed(error)
             }
         }
+    })
+    .await;
+    match outcome {
+        TerminalOutcome::Committed => state.service.mark_terminal(&run_id),
+        TerminalOutcome::NotActive => {
+            finish_cancelled(state.clone(), run_id.clone(), "requested".to_string()).await;
+        }
+        TerminalOutcome::SessionMissing => {
+            finish_failed(
+                state.clone(),
+                run_id.clone(),
+                failed_payload("session not found".to_string()),
+            )
+            .await;
+        }
+        TerminalOutcome::TerminalPersistFailed(error) => {
+            tracing::error!("failed to commit terminal state durably: {error}");
+            finish_failed(
+                state.clone(),
+                run_id.clone(),
+                json!({
+                    "status": "failed",
+                    "error_code": "persistence_unavailable",
+                    "error_message": "terminal state could not be committed durably",
+                }),
+            )
+            .await;
+        }
     }
-    commit_run_durable_locked(&state, &store, &run_id);
-    drop(store);
-    state.service.mark_terminal(&run_id);
 }
 
 impl WorkerOutcome {
@@ -1494,23 +1614,61 @@ impl WorkerOutcome {
     }
 }
 
-fn finish_cancelled(state: &AgentGatewayState, run_id: &str, reason: &str) {
-    let mut store = state.store.write();
-    if let Some(run) = store.runs.get_mut(run_id) {
+/// Outcome of one durable terminal commit attempt.
+enum TerminalOutcome {
+    /// The terminal state was committed durably and published.
+    Committed,
+    /// The run is no longer active (a terminal was committed elsewhere).
+    NotActive,
+    /// The run's session vanished before the commit.
+    SessionMissing,
+    /// The durable commit failed; the in-memory terminal state was rolled
+    /// back and the run remains active.
+    TerminalPersistFailed(String),
+}
+
+/// Cancels a run with the typed reason through a durable-first terminal
+/// commit: `run.terminal` commits the cancellation event and the status
+/// change in one transaction, and only then is the event published. A
+/// failed commit rolls the in-memory state back and logs (restart recovery
+/// repairs the durable side).
+async fn finish_cancelled(state: AgentGatewayState, run_id: String, reason: String) {
+    let run_id_for_commit = run_id.clone();
+    let outcome = store_mutation(state.clone(), move |store, persistence| {
+        let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
+            return TerminalOutcome::NotActive;
+        };
         if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
-            drop(store);
-            return;
+            return TerminalOutcome::NotActive;
         }
-        emit_event_locked(
+        let previous_status = run.status.clone();
+        let previous_events = run.events.len();
+        let event = make_event_locked(
             run,
             "run.cancelled",
             json!({"status":"cancelled", "reason":reason}),
         );
         run.status = "cancelled".to_string();
-        commit_run_durable_locked(state, &store, run_id);
+        match terminal_commit(persistence, run, "", "cancelled", &[&event], None) {
+            Ok(()) => {
+                let _ = run.sender.send(event);
+                TerminalOutcome::Committed
+            }
+            Err(error) => {
+                run.status = previous_status;
+                run.events.truncate(previous_events);
+                TerminalOutcome::TerminalPersistFailed(error)
+            }
+        }
+    })
+    .await;
+    match outcome {
+        TerminalOutcome::Committed => state.service.mark_terminal(&run_id),
+        TerminalOutcome::TerminalPersistFailed(error) => {
+            tracing::error!("failed to commit cancellation durably for {run_id}: {error}");
+        }
+        _ => {}
     }
-    drop(store);
-    state.service.mark_terminal(run_id);
 }
 
 /// Canonical run.failed payload from a plain failure message.
@@ -1522,45 +1680,161 @@ fn failed_payload(error: String) -> Value {
     })
 }
 
-fn finish_failed(state: &AgentGatewayState, run_id: &str, data: Value) {
-    let mut store = state.store.write();
-    if let Some(run) = store.runs.get_mut(run_id) {
+/// Fails a run through a durable-first terminal commit: `run.terminal`
+/// commits the failure event and the status change in one transaction, and
+/// only then is the event published. A failed commit rolls the in-memory
+/// state back and logs (restart recovery repairs the durable side).
+async fn finish_failed(state: AgentGatewayState, run_id: String, data: Value) {
+    let run_id_for_commit = run_id.clone();
+    let outcome = store_mutation(state.clone(), move |store, persistence| {
+        let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
+            return TerminalOutcome::NotActive;
+        };
         if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
-            drop(store);
-            return;
+            return TerminalOutcome::NotActive;
         }
-        emit_event_locked(run, "run.failed", data);
+        let previous_status = run.status.clone();
+        let previous_events = run.events.len();
+        let event = make_event_locked(run, "run.failed", data);
         run.status = "failed".to_string();
-        commit_run_durable_locked(state, &store, run_id);
+        match terminal_commit(persistence, run, "", "failed", &[&event], None) {
+            Ok(()) => {
+                let _ = run.sender.send(event);
+                TerminalOutcome::Committed
+            }
+            Err(error) => {
+                run.status = previous_status;
+                run.events.truncate(previous_events);
+                TerminalOutcome::TerminalPersistFailed(error)
+            }
+        }
+    })
+    .await;
+    match outcome {
+        TerminalOutcome::Committed => state.service.mark_terminal(&run_id),
+        TerminalOutcome::TerminalPersistFailed(error) => {
+            tracing::error!("failed to commit failure durably for {run_id}: {error}");
+        }
+        _ => {}
     }
-    drop(store);
-    state.service.mark_terminal(run_id);
 }
 
-/// Durably commits one run's record and retained events as idempotent
-/// per-record upserts while the caller's store write lock is held, so the
-/// terminal state is durable before any reader or subscriber can observe it.
-/// Best-effort: a failed commit is logged; the restart recovery path repairs
-/// the durable side.
-fn commit_run_durable_locked(state: &AgentGatewayState, store: &GatewayStore, run_id: &str) {
-    let Some(run) = store.runs.get(run_id) else {
-        return;
+/// Commits one run's terminal state through the typed `run.terminal`
+/// transaction (status change + terminal events + optional assistant
+/// message in one durable commit). The caller holds the store write lock on
+/// a blocking thread. The in-memory events' sequences are reconciled with
+/// the transactionally allocated sequences returned by the command, so
+/// reload adjacency validation can never diverge from the durable side.
+/// Callers publish the terminal events only after this returns `Ok`.
+fn terminal_commit(
+    persistence: Option<&GatewayPersistence>,
+    run: &mut RunRecord,
+    session_id: &str,
+    to_status: &str,
+    events: &[&GatewayEvent],
+    assistant_message: Option<&SessionMessage>,
+) -> Result<(), String> {
+    let Some(persistence) = persistence else {
+        return Ok(());
     };
-    let result = (|| -> Result<(), String> {
-        state.durable_put("run", run_id, &persisted_run_value(run)?)?;
-        for event in &run.events {
-            state.durable_put(
-                "event",
-                &event_record_id(run_id, event.seq),
-                &serde_json::to_value(event)
-                    .map_err(|error| format!("encode event {}: {error}", event.event_id))?,
-            )?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        tracing::error!("failed to commit run state durably for {run_id}: {error}");
+    let event = |index: usize| -> &GatewayEvent {
+        events.get(index).expect("terminal event index in range")
+    };
+    let event_count = events.len();
+    let payload = json!({
+        "run_id": run.run_id,
+        "to_status": to_status,
+        "error_code": "",
+        "error_message": "",
+        "event_1_id": if event_count >= 1 { event(0).event_id.clone() } else { String::new() },
+        "event_1_type": if event_count >= 1 { event(0).event.clone() } else { String::new() },
+        "event_1_payload": if event_count >= 1 {
+            serde_json::to_string(&event(0).data).unwrap_or_else(|_| "{}".to_string())
+        } else { "{}".to_string() },
+        "event_2_id": if event_count >= 2 { event(1).event_id.clone() } else { String::new() },
+        "event_2_type": if event_count >= 2 { event(1).event.clone() } else { String::new() },
+        "event_2_payload": if event_count >= 2 {
+            serde_json::to_string(&event(1).data).unwrap_or_else(|_| "{}".to_string())
+        } else { "{}".to_string() },
+        "event_count": event_count,
+        "message_id": assistant_message.map(|message| message.id.clone()).unwrap_or_default(),
+        "message_session_id": assistant_message.map(|_| session_id.to_string()).unwrap_or_default(),
+        "message_role": assistant_message.map(|message| message.role.clone()).unwrap_or_default(),
+        "message_content_json": assistant_message
+            .map(|message| serde_json::to_string(&message.content).unwrap_or_else(|_| "null".to_string()))
+            .unwrap_or_default(),
+        "message_run_id": assistant_message
+            .and_then(|message| message.run_id.clone())
+            .unwrap_or_default(),
+        "message_finish_reason": assistant_message
+            .and_then(|message| message.finish_reason.clone())
+            .unwrap_or_default(),
+        "now_ms": timestamp(),
+    });
+    let data = persistence
+        .run_terminal(&payload)
+        .map_err(|error| error.to_string())?;
+    // Reconcile the in-memory terminal event sequences with the
+    // transactionally allocated durable sequences.
+    let rows = data
+        .get("events")
+        .and_then(|events| events.get("rows"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "run.terminal result omitted events".to_string())?;
+    if rows.len() < event_count {
+        return Err(format!(
+            "run.terminal appended {} events, expected at least {event_count}",
+            rows.len()
+        ));
     }
+    let offset = rows.len() - event_count;
+    for (index, event) in events.iter().enumerate() {
+        let row = rows
+            .get(offset + index)
+            .and_then(Value::as_array)
+            .ok_or_else(|| "run.terminal returned a malformed event row".to_string())?;
+        let seq = row
+            .first()
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "run.terminal returned a malformed event sequence".to_string())?;
+        if let Some(in_memory) = run
+            .events
+            .iter_mut()
+            .find(|candidate| candidate.event_id == event.event_id)
+        {
+            in_memory.seq = seq;
+        }
+    }
+    Ok(())
+}
+
+/// Appends one service-owned event to the run's retained history and
+/// returns it WITHOUT publishing: callers publish only after the durable
+/// commit succeeds (durable-before-visible).
+fn make_event_locked(run: &mut RunRecord, event: &str, mut data: Value) -> GatewayEvent {
+    const MAX_EVENT_BYTES: usize = 32 * 1024;
+    const MAX_EVENTS_PER_RUN: usize = 240;
+    if serde_json::to_vec(&data)
+        .map(|payload| payload.len() > MAX_EVENT_BYTES)
+        .unwrap_or(true)
+    {
+        data = json!({"truncated":true,"original_bytes":"over_limit"});
+    }
+    let seq = run.events.last().map(|event| event.seq + 1).unwrap_or(1);
+    let event = GatewayEvent {
+        event_id: Uuid::new_v4().to_string(),
+        seq,
+        event: event.to_string(),
+        run_id: run.run_id.clone(),
+        timestamp: timestamp(),
+        data,
+    };
+    run.events.push(event.clone());
+    if run.events.len() > MAX_EVENTS_PER_RUN {
+        let excess = run.events.len() - MAX_EVENTS_PER_RUN;
+        run.events.drain(0..excess);
+    }
+    event
 }
 
 fn execute_rss_source(
@@ -1622,6 +1896,15 @@ impl RunEventSink for DiscardingSink {
 /// to live subscribers. Nothing is published after the run commits a terminal
 /// state, and a failed append is rolled back so no unpersisted event is ever
 /// visible.
+/// Outcome of one delivery critical section: the event was durably appended
+/// and may be published, the run ended (stop the stream), or the durable
+/// append failed (roll back in memory, report persist failure).
+enum DeliverOutcome {
+    Published(GatewayEvent, broadcast::Sender<GatewayEvent>),
+    RunEnded,
+    PersistFailed(String),
+}
+
 async fn run_delivery_task(
     state: AgentGatewayState,
     run_id: String,
@@ -1639,45 +1922,69 @@ async fn run_delivery_task(
             }
         };
         let data = events::script_event_data(&value);
-        let (event, sender) = {
-            let mut store = state.store.write();
-            let Some(run) = store.runs.get_mut(&run_id) else {
-                break;
+        // The critical section (store write lock plus the blocking storage
+        // worker round-trip) runs on a blocking thread so the request
+        // runtime is never occupied by a storage stall.
+        let state_for_block = state.clone();
+        let run_id_for_block = run_id.clone();
+        let event_type_for_block = event_type.clone();
+        let data_for_block = data.clone();
+        let delivered = tokio::task::spawn_blocking(move || {
+            let mut store = state_for_block.store.write();
+            let Some(run) = store.runs.get_mut(&run_id_for_block) else {
+                return DeliverOutcome::RunEnded;
             };
             if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
-                break;
+                return DeliverOutcome::RunEnded;
             }
             let event = append_script_event_locked(
                 run,
-                &event_type,
-                data,
-                state.config.max_event_bytes,
-                state.config.max_events_per_run,
+                &event_type_for_block,
+                data_for_block,
+                state_for_block.config.max_event_bytes,
+                state_for_block.config.max_events_per_run,
             );
             // Durable before visible: the event row is committed through the
-            // storage worker while the write lock is held; on failure the
-            // in-memory append is rolled back so no unpersisted event is
-            // ever visible.
-            let payload = serde_json::to_value(&event)
-                .map_err(|error| format!("encode event {}: {error}", event.event_id));
-            let durable = match payload {
-                Ok(payload) => {
-                    state.durable_put("event", &event_record_id(&run_id, event.seq), &payload)
+            // typed `event.append` transaction while the write lock is held;
+            // on failure the in-memory append is rolled back so no
+            // unpersisted event is ever visible.
+            let durable = match state_for_block.persistence() {
+                Some(persistence) => {
+                    let payload = json!({
+                        "run_id": run_id_for_block,
+                        "event_id": event.event_id,
+                        "event_type": event.event,
+                        "payload_json": serde_json::to_string(&event.data)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                        "now_ms": timestamp(),
+                        "max_events": state_for_block.config.max_events_per_run,
+                    });
+                    persistence.event_append(&payload).map(|_| ())
                 }
-                Err(error) => Err(error),
+                None => Ok(()),
             };
-            if let Err(error) = durable {
-                run.events
-                    .retain(|existing| existing.event_id != event.event_id);
-                drop(store);
+            match durable {
+                Ok(()) => DeliverOutcome::Published(event, run.sender.clone()),
+                Err(error) => {
+                    run.events
+                        .retain(|existing| existing.event_id != event.event_id);
+                    DeliverOutcome::PersistFailed(error.to_string())
+                }
+            }
+        })
+        .await
+        .expect("delivery task must complete");
+        match delivered {
+            DeliverOutcome::Published(event, sender) => {
+                outcome.delivered += 1;
+                let _ = sender.send(event);
+            }
+            DeliverOutcome::RunEnded => break,
+            DeliverOutcome::PersistFailed(error) => {
                 tracing::error!("failed to append run event durably: {error}");
                 outcome.persist_failed = true;
-                continue;
             }
-            (event, run.sender.clone())
-        };
-        outcome.delivered += 1;
-        let _ = sender.send(event);
+        }
     }
     outcome
 }
@@ -1839,32 +2146,6 @@ fn event_stream(
             }
         },
     )
-}
-
-pub(crate) fn emit_event_locked(run: &mut RunRecord, event: &str, mut data: Value) {
-    const MAX_EVENT_BYTES: usize = 32 * 1024;
-    const MAX_EVENTS_PER_RUN: usize = 240;
-    if serde_json::to_vec(&data)
-        .map(|payload| payload.len() > MAX_EVENT_BYTES)
-        .unwrap_or(true)
-    {
-        data = json!({"truncated":true,"original_bytes":"over_limit"});
-    }
-    let seq = run.events.last().map(|event| event.seq + 1).unwrap_or(1);
-    let event = GatewayEvent {
-        event_id: Uuid::new_v4().to_string(),
-        seq,
-        event: event.to_string(),
-        run_id: run.run_id.clone(),
-        timestamp: timestamp(),
-        data,
-    };
-    run.events.push(event.clone());
-    if run.events.len() > MAX_EVENTS_PER_RUN {
-        let excess = run.events.len() - MAX_EVENTS_PER_RUN;
-        run.events.drain(0..excess);
-    }
-    let _ = run.sender.send(event);
 }
 
 pub(crate) fn append_message(
