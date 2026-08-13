@@ -37,6 +37,18 @@ pub struct AgentGatewayConfig {
     pub terminal_persist_retries: usize,
     /// Backoff between bounded terminal-commit retries.
     pub terminal_persist_retry_delay: Duration,
+    /// Bounded in-memory rate limiting applied by the gateway middleware
+    /// before any handler runs (per peer IP and per verified bearer
+    /// account). Disabled by default; see [`RateLimitConfig`].
+    pub rate_limit: RateLimitConfig,
+    /// What happens to an active run when its last live SSE subscriber
+    /// disconnects (see [`ClientDisconnectPolicy`]). Defaults to
+    /// keep-running.
+    pub client_disconnect_policy: ClientDisconnectPolicy,
+    /// SSE keep-alive interval. Also the upper bound on how quickly a
+    /// client disconnect is detected: the next keep-alive write fails, the
+    /// SSE body is dropped, and the subscriber drop guard fires.
+    pub sse_keepalive_interval: Duration,
 
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
@@ -82,7 +94,116 @@ impl AgentGatewayConfig {
         if self.terminal_persist_retry_delay.is_zero() {
             return Err("terminal_persist_retry_delay must be positive".to_string());
         }
+        if self.sse_keepalive_interval.is_zero() {
+            return Err("sse_keepalive_interval must be positive".to_string());
+        }
+        self.rate_limit.validate()?;
         Ok(())
+    }
+}
+
+/// Bounded, non-blocking, in-memory token-bucket rate limiting enforced by
+/// the gateway middleware before any handler runs.
+///
+/// Two independent dimensions are tracked: one bucket per peer IP and one
+/// bucket per verified bearer account. Every request consumes one token
+/// from the peer-IP bucket; authenticated requests additionally consume one
+/// token from their account bucket. A request with no token left is
+/// rejected with HTTP 429 and a `Retry-After` header (the seconds until at
+/// least one token refills). Buckets are keyed by identity and never shared
+/// across dimensions, and failed authentication never charges an account
+/// bucket: accounts are charged only after the bearer token verifies. The
+/// limiter is non-blocking (one short critical section, no I/O) and memory
+/// is bounded by `max_buckets`: stale buckets are swept on access and the
+/// stalest bucket is evicted at the bound, so the table can never grow
+/// without limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimitConfig {
+    /// Master switch; when disabled the middleware passes every request
+    /// through untouched (the other fields still validate).
+    pub enabled: bool,
+    /// Per-peer-IP burst: tokens available per `window` for one IP.
+    pub ip_burst: u32,
+    /// Per-account burst: tokens available per `window` for one verified
+    /// bearer identity.
+    pub account_burst: u32,
+    /// Refill window shared by both dimensions: each bucket refills its
+    /// burst over one `window`.
+    pub window: Duration,
+    /// Upper bound on tracked buckets (per-IP and per-account combined);
+    /// at the bound the stalest bucket is evicted.
+    pub max_buckets: usize,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ip_burst: 60,
+            account_burst: 120,
+            window: Duration::from_secs(60),
+            max_buckets: 10_000,
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// Validates that every bound is positive and within the documented
+    /// sane upper bounds (the limiter divides by `window` and stores up to
+    /// `max_buckets` entries, so degenerate values are rejected up front).
+    fn validate(&self) -> Result<(), String> {
+        if self.ip_burst == 0 || self.ip_burst > 1_000_000 {
+            return Err("rate_limit.ip_burst must be positive and at most 1000000".to_string());
+        }
+        if self.account_burst == 0 || self.account_burst > 1_000_000 {
+            return Err(
+                "rate_limit.account_burst must be positive and at most 1000000".to_string(),
+            );
+        }
+        if self.window.is_zero() || self.window > Duration::from_secs(86_400) {
+            return Err("rate_limit.window must be positive and at most 86400 seconds".to_string());
+        }
+        if self.max_buckets == 0 || self.max_buckets > 1_000_000 {
+            return Err("rate_limit.max_buckets must be positive and at most 1000000".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// What happens to an active run when its last live SSE subscriber
+/// disconnects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientDisconnectPolicy {
+    /// Default: the run keeps running after every subscriber disconnects,
+    /// and events stay replayable through the `after_seq` cursor once a
+    /// client reconnects.
+    KeepRunning,
+    /// The run is cancelled with the typed `client_disconnect` reason, but
+    /// only when the last subscriber disconnects while the run is still
+    /// active. Multi-subscriber and reconnect races can never cancel while
+    /// at least one subscriber remains, and a normal terminal end never
+    /// requests a cancellation.
+    CancelOnDisconnect,
+}
+
+impl ClientDisconnectPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeepRunning => "keep-running",
+            Self::CancelOnDisconnect => "cancel-on-disconnect",
+        }
+    }
+
+    /// Parses the environment-variable spelling of the policy.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "keep-running" => Ok(Self::KeepRunning),
+            "cancel-on-disconnect" => Ok(Self::CancelOnDisconnect),
+            other => Err(format!(
+                "unknown client disconnect policy {other:?}; expected keep-running or \
+                 cancel-on-disconnect"
+            )),
+        }
     }
 }
 
@@ -108,6 +229,9 @@ impl Default for AgentGatewayConfig {
             terminal_commit_retry_window: Duration::from_secs(300),
             terminal_persist_retries: 3,
             terminal_persist_retry_delay: Duration::from_millis(25),
+            rate_limit: RateLimitConfig::default(),
+            client_disconnect_policy: ClientDisconnectPolicy::KeepRunning,
+            sse_keepalive_interval: Duration::from_secs(10),
 
             http: HttpConfig::default(),
             sqlite,
@@ -160,6 +284,99 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "terminal_persist_retry_delay must be a validated positive bound"
+        );
+    }
+
+    #[test]
+    fn sse_keepalive_interval_must_be_positive() {
+        let config = AgentGatewayConfig {
+            sse_keepalive_interval: Duration::ZERO,
+            ..AgentGatewayConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "sse_keepalive_interval must be a validated positive bound"
+        );
+    }
+
+    #[test]
+    fn rate_limit_defaults_validate() {
+        RateLimitConfig::default()
+            .validate()
+            .expect("default rate limit configuration must validate");
+    }
+
+    #[test]
+    fn rate_limit_bursts_must_be_positive_and_bounded() {
+        for burst in [0_u32, 1_000_001] {
+            let config = RateLimitConfig {
+                ip_burst: burst,
+                ..RateLimitConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "ip_burst {burst} must be rejected as out of bounds"
+            );
+            let config = RateLimitConfig {
+                account_burst: burst,
+                ..RateLimitConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "account_burst {burst} must be rejected as out of bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_window_must_be_positive_and_bounded() {
+        for window in [Duration::ZERO, Duration::from_secs(86_401)] {
+            let config = RateLimitConfig {
+                window,
+                ..RateLimitConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "window {window:?} must be rejected as out of bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_max_buckets_must_be_positive_and_bounded() {
+        for max_buckets in [0_usize, 1_000_001] {
+            let config = RateLimitConfig {
+                max_buckets,
+                ..RateLimitConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "max_buckets {max_buckets} must be rejected as out of bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn client_disconnect_policy_defaults_to_keep_running_and_parses() {
+        assert_eq!(
+            AgentGatewayConfig::default().client_disconnect_policy,
+            ClientDisconnectPolicy::KeepRunning
+        );
+        assert_eq!(
+            ClientDisconnectPolicy::parse("keep-running"),
+            Ok(ClientDisconnectPolicy::KeepRunning)
+        );
+        assert_eq!(
+            ClientDisconnectPolicy::parse("cancel-on-disconnect"),
+            Ok(ClientDisconnectPolicy::CancelOnDisconnect)
+        );
+        assert!(
+            ClientDisconnectPolicy::parse("stop-the-world").is_err(),
+            "unknown policy spellings must be rejected"
+        );
+        assert_eq!(
+            ClientDisconnectPolicy::CancelOnDisconnect.as_str(),
+            "cancel-on-disconnect"
         );
     }
 }

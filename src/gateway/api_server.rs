@@ -6,12 +6,21 @@
 //! No provider parser, agent loop, private host function, or SQL statement
 //! exists here.
 
-use std::{collections::HashMap, convert::Infallible, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, RETRY_AFTER},
+    },
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -20,16 +29,18 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::stream::{self, Stream};
+use parking_lot::Mutex;
 use rustscript_vm::CancellationReason;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::config::{AgentGatewayConfig, RateLimitConfig};
 use crate::domain::{input_text, timestamp, vm_value_to_json};
 use crate::runtime::delivery::DiscardingSink;
 use crate::runtime::rss_runner::execute_rss_source;
-use crate::service::{AdmitError, failed_payload};
+use crate::service::{AdmitError, SubscriberGuard, failed_payload};
 use crate::{
     AgentGatewayState, RunCancellation,
     gateway::store::{
@@ -134,6 +145,8 @@ struct JobListQuery {
 }
 
 pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
+    let rate_limiter = Arc::new(RateLimiter::new(state.config.rate_limit));
+    let guard_config = Arc::clone(&state.config);
     Router::new()
         .route("/health/detailed", get(health_detailed_handler))
         .route("/v1/models", get(models_handler))
@@ -177,29 +190,146 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
             post(interrupt_subagent_handler),
         )
         .layer(DefaultBodyLimit::max(state.config.max_body_bytes))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ))
+        // Outermost guard: per-IP rate limiting (all requests), bearer
+        // authentication, then per-account rate limiting (verified requests
+        // only). Auth failures are rejected before any account token is
+        // consumed, and the two rate-limit dimensions are keyed separately.
+        .layer(middleware::from_fn(move |request, next| {
+            gateway_guard_middleware(
+                request,
+                next,
+                Arc::clone(&rate_limiter),
+                Arc::clone(&guard_config),
+            )
+        }))
         .with_state(state)
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = (left.len() ^ right.len()) as u8;
-    let length = left.len().max(right.len());
-    for index in 0..length {
-        difference |=
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0);
-    }
-    difference == 0
+/// Bounded, non-blocking in-memory token-bucket rate limiter keyed by
+/// arbitrary identity strings (peer IP or bearer account).
+///
+/// Each bucket holds up to `burst` tokens and refills `burst` tokens per
+/// `window`; one `check` consumes one token when available. The critical
+/// section is a single short Mutex with no I/O, so request runtimes never
+/// block on the limiter. Memory is bounded by `max_buckets`: stale buckets
+/// (idle for a full window, i.e. fully refilled and therefore semantically
+/// lossless to drop) are swept on access, and at the bound the stalest
+/// bucket is evicted, so the table can never grow without limit.
+struct RateLimiter {
+    inner: Mutex<RateLimiterInner>,
+    window: Duration,
+    max_buckets: usize,
+    sweep_interval: Duration,
 }
 
-async fn bearer_auth_middleware(
-    State(state): State<AgentGatewayState>,
+struct RateLimiterInner {
+    buckets: HashMap<String, Bucket>,
+    last_sweep: Instant,
+}
+
+struct Bucket {
+    tokens: f64,
+    refilled_at: Instant,
+}
+
+enum RateLimitOutcome {
+    Allowed,
+    Denied { retry_after: Duration },
+}
+
+impl RateLimiter {
+    fn new(config: RateLimitConfig) -> Self {
+        Self {
+            inner: Mutex::new(RateLimiterInner {
+                buckets: HashMap::new(),
+                last_sweep: Instant::now(),
+            }),
+            window: config.window,
+            max_buckets: config.max_buckets,
+            // Sweep at most once per window: an idle bucket is fully
+            // refilled after one window, so dropping it is lossless.
+            sweep_interval: config.window,
+        }
+    }
+
+    /// Consumes one token from `key`'s bucket, refilling by elapsed time
+    /// first. On denial, returns the seconds until at least one token
+    /// refills (for the `Retry-After` header).
+    fn check(&self, key: &str, burst: f64) -> RateLimitOutcome {
+        let mut inner = self.inner.lock();
+        let now = Instant::now();
+        if now.duration_since(inner.last_sweep) >= self.sweep_interval {
+            inner
+                .buckets
+                .retain(|_, bucket| now.duration_since(bucket.refilled_at) < self.window);
+            inner.last_sweep = now;
+        }
+        if !inner.buckets.contains_key(key)
+            && inner.buckets.len() >= self.max_buckets
+            && let Some(stalest) = inner
+                .buckets
+                .iter()
+                .min_by_key(|(_, bucket)| bucket.refilled_at)
+                .map(|(key, _)| key.clone())
+        {
+            // Evict only to make room for a new identity; an existing key
+            // always keeps its bucket (evicting the caller's own bucket
+            // would silently reset its limit).
+            inner.buckets.remove(&stalest);
+        }
+        let bucket = inner.buckets.entry(key.to_string()).or_insert(Bucket {
+            tokens: burst,
+            refilled_at: now,
+        });
+        let rate = burst / self.window.as_secs_f64();
+        let elapsed = now.duration_since(bucket.refilled_at).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
+        bucket.refilled_at = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            RateLimitOutcome::Allowed
+        } else {
+            RateLimitOutcome::Denied {
+                retry_after: self.retry_after(bucket.tokens, rate),
+            }
+        }
+    }
+
+    /// Seconds until the bucket refills at least one token, at least 1.
+    fn retry_after(&self, tokens: f64, rate: f64) -> Duration {
+        let seconds = ((1.0 - tokens) / rate).ceil().max(1.0) as u64;
+        Duration::from_secs(seconds)
+    }
+
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        self.inner.lock().buckets.len()
+    }
+}
+
+async fn gateway_guard_middleware(
     request: Request,
     next: Next,
+    rate_limiter: Arc<RateLimiter>,
+    config: Arc<AgentGatewayConfig>,
 ) -> Response {
-    let Some(expected) = state.config.bearer_token.as_deref() else {
+    if config.rate_limit.enabled {
+        // Peer-IP dimension: every request charges its IP bucket, including
+        // auth failures (that is the anti-brute-force point). Without
+        // ConnectInfo (router oneshot) the key falls back to a single
+        // shared bucket, which only matters for in-process tests.
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|connect_info| connect_info.0.ip().to_string())
+            .unwrap_or_else(|| "no-peer".to_string());
+        if let RateLimitOutcome::Denied { retry_after } =
+            rate_limiter.check(&format!("ip:{peer}"), f64::from(config.rate_limit.ip_burst))
+        {
+            return rate_limited_response(retry_after);
+        }
+    }
+    let Some(expected) = config.bearer_token.as_deref() else {
         return next.run(request).await;
     };
     let authorized = request
@@ -215,7 +345,44 @@ async fn bearer_auth_middleware(
             "missing or invalid bearer token",
         );
     }
+    if config.rate_limit.enabled {
+        // Account dimension: charged only after the bearer token verifies,
+        // keyed by a hash of the verified identity. Failed authentication
+        // can never pollute an authenticated account's budget.
+        let account_key = format!("account:fnv64:{:016x}", fnv1a64(expected.as_bytes()));
+        if let RateLimitOutcome::Denied { retry_after } =
+            rate_limiter.check(&account_key, f64::from(config.rate_limit.account_burst))
+        {
+            return rate_limited_response(retry_after);
+        }
+    }
     next.run(request).await
+}
+
+/// HTTP 429 with the seconds until at least one token refills.
+fn rate_limited_response(retry_after: Duration) -> Response {
+    let seconds = retry_after.as_secs().max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(RETRY_AFTER, seconds.to_string())],
+        Json(json!({
+            "error": {
+                "code": "rate_limited",
+                "message": "rate limit exceeded",
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = (left.len() ^ right.len()) as u8;
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        difference |=
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0);
+    }
+    difference == 0
 }
 
 async fn health_detailed_handler(State(state): State<AgentGatewayState>) -> impl IntoResponse {
@@ -863,11 +1030,15 @@ async fn run_events_handler(
             run.sender.as_ref().map(|sender| sender.subscribe()),
         )
     };
-    let stream = event_stream(history, receiver);
+    // Track this SSE connection as a live subscriber for the duration of
+    // the stream; the drop guard (moved into the stream state) decides the
+    // client-disconnect policy when the connection ends.
+    let guard = state.service.attach_subscriber(&run_id);
+    let stream = event_stream(history, receiver, guard);
     Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
-                .interval(Duration::from_secs(10))
+                .interval(state.config.sse_keepalive_interval)
                 .text("keepalive"),
         )
         .into_response()
@@ -1196,13 +1367,21 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 fn event_stream(
     history: Vec<GatewayEvent>,
     receiver: Option<broadcast::Receiver<GatewayEvent>>,
+    guard: Option<SubscriberGuard>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(
-        (history.into_iter(), receiver, false),
-        |(mut history, receiver, mut done)| async move {
+        (history.into_iter(), receiver, guard, false),
+        |(mut history, receiver, mut guard, mut done)| async move {
             if let Some(event) = history.next() {
                 done |= event.is_terminal();
-                return Some((Ok(event.into_sse()), (history, receiver, done)));
+                // A stream that ends because a terminal was delivered must
+                // never request a client-disconnect cancellation.
+                if event.is_terminal()
+                    && let Some(guard) = guard.as_mut()
+                {
+                    guard.disarm();
+                }
+                return Some((Ok(event.into_sse()), (history, receiver, guard, done)));
             }
             if done {
                 return None;
@@ -1213,14 +1392,22 @@ fn event_stream(
             match receiver.recv().await {
                 Ok(event) => {
                     done |= event.is_terminal();
-                    Some((Ok(event.into_sse()), (history, Some(receiver), done)))
+                    if event.is_terminal()
+                        && let Some(guard) = guard.as_mut()
+                    {
+                        guard.disarm();
+                    }
+                    Some((Ok(event.into_sse()), (history, Some(receiver), guard, done)))
                 }
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                    // The subscriber fell behind and the stream ends without
+                    // a terminal: the guard stays armed, so a
+                    // cancel-on-disconnect run treats this as a disconnect.
                     done = true;
                     let event = Event::default()
                         .event("error")
                         .data(json!({"code":"event_lagged","dropped":dropped}).to_string());
-                    Some((Ok(event), (history, Some(receiver), done)))
+                    Some((Ok(event), (history, Some(receiver), guard, done)))
                 }
                 Err(broadcast::error::RecvError::Closed) => None,
             }
@@ -1234,4 +1421,126 @@ fn json_response(status: StatusCode, value: Value) -> Response {
 
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response {
     json_response(status, json!({"error":{"code":code,"message":message}}))
+}
+
+#[cfg(test)]
+mod rate_limiter_tests {
+    use super::*;
+
+    fn limiter(window: Duration, max_buckets: usize) -> RateLimiter {
+        RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            ip_burst: 1,
+            account_burst: 1,
+            window,
+            max_buckets,
+        })
+    }
+
+    #[test]
+    fn burst_is_allowed_then_denied_with_retry_after() {
+        let limiter = limiter(Duration::from_secs(60), 16);
+        for _ in 0..3 {
+            assert!(matches!(
+                limiter.check("ip:a", 3.0),
+                RateLimitOutcome::Allowed
+            ));
+        }
+        let denied = limiter.check("ip:a", 3.0);
+        let RateLimitOutcome::Denied { retry_after } = denied else {
+            panic!("the burst-exceeding check must be denied");
+        };
+        assert!(
+            retry_after >= Duration::from_secs(1),
+            "Retry-After must advertise at least one second"
+        );
+    }
+
+    #[test]
+    fn keys_are_isolated() {
+        let limiter = limiter(Duration::from_secs(60), 16);
+        assert!(matches!(
+            limiter.check("ip:1", 1.0),
+            RateLimitOutcome::Allowed
+        ));
+        assert!(matches!(
+            limiter.check("ip:2", 1.0),
+            RateLimitOutcome::Allowed
+        ));
+        assert!(matches!(
+            limiter.check("ip:1", 1.0),
+            RateLimitOutcome::Denied { .. }
+        ));
+        assert!(matches!(
+            limiter.check("account:2", 1.0),
+            RateLimitOutcome::Allowed
+        ));
+    }
+
+    #[test]
+    fn bucket_refills_after_the_window() {
+        let limiter = limiter(Duration::from_millis(100), 16);
+        assert!(matches!(
+            limiter.check("ip:a", 1.0),
+            RateLimitOutcome::Allowed
+        ));
+        assert!(matches!(
+            limiter.check("ip:a", 1.0),
+            RateLimitOutcome::Denied { .. }
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(matches!(
+            limiter.check("ip:a", 1.0),
+            RateLimitOutcome::Allowed
+        ));
+    }
+
+    #[test]
+    fn stale_buckets_are_swept() {
+        let limiter = limiter(Duration::from_millis(100), 16);
+        let _ = limiter.check("ip:a", 1.0);
+        let _ = limiter.check("ip:b", 1.0);
+        assert_eq!(limiter.bucket_count(), 2);
+        std::thread::sleep(Duration::from_millis(250));
+        let _ = limiter.check("ip:c", 1.0);
+        assert_eq!(
+            limiter.bucket_count(),
+            1,
+            "buckets idle for a full window must be swept on access"
+        );
+    }
+
+    #[test]
+    fn bucket_table_is_bounded_by_eviction() {
+        let limiter = limiter(Duration::from_secs(60), 2);
+        let _ = limiter.check("ip:a", 1.0);
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = limiter.check("ip:b", 1.0);
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = limiter.check("ip:c", 1.0);
+        assert_eq!(
+            limiter.bucket_count(),
+            2,
+            "the stalest bucket must be evicted at the bound"
+        );
+    }
+
+    #[test]
+    fn existing_key_never_evicts_its_own_bucket() {
+        // A single identity at the bucket bound must still be limited (its
+        // own bucket is never evicted to make room for itself).
+        let limiter = limiter(Duration::from_secs(60), 1);
+        assert!(matches!(
+            limiter.check("ip:a", 2.0),
+            RateLimitOutcome::Allowed
+        ));
+        assert!(matches!(
+            limiter.check("ip:a", 2.0),
+            RateLimitOutcome::Allowed
+        ));
+        assert!(matches!(
+            limiter.check("ip:a", 2.0),
+            RateLimitOutcome::Denied { .. }
+        ));
+    }
 }

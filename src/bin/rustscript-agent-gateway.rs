@@ -72,6 +72,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.http.allow_private_ips = true;
     }
 
+    // A7: bounded rate limiting (per peer IP and per bearer account) and
+    // the client-disconnect policy. Every bound is validated by
+    // `AgentGatewayConfig::validate` before the server starts.
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED",
+        "PD_EDGE_AGENT_RATE_LIMIT_ENABLED",
+    )? {
+        config.rate_limit.enabled = match value.as_str() {
+            "0" => false,
+            "1" => true,
+            other => {
+                return Err(format!(
+                    "RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED must be 0 or 1, got {other:?}"
+                )
+                .into());
+            }
+        };
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_RATE_LIMIT_IP_BURST",
+        "PD_EDGE_AGENT_RATE_LIMIT_IP_BURST",
+    )? {
+        config.rate_limit.ip_burst = value
+            .parse::<u32>()
+            .map_err(|_| format!("invalid RUSTSCRIPT_AGENT_RATE_LIMIT_IP_BURST: {value:?}"))?;
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_RATE_LIMIT_ACCOUNT_BURST",
+        "PD_EDGE_AGENT_RATE_LIMIT_ACCOUNT_BURST",
+    )? {
+        config.rate_limit.account_burst = value
+            .parse::<u32>()
+            .map_err(|_| format!("invalid RUSTSCRIPT_AGENT_RATE_LIMIT_ACCOUNT_BURST: {value:?}"))?;
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_RATE_LIMIT_WINDOW_MS",
+        "PD_EDGE_AGENT_RATE_LIMIT_WINDOW_MS",
+    )? {
+        config.rate_limit.window =
+            std::time::Duration::from_millis(value.parse::<u64>().map_err(|_| {
+                format!("invalid RUSTSCRIPT_AGENT_RATE_LIMIT_WINDOW_MS: {value:?}")
+            })?);
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_RATE_LIMIT_MAX_BUCKETS",
+        "PD_EDGE_AGENT_RATE_LIMIT_MAX_BUCKETS",
+    )? {
+        config.rate_limit.max_buckets = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid RUSTSCRIPT_AGENT_RATE_LIMIT_MAX_BUCKETS: {value:?}"))?;
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_CLIENT_DISCONNECT_POLICY",
+        "PD_EDGE_AGENT_CLIENT_DISCONNECT_POLICY",
+    )? {
+        config.client_disconnect_policy =
+            rustscript_agent::config::ClientDisconnectPolicy::parse(&value)
+                .map_err(std::io::Error::other)?;
+    }
+
     let script = match env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")? {
         Some(path) => Some(fs::read_to_string(path)?),
         None => None,
@@ -98,7 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let app = build_agent_gateway_app(state.clone());
     tokio::select! {
-        result = axum::serve(listener, app) => result?,
+        // ConnectInfo carries the peer address so the rate limiter can key
+        // per-IP buckets; without it every request would share one bucket.
+        result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => result?,
         signal = tokio::signal::ctrl_c() => {
             signal?;
             eprintln!("halting: cancelling active runs with the typed resource-closed reason");

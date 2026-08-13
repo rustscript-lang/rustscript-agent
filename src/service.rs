@@ -32,6 +32,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::config::AgentGatewayConfig;
+use crate::config::ClientDisconnectPolicy;
 use crate::domain::{RunContext, timestamp, vm_value_to_json};
 use crate::events;
 use crate::gateway::store::{
@@ -61,11 +62,31 @@ pub struct PendingTerminal {
 }
 
 /// One admitted run's lifecycle state: typed cancellation, delivery permit,
-/// and bounded terminal retention.
+/// bounded terminal retention, and live SSE subscriber tracking.
 pub struct RunHandle {
     pub(crate) cancel: RunCancellation,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) permit: Mutex<Option<OwnedSemaphorePermit>>,
+    /// Set when the one terminal transition is committed (mark_terminal).
+    /// The subscriber drop guard never requests a client-disconnect
+    /// cancellation for a run that already reached a terminal.
+    terminal: AtomicBool,
+    /// The typed gateway cancellation reason (stop/halt/client disconnect).
+    /// The worker commits this exact reason instead of the generic core
+    /// string, so `client_disconnect` survives into the persisted terminal.
+    cancel_reason: Mutex<Option<&'static str>>,
+    /// Live SSE subscriber bookkeeping: the active count and the
+    /// exactly-once disconnect notification flag, guarded by one short
+    /// critical section so attach/drop races are atomic.
+    subscribers: Mutex<SubscriberState>,
+    disconnect_policy: ClientDisconnectPolicy,
+}
+
+/// Live SSE subscriber accounting for one run handle.
+struct SubscriberState {
+    count: usize,
+    /// True once the last-subscriber disconnect cancellation was requested.
+    notified: bool,
 }
 
 impl RunHandle {
@@ -73,6 +94,66 @@ impl RunHandle {
     pub fn is_terminal(&self) -> bool {
         self.terminal_at.lock().expect("terminal lock").is_some()
     }
+}
+
+/// Drop guard returned by [`AgentService::attach_subscriber`] and moved into
+/// the SSE stream state. Dropping it (client disconnect, stream end, or the
+/// body future being cancelled) decrements the run's subscriber count
+/// synchronously — no async destructor, no store lock. A cancel-on-disconnect
+/// run whose count reaches zero while it is still active and whose stream
+/// ended without delivering a terminal (so `armed` is still true) requests
+/// the typed `client_disconnect` cancellation exactly once.
+pub(crate) struct SubscriberGuard {
+    handle: Arc<RunHandle>,
+    /// False once a terminal event was delivered to this subscriber: a
+    /// normal stream end after a terminal must never request a
+    /// cancellation. A stream that ends without a terminal (client abort or
+    /// closed live channel) stays armed.
+    armed: bool,
+}
+
+impl SubscriberGuard {
+    /// Disarms the guard when the SSE stream ends because a terminal event
+    /// was delivered, so the drop never requests a cancellation.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        let mut subscribers = self.handle.subscribers.lock().expect("subscriber lock");
+        subscribers.count = subscribers.count.saturating_sub(1);
+        if !self.armed
+            || subscribers.count != 0
+            || self.handle.disconnect_policy != ClientDisconnectPolicy::CancelOnDisconnect
+            || self.handle.terminal.load(Ordering::Acquire)
+            || subscribers.notified
+        {
+            return;
+        }
+        subscribers.notified = true;
+        // The gateway's typed reason is recorded before the request so the
+        // worker commits `client_disconnect` (the core VM has no dedicated
+        // variant; the request maps onto the core Requested reason).
+        *self
+            .handle
+            .cancel_reason
+            .lock()
+            .expect("cancel reason lock") = Some("client_disconnect");
+        self.handle.cancel.request(CancellationReason::Requested);
+    }
+}
+
+/// The typed gateway cancellation reason recorded on the handle, or the
+/// fallback when the cancellation was requested by the worker itself
+/// (deadline) or by the core (e.g. parent).
+fn handle_cancel_reason(handle: &RunHandle, fallback: &'static str) -> &'static str {
+    handle
+        .cancel_reason
+        .lock()
+        .expect("cancel reason lock")
+        .unwrap_or(fallback)
 }
 
 /// Admission request built by the transport from the normalized request.
@@ -446,6 +527,13 @@ impl AgentService {
             cancel: RunCancellation::with_timeout(self.inner.config.run_timeout),
             terminal_at: Mutex::new(None),
             permit: Mutex::new(Some(capacity_permit)),
+            terminal: AtomicBool::new(false),
+            cancel_reason: Mutex::new(None),
+            subscribers: Mutex::new(SubscriberState {
+                count: 0,
+                notified: false,
+            }),
+            disconnect_policy: self.inner.config.client_disconnect_policy,
         });
         self.inner
             .runs
@@ -457,6 +545,25 @@ impl AgentService {
             session_id,
             status: "started".to_string(),
             replayed: false,
+        })
+    }
+
+    /// Registers one live SSE subscriber against an active run's handle and
+    /// returns the drop guard that tracks it. Returns `None` when the run's
+    /// handle is already released (terminal beyond TTL): a terminal run can
+    /// never be cancelled by a disconnect, so no guard is needed.
+    pub(crate) fn attach_subscriber(&self, run_id: &str) -> Option<SubscriberGuard> {
+        let handle = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .cloned()?;
+        handle.subscribers.lock().expect("subscriber lock").count += 1;
+        Some(SubscriberGuard {
+            handle,
+            armed: true,
         })
     }
 
@@ -483,6 +590,9 @@ impl AgentService {
             if let Some(run) = store.runs.get_mut(run_id) {
                 run.status = "stopping".to_string();
             }
+            // The typed reason is recorded before the request so any worker
+            // observing the cancellation commits exactly this reason.
+            *handle.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
             handle.cancel.request(CancellationReason::Requested);
             Some("stopping".to_string())
         } else {
@@ -504,13 +614,16 @@ impl AgentService {
             .cloned()
             .collect::<Vec<_>>();
         for handle in handles {
+            *handle.cancel_reason.lock().expect("cancel reason lock") = Some("resource_closed");
             handle.cancel.request(CancellationReason::ResourceClosed);
         }
     }
 
-    /// Marks a run terminal: releases the capacity permit and records the
-    /// terminal time for TTL retention. Called by the worker (or the bounded
-    /// terminal retry loop) after the one terminal commit.
+    /// Marks a run terminal: records the terminal time for TTL retention,
+    /// releases the capacity permit, and sets the atomic terminal flag the
+    /// subscriber drop guard consults before any client-disconnect
+    /// cancellation. Called by the worker (or the bounded terminal retry
+    /// loop) after the one terminal commit.
     pub fn mark_terminal(&self, run_id: &str) {
         if let Some(handle) = self
             .inner
@@ -520,6 +633,7 @@ impl AgentService {
             .get(run_id)
             .cloned()
         {
+            handle.terminal.store(true, Ordering::Release);
             *handle.terminal_at.lock().expect("terminal lock") = Some(Instant::now());
             handle.permit.lock().expect("permit lock").take();
         }
@@ -604,7 +718,8 @@ impl AgentService {
         let cancellation = handle.cancel.clone();
 
         if cancellation.requested().is_some() {
-            self.finish_cancelled(&run_id, "requested").await;
+            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
+                .await;
             return;
         }
 
@@ -686,8 +801,12 @@ impl AgentService {
                     }
                     vm_value_to_json(&value).to_string()
                 }
-                WorkerOutcome::Cancelled(reason) => {
-                    self.finish_cancelled(&run_id, reason).await;
+                WorkerOutcome::Cancelled(core_reason) => {
+                    // Prefer the typed gateway reason recorded on the handle
+                    // (stop/halt/client disconnect); the core-derived string
+                    // is the fallback for worker-requested cancellations.
+                    self.finish_cancelled(&run_id, handle_cancel_reason(&handle, core_reason))
+                        .await;
                     return;
                 }
                 WorkerOutcome::Failed(error) => {
@@ -700,7 +819,8 @@ impl AgentService {
         };
 
         if cancellation.requested().is_some() {
-            self.finish_cancelled(&run_id, "requested").await;
+            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
+                .await;
             return;
         }
 
@@ -733,8 +853,17 @@ impl AgentService {
                 }
                 TerminalOutcome::NotActive => {
                     // A stop landed between the worker check and this
-                    // commit; the typed cancellation path wins.
-                    self.finish_cancelled(run_id, "requested").await;
+                    // commit; the typed cancellation path wins, keeping the
+                    // exact reason recorded on the handle.
+                    let reason = self
+                        .inner
+                        .runs
+                        .lock()
+                        .expect("runs lock")
+                        .get(run_id)
+                        .map(|handle| handle_cancel_reason(handle, "requested"))
+                        .unwrap_or("requested");
+                    self.finish_cancelled(run_id, reason).await;
                     return;
                 }
                 TerminalOutcome::SessionMissing => {

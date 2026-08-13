@@ -3413,4 +3413,849 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
         .expect("compaction after commit");
     assert_eq!(committed_row["rows"][0][10], json!("committed"));
     let _ = std::fs::remove_file(&path);
+// ---------------------------------------------------------------------------
+// A7: bounded rate limiting and the client-disconnect policy, exercised over
+// a real Axum HTTP/SSE server (not router oneshot) with fixture RSS.
+// ---------------------------------------------------------------------------
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::{Duration, Instant};
+
+use rustscript_agent::config::{ClientDisconnectPolicy, RateLimitConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Real Axum server bound to the dual-stack IPv6 wildcard so tests can
+/// reach one listener from two distinct peer IPs (127.0.0.1 and ::1).
+struct GatewayServer {
+    addr: SocketAddr,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_gateway_server(state: AgentGatewayState) -> GatewayServer {
+    let listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0))
+        .await
+        .expect("bind dual-stack gateway listener");
+    let addr = listener.local_addr().expect("gateway listener address");
+    let app = build_agent_gateway_app(state);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("gateway server must run");
+    });
+    GatewayServer {
+        addr,
+        _shutdown: shutdown_tx,
+        _task: task,
+    }
+}
+
+/// Minimal raw HTTP/1.1 client over tokio TCP (no extra dependencies), with
+/// an incremental SSE reader that strips chunked framing so marker scans
+/// see the event stream exactly as the server wrote it. Dropping the client
+/// aborts the connection (the server notices on the next write).
+struct RawHttp {
+    stream: tokio::net::TcpStream,
+    /// Raw bytes received but not yet consumed (head or chunk framing).
+    buffer: Vec<u8>,
+    /// De-chunked SSE body bytes.
+    sse: Vec<u8>,
+    /// True once the final chunk (`0\r\n\r\n`) or EOF was seen.
+    sse_done: bool,
+}
+
+impl RawHttp {
+    async fn connect(addr: SocketAddr) -> Self {
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to gateway");
+        Self {
+            stream,
+            buffer: Vec::new(),
+            sse: Vec::new(),
+            sse_done: false,
+        }
+    }
+
+    async fn read_some(&mut self) -> usize {
+        let mut chunk = [0_u8; 8192];
+        let read = self
+            .stream
+            .read(&mut chunk)
+            .await
+            .expect("read gateway response");
+        self.buffer.extend_from_slice(&chunk[..read]);
+        read
+    }
+
+    fn sse_contains(&self, marker: &str) -> bool {
+        self.sse
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    }
+
+    /// One complete request/response exchange (Content-Length bodies).
+    async fn exchange(&mut self, head: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        self.stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write request");
+        let (status, headers) = self.read_head().await;
+        let length = headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while self.buffer.len() < length && self.read_some().await > 0 {}
+        let body = self.buffer.drain(..length.min(self.buffer.len())).collect();
+        (status, headers, body)
+    }
+
+    /// Sends a request and reads only the response head; the SSE body stays
+    /// in the buffer for incremental `read_until` scanning.
+    async fn open(&mut self, head: &str) -> (u16, Vec<(String, String)>) {
+        self.stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write request");
+        self.read_head().await
+    }
+
+    async fn read_head(&mut self) -> (u16, Vec<(String, String)>) {
+        loop {
+            if let Some(end) = self
+                .buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+            {
+                let head = String::from_utf8_lossy(&self.buffer[..end]).into_owned();
+                self.buffer.drain(..end + 4);
+                let mut lines = head.split("\r\n");
+                let status_line = lines.next().unwrap_or_default();
+                let status = status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let headers = lines
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(name, value)| {
+                        (name.trim().to_ascii_lowercase(), value.trim().to_string())
+                    })
+                    .collect();
+                return (status, headers);
+            }
+            if self.read_some().await == 0 {
+                panic!("gateway closed the connection before the response head");
+            }
+        }
+    }
+
+    /// Blocks until `marker` appears in the de-chunked SSE body, the stream
+    /// ends, or `timeout` elapses.
+    async fn read_until(&mut self, marker: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (consumed, finished) = decode_chunked(&self.buffer, &mut self.sse);
+            if consumed > 0 {
+                self.buffer.drain(..consumed);
+            }
+            if finished {
+                self.sse_done = true;
+            }
+            if self.sse_contains(marker) {
+                return true;
+            }
+            if self.sse_done {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match tokio::time::timeout(remaining, self.read_some()).await {
+                Ok(0) => {
+                    let (_, finished) = decode_chunked(&self.buffer, &mut self.sse);
+                    if finished {
+                        self.sse_done = true;
+                    }
+                    return self.sse_contains(marker);
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// Reads until the SSE stream ends (final chunk or EOF), bounded.
+    async fn drain_sse(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !self.sse_done {
+            let (consumed, finished) = decode_chunked(&self.buffer, &mut self.sse);
+            if consumed > 0 {
+                self.buffer.drain(..consumed);
+            }
+            if finished {
+                self.sse_done = true;
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, self.read_some()).await {
+                Ok(0) => self.sse_done = true,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn sse_text(&self) -> String {
+        String::from_utf8_lossy(&self.sse).into_owned()
+    }
+}
+
+/// Strips HTTP/1.1 chunked framing from `raw`, appending decoded bytes to
+/// `out`. Returns how many raw bytes were consumed and whether the final
+/// chunk was reached. Incomplete trailing frames are left in `raw` for the
+/// next read.
+fn decode_chunked(raw: &[u8], out: &mut Vec<u8>) -> (usize, bool) {
+    let mut pos = 0;
+    loop {
+        let Some(relative_end) = raw[pos..].windows(2).position(|window| window == b"\r\n") else {
+            return (pos, false);
+        };
+        let size_line = &raw[pos..pos + relative_end];
+        let Some(size) = std::str::from_utf8(size_line)
+            .ok()
+            .and_then(|line| usize::from_str_radix(line.trim(), 16).ok())
+        else {
+            return (pos, false);
+        };
+        pos += relative_end + 2;
+        if size == 0 {
+            if raw.len() < pos + 2 || &raw[pos..pos + 2] != b"\r\n" {
+                return (pos, false);
+            }
+            pos += 2;
+            return (pos, true);
+        }
+        if raw.len() < pos + size + 2 {
+            return (pos, false);
+        }
+        out.extend_from_slice(&raw[pos..pos + size]);
+        pos += size + 2;
+    }
+}
+
+fn http_head(method: &str, path: &str, body: Option<&str>, extra: &[(&str, &str)]) -> String {
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: gateway.test\r\n");
+    for (name, value) in extra {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    match body {
+        Some(body) => head.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )),
+        None => head.push_str("Content-Length: 0\r\n\r\n"),
+    }
+    head
+}
+
+/// One JSON request over a fresh real HTTP connection.
+async fn raw_json(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Value,
+    extra: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, Value) {
+    let mut client = RawHttp::connect(addr).await;
+    let (status, headers, bytes) = client
+        .exchange(&http_head(method, path, Some(&body.to_string()), extra))
+        .await;
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, headers, value)
+}
+
+/// Polls `/health/detailed` until `active_agents` reaches `expected`.
+async fn wait_for_active_agents(addr: SocketAddr, expected: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut client = RawHttp::connect(addr).await;
+        let (status, _, bytes) = client
+            .exchange(&http_head("GET", "/health/detailed", None, &[]))
+            .await;
+        assert_eq!(status, 200, "health endpoint must respond");
+        let health: Value = serde_json::from_slice(&bytes).expect("health JSON");
+        let active = health["active_agents"].as_u64().unwrap_or(0) as usize;
+        if active == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "active_agents never reached {expected} (last={active})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_rejects_with_429_retry_after_and_recovers_after_window() {
+    let state = AgentGatewayState::new(AgentGatewayConfig {
+        rate_limit: RateLimitConfig {
+            enabled: true,
+            ip_burst: 2,
+            account_burst: 2,
+            window: Duration::from_millis(200),
+            max_buckets: 64,
+        },
+        ..AgentGatewayConfig::default()
+    })
+    .expect("gateway config must validate");
+    let server = spawn_gateway_server(state).await;
+
+    let mut client = RawHttp::connect(server.addr).await;
+    let health = http_head("GET", "/health/detailed", None, &[]);
+    for _ in 0..2 {
+        let (status, _, _) = client.exchange(&health).await;
+        assert_eq!(status, 200, "requests inside the burst must pass");
+    }
+    let (status, headers, bytes) = client.exchange(&health).await;
+    assert_eq!(
+        status, 429,
+        "the burst-exceeding request must be rate limited"
+    );
+    let retry_after = headers
+        .iter()
+        .find(|(name, _)| name == "retry-after")
+        .expect("429 must carry a Retry-After header");
+    assert!(
+        retry_after.1.parse::<u64>().unwrap_or(0) >= 1,
+        "Retry-After must be at least 1 second"
+    );
+    let body: Value = serde_json::from_slice(&bytes).expect("429 body JSON");
+    assert_eq!(body["error"]["code"], "rate_limited");
+
+    // After the window the bucket refills (or the stale bucket is swept,
+    // which is semantically identical: a fresh bucket starts full).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, _, _) = client.exchange(&health).await;
+    assert_eq!(status, 200, "the bucket must recover after the window");
+}
+
+#[tokio::test]
+async fn rate_limit_isolates_accounts_from_ips_and_auth_failures_never_charge_accounts() {
+    let state = AgentGatewayState::new(AgentGatewayConfig {
+        bearer_token: Some("a7-secret".to_string()),
+        rate_limit: RateLimitConfig {
+            enabled: true,
+            // The IP dimension has headroom: any 429 below must come from
+            // the account dimension, and a 401 proves auth failure ordering.
+            ip_burst: 100,
+            account_burst: 2,
+            window: Duration::from_millis(200),
+            max_buckets: 64,
+        },
+        ..AgentGatewayConfig::default()
+    })
+    .expect("gateway config must validate");
+    let server = spawn_gateway_server(state).await;
+    let authorized = [("authorization", "Bearer a7-secret")];
+
+    // 1) An authenticated request consumes one account token.
+    let (status, _, _) = raw_json(
+        server.addr,
+        "GET",
+        "/health/detailed",
+        Value::Null,
+        &authorized,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // 2) An auth failure is 401 and must not consume the account bucket.
+    let (status, _, _) = raw_json(
+        server.addr,
+        "GET",
+        "/health/detailed",
+        Value::Null,
+        &[("authorization", "Bearer wrong")],
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "auth failures must be rejected as unauthorized, never rate limited"
+    );
+
+    // 3) The account still has its last token: this request must pass.
+    let (status, _, _) = raw_json(
+        server.addr,
+        "GET",
+        "/health/detailed",
+        Value::Null,
+        &authorized,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the failed auth must not have consumed the account bucket"
+    );
+
+    // 4) The account bucket is now exhausted while the IP bucket has
+    //    headroom: the 429 must come from the account dimension.
+    let (status, _, body) = raw_json(
+        server.addr,
+        "GET",
+        "/health/detailed",
+        Value::Null,
+        &authorized,
+    )
+    .await;
+    assert_eq!(
+        status, 429,
+        "the account bucket must be exhausted independently of the IP bucket"
+    );
+    assert_eq!(body["error"]["code"], "rate_limited");
+
+    // Window recovery restores the account dimension.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, _, _) = raw_json(
+        server.addr,
+        "GET",
+        "/health/detailed",
+        Value::Null,
+        &authorized,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the account bucket must recover after the window"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_isolates_peer_ips_on_one_listener() {
+    let state = AgentGatewayState::new(AgentGatewayConfig {
+        rate_limit: RateLimitConfig {
+            enabled: true,
+            ip_burst: 2,
+            account_burst: 100,
+            window: Duration::from_secs(60),
+            max_buckets: 64,
+        },
+        ..AgentGatewayConfig::default()
+    })
+    .expect("gateway config must validate");
+    let server = spawn_gateway_server(state).await;
+    let health = http_head("GET", "/health/detailed", None, &[]);
+
+    // One dual-stack listener, two distinct peer addresses.
+    let ipv4_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server.addr.port());
+    let ipv6_peer = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), server.addr.port());
+
+    let mut ipv4 = RawHttp::connect(ipv4_peer).await;
+    let (status, _, _) = ipv4.exchange(&health).await;
+    assert_eq!(status, 200, "first request from the IPv4 peer must pass");
+
+    let mut ipv6 = RawHttp::connect(ipv6_peer).await;
+    let (status, _, _) = ipv6.exchange(&health).await;
+    assert_eq!(status, 200, "a different peer IP must have its own bucket");
+
+    let (status, _, _) = ipv4.exchange(&health).await;
+    assert_eq!(status, 200, "the IPv4 burst is not yet exhausted");
+    let (status, _, _) = ipv4.exchange(&health).await;
+    assert_eq!(status, 429, "the exhausted IPv4 bucket must be rejected");
+    let (status, _, _) = ipv6.exchange(&health).await;
+    assert_eq!(
+        status, 200,
+        "the IPv6 bucket must be unaffected by IPv4 exhaustion"
+    );
+}
+
+#[tokio::test]
+async fn keep_running_default_survives_disconnect_and_events_replay_by_cursor() {
+    let (_, arrived_rx, release_tx, fixture, config, source) =
+        spawn_holding_run_env(|config| AgentGatewayConfig {
+            sse_keepalive_interval: Duration::from_millis(100),
+            ..config
+        });
+    let state =
+        AgentGatewayState::with_agent_source(config, source).expect("RSS source should compile");
+    let server = spawn_gateway_server(state).await;
+
+    let (status, _, session) = raw_json(
+        server.addr,
+        "POST",
+        "/api/sessions",
+        json!({"source": "a7"}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 201);
+    let session_id = session["session"]["id"].as_str().expect("session id");
+    let (status, _, run) = raw_json(
+        server.addr,
+        "POST",
+        "/v1/runs",
+        json!({"session_id": session_id, "input": "hold"}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 202);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    arrived_rx
+        .await
+        .expect("the run must reach the holding fixture");
+
+    // Subscribe over real SSE, then disconnect while the run is active.
+    let sse_path = format!("/v1/runs/{run_id}/events");
+    let mut subscriber = RawHttp::connect(server.addr).await;
+    let (status, _) = subscriber
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        subscriber
+            .read_until("event: run.started", Duration::from_secs(3))
+            .await,
+        "started event must stream"
+    );
+    drop(subscriber); // client disconnect
+
+    // Default policy keep-running: the run must still be active well past
+    // the disconnect-detection bound (one keep-alive interval).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_for_active_agents(server.addr, 1, Duration::from_secs(2)).await;
+
+    // Release the held HTTP call: the run completes on its own.
+    release_tx.send(()).expect("release the held HTTP call");
+    wait_for_active_agents(server.addr, 0, Duration::from_secs(5)).await;
+    fixture.join().expect("fixture thread");
+
+    // Cursor replay: after_seq=1 returns everything after run.started,
+    // including the terminal. No cancellation was requested.
+    let replay_path = format!("/v1/runs/{run_id}/events?after_seq=1");
+    let mut replay = RawHttp::connect(server.addr).await;
+    let (status, _) = replay
+        .open(&http_head(
+            "GET",
+            &replay_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        replay
+            .read_until("event: run.completed", Duration::from_secs(5))
+            .await,
+        "replayed terminal event"
+    );
+    replay.drain_sse(Duration::from_secs(2)).await;
+    let text = replay.sse_text();
+    assert!(
+        text.contains("event: run.completed"),
+        "the terminal must be replayable"
+    );
+    assert!(
+        !text.contains("event: run.started"),
+        "after_seq=1 must skip the started event"
+    );
+    assert!(
+        !text.contains("event: run.cancelled"),
+        "keep-running must not cancel on disconnect"
+    );
+    assert_eq!(
+        text.matches("event: run.completed").count(),
+        1,
+        "exactly one terminal"
+    );
+}
+
+#[tokio::test]
+async fn cancel_on_disconnect_cancels_when_last_subscriber_disconnects() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            client_disconnect_policy: ClientDisconnectPolicy::CancelOnDisconnect,
+            sse_keepalive_interval: Duration::from_millis(100),
+            ..AgentGatewayConfig::default()
+        },
+        include_str!("fixtures/gateway/cpu_loop.rss"),
+    )
+    .expect("RSS source should compile");
+    let server = spawn_gateway_server(state).await;
+
+    let (status, _, run) = raw_json(
+        server.addr,
+        "POST",
+        "/v1/runs",
+        json!({"input": "spin"}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 202);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    let sse_path = format!("/v1/runs/{run_id}/events");
+    let mut subscriber = RawHttp::connect(server.addr).await;
+    let (status, _) = subscriber
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        subscriber
+            .read_until("event: run.started", Duration::from_secs(3))
+            .await,
+        "started event must stream"
+    );
+    drop(subscriber);
+
+    // The last subscriber disconnected while the run was active: the typed
+    // client_disconnect cancellation must commit a terminal.
+    wait_for_active_agents(server.addr, 0, Duration::from_secs(5)).await;
+
+    let mut replay = RawHttp::connect(server.addr).await;
+    let (status, _) = replay
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        replay
+            .read_until("\"reason\":\"client_disconnect\"", Duration::from_secs(5))
+            .await,
+        "the persisted cancellation must carry the typed client_disconnect reason"
+    );
+    replay.drain_sse(Duration::from_secs(2)).await;
+    let text = replay.sse_text();
+    assert_eq!(
+        text.matches("event: run.cancelled").count(),
+        1,
+        "exactly one terminal"
+    );
+    assert!(
+        !text.contains("event: run.completed"),
+        "a disconnected run must not complete"
+    );
+    assert!(
+        text.contains("event: run.started"),
+        "full history must replay"
+    );
+}
+
+#[tokio::test]
+async fn multi_subscriber_and_reconnect_races_never_cancel_while_a_subscriber_remains() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            client_disconnect_policy: ClientDisconnectPolicy::CancelOnDisconnect,
+            sse_keepalive_interval: Duration::from_millis(100),
+            ..AgentGatewayConfig::default()
+        },
+        include_str!("fixtures/gateway/cpu_loop.rss"),
+    )
+    .expect("RSS source should compile");
+    let server = spawn_gateway_server(state).await;
+
+    let (status, _, run) = raw_json(
+        server.addr,
+        "POST",
+        "/v1/runs",
+        json!({"input": "spin"}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 202);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    let sse_path = format!("/v1/runs/{run_id}/events");
+
+    let mut first = RawHttp::connect(server.addr).await;
+    let (status, _) = first
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        first
+            .read_until("event: run.started", Duration::from_secs(3))
+            .await
+    );
+
+    let mut second = RawHttp::connect(server.addr).await;
+    let (status, _) = second
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        second
+            .read_until("event: run.started", Duration::from_secs(3))
+            .await
+    );
+
+    // One of two subscribers drops: the run must survive well past the
+    // disconnect-detection bound.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_active_agents(server.addr, 1, Duration::from_secs(2)).await;
+
+    // A reconnecting subscriber joins before the second one drops: still no
+    // cancellation.
+    let mut third = RawHttp::connect(server.addr).await;
+    let (status, _) = third
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        third
+            .read_until("event: run.started", Duration::from_secs(3))
+            .await
+    );
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_active_agents(server.addr, 1, Duration::from_secs(2)).await;
+
+    // The last subscriber leaves: the typed cancellation commits.
+    drop(third);
+    wait_for_active_agents(server.addr, 0, Duration::from_secs(5)).await;
+
+    let mut replay = RawHttp::connect(server.addr).await;
+    let (status, _) = replay
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        replay
+            .read_until("\"reason\":\"client_disconnect\"", Duration::from_secs(5))
+            .await,
+        "the last disconnect must commit the typed client_disconnect cancellation"
+    );
+    replay.drain_sse(Duration::from_secs(2)).await;
+    let text = replay.sse_text();
+    assert_eq!(
+        text.matches("event: run.cancelled").count(),
+        1,
+        "exactly one terminal"
+    );
+    assert!(!text.contains("event: run.completed"));
+}
+
+#[tokio::test]
+async fn normal_terminal_end_never_requests_client_disconnect_cancellation() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            client_disconnect_policy: ClientDisconnectPolicy::CancelOnDisconnect,
+            sse_keepalive_interval: Duration::from_millis(100),
+            ..AgentGatewayConfig::default()
+        },
+        include_str!("fixtures/gateway/complete_fast.rss"),
+    )
+    .expect("RSS source should compile");
+    let server = spawn_gateway_server(state).await;
+
+    let (status, _, run) = raw_json(
+        server.addr,
+        "POST",
+        "/v1/runs",
+        json!({"input": "fast"}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 202);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    // Subscribe and read through the terminal; the stream ends on its own.
+    let sse_path = format!("/v1/runs/{run_id}/events");
+    let mut subscriber = RawHttp::connect(server.addr).await;
+    let (status, _) = subscriber
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        subscriber
+            .read_until("event: run.completed", Duration::from_secs(5))
+            .await,
+        "the fast run must complete"
+    );
+    subscriber.drain_sse(Duration::from_secs(2)).await;
+    let text = subscriber.sse_text();
+    assert_eq!(
+        text.matches("event: run.completed").count(),
+        1,
+        "exactly one terminal"
+    );
+    assert!(
+        !text.contains("event: run.cancelled"),
+        "a normal terminal end must never request a cancellation"
+    );
+
+    // Replaying the same terminal (subscriber attaches after completion)
+    // must not request anything either.
+    wait_for_active_agents(server.addr, 0, Duration::from_secs(5)).await;
+    let mut replay = RawHttp::connect(server.addr).await;
+    let (status, _) = replay
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        replay
+            .read_until("event: run.completed", Duration::from_secs(5))
+            .await
+    );
+    replay.drain_sse(Duration::from_secs(2)).await;
+    let replayed = replay.sse_text();
+    assert_eq!(replayed.matches("event: run.completed").count(), 1);
+    assert!(!replayed.contains("event: run.cancelled"));
+    assert!(!replayed.contains("client_disconnect"));
 }

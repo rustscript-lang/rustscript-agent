@@ -1,0 +1,6 @@
+pub fn run(input: map) -> string {
+    while true {
+        1;
+    }
+    "unreachable";
+}
