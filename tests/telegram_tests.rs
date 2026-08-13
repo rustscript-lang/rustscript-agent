@@ -1139,6 +1139,80 @@ async fn adapter_resumes_undelivered_events_after_restart() {
 }
 
 #[tokio::test]
+async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
+    let (base, state) = spawn_fixture().await;
+    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
+    let (config, source) = holding_config_and_source(port);
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("resume-gate");
+
+    // Phase 1: the run parks inside an HTTP call after one delta.
+    let gateway = test_state(&source, &db, |_config| config.clone());
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "before")
+    })
+    .await;
+    adapter.shutdown().await;
+    drop(gateway);
+
+    // Phase 2: the same durable state restarts. The recovered (terminal)
+    // run's catch-up renderer must end as soon as it renders the terminal
+    // event and release the session gate; only then does the new message
+    // arrive, so it is admitted and completes without /new. The new run
+    // uses a source that completes on its own (the holding fixture already
+    // served its single connection to the phase-1 worker).
+    let restored = test_state(ECHO_SOURCE, &db, |config| config);
+    let adapter2 = spawn_adapter(restored.clone(), test_config(&base)).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.starts_with("[failed]"))
+    })
+    .await;
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "after restart"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert_eq!(
+        sends.iter().filter(|text| *text == "hello world").count(),
+        1,
+        "the new message must be admitted after the resume released the gate: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        1,
+        "the new run must complete: {sends:?}"
+    );
+    assert!(
+        !sends.iter().any(|text| text.contains("already active")),
+        "the gate must be released before the new message arrives: {sends:?}"
+    );
+    adapter2.shutdown().await;
+    let _ = release_tx.send(());
+    holding.join().expect("holding fixture");
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test]
 async fn adapter_stop_command_cancels_the_active_run() {
     let (base, state) = spawn_fixture().await;
     let (port, _arrived, release_tx, holding) = spawn_holding_fixture();

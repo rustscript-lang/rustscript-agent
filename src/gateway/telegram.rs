@@ -1620,11 +1620,15 @@ fn spawn_run_renderer(
     ));
 }
 
-/// One run's renderer: catch-up replay of undelivered retained events, then
-/// live delivery through the run's broadcast channel. The delivery cursor
-/// (typed `delivery.get`/`delivery.advance`) is advanced per event only
-/// after the Telegram API accepted the render, so restart resumes exactly
-/// where delivery stopped.
+/// One run's renderer: durable catch-up of undelivered retained events, then
+/// live delivery through the run's broadcast channel. The live receiver is
+/// attached BEFORE the catch-up replay, so no durable-before-visible event
+/// can fall into a gap between the two paths; the delivery cursor (typed
+/// `delivery.get`/`delivery.advance`) dedups both directions. The cursor is
+/// advanced per event only after the Telegram API accepted the render, so
+/// restart resumes exactly where delivery stopped. A terminal event ends
+/// the renderer immediately (no live subscription is kept for a finished
+/// run), which releases the session gate for the next admission.
 async fn run_renderer(
     state: AgentGatewayState,
     config: TelegramConfig,
@@ -1645,8 +1649,12 @@ async fn run_renderer(
     let mut renderer = EventRenderer::new();
     let mut last_edit = Instant::now();
 
+    // Attach the live receiver first: events broadcast while the replay
+    // below runs are buffered here, and the cursor skips them afterwards.
+    let receiver = subscribe_to_run(&state, &run_id);
+
     // Catch-up: every retained event with seq > cursor (bounded by event
-    // retention) is rendered before any live event.
+    // retention) is rendered before any live event is considered.
     let events = replay_run_events(&state, &run_id, cursor + 1).await;
     for (seq, event_type, data) in events {
         if seq <= cursor {
@@ -1671,19 +1679,61 @@ async fn run_renderer(
         {
             return;
         }
+        if is_terminal_event_type(&event_type) {
+            // The run is finished: render the final flush and end without
+            // ever subscribing to a terminal run's channel (the gate is
+            // released here).
+            flush_renderer(&api, &mut renderer, chat_id, thread_id).await;
+            return;
+        }
     }
 
-    // Live: subscribe before catching up so no durable-before-visible event
-    // can be missed; events rendered by the catch-up are skipped below.
-    let receiver = subscribe_to_run(&state, &run_id);
-    if let Some(mut receiver) = receiver {
-        loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    if (event.seq as i64) <= cursor {
-                        if event.is_terminal() {
-                            break;
-                        }
+    // Live: drain the receiver, skipping events already rendered by the
+    // catch-up (seq <= cursor). A terminal event ends the loop.
+    let mut receiver = match receiver {
+        Some(receiver) => receiver,
+        None => return,
+    };
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                if (event.seq as i64) <= cursor {
+                    if event.is_terminal() {
+                        break;
+                    }
+                    continue;
+                }
+                if !render_event(
+                    &api,
+                    &mut renderer,
+                    &mut last_edit,
+                    &config,
+                    chat_id,
+                    thread_id,
+                    event.seq as i64,
+                    &event.event,
+                    &event.data,
+                    &mut cursor,
+                    &state,
+                    &session_id,
+                    &consumer,
+                )
+                .await
+                {
+                    break;
+                }
+                if event.is_terminal() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // The live buffer overflowed: re-sync from the durable
+                // cursor, then re-subscribe.
+                let current = load_cursor(&state, &session_id, &consumer).await;
+                let events = replay_run_events(&state, &run_id, current + 1).await;
+                let mut terminal = false;
+                for (seq, event_type, data) in events {
+                    if seq <= current {
                         continue;
                     }
                     if !render_event(
@@ -1693,9 +1743,9 @@ async fn run_renderer(
                         &config,
                         chat_id,
                         thread_id,
-                        event.seq as i64,
-                        &event.event,
-                        &event.data,
+                        seq,
+                        &event_type,
+                        &data,
                         &mut cursor,
                         &state,
                         &session_id,
@@ -1703,75 +1753,60 @@ async fn run_renderer(
                     )
                     .await
                     {
+                        terminal = true;
                         break;
                     }
-                    if event.is_terminal() {
+                    if is_terminal_event_type(&event_type) {
+                        terminal = true;
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // The live buffer overflowed: re-sync from the durable
-                    // cursor, then re-subscribe.
-                    let current = load_cursor(&state, &session_id, &consumer).await;
-                    let events = replay_run_events(&state, &run_id, current + 1).await;
-                    for (seq, event_type, data) in events {
-                        if seq <= current {
-                            continue;
-                        }
-                        if !render_event(
-                            &api,
-                            &mut renderer,
-                            &mut last_edit,
-                            &config,
-                            chat_id,
-                            thread_id,
-                            seq,
-                            &event_type,
-                            &data,
-                            &mut cursor,
-                            &state,
-                            &session_id,
-                            &consumer,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    match subscribe_to_run(&state, &run_id) {
-                        Some(next) => receiver = next,
-                        None => break,
-                    }
+                if terminal {
+                    break;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                match subscribe_to_run(&state, &run_id) {
+                    Some(next) => receiver = next,
+                    None => break,
+                }
             }
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 
     // Final flush: any text accumulated but never edited is finalized.
+    flush_renderer(&api, &mut renderer, chat_id, thread_id).await;
+}
+
+/// Sends every pending render action once (the final flush after a terminal
+/// event); a failed send stops the flush (the event stays undelivered for a
+/// later catch-up).
+async fn flush_renderer(
+    api: &TelegramApi,
+    renderer: &mut EventRenderer,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) {
     for action in renderer.flush() {
-        match action {
-            RenderAction::Send { text } => {
-                if api.send_message(chat_id, thread_id, &text).await.is_err() {
-                    break;
-                }
-            }
-            RenderAction::SendDelta { text } => {
-                if api.send_message(chat_id, thread_id, &text).await.is_err() {
-                    break;
-                }
-            }
-            RenderAction::Edit { message_id, text } => {
-                if api
-                    .edit_message_text(chat_id, message_id, &text)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
+        let result = match action {
+            RenderAction::Send { text } | RenderAction::SendDelta { text } => api
+                .send_message(chat_id, thread_id, &text)
+                .await
+                .map(|_| ()),
+            RenderAction::Edit { message_id, text } => api
+                .edit_message_text(chat_id, message_id, &text)
+                .await
+                .map(|_| ()),
+        };
+        if result.is_err() {
+            break;
         }
     }
+}
+
+/// True for the canonical terminal event types (replay rows carry only the
+/// event type string, unlike live [`GatewayEvent`]s).
+fn is_terminal_event_type(event_type: &str) -> bool {
+    matches!(event_type, "run.completed" | "run.cancelled" | "run.failed")
 }
 
 /// Renders one canonical event into Bot API calls; the delivery cursor is
