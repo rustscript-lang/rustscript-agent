@@ -1,3 +1,6 @@
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
@@ -15,6 +18,44 @@ fn gateway_db_path(label: &str) -> std::path::PathBuf {
     let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/gateway-tests");
     std::fs::create_dir_all(&root).expect("gateway test root should be created");
     root.join(format!("{label}-{}.db", Uuid::new_v4()))
+}
+
+/// Accepts one HTTP request and holds the response until the test releases
+/// it, so a scripted run can be parked deterministically before its terminal
+/// commit. The arrival signal is a Tokio oneshot so the test can await it
+/// without blocking the current-thread runtime (which must keep polling the
+/// worker task).
+fn spawn_holding_fixture() -> (
+    u16,
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept fixture request");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).expect("read fixture request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = arrived_tx.send(());
+        release_rx.recv().expect("wait for release");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Agent: fixture\r\n\r\nagent-ok")
+            .expect("write fixture response");
+    });
+    (port, arrived_rx, release_tx, handle)
 }
 
 async fn json_request(
@@ -2682,4 +2723,79 @@ async fn failed_replay_persist_keeps_the_original_idempotency_record() {
 
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
     std::fs::remove_file(backup).expect("temporary SQLite backup should be removed");
+}
+
+#[tokio::test]
+async fn failed_terminal_persist_never_publishes_or_marks_the_terminal() {
+    let (port, arrived_rx, release_tx, fixture) = spawn_holding_fixture();
+    let mut http = rustscript_vm::HttpConfig::default();
+    http.allowed_hosts = vec!["127.0.0.1".to_string()];
+    http.allowed_schemes = vec!["http".to_string()];
+    http.allowed_ports = vec![port];
+    http.allow_private_ips = true;
+    let path =
+        std::env::temp_dir().join(format!("rustscript-agent-terminal-{}.db", Uuid::new_v4()));
+    let source = format!(
+        r#"
+        use http;
+        pub fn run(input: map) -> string {{
+            http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+            "done";
+        }}
+        "#
+    );
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            http,
+            ..AgentGatewayConfig::default()
+        },
+        source,
+        &path,
+    )
+    .expect("SQLite state should open");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "hold-terminal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    // The worker is now parked inside the scripted HTTP call, before its
+    // terminal commit. Awaiting (instead of blocking) keeps the current-thread
+    // runtime polling the worker task.
+    tokio::time::timeout(std::time::Duration::from_secs(15), arrived_rx)
+        .await
+        .expect("the worker must reach the held HTTP call")
+        .expect("fixture arrival signal");
+
+    // Break the durable store: SQLite cannot open a directory.
+    std::fs::remove_file(&path).expect("remove SQLite state");
+    std::fs::create_dir(&path).expect("replace SQLite state with a directory");
+
+    // Release the script: the terminal commit cannot be persisted, so it
+    // must not publish the terminal and must not mark the run terminal.
+    release_tx.send(()).expect("release the held HTTP call");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let handle = service
+        .handle(&run_id)
+        .expect("run handle must still be retained");
+    assert!(
+        !handle.is_terminal(),
+        "a failed terminal persist must not mark the run terminal"
+    );
+    let status = service.stop(&run_id).expect("run handle must still exist");
+    assert_eq!(
+        status, "stopping",
+        "a failed terminal persist must leave the run active, not terminal"
+    );
+
+    fixture.join().expect("fixture thread");
+    std::fs::remove_dir(&path).expect("remove SQLite directory");
 }
