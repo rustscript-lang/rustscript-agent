@@ -777,7 +777,7 @@ struct AdapterRuntime {
     /// Per-session reset epochs: a renderer captures the epoch at spawn and
     /// aborts once `/new` bumps it, so an old renderer can never output
     /// into a recreated session.
-    epochs: Arc<Mutex<HashMap<String, u64>>>,
+    epochs: Arc<Mutex<EpochState>>,
     /// Metric: delivery cursor advance failures (at-least-once delivery
     /// hook — see [`advance_cursor`]).
     advance_failures: Arc<AtomicU64>,
@@ -943,7 +943,7 @@ async fn run_poller(
         allowlist: Allowlist::from_config(&config),
         dedup: DedupWindows::new(config.dedup_capacity),
         active_runs: Arc::new(Mutex::new(HashMap::new())),
-        epochs: Arc::new(Mutex::new(HashMap::new())),
+        epochs: Arc::new(Mutex::new(EpochState::default())),
         advance_failures,
     };
     let poll_timeout_secs = config.poll_timeout.as_secs().max(1);
@@ -956,7 +956,38 @@ async fn run_poller(
     // so old updates are never replayed into sessions. Disable
     // drop_pending_updates to process them.
     if offset.is_none() && config.drop_pending_updates {
-        drop_pending_updates(&api, &stop).await;
+        match drop_pending_updates(&api, &stop).await {
+            DrainOutcome::Drained(watermark) => {
+                // Fail-closed: the drained watermark is persisted BEFORE
+                // anything is processed, so a crash can never re-fetch and
+                // replay the drained queue.
+                if let Err(error) = persist_offset(&state, &account, watermark).await {
+                    tracing::error!(
+                        "telegram pending-update drain watermark could not be persisted: {error}; \
+                         the adapter is disabled for this process (fail-closed)"
+                    );
+                    return;
+                }
+                offset = Some(watermark);
+            }
+            DrainOutcome::Empty => {
+                // Nothing was queued; no watermark to confirm. Staying at
+                // None keeps the first-boot semantics for the next restart.
+            }
+            DrainOutcome::Failed => {
+                // Fail-closed: a drain that could not confirm the pending
+                // queue must never fall through to the normal poll (which
+                // would process exactly those unconfirmed updates). The
+                // adapter degrades for this process and the next boot
+                // re-attempts the drain.
+                tracing::error!(
+                    "telegram pending-update drain failed after bounded retries; \
+                     the adapter is disabled for this process (fail-closed: pending updates are \
+                     never processed unconfirmed)"
+                );
+                return;
+            }
+        }
     }
     let mut unauthorized_streak = 0usize;
     loop {
@@ -981,8 +1012,12 @@ async fn run_poller(
                     offset = Some(update.update_id + 1);
                 }
                 // Persist after every batch so a crash re-fetches at most the
-                // last batch (message-level idempotency covers the rest).
-                if let Err(error) = persist_offset(&state, &account, offset.unwrap_or(0)).await {
+                // last batch (message-level idempotency covers the rest). A
+                // first boot that never established an offset persists
+                // nothing (fail-closed first-boot semantics).
+                if let Some(offset) = offset
+                    && let Err(error) = persist_offset(&state, &account, offset).await
+                {
                     tracing::warn!("telegram poll offset could not be persisted: {error}");
                 }
                 // Pace poll rounds even when the fixture responds instantly;
@@ -1027,50 +1062,165 @@ async fn run_poller(
         }
     }
     // Final persist on graceful stop: no update older than this offset can
-    // be re-fetched after restart.
-    if let Err(error) = persist_offset(&state, &account, offset.unwrap_or(0)).await {
+    // be re-fetched after restart. Only a real offset is written: a first
+    // boot that never established one (for example a failed drain) writes
+    // nothing, so the next boot re-runs the drain instead of bypassing it.
+    if let Some(offset) = offset
+        && let Err(error) = persist_offset(&state, &account, offset).await
+    {
         tracing::warn!("telegram poll offset could not be persisted on stop: {error}");
     }
 }
 
+/// Outcome of one first-boot pending-update drain.
+enum DrainOutcome {
+    /// The queue was drained; `watermark` is the next offset to poll from
+    /// and must be persisted before anything is processed.
+    Drained(i64),
+    /// The queue was empty; there is no watermark to confirm.
+    Empty,
+    /// Every bounded attempt failed; the adapter must not process updates
+    /// it could not confirm (fail-closed).
+    Failed,
+}
+
+/// Bounds for the first-boot drain: at most [`DRAIN_ROUND_BOUND`] rounds,
+/// each with at most [`DRAIN_ATTEMPTS_PER_ROUND`] attempts (the client adds
+/// its own bounded 5xx budget per attempt).
+const DRAIN_ROUND_BOUND: usize = 100;
+const DRAIN_ATTEMPTS_PER_ROUND: usize = 3;
+
 /// Drains the pending-update queue on first boot without processing it
 /// (bounded rounds; the offset advances past every drained update so they
-/// are never re-fetched).
-async fn drop_pending_updates(api: &TelegramApi, stop: &watch::Receiver<bool>) {
+/// are never re-fetched). Fail-closed: a round that fails after its bounded
+/// attempts returns [`DrainOutcome::Failed`] so the poller never falls
+/// through to processing the unconfirmed queue.
+async fn drop_pending_updates(api: &TelegramApi, stop: &watch::Receiver<bool>) -> DrainOutcome {
     let mut drain_offset = None;
-    for _round in 0..100 {
+    for _round in 0..DRAIN_ROUND_BOUND {
         if *stop.borrow() {
-            return;
+            return DrainOutcome::Empty;
         }
-        match api.get_updates(drain_offset, 0, 50).await {
-            Ok(updates) => {
-                let Some(last) = updates.last() else {
-                    return;
-                };
-                drain_offset = Some(last.update_id + 1);
+        let mut round_ok = false;
+        for attempt in 0..DRAIN_ATTEMPTS_PER_ROUND {
+            if *stop.borrow() {
+                return DrainOutcome::Empty;
             }
-            Err(error) => {
-                tracing::warn!("telegram pending-update drain failed: {error}");
-                return;
+            match api.get_updates(drain_offset, 0, 50).await {
+                Ok(updates) => {
+                    if let Some(last) = updates.last() {
+                        drain_offset = Some(last.update_id + 1);
+                    } else {
+                        // The queue is empty: nothing further to confirm.
+                        return match drain_offset {
+                            Some(watermark) => DrainOutcome::Drained(watermark),
+                            None => DrainOutcome::Empty,
+                        };
+                    }
+                    round_ok = true;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "telegram pending-update drain attempt {} failed: {error}",
+                        attempt + 1
+                    );
+                    if attempt + 1 < DRAIN_ATTEMPTS_PER_ROUND {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
             }
+        }
+        if !round_ok {
+            return DrainOutcome::Failed;
         }
     }
     tracing::warn!("telegram pending-update drain hit its round bound");
+    drain_offset
+        .map(DrainOutcome::Drained)
+        .unwrap_or(DrainOutcome::Empty)
+}
+
+/// Per-session reset-epoch state with a live-renderer reference count.
+///
+/// `/new` bumps the epoch; every renderer captures the epoch at spawn and
+/// releases its reference when it ends. The entry is removed when the last
+/// renderer of a session ends (or when a `/new` finds no live renderer), so
+/// the map stays bounded while generations stay monotonic for every
+/// renderer that could still be alive: the entry exists whenever any
+/// renderer holds a reference, and a bump under the same lock always moves
+/// the value past every captured epoch.
+#[derive(Default)]
+struct EpochState {
+    epochs: HashMap<String, EpochEntry>,
+}
+
+#[derive(Default)]
+struct EpochEntry {
+    epoch: u64,
+    renderers: usize,
+}
+
+/// Captures the session's current reset epoch and holds a renderer
+/// reference (released by [`epoch_release`] when the renderer ends).
+fn epoch_capture(epochs: &Arc<Mutex<EpochState>>, session_id: &str) -> u64 {
+    let mut state = epochs.lock().expect("epochs lock");
+    let entry = state.epochs.entry(session_id.to_string()).or_default();
+    entry.renderers += 1;
+    entry.epoch
+}
+
+/// Releases one renderer reference; the session entry is removed when the
+/// last renderer ends (bounded epoch state).
+fn epoch_release(epochs: &Arc<Mutex<EpochState>>, session_id: &str) {
+    let mut state = epochs.lock().expect("epochs lock");
+    let remove = match state.epochs.get_mut(session_id) {
+        Some(entry) => {
+            entry.renderers = entry.renderers.saturating_sub(1);
+            entry.renderers == 0
+        }
+        None => false,
+    };
+    if remove {
+        state.epochs.remove(session_id);
+    }
+}
+
+/// Bumps the session's reset epoch. When no renderer is alive the bumped
+/// entry has nothing left to protect and is dropped immediately (bounded
+/// state); while any renderer holds a reference the entry stays, so the
+/// bump is monotonic against every captured epoch.
+fn epoch_bump(epochs: &Arc<Mutex<EpochState>>, session_id: &str) {
+    let mut state = epochs.lock().expect("epochs lock");
+    let entry = state.epochs.entry(session_id.to_string()).or_default();
+    entry.epoch += 1;
+    if entry.renderers == 0 {
+        state.epochs.remove(session_id);
+    }
 }
 
 /// The poller's per-session active-run gate with RAII release: the entry is
-/// removed on every exit path, including a panicking renderer task.
+/// removed on every exit path, including a panicking renderer task. The
+/// removal is a compare-and-remove of THIS renderer's own run id, so a
+/// late drop (for example an old renderer draining after `/new`) can never
+/// delete the gate of a later run in the same session.
 struct GateGuard {
     active_runs: Arc<Mutex<HashMap<String, String>>>,
+    epochs: Arc<Mutex<EpochState>>,
     session_id: String,
+    run_id: String,
 }
 
 impl Drop for GateGuard {
     fn drop(&mut self) {
-        self.active_runs
-            .lock()
-            .expect("active runs lock")
-            .remove(&self.session_id);
+        let mut runs = self.active_runs.lock().expect("active runs lock");
+        if runs.get(&self.session_id).map(String::as_str) == Some(self.run_id.as_str()) {
+            runs.remove(&self.session_id);
+        }
+        drop(runs);
+        // The renderer ended: release its epoch reference (the session
+        // entry is removed when the last renderer ends).
+        epoch_release(&self.epochs, &self.session_id);
     }
 }
 
@@ -1359,12 +1509,7 @@ async fn cmd_new(
     // 2. Invalidate any surviving old renderer: the epoch check aborts its
     //    in-flight output (including the final flush), so nothing from the
     //    old run can land in the recreated session.
-    *runtime
-        .epochs
-        .lock()
-        .expect("epochs lock")
-        .entry(session_id.to_string())
-        .or_insert(0) += 1;
+    epoch_bump(&runtime.epochs, session_id);
 
     // 3. Cascade delete + recreate (same deterministic session id).
     let state = runtime.state.clone();
@@ -1795,18 +1940,16 @@ fn spawn_run_renderer(
     chat_id: i64,
     thread_id: Option<i64>,
     active_runs: Arc<Mutex<HashMap<String, String>>>,
-    epochs: Arc<Mutex<HashMap<String, u64>>>,
+    epochs: Arc<Mutex<EpochState>>,
     advance_failures: Arc<AtomicU64>,
 ) {
     let state = state.clone();
     let config = config.clone();
     let session_id = session_id.to_string();
-    let epoch = epochs
-        .lock()
-        .expect("epochs lock")
-        .get(&session_id)
-        .copied()
-        .unwrap_or(0);
+    // Capture the session's current reset epoch and hold a renderer
+    // reference: the entry stays alive while this renderer is live, so
+    // `/new` can always bump past this captured value.
+    let epoch = epoch_capture(&epochs, &session_id);
     tokio::spawn(run_renderer(
         state,
         config,
@@ -1839,15 +1982,19 @@ async fn run_renderer(
     chat_id: i64,
     thread_id: Option<i64>,
     active_runs: Arc<Mutex<HashMap<String, String>>>,
-    epochs: Arc<Mutex<HashMap<String, u64>>>,
+    epochs: Arc<Mutex<EpochState>>,
     epoch: u64,
     advance_failures: Arc<AtomicU64>,
 ) {
     let api = TelegramApi::new(&config);
-    // RAII gate: released on every exit path, including panics.
+    // RAII gate: released on every exit path, including panics. The drop is
+    // a compare-and-remove of this run's own id and releases the renderer's
+    // epoch reference.
     let _gate = GateGuard {
         active_runs,
+        epochs: epochs.clone(),
         session_id: session_id.clone(),
+        run_id: run_id.clone(),
     };
     let consumer = run_consumer(&run_id);
     let mut cursor = load_cursor(&state, &session_id, &consumer).await;
@@ -2015,22 +2162,26 @@ async fn run_renderer(
 /// event); a failed send stops the flush (the event stays undelivered for a
 /// later catch-up). Aborts immediately when the session's reset epoch no
 /// longer matches the renderer's captured epoch (the old run's output must
-/// never reach a recreated session).
+/// never reach a recreated session): the epoch is checked before EVERY
+/// action and again after every network return, so a `/new` that bumps the
+/// epoch while an action is in flight stops every subsequent action.
 #[allow(clippy::too_many_arguments)]
 async fn flush_renderer(
     api: &TelegramApi,
     renderer: &mut EventRenderer,
     chat_id: i64,
     thread_id: Option<i64>,
-    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    epochs: &Arc<Mutex<EpochState>>,
     session_id: &str,
     epoch: u64,
     _advance_failures: &Arc<AtomicU64>,
 ) {
-    if !epoch_current(epochs, session_id, epoch) {
-        return;
-    }
     for action in renderer.flush() {
+        // Before the action: the session may have been reset while this
+        // flush was queued.
+        if !epoch_current(epochs, session_id, epoch) {
+            return;
+        }
         let result = match action {
             RenderAction::Send { text } | RenderAction::SendDelta { text } => api
                 .send_message(chat_id, thread_id, &text)
@@ -2041,6 +2192,11 @@ async fn flush_renderer(
                 .await
                 .map(|_| ()),
         };
+        // After the network returned: a bump that landed mid-flight stops
+        // the flush here; the in-flight action itself cannot be recalled.
+        if !epoch_current(epochs, session_id, epoch) {
+            return;
+        }
         if result.is_err() {
             break;
         }
@@ -2050,12 +2206,13 @@ async fn flush_renderer(
 /// True when the session's current reset epoch still matches the renderer's
 /// captured epoch (false after `/new` bumped it). A session without any
 /// entry is epoch 0, matching the renderer's capture default.
-fn epoch_current(epochs: &Arc<Mutex<HashMap<String, u64>>>, session_id: &str, epoch: u64) -> bool {
+fn epoch_current(epochs: &Arc<Mutex<EpochState>>, session_id: &str, epoch: u64) -> bool {
     epochs
         .lock()
         .expect("epochs lock")
+        .epochs
         .get(session_id)
-        .copied()
+        .map(|entry| entry.epoch)
         .unwrap_or(0)
         == epoch
 }
@@ -2070,7 +2227,9 @@ fn is_terminal_event_type(event_type: &str) -> bool {
 /// advanced only after every action succeeded. Returns false when delivery
 /// failed (the event stays undelivered for a later catch-up) or when the
 /// session's reset epoch no longer matches (old-run output must never reach
-/// a recreated session).
+/// a recreated session). The epoch is checked before EVERY action and again
+/// after every network return, so a `/new` that bumps the epoch while an
+/// action is in flight stops every subsequent action of this event.
 #[allow(clippy::too_many_arguments)]
 async fn render_event(
     api: &TelegramApi,
@@ -2086,15 +2245,17 @@ async fn render_event(
     state: &AgentGatewayState,
     session_id: &str,
     consumer: &str,
-    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    epochs: &Arc<Mutex<EpochState>>,
     epoch: u64,
     advance_failures: &Arc<AtomicU64>,
 ) -> bool {
-    if !epoch_current(epochs, session_id, epoch) {
-        return false;
-    }
     let throttle_edits = event_type == "model.delta";
     for action in renderer.on_event(event_type, data) {
+        // Before the action: the session may have been reset while this
+        // event was queued.
+        if !epoch_current(epochs, session_id, epoch) {
+            return false;
+        }
         let result = match action {
             // Status lines never claim the delta edit target: only delta
             // sends report their reply id via note_sent.
@@ -2127,6 +2288,12 @@ async fn render_event(
                 }
             }
         };
+        // After the network returned: a bump that landed mid-flight stops
+        // the event here (the in-flight action itself cannot be recalled);
+        // the cursor is never advanced for a stale event.
+        if !epoch_current(epochs, session_id, epoch) {
+            return false;
+        }
         if let Err(error) = result {
             // The error text never contains the token (the client redacts
             // URLs and the token is not part of any error payload).

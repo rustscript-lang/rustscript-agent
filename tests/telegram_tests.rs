@@ -61,6 +61,23 @@ pub struct FixtureState {
     /// When set, every Bot API method responds with a large chunked body
     /// (used to exercise the client's bounded response cap).
     pub huge_chunked: Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot deterministic delivery barrier: the first `sendMessage`
+    /// whose text starts with the armed prefix is held at the fixture (the
+    /// request is recorded, the response is delayed) until the paired
+    /// oneshot sender is released. Tests use this to interleave reset
+    /// epochs with in-flight renderer sends without wall-clock races.
+    pub hold_first_send_matching: Arc<Mutex<Option<SendHold>>>,
+}
+
+/// One armed send hold: the prefix to match and the release receiver.
+type SendHold = (String, tokio::sync::oneshot::Receiver<()>);
+
+/// Arms the one-shot send barrier; returns the release handle.
+fn hold_first_send(state: &FixtureState, prefix: &str) -> tokio::sync::oneshot::Sender<()> {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *state.hold_first_send_matching.lock().expect("hold lock") =
+        Some((prefix.to_string(), release_rx));
+    release_tx
 }
 
 impl FixtureState {
@@ -204,6 +221,29 @@ async fn bot_api_handler(
         }
         "sendMessage" | "editMessageText" => {
             let message_id = state.next_message_id.fetch_add(1, Ordering::SeqCst) + 1;
+            // One-shot deterministic barrier: the first sendMessage whose
+            // text starts with the armed prefix waits for the test's
+            // release before the response is written (the request itself is
+            // already recorded above).
+            if method == "sendMessage" {
+                let hold = {
+                    let mut holds = state
+                        .hold_first_send_matching
+                        .lock()
+                        .expect("hold lock");
+                    let text = parsed
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    match holds.as_ref() {
+                        Some((prefix, _)) if text.starts_with(prefix) => holds.take(),
+                        _ => None,
+                    }
+                };
+                if let Some((_prefix, receiver)) = hold {
+                    let _ = receiver.await;
+                }
+            }
             fixture_ok_result(json!({
                 "message_id": message_id,
                 "date": 1700000000,
@@ -501,6 +541,18 @@ async fn client_requests_carry_the_bot_token_path() {
             token, "123456:TEST-SECRET-TOKEN",
             "every request must hit the /bot<token>/<method> path"
         );
+    }
+    // The token must never leak into the query string: the api_base
+    // validation rejects query-bearing bases and the client builds the URL
+    // with the token only in the path segment.
+    let requests = state.requests.lock().expect("requests lock");
+    for request in requests.iter() {
+        for (key, value) in request.query.iter() {
+            assert!(
+                !key.contains("TEST-SECRET-TOKEN") && !value.contains("TEST-SECRET-TOKEN"),
+                "the bot token must never appear in a query parameter: {key}={value}"
+            );
+        }
     }
 }
 
@@ -1094,7 +1146,7 @@ fn spawn_holding_fixture() -> (
     (port, arrived_rx, release_tx, handle)
 }
 
-fn holding_config_and_source(port: u16) -> (AgentGatewayConfig, String) {
+fn holding_config(port: u16) -> AgentGatewayConfig {
     let http = rustscript_vm::HttpConfig {
         allowed_hosts: vec!["127.0.0.1".to_string()],
         allowed_schemes: vec!["http".to_string()],
@@ -1102,6 +1154,13 @@ fn holding_config_and_source(port: u16) -> (AgentGatewayConfig, String) {
         allow_private_ips: true,
         ..rustscript_vm::HttpConfig::default()
     };
+    AgentGatewayConfig {
+        http,
+        ..AgentGatewayConfig::default()
+    }
+}
+
+fn holding_config_and_source(port: u16) -> (AgentGatewayConfig, String) {
     let source = format!(
         r#"
         use http;
@@ -1113,56 +1172,175 @@ fn holding_config_and_source(port: u16) -> (AgentGatewayConfig, String) {
         }}
         "#
     );
-    (
-        AgentGatewayConfig {
-            http,
-            ..AgentGatewayConfig::default()
-        },
-        source,
+    (holding_config(port), source)
+}
+
+/// Source whose runs echo the input text and park in a holding HTTP call
+/// only for the `second` message, so a later run on the same gateway can
+/// complete on its own.
+fn park_on_second_source(port: u16) -> String {
+    format!(
+        r#"
+        use http;
+        use stream;
+        pub fn run(input: map) -> string {{
+            let text: string = input["input"];
+            stream::emit({{"type": "model.delta", "delta": text}});
+            if text == "second" {{
+                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+            }}
+            "ok";
+        }}
+        "#
     )
 }
+
+/// Source that emits one >2×4096-UTF-16 delta, so the renderer splits it
+/// into three send chunks: `A`×4096, `B`×4096, and a trailing `BC`.
+fn chunked_delta_source() -> String {
+    let delta = format!("{}B{}C", "A".repeat(4096), "B".repeat(4096));
+    format!(
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {{
+            stream::emit({{"type": "model.delta", "delta": "{delta}"}});
+            "ok";
+        }}
+        "#
+    )
+}
+
+/// Source that parks the first run (input `start`) in a pure CPU loop; a
+/// later run on the same gateway completes on its own. The CPU loop is
+/// interrupted by `/new`'s typed cancellation (epoch watcher), so the
+/// cancel path is real: nothing external releases the run.
+const CANCEL_ON_START_SOURCE: &str = r#"
+use stream;
+pub fn run(input: map) -> string {
+    let text: string = input["input"];
+    stream::emit({"type": "model.delta", "delta": "before"});
+    if text == "start" {
+        while true {
+            1;
+        }
+    }
+    "ok";
+}
+"#;
 
 #[tokio::test]
 async fn adapter_resumes_undelivered_events_after_restart() {
     let (base, state) = spawn_fixture().await;
-    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
-    let (config, source) = holding_config_and_source(port);
+    // Deterministic delivery barrier: the phase-1 renderer's first send is
+    // held at the fixture, so the run's terminal commits durably while the
+    // delivery cursor still lags behind it. No wall-clock HTTP timeout is
+    // involved anywhere in this test.
+    let release = hold_first_send(&state, "hello world");
     push_update(&state, fixture_json("updates_dm.json"));
     let db = telegram_db_path("resume");
 
-    // Phase 1: the run emits one delta and parks inside an HTTP call.
-    let gateway = test_state(&source, &db, |_config| config.clone());
+    // Phase 1: the run completes durably (terminal events retained) but the
+    // renderer is blocked before its first send, so the cursor never
+    // advances and the terminal is genuinely undelivered at shutdown.
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
-        state.sent_texts().iter().any(|text| text == "before")
+        // The blocked request is recorded on arrival, so this is the
+        // deterministic signal that the barrier is armed.
+        state.sent_texts().iter().any(|text| text == "hello world")
+    })
+    .await;
+    // Deterministic sync on the durable terminal: the assistant message is
+    // committed atomically with run.completed (the session's last_message_seq
+    // advances past zero only at that commit).
+    let persistence = gateway.persistence().expect("persistence");
+    wait_until(std::time::Duration::from_secs(15), || {
+        persistence
+            .session_get("telegram:fixture_bot:555:")
+            .map(|session| {
+                session["rows"]
+                    .as_array()
+                    .and_then(|rows| rows.first())
+                    .and_then(|row| row.get(14))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    > 0
+            })
+            .unwrap_or(false)
     })
     .await;
     adapter.shutdown().await;
+    drop(gateway);
 
-    // Phase 2: the same durable state recovers the interrupted run (typed
-    // recovery appends run.failed); the renderer resumes from the delivery
-    // cursor and delivers the missing terminal output.
-    let restored = test_state(&source, &db, |_config| config.clone());
+    // Phase 2: the same durable state resumes. The undelivered terminal is
+    // rendered by the restart catch-up (cursor < retained high-water), and
+    // the session gate is released once the resumed renderer ends.
+    let restored = test_state(ECHO_SOURCE, &db, |config| config);
     let adapter2 = spawn_adapter(restored.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
-        state
-            .sent_texts()
-            .iter()
-            .any(|text| text.starts_with("[failed]"))
+        state.sent_texts().iter().any(|text| text == "[done]")
     })
     .await;
+    // The resumed catch-up re-delivers the undelivered delta exactly once:
+    // the phase-1 attempt was held (recorded at arrival) and never
+    // completed, so the wire log shows it twice ("hello world" attempts)
+    // while the terminal is delivered exactly once.
+    let sends = state.sent_texts();
     assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        1,
+        "the resumed terminal must be delivered exactly once: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "hello world").count(),
+        2,
+        "the undelivered delta must be re-sent exactly once: {sends:?}"
+    );
+    // The resume renderer's final flush is the last action before its gate
+    // release; wait for it so the new message below is provably admitted
+    // after the gate is free (the terminal flush edits the final message).
+    wait_until(std::time::Duration::from_secs(15), || {
+        !state.edit_texts().is_empty()
+    })
+    .await;
+    // The gate is released: a new message is admitted and completes.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "after restart"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
         state
             .sent_texts()
             .iter()
-            .filter(|text| *text == "before")
-            .count(),
-        1,
-        "the already-delivered delta must not be re-sent"
+            .filter(|text| *text == "[done]")
+            .count()
+            >= 2
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        2,
+        "the new run must complete: {sends:?}"
+    );
+    assert!(
+        !sends.iter().any(|text| text.contains("already active")),
+        "the gate must be released before the new message arrives: {sends:?}"
     );
     adapter2.shutdown().await;
-    let _ = release_tx.send(());
-    holding.join().expect("holding fixture");
+    drop(release);
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1243,12 +1421,32 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
 #[tokio::test]
 async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
     let (base, state) = spawn_fixture().await;
-    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
-    let (config, source) = holding_config_and_source(port);
-    push_update(&state, fixture_json("updates_dm.json"));
+    // Deterministic barrier: the cancelled run's terminal render ("[stopped]")
+    // is held at the fixture, so the epoch bump provably happens while the
+    // old renderer is mid-send. No 50ms polling race decides the ordering.
+    let release = hold_first_send(&state, "[stopped]");
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 11,
+                "message": {
+                    "message_id": 101,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "start"
+                }
+            }]
+        }),
+    );
     let db = telegram_db_path("new-cancel");
-    let gateway = test_state(&source, &db, |_config| config.clone());
+    let gateway = test_state(CANCEL_ON_START_SOURCE, &db, |config| config);
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    // The run parks in a pure CPU loop; /new's stop must interrupt it
+    // through the epoch watcher — a real cancellation, because nothing
+    // external ever releases the run.
     wait_until(std::time::Duration::from_secs(15), || {
         state.sent_texts().iter().any(|text| text == "before")
     })
@@ -1278,7 +1476,15 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
             .any(|text| text.contains("Stopping the active run"))
     })
     .await;
-    let _ = release_tx.send(());
+    // The CPU loop is interrupted by the typed cancellation, the renderer
+    // attempts the cancelled-run terminal render, and the barrier holds it
+    // at the fixture (recorded on arrival).
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "[stopped]")
+    })
+    .await;
+    // The reset waits for the terminal transition, bumps the epoch, wipes
+    // the session, and only then confirms.
     wait_until(std::time::Duration::from_secs(20), || {
         state
             .sent_texts()
@@ -1286,12 +1492,14 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
             .any(|text| text.contains("New conversation started"))
     })
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let sends = state.sent_texts();
     let new_index = sends
         .iter()
         .position(|text| text.contains("New conversation started"))
         .expect("the /new confirmation must be present");
+    // The old run's delta ("before") and its in-flight terminal render were
+    // recorded before the confirmation; nothing from the old run may be
+    // recorded after it.
     assert_eq!(
         sends.len(),
         new_index + 1,
@@ -1313,8 +1521,347 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
         "the recreated session must have no messages: {}",
         rows[0][14]
     );
+    // Release the held terminal render: the old renderer's flush must be
+    // stopped by the stale epoch (no further old-run output), and the gate
+    // released by /new lets the next message through to completion.
+    drop(release);
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "after reset"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert!(
+        !sends.iter().any(|text| text.contains("already active")),
+        "the gate must be released after /new: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[stopped]").count(),
+        1,
+        "the cancelled run's terminal render stays a single in-flight send: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        1,
+        "the post-reset run must complete exactly once: {sends:?}"
+    );
     adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+/// P2-1 regression: `/new` while the old renderer is still draining must
+/// not let the old renderer's late gate drop delete the NEW run's gate.
+/// The old run's terminal send is held at the fixture across the reset, so
+/// its GateGuard drops only after a new run is already gated.
+#[tokio::test]
+async fn adapter_new_late_old_renderer_drop_keeps_the_new_gate() {
+    let (base, state) = spawn_fixture().await;
+    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
+    let source = park_on_second_source(port);
+    // Hold the old run's terminal send ("[done]") so the old renderer stays
+    // alive past the /new reset; its GateGuard drops only after we release.
+    let release = hold_first_send(&state, "[done]");
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("new-gate");
+    let gateway = test_state(&source, &db, |_config| holding_config(port));
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    // run1 ("hello"): delta sent, terminal "[done]" held at the fixture.
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    // /new: run1 is terminal, so the reset proceeds immediately (epoch
+    // bump first, then the cascade delete and the confirmation).
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 20,
+                "message": {
+                    "message_id": 200,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "/new"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(15), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("New conversation started"))
+    })
+    .await;
+    // A new run is admitted and gated; it parks in a holding HTTP call so
+    // it stays active (the gate must remain held for the whole test).
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "second"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "second")
+    })
+    .await;
+    // While the old renderer is still alive (its terminal send held), the
+    // third message must be rejected: the new run holds the gate.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 40,
+                "message": {
+                    "message_id": 400,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "third"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(15), || {
+        state
+            .sent_texts()
+            .iter()
+            .filter(|text| text.contains("already active"))
+            .count()
+            >= 1
+    })
+    .await;
+    // Release the old renderer's held send: its epoch is stale, so it stops
+    // without further output, and its GateGuard drops. The compare-and-
+    // remove must NOT touch the new run's gate entry.
+    drop(release);
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 50,
+                "message": {
+                    "message_id": 500,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "fourth"
+                }
+            }]
+        }),
+    );
+    // Deterministic wait on either outcome: the fix rejects the fourth
+    // message (the new run's gate survived the late drop); the bug admits
+    // it (its delta would be sent).
+    wait_until(std::time::Duration::from_secs(20), || {
+        state
+            .sent_texts()
+            .iter()
+            .filter(|text| text.contains("already active"))
+            .count()
+            >= 2
+            || state.sent_texts().iter().any(|text| text == "fourth")
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert_eq!(
+        sends
+            .iter()
+            .filter(|text| text.contains("already active"))
+            .count(),
+        2,
+        "the third and fourth messages must be rejected while the new run is gated: {sends:?}"
+    );
+    assert!(
+        !sends.iter().any(|text| text == "fourth"),
+        "the fourth message must not be admitted while the new run is gated: {sends:?}"
+    );
+    // Release the parked run: it completes, its renderer ends and releases
+    // the gate (compare-and-remove of its own run id).
+    let _ = release_tx.send(());
     holding.join().expect("holding fixture");
+    wait_until(std::time::Duration::from_secs(15), || {
+        state
+            .sent_texts()
+            .iter()
+            .filter(|text| *text == "[done]")
+            .count()
+            >= 2
+    })
+    .await;
+    // With the gate released after the new run ended, the next message is
+    // admitted and completes.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 60,
+                "message": {
+                    "message_id": 600,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "fifth"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
+        state
+            .sent_texts()
+            .iter()
+            .filter(|text| *text == "[done]")
+            .count()
+            >= 3
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        3,
+        "the run after the gate release must complete: {sends:?}"
+    );
+    assert!(
+        sends.iter().any(|text| text == "fifth"),
+        "the message after the gate release must be admitted: {sends:?}"
+    );
+    assert_eq!(
+        sends
+            .iter()
+            .filter(|text| text.contains("already active"))
+            .count(),
+        2,
+        "no further rejection after the gate release: {sends:?}"
+    );
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+/// P3 TOCTOU regression: `/new` bumping the session epoch while a renderer
+/// action is in flight must stop every SUBSEQUENT action of the old run.
+/// The old run's delta splits into three sends; the middle one is held at
+/// the fixture across the reset, so the trailing chunk can only be sent if
+/// the epoch is not re-checked after the network returns.
+#[tokio::test]
+async fn adapter_new_epoch_bump_mid_send_stops_the_old_renderer() {
+    let (base, state) = spawn_fixture().await;
+    let source = chunked_delta_source();
+    // The middle chunk (B×4096) of the old run's delta is held across the
+    // reset; the trailing chunk ("C") is the observable TOCTOU probe.
+    let release = hold_first_send(&state, "B");
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("new-epoch");
+    let gateway = test_state(&source, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    // run1: the first chunk is delivered, the middle chunk is held.
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.request_count("sendMessage") >= 2
+    })
+    .await;
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 20,
+                "message": {
+                    "message_id": 200,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "/new"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(15), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("New conversation started"))
+    })
+    .await;
+    // The bump landed while the middle chunk was in flight; releasing it
+    // lets the old renderer continue. With the per-action epoch re-check it
+    // stops; without it, the trailing "BC" chunk is sent after the reset.
+    drop(release);
+    // A new run after the reset: its chunks and terminal are the positive
+    // wait condition that provably follows the old renderer's continuation.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "second"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    let sends = state.sent_texts();
+    let confirmation = sends
+        .iter()
+        .position(|text| text.contains("New conversation started"))
+        .expect("the /new confirmation must be present");
+    assert_eq!(
+        sends.iter().filter(|text| *text == "BC").count(),
+        1,
+        "only the post-reset run may send the trailing chunk: {sends:?}"
+    );
+    assert!(
+        sends[confirmation + 1..]
+            .iter()
+            .all(|text| *text == "A".repeat(4096)
+                || *text == "B".repeat(4096)
+                || *text == "BC"
+                || *text == "[done]"),
+        "no old-run output may follow the /new confirmation: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        1,
+        "only the post-reset run may complete: {sends:?}"
+    );
+    adapter.shutdown().await;
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1492,6 +2039,158 @@ async fn adapter_replays_pending_updates_when_drop_is_disabled() {
     })
     .await;
     adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+/// P3 fail-closed drain: a drain round that fails is retried a bounded
+/// number of times; once a round succeeds, the drained watermark is
+/// persisted BEFORE anything is processed, so only updates that arrive
+/// after the drain are ever admitted.
+#[tokio::test]
+async fn adapter_drop_pending_drain_retries_then_persists_before_processing() {
+    let (base, state) = spawn_fixture().await;
+    // The pending update is queued while the bot was offline; the first
+    // drain round fails (the client exhausts its bounded 5xx budget) and
+    // the drain's bounded retry succeeds.
+    push_update(&state, fixture_json("updates_dm.json"));
+    state.script_failures(
+        "getUpdates",
+        vec![
+            FailureScript::Server { status: 500 },
+            FailureScript::Server { status: 500 },
+            FailureScript::Server { status: 500 },
+        ],
+    );
+    let db = telegram_db_path("drop-pending-retry");
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    let mut telegram = test_config(&base);
+    telegram.drop_pending_updates = true;
+    let adapter = spawn_adapter(gateway.clone(), telegram).await;
+    // Deterministic sync: the drain's five getUpdates calls (3 client
+    // attempts on the failed round, the successful retry, and the empty
+    // confirmation round) precede any processing. Only AFTER the drain is a
+    // new update pushed, so it cannot be drained by mistake.
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.request_count("getUpdates") >= 5
+    })
+    .await;
+    // The pending update is drained without processing; only a NEW update
+    // that arrives after the drain is admitted.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "after boot"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    let sends = state.sent_texts();
+    assert_eq!(
+        adapter.processed_updates(),
+        1,
+        "only the post-drain update may be processed"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "hello world").count(),
+        1,
+        "the drained pending update must never be rendered: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        1,
+        "only the post-drain run completes: {sends:?}"
+    );
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+/// P3 fail-closed drain: when every bounded retry fails, the adapter must
+/// NOT fall through to the normal poll (no pending update may be admitted),
+/// and its shutdown must not persist a zero offset — a restart re-runs the
+/// drain instead of bypassing it.
+#[tokio::test]
+async fn adapter_drop_pending_drain_failure_disables_polling_without_zero_offset() {
+    let (base, state) = spawn_fixture().await;
+    push_update(&state, fixture_json("updates_dm.json"));
+    // The client exhausts its bounded 5xx budget on every drain attempt
+    // (3 attempts × 3 client calls).
+    let script_failures = vec![
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+        FailureScript::Server { status: 500 },
+    ];
+    state.script_failures("getUpdates", script_failures.clone());
+    let db = telegram_db_path("drop-pending-fail");
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    let mut telegram = test_config(&base);
+    telegram.drop_pending_updates = true;
+    let adapter = spawn_adapter(gateway.clone(), telegram).await;
+    // The drain fails after its bounded attempts: the adapter must stop
+    // (fail-closed) instead of processing the pending queue.
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.request_count("getUpdates") >= 9
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let count = state.request_count("getUpdates");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        state.request_count("getUpdates"),
+        count,
+        "the adapter must not continue polling after a failed drain (fail-closed)"
+    );
+    assert_eq!(
+        adapter.processed_updates(),
+        0,
+        "no update may be processed after a failed drain"
+    );
+    assert_eq!(
+        state.sent_texts().len(),
+        0,
+        "no pending update may produce output after a failed drain"
+    );
+    adapter.shutdown().await;
+    // Fail-closed persistence: nothing was persisted (no zero write), so a
+    // restart re-runs the drain instead of bypassing it.
+    state.script_failures("getUpdates", script_failures);
+    let mut telegram2 = test_config(&base);
+    telegram2.drop_pending_updates = true;
+    let adapter2 = spawn_adapter(gateway.clone(), telegram2).await;
+    // The restart re-runs the full bounded drain (9 getUpdates calls) and
+    // fails closed again; the zero-write prohibition is proven by the
+    // drain being attempted at all.
+    wait_until(std::time::Duration::from_secs(20), || {
+        state.request_count("getUpdates") >= count + 9
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let count2 = state.request_count("getUpdates");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        state.request_count("getUpdates"),
+        count2,
+        "the restarted adapter must fail closed again (the drain was re-run)"
+    );
+    assert_eq!(adapter2.processed_updates(), 0);
+    adapter2.shutdown().await;
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
