@@ -2853,3 +2853,106 @@ fn job_delete_reports_real_rows_affected() {
     );
     fs::remove_dir_all(root).expect("temporary root should be removed");
 }
+
+#[test]
+fn delivery_set_is_monotonic_and_unvalidated() {
+    let root = temporary_root("delivery-set");
+    let runner = storage_runner(&root);
+    let db_name = "delivery-set.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+
+    // `delivery.advance` validates the value against the session's event
+    // high-water (no runs yet -> 0), so transport-level cursors like the
+    // Telegram getUpdates offset cannot use it.
+    let rejected = run_storage(
+        &runner,
+        db_name,
+        "advance-rejected",
+        "delivery.advance",
+        json!({
+            "session_id": "session-1",
+            "consumer": "telegram:offset",
+            "event_seq": 42,
+            "now_ms": 3,
+        }),
+        3,
+    );
+    assert_eq!(
+        rejected["ok"],
+        json!(true),
+        "advance no-ops above the high-water instead of erroring"
+    );
+    assert_eq!(
+        rejected["rows_affected"],
+        json!(0),
+        "advance must not persist a value above the session high-water"
+    );
+
+    // `delivery.set` is the sibling command for unvalidated monotonic
+    // cursors (poll offsets, session generations).
+    run_storage(
+        &runner,
+        db_name,
+        "set-1",
+        "delivery.set",
+        json!({
+            "session_id": "session-1",
+            "consumer": "telegram:offset",
+            "event_seq": 42,
+            "now_ms": 4,
+        }),
+        4,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "set-2",
+        "delivery.set",
+        json!({
+            "session_id": "session-1",
+            "consumer": "telegram:offset",
+            "event_seq": 7,
+            "now_ms": 5,
+        }),
+        5,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "set-3",
+        "delivery.set",
+        json!({
+            "session_id": "session-1",
+            "consumer": "telegram:offset",
+            "event_seq": 5,
+            "now_ms": 6,
+        }),
+        6,
+    );
+    let read = run_storage(
+        &runner,
+        db_name,
+        "get-1",
+        "delivery.get",
+        json!({ "session_id": "session-1", "consumer": "telegram:offset" }),
+        7,
+    );
+    assert_eq!(read["ok"], json!(true));
+    let rows = read["data"]["rows"].as_array().expect("cursor rows");
+    assert_eq!(rows.len(), 1, "one cursor row per (session, consumer)");
+    assert_eq!(rows[0][1], json!("telegram:offset"));
+    assert_eq!(
+        rows[0][2],
+        json!(42),
+        "delivery.set must be monotonic: 7 then 5 must leave 42"
+    );
+    fs::remove_dir_all(root).expect("temporary root should be removed");
+}

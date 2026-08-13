@@ -22,6 +22,17 @@ pub(crate) fn timestamp() -> u64 {
         .as_millis() as u64
 }
 
+/// FNV-1a 64-bit hash used for idempotency request hashes (transport
+/// adapters derive the same canonical hash shape as the API server).
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Canonical inbound platform envelope (gateway-api plan section 4.1).
 ///
 /// Platform adapters normalize inbound data into this envelope; the default

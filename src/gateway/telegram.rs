@@ -331,3 +331,1575 @@ impl TelegramApi {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Adapter: allowlists, envelope mapping, polling, commands, and delivery.
+// ---------------------------------------------------------------------------
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use tokio::sync::{broadcast, watch};
+
+use crate::AgentGatewayState;
+use crate::domain::{InboundEnvelope, fnv1a64, timestamp};
+use crate::gateway::store::{GatewayEvent, SessionRecord, SessionView};
+use crate::gateway::telegram_render::{EventRenderer, RenderAction};
+use crate::service::{AdmitError, AdmitRunRequest, failed_payload};
+
+/// Delivery cursor consumer for the global getUpdates offset (hangs on the
+/// control session).
+pub(crate) const OFFSET_CONSUMER: &str = "telegram:offset";
+
+/// Canonical session id for one (account, chat, thread) identity. Stable
+/// across restarts; `/new` wipes and recreates the same id.
+pub(crate) fn session_id_for(account: &str, chat_id: i64, thread_id: Option<i64>) -> String {
+    let thread = thread_id.map(|id| id.to_string()).unwrap_or_default();
+    format!("telegram:{account}:{chat_id}:{thread}")
+}
+
+/// The bot-owned control session that anchors transport-level cursors (the
+/// getUpdates offset).
+pub(crate) fn control_session_id(account: &str) -> String {
+    format!("telegram-control:{account}")
+}
+
+/// Per-run delivery cursor consumer.
+pub(crate) fn run_consumer(run_id: &str) -> String {
+    format!("telegram:run:{run_id}")
+}
+
+/// Deny-by-default allowlists: every list starts empty and an empty list
+/// denies everything.
+struct Allowlist {
+    accounts: Vec<String>,
+    chats: Vec<i64>,
+    users: Vec<i64>,
+}
+
+impl Allowlist {
+    fn from_config(config: &TelegramConfig) -> Self {
+        Self {
+            accounts: config
+                .allowed_accounts
+                .iter()
+                .map(|account| account.to_ascii_lowercase())
+                .collect(),
+            chats: config.allowed_chats.clone(),
+            users: config.allowed_users.clone(),
+        }
+    }
+
+    fn account_allowed(&self, username: &str) -> bool {
+        self.accounts
+            .iter()
+            .any(|allowed| allowed == &username.to_ascii_lowercase())
+    }
+
+    fn chat_allowed(&self, chat_id: i64) -> bool {
+        self.chats.contains(&chat_id)
+    }
+
+    fn user_allowed(&self, user_id: i64) -> bool {
+        self.users.contains(&user_id)
+    }
+}
+
+/// Bounded dedup windows for update_ids and (chat, message) keys; old
+/// entries fall off so the memory footprint stays fixed.
+struct DedupWindows {
+    update_ids: VecDeque<i64>,
+    message_keys: VecDeque<String>,
+    capacity: usize,
+}
+
+impl DedupWindows {
+    fn new(capacity: usize) -> Self {
+        Self {
+            update_ids: VecDeque::new(),
+            message_keys: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    /// Returns true when the update_id was already seen.
+    fn seen_update(&mut self, update_id: i64) -> bool {
+        if self.update_ids.contains(&update_id) {
+            return true;
+        }
+        push_bounded(&mut self.update_ids, update_id, self.capacity);
+        false
+    }
+
+    /// Returns true when the (chat, message) key was already seen.
+    fn seen_message(&mut self, key: &str) -> bool {
+        if self.message_keys.iter().any(|existing| existing == key) {
+            return true;
+        }
+        push_bounded(&mut self.message_keys, key.to_string(), self.capacity);
+        false
+    }
+}
+
+fn push_bounded<T>(window: &mut VecDeque<T>, value: T, capacity: usize) {
+    if window.len() >= capacity {
+        window.pop_front();
+    }
+    window.push_back(value);
+}
+
+/// Parses one message text into a known command and its remaining content.
+/// Only the four canonical commands are recognized; anything else (including
+/// unknown `/x` tokens) is plain conversation text.
+pub(crate) fn parse_command(text: &str) -> (Option<String>, String) {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix('/') {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let token = parts.next().unwrap_or_default();
+        let args = parts.next().unwrap_or("").trim();
+        let name = token
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(name.as_str(), "new" | "stop" | "status" | "compact") {
+            return (Some(name), args.to_string());
+        }
+    }
+    (None, trimmed.to_string())
+}
+
+/// Normalizes one Telegram message into the canonical inbound envelope.
+/// Non-text messages and messages without a sender are not user input.
+pub(crate) fn envelope_from_message(
+    update: &TgUpdate,
+    message: &TgMessage,
+    account: &str,
+) -> Option<InboundEnvelope> {
+    let from = message.from.as_ref()?;
+    let content = message.text.clone().unwrap_or_default();
+    if content.trim().is_empty() {
+        return None;
+    }
+    // Private chats have no thread; group/supergroup topics are identified
+    // by message_thread_id (the General topic has none). The identity is
+    // stable because both dimensions come straight from the platform.
+    let thread_id = match message.chat.chat_type.as_str() {
+        "private" => None,
+        _ => message.message_thread_id,
+    };
+    let (command, content) = parse_command(&content);
+    Some(InboundEnvelope {
+        platform: "telegram".to_string(),
+        profile: "telegram".to_string(),
+        account_id: account.to_string(),
+        chat_id: message.chat.id.to_string(),
+        thread_id: thread_id.map(|id| id.to_string()),
+        user_id: from.id.to_string(),
+        message_id: format!("{}:{}", message.chat.id, message.message_id),
+        session_hint: None,
+        content,
+        attachments: Vec::new(),
+        command,
+        reply_to: None,
+        received_at: timestamp(),
+        metadata: json!({
+            "update_id": update.update_id,
+            "message_id": message.message_id,
+            "chat_type": message.chat.chat_type,
+            "is_topic_message": message.is_topic_message,
+        }),
+    })
+}
+
+/// Shared adapter runtime: the gateway state, the allowlist, the bounded
+/// dedup windows, and the per-session active-run gate.
+struct AdapterRuntime {
+    state: AgentGatewayState,
+    config: TelegramConfig,
+    account: String,
+    allowlist: Allowlist,
+    dedup: DedupWindows,
+    active_runs: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// Handle for one running Telegram adapter (poller task). Shutdown is
+/// bounded: the stop signal is sent, the in-flight poll round finishes
+/// within the client timeout, the final offset is persisted, and the join
+/// waits at most the configured bound.
+pub struct TelegramAdapter {
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+    processed: Arc<AtomicU64>,
+}
+
+impl TelegramAdapter {
+    /// Number of updates fully handled so far (tests poll this).
+    pub fn processed_updates(&self) -> u64 {
+        self.processed.load(Ordering::SeqCst)
+    }
+
+    /// Bounded graceful stop: signals the poller, waits at most 60s for the
+    /// in-flight poll round and the final offset persist.
+    pub async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), self.task).await;
+    }
+}
+
+/// Starts the Telegram adapter: verifies the token via `getMe`, ensures the
+/// control session, loads the persisted poll offset, and spawns the long
+/// poll loop. The adapter shares the gateway's AgentService/store, so API
+/// and Telegram traffic use the same sessions and runs.
+pub async fn spawn_telegram_adapter(
+    state: AgentGatewayState,
+    config: TelegramConfig,
+) -> Result<TelegramAdapter, String> {
+    config
+        .validate()
+        .map_err(|error| format!("invalid Telegram configuration: {error}"))?;
+    let api = TelegramApi::new(&config);
+    let me = api
+        .get_me()
+        .await
+        .map_err(|error| format!("telegram getMe failed: {error}"))?;
+    let account = me
+        .username
+        .clone()
+        .unwrap_or_else(|| format!("bot{}", me.id));
+    ensure_control_session(&state, &account, me.id).await?;
+    let offset = load_offset(&state, &account).await?;
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let processed = Arc::new(AtomicU64::new(0));
+    let task = tokio::spawn(run_poller(
+        state,
+        config,
+        account,
+        offset,
+        stop_rx,
+        Arc::clone(&processed),
+    ));
+    Ok(TelegramAdapter {
+        stop: stop_tx,
+        task,
+        processed,
+    })
+}
+
+/// Ensures the bot's control session exists (INSERT OR IGNORE semantics:
+/// idempotent across restarts). It anchors the persisted getUpdates offset
+/// cursor row.
+async fn ensure_control_session(
+    state: &AgentGatewayState,
+    account: &str,
+    bot_id: i64,
+) -> Result<(), String> {
+    let Some(persistence) = state.persistence() else {
+        return Ok(());
+    };
+    let session_id = control_session_id(account);
+    let model = state.config.model.clone();
+    let account_for_block = account.to_string();
+    let now = timestamp();
+    let result = tokio::task::spawn_blocking(move || {
+        let payload = json!({
+            "id": session_id,
+            "profile": "telegram",
+            "platform": "telegram",
+            "account_id": account_for_block,
+            "chat_id": "",
+            "thread_id": "",
+            "user_id": bot_id.to_string(),
+            "generation": 1,
+            "system_prompt": "",
+            "model": model,
+            "provider": "",
+            "toolset_hash": "",
+            "metadata_json": "{}",
+            "title": "telegram control",
+            "end_reason": "",
+            "now_ms": now as i64,
+        });
+        persistence.session_create(&payload).map(|_| ())
+    })
+    .await
+    .map_err(|error| format!("control session worker failed: {error}"))?;
+    result.map_err(|error| format!("create telegram control session: {error}"))
+}
+
+/// Loads the persisted getUpdates offset (0 when none was ever persisted).
+async fn load_offset(state: &AgentGatewayState, account: &str) -> Result<Option<i64>, String> {
+    let Some(persistence) = state.persistence() else {
+        return Ok(None);
+    };
+    let data = persistence
+        .delivery_get(&control_session_id(account), OFFSET_CONSUMER)
+        .map_err(|error| format!("read telegram poll offset: {error}"))?;
+    Ok(cursor_from_rows(&data))
+}
+
+/// Persists the getUpdates offset through the typed delivery cursor surface
+/// (monotonic, so a stale process can never rewind the offset).
+async fn persist_offset(
+    state: &AgentGatewayState,
+    account: &str,
+    offset: i64,
+) -> Result<(), String> {
+    let Some(persistence) = state.persistence() else {
+        return Ok(());
+    };
+    persistence
+        .delivery_set(&control_session_id(account), OFFSET_CONSUMER, offset)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// The long-poll loop: getUpdates with offset management, bounded dedup,
+/// allowlist gating, command/plain-text dispatch, and offset persistence
+/// after every batch and on graceful stop.
+async fn run_poller(
+    state: AgentGatewayState,
+    config: TelegramConfig,
+    account: String,
+    mut offset: Option<i64>,
+    stop: watch::Receiver<bool>,
+    processed: Arc<AtomicU64>,
+) {
+    let api = TelegramApi::new(&config);
+    let mut runtime = AdapterRuntime {
+        state: state.clone(),
+        config: config.clone(),
+        account: account.clone(),
+        allowlist: Allowlist::from_config(&config),
+        dedup: DedupWindows::new(config.dedup_capacity),
+        active_runs: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let poll_timeout_secs = config.poll_timeout.as_secs().max(1);
+    // Restart resume: after a crash the poll offset skips the interrupted
+    // update, so its run exists only in durable state. Any event left
+    // undelivered (delivery cursor < retained high-water) is rendered now.
+    resume_undelivered(&mut runtime).await;
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        match api.get_updates(offset, poll_timeout_secs, 50).await {
+            Ok(updates) => {
+                for update in updates {
+                    if *stop.borrow() {
+                        break;
+                    }
+                    if offset.is_some_and(|base| update.update_id < base) {
+                        continue;
+                    }
+                    if runtime.dedup.seen_update(update.update_id) {
+                        continue;
+                    }
+                    handle_update(&mut runtime, &api, &update).await;
+                    processed.fetch_add(1, Ordering::SeqCst);
+                    offset = Some(update.update_id + 1);
+                }
+                // Persist after every batch so a crash re-fetches at most the
+                // last batch (message-level idempotency covers the rest).
+                if let Err(error) = persist_offset(&state, &account, offset.unwrap_or(0)).await {
+                    tracing::warn!("telegram poll offset could not be persisted: {error}");
+                }
+                // Pace poll rounds even when the fixture responds instantly;
+                // the long poll itself already bounded the wait on real
+                // Telegram, so this only prevents a hot loop.
+                tokio::time::sleep(config.poll_interval).await;
+            }
+            Err(TelegramError::Transport(error)) => {
+                tracing::warn!("telegram poll transport failure: {error}");
+                tokio::time::sleep(config.poll_interval).await;
+            }
+            Err(TelegramError::Server { status }) => {
+                tracing::warn!("telegram poll server failure (HTTP {status})");
+                tokio::time::sleep(config.poll_interval).await;
+            }
+            Err(error) => {
+                tracing::warn!("telegram poll failed: {error}");
+                tokio::time::sleep(config.poll_interval).await;
+            }
+        }
+    }
+    // Final persist on graceful stop: no update older than this offset can
+    // be re-fetched after restart.
+    if let Err(error) = persist_offset(&state, &account, offset.unwrap_or(0)).await {
+        tracing::warn!("telegram poll offset could not be persisted on stop: {error}");
+    }
+}
+
+/// The poller's per-session active-run gate with RAII release: the entry is
+/// removed on every exit path, including a panicking renderer task.
+struct GateGuard {
+    active_runs: Arc<Mutex<HashMap<String, String>>>,
+    session_id: String,
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.active_runs
+            .lock()
+            .expect("active runs lock")
+            .remove(&self.session_id);
+    }
+}
+
+/// Parses the canonical telegram session id back into chat/thread identity
+/// (`telegram:<account>:<chat>:<thread>`); `None` for non-telegram ids (for
+/// example the bot's control session).
+fn parse_session_identity(session_id: &str) -> Option<(i64, Option<i64>)> {
+    let rest = session_id.strip_prefix("telegram:")?;
+    let mut parts = rest.splitn(3, ':');
+    let _account = parts.next()?;
+    let chat_id = parts.next()?.parse::<i64>().ok()?;
+    let thread = parts.next().unwrap_or("");
+    let thread_id = if thread.is_empty() {
+        None
+    } else {
+        Some(thread.parse::<i64>().ok()?)
+    };
+    Some((chat_id, thread_id))
+}
+
+/// Renders any events left undelivered before the previous process stopped:
+/// for every telegram session, every run whose delivery cursor trails its
+/// retained high-water gets a fresh renderer (the live path would never
+/// touch it again, and restart must not lose output).
+async fn resume_undelivered(runtime: &mut AdapterRuntime) {
+    let sessions = {
+        let store = runtime.state.store.read();
+        store
+            .sessions
+            .values()
+            .filter(|session| session.view.source == "telegram")
+            .filter_map(|session| {
+                let identity = parse_session_identity(&session.view.id)?;
+                Some((session.view.id.clone(), identity.0, identity.1))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (session_id, chat_id, thread_id) in sessions {
+        let runs = {
+            let store = runtime.state.store.read();
+            store
+                .runs
+                .values()
+                .filter(|run| run.session_id == session_id)
+                .map(|run| run.run_id.clone())
+                .collect::<Vec<_>>()
+        };
+        for run_id in runs {
+            let consumer = run_consumer(&run_id);
+            let cursor = load_cursor(&runtime.state, &session_id, &consumer).await;
+            let high_water = {
+                let store = runtime.state.store.read();
+                store
+                    .runs
+                    .get(&run_id)
+                    .map(|run| run.events.iter().map(|event| event.seq).max().unwrap_or(0) as i64)
+                    .unwrap_or(0)
+            };
+            if high_water > cursor {
+                runtime
+                    .active_runs
+                    .lock()
+                    .expect("active runs lock")
+                    .insert(session_id.clone(), run_id.clone());
+                spawn_run_renderer(
+                    &runtime.state,
+                    &runtime.config,
+                    &session_id,
+                    run_id,
+                    chat_id,
+                    thread_id,
+                    Arc::clone(&runtime.active_runs),
+                );
+            }
+        }
+    }
+}
+
+/// One update: envelope, allowlist gates, dedup, then command or admission.
+async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: &TgUpdate) {
+    let Some(message) = &update.message else {
+        return;
+    };
+    let Some(envelope) = envelope_from_message(update, message, &runtime.account) else {
+        return;
+    };
+    // Deny-by-default allowlists; denied updates are dropped silently (the
+    // offset still advances, so they are not re-fetched forever).
+    if !runtime.allowlist.account_allowed(&runtime.account) {
+        tracing::debug!("telegram account not allowed; update dropped");
+        return;
+    }
+    let chat_id = message.chat.id;
+    if !runtime.allowlist.chat_allowed(chat_id) {
+        tracing::debug!(chat_id, "telegram chat not allowed; update dropped");
+        return;
+    }
+    let Some(from) = &message.from else {
+        return;
+    };
+    if !runtime.allowlist.user_allowed(from.id) {
+        tracing::debug!(
+            user_id = from.id,
+            "telegram user not allowed; update dropped"
+        );
+        return;
+    }
+    let message_key = format!("{}:{}", chat_id, message.message_id);
+    if runtime.dedup.seen_message(&message_key) {
+        return;
+    }
+    let session_id = session_id_for(&runtime.account, chat_id, message.message_thread_id);
+    match envelope.command.as_deref() {
+        Some("new") => {
+            cmd_new(
+                runtime,
+                api,
+                &envelope,
+                chat_id,
+                message.message_thread_id,
+                &session_id,
+            )
+            .await
+        }
+        Some("stop") => {
+            cmd_stop(
+                runtime,
+                api,
+                chat_id,
+                message.message_thread_id,
+                &session_id,
+            )
+            .await
+        }
+        Some("status") => {
+            cmd_status(
+                runtime,
+                api,
+                chat_id,
+                message.message_thread_id,
+                &session_id,
+            )
+            .await
+        }
+        Some("compact") => {
+            // Explicitly unavailable: compaction is A5-scoped and not wired
+            // here; never advertise it as complete.
+            let _ = reply(
+                api,
+                chat_id,
+                message.message_thread_id,
+                "/compact is not available yet: compaction is blocked until the A5 integration lands; \
+                 your conversation is unchanged.",
+            )
+            .await;
+        }
+        _ => {
+            admit_text(
+                runtime,
+                api,
+                &envelope,
+                &session_id,
+                chat_id,
+                message.message_thread_id,
+            )
+            .await
+        }
+    }
+}
+
+/// One bounded plain-text reply to the chat (thread-aware).
+async fn reply(
+    api: &TelegramApi,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    text: &str,
+) -> Result<(), TelegramError> {
+    api.send_message(chat_id, thread_id, text).await.map(|_| ())
+}
+
+/// `/new`: wipes the conversation (typed cascade delete) and recreates the
+/// same deterministic session id, so the identity stays stable across
+/// restarts while the history starts fresh.
+async fn cmd_new(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    envelope: &InboundEnvelope,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_id: &str,
+) {
+    let state = runtime.state.clone();
+    let session_id_for_block = session_id.to_string();
+    let account_for_block = envelope.account_id.clone();
+    let user_id_for_block = envelope.user_id.clone();
+    let chat_id_for_block = envelope.chat_id.clone();
+    let thread_id_for_block = envelope.thread_id.clone().unwrap_or_default();
+    let model = state.config.model.clone();
+    let now = timestamp();
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut store = state.store.write();
+        let persistence = state.service.persistence_handle();
+        // Only a session that exists is reset: on a fresh chat there is
+        // nothing to cascade (session.delete on a missing session is a
+        // typed error).
+        if store.sessions.contains_key(&session_id_for_block) {
+            // Mirror the durable cascade in memory: the session and its
+            // runs go away together (the DB cascade removes
+            // messages/events/cursors too).
+            let removed_runs = store
+                .runs
+                .iter()
+                .filter(|(_, run)| run.session_id == session_id_for_block)
+                .map(|(run_id, _)| run_id.clone())
+                .collect::<Vec<_>>();
+            for run_id in removed_runs {
+                store.runs.remove(&run_id);
+            }
+            if let Some(persistence) = persistence.as_ref() {
+                persistence
+                    .session_delete(&session_id_for_block)
+                    .map_err(|error| error.to_string())?;
+            }
+            store.sessions.remove(&session_id_for_block);
+        }
+        if let Some(persistence) = persistence.as_ref() {
+            let payload = json!({
+                "id": session_id_for_block,
+                "profile": "telegram",
+                "platform": "telegram",
+                "account_id": account_for_block,
+                "chat_id": chat_id_for_block,
+                "thread_id": thread_id_for_block,
+                "user_id": user_id_for_block,
+                "generation": 1,
+                "system_prompt": "",
+                "model": model,
+                "provider": "",
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now as i64,
+            });
+            persistence
+                .session_create(&payload)
+                .map_err(|error| error.to_string())?;
+        }
+        store.sessions.insert(
+            session_id_for_block.clone(),
+            SessionRecord {
+                view: SessionView {
+                    id: session_id_for_block.clone(),
+                    object: "hermes.session".to_string(),
+                    title: None,
+                    model,
+                    provider: None,
+                    source: "telegram".to_string(),
+                    system_prompt: None,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: 0,
+                    end_reason: None,
+                },
+                messages: Vec::new(),
+            },
+        );
+        Ok(())
+    })
+    .await;
+    runtime
+        .active_runs
+        .lock()
+        .expect("active runs lock")
+        .remove(session_id);
+    match result {
+        Ok(Ok(())) => {
+            let _ = reply(api, chat_id, thread_id, "New conversation started.").await;
+        }
+        _ => {
+            let _ = reply(api, chat_id, thread_id, "Could not reset the conversation.").await;
+        }
+    }
+}
+
+/// `/stop`: cancels the session's active run through the shared
+/// AgentService (the first stop wins; later stops report the status).
+async fn cmd_stop(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_id: &str,
+) {
+    let gated = runtime
+        .active_runs
+        .lock()
+        .expect("active runs lock")
+        .get(session_id)
+        .cloned();
+    let run_id = match gated {
+        Some(run_id) => Some(run_id),
+        None => {
+            // Restart fallback: the gate is in-memory, so scan the store for
+            // an active run of the session.
+            let store = runtime.state.store.read();
+            store
+                .runs
+                .values()
+                .filter(|run| run.session_id == session_id)
+                .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
+                .map(|run| run.run_id.clone())
+                .next()
+        }
+    };
+    let outcome = match run_id {
+        Some(run_id) => runtime.state.service().stop(&run_id),
+        None => None,
+    };
+    match outcome.as_deref() {
+        Some("stopping") => {
+            let _ = reply(api, chat_id, thread_id, "Stopping the active run.").await;
+        }
+        Some(status) => {
+            let _ = reply(api, chat_id, thread_id, &format!("Run status: {status}.")).await;
+        }
+        None => {
+            let _ = reply(api, chat_id, thread_id, "No active run in this chat.").await;
+        }
+    }
+}
+
+/// `/status`: one readable line about the session and its latest run.
+async fn cmd_status(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_id: &str,
+) {
+    let status_line = {
+        let store = runtime.state.store.read();
+        store.sessions.get(session_id).map(|session| {
+            match store
+                .runs
+                .values()
+                .filter(|run| run.session_id == session_id)
+                .max_by_key(|run| run.events.last().map(|event| event.timestamp).unwrap_or(0))
+            {
+                Some(run) => format!(
+                    "Session {session_id} · {} messages · latest run {}: {}",
+                    session.view.message_count, run.run_id, run.status
+                ),
+                None => format!(
+                    "Session {session_id} · {} messages · no runs yet",
+                    session.view.message_count
+                ),
+            }
+        })
+    };
+    let Some(status_line) = status_line else {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "No conversation yet in this chat — send a message to start one.",
+        )
+        .await;
+        return;
+    };
+    let _ = reply(api, chat_id, thread_id, &status_line).await;
+}
+
+/// Ensures the deterministic session exists (durable + in-memory), so
+/// admission can reference it. Idempotent: the typed `session.create` is
+/// INSERT OR IGNORE and the in-memory map is checked first.
+async fn ensure_session(
+    state: &AgentGatewayState,
+    session_id: &str,
+    account: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    user_id: &str,
+) -> Result<(), String> {
+    {
+        let store = state.store.read();
+        if store.sessions.contains_key(session_id) {
+            return Ok(());
+        }
+    }
+    let state_for_block = state.clone();
+    let session_id_for_block = session_id.to_string();
+    let account_for_block = account.to_string();
+    let chat_id_for_block = chat_id.to_string();
+    let thread_id_for_block = thread_id.unwrap_or_default().to_string();
+    let user_id_for_block = user_id.to_string();
+    let model = state.config.model.clone();
+    let now = timestamp();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut store = state_for_block.store.write();
+        if store.sessions.contains_key(&session_id_for_block) {
+            return Ok(());
+        }
+        if let Some(persistence) = state_for_block.service.persistence_handle() {
+            let payload = json!({
+                "id": session_id_for_block,
+                "profile": "telegram",
+                "platform": "telegram",
+                "account_id": account_for_block,
+                "chat_id": chat_id_for_block,
+                "thread_id": thread_id_for_block,
+                "user_id": user_id_for_block,
+                "generation": 1,
+                "system_prompt": "",
+                "model": model,
+                "provider": "",
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now as i64,
+            });
+            persistence
+                .session_create(&payload)
+                .map_err(|error| error.to_string())?;
+        }
+        store.sessions.insert(
+            session_id_for_block.clone(),
+            SessionRecord {
+                view: SessionView {
+                    id: session_id_for_block.clone(),
+                    object: "hermes.session".to_string(),
+                    title: None,
+                    model,
+                    provider: None,
+                    source: "telegram".to_string(),
+                    system_prompt: None,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: 0,
+                    end_reason: None,
+                },
+                messages: Vec::new(),
+            },
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("session worker failed: {error}"))?
+}
+
+/// Plain text: atomic admission through the shared AgentService with a
+/// durable message-level idempotency key, so a re-fetched update after a
+/// crash can never create a second run.
+async fn admit_text(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    envelope: &InboundEnvelope,
+    session_id: &str,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) {
+    if runtime
+        .active_runs
+        .lock()
+        .expect("active runs lock")
+        .contains_key(session_id)
+    {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "A run is already active in this chat — send /stop to cancel it.",
+        )
+        .await;
+        return;
+    }
+    let canonical = serde_json::to_string(&json!({
+        "input": envelope.content,
+        "session_id": session_id,
+    }))
+    .unwrap_or_default();
+    let idempotency_hash = format!("fnv64:{:016x}", fnv1a64(canonical.as_bytes()));
+    let idempotency_key = format!(
+        "telegram:{account}:{message}",
+        account = envelope.account_id,
+        message = envelope.message_id
+    );
+    if let Err(error) = ensure_session(
+        &runtime.state,
+        session_id,
+        &envelope.account_id,
+        &envelope.chat_id,
+        envelope.thread_id.as_deref(),
+        &envelope.user_id,
+    )
+    .await
+    {
+        tracing::warn!("telegram session creation failed: {error}");
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "Storage is unavailable; try again shortly.",
+        )
+        .await;
+        return;
+    }
+    let admitted = runtime
+        .state
+        .service()
+        .admit(AdmitRunRequest {
+            input: json!(envelope.content),
+            session_id: Some(session_id.to_string()),
+            platform: "telegram".to_string(),
+            idempotency_key: Some(idempotency_key),
+            idempotency_hash: Some(idempotency_hash),
+            ..AdmitRunRequest::default()
+        })
+        .await;
+    match admitted {
+        Ok(admitted_run) => {
+            if admitted_run.replayed {
+                // The same message already produced this run (durable
+                // idempotency across restarts); never start a second one.
+                return;
+            }
+            runtime
+                .active_runs
+                .lock()
+                .expect("active runs lock")
+                .insert(session_id.to_string(), admitted_run.run_id.clone());
+            spawn_worker(
+                &runtime.state,
+                admitted_run.run_id.clone(),
+                envelope.content.clone(),
+            );
+            spawn_run_renderer(
+                &runtime.state,
+                &runtime.config,
+                session_id,
+                admitted_run.run_id,
+                chat_id,
+                thread_id,
+                Arc::clone(&runtime.active_runs),
+            );
+        }
+        Err(AdmitError::RunLimitReached) => {
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "The agent is at capacity; try again shortly.",
+            )
+            .await;
+        }
+        Err(AdmitError::Persistence(message)) => {
+            tracing::warn!("telegram admission persistence failure: {message}");
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "Storage is unavailable; try again shortly.",
+            )
+            .await;
+        }
+        Err(error) => {
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                &format!("Could not start the run: {error}."),
+            )
+            .await;
+        }
+    }
+}
+
+/// Spawns the run worker with the same panic guard as the API server: a
+/// worker that exits without a terminal commits a typed failure.
+fn spawn_worker(state: &AgentGatewayState, run_id: String, input: String) {
+    let service = state.service();
+    let worker_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let outcome =
+            tokio::task::spawn(service.clone().run_worker(worker_run_id.clone(), input)).await;
+        if outcome.is_err() {
+            service
+                .finish_failed(
+                    &worker_run_id,
+                    failed_payload("agent worker exited without a terminal outcome".to_string()),
+                )
+                .await;
+        }
+    });
+}
+
+/// Spawns the per-run delivery renderer: durable catch-up from the delivery
+/// cursor, then live subscription, with the cursor advanced only after each
+/// event was rendered successfully.
+fn spawn_run_renderer(
+    state: &AgentGatewayState,
+    config: &TelegramConfig,
+    session_id: &str,
+    run_id: String,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    active_runs: Arc<Mutex<HashMap<String, String>>>,
+) {
+    let state = state.clone();
+    let config = config.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(run_renderer(
+        state,
+        config,
+        session_id,
+        run_id,
+        chat_id,
+        thread_id,
+        active_runs,
+    ));
+}
+
+/// One run's renderer: catch-up replay of undelivered retained events, then
+/// live delivery through the run's broadcast channel. The delivery cursor
+/// (typed `delivery.get`/`delivery.advance`) is advanced per event only
+/// after the Telegram API accepted the render, so restart resumes exactly
+/// where delivery stopped.
+async fn run_renderer(
+    state: AgentGatewayState,
+    config: TelegramConfig,
+    session_id: String,
+    run_id: String,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    active_runs: Arc<Mutex<HashMap<String, String>>>,
+) {
+    let api = TelegramApi::new(&config);
+    // RAII gate: released on every exit path, including panics.
+    let _gate = GateGuard {
+        active_runs,
+        session_id: session_id.clone(),
+    };
+    let consumer = run_consumer(&run_id);
+    let mut cursor = load_cursor(&state, &session_id, &consumer).await;
+    let mut renderer = EventRenderer::new();
+    let mut last_edit = Instant::now();
+
+    // Catch-up: every retained event with seq > cursor (bounded by event
+    // retention) is rendered before any live event.
+    let events = replay_run_events(&state, &run_id, cursor + 1).await;
+    for (seq, event_type, data) in events {
+        if seq <= cursor {
+            continue;
+        }
+        if !render_event(
+            &api,
+            &mut renderer,
+            &mut last_edit,
+            &config,
+            chat_id,
+            thread_id,
+            seq,
+            &event_type,
+            &data,
+            &mut cursor,
+            &state,
+            &session_id,
+            &consumer,
+        )
+        .await
+        {
+            return;
+        }
+    }
+
+    // Live: subscribe before catching up so no durable-before-visible event
+    // can be missed; events rendered by the catch-up are skipped below.
+    let receiver = subscribe_to_run(&state, &run_id);
+    if let Some(mut receiver) = receiver {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if (event.seq as i64) <= cursor {
+                        if event.is_terminal() {
+                            break;
+                        }
+                        continue;
+                    }
+                    if !render_event(
+                        &api,
+                        &mut renderer,
+                        &mut last_edit,
+                        &config,
+                        chat_id,
+                        thread_id,
+                        event.seq as i64,
+                        &event.event,
+                        &event.data,
+                        &mut cursor,
+                        &state,
+                        &session_id,
+                        &consumer,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    if event.is_terminal() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // The live buffer overflowed: re-sync from the durable
+                    // cursor, then re-subscribe.
+                    let current = load_cursor(&state, &session_id, &consumer).await;
+                    let events = replay_run_events(&state, &run_id, current + 1).await;
+                    for (seq, event_type, data) in events {
+                        if seq <= current {
+                            continue;
+                        }
+                        if !render_event(
+                            &api,
+                            &mut renderer,
+                            &mut last_edit,
+                            &config,
+                            chat_id,
+                            thread_id,
+                            seq,
+                            &event_type,
+                            &data,
+                            &mut cursor,
+                            &state,
+                            &session_id,
+                            &consumer,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    match subscribe_to_run(&state, &run_id) {
+                        Some(next) => receiver = next,
+                        None => break,
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
+    // Final flush: any text accumulated but never edited is finalized.
+    for action in renderer.flush() {
+        match action {
+            RenderAction::Send { text } => {
+                if api.send_message(chat_id, thread_id, &text).await.is_err() {
+                    break;
+                }
+            }
+            RenderAction::Edit { message_id, text } => {
+                if api
+                    .edit_message_text(chat_id, message_id, &text)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Renders one canonical event into Bot API calls; the delivery cursor is
+/// advanced only after every action succeeded. Returns false when delivery
+/// failed (the event stays undelivered for a later catch-up).
+#[allow(clippy::too_many_arguments)]
+async fn render_event(
+    api: &TelegramApi,
+    renderer: &mut EventRenderer,
+    last_edit: &mut Instant,
+    config: &TelegramConfig,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    seq: i64,
+    event_type: &str,
+    data: &Value,
+    cursor: &mut i64,
+    state: &AgentGatewayState,
+    session_id: &str,
+    consumer: &str,
+) -> bool {
+    let throttle_edits = event_type == "model.delta";
+    for action in renderer.on_event(event_type, data) {
+        let result = match action {
+            RenderAction::Send { text } => {
+                match api.send_message(chat_id, thread_id, &text).await {
+                    Ok(sent) => {
+                        renderer.note_sent(sent.message_id);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            RenderAction::Edit { message_id, text } => {
+                if throttle_edits && last_edit.elapsed() < config.max_edit_interval {
+                    // Throttled: the accumulated text stays in the renderer,
+                    // so a later edit (or the final flush) re-sends it whole.
+                    Ok(())
+                } else {
+                    match api.edit_message_text(chat_id, message_id, &text).await {
+                        Ok(_) => {
+                            *last_edit = Instant::now();
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+        };
+        if let Err(error) = result {
+            // The error text never contains the token (the client redacts
+            // URLs and the token is not part of any error payload).
+            tracing::warn!(event_type, "telegram delivery failed: {error}");
+            return false;
+        }
+    }
+    *cursor = seq;
+    if let Err(error) = advance_cursor(state, session_id, consumer, seq).await {
+        tracing::warn!("telegram delivery cursor advance failed: {error}");
+    }
+    true
+}
+
+/// Reads one delivery cursor row's `last_event_seq` (0 when absent).
+fn cursor_from_rows(data: &Value) -> Option<i64> {
+    data.get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(2))
+        .and_then(Value::as_i64)
+}
+
+async fn load_cursor(state: &AgentGatewayState, session_id: &str, consumer: &str) -> i64 {
+    let Some(persistence) = state.persistence() else {
+        return 0;
+    };
+    match persistence.delivery_get(session_id, consumer) {
+        Ok(data) => cursor_from_rows(&data).unwrap_or(0),
+        Err(error) => {
+            tracing::warn!("telegram delivery cursor read failed: {error}");
+            0
+        }
+    }
+}
+
+async fn advance_cursor(
+    state: &AgentGatewayState,
+    session_id: &str,
+    consumer: &str,
+    seq: i64,
+) -> Result<(), String> {
+    let Some(persistence) = state.persistence() else {
+        return Ok(());
+    };
+    persistence
+        .delivery_advance(session_id, consumer, seq)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Subscribes to the run's live delivery channel.
+fn subscribe_to_run(
+    state: &AgentGatewayState,
+    run_id: &str,
+) -> Option<broadcast::Receiver<GatewayEvent>> {
+    state
+        .store
+        .read()
+        .runs
+        .get(run_id)
+        .and_then(|run| run.sender.as_ref().map(|sender| sender.subscribe()))
+}
+
+/// Replays one run's retained events with seq >= after_seq. The durable
+/// path pages through `event.replay` and resumes from the retention floor
+/// when the requested cursor is too old (pruned events cannot be recovered;
+/// the caller filters already-delivered sequences).
+async fn replay_run_events(
+    state: &AgentGatewayState,
+    run_id: &str,
+    after_seq: i64,
+) -> Vec<(i64, String, Value)> {
+    let Some(persistence) = state.persistence() else {
+        let store = state.store.read();
+        return store
+            .runs
+            .get(run_id)
+            .map(|run| {
+                run.events
+                    .iter()
+                    .filter(|event| (event.seq as i64) >= after_seq)
+                    .map(|event| (event.seq as i64, event.event.clone(), event.data.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+    };
+    let mut events = Vec::new();
+    let mut after = after_seq;
+    loop {
+        let payload = json!({
+            "run_id": run_id,
+            "after_seq": after,
+            "max_events": 256,
+            "max_bytes": 65536,
+        });
+        match persistence.event_replay(&payload) {
+            Ok(data) => {
+                let rows = replay_rows(&data);
+                let truncated = data
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let last = rows.last().map(|(seq, _, _)| *seq);
+                events.extend(rows);
+                if !truncated {
+                    break;
+                }
+                let Some(last) = last else { break };
+                after = last;
+            }
+            Err(error) if error.code == "cursor_too_old" => {
+                // The cursor precedes the retention floor: resume from the
+                // oldest available sequence (the caller filters delivered
+                // ones below).
+                after = 1;
+            }
+            Err(error) => {
+                tracing::warn!("telegram event replay failed: {error}");
+                break;
+            }
+        }
+    }
+    events
+}
+
+/// Parses one `event.replay` page into (seq, event_type, data) rows.
+fn replay_rows(data: &Value) -> Vec<(i64, String, Value)> {
+    data.get("rows")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let seq = row.get(0)?.as_i64()?;
+                    let event_type = row.get(3)?.as_str()?.to_string();
+                    let payload = serde_json::from_str(row.get(4)?.as_str()?).ok()?;
+                    Some((seq, event_type, payload))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_message(
+        chat_id: i64,
+        chat_type: &str,
+        message_id: i64,
+        thread: Option<i64>,
+        text: Option<&str>,
+        from: Option<i64>,
+    ) -> TgMessage {
+        TgMessage {
+            message_id,
+            date: 1,
+            chat: TgChat {
+                id: chat_id,
+                chat_type: chat_type.to_string(),
+                title: None,
+            },
+            from: from.map(|id| TgUser {
+                id,
+                is_bot: false,
+                first_name: None,
+                username: None,
+            }),
+            text: text.map(ToOwned::to_owned),
+            message_thread_id: thread,
+            is_topic_message: thread.map(|_| true),
+        }
+    }
+
+    fn make_update(message: TgMessage) -> (TgUpdate, TgMessage) {
+        let update = TgUpdate {
+            update_id: 11,
+            message: Some(message.clone()),
+        };
+        (update, message)
+    }
+
+    #[test]
+    fn parse_command_recognizes_only_canonical_commands() {
+        assert_eq!(
+            parse_command("/new"),
+            (Some("new".to_string()), String::new())
+        );
+        assert_eq!(
+            parse_command("/stop@fixture_bot"),
+            (Some("stop".to_string()), String::new())
+        );
+        assert_eq!(
+            parse_command("/COMPACT"),
+            (Some("compact".to_string()), String::new())
+        );
+        assert_eq!(
+            parse_command("/status detail"),
+            (Some("status".to_string()), "detail".to_string())
+        );
+        assert_eq!(
+            parse_command("/unknown x"),
+            (None, "/unknown x".to_string())
+        );
+        assert_eq!(parse_command("hello"), (None, "hello".to_string()));
+    }
+
+    #[test]
+    fn envelope_maps_private_group_and_topic_chats_stably() {
+        let (update, message) = make_update(make_message(
+            555,
+            "private",
+            101,
+            None,
+            Some("hello"),
+            Some(555),
+        ));
+        let envelope =
+            envelope_from_message(&update, &message, "fixture_bot").expect("dm envelope");
+        assert_eq!(envelope.platform, "telegram");
+        assert_eq!(envelope.profile, "telegram");
+        assert_eq!(envelope.account_id, "fixture_bot");
+        assert_eq!(envelope.chat_id, "555");
+        assert_eq!(envelope.thread_id, None);
+        assert_eq!(envelope.user_id, "555");
+        assert_eq!(envelope.message_id, "555:101");
+        assert_eq!(envelope.content, "hello");
+        assert_eq!(
+            session_id_for("fixture_bot", 555, None),
+            "telegram:fixture_bot:555:"
+        );
+
+        let (update, message) = make_update(make_message(
+            -1001234,
+            "supergroup",
+            102,
+            Some(7),
+            Some("topic question"),
+            Some(555),
+        ));
+        let envelope =
+            envelope_from_message(&update, &message, "fixture_bot").expect("topic envelope");
+        assert_eq!(envelope.chat_id, "-1001234");
+        assert_eq!(envelope.thread_id.as_deref(), Some("7"));
+        assert_eq!(
+            session_id_for("fixture_bot", -1001234, Some(7)),
+            "telegram:fixture_bot:-1001234:7"
+        );
+
+        let (update, message) = make_update(make_message(
+            -1001234,
+            "supergroup",
+            103,
+            None,
+            Some("general question"),
+            Some(555),
+        ));
+        let envelope =
+            envelope_from_message(&update, &message, "fixture_bot").expect("general envelope");
+        assert_eq!(envelope.thread_id, None);
+        assert_eq!(
+            session_id_for("fixture_bot", -1001234, None),
+            "telegram:fixture_bot:-1001234:"
+        );
+        // The general topic and a named topic are different sessions; the
+        // same chat+thread is always the same session.
+        assert_ne!(
+            session_id_for("fixture_bot", -1001234, None),
+            session_id_for("fixture_bot", -1001234, Some(7))
+        );
+    }
+
+    #[test]
+    fn envelope_extracts_commands_and_ignores_non_text_or_senderless_messages() {
+        let (update, message) = make_update(make_message(
+            555,
+            "private",
+            104,
+            None,
+            Some("/new"),
+            Some(555),
+        ));
+        let envelope =
+            envelope_from_message(&update, &message, "fixture_bot").expect("command envelope");
+        assert_eq!(envelope.command.as_deref(), Some("new"));
+        assert_eq!(envelope.content, "");
+
+        let (update, message) = make_update(make_message(
+            555,
+            "private",
+            105,
+            None,
+            Some("   "),
+            Some(555),
+        ));
+        assert!(
+            envelope_from_message(&update, &message, "fixture_bot").is_none(),
+            "blank text is not user input"
+        );
+
+        let (update, message) =
+            make_update(make_message(555, "private", 106, None, Some("hello"), None));
+        assert!(
+            envelope_from_message(&update, &message, "fixture_bot").is_none(),
+            "senderless messages are not user input"
+        );
+    }
+
+    #[test]
+    fn dedup_windows_are_bounded_and_detect_duplicates() {
+        let mut dedup = DedupWindows::new(3);
+        assert!(!dedup.seen_update(1));
+        assert!(dedup.seen_update(1), "same update_id is a duplicate");
+        assert!(!dedup.seen_update(2));
+        assert!(!dedup.seen_update(3));
+        assert!(
+            !dedup.seen_update(4),
+            "the oldest entry fell out of the window"
+        );
+        assert!(dedup.seen_update(4));
+
+        assert!(!dedup.seen_message("555:101"));
+        assert!(dedup.seen_message("555:101"), "same message is a duplicate");
+        assert!(
+            !dedup.seen_message("555:102"),
+            "different messages are distinct"
+        );
+    }
+
+    #[test]
+    fn session_consumer_and_control_ids_are_deterministic() {
+        assert_eq!(session_id_for("b", 1, None), "telegram:b:1:");
+        assert_eq!(session_id_for("b", 1, Some(2)), "telegram:b:1:2");
+        assert_eq!(control_session_id("b"), "telegram-control:b");
+        assert_eq!(run_consumer("r1"), "telegram:run:r1");
+        assert_eq!(OFFSET_CONSUMER, "telegram:offset");
+    }
+}

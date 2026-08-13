@@ -37,7 +37,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::config::{AgentGatewayConfig, RateLimitConfig};
-use crate::domain::{input_text, timestamp, vm_value_to_json};
+use crate::domain::{fnv1a64, input_text, timestamp, vm_value_to_json};
 use crate::runtime::delivery::DiscardingSink;
 use crate::runtime::rss_runner::execute_rss_source;
 use crate::service::{AdmitError, SubscriberGuard, failed_payload};
@@ -1367,16 +1367,8 @@ fn job_payload(view: &JobView, now: u64) -> Value {
 
 /// FNV-1a 64-bit hash of the canonical idempotency payload. The `fnv64:`
 /// label matches the algorithm exactly, so persisted hashes stay
-/// unambiguous regardless of the platform's `DefaultHasher`.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
+/// unambiguous regardless of the platform's `DefaultHasher`. Shared with the
+/// Telegram adapter through `crate::domain::fnv1a64`.
 fn event_stream(
     history: Vec<GatewayEvent>,
     receiver: Option<broadcast::Receiver<GatewayEvent>>,

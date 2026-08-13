@@ -408,6 +408,8 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         result = storage_raw_ok(request_id, op, events::storage_delivery_cursor_get(db_id, input.session_id, input.consumer, command.max_rows, command.max_bytes));
     } else if command.op == "delivery.advance" {
         result = storage_raw_ok(request_id, op, events::storage_delivery_cursor_advance(db_id, command.payload_json));
+    } else if command.op == "delivery.set" {
+        result = storage_raw_ok(request_id, op, events::storage_delivery_cursor_set(db_id, command.payload_json));
     } else if command.op == "approval.request" {
         result = storage_unwrap(request_id, op, approvals::storage_approval_request(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "approval.get" {

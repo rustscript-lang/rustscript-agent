@@ -122,6 +122,20 @@ pub fn storage_delivery_cursor_get(db_id: int, session_id: string, consumer: str
     )
 }
 
+/// Monotonic unvalidated cursor upsert for values that are not run-event
+/// sequence numbers (for example the Telegram getUpdates offset). `advance`
+/// stays the validated path for per-run event delivery; `set` is the
+/// sibling command for transport-level cursors whose values are unrelated
+/// to `run_events.seq`.
+pub fn storage_delivery_cursor_set(db_id: int, payload_json: string) -> map {
+    let input: CursorInput = json::decode::<CursorInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "INSERT INTO delivery_cursors (session_id, consumer, last_event_seq, updated_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (session_id, consumer) DO UPDATE SET last_event_seq = MAX(delivery_cursors.last_event_seq, excluded.last_event_seq), updated_at_ms = excluded.updated_at_ms",
+        [&input.session_id, &input.consumer, input.event_seq.copy(), input.now_ms.copy()]
+    )
+}
+
 pub fn storage_delivery_cursor_advance(db_id: int, payload_json: string) -> map {
     let input: CursorInput = json::decode::<CursorInput>(payload_json);
     sqlite::execute(

@@ -361,6 +361,59 @@ impl GatewayPersistence {
         self.command_data("run.get", &json!({ "run_id": run_id }))
     }
 
+    pub fn session_get(&self, session_id: &str) -> Result<Value, StorageError> {
+        self.command_data("session.get", &json!({ "session_id": session_id }))
+    }
+
+    /// Reads one delivery cursor row (`session_id`, `consumer`,
+    /// `last_event_seq`, `updated_at_ms`); an empty `rows` array means no
+    /// cursor was ever persisted for the consumer.
+    pub fn delivery_get(&self, session_id: &str, consumer: &str) -> Result<Value, StorageError> {
+        self.command_data(
+            "delivery.get",
+            &json!({ "session_id": session_id, "consumer": consumer }),
+        )
+    }
+
+    /// Monotonic validated cursor advance for run-event delivery: the value
+    /// must not exceed the session's high-water event sequence.
+    pub fn delivery_advance(
+        &self,
+        session_id: &str,
+        consumer: &str,
+        event_seq: i64,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "delivery.advance",
+            &json!({
+                "session_id": session_id,
+                "consumer": consumer,
+                "event_seq": event_seq,
+                "now_ms": timestamp() as i64,
+            }),
+        )
+    }
+
+    /// Monotonic unvalidated cursor upsert for transport-level values (for
+    /// example the Telegram getUpdates offset) that are unrelated to run
+    /// event sequences.
+    pub fn delivery_set(
+        &self,
+        session_id: &str,
+        consumer: &str,
+        value: i64,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "delivery.set",
+            &json!({
+                "session_id": session_id,
+                "consumer": consumer,
+                "event_seq": value,
+                "now_ms": timestamp() as i64,
+            }),
+        )
+    }
+
     /// Replays one run's retained events with precise
     /// oldest/high-water cursors (`cursor_too_old` below the floor).
     pub fn event_replay(&self, payload: &Value) -> Result<Value, StorageError> {

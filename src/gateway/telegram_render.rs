@@ -52,7 +52,12 @@ impl EventRenderer {
         match event_type {
             "model.delta" => self.on_delta(delta_text(data)),
             "message.delta" => {
-                self.on_delta(delta_text(data));
+                // The service-owned terminal message is the authoritative
+                // final assistant text; it replaces any accumulated deltas.
+                let delta = delta_text(data);
+                if !delta.is_empty() {
+                    self.current_text = delta;
+                }
                 self.flush()
             }
             "tool.requested" => send_line(&format!("[tool] {} requested", tool_name(data))),
@@ -210,6 +215,8 @@ fn error_message(data: &Value) -> String {
     data.get("error_message")
         .or_else(|| data.get("message"))
         .or_else(|| data.get("error"))
+        .or_else(|| data.get("error_code"))
+        .or_else(|| data.get("recovery_reason"))
         .and_then(Value::as_str)
         .unwrap_or("run failed")
         .to_string()
@@ -266,14 +273,14 @@ mod tests {
             }],
             "later deltas edit the same message"
         );
-        let actions = renderer.on_event("message.delta", &json!({"delta": "!"}));
+        let actions = renderer.on_event("message.delta", &json!({"delta": "final"}));
         assert_eq!(
             actions,
             vec![RenderAction::Edit {
                 message_id: 41,
-                text: "Hello!".to_string()
+                text: "final".to_string()
             }],
-            "the terminal message delta flushes the final text"
+            "the terminal message delta replaces the deltas with the final text"
         );
         assert_eq!(renderer.flush(), Vec::new(), "nothing left to flush");
     }
