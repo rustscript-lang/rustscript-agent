@@ -1,15 +1,17 @@
 //! Canonical domain contracts shared by the service, gateways, and RSS.
 //!
-//! This module freezes the agent contracts (gateway-api plan sections 4.1 and
-//! 4.2): the inbound platform envelope and the structured run context. The
-//! run context is rendered as the sole argument of the exported
-//! `run(context)` callable; scripts receive no ambient input. JSON/VM value
-//! conversions and the canonical timestamp also live here so no gateway
-//! module re-implements them.
+//! This module freezes the agent contracts (gateway-api plan sections 4.1,
+//! 4.2, 4.4, and 4.5): the inbound platform envelope, the structured run
+//! context, the canonical provider request/event model, and the tool
+//! descriptor. The run context is rendered as the sole argument of the
+//! exported `run(context)` callable; scripts receive no ambient input.
+//! JSON/VM value conversions and the canonical timestamp also live here so no
+//! gateway module re-implements them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustscript_vm::Value as VmValue;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Milliseconds since the Unix epoch; the canonical agent timestamp.
@@ -20,12 +22,40 @@ pub(crate) fn timestamp() -> u64 {
         .as_millis() as u64
 }
 
+/// Canonical inbound platform envelope (gateway-api plan section 4.1).
+///
+/// Platform adapters normalize inbound data into this envelope; the default
+/// session identity derives from `(profile, platform, account_id, chat_id,
+/// thread_id)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InboundEnvelope {
+    pub platform: String,
+    pub account_id: String,
+    pub chat_id: String,
+    pub thread_id: Option<String>,
+    pub user_id: String,
+    pub message_id: String,
+    pub session_hint: Option<String>,
+    pub content: InboundContent,
+    pub command: Option<String>,
+    pub reply_to: Option<String>,
+    pub received_at: u64,
+    pub metadata: Value,
+}
+
+/// Text/attachment content carried by an inbound envelope.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InboundContent {
+    pub text: String,
+    pub attachments: Vec<Value>,
+}
+
 /// Canonical agent run context (gateway-api plan section 4.2).
 ///
 /// The exact structured context is passed to the exported RSS `run(context)`
 /// callable as one ordinary argument. AgentService resolves the session/run
 /// state and fills this struct; [`RunContext::to_vm_value`] renders it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunContext {
     pub run_id: String,
     pub session_id: String,
@@ -36,6 +66,10 @@ pub struct RunContext {
     pub system_prompt: Option<String>,
     pub model: String,
     pub provider: Option<String>,
+    pub provider_options: Value,
+    pub tool_schemas: Value,
+    pub limits: Value,
+    pub metadata: Value,
 }
 
 impl RunContext {
@@ -43,7 +77,10 @@ impl RunContext {
     pub fn to_vm_value(&self) -> VmValue {
         VmValue::map(vec![
             (VmValue::string("run_id"), VmValue::string(&self.run_id)),
-            (VmValue::string("session_id"), VmValue::string(&self.session_id)),
+            (
+                VmValue::string("session_id"),
+                VmValue::string(&self.session_id),
+            ),
             (
                 VmValue::string("parent_run_id"),
                 self.parent_run_id
@@ -52,10 +89,7 @@ impl RunContext {
                     .unwrap_or(VmValue::Null),
             ),
             (VmValue::string("platform"), VmValue::string(&self.platform)),
-            (
-                VmValue::string("input"),
-                json_to_vm_value(&self.input),
-            ),
+            (VmValue::string("input"), json_to_vm_value(&self.input)),
             (
                 VmValue::string("messages"),
                 json_to_vm_value(&self.messages),
@@ -75,8 +109,106 @@ impl RunContext {
                     .map(VmValue::string)
                     .unwrap_or(VmValue::Null),
             ),
+            (
+                VmValue::string("provider_options"),
+                json_to_vm_value(&self.provider_options),
+            ),
+            (
+                VmValue::string("tool_schemas"),
+                json_to_vm_value(&self.tool_schemas),
+            ),
+            (VmValue::string("limits"), json_to_vm_value(&self.limits)),
+            (
+                VmValue::string("metadata"),
+                json_to_vm_value(&self.metadata),
+            ),
         ])
     }
+}
+
+/// Canonical provider request model (gateway-api plan section 4.4). RSS
+/// provider adapters map wire formats to this shape; this struct is the
+/// frozen contract, not a parser.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmRequest {
+    pub model: String,
+    pub messages: Vec<LlmMessage>,
+    pub tools: Vec<ToolDescriptor>,
+    pub tool_choice: Option<Value>,
+    pub reasoning: Option<Value>,
+    pub sampling: Option<Sampling>,
+    pub max_output_tokens: Option<u32>,
+    pub stream: bool,
+    pub provider_options: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmMessage {
+    pub role: String,
+    pub content: Vec<LlmContentBlock>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmContentBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sampling {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+}
+
+/// Canonical provider event model (gateway-api plan section 4.4): deltas,
+/// tool calls, and completion markers carry the run/session identity and a
+/// per-run sequence assigned by the agent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub tool_call: Option<ToolCall>,
+    pub created_at: u64,
+}
+
+/// One model-requested tool call (gateway-api plan section 4.4).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+/// Tool descriptor contract (gateway-api plan section 4.5): name,
+/// description, JSON schema, toolset, and risk class. Native capability
+/// policy remains the hard upper bound for any mapped generic capability.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub toolset: String,
+    pub risk_class: String,
+    pub schema: Value,
+}
+
+/// Canonical event envelope attached to one run (gateway-api plan section
+/// 4.3): AgentService assigns the durable event identity, the monotonic
+/// per-run sequence, and the timestamp.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentEventEnvelope {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub status: String,
+    pub output: Option<Value>,
+    pub error: Option<Value>,
+    pub created_at: u64,
 }
 
 /// Converts one JSON value into a VM value (mirror of `vm_value_to_json`).

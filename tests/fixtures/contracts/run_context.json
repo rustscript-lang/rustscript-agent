@@ -1,0 +1,15 @@
+{
+  "run_id": "run-fixture",
+  "session_id": "session-fixture",
+  "parent_run_id": null,
+  "platform": "api_server",
+  "input": "hello from fixture",
+  "messages": [],
+  "system_prompt": null,
+  "model": "local-agent",
+  "provider": "local-agent",
+  "provider_options": {},
+  "tool_schemas": [],
+  "limits": {"max_events": 240, "timeout_ms": 900000, "max_event_bytes": 32768},
+  "metadata": {}
+}

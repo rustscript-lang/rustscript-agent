@@ -14,7 +14,10 @@ pub mod runtime;
 pub mod service;
 
 pub use config::AgentGatewayConfig;
-pub use domain::RunContext;
+pub use domain::{
+    AgentEventEnvelope, InboundContent, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage,
+    LlmRequest, RunContext, Sampling, ToolCall, ToolDescriptor,
+};
 pub use gateway::{AgentGatewayState, build_agent_gateway_app};
 pub use gateway::store::GatewayPersistence;
 pub use runtime::rss_runner::{

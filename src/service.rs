@@ -581,7 +581,14 @@ impl AgentService {
     /// the terminal commit.
     pub async fn run_worker(self: Arc<Self>, run_id: String, input: String) {
         tokio::task::yield_now().await;
-        let Some(handle) = self.inner.runs.lock().expect("runs lock").get(&run_id).cloned() else {
+        let Some(handle) = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(&run_id)
+            .cloned()
+        else {
             return;
         };
         let session_id = {
@@ -633,9 +640,7 @@ impl AgentService {
             let outcome = match tokio::time::timeout(run_timeout, &mut worker).await {
                 Ok(Ok(Ok(value))) => WorkerOutcome::Completed(value),
                 Ok(Ok(Err(error))) => WorkerOutcome::from_run_error(error),
-                Ok(Err(error)) => {
-                    WorkerOutcome::Failed(format!("RSS worker join failed: {error}"))
-                }
+                Ok(Err(error)) => WorkerOutcome::Failed(format!("RSS worker join failed: {error}")),
                 Err(_) => {
                     // The timeout is authoritative: cancel with the typed
                     // deadline reason and wait only the configured grace for
@@ -1001,6 +1006,16 @@ impl AgentService {
             system_prompt,
             model,
             provider,
+            // Provider options and tool schemas arrive with the provider and
+            // tool milestones; the canonical shape is present from the start.
+            provider_options: JsonValue::Object(Default::default()),
+            tool_schemas: JsonValue::Array(Vec::new()),
+            limits: json!({
+                "max_events": self.inner.config.max_events_per_run,
+                "max_event_bytes": self.inner.config.max_event_bytes,
+                "timeout_ms": self.inner.config.run_timeout.as_millis(),
+            }),
+            metadata: JsonValue::Object(Default::default()),
         };
         context.to_vm_value()
     }

@@ -2445,3 +2445,83 @@ async fn idempotent_run_replay_uses_the_single_api_chat_scope() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+
+
+#[tokio::test]
+async fn live_run_context_carries_the_full_canonical_shape() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> map { input; }",
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"shape"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    assert!(
+        text.contains("run.completed"),
+        "the run must complete and echo its context, got: {text}"
+    );
+    for key in [
+        "run_id",
+        "session_id",
+        "parent_run_id",
+        "platform",
+        "input",
+        "messages",
+        "system_prompt",
+        "model",
+        "provider",
+        "provider_options",
+        "tool_schemas",
+        "limits",
+        "metadata",
+    ] {
+        assert!(
+            text.contains(key),
+            "the live run context must carry the canonical {key} field"
+        );
+    }
+}
+
+#[tokio::test]
+async fn service_owned_terminal_events_emitted_by_scripts_are_rejected() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "run.completed", "output": "spoofed"});
+            "done";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input":"spoof"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id");
+    let text = read_run_events(&app, run_id).await;
+    assert!(
+        text.contains("run.failed") && text.contains("invalid_event_schema"),
+        "a script-emitted service-owned terminal must fail the run with the typed code, got: {text}"
+    );
+    assert!(
+        !text.contains("event: run.completed"),
+        "no script-owned terminal may be committed, got: {text}"
+    );
+}
