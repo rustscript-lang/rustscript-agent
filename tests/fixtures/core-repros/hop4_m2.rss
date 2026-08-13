@@ -1,0 +1,40 @@
+// m2: hop2 + SAME-MODULE helper called at top level of complete.
+use json;
+use bytes;
+use http;
+use self::chain_m1 as types;
+
+struct WireMessage {
+    role: string,
+    content: string?
+}
+
+pub fn call(request: map, profile: map) -> map {
+    let stream: bool = false;
+    if stream => {
+        { kind: "stream" }
+    } else => {
+        dispatch(profile, request)
+    }
+}
+
+fn dispatch(profile: map, request: map) -> map {
+    let base_url: string = types::request_string(profile, "base_url");
+    let api_key: string = types::request_string(profile, "api_key");
+    let provider: string = types::request_string(profile, "provider");
+    complete(request, base_url, api_key, provider)
+}
+
+fn complete(request: map, base_url: string, api_key: string, provider: string) -> map {
+    let model: string = types::request_string(request, "model");
+    let body_text: string = local_helper(request, model, false);
+    if model == "" => {
+        { kind: "missing" }
+    } else => {
+        { kind: "ok", body: body_text, url: base_url, provider: provider }
+    }
+}
+
+fn local_helper(request: map, model: string, stream: bool) -> string {
+    "stub"
+}

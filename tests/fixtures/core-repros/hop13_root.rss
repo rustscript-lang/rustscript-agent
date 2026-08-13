@@ -1,0 +1,8 @@
+// Root for hop13_m2.
+use self::hop13_m2 as adapter;
+
+pub fn run(context: map) -> map {
+    let request: map = context["request"];
+    let profile: map = context["profile"];
+    adapter::call(request, profile)
+}

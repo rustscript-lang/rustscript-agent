@@ -1,0 +1,10 @@
+// Variant: annotated let with LITERAL RHS inside expression-if else branch
+pub fn run(context: map) -> map {
+    let model: string = context["model"];
+    if model == "" => {
+        { text: "" }
+    } else => {
+        let body_text: string = "literal";
+        { text: body_text }
+    }
+}

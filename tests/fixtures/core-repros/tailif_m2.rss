@@ -1,0 +1,30 @@
+// m2: expression-if as TAIL expression with let+call in branch.
+use self::chain_m1 as types;
+
+pub fn call(request: map) -> map {
+    let first: map = types::request_map(request, "first");
+    let stop_reason: string = types::request_string(first, "finish_reason");
+    let usage: map = types::request_map(first, "usage");
+    let usage_input: int = types::request_int(usage, "prompt_tokens", 0);
+    let usage_output: int = types::request_int(usage, "completion_tokens", 0);
+    let usage_total: int = types::request_int(usage, "total_tokens", 0);
+    let message: map = types::request_map(first, "message");
+    if first.has("message") => {
+        let tool_calls: array = types::request_array(message, "tool_calls");
+        chat_parse_message(message, stop_reason, usage_input, usage_output, usage_total, tool_calls, "p")
+    } else => {
+        { kind: "missing" }
+    }
+}
+
+fn chat_parse_message(
+    message: map,
+    stop_reason: string,
+    usage_input: int,
+    usage_output: int,
+    usage_total: int,
+    tool_calls: array,
+    provider: string
+) -> map {
+    { kind: "ok", calls: tool_calls.length, provider: provider }
+}

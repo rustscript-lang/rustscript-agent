@@ -561,7 +561,6 @@ pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), V
         "json::encode",
         "json::decode",
         "stream::emit",
-        "bytes::from_utf8",
         "bytes::to_utf8",
         "sqlite::open",
         "sqlite::execute",
@@ -572,7 +571,6 @@ pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), V
         "sqlite::truncated",
         "sqlite::next_cursor",
         "http::client::request",
-        "http::client::sse",
     ] {
         registry.allow_builtin(name)?;
     }

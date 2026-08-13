@@ -1,0 +1,12 @@
+// let-with-annotation INSIDE an expression-if else branch
+use json;
+
+pub fn run(context: map) -> map {
+    let model: string = context["model"];
+    if model == "" => {
+        { text: "" }
+    } else => {
+        let body_text: string = json::encode({ a: 1 });
+        { text: body_text }
+    }
+}

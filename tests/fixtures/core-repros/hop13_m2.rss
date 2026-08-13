@@ -1,0 +1,34 @@
+// m2: dispatch reads strings from param[1] (request), passes param[0] (profile) onward.
+use json;
+use bytes;
+use http;
+use self::chain_m1 as types;
+
+struct WireMessage {
+    role: string,
+    content: string?
+}
+
+pub fn call(request: map, profile: map) -> map {
+    let stream: bool = false;
+    if stream => {
+        { kind: "stream" }
+    } else => {
+        dispatch(profile, request)
+    }
+}
+
+fn dispatch(profile: map, request: map) -> map {
+    let model: string = types::request_string(request, "model");
+    complete(profile, "u", "k", "p")
+}
+
+fn complete(request: map, base_url: string, api_key: string, provider: string) -> map {
+    let model: string = types::request_string(request, "model");
+    let result: map = if model == "" => {
+        { kind: "missing" }
+    } else => {
+        { kind: "ok", url: base_url, key: api_key, provider: provider }
+    };
+    result
+}

@@ -1,0 +1,7 @@
+// Root for tailif_m2.
+use self::tailif_m2 as adapter;
+
+pub fn run(context: map) -> map {
+    let request: map = context["request"];
+    adapter::call(request)
+}

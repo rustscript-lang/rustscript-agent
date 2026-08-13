@@ -13,17 +13,25 @@
 //! from adapter modules whose layout matches `rss/llm/openai_chat.rss`
 //! (multiple maps, cross-module accessor results, same-module helpers).
 //! At runtime the VM fails the callable argument/return schema guard with
-//! `Invocation(Vm(TypeMismatch("callable argument schema")))` or
-//! `TypeMismatch("string")` even though every value is correctly typed.
+//! `Invocation(Vm(TypeMismatch("callable argument schema")))`,
+//! `TypeMismatch("callable return schema")`, or `TypeMismatch("string")`
+//! even though every value is correctly typed. The streaming suites are
+//! additionally blocked because the frontend availability pass rejects
+//! closures that assign to captured locals (`local 'x' was moved earlier`),
+//! so an `http::client::sse` callback cannot aggregate deltas into a shared
+//! accumulator; `http::client::sse` is therefore not exposed in the
+//! restricted registry.
 //!
 //! Minimal repros and the exact commands are recorded in
-//! `plans/2026-08-13_a3-provider-core-blocker.md`. One trigger is avoided in
-//! the adapter source already (two-map functions must string-read only their
-//! SECOND map parameter; see `openai_chat_complete_dispatch`), but the
+//! `plans/2026-08-13_a3-provider-core-blocker.md`; the committed, executable
+//! repro set lives in `tests/fixtures/core-repros/` and is driven by
+//! `tests/core_repro_driver.rs` (ignored by default). One trigger is avoided
+//! in the adapter source already (two-map functions must string-read only
+//! their SECOND map parameter; see `openai_chat_complete_dispatch`), but the
 //! remaining corruption is module-layout dependent and cannot be worked
-//! around from this repository. The single non-blocked suite
-//! (`openai_chat_provider_error_is_structured`) runs green; it covers the
-//! structured provider-error mapping criterion end to end.
+//! around from this repository. Two suites run green: the structured
+//! provider-error mapping (`openai_chat_provider_error_is_structured`) and
+//! the P1 standard-wire guard (`openai_chat_wire_format_is_standard`).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -483,6 +491,56 @@ fn openai_chat_provider_error_is_structured() {
     );
 }
 
+/// P1 wire-format guard: the recorded request must carry the standard OpenAI
+/// chat-completions wire shape (user `content` as a parts array, tool/assistant
+/// content as plain strings, no custom `content_parts` field, tool schemas
+/// spliced in place, `tool_choice` not an empty string). The fixture replies
+/// 400 so the run follows the already-green error path; the wire is built and
+/// recorded before the response is parsed, which keeps this assertion
+/// independent of the core-blocked response-parse path.
+#[test]
+fn openai_chat_wire_format_is_standard() {
+    let body = read_fixture("openai_chat/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+
+    assert!(
+        !recorded.body.contains("content_parts"),
+        "wire must not contain the custom content_parts field: {}",
+        recorded.body
+    );
+    assert_eq!(wire["messages"][0]["role"], json!("user"));
+    assert_eq!(wire["messages"][0]["content"][0]["type"], json!("text"));
+    assert_eq!(wire["messages"][0]["content"][0]["text"], json!("hello"));
+    assert_eq!(wire["messages"][1]["role"], json!("tool"));
+    assert_eq!(wire["messages"][1]["tool_call_id"], json!("call_ab12"));
+    assert_eq!(wire["messages"][1]["content"], json!("ok"));
+    assert_eq!(wire["messages"][2]["role"], json!("assistant"));
+    assert_eq!(
+        wire["messages"][2]["content"],
+        json!("Let me read the file.")
+    );
+    assert_eq!(
+        wire["messages"][2]["tool_calls"][0]["function"]["arguments"],
+        json!("{\"path\":\"README.md\"}")
+    );
+    assert_eq!(
+        wire["tools"][0]["function"]["parameters"]["required"][0],
+        json!("path")
+    );
+    assert_eq!(wire["tool_choice"], json!(null), "{wire}");
+}
+
 #[ignore = "core callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_malformed_payload_is_typed() {
@@ -541,12 +599,18 @@ fn openai_chat_invalid_json_fails_as_typed_invocation_error() {
 // S2: OpenAI Chat Completions, streaming (http::client::sse)
 // ---------------------------------------------------------------------------
 //
-// The streaming adapter (`openai_chat_stream`) is not implemented yet, and
-// any implementation must call through the same corrupted callable-schema
-// paths as the buffered adapter (see the module doc), so these tests are
-// ignored until the core blocker clears.
+// The streaming adapter (`openai_chat_stream`) is not implemented. Two
+// independent core-side blockers keep it out of agent reach in this revision:
+// (1) the frontend availability pass rejects closures that assign to captured
+// locals (`local 'x' was moved earlier`), so an SSE callback cannot aggregate
+// text deltas into a shared accumulator map; (2) the runtime callable-schema
+// corruption documented above would also hit any parse helper called from the
+// adapter module. `http::client::sse` is therefore not exposed in the
+// restricted registry. These tests stay ignored until the core clears.
+// Minimal repros: `tests/fixtures/core-repros/` (committed, independently
+// runnable via `tests/core_repro_driver.rs`, ignored).
 
-#[ignore = "core callable-schema corruption + openai_chat_stream not implemented (see module doc)"]
+#[ignore = "core: closure capture assignment rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_text_and_usage() {
     let events = sse_events(&read_fixture("openai_chat/stream.sse"));
@@ -577,7 +641,7 @@ fn openai_chat_stream_text_and_usage() {
     assert_eq!(wire["stream_options"]["include_usage"], json!(true));
 }
 
-#[ignore = "core callable-schema corruption + openai_chat_stream not implemented (see module doc)"]
+#[ignore = "core: closure capture assignment rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_tool_call_chunk_aggregation() {
     let events = sse_events(&read_fixture("openai_chat/stream_tools.sse"));
@@ -607,7 +671,7 @@ fn openai_chat_stream_tool_call_chunk_aggregation() {
     assert_eq!(wire["stream"], json!(true));
 }
 
-#[ignore = "core callable-schema corruption + openai_chat_stream not implemented (see module doc)"]
+#[ignore = "core: closure capture assignment rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_cancellation_is_typed() {
     let events = sse_events(&read_fixture("openai_chat/stream.sse"));
@@ -643,4 +707,114 @@ fn openai_chat_stream_cancellation_is_typed() {
         ),
         "expected a typed cancellation, got {error:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// S3: OpenAI Responses adapter (blocked references)
+// ---------------------------------------------------------------------------
+//
+// `openai_responses.rss` is a typed `not_implemented` stub. The buffered and
+// streaming transcripts under `tests/fixtures/providers/openai_responses/`
+// document the wire contract; these tests stay ignored until the adapter is
+// implemented AND the core callable-schema corruption (module doc) clears.
+// The streaming transcript is data-only SSE (no `event:` prefix lines),
+// matching the real Responses API transport.
+
+#[ignore = "openai_responses adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[test]
+fn openai_responses_buffered_transcript_is_referenced() {
+    let body = read_fixture("openai_responses/response.json");
+    let (port, _requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    assert_eq!(result["error"]["code"], json!("not_implemented"));
+}
+
+#[ignore = "openai_responses adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[test]
+fn openai_responses_stream_transcript_is_data_only_and_referenced() {
+    let events = sse_events(&read_fixture("openai_responses/stream.sse"));
+    assert!(
+        !events.iter().any(|event| event.contains("event:")),
+        "Responses stream fixture must be data-only SSE (no event: lines)"
+    );
+    assert!(
+        events.iter().all(|event| event.starts_with("data:")),
+        "Responses stream fixture events must start with data:"
+    );
+    assert!(events.last().unwrap_or(&String::new()).contains("[DONE]"));
+
+    let (port, _requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    assert_eq!(result["error"]["code"], json!("not_implemented"));
+}
+
+// ---------------------------------------------------------------------------
+// S4: Anthropic Messages adapter (blocked references)
+// ---------------------------------------------------------------------------
+//
+// `anthropic_messages.rss` is a typed `not_implemented` stub. The buffered and
+// streaming transcripts under `tests/fixtures/providers/anthropic/` document
+// the wire contract; these tests stay ignored until the adapter is
+// implemented AND the core callable-schema corruption (module doc) clears.
+
+#[ignore = "anthropic_messages adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[test]
+fn anthropic_messages_buffered_transcript_is_referenced() {
+    let body = read_fixture("anthropic/response.json");
+    let (port, _requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    assert_eq!(result["error"]["code"], json!("not_implemented"));
+}
+
+#[ignore = "anthropic_messages adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[test]
+fn anthropic_messages_stream_transcript_is_referenced() {
+    let events = sse_events(&read_fixture("anthropic/stream.sse"));
+    let (port, _requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    assert_eq!(result["error"]["code"], json!("not_implemented"));
 }

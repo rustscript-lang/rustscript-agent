@@ -1,6 +1,6 @@
 # A3 Provider Adapter Core Blocker
 
-Date: 2026-08-13
+Date: 2026-08-13 (updated 2026-08-13 after agent-side review pass)
 Branch: `scope/agent-a3`
 Core checkout: `/mnt/TEMP/rustscript/agent-roadmap/rustscript` at `plan/callable-stream-integration` (06b37fd)
 
@@ -8,10 +8,11 @@ Core checkout: `/mnt/TEMP/rustscript/agent-roadmap/rustscript` at `plan/callable
 
 A3 "shared adapters handle non-stream/stream text, tool calls, usage, reasoning
 fields, provider errors, and cancellation; profiles reuse adapters without
-copied parsers" is **partially blocked** by a core compiler defect. One test
-suite (`openai_chat_provider_error_is_structured`) is green; the remaining
-non-stream suites and all streaming work are `#[ignore]`d until the core is
-fixed (see `tests/provider_tests.rs` module doc).
+copied parsers" is **partially blocked** by core compiler defects. Two suites
+are green (`openai_chat_provider_error_is_structured` and the P1 wire-format
+guard `openai_chat_wire_format_is_standard`); the remaining non-stream suites
+and all streaming work are `#[ignore]`d until the core is fixed (see
+`tests/provider_tests.rs` module doc).
 
 ## Symptom
 
@@ -31,7 +32,7 @@ operand against the compiler-emitted `TypeSchema::Callable` prototype schema.
 The emitted schemas are corrupted (wrong parameter shapes/counts, wrong
 return schemas) for a subset of call sites in non-root modules.
 
-## Verified, avoidable trigger (already worked around in the adapter)
+## Verified, avoidable trigger (worked around in the adapter)
 
 In a function with **two map parameters**, string-reading fields of the
 **first** map parameter and passing the **second** map onward to another
@@ -40,9 +41,8 @@ map parameter instead is safe.
 
 Repro: `hop4_m2.rss` fails; `hop13_m2.rss` (identical except the read moves
 to the second map parameter) passes.
-Repro files: `/mnt/TEMP/rustscript/scratch-a3/repro/hop4_m2.rss`,
-`hop13_m2.rss` (plus `chain_m1.rss` accessor module and `hop*_root.rss`
-drivers).
+Repro files: `tests/fixtures/core-repros/hop4_m2.rss`, `hop13_m2.rss` (plus
+`chain_m1.rss` accessor module and `hop*_root.rss` drivers).
 
 Workaround applied: `openai_chat_complete_dispatch(request, profile)` and
 `openai_chat_stream_dispatch(request, profile)` read profile fields from the
@@ -67,7 +67,7 @@ use self::chain_m1 as types;
 pub fn run(context: map) -> map {
     let request: map = context["request"];
     let tools: array = types::request_array(request, "tools");
-    let body: string = splice("{}", tools);
+    let body: string = splice("{", tools);
     { kind: "ok", body: body }
 }
 
@@ -79,35 +79,75 @@ fn splice(body: string, tools: array) -> string {
 `root_splice2.rss` (same call with a literal `[]` argument) passes, which
 isolates the trigger to the cross-module array value.
 
-Additional compile-time limitations of the same revision (worked around in
-the adapter source):
+## Verified stream blocker (closure capture, independent of layout)
+
+The pure-text stream path (`http::client::sse` callback aggregating text
+deltas, usage, `[DONE]`) cannot be expressed in this core revision: the
+frontend availability pass rejects closures that **assign to a captured
+local** (`local 'state' was moved earlier; use 'state.copy()' ...`), because
+any assignment inside a closure body forces `CaptureBindingMode::Move` for
+the captured slot. This is a compile-time rejection, independent of module
+layout — even a root-module probe fails identically. There is no shared
+accumulator mechanism left for the callback, so `openai_chat_stream` stays a
+typed `not_implemented` stub and `http::client::sse` is **not exposed** in
+the restricted registry (it has no consumer). The core test suite proves the
+SSE transport itself works; only the script-side aggregation pattern is
+unavailable.
+
+## Additional compile-time limitations of the same revision (worked around in the adapter source)
 
 - Annotated `let` statements whose initializer type the checker cannot prove
   (`json::encode` results, literals inside branches, same-module helpers) are
   rejected when placed inside expression-if branches
-  (`json_enc_e.rss`, `letif_a.rss`) or in the branch of a **tail**
-  expression-if (`tailif_m2.rss`). Statement-if bodies are fine.
+  (`tests/fixtures/core-repros/json_enc_e.rss`, `letif_a.rss`) or in the
+  branch of a tail expression-if (`tailif_m2.rss`). Statement-if bodies are
+  fine.
 - `bytes::to_utf8` requires a concretely typed argument; annotate the body
-  local as `bytes` first (`bytes_b.rss` fails, `bytes_a.rss` passes).
+  local as `bytes` first.
+
+## Green survival call sites (verified end to end)
+
+The following paths run green on the current core HEAD with the production
+adapter module, so any future core fix must keep them working:
+
+- Wire building: `chat_build_wire` → `chat_build_messages` /
+  `chat_append_message_by_role` / `chat_append_user_message` /
+  `chat_append_assistant_message` / `chat_build_tools`, including
+  cross-module accessor calls inside `while` bodies, expression-if dispatch
+  branches, struct literals, `json::encode` at function top level, and the
+  tool-schema / user-parts string splices (`chat_splice_tool_schemas`,
+  `chat_splice_user_parts`).
+- Standard wire shape (P1): user messages emit `content` as a parts array via
+  marker splice (`__RSS_USER_PARTS_<i>__`), tool/assistant messages carry
+  plain strings, `tool_choice` is omitted when empty. Verified by
+  `openai_chat_wire_format_is_standard` on the 400-error path (wire is built
+  and recorded before error parsing, so the assertion is independent of the
+  blocked response-parse path).
+- Structured provider errors: `chat_parse_error` / `chat_error_payload`
+  (status/type/code/param/message/request_id mapping) — verified end to end
+  by `openai_chat_provider_error_is_structured`.
+- Content parsing helper `chat_message_text` accepts both a plain string and
+  an array of `{type, text}` / `{type, output_text}` parts (used by
+  `chat_parse_message`; the surrounding parse path remains blocked).
 
 ## Exact commands
 
 ```bash
-# Core blocker repro (runtime): compile + run root_splice.rss through the agent runner
+# Core blocker repro (runtime): compile + run the committed repro set
 cd /mnt/TEMP/rustscript/agent-roadmap/a3
 CARGO_TARGET_DIR=/mnt/TEMP/rustscript/agent-roadmap/target-a3 \
-  cargo test --test blocker_repro7_tmp -- --nocapture   # (temp driver, deleted before commit)
-# Expect:
-#   ROOTSPLICE root_splice:   Err(Invocation(Vm(TypeMismatch("callable return schema"))))
-#   ROOTSPLICE root_splice2:  Ok(...)   # literal-array control passes
+  cargo test --test core_repro_driver -- --ignored --nocapture
+# Expect: 7 passed; root_splice/hop4 fail with typed TypeMismatch,
+#         root_splice2/hop13 pass as controls, compile-time repros rejected.
 #
-# Full adapter flow: the four ignored suites fail at runtime with the same family:
+# Full adapter flow: the ignored suites fail at runtime with the same family:
 cargo test --test provider_tests -- --ignored
 ```
 
-The repro sources live under `/mnt/TEMP/rustscript/scratch-a3/repro/`
-(`chain_m1.rss` provides the accessor module; `hop*`, `fullchain*`,
-`splice*`, `tailif*`, `letif*`, `bytes_*`, `json_enc_*` cover each trigger).
+The repro sources live in `tests/fixtures/core-repros/` (`chain_m1.rss`
+provides the accessor module; `hop*`, `root_splice*`, `tailif*`, `letif*`,
+`json_enc_e` cover each trigger) and are independently runnable through
+`tests/core_repro_driver.rs` (ignored by default, documented in its header).
 
 ## Core unblock conditions
 
@@ -122,25 +162,34 @@ modules. Concretely:
    the callee's return schema (`TypeMismatch("callable return schema")`).
 3. Annotated lets inside expression-if branches must resolve to their
    declared schema (strict-typing rejection).
+4. Closures must be allowed to assign to captured locals without forcing
+   `Move` on the source (or an equivalent shared-accumulator mechanism must
+   exist), to unblock the SSE callback aggregation pattern.
 
 ## What is committed and green
 
 - `rss/llm/types.rss` — canonical contract (request accessors, response/error
   builders, call results).
-- `rss/llm/openai_chat.rss` — buffered adapter: wire building, tool-schema
-  splicing, response/error parsing (compiles; structured provider-error
-  mapping verified end to end by the green suite).
+- `rss/llm/openai_chat.rss` — buffered adapter: standard wire building
+  (user content parts array, tool/assistant string content, omitted empty
+  `tool_choice`, tool-schema and user-parts splices), response/error parsing,
+  content string+parts compatibility; streaming stays a typed
+  `not_implemented` stub (see stream blocker above).
 - `rss/llm/harness.rss` — test dispatch entry (no protocol logic).
 - `rss/providers/*.rss` — OpenRouter, DeepSeek, OpenCode Zen, OpenCode Go,
   custom profiles reusing the shared adapter (no copied parsers).
 - `tests/provider_tests.rs` — fixture server infrastructure, canonical
-  request/profile construction, 1 green suite, 7 documented ignored suites.
+  request/profile construction, 2 green suites (provider error + P1 wire
+  format), 11 documented ignored suites (buffered parse, streaming, and
+  blocked references for the openai_responses/anthropic fixtures).
 - `tests/fixtures/providers/**` — transcripts for chat buffered/stream,
-  responses, anthropic, and error/malformed payloads.
-- `src/runtime/rss_runner.rs` — restricted registry now exposes
-  `bytes::from_utf8`/`bytes::to_utf8` and `http::client::sse`; the
-  `configure_http` result is propagated; stream polling holds a Tokio
-  context (from the earlier session's uncommitted work).
+  responses (data-only SSE), anthropic, and error/malformed payloads.
+- `tests/fixtures/core-repros/` + `tests/core_repro_driver.rs` — committed,
+  independently runnable minimal repro set for the core blocker.
+- `src/runtime/rss_runner.rs` — restricted registry exposes only consumed
+  capabilities: JSON, stream emit, `bytes::to_utf8`, SQLite, and
+  `http::client::request`. `bytes::from_utf8` and `http::client::sse` were
+  removed (no RSS consumer; see stream blocker).
 
 ## Still open when the core clears
 

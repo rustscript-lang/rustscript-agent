@@ -1,0 +1,72 @@
+// m1-like: shared accessors (exact types.rss bodies).
+use json;
+
+pub fn request_array(request: map, key: string) -> array {
+    let mut items: array = [];
+    if request.has(key) {
+        if type(request[key]) == "array" {
+            let coerced: array = request[key];
+            items = coerced;
+        }
+    }
+    items
+}
+
+pub fn request_string(request: map, key: string) -> string {
+    let mut text: string = "";
+    if request.has(key) {
+        if type(request[key]) == "string" {
+            let coerced: string = request[key];
+            text = coerced;
+        }
+    }
+    text
+}
+
+pub fn request_int(request: map, key: string, fallback: int) -> int {
+    let mut number: int = fallback;
+    if request.has(key) {
+        if type(request[key]) == "int" {
+            let coerced: int = request[key];
+            number = coerced;
+        }
+    }
+    number
+}
+
+pub fn request_bool(request: map, key: string, fallback: bool) -> bool {
+    let mut flag: bool = fallback;
+    if request.has(key) {
+        if type(request[key]) == "bool" {
+            let coerced: bool = request[key];
+            flag = coerced;
+        }
+    }
+    flag
+}
+
+pub fn request_map(request: map, key: string) -> map {
+    let mut items: map = {};
+    if request.has(key) {
+        if type(request[key]) == "map" {
+            let coerced: map = request[key];
+            items = coerced;
+        }
+    }
+    items
+}
+
+pub fn array_entry(items: array, index: int) -> map {
+    let mut result: map = {};
+    if items.has(index) {
+        if type(items[index].copy()) == "map" {
+            let coerced: map = items[index].copy();
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn parse_body(body: map) -> map {
+    { kind: "map", text: body["text"] }
+}

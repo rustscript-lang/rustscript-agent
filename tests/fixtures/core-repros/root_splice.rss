@@ -1,0 +1,16 @@
+// ROOT module: same (string, array) function.
+use json;
+use bytes;
+use http;
+use self::chain_m1 as types;
+
+pub fn run(context: map) -> map {
+    let request: map = context["request"];
+    let tools: array = types::request_array(request, "tools");
+    let body: string = splice("{}", tools);
+    { kind: "ok", body: body }
+}
+
+fn splice(body: string, tools: array) -> string {
+    body
+}

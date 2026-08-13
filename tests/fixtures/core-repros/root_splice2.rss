@@ -1,0 +1,9 @@
+// ROOT module: (string, array) with literal array arg.
+pub fn run(context: map) -> map {
+    let body: string = splice("{}", []);
+    { kind: "ok", body: body }
+}
+
+fn splice(body: string, tools: array) -> string {
+    body
+}
