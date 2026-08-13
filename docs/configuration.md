@@ -1,0 +1,193 @@
+# rustscript-agent configuration reference
+
+This document is the canonical configuration reference for this revision of
+`rustscript-agent`. It lists **only** configuration that exists in this
+revision: every environment variable the binaries read, every native
+`AgentGatewayConfig` field, and the capability-policy defaults the gateway
+passes through to the `pd-vm` core. Reserved-but-unimplemented configuration
+is called out explicitly in [Reserved configuration](#reserved-configuration)
+and must not be treated as real.
+
+A drift guard (`tests/docs_consistency_tests.rs`) compares this document
+against `src/` in both directions: a variable that the binaries read but this
+document misses, or a variable this document advertises that no binary reads,
+fails the test suite.
+
+## Configuration sources
+
+| Source | Owns | Read by |
+| --- | --- | --- |
+| Environment variables (`RUSTSCRIPT_AGENT_*`) | gateway process | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
+| CLI arguments (`--script`, `--allow-host`) | one run | `rustscript-agent` binary (`src/bin/rustscript-agent.rs`) |
+| Native `AgentGatewayConfig` fields | embedding code | library API; the gateway binary maps a fixed subset from environment variables |
+
+RSS programs never read ambient configuration: all bounds reach the VM
+through validated native configuration (`AgentConfig`/`HttpConfig`/
+`SqlitePolicy`), and the storage program receives its per-command limits
+through the typed command envelope.
+
+## Environment variables (gateway binary)
+
+Every `RUSTSCRIPT_AGENT_*` variable has a deprecated prototype alias
+`PD_EDGE_AGENT_*`. When the primary variable is unset, the legacy name is
+read and a deprecation warning is printed to stderr; the primary name always
+wins. The aliases are scheduled for removal before v1 — do not rely on them.
+
+| Variable | Deprecated alias | Type | Default | Bounds / notes |
+| --- | --- | --- | --- | --- |
+| `RUSTSCRIPT_AGENT_GATEWAY_ADDR` | `PD_EDGE_AGENT_GATEWAY_ADDR` | string (`SocketAddr`) | `127.0.0.1:8090` | Bind address. An unparsable value fails startup. |
+| `RUSTSCRIPT_AGENT_BEARER_TOKEN` | `PD_EDGE_AGENT_BEARER_TOKEN` | string (secret) | unset | Required unless `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`. A blank value is rejected. Compared with a constant-time equality against the `Authorization: Bearer` header. Treat as a secret; see [Secrets](#secrets). |
+| `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS` | `PD_EDGE_AGENT_ALLOW_ANONYMOUS` | flag | unset | Only the exact value `1` enables anonymous access. Local testing only. |
+| `RUSTSCRIPT_AGENT_ALLOW_HOSTS` | `PD_EDGE_AGENT_ALLOW_HOSTS` | comma-separated list | empty (deny all) | Every HTTP(S)/WS(S) destination host must be allowlisted. Empty list denies all hosts. |
+| `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
+| `RUSTSCRIPT_AGENT_ALLOW_PORTS` | `PD_EDGE_AGENT_ALLOW_PORTS` | comma-separated list of `u16` | empty (deny all) | When set it must contain at least one valid port and no empty entries; otherwise startup fails. Empty list denies all ports — with the default configuration no request can be made, so production deployments must list the ports scripts may reach (for example `443`). |
+| `RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS` | `PD_EDGE_AGENT_ALLOW_PRIVATE_IPS` | flag | unset (`false`) | Only the exact value `1` allows destinations on private/loopback IP ranges. |
+| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | unset | Path to the RSS agent source. Read and compiled at startup; sources over 1 MiB (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
+| `RUSTSCRIPT_AGENT_STATE_DB` | `PD_EDGE_AGENT_STATE_DB` | filesystem path | unset (in-memory) | SQLite state file (sessions, messages, runs, events, jobs, approvals, compactions). Without it the gateway runs in-memory only and state is lost on restart. See `docs/deployment.md`. |
+
+Example (all variables with their deprecated aliases):
+
+```bash
+RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090 \
+RUSTSCRIPT_AGENT_BEARER_TOKEN=[REDACTED] \
+RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com \
+RUSTSCRIPT_AGENT_ALLOW_PORTS=443 \
+RUSTSCRIPT_AGENT_SCRIPT=examples/http_get.rss \
+RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db \
+cargo run --release --bin rustscript-agent-gateway
+```
+
+## CLI arguments (runner binary)
+
+`rustscript-agent` is the single-run runner: it compiles one script and
+drives its exported `run(context)` to completion with no gateway.
+
+| Argument | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `--script PATH` | path | required | RSS source file (≤ 1 MiB). |
+| `--allow-host HOST` | string, repeatable | required | Host allowlist entry; at least one is required. Hosts are lowercased. |
+| `--help` / `-h` | flag | — | Prints usage. |
+
+The runner enforces the same deny-by-default HTTP policy as the gateway:
+with only hosts allowlisted, script HTTP requests still need the port
+allowlist (see above), which the runner currently does not expose — requests
+over non-listed ports fail inside the VM.
+
+## Native `AgentGatewayConfig` fields (library API)
+
+`AgentGatewayConfig` (`src/config.rs`) is validated before use:
+`AgentGatewayState::new`/`with_*` reject any configuration with a zero
+lifecycle bound. The gateway binary exposes only the environment variables
+above; every other field is set by embedding code.
+
+| Field | Type | Default | Validation |
+| --- | --- | --- | --- |
+| `model` | `String` | `"local-agent"` | — |
+| `provider` | `Option<String>` | `Some("local-agent")` | — |
+| `agent_name` | `String` | `"local-rss-agent"` | Reported by `/health/detailed`. |
+| `bearer_token` | `Option<String>` | `None` | Blank tokens rejected by the binary. |
+| `max_body_bytes` | `usize` | 4 MiB | Must be positive. HTTP request body limit (`DefaultBodyLimit`). |
+| `max_concurrent_runs` | `usize` | 8 | Must be positive. Admission limit; excess admissions answer `429 run_limit_reached`. |
+| `run_timeout` | `Duration` | 900 s | Must be positive. Per-run wall-clock deadline; expiry cancels with `Deadline` and answers `504 agent_timeout` on the legacy chat path. |
+| `event_channel_capacity` | `usize` | 64 | Must be positive. Bounded per-run event channel. |
+| `broadcast_capacity` | `usize` | 64 | Must be positive. SSE broadcast channel capacity. |
+| `max_events_per_run` | `usize` | 240 | Must be positive. Retained event history bound per run. |
+| `max_event_bytes` | `usize` | 32 KiB | Must be positive. Per-event payload bound. |
+| `terminal_run_ttl` | `Duration` | 60 s | Must be positive. Retention of terminal run handles before release. |
+| `cancellation_grace` | `Duration` | 5 s | Must be positive. Bounded wait after a deadline before the worker is abandoned. |
+| `janitor_interval` | `Duration` | 5 s | Must be positive. Terminal-commit retry / pending-terminal cadence. |
+| `terminal_commit_retry_window` | `Duration` | 300 s | Must be positive. Bounded window during which a failed terminal commit is retried. |
+| `terminal_persist_retries` | `usize` | 3 | —. Additional immediate retries before a terminal is parked as pending. |
+| `terminal_persist_retry_delay` | `Duration` | 25 ms | Must be positive. Backoff between immediate terminal-persist retries. |
+| `http` | `HttpConfig` | core defaults (below) | Validated by the core (`HttpConfig::validate`). |
+| `sqlite` | `SqlitePolicy` | core defaults, `max_statements = 1024` | — |
+| `fuel` | `Option<u64>` | `Some(10_000_000)` | VM fuel budget; `None` disables the fuel cap. |
+
+## HTTP capability policy (core `HttpConfig` defaults)
+
+The gateway passes `HttpConfig` through to the `pd-vm` HTTP host unchanged.
+Defaults come from the pinned core revision; the policy is deny-by-default:
+**hosts and ports must both be allowlisted before any request can be made.**
+
+| Field | Default |
+| --- | --- |
+| `allowed_schemes` | `https`, `wss` |
+| `allowed_hosts` | empty (deny all) |
+| `allowed_ports` | empty (deny all) |
+| `max_redirects` | 5 |
+| `max_request_body_bytes` | 1 MiB |
+| `max_response_body_bytes` | 8 MiB |
+| `connect_timeout` | 10 s |
+| `request_timeout` | 30 s |
+| `allow_private_ips` | `false` |
+| `max_stream_item_bytes` | 1 MiB |
+| `max_stream_total_bytes` | 64 MiB |
+| `max_sse_line_bytes` | 64 KiB |
+| `max_websocket_frame_bytes` | 1 MiB |
+| `max_websocket_send_bytes` | 1 MiB |
+| `max_stream_duration` | 5 min |
+| `stream_idle_timeout` | 30 s |
+| `websocket_close_timeout` | 5 s |
+
+## SQLite policy (core `SqlitePolicy` defaults)
+
+| Field | Default |
+| --- | --- |
+| `database_root` | `None` (the gateway storage worker sets it to the state DB's parent directory) |
+| `allow_unsafe_sql` | `false` |
+| `limits.max_connections` | 16 (the gateway storage worker opens 1) |
+| `limits.max_statements` | 128 (the gateway default config raises this to 1024; the storage worker runs 64) |
+| `limits.max_rows` | 1 000 |
+| `limits.max_columns` | 128 |
+| `limits.max_result_bytes` | 4 MiB |
+| `limits.max_statement_bytes` | 1 MiB |
+| `limits.max_parameters` | 128 |
+| `limits.max_parameter_bytes` | 1 MiB |
+| `limits.max_pending_operations` | 32 |
+| `limits.max_transaction_ms` | 5 000 |
+| `limits.busy_timeout_ms` | 5 000 |
+
+The storage worker (`src/gateway/store.rs`) runs every command through the
+RSS storage program (`rss/storage/main.rss`) on a dedicated thread with a
+single connection and these per-command limits: `busy_timeout_ms = 5000`,
+`max_connections = 1`, `max_statements = 64`, `max_transaction_ms = 5000`,
+plus the configured `max_events_per_run` / `max_rows` / `max_result_bytes`
+page bounds.
+
+## RSS source and run bounds
+
+| Constant | Value | Notes |
+| --- | --- | --- |
+| `MAX_AGENT_SOURCE_BYTES` | 1 MiB | Agent sources (and the storage program) over this bound are rejected at load/compile time. |
+| `RUN_EPOCH_DEADLINE_TICKS` | 1 000 000 000 | Epoch budget granted to one cancellable run; the cancellation watcher jumps the epoch past it. |
+| `RUN_EPOCH_CHECK_INTERVAL` | 1 000 | Interpreter operations between epoch checks on cancellable runs. |
+
+## Secrets
+
+- `RUSTSCRIPT_AGENT_BEARER_TOKEN` is the only secret in this revision. All
+  examples in this document show it as `[REDACTED]`; it must never be passed
+  through process arguments or committed to repositories.
+- The binaries never echo the token. Store it in an environment file or
+  secret manager with restrictive permissions (see `docs/deployment.md`).
+
+## Reserved configuration
+
+The following configuration does **not** exist in this revision. It is
+listed only to reserve the namespace and to make the roadmap explicit; no
+binary reads these names and setting them has no effect. They become real
+only after their integration milestones land (marked *待接入 / integration
+后生成* below).
+
+- **A7 API-server hardening (待接入)**: rate limiting, per-client
+  idempotency bounds beyond the current `Idempotency-Key` handling, CORS,
+  and TLS termination options are not yet configurable. The current
+  hardening bounds (`max_body_bytes`, `max_concurrent_runs`,
+  `max_events_per_run`, `max_event_bytes`, `terminal_run_ttl`) are native
+  `AgentGatewayConfig` fields only.
+- **A8 Telegram gateway (待接入)**: a Telegram token and chat/group/topic
+  allowlist will be needed when the Telegram adapter lands; the naming
+  family is reserved as `RUSTSCRIPT_AGENT_TELEGRAM_…` but **no such
+  variable exists yet**.
+- **A4 harness/approvals and A6 parallel tools/subagents (排除)** are out
+  of scope for this repository's current milestones and define no
+  configuration.
