@@ -267,6 +267,11 @@ fn test_config(api_base: &str) -> TelegramConfig {
         max_edit_interval: std::time::Duration::ZERO,
         max_response_body_bytes: 1024 * 1024,
         new_wait_timeout: std::time::Duration::from_secs(10),
+        // Existing tests queue updates before spawning and expect them to
+        // be processed; the drop-pending default is covered by its own
+        // tests and the config default.
+        drop_pending_updates: false,
+        unauthorized_failure_bound: 3,
         dedup_capacity: 64,
         allowed_accounts: vec!["fixture_bot".to_string()],
         allowed_chats: vec![555, -1001234],
@@ -1412,6 +1417,124 @@ async fn adapter_new_wait_timeout_keeps_the_session_and_run() {
 }
 
 #[tokio::test]
+async fn adapter_drops_pending_updates_on_first_boot_by_default() {
+    let (base, state) = spawn_fixture().await;
+    // Pending before the adapter starts (the bot was offline): the safe
+    // default must not replay old updates into sessions.
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("drop-pending");
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    // test_config opts out of the drop to keep queue-before-spawn tests
+    // working; this test re-enables the safe first-boot default (the
+    // config default itself is asserted by the unit test).
+    let mut telegram = test_config(&base);
+    telegram.drop_pending_updates = true;
+    let adapter = spawn_adapter(gateway.clone(), telegram).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.request_count("getUpdates") >= 2
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        adapter.processed_updates(),
+        0,
+        "pending updates must be drained without processing on first boot"
+    );
+    assert_eq!(
+        state.sent_texts().len(),
+        0,
+        "no pending update may produce output"
+    );
+    // A NEW message after boot is processed normally.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 30,
+                "message": {
+                    "message_id": 300,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "after boot"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(15), || {
+        adapter.processed_updates() >= 1
+    })
+    .await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "hello world")
+    })
+    .await;
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test]
+async fn adapter_replays_pending_updates_when_drop_is_disabled() {
+    let (base, state) = spawn_fixture().await;
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("keep-pending");
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    let mut telegram = test_config(&base);
+    telegram.drop_pending_updates = false;
+    let adapter = spawn_adapter(gateway.clone(), telegram).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        adapter.processed_updates() >= 1
+    })
+    .await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "hello world")
+    })
+    .await;
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test]
+async fn adapter_stops_polling_after_bounded_unauthorized_failures() {
+    let (base, state) = spawn_fixture().await;
+    state.script_failures(
+        "getUpdates",
+        vec![
+            FailureScript::BadRequest {
+                error_code: 401,
+                description: "Unauthorized".to_string(),
+            },
+            FailureScript::BadRequest {
+                error_code: 401,
+                description: "Unauthorized".to_string(),
+            },
+        ],
+    );
+    let db = telegram_db_path("unauthorized");
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    let mut telegram = test_config(&base);
+    telegram.drop_pending_updates = false;
+    telegram.unauthorized_failure_bound = 2;
+    let adapter = spawn_adapter(gateway.clone(), telegram).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.request_count("getUpdates") >= 2
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let count = state.request_count("getUpdates");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        state.request_count("getUpdates"),
+        count,
+        "the poller must stop after the unauthorized bound (no infinite 401 loop)"
+    );
+    assert_eq!(adapter.processed_updates(), 0);
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test]
 async fn adapter_stop_command_cancels_the_active_run() {
     let (base, state) = spawn_fixture().await;
     let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
@@ -1501,6 +1624,9 @@ async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
         .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_ACCOUNTS", "fixture_bot")
         .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_CHATS", "555")
         .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS", "555")
+        // The update is queued before the binary starts: opt out of the
+        // safe first-boot drop so it is processed.
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_DROP_PENDING_UPDATES", "0")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

@@ -47,6 +47,15 @@ pub struct TelegramConfig {
     /// (typed cancel first, then the session reset). When the wait expires
     /// the reset fails with a typed reply and deletes nothing.
     pub new_wait_timeout: Duration,
+    /// First-boot offset strategy: when no poll offset was ever persisted,
+    /// pending updates (queued while the bot was offline) are drained
+    /// without processing by default, so old updates are never replayed
+    /// into sessions. Set to false to process pending updates.
+    pub drop_pending_updates: bool,
+    /// Bounded 401 circuit breaker: after this many consecutive
+    /// unauthorized getUpdates failures the poller stops (the adapter is
+    /// disabled for the process) instead of retrying forever.
+    pub unauthorized_failure_bound: usize,
     /// Bounded capacity of the update_id/message_id dedup windows.
     pub dedup_capacity: usize,
     /// Allowed bot account usernames (case-insensitive); empty denies all.
@@ -73,6 +82,11 @@ impl std::fmt::Debug for TelegramConfig {
             .field("max_edit_interval", &self.max_edit_interval)
             .field("max_response_body_bytes", &self.max_response_body_bytes)
             .field("new_wait_timeout", &self.new_wait_timeout)
+            .field("drop_pending_updates", &self.drop_pending_updates)
+            .field(
+                "unauthorized_failure_bound",
+                &self.unauthorized_failure_bound,
+            )
             .field("dedup_capacity", &self.dedup_capacity)
             .field("allowed_accounts", &self.allowed_accounts)
             .field("allowed_chats", &self.allowed_chats)
@@ -141,6 +155,9 @@ impl TelegramConfig {
         if self.new_wait_timeout.is_zero() {
             return Err("telegram new_wait_timeout must be positive".to_string());
         }
+        if self.unauthorized_failure_bound == 0 {
+            return Err("telegram unauthorized_failure_bound must be positive".to_string());
+        }
         Ok(())
     }
 }
@@ -159,6 +176,8 @@ impl Default for TelegramConfig {
             max_edit_interval: Duration::from_millis(300),
             max_response_body_bytes: 1024 * 1024,
             new_wait_timeout: Duration::from_secs(10),
+            drop_pending_updates: true,
+            unauthorized_failure_bound: 3,
             dedup_capacity: 512,
             allowed_accounts: Vec::new(),
             allowed_chats: Vec::new(),
@@ -640,6 +659,28 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "max_response_body_bytes must be a validated positive bound"
+        );
+    }
+
+    #[test]
+    fn telegram_unauthorized_failure_bound_must_be_positive() {
+        let config = TelegramConfig {
+            bot_token: "123:abc".to_string(),
+            unauthorized_failure_bound: 0,
+            ..TelegramConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "unauthorized_failure_bound must be a validated positive bound"
+        );
+    }
+
+    #[test]
+    fn telegram_drop_pending_updates_defaults_to_safe() {
+        let config = TelegramConfig::default();
+        assert!(
+            config.drop_pending_updates,
+            "pending updates must be dropped on first boot by default (no replay of old updates)"
         );
     }
 }

@@ -779,6 +779,9 @@ struct AdapterRuntime {
     /// aborts once `/new` bumps it, so an old renderer can never output
     /// into a recreated session.
     epochs: Arc<Mutex<HashMap<String, u64>>>,
+    /// Metric: delivery cursor advance failures (at-least-once delivery
+    /// hook — see [`advance_cursor`]).
+    advance_failures: Arc<AtomicU64>,
 }
 
 /// Handle for one running Telegram adapter (poller task). Shutdown is
@@ -789,12 +792,18 @@ pub struct TelegramAdapter {
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
     processed: Arc<AtomicU64>,
+    advance_failures: Arc<AtomicU64>,
 }
 
 impl TelegramAdapter {
     /// Number of updates fully handled so far (tests poll this).
     pub fn processed_updates(&self) -> u64 {
         self.processed.load(Ordering::SeqCst)
+    }
+
+    /// Metric: delivery cursor advance failures (at-least-once delivery).
+    pub fn advance_failure_count(&self) -> u64 {
+        self.advance_failures.load(Ordering::SeqCst)
     }
 
     /// Bounded graceful stop: signals the poller, waits at most 60s for the
@@ -829,6 +838,7 @@ pub async fn spawn_telegram_adapter(
     let offset = load_offset(&state, &account).await?;
     let (stop_tx, stop_rx) = watch::channel(false);
     let processed = Arc::new(AtomicU64::new(0));
+    let advance_failures = Arc::new(AtomicU64::new(0));
     let task = tokio::spawn(run_poller(
         state,
         config,
@@ -836,11 +846,13 @@ pub async fn spawn_telegram_adapter(
         offset,
         stop_rx,
         Arc::clone(&processed),
+        Arc::clone(&advance_failures),
     ));
     Ok(TelegramAdapter {
         stop: stop_tx,
         task,
         processed,
+        advance_failures,
     })
 }
 
@@ -922,6 +934,7 @@ async fn run_poller(
     mut offset: Option<i64>,
     stop: watch::Receiver<bool>,
     processed: Arc<AtomicU64>,
+    advance_failures: Arc<AtomicU64>,
 ) {
     let api = TelegramApi::new(&config);
     let mut runtime = AdapterRuntime {
@@ -932,18 +945,28 @@ async fn run_poller(
         dedup: DedupWindows::new(config.dedup_capacity),
         active_runs: Arc::new(Mutex::new(HashMap::new())),
         epochs: Arc::new(Mutex::new(HashMap::new())),
+        advance_failures,
     };
     let poll_timeout_secs = config.poll_timeout.as_secs().max(1);
     // Restart resume: after a crash the poll offset skips the interrupted
     // update, so its run exists only in durable state. Any event left
     // undelivered (delivery cursor < retained high-water) is rendered now.
     resume_undelivered(&mut runtime).await;
+    // First boot without a persisted offset: by default drain pending
+    // updates (queued while the bot was offline) without processing them,
+    // so old updates are never replayed into sessions. Disable
+    // drop_pending_updates to process them.
+    if offset.is_none() && config.drop_pending_updates {
+        drop_pending_updates(&api, &stop).await;
+    }
+    let mut unauthorized_streak = 0usize;
     loop {
         if *stop.borrow() {
             break;
         }
         match api.get_updates(offset, poll_timeout_secs, 50).await {
             Ok(updates) => {
+                unauthorized_streak = 0;
                 for update in updates {
                     if *stop.borrow() {
                         break;
@@ -968,6 +991,28 @@ async fn run_poller(
                 // Telegram, so this only prevents a hot loop.
                 tokio::time::sleep(config.poll_interval).await;
             }
+            Err(TelegramError::Api {
+                error_code: 401, ..
+            }) => {
+                // Bounded circuit breaker: an unauthorized token will never
+                // succeed, so stop polling instead of looping forever. The
+                // API gateway keeps serving; the adapter is disabled for
+                // this process.
+                unauthorized_streak += 1;
+                tracing::warn!(
+                    "telegram adapter unauthorized (HTTP 401) {} consecutive failure(s); \
+                     check the bot token",
+                    unauthorized_streak
+                );
+                if unauthorized_streak >= config.unauthorized_failure_bound {
+                    tracing::warn!(
+                        "telegram adapter disabled after {} unauthorized failures",
+                        unauthorized_streak
+                    );
+                    break;
+                }
+                tokio::time::sleep(config.poll_interval).await;
+            }
             Err(TelegramError::Transport(error)) => {
                 tracing::warn!("telegram poll transport failure: {error}");
                 tokio::time::sleep(config.poll_interval).await;
@@ -987,6 +1032,31 @@ async fn run_poller(
     if let Err(error) = persist_offset(&state, &account, offset.unwrap_or(0)).await {
         tracing::warn!("telegram poll offset could not be persisted on stop: {error}");
     }
+}
+
+/// Drains the pending-update queue on first boot without processing it
+/// (bounded rounds; the offset advances past every drained update so they
+/// are never re-fetched).
+async fn drop_pending_updates(api: &TelegramApi, stop: &watch::Receiver<bool>) {
+    let mut drain_offset = None;
+    for _round in 0..100 {
+        if *stop.borrow() {
+            return;
+        }
+        match api.get_updates(drain_offset, 0, 50).await {
+            Ok(updates) => {
+                let Some(last) = updates.last() else {
+                    return;
+                };
+                drain_offset = Some(last.update_id + 1);
+            }
+            Err(error) => {
+                tracing::warn!("telegram pending-update drain failed: {error}");
+                return;
+            }
+        }
+    }
+    tracing::warn!("telegram pending-update drain hit its round bound");
 }
 
 /// The poller's per-session active-run gate with RAII release: the entry is
@@ -1075,6 +1145,7 @@ async fn resume_undelivered(runtime: &mut AdapterRuntime) {
                     thread_id,
                     Arc::clone(&runtime.active_runs),
                     Arc::clone(&runtime.epochs),
+                    Arc::clone(&runtime.advance_failures),
                 );
             }
         }
@@ -1183,6 +1254,31 @@ async fn reply(
     api.send_message(chat_id, thread_id, text).await.map(|_| ())
 }
 
+/// The session's active run for command targeting (`/stop`, `/new`): the
+/// gated run wins; a gate-less fallback scans the store for started/stopping
+/// runs and picks the most recently active one (deterministic restart
+/// recovery path — terminal runs never qualify).
+fn session_active_run(
+    active_runs: &Arc<Mutex<HashMap<String, String>>>,
+    store: &crate::gateway::store::GatewayStore,
+    session_id: &str,
+) -> Option<String> {
+    if let Some(run_id) = active_runs
+        .lock()
+        .expect("active runs lock")
+        .get(session_id)
+    {
+        return Some(run_id.clone());
+    }
+    store
+        .runs
+        .values()
+        .filter(|run| run.session_id == session_id)
+        .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
+        .max_by_key(|run| run.events.last().map(|event| event.timestamp).unwrap_or(0))
+        .map(|run| run.run_id.clone())
+}
+
 /// `/new`: wipes the conversation (typed cascade delete) and recreates the
 /// same deterministic session id, so the identity stays stable across
 /// restarts while the history starts fresh.
@@ -1210,13 +1306,7 @@ async fn cmd_new(
         // active run of the session (a run without a live service handle
         // reports None from stop() and the reset proceeds).
         let store = runtime.state.store.read();
-        store
-            .runs
-            .values()
-            .filter(|run| run.session_id == session_id)
-            .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
-            .map(|run| run.run_id.clone())
-            .next()
+        session_active_run(&runtime.active_runs, &store, session_id)
     });
     if let Some(run_id) = &run_id {
         runtime
@@ -1401,26 +1491,13 @@ async fn cmd_stop(
     thread_id: Option<i64>,
     session_id: &str,
 ) {
-    let gated = runtime
-        .active_runs
-        .lock()
-        .expect("active runs lock")
-        .get(session_id)
-        .cloned();
-    let run_id = match gated {
-        Some(run_id) => Some(run_id),
-        None => {
-            // Restart fallback: the gate is in-memory, so scan the store for
-            // an active run of the session.
-            let store = runtime.state.store.read();
-            store
-                .runs
-                .values()
-                .filter(|run| run.session_id == session_id)
-                .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
-                .map(|run| run.run_id.clone())
-                .next()
-        }
+    // The precise target is the session's active run: the gated run when
+    // one is live, otherwise the most recently active started/stopping run
+    // from the store (deterministic restart recovery; terminal runs never
+    // qualify).
+    let run_id = {
+        let store = runtime.state.store.read();
+        session_active_run(&runtime.active_runs, &store, session_id)
     };
     let outcome = match run_id {
         Some(run_id) => runtime.state.service().stop(&run_id),
@@ -1653,6 +1730,7 @@ async fn admit_text(
                 thread_id,
                 Arc::clone(&runtime.active_runs),
                 Arc::clone(&runtime.epochs),
+                Arc::clone(&runtime.advance_failures),
             );
         }
         Err(AdmitError::RunLimitReached) => {
@@ -1719,6 +1797,7 @@ fn spawn_run_renderer(
     thread_id: Option<i64>,
     active_runs: Arc<Mutex<HashMap<String, String>>>,
     epochs: Arc<Mutex<HashMap<String, u64>>>,
+    advance_failures: Arc<AtomicU64>,
 ) {
     let state = state.clone();
     let config = config.clone();
@@ -1739,6 +1818,7 @@ fn spawn_run_renderer(
         active_runs,
         epochs,
         epoch,
+        advance_failures,
     ));
 }
 
@@ -1761,6 +1841,7 @@ async fn run_renderer(
     active_runs: Arc<Mutex<HashMap<String, String>>>,
     epochs: Arc<Mutex<HashMap<String, u64>>>,
     epoch: u64,
+    advance_failures: Arc<AtomicU64>,
 ) {
     let api = TelegramApi::new(&config);
     // RAII gate: released on every exit path, including panics.
@@ -1800,6 +1881,7 @@ async fn run_renderer(
             &consumer,
             &epochs,
             epoch,
+            &advance_failures,
         )
         .await
         {
@@ -1817,6 +1899,7 @@ async fn run_renderer(
                 &epochs,
                 &session_id,
                 epoch,
+                &advance_failures,
             )
             .await;
             return;
@@ -1854,6 +1937,7 @@ async fn run_renderer(
                     &consumer,
                     &epochs,
                     epoch,
+                    &advance_failures,
                 )
                 .await
                 {
@@ -1889,6 +1973,7 @@ async fn run_renderer(
                         &consumer,
                         &epochs,
                         epoch,
+                        &advance_failures,
                     )
                     .await
                     {
@@ -1921,6 +2006,7 @@ async fn run_renderer(
         &epochs,
         &session_id,
         epoch,
+        &advance_failures,
     )
     .await;
 }
@@ -1938,6 +2024,7 @@ async fn flush_renderer(
     epochs: &Arc<Mutex<HashMap<String, u64>>>,
     session_id: &str,
     epoch: u64,
+    _advance_failures: &Arc<AtomicU64>,
 ) {
     if !epoch_current(epochs, session_id, epoch) {
         return;
@@ -2000,6 +2087,7 @@ async fn render_event(
     consumer: &str,
     epochs: &Arc<Mutex<HashMap<String, u64>>>,
     epoch: u64,
+    advance_failures: &Arc<AtomicU64>,
 ) -> bool {
     if !epoch_current(epochs, session_id, epoch) {
         return false;
@@ -2047,6 +2135,11 @@ async fn render_event(
     }
     *cursor = seq;
     if let Err(error) = advance_cursor(state, session_id, consumer, seq).await {
+        // At-least-once delivery: the render already reached Telegram, so
+        // the event counts as delivered; the failed advance only means the
+        // next catch-up re-renders it (a possible duplicate message). The
+        // counter is the observable metric hook for this condition.
+        advance_failures.fetch_add(1, Ordering::SeqCst);
         tracing::warn!("telegram delivery cursor advance failed: {error}");
     }
     true
@@ -2074,6 +2167,11 @@ async fn load_cursor(state: &AgentGatewayState, session_id: &str, consumer: &str
     }
 }
 
+/// Advances one delivery cursor. Delivery is at-least-once: the cursor is
+/// advanced only after the Telegram API accepted the render, and a failed
+/// advance leaves the event undelivered so a later catch-up re-renders it
+/// (a duplicate message is possible; the metric counter on the renderer is
+/// the observable hook). Advances are monotonic per consumer.
 async fn advance_cursor(
     state: &AgentGatewayState,
     session_id: &str,
@@ -2403,6 +2501,70 @@ mod tests {
             error.kind(),
             io::ErrorKind::ConnectionRefused,
             "the https URI must reach the TCP layer: {error}"
+        );
+    }
+
+    #[test]
+    fn session_active_run_prefers_the_gate_then_the_most_recent_store_run() {
+        use crate::gateway::store::{GatewayEvent, GatewayStore, RunRecord};
+        use std::sync::atomic::AtomicBool;
+
+        fn run(store: &mut GatewayStore, id: &str, status: &str, last_timestamp: u64) {
+            let event = GatewayEvent {
+                event_id: format!("{id}-e1"),
+                seq: 1,
+                event: "run.started".to_string(),
+                run_id: id.to_string(),
+                timestamp: last_timestamp,
+                data: serde_json::json!({}),
+            };
+            store.runs.insert(
+                id.to_string(),
+                RunRecord {
+                    run_id: id.to_string(),
+                    session_id: "telegram:b:1:".to_string(),
+                    parent_run_id: None,
+                    status: status.to_string(),
+                    events: vec![event],
+                    sender: None,
+                    cancel_requested: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+
+        let active_runs = Arc::new(Mutex::new(HashMap::new()));
+        let mut store = GatewayStore::default();
+        run(&mut store, "old-zombie", "started", 100);
+        run(&mut store, "stale-stopping", "stopping", 200);
+        run(&mut store, "done", "completed", 300);
+
+        // With a gated run, the gate wins even when the store also holds
+        // active-looking runs.
+        active_runs
+            .lock()
+            .expect("active runs lock")
+            .insert("telegram:b:1:".to_string(), "gated".to_string());
+        assert_eq!(
+            session_active_run(&active_runs, &store, "telegram:b:1:"),
+            Some("gated".to_string())
+        );
+
+        // Without a gate, the most recently active started/stopping run is
+        // the deterministic target; terminal runs never qualify.
+        active_runs
+            .lock()
+            .expect("active runs lock")
+            .remove("telegram:b:1:");
+        assert_eq!(
+            session_active_run(&active_runs, &store, "telegram:b:1:"),
+            Some("stale-stopping".to_string())
+        );
+        store.runs.remove("stale-stopping");
+        store.runs.remove("old-zombie");
+        assert_eq!(
+            session_active_run(&active_runs, &store, "telegram:b:1:"),
+            None,
+            "terminal runs must never be targeted"
         );
     }
 }

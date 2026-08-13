@@ -267,6 +267,17 @@ fn telegram_config() -> Result<Option<TelegramConfig>, Box<dyn std::error::Error
         // api_base stays https-only so the token never travels in cleartext.
         config.allow_insecure_localhost = true;
     }
+    if env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_DROP_PENDING_UPDATES",
+        "PD_EDGE_AGENT_TELEGRAM_DROP_PENDING_UPDATES",
+    )?
+    .as_deref()
+        == Some("0")
+    {
+        // Opt out of the safe first-boot default: process updates queued
+        // while the bot was offline instead of dropping them.
+        config.drop_pending_updates = false;
+    }
     if let Some(accounts) = env_value(
         "RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_ACCOUNTS",
         "PD_EDGE_AGENT_TELEGRAM_ALLOWED_ACCOUNTS",
