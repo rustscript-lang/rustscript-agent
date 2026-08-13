@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
 
+# Read-only workflow: checkout + build + test only. Explicit least-privilege
+# declaration so a future step cannot silently gain write access.
+permissions:
+  contents: read
+
 # Optional but recommended: cancel superseded runs on the same ref so a
 # fresh push or PR update does not queue behind an outdated run.
 concurrency:
@@ -29,7 +34,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout rustscript-agent
-        uses: actions/checkout@v4
+        # Full-SHA pin, matching the rustscript-lang/rustscript CI policy
+        # (actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5).
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           # The agent must live in a directory named `rustscript-agent`
           # relative to $GITHUB_WORKSPACE so the `path = "../rustscript"`
@@ -40,7 +47,8 @@ jobs:
           path: rustscript-agent
 
       - name: Checkout pinned RustScript core (path dependency)
-        uses: actions/checkout@v4
+        # Full-SHA pin, same policy as the sibling checkout above.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: rustscript-lang/rustscript
           # Sibling of the agent checkout, resolving `../rustscript`.
@@ -48,12 +56,16 @@ jobs:
           ref: ${{ env.RUSTSCRIPT_CORE_REF }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Full-SHA pin, matching the rustscript-lang/rustscript CI policy
+        # (dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30).
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build target
-        uses: Swatinem/rust-cache@v2
+        # Full-SHA pin of the v2 tag (verified: v2 →
+        # 6323deb102c322ba6fcbdcafc7e3dddab59af2b6).
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Format check
         working-directory: rustscript-agent
@@ -71,11 +83,26 @@ jobs:
         working-directory: rustscript-agent
         run: cargo test --locked --all-features --all-targets
 
-      # `git diff --check` on a fresh checkout checks nothing (there is no
-      # unstaged diff), so fail on real drift instead: every step above must
-      # leave the working tree exactly as checked out. This catches tests
-      # writing state into the checkout instead of $RUSTSCRIPT_AGENT_TEST_TMP
-      # and generated files left dirty by a step.
-      - name: Working tree must stay clean
+      # Whitespace diagnostic: `git diff --check` reports trailing-whitespace
+      # errors in any tracked-file change a step leaves. On a fresh checkout
+      # with no drift it is a no-op, which is the point — the authoritative
+      # gate below is what actually fails on drift.
+      - name: No whitespace errors in tracked changes
         working-directory: rustscript-agent
-        run: git diff --exit-code
+        run: git diff --check
+
+      # Fail on real drift instead: every step above must leave the working
+      # tree exactly as checked out. `git diff --exit-code` only sees tracked
+      # modifications, so this gate uses `git status --porcelain`, which
+      # reports both tracked changes and untracked/generated files — it
+      # catches tests writing state into the checkout instead of
+      # $RUSTSCRIPT_AGENT_TEST_TMP, and any file a step leaves behind.
+      - name: Working tree must stay clean (tracked and untracked)
+        working-directory: rustscript-agent
+        run: |
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "::error::working tree is not clean after CI steps:"
+            printf '%s\n' "$status"
+            exit 1
+          fi

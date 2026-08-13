@@ -234,10 +234,93 @@ fn table_cells(line: &str) -> Option<Vec<String>> {
     (!cells.is_empty()).then_some(cells)
 }
 
+/// Returns true when every inline-code span outside fenced blocks on the
+/// line is closed: backtick runs must come in matched pairs of equal length
+/// (`` `code` ``, `` ``code`` ``). Fenced code blocks (` ``` ` lines) and
+/// their contents are skipped by the caller.
+fn inline_code_closed(line: &str) -> bool {
+    let mut runs: Vec<usize> = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    while let Some((_, character)) = chars.next() {
+        if character != '`' {
+            continue;
+        }
+        let mut length = 1;
+        while let Some((_, '`')) = chars.peek() {
+            chars.next();
+            length += 1;
+        }
+        match runs.last() {
+            Some(&open) if open == length => {
+                runs.pop();
+            }
+            _ => runs.push(length),
+        }
+    }
+    runs.is_empty()
+}
+
+#[test]
+fn inline_code_spans_in_docs_are_closed() {
+    // An unclosed opening backtick makes the code span extend until the next
+    // backtick in the document, rendering whole paragraphs as inline code on
+    // GitHub. Every inline-code span in the two docs must be paired on its
+    // line (tables and bullets are single lines); fenced code blocks and
+    // their contents are skipped.
+    let mut checked = 0;
+    for file in ["docs/configuration.md", "docs/deployment.md"] {
+        let text = read_relative(file);
+        let mut in_fence = false;
+        for (index, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            assert!(
+                inline_code_closed(line),
+                "{file}:{} unclosed inline-code span in line: {line:?}",
+                index + 1
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 200,
+        "expected the full docs to be scanned, got {checked} lines"
+    );
+}
+
+#[test]
+fn authorization_bearer_placeholder_is_a_closed_inline_code_span() {
+    // The `Authorization: Bearer <token>` placeholder must appear exactly as
+    // a closed inline-code span (backtick immediately before and after the
+    // placeholder) in both docs, matching the middleware's `Bearer ` strip
+    // plus constant-time compare. Every mention of the token in the docs
+    // must be that closed span.
+    let token = "Authorization: Bearer <token>";
+    for file in ["docs/configuration.md", "docs/deployment.md"] {
+        let text = read_relative(file);
+        let closed_span = format!("`{token}`");
+        assert!(
+            text.contains(&closed_span),
+            "{file} must contain the closed inline-code span {closed_span:?}"
+        );
+        assert_eq!(
+            text.matches(&closed_span).count(),
+            text.matches(token).count(),
+            "{file}: every `{token}` mention must be the closed span {closed_span:?}"
+        );
+    }
+}
+
 #[test]
 fn canonical_env_table_rows_are_well_formed_with_key_defaults() {
     // (variable, expected default cell, validation keyword the notes must
-    // mention). The values mirror `src/bin/rustscript-agent-gateway.rs`:
+    // mention). The values mirror `src/config.rs` `Default` impl and
+    // `src/bin/rustscript-agent-gateway.rs` env parsing:
     // exact "1" flag semantics, blank token rejection, port list validation,
     // and the deny-by-default policy.
     let key_rows: &[(&str, &str, &str)] = &[
