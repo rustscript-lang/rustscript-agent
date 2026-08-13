@@ -154,7 +154,7 @@ struct ApiParameters {
 /// I/O traits (for the hyper-util legacy client).
 enum TelegramConnStream {
     Http(tokio::net::TcpStream),
-    Https(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+    Https(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
 impl TelegramConnStream {
@@ -262,7 +262,6 @@ impl Connection for TelegramConnStream {
         }
     }
 }
-
 /// Scheme-routing connector for the Bot API client. `https` URIs are
 /// resolved through the plain connector to a TCP stream and then wrapped in
 /// a rustls TLS session (webpki-roots anchors); `http` URIs stay plaintext.
@@ -333,7 +332,7 @@ impl Service<Uri> for TelegramConnector {
                         io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS server name")
                     })?;
                 let tls_stream = tls.connect(server_name, tcp).await?;
-                Ok(TelegramConnStream::Https(tls_stream))
+                Ok(TelegramConnStream::Https(Box::new(tls_stream)))
             })
         } else {
             let mut http = self.http.clone();
@@ -1831,6 +1830,7 @@ fn spawn_run_renderer(
 /// restart resumes exactly where delivery stopped. A terminal event ends
 /// the renderer immediately (no live subscription is kept for a finished
 /// run), which releases the session gate for the next admission.
+#[allow(clippy::too_many_arguments)]
 async fn run_renderer(
     state: AgentGatewayState,
     config: TelegramConfig,
@@ -2016,6 +2016,7 @@ async fn run_renderer(
 /// later catch-up). Aborts immediately when the session's reset epoch no
 /// longer matches the renderer's captured epoch (the old run's output must
 /// never reach a recreated session).
+#[allow(clippy::too_many_arguments)]
 async fn flush_renderer(
     api: &TelegramApi,
     renderer: &mut EventRenderer,

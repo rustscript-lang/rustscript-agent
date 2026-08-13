@@ -223,8 +223,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("halting: cancelling active runs with the typed resource-closed reason");
             state.service().halt();
             // Bounded Telegram shutdown: stop the poller, wait for the final
-            // offset persist (join bounded at 60s).
-            if let Some(adapter) = telegram_handle.lock().expect("telegram handle lock").take() {
+            // offset persist (join bounded at 60s). The guard is dropped
+            // before the await.
+            let adapter = telegram_handle.lock().expect("telegram handle lock").take();
+            if let Some(adapter) = adapter {
                 adapter.shutdown().await;
             }
         }
