@@ -87,6 +87,21 @@ impl RunEventSink for RejectingSink {
     }
 }
 
+/// Blocks on the first delivered event until the test releases it: the run
+/// must not finish while the delivery path cannot accept another event.
+struct BlockingSink {
+    blocked: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl RunEventSink for BlockingSink {
+    fn deliver(&mut self, _value: Value) -> Result<(), RunDeliveryError> {
+        let _ = self.blocked.send(());
+        let _ = self.release.recv();
+        Ok(())
+    }
+}
+
 #[test]
 fn runs_script_owned_http_call_to_completion() {
     let (port, fixture) = spawn_fixture();
@@ -440,4 +455,47 @@ fn deadline_cancellation_between_polls_preserves_the_typed_deadline_reason() {
         ),
         "timeout must stay a typed deadline failure, got {error:?}"
     );
+}
+
+#[test]
+fn blocked_delivery_pauses_invocation_polling() {
+    // While the bounded delivery path cannot accept another event, core
+    // execution must not outrun delivery: the run cannot finish until the
+    // sink accepts the emitted event.
+    let runner = AgentRunner::from_source(
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit("blocked");
+            "done";
+        }
+        "#,
+        AgentConfig::default(),
+    )
+    .expect("compile agent");
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut sink = BlockingSink {
+        blocked: blocked_tx,
+        release: release_rx,
+    };
+    let worker = thread::spawn(move || {
+        runner.run_with_context_and_events(Value::map(vec![]), &mut sink, &RunCancellation::new())
+    });
+    blocked_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the emitted event must reach delivery");
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !worker.is_finished(),
+        "core execution must not outrun a blocked delivery path"
+    );
+    release_tx
+        .send(())
+        .expect("the delivery path should be releasable");
+    let result = worker
+        .join()
+        .expect("worker thread should join")
+        .expect("the run must complete after delivery resumes");
+    assert_eq!(result, Value::string("done"));
 }

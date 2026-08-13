@@ -75,3 +75,52 @@ pub fn schema_violation_error(reason: &str) -> Value {
         "error_message": format!("script event rejected by the agent event schema: {reason}"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_script_events_are_accepted() {
+        for event_type in CANONICAL_SCRIPT_EVENTS {
+            let value = VmValue::map(vec![(
+                VmValue::string("type"),
+                VmValue::string(*event_type),
+            )]);
+            assert_eq!(
+                validate_script_event(&value),
+                Ok(*event_type),
+                "{event_type} must be a canonical script event"
+            );
+        }
+    }
+
+    #[test]
+    fn non_canonical_and_service_owned_events_are_rejected() {
+        let service_owned = VmValue::map(vec![(
+            VmValue::string("type"),
+            VmValue::string("run.completed"),
+        )]);
+        assert!(
+            validate_script_event(&service_owned).is_err(),
+            "service-owned terminal events must be rejected"
+        );
+        let unknown = VmValue::map(vec![(
+            VmValue::string("type"),
+            VmValue::string("not_a_canonical_event"),
+        )]);
+        assert!(
+            validate_script_event(&unknown).is_err(),
+            "unknown event types must be rejected"
+        );
+        let missing_type = VmValue::map(vec![]);
+        assert!(
+            validate_script_event(&missing_type).is_err(),
+            "events without a type field must be rejected"
+        );
+        assert!(
+            validate_script_event(&VmValue::string("nope")).is_err(),
+            "non-map payloads must be rejected"
+        );
+    }
+}
