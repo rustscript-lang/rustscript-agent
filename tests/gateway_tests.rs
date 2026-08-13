@@ -4701,3 +4701,525 @@ async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
     fixture.join().expect("fixture thread");
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn telegram_storage_ops_classify_precisely_and_never_collapse_to_unknown() {
+    // A8's Telegram adapter drives delivery.get/advance/set and session.get
+    // through the shared storage worker; every one of those commands must
+    // classify as its typed storage op, never as `unknown`.
+    let path = gateway_db_path("telegram-storage-ops");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let metrics = state.metrics();
+    let persistence = state.persistence().expect("persistence handle");
+
+    // One real session so the raw delivery cursor commands succeed (the
+    // cursor table has a foreign key to sessions).
+    persistence
+        .session_create(&json!({
+            "id": "telegram-session",
+            "profile": "telegram",
+            "platform": "telegram",
+            "account_id": "telegram",
+            "chat_id": "",
+            "thread_id": "",
+            "user_id": "",
+            "generation": 1,
+            "system_prompt": "",
+            "model": "m",
+            "provider": "p",
+            "toolset_hash": "",
+            "metadata_json": "{}",
+            "title": "",
+            "end_reason": "",
+            "now_ms": 1_000,
+        }))
+        .expect("session create should commit");
+    // session.get / delivery.get / delivery.set are raw commands: they
+    // count as successes under their typed ops.
+    persistence
+        .session_get("telegram-session")
+        .expect("raw session read must succeed");
+    persistence
+        .delivery_get("telegram-session", "telegram:offset")
+        .expect("raw cursor read must succeed");
+    persistence
+        .delivery_set("telegram-session", "telegram:offset", 7)
+        .expect("raw cursor upsert must succeed");
+    // A delivery.set for an unknown session violates the cursor foreign key
+    // — a typed storage failure still classified as delivery.set.
+    assert!(
+        persistence
+            .delivery_set("missing-session", "telegram:offset", 7)
+            .is_err(),
+        "delivery.set on an unknown session must fail the foreign key guard"
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.storage_op_successes(StorageOp::SessionGet), 1);
+    assert_eq!(snapshot.storage_op_successes(StorageOp::DeliveryGet), 1);
+    assert_eq!(snapshot.storage_op_successes(StorageOp::DeliverySet), 1);
+    assert_eq!(snapshot.storage_op_failures(StorageOp::DeliverySet), 1);
+    assert_eq!(
+        snapshot.storage_op_failures(StorageOp::Unknown),
+        0,
+        "no telegram storage op may collapse to unknown"
+    );
+
+    // Storage failures (worker unavailable) classify under their typed ops
+    // — the registry's error counters are the source of truth for
+    // at-least-once delivery advance failures.
+    persistence.shutdown();
+    assert!(
+        persistence
+            .delivery_advance("missing-session", "telegram:offset", 5)
+            .is_err(),
+        "commands after shutdown must fail fast"
+    );
+    assert!(
+        persistence.session_get("missing-session").is_err(),
+        "commands after shutdown must fail fast"
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.storage_op_failures(StorageOp::DeliveryAdvance), 1);
+    assert_eq!(snapshot.storage_op_failures(StorageOp::SessionGet), 1);
+    assert_eq!(
+        snapshot.storage_op_failures(StorageOp::Unknown),
+        0,
+        "a shutdown delivery/session command must still classify as its typed op"
+    );
+
+    drop(state);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
+    // SIGINT ordering (A7+A8): admission is closed first with a typed
+    // rejection, then active runs are cancelled, then the storage worker is
+    // shut down deterministically — later commands fail fast instead of
+    // hanging, and nothing leaks a second chance to start work.
+    let path = gateway_db_path("halt-shutdown");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let service = state.service();
+    let persistence = state.persistence().expect("persistence handle");
+
+    // Admission is open before the halt.
+    let first = service
+        .admit(AdmitRunRequest {
+            input: json!({"text": "hi"}),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "api_server".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+        })
+        .await
+        .expect("admission must be open before the halt");
+    assert_eq!(first.status, "started");
+
+    // stop_admission closes the gate with the typed Halting rejection and
+    // never touches active runs.
+    service.stop_admission();
+    let rejected = service
+        .admit(AdmitRunRequest {
+            input: json!({"text": "later"}),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "api_server".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+        })
+        .await;
+    assert!(
+        matches!(rejected, Err(AdmitError::Halting)),
+        "admission after stop_admission must answer the typed Halting rejection, got {rejected:?}"
+    );
+    assert_eq!(
+        state
+            .metrics()
+            .snapshot()
+            .admissions_rejected_by(rustscript_agent::metrics::AdmitRejectReason::Halting),
+        1,
+        "the halting rejection must be observable in the bounded metrics"
+    );
+
+    // The HTTP surface answers 503 gateway_halting for new runs.
+    let app = build_agent_gateway_app(state.clone());
+    let (status, body) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "gateway_halting");
+
+    // halt() is idempotent with stop_admission and cancels active runs.
+    service.halt();
+    service.halt();
+
+    // Deterministic storage shutdown: every later command fails fast with a
+    // typed error instead of hanging; shutdown is idempotent.
+    persistence.shutdown();
+    persistence.shutdown();
+    let error = persistence
+        .session_get("whatever")
+        .expect_err("commands after shutdown must fail fast");
+    assert_eq!(error.code, "storage_unavailable");
+
+    drop(state);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P3 (production path): restart recovery fails EVERY pending compaction,
+/// including one whose run is already terminal when the gateway reopens
+/// (the crash window between the run terminal commit and
+/// `compaction.fail`), so no session is ever stuck with an orphaned
+/// pending row.
+#[tokio::test]
+async fn gateway_reopen_fails_orphan_pending_compaction_even_when_run_is_terminal() {
+    let path = gateway_db_path("compaction-orphan-crash-window");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let now = 2_000_000u64;
+    persistence
+        .admission_create(&json!({
+            "session_id": "orphan-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "orphan-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "orphan-run",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "orphan-message",
+            "message_run_id": "orphan-run",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "orphan-run",
+            "request_hash": "",
+            "event_id": "orphan-event",
+            "now_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("admission should commit");
+    for (message_id, content) in [
+        ("orphan-message-2", r#"[{"type":"text","text":"more"}]"#),
+        ("orphan-message-3", r#"[{"type":"text","text":"done"}]"#),
+    ] {
+        persistence
+            .message_append(&json!({
+                "id": message_id,
+                "session_id": "orphan-session",
+                "role": "user",
+                "content_json": content,
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": now + 1,
+            }))
+            .expect("message should append");
+    }
+    persistence
+        .run_transition(&json!({
+            "run_id": "orphan-run",
+            "from_status": "running",
+            "to_status": "compacting",
+            "error_code": "",
+            "error_message": "",
+            "recovery_reason": "",
+            "now_ms": now + 3,
+        }))
+        .expect("run should transition to compacting");
+    persistence
+        .compaction_start(&json!({
+            "id": "orphan-compaction",
+            "session_id": "orphan-session",
+            "run_id": "orphan-run",
+            "generation": 2,
+            "source_start_ordinal": 1,
+            "source_end_ordinal": 3,
+            "retained_tail_ordinal": 3,
+            "summary_json": "{\"summary\":\"compacted\"}",
+            "token_estimate": 10,
+            "model": "m",
+            "now_ms": now + 4,
+        }))
+        .expect("compaction should start");
+    // The run leaves compacting with a terminal transition BEFORE any
+    // compaction.fail is committed — the crash window.
+    persistence
+        .run_transition(&json!({
+            "run_id": "orphan-run",
+            "from_status": "compacting",
+            "to_status": "failed",
+            "error_code": "gateway_restart",
+            "error_message": "",
+            "recovery_reason": "gateway_restart",
+            "now_ms": now + 5,
+        }))
+        .expect("run should transition to failed");
+    drop(state);
+
+    // Production reopen: the restart load path fails the orphaned pending
+    // compaction even though its run is already terminal (no run is
+    // recovered).
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reopen");
+    let restored_persistence = restored
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let recovered = restored_persistence
+        .compaction_get("orphan-compaction")
+        .expect("compaction after reopen");
+    let row = recovered["rows"][0].clone();
+    assert_eq!(row[10], json!("failed"));
+    assert_eq!(
+        row[11],
+        json!("run interrupted during gateway restart"),
+        "the typed recovery failure reason must be recorded"
+    );
+    let run = restored_persistence
+        .run_get("orphan-run")
+        .expect("run after reopen");
+    assert_eq!(
+        run["rows"][0][3],
+        json!("failed"),
+        "the terminal run must stay terminal"
+    );
+    drop(restored);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
+    // A7 service guard + A9 metrics guard coexist on every SSE stream: the
+    // subscriber gauge tracks the exact live-stream count across
+    // multi-subscriber attach/drop, a lagging stream emits the typed error
+    // and releases its gauge slot, the last-subscriber disconnect cancels
+    // the run (typed client_disconnect), and a reconnect replays the exact
+    // terminal. No drift between the two guards on any path.
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            client_disconnect_policy: ClientDisconnectPolicy::CancelOnDisconnect,
+            sse_keepalive_interval: Duration::from_millis(100),
+            broadcast_capacity: 2,
+            ..AgentGatewayConfig::default()
+        },
+        include_str!("fixtures/gateway/cpu_loop.rss"),
+    )
+    .expect("RSS source should compile");
+    let metrics = state.metrics();
+    let server = spawn_gateway_server(state).await;
+
+    // --- Run 1: multi-subscriber, disconnect, gauge, cancel, replay ---
+    let (status, _, run) = raw_json(
+        server.addr,
+        "POST",
+        "/v1/runs",
+        json!({"input": "spin"}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 202);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    let sse_path = format!("/v1/runs/{run_id}/events");
+
+    let mut first = RawHttp::connect(server.addr).await;
+    let (status, _) = first
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    let mut second = RawHttp::connect(server.addr).await;
+    let (status, _) = second
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    let subscribed = wait_until(std::time::Duration::from_secs(5), || {
+        metrics.snapshot().sse_subscribers == 2
+    })
+    .await;
+    assert!(
+        subscribed,
+        "two open SSE streams must be counted by the gauge"
+    );
+
+    // One subscriber disconnects while the other remains: no cancellation
+    // (cancel-on-disconnect only fires for the LAST subscriber) and the
+    // gauge drops to exactly 1.
+    drop(first);
+    let released = wait_until(std::time::Duration::from_secs(5), || {
+        metrics.snapshot().sse_subscribers == 1
+    })
+    .await;
+    assert!(released, "the dropped stream must release its gauge slot");
+    // The run must stay active while one subscriber remains (the helper
+    // itself asserts the observed count).
+    wait_for_active_agents(server.addr, 1, Duration::from_secs(2)).await;
+
+    // The last subscriber disconnects while the run is active: the service
+    // guard cancels the run with the typed reason; the metrics guard drops
+    // the gauge to exactly 0.
+    drop(second);
+    let drained = wait_until(std::time::Duration::from_secs(5), || {
+        metrics.snapshot().sse_subscribers == 0
+    })
+    .await;
+    assert!(drained, "the last dropped stream must release the gauge");
+    wait_for_active_agents(server.addr, 0, Duration::from_secs(5)).await;
+
+    // Terminal replay: exactly one run.cancelled with the typed
+    // client_disconnect reason and the full replayed history.
+    let mut replay = RawHttp::connect(server.addr).await;
+    let (status, _) = replay
+        .open(&http_head(
+            "GET",
+            &sse_path,
+            None,
+            &[("accept", "text/event-stream")],
+        ))
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        replay
+            .read_until("event: run.cancelled", Duration::from_secs(5))
+            .await,
+        "the persisted cancellation must replay"
+    );
+    replay.drain_sse(Duration::from_secs(2)).await;
+    let text = replay.sse_text();
+    assert_eq!(text.matches("event: run.cancelled").count(), 1);
+    assert!(
+        text.contains("client_disconnect"),
+        "the replayed terminal must carry the typed reason, got: {text}"
+    );
+    assert!(
+        text.contains("event: run.started"),
+        "full history must replay"
+    );
+
+    // --- Run 2: a lagging stream emits the typed error, releases its
+    // gauge slot, and the registry counts the lag. The subscriber body is
+    // held unread (router oneshot), so the bounded broadcast channel fills
+    // deterministically before the stream is polled.
+    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let http = rustscript_vm::HttpConfig {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_schemes: vec!["http".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..rustscript_vm::HttpConfig::default()
+    };
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            client_disconnect_policy: ClientDisconnectPolicy::CancelOnDisconnect,
+            sse_keepalive_interval: Duration::from_millis(100),
+            broadcast_capacity: 2,
+            http,
+            ..AgentGatewayConfig::default()
+        },
+        format!(
+            r#"
+            use http;
+            use stream;
+            pub fn run(input: map) -> string {{
+                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                stream::emit({{"type": "model.delta", "delta": "a"}});
+                stream::emit({{"type": "model.delta", "delta": "b"}});
+                stream::emit({{"type": "model.delta", "delta": "c"}});
+                "done";
+            }}
+            "#
+        ),
+    )
+    .expect("RSS source should compile");
+    let metrics = state.metrics();
+    let app = build_agent_gateway_app(state.clone());
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "lag"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    arrived.await.expect("the run must reach the fixture");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/v1/runs/{run_id}/events"))
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .expect("SSE request should build"),
+        )
+        .await;
+    let response = response.expect("SSE route should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let counted = wait_until(std::time::Duration::from_secs(5), || {
+        metrics.snapshot().sse_subscribers == 1
+    })
+    .await;
+    assert!(counted, "the lagging stream must be counted by the gauge");
+
+    // Release the script: five broadcasts into a capacity-2 channel while
+    // the subscriber is not reading — a deterministic lag.
+    release.send(()).expect("release the fixture");
+    let terminal = wait_until(std::time::Duration::from_secs(10), || {
+        metrics.snapshot().active_runs == 0
+    })
+    .await;
+    assert!(terminal, "the run must reach its terminal");
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("SSE body should be readable");
+    let text = String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8");
+    assert!(
+        text.contains("event_lagged"),
+        "the lagging subscriber must observe the typed lagged error, got: {text}"
+    );
+    let released = wait_until(std::time::Duration::from_secs(5), || {
+        metrics.snapshot().sse_subscribers == 0
+    })
+    .await;
+    assert!(
+        released,
+        "the lagged stream must release its gauge slot exactly once"
+    );
+    assert!(
+        metrics.snapshot().events_lagged >= 3,
+        "the registry must count the dropped broadcasts"
+    );
+    fixture.join().expect("fixture thread");
+}

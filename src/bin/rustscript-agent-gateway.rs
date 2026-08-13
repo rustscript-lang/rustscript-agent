@@ -1,4 +1,12 @@
-use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use rustscript_agent::{
     AgentGatewayConfig, AgentGatewayState, TelegramConfig, build_agent_gateway_app,
@@ -167,6 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with bounded backoff in the background; after the bound it is
     // disabled for this process while the API keeps serving.
     let telegram_handle = Arc::new(std::sync::Mutex::new(None::<TelegramAdapter>));
+    // Set before shutdown begins so the bounded reconnect task can never
+    // spawn a second adapter after the graceful stop path started.
+    let stopping = Arc::new(AtomicBool::new(false));
     if let Some(telegram) = telegram {
         match spawn_telegram_adapter(state.clone(), telegram.clone()).await {
             Ok(adapter) => {
@@ -180,10 +191,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let reconnect_state = state.clone();
                 let reconnect_handle = Arc::clone(&telegram_handle);
+                let stopping_reconnect = Arc::clone(&stopping);
                 tokio::spawn(async move {
                     let mut delay = Duration::from_secs(1);
                     for attempt in 1..=3 {
                         tokio::time::sleep(delay).await;
+                        if stopping_reconnect.load(Ordering::Acquire) {
+                            return;
+                        }
                         match spawn_telegram_adapter(reconnect_state.clone(), telegram.clone())
                             .await
                         {
@@ -191,6 +206,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!(
                                     "rustscript-agent-gateway telegram adapter started (reconnect attempt {attempt})"
                                 );
+                                if stopping_reconnect.load(Ordering::Acquire) {
+                                    // Shutdown began while the reconnect was
+                                    // in flight: stop the adapter we just
+                                    // spawned (bounded join) and never leave
+                                    // it running after the graceful stop
+                                    // path.
+                                    adapter.shutdown().await;
+                                    return;
+                                }
                                 *reconnect_handle.lock().expect("telegram handle lock") =
                                     Some(adapter);
                                 return;
@@ -220,14 +244,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) => result?,
         signal = tokio::signal::ctrl_c() => {
             signal?;
-            eprintln!("halting: cancelling active runs with the typed resource-closed reason");
-            state.service().halt();
-            // Bounded Telegram shutdown: stop the poller, wait for the final
-            // offset persist (join bounded at 60s). The guard is dropped
-            // before the await.
+            eprintln!(
+                "halting: stopping admission and Telegram, then cancelling active runs, \
+                 then closing the storage worker"
+            );
+            // 1. Stop admission first: new runs answer the typed Halting
+            //    rejection, so no new work can start after shutdown begins.
+            state.service().stop_admission();
+            // 2. Bounded Telegram shutdown: stop the poller, wait for the
+            //    final offset persist (join bounded at 60s). The stopping
+            //    flag prevents the reconnect task from spawning a second
+            //    adapter mid-shutdown.
+            stopping.store(true, Ordering::Release);
             let adapter = telegram_handle.lock().expect("telegram handle lock").take();
             if let Some(adapter) = adapter {
                 adapter.shutdown().await;
+            }
+            // 3. Cancel active runs with the typed resource-closed reason;
+            //    workers exit within their configured bounds and commit
+            //    their typed terminal transitions.
+            state.service().halt();
+            // 4. Deterministic storage-worker shutdown: queued commands fail
+            //    fast with a typed error instead of hanging, and the worker
+            //    thread is joined.
+            if let Some(persistence) = state.persistence() {
+                persistence.shutdown();
             }
         }
     }

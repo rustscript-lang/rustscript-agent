@@ -189,6 +189,10 @@ pub enum AdmitError {
     SessionNotFound,
     Persistence(String),
     Invalid(String),
+    /// The gateway is halting (SIGINT path): admission is closed before
+    /// active runs are cancelled, so no new work can start after shutdown
+    /// begins.
+    Halting,
 }
 
 impl std::fmt::Display for AdmitError {
@@ -202,6 +206,7 @@ impl std::fmt::Display for AdmitError {
             Self::SessionNotFound => formatter.write_str("session not found"),
             Self::Persistence(message) => formatter.write_str(message),
             Self::Invalid(message) => formatter.write_str(message),
+            Self::Halting => formatter.write_str("gateway is halting; new runs are not admitted"),
         }
     }
 }
@@ -298,6 +303,15 @@ impl AgentService {
     /// after the durable commit succeeded, so a failed admission leaves
     /// nothing behind — in memory or on disk.
     pub async fn admit(&self, request: AdmitRunRequest) -> Result<AdmittedRun, AdmitError> {
+        // The halting gate is checked before any capacity permit or storage
+        // work: once shutdown begins (SIGINT path), new admissions answer
+        // the typed Halting rejection and never consume capacity.
+        if self.inner.halting.load(Ordering::Acquire) {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Halting);
+            return Err(AdmitError::Halting);
+        }
         let capacity_permit = self
             .inner
             .capacity
@@ -638,7 +652,7 @@ impl AgentService {
     /// marks the service as halting; workers exit within their configured
     /// bounds and commit their typed terminal transitions.
     pub fn halt(&self) {
-        self.inner.halting.store(true, Ordering::Release);
+        self.stop_admission();
         let handles = self
             .inner
             .runs
@@ -656,6 +670,15 @@ impl AgentService {
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("resource_closed");
             handle.cancel.request(CancellationReason::ResourceClosed);
         }
+    }
+
+    /// Stops new admissions without touching active runs: every later
+    /// `admit()` answers the typed [`AdmitError::Halting`] rejection. The
+    /// gateway's SIGINT path calls this first (no new work can start after
+    /// shutdown begins), then stops the Telegram adapter, then cancels
+    /// active runs via [`Self::halt`]. Idempotent.
+    pub fn stop_admission(&self) {
+        self.inner.halting.store(true, Ordering::Release);
     }
 
     /// Marks a run terminal: records the terminal time for TTL retention,

@@ -974,6 +974,13 @@ async fn create_run_handler(
                 &message,
             );
         }
+        Err(AdmitError::Halting) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway_halting",
+                "gateway is halting; new runs are not admitted",
+            );
+        }
     };
     if admitted.replayed {
         return json_response(
@@ -1359,7 +1366,13 @@ fn event_stream(
     subscriber_guard: Option<crate::metrics::SubscriberGuard>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(
-        (history.into_iter(), receiver, guard, subscriber_guard, false),
+        (
+            history.into_iter(),
+            receiver,
+            guard,
+            subscriber_guard,
+            false,
+        ),
         |(mut history, receiver, mut guard, subscriber_guard, mut done)| async move {
             if let Some(event) = history.next() {
                 done |= event.is_terminal();
@@ -1384,35 +1397,35 @@ fn event_stream(
             match receiver.recv().await {
                 Ok(event) => {
                     done |= event.is_terminal();
-                if event.is_terminal()
-                    && let Some(guard) = guard.as_mut()
-                {
-                    guard.disarm();
+                    if event.is_terminal()
+                        && let Some(guard) = guard.as_mut()
+                    {
+                        guard.disarm();
+                    }
+                    Some((
+                        Ok(event.into_sse()),
+                        (history, Some(receiver), guard, subscriber_guard, done),
+                    ))
                 }
-                Some((
-                    Ok(event.into_sse()),
-                    (history, Some(receiver), guard, subscriber_guard, done),
-                ))
-            }
-            Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                // The subscriber fell behind the bounded broadcast
-                // buffer; the dropped count is observable, the stream
-                // ends instead of presenting a gap as if nothing
-                // happened, and the client reconnects for a full replay.
-                // The service guard stays armed: without a delivered
-                // terminal, a cancel-on-disconnect run treats this as a
-                // disconnect.
-                if let Some(guard) = &subscriber_guard {
-                    guard.record_lag(dropped);
-                }
+                Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                    // The subscriber fell behind the bounded broadcast
+                    // buffer; the dropped count is observable, the stream
+                    // ends instead of presenting a gap as if nothing
+                    // happened, and the client reconnects for a full replay.
+                    // The service guard stays armed: without a delivered
+                    // terminal, a cancel-on-disconnect run treats this as a
+                    // disconnect.
+                    if let Some(guard) = &subscriber_guard {
+                        guard.record_lag(dropped);
+                    }
                     done = true;
                     let event = Event::default()
                         .event("error")
                         .data(json!({"code":"event_lagged","dropped":dropped}).to_string());
-                Some((
-                    Ok(event),
-                    (history, Some(receiver), guard, subscriber_guard, done),
-                ))
+                    Some((
+                        Ok(event),
+                        (history, Some(receiver), guard, subscriber_guard, done),
+                    ))
                 }
                 Err(broadcast::error::RecvError::Closed) => None,
             }

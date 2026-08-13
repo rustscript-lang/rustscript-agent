@@ -21,16 +21,20 @@ pub enum AdmitRejectReason {
     SessionNotFound = 3,
     Persistence = 4,
     Invalid = 5,
+    /// Admission rejected because the gateway is halting (SIGINT path):
+    /// no new work can start after shutdown begins.
+    Halting = 6,
 }
 
 impl AdmitRejectReason {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::RunLimitReached,
         Self::IdempotencyConflict,
         Self::ParentNotFound,
         Self::SessionNotFound,
         Self::Persistence,
         Self::Invalid,
+        Self::Halting,
     ];
 
     pub fn label(self) -> &'static str {
@@ -41,6 +45,7 @@ impl AdmitRejectReason {
             Self::SessionNotFound => "session_not_found",
             Self::Persistence => "persistence",
             Self::Invalid => "invalid",
+            Self::Halting => "halting",
         }
     }
 }
@@ -96,11 +101,15 @@ pub enum StorageOp {
     Migrate = 22,
     RecoveryRecoverActive = 23,
     LoadAll = 24,
-    Unknown = 25,
+    SessionGet = 25,
+    DeliveryGet = 26,
+    DeliveryAdvance = 27,
+    DeliverySet = 28,
+    Unknown = 29,
 }
 
 impl StorageOp {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 30] = [
         Self::AdmissionCreate,
         Self::SessionCreate,
         Self::SessionTouch,
@@ -126,6 +135,10 @@ impl StorageOp {
         Self::Migrate,
         Self::RecoveryRecoverActive,
         Self::LoadAll,
+        Self::SessionGet,
+        Self::DeliveryGet,
+        Self::DeliveryAdvance,
+        Self::DeliverySet,
         Self::Unknown,
     ];
 
@@ -156,6 +169,10 @@ impl StorageOp {
             Self::Migrate => "migrate",
             Self::RecoveryRecoverActive => "recovery.recover_active",
             Self::LoadAll => "load.all",
+            Self::SessionGet => "session.get",
+            Self::DeliveryGet => "delivery.get",
+            Self::DeliveryAdvance => "delivery.advance",
+            Self::DeliverySet => "delivery.set",
             Self::Unknown => "unknown",
         }
     }
@@ -187,6 +204,10 @@ impl StorageOp {
             "migrate" => Self::Migrate,
             "recovery.recover_active" => Self::RecoveryRecoverActive,
             "load.all" => Self::LoadAll,
+            "session.get" => Self::SessionGet,
+            "delivery.get" => Self::DeliveryGet,
+            "delivery.advance" => Self::DeliveryAdvance,
+            "delivery.set" => Self::DeliverySet,
             _ => Self::Unknown,
         }
     }

@@ -779,7 +779,12 @@ struct AdapterRuntime {
     /// into a recreated session.
     epochs: Arc<Mutex<EpochState>>,
     /// Metric: delivery cursor advance failures (at-least-once delivery
-    /// hook — see [`advance_cursor`]).
+    /// hook — see [`advance_cursor`]). The bounded metrics registry's
+    /// `agent_storage_ops_total{op="delivery.advance",result="error"}`
+    /// counter is the source of truth for every storage command failure;
+    /// this adapter-scoped counter mirrors the same events at the same call
+    /// sites and exists so tests can observe one adapter's delivery health
+    /// without scraping the registry.
     advance_failures: Arc<AtomicU64>,
 }
 
@@ -1893,6 +1898,15 @@ async fn admit_text(
                 chat_id,
                 thread_id,
                 "Storage is unavailable; try again shortly.",
+            )
+            .await;
+        }
+        Err(AdmitError::Halting) => {
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "The gateway is shutting down; try again shortly.",
             )
             .await;
         }

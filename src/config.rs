@@ -607,6 +607,7 @@ mod tests {
             "cancel-on-disconnect"
         );
     }
+    #[test]
     fn telegram_api_base_must_be_https_in_production() {
         let base = TelegramConfig {
             bot_token: "123:abc".to_string(),

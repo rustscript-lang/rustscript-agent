@@ -293,6 +293,12 @@ fn storage_op_label_mapping_is_a_finite_closed_set() {
         ("migrate", StorageOp::Migrate),
         ("recovery.recover_active", StorageOp::RecoveryRecoverActive),
         ("load.all", StorageOp::LoadAll),
+        // A8 Telegram adapter storage ops: delivery cursors and session
+        // reads must classify as their typed ops, never as `unknown`.
+        ("session.get", StorageOp::SessionGet),
+        ("delivery.get", StorageOp::DeliveryGet),
+        ("delivery.advance", StorageOp::DeliveryAdvance),
+        ("delivery.set", StorageOp::DeliverySet),
     ];
     for (command, expected) in known {
         assert_eq!(
