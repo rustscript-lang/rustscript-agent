@@ -1,0 +1,7 @@
+{
+  "code": "rate_limited",
+  "message": "provider rate limit exceeded",
+  "retryable": true,
+  "status_code": 429,
+  "raw": {"error": {"type": "rate_limit_error"}}
+}

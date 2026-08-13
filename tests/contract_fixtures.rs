@@ -1,7 +1,8 @@
 use std::fs;
 
 use rustscript_agent::domain::{
-    AgentEventEnvelope, InboundEnvelope, LlmEvent, LlmRequest, ToolDescriptor,
+    AgentEventEnvelope, InboundEnvelope, LlmEvent, LlmRequest, LlmResponse, ProviderError, Usage,
+    ToolDescriptor,
 };
 use rustscript_agent::{AgentConfig, AgentRunner, RunContext};
 use serde_json::Value;
@@ -10,9 +11,12 @@ const FIXTURES: &[(&str, &str)] = &[
     ("inbound_envelope.json", "platform"),
     ("llm_request.json", "model"),
     ("llm_event.json", "type"),
+    ("llm_response.json", "id"),
+    ("provider_error.json", "code"),
     ("tool_call.json", "name"),
     ("run_event.json", "type"),
     ("run_context.json", "run_id"),
+    ("usage.json", "input_tokens"),
 ];
 
 fn fixtures_root() -> std::path::PathBuf {
@@ -40,8 +44,10 @@ fn canonical_contract_fixtures_are_valid_json_with_required_discriminators() {
 fn canonical_fixtures_deserialize_into_the_frozen_typed_contracts() {
     let inbound: InboundEnvelope = read_fixture("inbound_envelope.json");
     assert_eq!(inbound.platform, "api_server");
+    assert_eq!(inbound.profile, "default");
     assert_eq!(inbound.account_id, "account-test");
-    assert_eq!(inbound.content.text, "hello");
+    assert_eq!(inbound.content, "hello");
+    assert!(inbound.attachments.is_empty());
 
     let run_context: RunContext = read_fixture("run_context.json");
     assert_eq!(run_context.run_id, "run-fixture");
@@ -80,6 +86,25 @@ fn canonical_fixtures_deserialize_into_the_frozen_typed_contracts() {
     assert_eq!(run_event.status, "completed");
     assert_eq!(run_event.sequence, 4);
     assert!(run_event.error.is_none());
+
+    let usage: Usage = read_fixture("usage.json");
+    assert_eq!(usage.input_tokens, 5);
+    assert_eq!(usage.output_tokens, 7);
+    assert_eq!(usage.total_tokens, 12);
+
+    let response: LlmResponse = read_fixture("llm_response.json");
+    assert_eq!(response.id, "resp-test");
+    assert_eq!(response.model, "test-model");
+    assert_eq!(response.content[0].text.as_deref(), Some("hello from the provider"));
+    assert!(response.tool_calls.is_empty());
+    assert_eq!(response.usage.total_tokens, 12);
+    assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+
+    let provider_error: ProviderError = read_fixture("provider_error.json");
+    assert_eq!(provider_error.code, "rate_limited");
+    assert!(provider_error.retryable);
+    assert_eq!(provider_error.status_code, Some(429));
+    assert!(provider_error.raw.get("error").is_some());
 }
 
 #[test]

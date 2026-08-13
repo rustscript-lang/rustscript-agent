@@ -15,8 +15,8 @@ pub mod service;
 
 pub use config::AgentGatewayConfig;
 pub use domain::{
-    AgentEventEnvelope, InboundContent, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage,
-    LlmRequest, RunContext, Sampling, ToolCall, ToolDescriptor,
+    AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
+    LlmResponse, ProviderError, RunContext, Sampling, ToolCall, ToolDescriptor, Usage,
 };
 pub use gateway::{AgentGatewayState, build_agent_gateway_app};
 pub use gateway::store::GatewayPersistence;

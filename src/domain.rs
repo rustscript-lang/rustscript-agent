@@ -30,24 +30,19 @@ pub(crate) fn timestamp() -> u64 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InboundEnvelope {
     pub platform: String,
+    pub profile: String,
     pub account_id: String,
     pub chat_id: String,
     pub thread_id: Option<String>,
     pub user_id: String,
     pub message_id: String,
     pub session_hint: Option<String>,
-    pub content: InboundContent,
+    pub content: String,
+    pub attachments: Vec<Value>,
     pub command: Option<String>,
     pub reply_to: Option<String>,
     pub received_at: u64,
     pub metadata: Value,
-}
-
-/// Text/attachment content carried by an inbound envelope.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct InboundContent {
-    pub text: String,
-    pub attachments: Vec<Value>,
 }
 
 /// Canonical agent run context (gateway-api plan section 4.2).
@@ -181,6 +176,41 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+}
+
+/// Canonical token usage reported by a provider (gateway-api plan section
+/// 4.4).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Canonical provider completion response (gateway-api plan section 4.4).
+/// RSS adapters normalize wire responses into this shape; unknown provider
+/// fields remain under the explicit raw field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmResponse {
+    pub id: String,
+    pub model: String,
+    pub content: Vec<LlmContentBlock>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Usage,
+    pub finish_reason: Option<String>,
+    pub raw: Value,
+}
+
+/// Canonical provider error (gateway-api plan section 4.4): typed code,
+/// human message, retry hint, transport status when known, and the raw
+/// provider payload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub status_code: Option<u16>,
+    pub raw: Value,
 }
 
 /// Tool descriptor contract (gateway-api plan section 4.5): name,

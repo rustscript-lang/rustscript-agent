@@ -1,0 +1,11 @@
+{
+  "id": "resp-test",
+  "model": "test-model",
+  "content": [
+    {"type": "text", "text": "hello from the provider"}
+  ],
+  "tool_calls": [],
+  "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+  "finish_reason": "stop",
+  "raw": {}
+}
