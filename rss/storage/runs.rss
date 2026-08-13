@@ -371,8 +371,13 @@ pub fn storage_run_recover_active(db_id: int, payload_json: string) -> array {
             params: [input.now_ms.copy(), input.now_ms.copy(), &input.reason]
         },
         {
-            sql: "UPDATE compactions SET state = 'failed', error_message = 'run interrupted during gateway restart', completed_at_ms = ? WHERE state = 'pending' AND run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",
-            params: [input.now_ms.copy(), input.now_ms.copy(), &input.reason]
+            // After a restart EVERY pending compaction is an interrupted
+            // leftover: a crash between the run terminal commit and
+            // compaction.fail leaves a pending row whose run is already
+            // terminal (never in the recovered set), so the fail-sweep is
+            // unconditional instead of being limited to recovered runs.
+            sql: "UPDATE compactions SET state = 'failed', error_message = 'run interrupted during gateway restart', completed_at_ms = ? WHERE state = 'pending'",
+            params: [input.now_ms.copy()]
         },
         {
             sql: "UPDATE idempotency_records SET state = 'expired', completed_at_ms = ? WHERE state = 'claimed' AND resource_type = 'run' AND resource_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",

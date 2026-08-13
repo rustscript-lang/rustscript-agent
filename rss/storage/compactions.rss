@@ -131,14 +131,17 @@ fn compaction_row_matches(
 /// is exactly one below the plan generation, the range is ordered with the
 /// retained-tail marker inside it, and messages exist at both endpoints),
 /// and resets a FAILED row for the same session+generation to pending with
-/// the new payload (the retry-after-failure / restart-recovery path).
-/// When no row exists after the insert, the guards rejected the start: that
-/// is a typed `compaction_start_rejected`, never a silent success.
+/// the new payload (the retry-after-failure / restart-recovery path). The
+/// reset keeps the row's audit identity (the caller's id equals the row's
+/// id — enforced by `storage_compaction_start`) and clears the stale
+/// `completed_at_ms`, so a later commit records only its own time. When no
+/// row exists after the insert, the guards rejected the start: that is a
+/// typed `compaction_start_rejected`, never a silent success.
 fn compaction_start_insert(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: CompactionStartInput = json::decode::<CompactionStartInput>(payload_json);
     sqlite::execute(
         db_id,
-        "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms WHERE compactions.state = 'failed'",
+        "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms, completed_at_ms = 0 WHERE compactions.state = 'failed'",
         [&input.id, &input.session_id, &input.run_id, input.generation.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.retained_tail_ordinal.copy(), &input.summary_json, input.token_estimate.copy(), &input.model, input.now_ms.copy(), &input.session_id, input.generation.copy(), &input.run_id, &input.session_id, input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), &input.id, &input.session_id]
     );
     let inserted: map = sqlite::query(
@@ -224,10 +227,19 @@ pub fn storage_compaction_start(db_id: int, payload_json: string, max_rows: int,
                                 result = { ok: false, code: "compaction_pending_conflict", message: "a pending compaction for this session+generation already exists with a different plan", result: { columns: [], rows: [] } };
                             }
                         } else {
-                            // state == "failed": the guarded insert resets
-                            // the row to pending (retry after a typed failure
-                            // or restart recovery).
-                            result = compaction_start_insert(db_id, payload_json, max_rows, max_bytes);
+                            // state == "failed": a retry with the SAME id
+                            // resets the row to pending (the guarded insert
+                            // also clears the stale failure timestamp). A
+                            // DIFFERENT id would silently replace the failed
+                            // row's audit identity, so it is a typed
+                            // conflict: the caller must resume with the
+                            // original id.
+                            let existing_failed_id: string = existing_row[0];
+                            if existing_failed_id == input.id.copy() {
+                                result = compaction_start_insert(db_id, payload_json, max_rows, max_bytes);
+                            } else {
+                                result = { ok: false, code: "compaction_failed_conflict", message: "a failed compaction for this session+generation exists with a different id; resume with the original compaction id", result: { columns: [], rows: [] } };
+                            }
                         }
                     }
                 } else {

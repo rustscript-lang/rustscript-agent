@@ -312,3 +312,26 @@ advances exactly once).
 | Tool-call cycle bounded by max_turns; tool_calls count pinned | GREEN (2 new suites + updated) |
 | Full-compaction rule and O(n³) bound documented | GREEN (doc + boundary test) |
 | Production entry (policy wired into gateway/service) | NOT WIRED (unchanged; A3/A4 blockers stand) |
+
+## 9. Wave 2 integration hardening (2026-08-14, `feat/agent-roadmap-no-a4-a6`)
+
+The Wave 2 integration (A5+A7+A8+A9 on one branch) added three P3
+hardening items to the durable compaction policy, all TDD (real SQLite and
+the gateway reopen path):
+
+- **failed → pending reset clears `completed_at_ms`**: the guarded insert's
+  `ON CONFLICT ... DO UPDATE` now sets `completed_at_ms = 0`, so a retried
+  compaction's later commit records only its own time
+  (`failed_retry_reset_clears_completed_at_ms`).
+- **Different compaction id on a failed row is a typed conflict**: a retry
+  with a different id would silently replace the failed row's audit
+  identity; `compaction.start` now answers `compaction_failed_conflict` and
+  the caller must resume with the original id. Same-id retries (including
+  the fresh-run recovery flow) are unchanged
+  (`failed_retry_with_different_id_is_a_typed_conflict`).
+- **Restart recovery fails EVERY pending compaction**: after a restart any
+  pending row is an interrupted leftover, even when its run is already
+  terminal (the crash window between the run terminal commit and
+  `compaction.fail`); the recovery fail-sweep is unconditional instead of
+  being limited to recovered runs (`recovery_fails_pending_compaction_even_when_run_is_terminal`,
+  `gateway_reopen_fails_orphan_pending_compaction_even_when_run_is_terminal`).

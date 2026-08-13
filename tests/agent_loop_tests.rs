@@ -2371,3 +2371,212 @@ fn restart_recovery_fails_pending_compaction_then_new_start_commits() {
 
     fs::remove_dir_all(&root).expect("temporary storage root should be removed");
 }
+
+/// P3: a retry of a FAILED compaction resets the row to pending with the
+/// same audit identity AND clears the stale failure timestamp
+/// (`completed_at_ms = 0`), so a later commit records only its own time.
+#[test]
+fn failed_retry_reset_clears_completed_at_ms() {
+    let root = temporary_root("compaction-failed-reset");
+    let storage = storage_runner(&root);
+    let db_name = "failed-reset.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    run_storage(
+        &storage,
+        db_name,
+        "start",
+        "compaction.start",
+        plan["commands"][0]["payload"].clone(),
+        1000,
+    );
+    run_storage(
+        &storage,
+        db_name,
+        "fail",
+        "compaction.fail",
+        json!({
+            "id": "compaction-1",
+            "error_message": "boom",
+            "completed_at_ms": 1000,
+        }),
+        1000,
+    );
+    let failed_row = first_query_row(&run_storage(
+        &storage,
+        db_name,
+        "get-failed",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        1000,
+    ));
+    assert_eq!(failed_row["state"], json!("failed"));
+    assert_eq!(failed_row["completed_at_ms"], json!(1000));
+
+    // Retry with the SAME id: the failed row is reset to pending and the
+    // stale failure timestamp must be cleared.
+    let restarted = run_storage(
+        &storage,
+        db_name,
+        "retry-start",
+        "compaction.start",
+        plan["commands"][0]["payload"].clone(),
+        1001,
+    );
+    assert_eq!(restarted["ok"], json!(true));
+    let pending_row = first_query_row(&restarted);
+    assert_eq!(pending_row["id"], json!("compaction-1"));
+    assert_eq!(pending_row["state"], json!("pending"));
+    assert_eq!(
+        pending_row["completed_at_ms"],
+        json!(0),
+        "the failed -> pending reset must clear the stale completed_at_ms"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+/// P3: a retry that would silently REPLACE a failed compaction's audit id
+/// is a typed conflict — the failed row keeps its identity, and the caller
+/// must resume with the original id.
+#[test]
+fn failed_retry_with_different_id_is_a_typed_conflict() {
+    let root = temporary_root("compaction-failed-id-conflict");
+    let storage = storage_runner(&root);
+    let db_name = "failed-id-conflict.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    run_storage(
+        &storage,
+        db_name,
+        "start",
+        "compaction.start",
+        plan["commands"][0]["payload"].clone(),
+        1000,
+    );
+    run_storage(
+        &storage,
+        db_name,
+        "fail",
+        "compaction.fail",
+        json!({
+            "id": "compaction-1",
+            "error_message": "boom",
+            "completed_at_ms": 1000,
+        }),
+        1000,
+    );
+
+    // A fresh plan id for the same session+generation must not silently
+    // replace the failed row's audit id.
+    let mut different = plan["commands"][0]["payload"].clone();
+    different["id"] = json!("compaction-2");
+    let conflicted = run_storage(
+        &storage,
+        db_name,
+        "conflict-start",
+        "compaction.start",
+        different,
+        1001,
+    );
+    assert_eq!(conflicted["ok"], json!(false));
+    assert_eq!(conflicted["code"], json!("compaction_failed_conflict"));
+
+    let row = first_query_row(&run_storage(
+        &storage,
+        db_name,
+        "get-after-conflict",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        1001,
+    ));
+    assert_eq!(
+        row["id"],
+        json!("compaction-1"),
+        "the failed row's audit identity must survive the rejected retry"
+    );
+    assert_eq!(row["state"], json!("failed"));
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+/// P3: restart recovery fails EVERY pending compaction — after a restart
+/// any pending row is an interrupted leftover, even when its run is already
+/// terminal (the crash window between the run terminal commit and
+/// `compaction.fail`).
+#[test]
+fn recovery_fails_pending_compaction_even_when_run_is_terminal() {
+    let root = temporary_root("compaction-recovery-orphan");
+    let storage = storage_runner(&root);
+    let db_name = "recovery-orphan.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    run_storage(
+        &storage,
+        db_name,
+        "start",
+        "compaction.start",
+        plan["commands"][0]["payload"].clone(),
+        1000,
+    );
+    // The run leaves compacting with a terminal transition BEFORE any
+    // compaction.fail is committed (the crash window the recovery closes).
+    let terminal = run_storage(
+        &storage,
+        db_name,
+        "run-terminal",
+        "run.transition",
+        transition_payload("run-1", "compacting", "failed", 1001),
+        1001,
+    );
+    assert_eq!(terminal["ok"], json!(true));
+
+    // Restart recovery: NO run is recovered (run-1 is already terminal),
+    // yet the pending compaction is still an interrupted leftover and must
+    // be durably failed.
+    let recovery = run_storage(
+        &storage,
+        db_name,
+        "recovery",
+        "recovery.recover_active",
+        json!({
+            "reason": "gateway_restart",
+            "details_json": "{}",
+            "now_ms": 2000,
+            "max_rows": 128,
+            "max_bytes": 65_536,
+            "max_events": 128,
+        }),
+        2000,
+    );
+    assert_eq!(recovery["ok"], json!(true));
+    assert_eq!(recovery["recovered"], json!(0), "no run may be recovered");
+
+    let row = first_query_row(&run_storage(
+        &storage,
+        db_name,
+        "compaction-after-recovery",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        2000,
+    ));
+    assert_eq!(
+        row["state"],
+        json!("failed"),
+        "every pending compaction must be failed by restart recovery"
+    );
+    assert_eq!(
+        row["error_message"],
+        json!("run interrupted during gateway restart"),
+        "the typed recovery failure reason must be recorded"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
