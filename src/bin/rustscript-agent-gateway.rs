@@ -218,6 +218,17 @@ fn telegram_config() -> Result<Option<TelegramConfig>, Box<dyn std::error::Error
     )? {
         config.api_base = api_base;
     }
+    if env_value(
+        "RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST",
+        "PD_EDGE_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST",
+    )?
+    .as_deref()
+        == Some("1")
+    {
+        // Explicit escape hatch for local fixture servers; production
+        // api_base stays https-only so the token never travels in cleartext.
+        config.allow_insecure_localhost = true;
+    }
     if let Some(accounts) = env_value(
         "RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_ACCOUNTS",
         "PD_EDGE_AGENT_TELEGRAM_ALLOWED_ACCOUNTS",

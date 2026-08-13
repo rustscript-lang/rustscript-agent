@@ -17,8 +17,15 @@ pub struct TelegramConfig {
     /// Bot API token; never logged, redacted in Debug.
     pub bot_token: String,
     /// Bot API base URL (defaults to `https://api.telegram.org`); tests point
-    /// this at a local fixture server.
+    /// this at a local fixture server. Production requires `https`: a plain
+    /// `http` base is only accepted for localhost and only with
+    /// [`Self::allow_insecure_localhost`] (or under `cfg(test)`), so the
+    /// token is never transmitted in cleartext.
     pub api_base: String,
+    /// Explicit escape hatch for `http://localhost` fixture bases (tests
+    /// and local development only). `https` remains the only production
+    /// scheme.
+    pub allow_insecure_localhost: bool,
     /// `getUpdates` long-poll timeout in seconds.
     pub poll_timeout: Duration,
     /// Backoff between poll rounds after a transport/API error.
@@ -50,6 +57,7 @@ impl std::fmt::Debug for TelegramConfig {
             .debug_struct("TelegramConfig")
             .field("bot_token", &"REDACTED")
             .field("api_base", &self.api_base)
+            .field("allow_insecure_localhost", &self.allow_insecure_localhost)
             .field("poll_timeout", &self.poll_timeout)
             .field("poll_interval", &self.poll_interval)
             .field("max_429_retries", &self.max_429_retries)
@@ -66,13 +74,45 @@ impl std::fmt::Debug for TelegramConfig {
 
 impl TelegramConfig {
     /// Validates every lifecycle bound; allowlists may stay empty (that is
-    /// the deny-by-default posture).
+    /// the deny-by-default posture). The api_base scheme is enforced:
+    /// production must be `https`; `http` is only accepted for a localhost
+    /// host with the explicit [`Self::allow_insecure_localhost`] escape (or
+    /// under `cfg(test)`), so the token is never sent over cleartext.
     pub fn validate(&self) -> Result<(), String> {
         if self.bot_token.trim().is_empty() {
             return Err("telegram bot_token must not be blank".to_string());
         }
         if self.api_base.trim().is_empty() {
             return Err("telegram api_base must not be blank".to_string());
+        }
+        let base = url::Url::parse(&self.api_base)
+            .map_err(|error| format!("telegram api_base is not a valid URL: {error}"))?;
+        if !base.username().is_empty() || base.password().is_some() {
+            return Err("telegram api_base must not embed credentials".to_string());
+        }
+        match base.scheme() {
+            "https" => {}
+            "http" => {
+                let host = base.host_str().unwrap_or_default();
+                let localhost = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+                if !localhost {
+                    return Err(
+                        "telegram api_base http is only allowed for localhost (the bot token must never travel in cleartext)"
+                            .to_string(),
+                    );
+                }
+                if !(self.allow_insecure_localhost || cfg!(test)) {
+                    return Err(
+                        "telegram api_base http requires allow_insecure_localhost (test fixtures and local development only)"
+                            .to_string(),
+                    );
+                }
+            }
+            other => {
+                return Err(format!(
+                    "telegram api_base scheme must be https (got {other})"
+                ));
+            }
         }
         if self.poll_timeout.is_zero() {
             return Err("telegram poll_timeout must be positive".to_string());
@@ -95,6 +135,7 @@ impl Default for TelegramConfig {
         Self {
             bot_token: String::new(),
             api_base: "https://api.telegram.org".to_string(),
+            allow_insecure_localhost: false,
             poll_timeout: Duration::from_secs(30),
             poll_interval: Duration::from_secs(1),
             max_429_retries: 3,
@@ -513,5 +554,62 @@ mod tests {
             ClientDisconnectPolicy::CancelOnDisconnect.as_str(),
             "cancel-on-disconnect"
         );
+    }
+    fn telegram_api_base_must_be_https_in_production() {
+        let base = TelegramConfig {
+            bot_token: "123:abc".to_string(),
+            ..TelegramConfig::default()
+        };
+        base.validate()
+            .expect("the default https base must validate");
+        let http_remote = TelegramConfig {
+            api_base: "http://api.telegram.example".to_string(),
+            ..base.clone()
+        };
+        assert!(
+            http_remote.validate().is_err(),
+            "a non-localhost http api_base must be rejected"
+        );
+        let ftp = TelegramConfig {
+            api_base: "ftp://api.telegram.org".to_string(),
+            ..base.clone()
+        };
+        assert!(
+            ftp.validate().is_err(),
+            "a non-http(s) scheme must be rejected"
+        );
+        let credentials = TelegramConfig {
+            api_base: "https://user:pass@api.telegram.org".to_string(),
+            ..base.clone()
+        };
+        assert!(
+            credentials.validate().is_err(),
+            "credentials embedded in api_base must be rejected"
+        );
+    }
+
+    #[test]
+    fn telegram_api_base_http_localhost_uses_the_test_escape() {
+        let base = TelegramConfig {
+            bot_token: "123:abc".to_string(),
+            ..TelegramConfig::default()
+        };
+        // Unit tests compile with cfg(test): the localhost escape exists.
+        let localhost = TelegramConfig {
+            api_base: "http://127.0.0.1:9999".to_string(),
+            ..base.clone()
+        };
+        localhost
+            .validate()
+            .expect("cfg(test) permits localhost http");
+        // The explicit flag is the same escape for non-test binaries.
+        let explicit = TelegramConfig {
+            api_base: "http://localhost:9999".to_string(),
+            allow_insecure_localhost: true,
+            ..base
+        };
+        explicit
+            .validate()
+            .expect("allow_insecure_localhost permits localhost http");
     }
 }

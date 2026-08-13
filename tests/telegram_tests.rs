@@ -232,6 +232,9 @@ fn test_config(api_base: &str) -> TelegramConfig {
     TelegramConfig {
         bot_token: "123456:TEST-SECRET-TOKEN".to_string(),
         api_base: api_base.to_string(),
+        // Integration tests compile without cfg(test); the explicit escape
+        // hatch permits the local http fixture base.
+        allow_insecure_localhost: true,
         poll_timeout: std::time::Duration::from_secs(5),
         poll_interval: std::time::Duration::from_millis(20),
         max_429_retries: 2,
@@ -478,6 +481,46 @@ fn telegram_config_debug_redacts_the_bot_token() {
         debug.contains("REDACTED"),
         "Debug output must mark the token"
     );
+}
+
+#[test]
+fn api_base_http_is_rejected_outside_localhost_without_the_escape_hatch() {
+    // Integration tests compile without cfg(test), so the escape must be
+    // explicit: the token is never sent over cleartext in production.
+    let remote = TelegramConfig {
+        api_base: "http://telegram.example.com".to_string(),
+        allow_insecure_localhost: false,
+        ..test_config("http://127.0.0.1:1")
+    };
+    assert!(
+        remote.validate().is_err(),
+        "a non-localhost http api_base must be rejected"
+    );
+    let localhost = TelegramConfig {
+        api_base: "http://127.0.0.1:1".to_string(),
+        allow_insecure_localhost: false,
+        ..test_config("http://127.0.0.1:1")
+    };
+    assert!(
+        localhost.validate().is_err(),
+        "localhost http requires the explicit escape hatch"
+    );
+    let escaped = TelegramConfig {
+        api_base: "http://127.0.0.1:1".to_string(),
+        allow_insecure_localhost: true,
+        ..test_config("http://127.0.0.1:1")
+    };
+    escaped
+        .validate()
+        .expect("the explicit escape hatch permits localhost http");
+    let production = TelegramConfig {
+        api_base: "https://api.telegram.org".to_string(),
+        allow_insecure_localhost: false,
+        ..test_config("http://127.0.0.1:1")
+    };
+    production
+        .validate()
+        .expect("the production https base must validate");
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,6 +1086,7 @@ async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
             "123456:TEST-SECRET-TOKEN",
         )
         .env("RUSTSCRIPT_AGENT_TELEGRAM_API_BASE", &base)
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST", "1")
         .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_ACCOUNTS", "fixture_bot")
         .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_CHATS", "555")
         .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS", "555")
