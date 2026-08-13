@@ -22,6 +22,7 @@ use rustscript_agent::config::TelegramConfig;
 use rustscript_agent::gateway::telegram::{TelegramApi, TelegramError};
 use rustscript_agent::service::AdmitRunRequest;
 use serde_json::{Value, json};
+use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
@@ -637,6 +638,25 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+/// One raw HTTP GET over a plain TCP stream (no HTTP client dependency).
+async fn http_get(host_port: &str, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(host_port)
+        .await
+        .expect("connect to the gateway");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 fn push_update(state: &FixtureState, fixture: Value) {
@@ -1574,6 +1594,89 @@ fn install_log_capture() -> Arc<Mutex<Vec<String>>> {
             messages
         })
         .clone()
+}
+
+#[tokio::test]
+async fn gateway_binary_survives_telegram_startup_failure_and_serves_the_api() {
+    let db = telegram_db_path("binary-degraded");
+    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/telegram-tests");
+    std::fs::create_dir_all(&root).expect("telegram test root");
+    let script = root.join(format!("binary-degraded-{}.rss", Uuid::new_v4()));
+    std::fs::write(&script, ECHO_SOURCE).expect("write agent script");
+    let bin = env!("CARGO_BIN_EXE_rustscript-agent-gateway");
+    let mut child = tokio::process::Command::new(bin)
+        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+        .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
+        .env("RUSTSCRIPT_AGENT_SCRIPT", &script)
+        .env(
+            "RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN",
+            "123456:TEST-SECRET-TOKEN",
+        )
+        // A dead local endpoint: getMe fails at startup, which must NOT
+        // terminate the gateway: the adapter degrades in the background
+        // (bounded retries) while the API keeps serving.
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_API_BASE", "http://127.0.0.1:1")
+        .env("RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("gateway binary should spawn");
+    let stderr = child.stderr.take().expect("stderr");
+    let mut lines = tokio::io::BufReader::new(stderr).lines();
+    // The API must come up: read stderr until the listening line.
+    let mut address = None;
+    while let Some(line) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line())
+            .await
+            .expect("the gateway must print its listening address")
+            .expect("stderr line")
+    {
+        if let Some(position) = line.find("listening on http://") {
+            address = Some(line[position + "listening on http://".len()..].to_string());
+            break;
+        }
+    }
+    let address = address.expect("listening address");
+    // The API is alive despite the telegram startup failure.
+    let health = http_get(&address, "/health/detailed").await;
+    assert!(
+        health.contains("200 OK") && health.contains("\"status\":\"ok\""),
+        "the API must serve health with the telegram adapter degraded: {health}"
+    );
+    // The degraded state is recorded (redacted) on stderr.
+    let mut degraded = false;
+    while let Some(line) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line())
+            .await
+            .expect("the degraded line must be printed")
+            .expect("stderr line")
+    {
+        if line.contains("degraded") {
+            degraded = true;
+            assert!(
+                !line.contains("TEST-SECRET-TOKEN"),
+                "the degraded log must not leak the token: {line}"
+            );
+            break;
+        }
+    }
+    assert!(
+        degraded,
+        "the telegram startup failure must be logged as degraded"
+    );
+    let pid = child.id().expect("child pid");
+    std::process::Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .expect("send SIGINT");
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait())
+        .await
+        .expect("the gateway must exit within the bound after SIGINT")
+        .expect("child wait");
+    assert!(exited.success(), "graceful shutdown must exit cleanly");
+    std::fs::remove_file(&script).expect("temporary script should be removed");
+    std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
 #[tokio::test]

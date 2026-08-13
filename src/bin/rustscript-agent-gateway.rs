@@ -1,8 +1,8 @@
-use std::{env, fs, net::SocketAddr, time::Duration};
+use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
 
 use rustscript_agent::{
     AgentGatewayConfig, AgentGatewayState, TelegramConfig, build_agent_gateway_app,
-    gateway::telegram::spawn_telegram_adapter,
+    gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
 };
 
 #[tokio::main]
@@ -162,14 +162,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener.local_addr()?
     );
     // Optional Telegram adapter: same AgentService/store as the API server.
-    let mut telegram_adapter = None;
+    // A startup failure (getMe/network) must never terminate the API
+    // gateway: the adapter records a redacted degraded state and retries
+    // with bounded backoff in the background; after the bound it is
+    // disabled for this process while the API keeps serving.
+    let telegram_handle = Arc::new(std::sync::Mutex::new(None::<TelegramAdapter>));
     if let Some(telegram) = telegram {
-        match spawn_telegram_adapter(state.clone(), telegram).await {
+        match spawn_telegram_adapter(state.clone(), telegram.clone()).await {
             Ok(adapter) => {
                 eprintln!("rustscript-agent-gateway telegram adapter started");
-                telegram_adapter = Some(adapter);
+                *telegram_handle.lock().expect("telegram handle lock") = Some(adapter);
             }
-            Err(error) => return Err(format!("start telegram adapter: {error}").into()),
+            Err(error) => {
+                eprintln!(
+                    "rustscript-agent-gateway telegram adapter degraded (startup failed: {error}); \
+                     retrying with bounded backoff in the background"
+                );
+                let reconnect_state = state.clone();
+                let reconnect_handle = Arc::clone(&telegram_handle);
+                tokio::spawn(async move {
+                    let mut delay = Duration::from_secs(1);
+                    for attempt in 1..=3 {
+                        tokio::time::sleep(delay).await;
+                        match spawn_telegram_adapter(reconnect_state.clone(), telegram.clone())
+                            .await
+                        {
+                            Ok(adapter) => {
+                                eprintln!(
+                                    "rustscript-agent-gateway telegram adapter started (reconnect attempt {attempt})"
+                                );
+                                *reconnect_handle.lock().expect("telegram handle lock") =
+                                    Some(adapter);
+                                return;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "rustscript-agent-gateway telegram adapter retry {attempt} failed: {error}"
+                                );
+                                delay *= 2;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "rustscript-agent-gateway telegram adapter disabled after bounded retries"
+                    );
+                });
+            }
         }
     }
     let app = build_agent_gateway_app(state.clone());
@@ -186,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.service().halt();
             // Bounded Telegram shutdown: stop the poller, wait for the final
             // offset persist (join bounded at 60s).
-            if let Some(adapter) = telegram_adapter.take() {
+            if let Some(adapter) = telegram_handle.lock().expect("telegram handle lock").take() {
                 adapter.shutdown().await;
             }
         }
