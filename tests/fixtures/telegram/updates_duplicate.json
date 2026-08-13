@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 15,
+      "message": {
+        "message_id": 105,
+        "date": 1700000000,
+        "chat": { "id": 555, "type": "private" },
+        "from": { "id": 555, "is_bot": false, "first_name": "Alice" },
+        "text": "dup"
+      }
+    },
+    {
+      "update_id": 16,
+      "message": {
+        "message_id": 105,
+        "date": 1700000000,
+        "chat": { "id": 555, "type": "private" },
+        "from": { "id": 555, "is_bot": false, "first_name": "Alice" },
+        "text": "dup"
+      }
+    }
+  ]
+}

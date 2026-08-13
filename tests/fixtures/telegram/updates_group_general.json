@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 13,
+      "message": {
+        "message_id": 103,
+        "date": 1700000000,
+        "chat": { "id": -1001234, "type": "supergroup", "title": "Team" },
+        "from": { "id": 555, "is_bot": false, "first_name": "Alice" },
+        "text": "general question"
+      }
+    }
+  ]
+}

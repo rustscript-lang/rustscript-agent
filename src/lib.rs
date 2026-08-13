@@ -14,7 +14,7 @@ pub mod metrics;
 pub mod runtime;
 pub mod service;
 
-pub use config::AgentGatewayConfig;
+pub use config::{AgentGatewayConfig, TelegramConfig};
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
     LlmResponse, ProviderError, RunContext, Sampling, ToolCall, ToolDescriptor, Usage,

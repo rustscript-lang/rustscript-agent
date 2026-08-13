@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "result": {
+    "id": 1001,
+    "is_bot": true,
+    "first_name": "Fixture Bot",
+    "username": "fixture_bot"
+  }
+}

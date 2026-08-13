@@ -18,7 +18,11 @@ path = "src/bin/rustscript-agent-gateway.rs"
 
 [dependencies]
 axum = "0.8"
+bytes = "1"
 futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 parking_lot = "0.12"
 rustscript-vm = { package = "pd-vm", path = "../rustscript", default-features = false, features = ["runtime", "http-client", "sqlite"] }
 serde = { version = "1", features = ["derive"] }

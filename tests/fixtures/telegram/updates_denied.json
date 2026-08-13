@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 14,
+      "message": {
+        "message_id": 104,
+        "date": 1700000000,
+        "chat": { "id": 777, "type": "private" },
+        "from": { "id": 777, "is_bot": false, "first_name": "Mallory" },
+        "text": "hi"
+      }
+    }
+  ]
+}

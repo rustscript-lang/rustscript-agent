@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 12,
+      "message": {
+        "message_id": 102,
+        "date": 1700000000,
+        "message_thread_id": 7,
+        "is_topic_message": true,
+        "chat": { "id": -1001234, "type": "supergroup", "title": "Team" },
+        "from": { "id": 555, "is_bot": false, "first_name": "Alice" },
+        "text": "topic question"
+      }
+    }
+  ]
+}

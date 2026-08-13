@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 17,
+      "message": {
+        "message_id": 106,
+        "date": 1700000000,
+        "chat": { "id": 555, "type": "private" },
+        "from": { "id": 555, "is_bot": false, "first_name": "Alice" },
+        "text": "/new"
+      }
+    },
+    {
+      "update_id": 18,
+      "message": {
+        "message_id": 107,
+        "date": 1700000000,
+        "chat": { "id": 555, "type": "private" },
+        "from": { "id": 555, "is_bot": false, "first_name": "Alice" },
+        "text": "/status"
+      }
+    },
+    {
+      "update_id": 19,
+      "message": {
+        "message_id": 108,
+        "date": 1700000000,
+        "chat": { "id": 555, "type": "private" },
+        "from": { "id": 555, "is_bot": false, "first_name": "Alice" },
+        "text": "/compact"
+      }
+    }
+  ]
+}

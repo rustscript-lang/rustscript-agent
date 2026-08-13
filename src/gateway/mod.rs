@@ -3,6 +3,13 @@
 //! AgentService and cannot call providers or tools directly.
 
 mod api_server;
+/// Native Telegram Bot API transport, poller, and adapter. Public so
+/// integration tests can drive the client and adapter against a fixture
+/// server.
+pub mod telegram;
+/// Canonical event → Telegram text rendering (pure; no I/O).
+mod telegram_render;
+pub use telegram_render::{EventRenderer, RenderAction, TELEGRAM_MAX_UTF16, chunk_text, utf16_len};
 /// The typed RSS-backed storage repository (normalized schema, dedicated
 /// storage worker). Public so integration tests can exercise the typed
 /// repository commands directly; application code reaches it through

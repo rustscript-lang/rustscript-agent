@@ -8,6 +8,107 @@ use std::time::Duration;
 
 use rustscript_vm::{HttpConfig, SqlitePolicy};
 
+/// Telegram Bot API adapter configuration.
+///
+/// Deny-by-default allowlists: every list starts empty and an empty list
+/// denies everything. The bot token is redacted in every Debug/log surface.
+#[derive(Clone)]
+pub struct TelegramConfig {
+    /// Bot API token; never logged, redacted in Debug.
+    pub bot_token: String,
+    /// Bot API base URL (defaults to `https://api.telegram.org`); tests point
+    /// this at a local fixture server.
+    pub api_base: String,
+    /// `getUpdates` long-poll timeout in seconds.
+    pub poll_timeout: Duration,
+    /// Backoff between poll rounds after a transport/API error.
+    pub poll_interval: Duration,
+    /// Bounded 429 retries (each sleeps `retry_after`, capped at
+    /// `max_429_backoff`).
+    pub max_429_retries: usize,
+    /// Cap for one 429 `retry_after` sleep.
+    pub max_429_backoff: Duration,
+    /// Bounded 5xx retries (exponential backoff, capped).
+    pub max_5xx_retries: usize,
+    /// Minimum interval between `editMessageText` calls (delta throttle);
+    /// zero edits on every delta.
+    pub max_edit_interval: Duration,
+    /// Bounded capacity of the update_id/message_id dedup windows.
+    pub dedup_capacity: usize,
+    /// Allowed bot account usernames (case-insensitive); empty denies all.
+    pub allowed_accounts: Vec<String>,
+    /// Allowed chat ids (negative ids are groups/supergroups); empty denies
+    /// all chats.
+    pub allowed_chats: Vec<i64>,
+    /// Allowed sender user ids; empty denies all users.
+    pub allowed_users: Vec<i64>,
+}
+
+impl std::fmt::Debug for TelegramConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelegramConfig")
+            .field("bot_token", &"REDACTED")
+            .field("api_base", &self.api_base)
+            .field("poll_timeout", &self.poll_timeout)
+            .field("poll_interval", &self.poll_interval)
+            .field("max_429_retries", &self.max_429_retries)
+            .field("max_429_backoff", &self.max_429_backoff)
+            .field("max_5xx_retries", &self.max_5xx_retries)
+            .field("max_edit_interval", &self.max_edit_interval)
+            .field("dedup_capacity", &self.dedup_capacity)
+            .field("allowed_accounts", &self.allowed_accounts)
+            .field("allowed_chats", &self.allowed_chats)
+            .field("allowed_users", &self.allowed_users)
+            .finish()
+    }
+}
+
+impl TelegramConfig {
+    /// Validates every lifecycle bound; allowlists may stay empty (that is
+    /// the deny-by-default posture).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.bot_token.trim().is_empty() {
+            return Err("telegram bot_token must not be blank".to_string());
+        }
+        if self.api_base.trim().is_empty() {
+            return Err("telegram api_base must not be blank".to_string());
+        }
+        if self.poll_timeout.is_zero() {
+            return Err("telegram poll_timeout must be positive".to_string());
+        }
+        if self.poll_interval.is_zero() {
+            return Err("telegram poll_interval must be positive".to_string());
+        }
+        if self.max_429_backoff.is_zero() {
+            return Err("telegram max_429_backoff must be positive".to_string());
+        }
+        if self.dedup_capacity == 0 {
+            return Err("telegram dedup_capacity must be positive".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            bot_token: String::new(),
+            api_base: "https://api.telegram.org".to_string(),
+            poll_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(1),
+            max_429_retries: 3,
+            max_429_backoff: Duration::from_secs(30),
+            max_5xx_retries: 3,
+            max_edit_interval: Duration::from_millis(300),
+            dedup_capacity: 512,
+            allowed_accounts: Vec::new(),
+            allowed_chats: Vec::new(),
+            allowed_users: Vec::new(),
+        }
+    }
+}
+
 /// Validated configuration shared by the gateway, AgentService, and runner.
 #[derive(Clone, Debug)]
 pub struct AgentGatewayConfig {
