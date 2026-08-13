@@ -43,6 +43,10 @@ pub struct TelegramConfig {
     /// Bounded cap on one Bot API response body; a body that exceeds it is
     /// a typed [`TelegramError::ResponseTooLarge`] and is never buffered.
     pub max_response_body_bytes: usize,
+    /// Bounded wait for an active run's terminal transition during `/new`
+    /// (typed cancel first, then the session reset). When the wait expires
+    /// the reset fails with a typed reply and deletes nothing.
+    pub new_wait_timeout: Duration,
     /// Bounded capacity of the update_id/message_id dedup windows.
     pub dedup_capacity: usize,
     /// Allowed bot account usernames (case-insensitive); empty denies all.
@@ -68,6 +72,7 @@ impl std::fmt::Debug for TelegramConfig {
             .field("max_5xx_retries", &self.max_5xx_retries)
             .field("max_edit_interval", &self.max_edit_interval)
             .field("max_response_body_bytes", &self.max_response_body_bytes)
+            .field("new_wait_timeout", &self.new_wait_timeout)
             .field("dedup_capacity", &self.dedup_capacity)
             .field("allowed_accounts", &self.allowed_accounts)
             .field("allowed_chats", &self.allowed_chats)
@@ -133,6 +138,9 @@ impl TelegramConfig {
         if self.max_response_body_bytes == 0 {
             return Err("telegram max_response_body_bytes must be positive".to_string());
         }
+        if self.new_wait_timeout.is_zero() {
+            return Err("telegram new_wait_timeout must be positive".to_string());
+        }
         Ok(())
     }
 }
@@ -150,6 +158,7 @@ impl Default for TelegramConfig {
             max_5xx_retries: 3,
             max_edit_interval: Duration::from_millis(300),
             max_response_body_bytes: 1024 * 1024,
+            new_wait_timeout: Duration::from_secs(10),
             dedup_capacity: 512,
             allowed_accounts: Vec::new(),
             allowed_chats: Vec::new(),

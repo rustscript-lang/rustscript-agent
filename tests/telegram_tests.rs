@@ -20,8 +20,10 @@ use axum::{
 use futures_util::StreamExt;
 use rustscript_agent::config::TelegramConfig;
 use rustscript_agent::gateway::telegram::{TelegramApi, TelegramError};
+use rustscript_agent::service::AdmitRunRequest;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tower::ServiceExt;
 
 /// One recorded Bot API request: method, query string, and JSON body.
 #[derive(Clone, Debug)]
@@ -263,6 +265,7 @@ fn test_config(api_base: &str) -> TelegramConfig {
         max_5xx_retries: 2,
         max_edit_interval: std::time::Duration::ZERO,
         max_response_body_bytes: 1024 * 1024,
+        new_wait_timeout: std::time::Duration::from_secs(10),
         dedup_capacity: 64,
         allowed_accounts: vec!["fixture_bot".to_string()],
         allowed_chats: vec![555, -1001234],
@@ -1209,6 +1212,182 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
     adapter2.shutdown().await;
     let _ = release_tx.send(());
     holding.join().expect("holding fixture");
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test]
+async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
+    let (base, state) = spawn_fixture().await;
+    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
+    let (config, source) = holding_config_and_source(port);
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("new-cancel");
+    let gateway = test_state(&source, &db, |_config| config.clone());
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    wait_until(std::time::Duration::from_secs(15), || {
+        state.sent_texts().iter().any(|text| text == "before")
+    })
+    .await;
+    // /new from the same chat: the active run must be cancelled and the
+    // reset must wait for its terminal transition.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 20,
+                "message": {
+                    "message_id": 200,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "/new"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(15), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("Stopping the active run"))
+    })
+    .await;
+    let _ = release_tx.send(());
+    wait_until(std::time::Duration::from_secs(20), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("New conversation started"))
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let sends = state.sent_texts();
+    let new_index = sends
+        .iter()
+        .position(|text| text.contains("New conversation started"))
+        .expect("the /new confirmation must be present");
+    assert_eq!(
+        sends.len(),
+        new_index + 1,
+        "the old renderer must not output anything after the reset: {sends:?}"
+    );
+    assert!(
+        !sends.iter().any(|text| text == "[done]"),
+        "the cancelled run must not complete: {sends:?}"
+    );
+    // The durable session is fresh: no messages.
+    let persistence = gateway.persistence().expect("persistence");
+    let session = persistence
+        .session_get("telegram:fixture_bot:555:")
+        .expect("session read");
+    let rows = session["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "the recreated session must exist");
+    assert!(
+        rows[0][14].is_null() || rows[0][14] == json!(0),
+        "the recreated session must have no messages: {}",
+        rows[0][14]
+    );
+    adapter.shutdown().await;
+    holding.join().expect("holding fixture");
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test]
+async fn adapter_new_wait_timeout_keeps_the_session_and_run() {
+    let (base, state) = spawn_fixture().await;
+    let db = telegram_db_path("new-timeout");
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    // Create the telegram session through the public API surface, then
+    // admit a run WITHOUT a worker: it never reaches terminal, so /new's
+    // bounded wait must expire and leave the session and run intact.
+    let app = rustscript_agent::build_agent_gateway_app(gateway.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({
+                        "session_id": "telegram:fixture_bot:555:",
+                        "source": "telegram",
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "session creation must succeed: {status}"
+    );
+    let admitted = gateway
+        .service()
+        .admit(AdmitRunRequest {
+            input: json!("parked"),
+            session_id: Some("telegram:fixture_bot:555:".to_string()),
+            platform: "telegram".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admission must succeed");
+    assert_eq!(admitted.status, "started");
+    let mut telegram = test_config(&base);
+    telegram.new_wait_timeout = std::time::Duration::from_millis(400);
+    let adapter = spawn_adapter(gateway.clone(), telegram).await;
+    // /new while the run never stops within the bound: the reset must fail
+    // with a typed reply and delete nothing.
+    push_update(
+        &state,
+        json!({
+            "ok": true,
+            "result": [{
+                "update_id": 20,
+                "message": {
+                    "message_id": 200,
+                    "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": false, "first_name": "Alice"},
+                    "text": "/new"
+                }
+            }]
+        }),
+    );
+    wait_until(std::time::Duration::from_secs(15), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("Could not stop the active run"))
+    })
+    .await;
+    assert!(
+        !state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("New conversation started")),
+        "a failed reset must not advertise a new conversation"
+    );
+    // The session and its run are untouched.
+    let persistence = gateway.persistence().expect("persistence");
+    let session = persistence
+        .session_get("telegram:fixture_bot:555:")
+        .expect("session read");
+    assert_eq!(
+        session["rows"].as_array().map(Vec::len),
+        Some(1),
+        "the session must survive a failed reset"
+    );
+    let run = persistence.run_get(&admitted.run_id).expect("run read");
+    assert_eq!(
+        run["rows"].as_array().map(Vec::len),
+        Some(1),
+        "the run must survive a failed reset"
+    );
+    adapter.shutdown().await;
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 

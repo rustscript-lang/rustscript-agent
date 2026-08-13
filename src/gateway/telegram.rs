@@ -775,6 +775,10 @@ struct AdapterRuntime {
     allowlist: Allowlist,
     dedup: DedupWindows,
     active_runs: Arc<Mutex<HashMap<String, String>>>,
+    /// Per-session reset epochs: a renderer captures the epoch at spawn and
+    /// aborts once `/new` bumps it, so an old renderer can never output
+    /// into a recreated session.
+    epochs: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 /// Handle for one running Telegram adapter (poller task). Shutdown is
@@ -927,6 +931,7 @@ async fn run_poller(
         allowlist: Allowlist::from_config(&config),
         dedup: DedupWindows::new(config.dedup_capacity),
         active_runs: Arc::new(Mutex::new(HashMap::new())),
+        epochs: Arc::new(Mutex::new(HashMap::new())),
     };
     let poll_timeout_secs = config.poll_timeout.as_secs().max(1);
     // Restart resume: after a crash the poll offset skips the interrupted
@@ -1069,6 +1074,7 @@ async fn resume_undelivered(runtime: &mut AdapterRuntime) {
                     chat_id,
                     thread_id,
                     Arc::clone(&runtime.active_runs),
+                    Arc::clone(&runtime.epochs),
                 );
             }
         }
@@ -1188,6 +1194,90 @@ async fn cmd_new(
     thread_id: Option<i64>,
     session_id: &str,
 ) {
+    // 1. Typed cancel of the session's active run (if any), then a bounded
+    //    wait for its terminal transition BEFORE anything is deleted. The
+    //    session gate is held for the whole reset so no new run can be
+    //    admitted mid-reset.
+    let gated = runtime
+        .active_runs
+        .lock()
+        .expect("active runs lock")
+        .get(session_id)
+        .cloned();
+    let gate_was_held = gated.is_some();
+    let run_id = gated.or_else(|| {
+        // Restart fallback: the gate is in-memory, so scan the store for an
+        // active run of the session (a run without a live service handle
+        // reports None from stop() and the reset proceeds).
+        let store = runtime.state.store.read();
+        store
+            .runs
+            .values()
+            .filter(|run| run.session_id == session_id)
+            .filter(|run| matches!(run.status.as_str(), "started" | "stopping"))
+            .map(|run| run.run_id.clone())
+            .next()
+    });
+    if let Some(run_id) = &run_id {
+        runtime
+            .active_runs
+            .lock()
+            .expect("active runs lock")
+            .insert(session_id.to_string(), run_id.clone());
+    }
+    let mut stopped = true;
+    if let Some(run_id) = run_id {
+        match runtime.state.service().stop(&run_id).as_deref() {
+            Some("stopping") | Some("started") => {
+                let _ = reply(api, chat_id, thread_id, "Stopping the active run.").await;
+                stopped =
+                    wait_for_run_terminal(&runtime.state, &run_id, runtime.config.new_wait_timeout)
+                        .await;
+            }
+            Some(_) => {
+                // Already terminal (or stopping); nothing to wait for.
+                stopped = true;
+            }
+            None => {
+                // No live handle (for example a recovered run after a
+                // restart): the durable run is not cancellable in this
+                // process; the reset proceeds.
+                stopped = true;
+            }
+        }
+    }
+    if !stopped {
+        // Typed failure: the run did not reach terminal within the bound.
+        // Nothing was deleted; the session and its run stay untouched and
+        // the old renderer keeps delivering.
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "Could not stop the active run; the conversation is unchanged. Try /stop and /new again.",
+        )
+        .await;
+        if !gate_was_held {
+            runtime
+                .active_runs
+                .lock()
+                .expect("active runs lock")
+                .remove(session_id);
+        }
+        return;
+    }
+
+    // 2. Invalidate any surviving old renderer: the epoch check aborts its
+    //    in-flight output (including the final flush), so nothing from the
+    //    old run can land in the recreated session.
+    *runtime
+        .epochs
+        .lock()
+        .expect("epochs lock")
+        .entry(session_id.to_string())
+        .or_insert(0) += 1;
+
+    // 3. Cascade delete + recreate (same deterministic session id).
     let state = runtime.state.clone();
     let session_id_for_block = session_id.to_string();
     let account_for_block = envelope.account_id.clone();
@@ -1267,6 +1357,7 @@ async fn cmd_new(
         Ok(())
     })
     .await;
+    // The recreated session starts with an empty gate.
     runtime
         .active_runs
         .lock()
@@ -1279,6 +1370,25 @@ async fn cmd_new(
         _ => {
             let _ = reply(api, chat_id, thread_id, "Could not reset the conversation.").await;
         }
+    }
+}
+
+/// Polls the in-memory store until the run reaches a terminal status (or
+/// disappears), returning false when the bound expires first.
+async fn wait_for_run_terminal(state: &AgentGatewayState, run_id: &str, bound: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        let terminal =
+            state.store.read().runs.get(run_id).is_none_or(|run| {
+                matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+            });
+        if terminal {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1542,6 +1652,7 @@ async fn admit_text(
                 chat_id,
                 thread_id,
                 Arc::clone(&runtime.active_runs),
+                Arc::clone(&runtime.epochs),
             );
         }
         Err(AdmitError::RunLimitReached) => {
@@ -1596,7 +1707,9 @@ fn spawn_worker(state: &AgentGatewayState, run_id: String, input: String) {
 
 /// Spawns the per-run delivery renderer: durable catch-up from the delivery
 /// cursor, then live subscription, with the cursor advanced only after each
-/// event was rendered successfully.
+/// event was rendered successfully. The renderer captures the session's
+/// current reset epoch and aborts all output once `/new` bumps it.
+#[allow(clippy::too_many_arguments)]
 fn spawn_run_renderer(
     state: &AgentGatewayState,
     config: &TelegramConfig,
@@ -1605,10 +1718,17 @@ fn spawn_run_renderer(
     chat_id: i64,
     thread_id: Option<i64>,
     active_runs: Arc<Mutex<HashMap<String, String>>>,
+    epochs: Arc<Mutex<HashMap<String, u64>>>,
 ) {
     let state = state.clone();
     let config = config.clone();
     let session_id = session_id.to_string();
+    let epoch = epochs
+        .lock()
+        .expect("epochs lock")
+        .get(&session_id)
+        .copied()
+        .unwrap_or(0);
     tokio::spawn(run_renderer(
         state,
         config,
@@ -1617,6 +1737,8 @@ fn spawn_run_renderer(
         chat_id,
         thread_id,
         active_runs,
+        epochs,
+        epoch,
     ));
 }
 
@@ -1637,6 +1759,8 @@ async fn run_renderer(
     chat_id: i64,
     thread_id: Option<i64>,
     active_runs: Arc<Mutex<HashMap<String, String>>>,
+    epochs: Arc<Mutex<HashMap<String, u64>>>,
+    epoch: u64,
 ) {
     let api = TelegramApi::new(&config);
     // RAII gate: released on every exit path, including panics.
@@ -1674,6 +1798,8 @@ async fn run_renderer(
             &state,
             &session_id,
             &consumer,
+            &epochs,
+            epoch,
         )
         .await
         {
@@ -1683,7 +1809,16 @@ async fn run_renderer(
             // The run is finished: render the final flush and end without
             // ever subscribing to a terminal run's channel (the gate is
             // released here).
-            flush_renderer(&api, &mut renderer, chat_id, thread_id).await;
+            flush_renderer(
+                &api,
+                &mut renderer,
+                chat_id,
+                thread_id,
+                &epochs,
+                &session_id,
+                epoch,
+            )
+            .await;
             return;
         }
     }
@@ -1717,6 +1852,8 @@ async fn run_renderer(
                     &state,
                     &session_id,
                     &consumer,
+                    &epochs,
+                    epoch,
                 )
                 .await
                 {
@@ -1750,6 +1887,8 @@ async fn run_renderer(
                         &state,
                         &session_id,
                         &consumer,
+                        &epochs,
+                        epoch,
                     )
                     .await
                     {
@@ -1774,18 +1913,35 @@ async fn run_renderer(
     }
 
     // Final flush: any text accumulated but never edited is finalized.
-    flush_renderer(&api, &mut renderer, chat_id, thread_id).await;
+    flush_renderer(
+        &api,
+        &mut renderer,
+        chat_id,
+        thread_id,
+        &epochs,
+        &session_id,
+        epoch,
+    )
+    .await;
 }
 
 /// Sends every pending render action once (the final flush after a terminal
 /// event); a failed send stops the flush (the event stays undelivered for a
-/// later catch-up).
+/// later catch-up). Aborts immediately when the session's reset epoch no
+/// longer matches the renderer's captured epoch (the old run's output must
+/// never reach a recreated session).
 async fn flush_renderer(
     api: &TelegramApi,
     renderer: &mut EventRenderer,
     chat_id: i64,
     thread_id: Option<i64>,
+    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    session_id: &str,
+    epoch: u64,
 ) {
+    if !epoch_current(epochs, session_id, epoch) {
+        return;
+    }
     for action in renderer.flush() {
         let result = match action {
             RenderAction::Send { text } | RenderAction::SendDelta { text } => api
@@ -1803,6 +1959,19 @@ async fn flush_renderer(
     }
 }
 
+/// True when the session's current reset epoch still matches the renderer's
+/// captured epoch (false after `/new` bumped it). A session without any
+/// entry is epoch 0, matching the renderer's capture default.
+fn epoch_current(epochs: &Arc<Mutex<HashMap<String, u64>>>, session_id: &str, epoch: u64) -> bool {
+    epochs
+        .lock()
+        .expect("epochs lock")
+        .get(session_id)
+        .copied()
+        .unwrap_or(0)
+        == epoch
+}
+
 /// True for the canonical terminal event types (replay rows carry only the
 /// event type string, unlike live [`GatewayEvent`]s).
 fn is_terminal_event_type(event_type: &str) -> bool {
@@ -1811,7 +1980,9 @@ fn is_terminal_event_type(event_type: &str) -> bool {
 
 /// Renders one canonical event into Bot API calls; the delivery cursor is
 /// advanced only after every action succeeded. Returns false when delivery
-/// failed (the event stays undelivered for a later catch-up).
+/// failed (the event stays undelivered for a later catch-up) or when the
+/// session's reset epoch no longer matches (old-run output must never reach
+/// a recreated session).
 #[allow(clippy::too_many_arguments)]
 async fn render_event(
     api: &TelegramApi,
@@ -1827,7 +1998,12 @@ async fn render_event(
     state: &AgentGatewayState,
     session_id: &str,
     consumer: &str,
+    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    epoch: u64,
 ) -> bool {
+    if !epoch_current(epochs, session_id, epoch) {
+        return false;
+    }
     let throttle_edits = event_type == "model.delta";
     for action in renderer.on_event(event_type, data) {
         let result = match action {
