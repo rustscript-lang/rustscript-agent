@@ -36,7 +36,7 @@ wins. The aliases are scheduled for removal before v1 — do not rely on them.
 | Variable | Deprecated alias | Type | Default | Bounds / notes |
 | --- | --- | --- | --- | --- |
 | `RUSTSCRIPT_AGENT_GATEWAY_ADDR` | `PD_EDGE_AGENT_GATEWAY_ADDR` | string (`SocketAddr`) | `127.0.0.1:8090` | Bind address. An unparsable value fails startup. |
-| `RUSTSCRIPT_AGENT_BEARER_TOKEN` | `PD_EDGE_AGENT_BEARER_TOKEN` | string (secret) | unset | Required unless `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`. A blank value is rejected. Compared in constant time against the token carried in the `Authorization: Bearer <token>` header. Treat as a secret; see [Secrets](#secrets). |
+| `RUSTSCRIPT_AGENT_BEARER_TOKEN` | `PD_EDGE_AGENT_BEARER_TOKEN` | string (secret) | unset | Required unless `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`. A blank value is rejected. Compared in constant time against the token carried in the `Authorization: Bearer ***` header. Treat as a secret; see [Secrets](#secrets). |
 | `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS` | `PD_EDGE_AGENT_ALLOW_ANONYMOUS` | flag | unset | Only the exact value `1` enables anonymous access. Local testing only. |
 | `RUSTSCRIPT_AGENT_ALLOW_HOSTS` | `PD_EDGE_AGENT_ALLOW_HOSTS` | comma-separated list | empty (deny all) | Every HTTP(S)/WS(S) destination host must be allowlisted. Empty list denies all hosts. |
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
@@ -44,6 +44,22 @@ wins. The aliases are scheduled for removal before v1 — do not rely on them.
 | `RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS` | `PD_EDGE_AGENT_ALLOW_PRIVATE_IPS` | flag | unset (`false`) | Only the exact value `1` allows destinations on private/loopback IP ranges. |
 | `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | unset | Path to the RSS agent source. Read and compiled at startup; sources over 1 MiB (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
 | `RUSTSCRIPT_AGENT_STATE_DB` | `PD_EDGE_AGENT_STATE_DB` | filesystem path | unset (in-memory) | SQLite state file (sessions, messages, runs, events, jobs, approvals, compactions). Without it the gateway runs in-memory only and state is lost on restart. See `docs/deployment.md`. |
+| Rate limiting (A7) |
+| `RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED` | `PD_EDGE_AGENT_RATE_LIMIT_ENABLED` | flag | `0` (disabled) | Only the exact values `0`/`1` are accepted; anything else fails startup. When enabled, every API request consumes one per-peer-IP token and verified requests additionally consume one per-account token. |
+| `RUSTSCRIPT_AGENT_RATE_LIMIT_IP_BURST` | `PD_EDGE_AGENT_RATE_LIMIT_IP_BURST` | integer `u32` | `60` | Tokens available per window for one peer IP. Must be positive and at most 1 000 000. |
+| `RUSTSCRIPT_AGENT_RATE_LIMIT_ACCOUNT_BURST` | `PD_EDGE_AGENT_RATE_LIMIT_ACCOUNT_BURST` | integer `u32` | `120` | Tokens available per window for one verified bearer account. Must be positive and at most 1 000 000. |
+| `RUSTSCRIPT_AGENT_RATE_LIMIT_WINDOW_MS` | `PD_EDGE_AGENT_RATE_LIMIT_WINDOW_MS` | integer milliseconds | `60000` | Refill window shared by both dimensions. Must be positive and at most 86 400 000 ms (24 h). |
+| `RUSTSCRIPT_AGENT_RATE_LIMIT_MAX_BUCKETS` | `PD_EDGE_AGENT_RATE_LIMIT_MAX_BUCKETS` | integer `usize` | `10000` | Upper bound on tracked buckets (per-IP and per-account combined); at the bound the stalest bucket is evicted, so memory is bounded. |
+| `RUSTSCRIPT_AGENT_CLIENT_DISCONNECT_POLICY` | `PD_EDGE_AGENT_CLIENT_DISCONNECT_POLICY` | enum | `keep-running` | `keep-running`: the run survives every subscriber disconnect and events stay replayable by cursor. `cancel-on-disconnect`: the run is cancelled with the typed `client_disconnect` reason when the LAST subscriber disconnects while it is still active. Unknown spellings fail startup. |
+| Telegram adapter (A8) |
+| `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN` | `PD_EDGE_AGENT_TELEGRAM_BOT_TOKEN` | string (secret) | unset (adapter disabled) | Bot API token. When set, the Telegram poller starts alongside the API server; a blank value fails startup. Never logged; see [Secrets](#secrets). |
+| `RUSTSCRIPT_AGENT_TELEGRAM_API_BASE` | `PD_EDGE_AGENT_TELEGRAM_API_BASE` | URL | `https://api.telegram.org` | Bot API base. Must be a bare origin: `https` only (an `http` base is rejected unless the host is localhost AND `RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST=1`), no credentials, query, fragment, or path. |
+| `RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST` | `PD_EDGE_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST` | flag | unset (`false`) | Only the exact value `1` allows an `http` api_base for a localhost host (test fixtures and local development; the token must never travel in cleartext). |
+| `RUSTSCRIPT_AGENT_TELEGRAM_DROP_PENDING_UPDATES` | `PD_EDGE_AGENT_TELEGRAM_DROP_PENDING_UPDATES` | flag | `1` (drop) | Safe first-boot default: updates queued while the bot was offline are drained and dropped before polling starts (fail-closed). Only the exact value `0` keeps them for processing. |
+| `RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_ACCOUNTS` | `PD_EDGE_AGENT_TELEGRAM_ALLOWED_ACCOUNTS` | comma-separated list | empty (deny all) | Allowed bot account usernames (case-insensitive). Empty list denies every account. |
+| `RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_CHATS` | `PD_EDGE_AGENT_TELEGRAM_ALLOWED_CHATS` | comma-separated list of `i64` | empty (deny all) | Allowed chat ids (negative ids are groups/supergroups). Empty list denies all chats; a non-integer entry fails startup. |
+| `RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS` | `PD_EDGE_AGENT_TELEGRAM_ALLOWED_USERS` | comma-separated list of `i64` | empty (deny all) | Allowed sender user ids. Empty list denies all users; a non-integer entry fails startup. |
+| `RUSTSCRIPT_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | `PD_EDGE_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | integer seconds | `30` | `getUpdates` long-poll timeout. A non-integer value fails startup. |
 
 Example (all variables with their deprecated aliases):
 
@@ -99,9 +115,21 @@ above; every other field is set by embedding code.
 | `terminal_commit_retry_window` | `Duration` | 300 s | Must be positive. Bounded window during which a failed terminal commit is retried. |
 | `terminal_persist_retries` | `usize` | 3 | —. Additional immediate retries before a terminal is parked as pending. |
 | `terminal_persist_retry_delay` | `Duration` | 25 ms | Must be positive. Backoff between immediate terminal-persist retries. |
+| `rate_limit` | `RateLimitConfig` | disabled; `ip_burst = 60`, `account_burst = 120`, `window = 60 s`, `max_buckets = 10 000` | Validated by `RateLimitConfig::validate` (bursts ≤ 1 000 000, window ≤ 86 400 s, buckets ≤ 1 000 000). Bounded in-memory token buckets keyed by peer IP and verified bearer account; see `RUSTSCRIPT_AGENT_RATE_LIMIT_*` above. |
+| `client_disconnect_policy` | `ClientDisconnectPolicy` | `keep-running` | `keep-running` (default) or `cancel-on-disconnect`; see `RUSTSCRIPT_AGENT_CLIENT_DISCONNECT_POLICY` above. |
+| `sse_keepalive_interval` | `Duration` | 10 s | Must be positive. SSE keep-alive interval; also the upper bound on client-disconnect detection (the next keep-alive write fails, the SSE body is dropped, and the subscriber drop guard fires). |
+| `telegram` | `Option<TelegramConfig>` | `None` (disabled) | When present, the gateway starts the Telegram poller alongside the API server on the same service/store. Validated by `TelegramConfig::validate` (non-blank token, bare-origin https api_base, positive bounds, allowlists may stay empty — deny-by-default). See the `RUSTSCRIPT_AGENT_TELEGRAM_*` variables and `docs/deployment.md`. |
 | `http` | `HttpConfig` | core defaults (below) | Validated by the core (`HttpConfig::validate`). |
 | `sqlite` | `SqlitePolicy` | core defaults, `max_statements = 1024` | — |
 | `fuel` | `Option<u64>` | `Some(10_000_000)` | VM fuel budget; `None` disables the fuel cap. |
+
+`RateLimitConfig` bounds: `enabled` (master switch), `ip_burst`, `account_burst`,
+`window`, `max_buckets`. `TelegramConfig` bounds: `bot_token` (redacted in
+every Debug/log surface), `api_base`, `allow_insecure_localhost`, `poll_timeout`,
+`poll_interval`, `max_429_retries`, `max_429_backoff`, `max_5xx_retries`,
+`max_edit_interval`, `max_response_body_bytes`, `new_wait_timeout`,
+`drop_pending_updates`, `unauthorized_failure_bound`, `dedup_capacity`,
+`allowed_accounts`, `allowed_chats`, `allowed_users`.
 
 ## HTTP capability policy (core `HttpConfig` defaults)
 
@@ -164,30 +192,25 @@ page bounds.
 
 ## Secrets
 
-- `RUSTSCRIPT_AGENT_BEARER_TOKEN` is the only secret in this revision. All
-  examples in this document show it as `[REDACTED]`; it must never be passed
-  through process arguments or committed to repositories.
-- The binaries never echo the token. Store it in an environment file or
-  secret manager with restrictive permissions (see `docs/deployment.md`).
+- `RUSTSCRIPT_AGENT_BEARER_TOKEN` and `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`
+  are the two secrets in this revision. All examples in this document show
+  them as `[REDACTED]`; they must never be passed through process arguments
+  or committed to repositories.
+- The binaries never echo either secret: the bearer token is compared in
+  constant time and the Telegram token is redacted in every Debug/log
+  surface. Store them in an environment file or secret manager with
+  restrictive permissions (see `docs/deployment.md`).
 
 ## Reserved configuration
 
 The following configuration does **not** exist in this revision. It is
 listed only to reserve the namespace and to make the roadmap explicit; no
-binary reads these names and setting them has no effect. They become real
-only after their integration milestones land (marked *待接入 / integration
-后生成* below).
+binary reads these names and setting them has no effect.
 
-- **A7 API-server hardening (待接入)**: rate limiting, per-client
-  idempotency bounds beyond the current `Idempotency-Key` handling, CORS,
-  and TLS termination options are not yet configurable. The current
-  hardening bounds (`max_body_bytes`, `max_concurrent_runs`,
-  `max_events_per_run`, `max_event_bytes`, `terminal_run_ttl`) are native
-  `AgentGatewayConfig` fields only.
-- **A8 Telegram gateway (待接入)**: a Telegram token and chat/group/topic
-  allowlist will be needed when the Telegram adapter lands; the naming
-  family is reserved as `RUSTSCRIPT_AGENT_TELEGRAM_…` but **no such
-  variable exists yet**.
-- **A4 harness/approvals and A6 parallel tools/subagents (排除)** are out
-  of scope for this repository's current milestones and define no
-  configuration.
+- **A4 harness/approval machinery (排除)** and **A6 parallel tools /
+  subagents (排除)** are out of scope for this repository's current
+  milestones and define no configuration. The approval repository CRUD
+  (`approval.request`/`get`/`resolve`/`expire` storage commands) exists, but
+  there is no approval flow driving runs.
+- A job **scheduler** is not implemented: job CRUD/pause/resume/latest-output
+  routes exist, but scheduled execution defines no configuration.

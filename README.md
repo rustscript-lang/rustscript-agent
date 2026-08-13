@@ -54,12 +54,14 @@ placeholder route is advertised.
 | Gateway HTTP API: sessions, runs, SSE events, stop, jobs CRUD, subagent interrupt | Implemented (see [plans/2026-07-30_rustscript-agent-gateway-api.md](plans/2026-07-30_rustscript-agent-gateway-api.md)) |
 | Durable SQLite state: sessions/messages/runs/events/jobs/approvals/compactions, restart recovery | Implemented |
 | Legacy chat completion path (`/api/sessions/{id}/chat`) | Implemented; requires `RUSTSCRIPT_AGENT_SCRIPT`, otherwise answers `501 agent_source_not_configured` |
+| API hardening (A7): bounded per-peer-IP/per-account rate limiting, client-disconnect policy | Implemented (disabled by default; see [docs/configuration.md](docs/configuration.md)) |
+| Observability (A9): bounded metrics registry, `GET /metrics`, structured terminal tracing | Implemented (see [docs/deployment.md](docs/deployment.md)) |
 | Provider protocol adapters (OpenAI Chat/Responses, Anthropic Messages, provider profiles) | **Partial — blocked by core (A3)**. Wire building, standard-shape guard, marker-preservation, and structured provider errors are green; buffered response parsing, streaming, and the Responses/Anthropic adapters stay typed `not_implemented` stubs until core compiler defects are fixed. See [plans/2026-08-13_a3-provider-core-blocker.md](plans/2026-08-13_a3-provider-core-blocker.md). |
-| RSS agent loop + compaction (A5) | **Not implemented — blocked**. Requires the A3 core contract gates; no `rss/agent/` source exists in this revision. |
-| Harness and approvals (A4) | Not implemented (excluded from the current milestone scope) |
+| RSS serial loop + durable compaction policies (A5) | **Policies implemented and tested** (`rss/agent/main.rss`, `rss/agent/compact.rss` with executable suites); the production entry is **not wired** into the gateway/service yet (blocked by A3/A4). See [plans/2026-08-13_a5-scope-split.md](plans/2026-08-13_a5-scope-split.md). |
+| Harness and approval machinery (A4) | Not implemented (excluded from the current milestone scope); approval **repository** CRUD exists, there is no approval flow driving runs |
 | Parallel tools and subagents (A6) | Not implemented (excluded from the current milestone scope) |
 | Scheduled / durable job execution | **Not implemented (explicitly excluded)**. Job CRUD, pause/resume, and latest-output routes exist, but there is no scheduler; `POST /api/jobs/{id}/run` is intentionally absent and answers `404`. |
-| Telegram gateway (A8) | Not implemented |
+| Telegram gateway (A8) | **Implemented**: native Bot API transport (https/rustls), deny-by-default account/chat/user allowlists, durable delivery cursors (at-least-once), bounded 429/5xx/401 retries, fail-closed first-boot drain, bounded shutdown drain. See [docs/deployment.md](docs/deployment.md). |
 
 Current lifecycle/reliability behavior is covered by the integration
 suites in `tests/` (admission, bounded delivery, terminal-commit retries,
