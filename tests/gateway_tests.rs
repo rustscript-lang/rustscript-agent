@@ -88,6 +88,24 @@ async fn json_request(
     )
 }
 
+/// Sends one request and returns only the status code. Needed for routes
+/// that are intentionally absent: the default 404 body is empty and is not
+/// JSON, so `json_request` cannot be used.
+async fn raw_status(app: &axum::Router, method: axum::http::Method, uri: &str) -> StatusCode {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    response.status()
+}
+
 #[tokio::test]
 async fn health_models_and_sessions_follow_hermes_envelopes() {
     let state = AgentGatewayState::new(AgentGatewayConfig::default())
@@ -289,15 +307,16 @@ async fn jobs_and_subagent_interrupt_follow_hermes_shapes() {
     assert_eq!(resume_status, StatusCode::OK);
     assert_eq!(resumed["job"]["enabled"], true);
 
-    let (run_status, run) = json_request(
+    // Durable scheduled job execution is explicitly out of scope, so the
+    // run route is intentionally absent: the path answers a plain 404
+    // instead of advertising a not-implemented placeholder.
+    let run_status = raw_status(
         &app,
         axum::http::Method::POST,
         &format!("/api/jobs/{job_id}/run"),
-        Value::Null,
     )
     .await;
-    assert_eq!(run_status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(run["error"]["code"], "job_execution_unavailable");
+    assert_eq!(run_status, StatusCode::NOT_FOUND);
 
     let (output_status, output) = json_request(
         &app,

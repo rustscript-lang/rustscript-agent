@@ -185,7 +185,6 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
         )
         .route("/api/jobs/{job_id}/pause", post(pause_job_handler))
         .route("/api/jobs/{job_id}/resume", post(resume_job_handler))
-        .route("/api/jobs/{job_id}/run", post(run_job_handler))
         .route(
             "/api/subagents/{subagent_id}/interrupt",
             post(interrupt_subagent_handler),
@@ -1273,22 +1272,6 @@ async fn resume_job_handler(
     Path(job_id): Path<String>,
 ) -> Response {
     set_job_enabled(state, job_id, true).await
-}
-
-async fn run_job_handler(
-    State(_state): State<AgentGatewayState>,
-    Path(_job_id): Path<String>,
-) -> Response {
-    json_response(
-        StatusCode::NOT_IMPLEMENTED,
-        json!({
-            "experimental": true,
-            "error": {
-                "code": "job_execution_unavailable",
-                "message": "scheduled job execution is not wired to the agent runner"
-            }
-        }),
-    )
 }
 
 async fn interrupt_subagent_handler(
