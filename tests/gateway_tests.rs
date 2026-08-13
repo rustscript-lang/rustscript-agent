@@ -14,10 +14,13 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Temporary gateway SQLite path under /mnt/TEMP/rustscript (workspace
-/// rule: all development temporary state lives there).
+/// Temporary gateway SQLite path. Honors `RUSTSCRIPT_AGENT_TEST_TMP` (CI
+/// sets it to a runner-local directory); the default keeps local
+/// development state under /mnt/TEMP/rustscript (workspace rule).
 fn gateway_db_path(label: &str) -> std::path::PathBuf {
-    let root = std::path::PathBuf::from("/mnt/TEMP/rustscript/gateway-tests");
+    let root = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/mnt/TEMP/rustscript/gateway-tests"));
     std::fs::create_dir_all(&root).expect("gateway test root should be created");
     root.join(format!("{label}-{}.db", Uuid::new_v4()))
 }

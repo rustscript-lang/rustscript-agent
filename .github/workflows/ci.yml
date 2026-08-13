@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The agent depends on pd-vm through the path dependency `../rustscript`,
+  # and Cargo.lock in this repository is generated against exactly this core
+  # revision. CI checks out the core at this revision so `--locked` builds
+  # resolve. Bump this only together with a Cargo.lock refresh.
+  RUSTSCRIPT_CORE_REF: 06b37fd155be2b81ba4b41dbb6514e7b283f4f10
+  # Integration tests place temporary SQLite state here. The tests honor
+  # this variable; without it they fall back to /mnt/TEMP/rustscript/...
+  # which is the local-development default and not writable on CI runners.
+  RUSTSCRIPT_AGENT_TEST_TMP: ${{ runner.temp }}/rustscript-agent-tests
+
+jobs:
+  quality:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout rustscript-agent
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned RustScript core (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: rustscript-lang/rustscript
+          # Checked out as a sibling of the agent repo so that the
+          # `path = "../rustscript"` dependency in Cargo.toml resolves.
+          path: rustscript
+          ref: ${{ env.RUSTSCRIPT_CORE_REF }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+
+      - name: Whitespace check
+        run: git diff --check
+
+      # The default suite runs all non-ignored tests. #[ignore]d suites
+      # (core repro driver and blocked provider parse/stream tests) stay
+      # excluded until the core contract gate clears — see
+      # plans/2026-08-13_a3-provider-core-blocker.md.
+      - name: Test (workspace, all features, all targets)
+        run: cargo test --locked --all-features --all-targets

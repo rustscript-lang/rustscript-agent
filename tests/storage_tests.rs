@@ -31,7 +31,12 @@ fn temporary_root(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after the Unix epoch")
         .as_nanos();
-    let root = PathBuf::from("/mnt/TEMP/rustscript/storage-tests")
+    // Honors RUSTSCRIPT_AGENT_TEST_TMP (CI sets it to a runner-local
+    // directory); the default keeps local development state under
+    // /mnt/TEMP/rustscript (workspace rule).
+    let root = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/mnt/TEMP/rustscript/storage-tests"))
         .join(format!("{label}-{}-{nonce}", std::process::id()));
     fs::create_dir_all(&root).expect("temporary storage root should be created");
     root
