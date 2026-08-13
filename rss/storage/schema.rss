@@ -7,27 +7,31 @@ pub fn schema_migrations_table_sql() -> string {
 }
 
 fn sessions_table_sql() -> string {
-    "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, profile TEXT NOT NULL, platform TEXT NOT NULL, account_id TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'closed')), system_prompt TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', toolset_hash TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}', last_message_seq INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, UNIQUE (profile, platform, account_id, chat_id, thread_id))"
+    "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, profile TEXT NOT NULL, platform TEXT NOT NULL, account_id TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'closed')), system_prompt TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', toolset_hash TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (length(metadata_json) <= 1048576), last_message_seq INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, UNIQUE (profile, platform, account_id, chat_id, thread_id))"
 }
 
 fn messages_table_sql() -> string {
-    "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')), content_json TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', tool_call_id TEXT NOT NULL DEFAULT '', parent_message_id TEXT NOT NULL DEFAULT '', token_estimate INTEGER NOT NULL DEFAULT 0, compacted INTEGER NOT NULL DEFAULT 0 CHECK (compacted IN (0, 1)), metadata_json TEXT NOT NULL DEFAULT '{}', created_at_ms INTEGER NOT NULL, UNIQUE (session_id, ordinal))"
+    "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')), content_json TEXT NOT NULL CHECK (length(content_json) <= 1048576), name TEXT NOT NULL DEFAULT '', tool_call_id TEXT NOT NULL DEFAULT '', parent_message_id TEXT NOT NULL DEFAULT '', token_estimate INTEGER NOT NULL DEFAULT 0, compacted INTEGER NOT NULL DEFAULT 0 CHECK (compacted IN (0, 1)), metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (length(metadata_json) <= 1048576), created_at_ms INTEGER NOT NULL, UNIQUE (session_id, ordinal))"
 }
 
 fn runs_table_sql() -> string {
-    "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, parent_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'waiting_approval', 'compacting', 'completed', 'failed', 'cancelled')), input_json TEXT NOT NULL DEFAULT '{}', provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', script_hash TEXT NOT NULL DEFAULT '', idempotency_scope TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', turn_count INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '', recovery_reason TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, started_at_ms INTEGER NOT NULL DEFAULT 0, finished_at_ms INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL)"
+    "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, parent_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'waiting_approval', 'compacting', 'completed', 'failed', 'cancelled')), input_json TEXT NOT NULL DEFAULT '{}' CHECK (length(input_json) <= 1048576), provider TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', script_hash TEXT NOT NULL DEFAULT '', idempotency_scope TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', turn_count INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '', recovery_reason TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, started_at_ms INTEGER NOT NULL DEFAULT 0, finished_at_ms INTEGER NOT NULL DEFAULT 0, updated_at_ms INTEGER NOT NULL)"
 }
 
 fn run_events_table_sql() -> string {
-    "CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, seq INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL, PRIMARY KEY (run_id, seq))"
+    "CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, seq INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, payload_json TEXT NOT NULL CHECK (length(payload_json) <= 1048576), created_at_ms INTEGER NOT NULL, PRIMARY KEY (run_id, seq))"
+}
+
+fn run_retention_table_sql() -> string {
+    "CREATE TABLE IF NOT EXISTS run_retention (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, first_seq INTEGER NOT NULL, high_water_seq INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)"
 }
 
 fn approvals_table_sql() -> string {
-    "CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, tool_call_id TEXT NOT NULL, tool_name TEXT NOT NULL, arguments_json TEXT NOT NULL, risk_class TEXT NOT NULL CHECK (risk_class IN ('read', 'write', 'execute', 'privileged')), state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'denied', 'expired')), decision_scope TEXT NOT NULL DEFAULT '', one_time INTEGER NOT NULL DEFAULT 0 CHECK (one_time IN (0, 1)), requested_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL DEFAULT 0, resolved_at_ms INTEGER NOT NULL DEFAULT 0, resolver TEXT NOT NULL DEFAULT '', decision_reason TEXT NOT NULL DEFAULT '', UNIQUE (run_id, tool_call_id))"
+    "CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, tool_call_id TEXT NOT NULL, tool_name TEXT NOT NULL, arguments_json TEXT NOT NULL CHECK (length(arguments_json) <= 1048576), risk_class TEXT NOT NULL CHECK (risk_class IN ('read', 'write', 'execute', 'privileged')), state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'denied', 'expired')), decision_scope TEXT NOT NULL DEFAULT '', one_time INTEGER NOT NULL DEFAULT 0 CHECK (one_time IN (0, 1)), requested_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL DEFAULT 0, resolved_at_ms INTEGER NOT NULL DEFAULT 0, resolver TEXT NOT NULL DEFAULT '', decision_reason TEXT NOT NULL DEFAULT '', UNIQUE (run_id, tool_call_id))"
 }
 
 fn compactions_table_sql() -> string {
-    "CREATE TABLE IF NOT EXISTS compactions (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, generation INTEGER NOT NULL, source_start_ordinal INTEGER NOT NULL, source_end_ordinal INTEGER NOT NULL, retained_tail_ordinal INTEGER NOT NULL, summary_json TEXT NOT NULL DEFAULT '{}', token_estimate INTEGER NOT NULL DEFAULT 0, model TEXT NOT NULL DEFAULT '', state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'failed')), error_message TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL DEFAULT 0, UNIQUE (session_id, generation))"
+    "CREATE TABLE IF NOT EXISTS compactions (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, generation INTEGER NOT NULL, source_start_ordinal INTEGER NOT NULL, source_end_ordinal INTEGER NOT NULL, retained_tail_ordinal INTEGER NOT NULL, summary_json TEXT NOT NULL DEFAULT '{}' CHECK (length(summary_json) <= 1048576), token_estimate INTEGER NOT NULL DEFAULT 0, model TEXT NOT NULL DEFAULT '', state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'failed')), error_message TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL DEFAULT 0, UNIQUE (session_id, generation))"
 }
 
 fn provider_usage_table_sql() -> string {
@@ -43,7 +47,7 @@ fn delivery_cursors_table_sql() -> string {
 }
 
 fn idempotency_records_table_sql() -> string {
-    "CREATE TABLE IF NOT EXISTS idempotency_records (scope TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed', 'completed', 'failed', 'expired')), response_json TEXT NOT NULL DEFAULT '{}', created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL DEFAULT 0, completed_at_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scope, key))"
+    "CREATE TABLE IF NOT EXISTS idempotency_records (scope TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('claimed', 'completed', 'failed', 'expired')), response_json TEXT NOT NULL DEFAULT '{}' CHECK (length(response_json) <= 1048576), created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL DEFAULT 0, completed_at_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scope, key))"
 }
 
 fn recovery_records_table_sql() -> string {
@@ -99,18 +103,24 @@ fn index_statement(statement_index: int) -> string {
 }
 
 pub fn schema_migration_count() -> int {
-    2
+    3
 }
 
 pub fn schema_migration_version(migration_index: int) -> int {
-    if migration_index == 0 => { 1 } else => { 2 }
+    if migration_index == 0 => { 1 } else => {
+        if migration_index == 1 => { 2 } else => { 3 }
+    }
 }
 
 pub fn schema_migration_name(migration_index: int) -> string {
     if migration_index == 0 => {
         "agent-storage-v1"
     } else => {
-        "agent-storage-v1-indexes"
+        if migration_index == 1 => {
+            "agent-storage-v1-indexes"
+        } else => {
+            "agent-storage-v3-event-retention"
+        }
     }
 }
 
@@ -118,12 +128,23 @@ pub fn schema_migration_checksum(migration_index: int) -> string {
     if migration_index == 0 => {
         "rss-storage-v1-tables"
     } else => {
-        "rss-storage-v1-indexes"
+        if migration_index == 1 => {
+            "rss-storage-v1-indexes"
+        } else => {
+            "rss-storage-v3-retention"
+        }
     }
 }
 
 pub fn schema_migration_statement_count(migration_index: int) -> int {
-    if migration_index == 0 => { 11 } else => { 12 }
+    if migration_index == 0 => { 11 } else => {
+        if migration_index == 1 => { 12 } else => { 1 }
+    }
+}
+
+/// The schema version a fully migrated database reaches.
+pub fn schema_current_version() -> int {
+    3
 }
 
 fn table_migration_statement(statement_index: int) -> string {
@@ -150,11 +171,19 @@ fn table_migration_statement(statement_index: int) -> string {
     }
 }
 
+fn retention_migration_statement(statement_index: int) -> string {
+    if statement_index == 0 => { run_retention_table_sql() } else => { "" }
+}
+
 pub fn schema_migration_statement(migration_index: int, statement_index: int) -> string {
     if migration_index == 0 => {
         table_migration_statement(statement_index)
     } else => {
-        index_statement(statement_index)
+        if migration_index == 1 => {
+            index_statement(statement_index)
+        } else => {
+            retention_migration_statement(statement_index)
+        }
     }
 }
 

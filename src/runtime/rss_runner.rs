@@ -375,7 +375,8 @@ impl AgentRunner {
     ) -> std::result::Result<(Vm, Value), RunError> {
         let mut vm = Vm::new(self.program.clone());
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()));
-        vm.configure_http(self.config.http.clone());
+        vm.configure_http(self.config.http.clone())
+            .map_err(RunError::Setup)?;
         vm.configure_sqlite(self.config.sqlite.clone());
         bind_restricted_registry(&mut vm).map_err(RunError::Setup)?;
         if let Some(cancellation) = cancellation {

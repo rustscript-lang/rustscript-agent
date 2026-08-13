@@ -35,16 +35,21 @@ struct CursorInput {
     now_ms: int
 }
 
-pub fn storage_event_append(db_id: int, payload_json: string) -> map {
+pub fn storage_event_append(db_id: int, payload_json: string) -> array {
     let input: EventAppendInput = json::decode::<EventAppendInput>(payload_json);
+    let max_events: int = schema::max_events_limit(input.max_events.copy());
     let statements = [
         {
-            sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events JOIN runs owners ON owners.id = events.run_id WHERE owners.session_id = (SELECT session_id FROM runs WHERE id = ?)), 0) + 1, ?, ?, ?, ?",
+            sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ?",
             params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
         },
         {
-            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END ELSE 0 END)",
-            params: [&input.run_id, &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy(), &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy()]
+            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
+            params: [&input.run_id, &input.run_id, max_events.copy(), &input.run_id, max_events.copy()]
+        },
+        {
+            sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+            params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
         },
         {
             sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
@@ -54,11 +59,29 @@ pub fn storage_event_append(db_id: int, payload_json: string) -> map {
     sqlite::transaction(db_id, statements)
 }
 
+/// Returns the persisted retention floor for one run: the oldest retained
+/// sequence and the highest sequence ever allocated. Runs without retained
+/// events report floor 1 / high-water 0. The query always yields exactly one
+/// row (COALESCE), so extraction is unconditional.
+pub fn storage_event_retention(db_id: int, run_id: string) -> map {
+    let result: map = sqlite::query(
+        db_id,
+        "SELECT COALESCE((SELECT first_seq FROM run_retention WHERE run_id = ?), 1) AS first_seq, COALESCE((SELECT high_water_seq FROM run_retention WHERE run_id = ?), 0) AS high_water_seq",
+        [&run_id, &run_id],
+        { max_rows: 1, max_result_bytes: 4096 }
+    );
+    let rows: array = result["rows"];
+    let row: array = rows[0];
+    let first_seq: int = row[0];
+    let high_water_seq: int = row[1];
+    { first_seq: first_seq, high_water_seq: high_water_seq }
+}
+
 pub fn storage_event_replay(db_id: int, payload_json: string) -> map {
     let input: EventReplayInput = json::decode::<EventReplayInput>(payload_json);
     sqlite::query(
         db_id,
-        "SELECT events.run_id, events.seq, events.event_id, events.event_type, CASE WHEN length(CAST(events.payload_json AS BLOB)) > CASE WHEN ? <= 0 THEN 16384 WHEN ? > 32768 THEN 16384 WHEN ? < 128 THEN 64 ELSE ? / 2 END THEN '{\"truncated\":true,\"original_bytes\":' || length(CAST(events.payload_json AS BLOB)) || '}' ELSE events.payload_json END AS payload_json, events.created_at_ms FROM run_events events WHERE events.run_id = ? AND events.seq > ? ORDER BY events.seq ASC LIMIT (CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END) + 1",
+        "SELECT events.seq, events.run_id, events.event_id, events.event_type, CASE WHEN length(CAST(events.payload_json AS BLOB)) > CASE WHEN ? <= 0 THEN 16384 WHEN ? > 32768 THEN 16384 WHEN ? < 128 THEN 64 ELSE ? / 2 END THEN '{\"truncated\":true,\"original_bytes\":' || length(CAST(events.payload_json AS BLOB)) || '}' ELSE events.payload_json END AS payload_json, events.created_at_ms FROM run_events events WHERE events.run_id = ? AND events.seq >= ? ORDER BY events.seq ASC LIMIT (CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END) + 1",
         [input.max_bytes.copy(), input.max_bytes.copy(), input.max_bytes.copy(), input.max_bytes.copy(), &input.run_id, input.after_seq.copy(), input.max_events.copy(), input.max_events.copy(), input.max_events.copy()],
         events_query_limits(input.max_events.copy(), input.max_bytes.copy())
     )

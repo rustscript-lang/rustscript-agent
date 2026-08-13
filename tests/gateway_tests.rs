@@ -883,6 +883,60 @@ async fn no_events_are_published_after_the_terminal_commit() {
     );
 }
 
+/// A deleted session (and its runs/events) must not resurrect on restart:
+/// the durable cascade removes every row the reload path validates.
+#[tokio::test]
+async fn deleted_session_does_not_resurrect_after_restart() {
+    let path = std::env::temp_dir().join(format!("rustscript-agent-delete-{}.db", Uuid::new_v4()));
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+
+    let (session_status, _session) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/api/sessions",
+        json!({"id":"doomed-session", "title":"doomed"}),
+    )
+    .await;
+    assert_eq!(session_status, StatusCode::CREATED);
+    let (run_status, _run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"session_id":"doomed-session", "input":"doomed"}),
+    )
+    .await;
+    assert_eq!(run_status, StatusCode::ACCEPTED);
+    let (delete_status, deleted) = json_request(
+        &app,
+        axum::http::Method::DELETE,
+        "/api/sessions/doomed-session",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(deleted["deleted"], true);
+    drop(app);
+
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload after deletion");
+    let restored_app = build_agent_gateway_app(restored);
+    let (sessions_status, sessions) = json_request(
+        &restored_app,
+        axum::http::Method::GET,
+        "/api/sessions",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(sessions_status, StatusCode::OK);
+    assert!(
+        sessions["data"].as_array().is_some_and(Vec::is_empty),
+        "deleted session must not resurrect, got: {sessions}"
+    );
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
 #[tokio::test]
 async fn event_retention_respects_the_configured_per_run_limit() {
     let path =

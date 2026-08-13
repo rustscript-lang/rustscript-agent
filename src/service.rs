@@ -22,6 +22,7 @@ use crate::RunCancellation;
 use crate::gateway::{AgentGatewayConfig, append_message, emit_event_locked, timestamp};
 use crate::gateway_store::{
     GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionRecord, SessionView,
+    event_record_id, persisted_run_value,
 };
 
 /// One admitted run's lifecycle state: typed cancellation, delivery permit,
@@ -154,17 +155,26 @@ impl AgentService {
         self.inner.runs.lock().expect("runs lock").len()
     }
 
-    pub fn persist(&self) -> bool {
-        let Some(persistence) = self.inner.persistence.as_ref() else {
-            return true;
-        };
-        let store = self.inner.store.read();
-        match persistence.save(&store) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::error!("failed to persist agent gateway state: {error}");
-                false
-            }
+    /// Commits one per-record mutation through the dedicated storage worker.
+    /// With no SQLite persistence configured this is a no-op.
+    pub(crate) fn durable_put(
+        &self,
+        kind: &str,
+        record_id: &str,
+        payload: &JsonValue,
+    ) -> Result<(), String> {
+        match self.inner.persistence.as_ref() {
+            Some(persistence) => persistence.put(kind, record_id, payload),
+            None => Ok(()),
+        }
+    }
+
+    /// Deletes one durable record (event deletes cascade by run prefix).
+    /// With no SQLite persistence configured this is a no-op.
+    pub(crate) fn durable_delete(&self, kind: &str, record_id: &str) -> Result<(), String> {
+        match self.inner.persistence.as_ref() {
+            Some(persistence) => persistence.delete(kind, record_id),
+            None => Ok(()),
         }
     }
 
@@ -302,6 +312,31 @@ impl AgentService {
                     },
                 );
             }
+            // Durable-before-visible: commit every mutation through the
+            // dedicated storage worker while the store write lock is held.
+            // On failure, roll back all in-memory steps so a rejected
+            // admission leaves no session, run, or idempotency record behind.
+            if let Err(error) =
+                self.durable_admission_locked(&store, &session_id, &run_id, &request)
+            {
+                store.runs.remove(&run_id);
+                if let Some(key) = request.idempotency_key.as_deref() {
+                    store.idempotency.remove(key);
+                }
+                if let Some((session_id, previous)) = previous_session.clone() {
+                    match previous {
+                        Some(session) => {
+                            store.sessions.insert(session_id, session);
+                        }
+                        None => {
+                            store.sessions.remove(&session_id);
+                        }
+                    }
+                }
+                return Err(AdmitError::Persistence(format!(
+                    "run admission could not be durably committed: {error}"
+                )));
+            }
             let handle = Arc::new(RunHandle {
                 cancel: cancel.clone(),
                 terminal_at: Mutex::new(None),
@@ -321,43 +356,75 @@ impl AgentService {
         })();
 
         match result {
-            Ok(admitted) => {
-                drop(store);
-                if !self.persist() {
-                    // Roll back every intermediate step; the rejection leaves
-                    // no session, run, or idempotency record behind.
+            Ok(admitted) => Ok(admitted),
+            Err(error) => {
+                // Roll back a session created for a rejected admission
+                // (idempotency conflict / parent missing) so no partial
+                // session outlives the failure.
+                if let Some((session_id, previous)) = previous_session {
                     let mut store = self.inner.store.write();
-                    store.runs.remove(&run_id);
-                    if let Some(key) = request.idempotency_key.as_deref() {
-                        store.idempotency.remove(key);
-                    }
-                    if let Some((session_id, previous)) = previous_session {
-                        match previous {
-                            Some(session) => {
-                                store.sessions.insert(session_id, session);
-                            }
-                            None => {
-                                store.sessions.remove(&session_id);
-                            }
+                    match previous {
+                        Some(session) => {
+                            store.sessions.insert(session_id, session);
+                        }
+                        None => {
+                            store.sessions.remove(&session_id);
                         }
                     }
-                    if let Some(handle) = self.inner.runs.lock().expect("runs lock").remove(&run_id)
-                    {
-                        handle.permit.lock().expect("permit lock").take();
-                    }
-                    return Err(AdmitError::Persistence(
-                        "run admission could not be durably committed".to_string(),
-                    ));
                 }
-                Ok(admitted)
-            }
-            Err(error) => {
                 if let Some(permit) = permit.take() {
                     drop(permit);
                 }
                 Err(error)
             }
         }
+    }
+
+    /// Durable-before-visible commit for one admission: session (with the
+    /// appended user message), run, the `run.started` event, and the
+    /// idempotency record. Callers hold the store write lock.
+    fn durable_admission_locked(
+        &self,
+        store: &GatewayStore,
+        session_id: &str,
+        run_id: &str,
+        request: &AdmitRunRequest,
+    ) -> Result<(), String> {
+        let Some(persistence) = self.inner.persistence.as_ref() else {
+            return Ok(());
+        };
+        let session = store
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| "admission session missing".to_string())?;
+        persistence.put(
+            "session",
+            session_id,
+            &serde_json::to_value(session).map_err(|error| format!("encode session: {error}"))?,
+        )?;
+        let run = store
+            .runs
+            .get(run_id)
+            .ok_or_else(|| "admission run missing".to_string())?;
+        persistence.put("run", run_id, &persisted_run_value(run)?)?;
+        for event in &run.events {
+            persistence.put(
+                "event",
+                &event_record_id(run_id, event.seq),
+                &serde_json::to_value(event).map_err(|error| format!("encode event: {error}"))?,
+            )?;
+        }
+        if let Some(key) = request.idempotency_key.as_deref()
+            && let Some(record) = store.idempotency.get(key)
+        {
+            persistence.put(
+                "idempotency",
+                key,
+                &serde_json::to_value(record)
+                    .map_err(|error| format!("encode idempotency: {error}"))?,
+            )?;
+        }
+        Ok(())
     }
 
     /// Requests a typed stop for an active run. Idempotent: the first request

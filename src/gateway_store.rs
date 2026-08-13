@@ -1,25 +1,62 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::AtomicBool},
-};
+//! Gateway durable state: a dedicated storage worker thread executes every
+//! RSS storage command off the Tokio request threads, and mutations are
+//! committed one typed command at a time (never a delete-all + insert-snapshot
+//! replacement).
+//!
+//! The worker owns the compiled `gateway.rss` program and serializes all
+//! SQLite access through one connection per command. Callers submit a
+//! request and block on the bounded response; the worker performs the RSS
+//! invocation. `load()` reconstructs the in-memory store from the durable
+//! tables and re-normalizes it with per-record upserts.
 
-use axum::response::sse::Event;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::AtomicBool,
+    mpsc::{self, Receiver, RecvTimeoutError, Sender},
+};
+use std::time::Duration;
+
 use rustscript_vm::Value as VmValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
+use axum::response::sse::Event;
+
 use crate::gateway::{timestamp, vm_value_to_json};
 use crate::{AgentConfig, AgentRunner};
 
+/// Response timeout for one storage command; the worker is dedicated and
+/// every RSS op is bounded, so this only guards against a wedged worker.
+const STORAGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) struct GatewayPersistence {
-    storage: Mutex<StorageRunner>,
+    worker: StorageWorker,
+}
+
+/// One serialized storage request for the dedicated worker thread.
+struct StorageRequest {
+    op: String,
+    kind: String,
+    record_id: String,
+    payload: Value,
+    respond: Sender<Result<Value, String>>,
+}
+
+/// The dedicated storage worker: owns the compiled RSS program and executes
+/// every command on its own thread.
+struct StorageWorker {
+    sender: Sender<StorageRequest>,
+    shutdown: Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 struct StorageRunner {
     runner: AgentRunner,
     db_path: String,
+    max_events: i64,
 }
 
 impl StorageRunner {
@@ -42,7 +79,11 @@ impl StorageRunner {
             .ok_or_else(|| "gateway SQLite state path must name a file".to_string())?
             .to_string_lossy()
             .into_owned();
-        Ok(Self { runner, db_path })
+        Ok(Self {
+            runner,
+            db_path,
+            max_events: config.max_events_per_run as i64,
+        })
     }
 
     fn command(
@@ -50,7 +91,7 @@ impl StorageRunner {
         op: &str,
         kind: &str,
         record_id: &str,
-        payload: Value,
+        payload: &Value,
     ) -> Result<Value, String> {
         let input = VmValue::map(vec![
             (VmValue::string("op"), VmValue::string(op)),
@@ -71,7 +112,7 @@ impl StorageRunner {
             (VmValue::string("busy_timeout_ms"), VmValue::Int(5_000)),
             (VmValue::string("max_rows"), VmValue::Int(10_000)),
             (VmValue::string("max_bytes"), VmValue::Int(4 * 1024 * 1024)),
-            (VmValue::string("max_events"), VmValue::Int(128)),
+            (VmValue::string("max_events"), VmValue::Int(self.max_events)),
             (VmValue::string("max_messages"), VmValue::Int(128)),
             (VmValue::string("now_ms"), VmValue::Int(timestamp() as i64)),
             (
@@ -92,22 +133,107 @@ impl StorageRunner {
     }
 }
 
+/// Runs the worker loop: execute one request at a time on this dedicated
+/// thread, then answer. A dropped sender (or shutdown signal) ends the loop.
+fn storage_worker_loop(
+    runner: StorageRunner,
+    requests: Receiver<StorageRequest>,
+    shutdown: Receiver<()>,
+) {
+    loop {
+        match requests.recv_timeout(Duration::from_millis(200)) {
+            Ok(request) => {
+                let result = runner.command(
+                    &request.op,
+                    &request.kind,
+                    &request.record_id,
+                    &request.payload,
+                );
+                let _ = request.respond.send(result);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if shutdown.try_recv().is_ok() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
 impl GatewayPersistence {
     pub(crate) fn open(
         config: &crate::gateway::AgentGatewayConfig,
         path: &Path,
     ) -> Result<Self, String> {
+        let runner = StorageRunner::open(config, path)?;
+        let (sender, requests) = mpsc::channel::<StorageRequest>();
+        let (shutdown_sender, shutdown) = mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("gateway-storage-worker".to_string())
+            .spawn(move || storage_worker_loop(runner, requests, shutdown))
+            .map_err(|error| format!("spawn gateway storage worker: {error}"))?;
         Ok(Self {
-            storage: Mutex::new(StorageRunner::open(config, path)?),
+            worker: StorageWorker {
+                sender,
+                shutdown: shutdown_sender,
+                thread: Some(thread),
+            },
         })
     }
 
+    /// Runs one command on the dedicated storage worker and blocks (bounded)
+    /// for the response. The worker thread executes the RSS program; request
+    /// threads never run storage code themselves.
+    fn command(
+        &self,
+        op: &str,
+        kind: &str,
+        record_id: &str,
+        payload: &Value,
+    ) -> Result<Value, String> {
+        let (respond, response) = mpsc::channel();
+        self.worker
+            .sender
+            .send(StorageRequest {
+                op: op.to_string(),
+                kind: kind.to_string(),
+                record_id: record_id.to_string(),
+                payload: payload.clone(),
+                respond,
+            })
+            .map_err(|_| "gateway storage worker is not running".to_string())?;
+        response
+            .recv_timeout(STORAGE_COMMAND_TIMEOUT)
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => "gateway storage worker timed out".to_string(),
+                RecvTimeoutError::Disconnected => {
+                    "gateway storage worker exited unexpectedly".to_string()
+                }
+            })?
+    }
+
+    /// Upserts one record through the typed per-record command.
+    pub(crate) fn put(&self, kind: &str, record_id: &str, payload: &Value) -> Result<(), String> {
+        let result = self.command("put", kind, record_id, payload)?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(format!("put {kind}/{record_id} failed: {result}"));
+        }
+        Ok(())
+    }
+
+    /// Deletes one record (events delete by run prefix) through the typed
+    /// per-record command.
+    pub(crate) fn delete(&self, kind: &str, record_id: &str) -> Result<(), String> {
+        let result = self.command("delete", kind, record_id, &Value::Null)?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            return Err(format!("delete {kind}/{record_id} failed: {result}"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn load(&self) -> Result<GatewayStore, String> {
-        let storage = self
-            .storage
-            .lock()
-            .map_err(|_| "gateway storage mutex poisoned".to_string())?;
-        let result = storage.command("load", "", "", json!({}))?;
+        let result = self.command("load", "", "", &json!({}))?;
         if result.get("ok") != Some(&Value::Bool(true)) {
             return Err(format!("load gateway state failed: {result}"));
         }
@@ -131,11 +257,6 @@ impl GatewayPersistence {
             .get("rows")
             .and_then(Value::as_array)
             .ok_or_else(|| "gateway state result omitted rows".to_string())?;
-        if rows.len() >= 100_000 {
-            return Err(
-                "gateway state row limit reached; refusing possibly truncated replay".to_string(),
-            );
-        }
         for row in rows {
             let Some(row) = row.as_array() else { continue };
             let (Some(kind), Some(record_id), Some(payload)) = (
@@ -228,79 +349,87 @@ impl GatewayPersistence {
                 .events = events;
         }
         let store = GatewayStore::from_snapshot(snapshot);
-        drop(storage);
-        self.save(&store)?;
+        // Re-normalize durably with per-record upserts (sequence fixes and
+        // restart terminal transitions), never a full snapshot replacement.
+        self.normalize(&store)?;
         Ok(store)
     }
 
-    pub(crate) fn save(&self, store: &GatewayStore) -> Result<(), String> {
-        let storage = self
-            .storage
-            .lock()
-            .map_err(|_| "gateway storage mutex poisoned".to_string())?;
-        let snapshot = store.snapshot();
-        let mut sessions = Vec::with_capacity(snapshot.sessions.len());
-        for (id, session) in snapshot.sessions {
-            sessions.push(json!({
-                "record_id": id,
-                "payload_json": serde_json::to_string(&session)
-                    .map_err(|error| format!("encode session: {error}"))?,
-            }));
+    /// Writes the normalized store back one record at a time. Ordering
+    /// matters for reload validation: sessions, then runs, then events, then
+    /// idempotency records.
+    fn normalize(&self, store: &GatewayStore) -> Result<(), String> {
+        for (id, session) in &store.sessions {
+            self.put(
+                "session",
+                id,
+                &serde_json::to_value(session)
+                    .map_err(|error| format!("encode session {id}: {error}"))?,
+            )?;
         }
-        let mut runs = Vec::with_capacity(snapshot.runs.len());
-        let mut events = Vec::new();
-        for (id, mut run) in snapshot.runs {
-            let run_events = std::mem::take(&mut run.events);
-            runs.push(json!({
-                "record_id": id,
-                "payload_json": serde_json::to_string(&run)
-                    .map_err(|error| format!("encode run: {error}"))?,
-            }));
-            for event in run_events {
-                events.push(json!({
-                    "record_id": format!("{}:{:020}", run.run_id, event.seq),
-                            "payload_json": serde_json::to_string(&event)
-                        .map_err(|error| format!("encode event: {error}"))?,
-                }));
+        for run in store.runs.values() {
+            self.put(
+                "run",
+                &run.run_id,
+                &persisted_run_value(run)
+                    .map_err(|error| format!("encode run {}: {error}", run.run_id))?,
+            )?;
+            for event in &run.events {
+                self.put(
+                    "event",
+                    &event_record_id(&run.run_id, event.seq),
+                    &serde_json::to_value(event)
+                        .map_err(|error| format!("encode event {}: {error}", event.event_id))?,
+                )?;
             }
         }
-        let mut jobs = Vec::with_capacity(snapshot.jobs.len());
-        for (id, job) in snapshot.jobs {
-            jobs.push(json!({
-                "record_id": id,
-                "payload_json": serde_json::to_string(&job)
-                    .map_err(|error| format!("encode job: {error}"))?,
-            }));
+        for (id, job) in &store.jobs {
+            self.put(
+                "job",
+                id,
+                &serde_json::to_value(job).map_err(|error| format!("encode job {id}: {error}"))?,
+            )?;
         }
-        let mut idempotency = Vec::with_capacity(snapshot.idempotency.len());
-        for (id, record) in snapshot.idempotency {
-            idempotency.push(json!({
-                "record_id": id,
-                "payload_json": serde_json::to_string(&record)
-                    .map_err(|error| format!("encode idempotency record: {error}"))?,
-            }));
+        for (id, record) in &store.idempotency {
+            self.put(
+                "idempotency",
+                id,
+                &serde_json::to_value(record)
+                    .map_err(|error| format!("encode idempotency record {id}: {error}"))?,
+            )?;
         }
-        let record_count =
-            sessions.len() + runs.len() + jobs.len() + events.len() + idempotency.len();
-        if record_count + 5 > 1024 {
-            return Err(format!(
-                "gateway state has {record_count} records; atomic storage transaction limit is 1019"
-            ));
-        }
-        storage.command(
-            "replace",
-            "",
-            "",
-            json!({
-                "sessions": sessions,
-                "runs": runs,
-                "jobs": jobs,
-                "events": events,
-                "idempotency": idempotency,
-            }),
-        )?;
         Ok(())
     }
+}
+
+impl Drop for GatewayPersistence {
+    /// Signals the worker to exit and joins it so no storage thread outlives
+    /// the persistence handle.
+    fn drop(&mut self) {
+        let _ = self.worker.shutdown.send(());
+        if let Some(thread) = self.worker.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Serializes one run record without its event rows (events are separate
+/// records); the `events` field deserializes as empty on reload.
+pub(crate) fn persisted_run_value(run: &RunRecord) -> Result<Value, String> {
+    serde_json::to_value(PersistedRun {
+        run_id: run.run_id.clone(),
+        session_id: run.session_id.clone(),
+        parent_run_id: run.parent_run_id.clone(),
+        status: run.status.clone(),
+        events: Vec::new(),
+    })
+    .map_err(|error| format!("encode run {}: {error}", run.run_id))
+}
+
+/// Durable record id for one event row: zero-padded sequence keeps the load
+/// dump ordered by run and sequence.
+pub(crate) fn event_record_id(run_id: &str, seq: u64) -> String {
+    format!("{run_id}:{seq:020}")
 }
 
 #[derive(Default)]
@@ -333,34 +462,11 @@ struct PersistedRun {
     session_id: String,
     parent_run_id: Option<String>,
     status: String,
+    #[serde(default)]
     events: Vec<GatewayEvent>,
 }
 
 impl GatewayStore {
-    fn snapshot(&self) -> PersistedState {
-        PersistedState {
-            sessions: self.sessions.clone(),
-            runs: self
-                .runs
-                .values()
-                .map(|run| {
-                    (
-                        run.run_id.clone(),
-                        PersistedRun {
-                            run_id: run.run_id.clone(),
-                            session_id: run.session_id.clone(),
-                            parent_run_id: run.parent_run_id.clone(),
-                            status: run.status.clone(),
-                            events: run.events.clone(),
-                        },
-                    )
-                })
-                .collect(),
-            jobs: self.jobs.clone(),
-            idempotency: self.idempotency.clone(),
-        }
-    }
-
     fn from_snapshot(snapshot: PersistedState) -> Self {
         let runs = snapshot
             .runs

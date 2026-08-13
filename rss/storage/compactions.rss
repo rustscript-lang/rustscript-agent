@@ -69,7 +69,7 @@ pub fn storage_compaction_latest(db_id: int, session_id: string, max_rows: int, 
     )
 }
 
-pub fn storage_compaction_commit(db_id: int, payload_json: string) -> map {
+pub fn storage_compaction_commit(db_id: int, payload_json: string) -> array {
     let input: CompactionCommitInput = json::decode::<CompactionCommitInput>(payload_json);
     let statements = [
         {
