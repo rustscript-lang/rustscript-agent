@@ -874,13 +874,16 @@ dependencies = [
  "hyper-util",
  "parking_lot",
  "pd-vm",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tracing",
  "tracing-core",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

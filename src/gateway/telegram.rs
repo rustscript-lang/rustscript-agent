@@ -2,7 +2,12 @@
 //! bounded retry policy.
 //!
 //! The client speaks the Bot API over the existing dependency graph (hyper +
-//! hyper-util, already pulled by axum — no new transitive crates). The bot
+//! hyper-util, already pulled by axum). Transport security: the default
+//! `https://api.telegram.org` base is served by a rustls TLS connector (the
+//! pinned pd-vm already locks rustls/tokio-rustls/webpki-roots, so this adds
+//! no new transitive crates); a plain `http` base is rejected by
+//! configuration unless it is a localhost test escape hatch (see
+//! [`crate::config::TelegramConfig::allow_insecure_localhost`]). The bot
 //! token is embedded in the request URL by Telegram's protocol, so the URL is
 //! never logged and the token never appears in `Debug` output; only the
 //! method name and the typed outcome are observable.
@@ -12,18 +17,26 @@
 //! `max_5xx_retries` times with capped exponential backoff; any other 4xx is
 //! a typed `Api` failure with no retry; transport failures are typed and
 //! surfaced immediately (the poller treats them as recoverable). No retry
-//! path is unbounded.
+//! path is unbounded. Response bodies are collected under a configured byte
+//! cap and a body that exceeds it is a typed `ResponseTooLarge` failure.
 
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::Request as HyperRequest;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper::Uri;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
+use tower::Service;
 
 use crate::config::TelegramConfig;
 
@@ -125,12 +138,213 @@ struct ApiParameters {
     retry_after: Option<u64>,
 }
 
+/// One Bot API connection: a plain TCP stream for `http` or a rustls TLS
+/// stream for `https`. The connector routes by URI scheme, so an `https://`
+/// api_base is always wrapped in TLS and never handed to the plain-text
+/// path (and vice versa: `http` never goes through TLS). The enum
+/// implements both the tokio I/O traits (for rustls) and hyper's runtime
+/// I/O traits (for the hyper-util legacy client).
+enum TelegramConnStream {
+    Http(tokio::net::TcpStream),
+    Https(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+}
+
+impl TelegramConnStream {
+    fn poll_read_tokio(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Https(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncRead for TelegramConnStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_read_tokio(cx, buf)
+    }
+}
+
+impl AsyncWrite for TelegramConnStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Https(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Https(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Http(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Https(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Http(stream) => stream.is_write_vectored(),
+            Self::Https(stream) => stream.is_write_vectored(),
+        }
+    }
+}
+
+impl hyper::rt::Read for TelegramConnStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Adapt the hyper read buffer to a tokio ReadBuf, exactly like
+        // hyper-util's TokioIo does, then delegate to the tokio I/O impl.
+        let filled = unsafe {
+            let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
+            match self.poll_read_tokio(cx, &mut tbuf) {
+                Poll::Ready(Ok(())) => tbuf.filled().len(),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+        // SAFETY: the filled bytes were initialized by the read above.
+        unsafe { buf.advance(filled) };
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl hyper::rt::Write for TelegramConnStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        AsyncWrite::poll_write(self, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_flush(self, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_shutdown(self, cx)
+    }
+}
+
+impl Connection for TelegramConnStream {
+    fn connected(&self) -> Connected {
+        match self {
+            Self::Http(stream) => stream.connected(),
+            Self::Https(stream) => stream.get_ref().0.connected(),
+        }
+    }
+}
+
+/// Scheme-routing connector for the Bot API client. `https` URIs are
+/// resolved through the plain connector to a TCP stream and then wrapped in
+/// a rustls TLS session (webpki-roots anchors); `http` URIs stay plaintext.
+#[derive(Clone)]
+struct TelegramConnector {
+    http: HttpConnector,
+    tls: tokio_rustls::TlsConnector,
+}
+
+impl TelegramConnector {
+    fn new() -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut http = HttpConnector::new();
+        // hyper-util's plain connector is http-only by default; https URIs
+        // must be accepted here and routed into the TLS layer below.
+        http.enforce_http(false);
+        Self {
+            http,
+            tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+        }
+    }
+}
+
+/// Maps a hyper-util connect error to an `io::Error`, preserving the
+/// underlying error kind (connection refused, timeout, ...) when the source
+/// chain exposes one. Generic so the private hyper-util error type is never
+/// named.
+fn map_connect_error<E>(error: E) -> io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let kind = std::error::Error::source(&error)
+        .and_then(|cause| cause.downcast_ref::<io::Error>())
+        .map(io::Error::kind)
+        .unwrap_or(io::ErrorKind::Other);
+    io::Error::new(kind, error)
+}
+
+impl Service<Uri> for TelegramConnector {
+    type Response = TelegramConnStream;
+    type Error = io::Error;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        if uri.scheme_str() == Some("https") {
+            let mut http = self.http.clone();
+            let tls = self.tls.clone();
+            Box::pin(async move {
+                let tcp = http
+                    .call(uri.clone())
+                    .await
+                    .map_err(map_connect_error)?
+                    .into_inner();
+                let host = uri.host().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "https URI has no host")
+                })?;
+                let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS server name")
+                    })?;
+                let tls_stream = tls.connect(server_name, tcp).await?;
+                Ok(TelegramConnStream::Https(tls_stream))
+            })
+        } else {
+            let mut http = self.http.clone();
+            Box::pin(async move {
+                http.call(uri)
+                    .await
+                    .map(|stream| TelegramConnStream::Http(stream.into_inner()))
+                    .map_err(map_connect_error)
+            })
+        }
+    }
+}
+
 /// The minimal HTTP client surface the Bot API needs; the token lives only
 /// inside the per-request URL and in this struct (redacted `Debug`).
 pub struct TelegramApi {
     api_base: String,
     token: String,
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: Client<TelegramConnector, Full<Bytes>>,
     request_timeout: Duration,
     max_429_retries: usize,
     max_429_backoff: Duration,
@@ -156,7 +370,7 @@ impl TelegramApi {
     /// always exceeds the long-poll timeout so a poll round is never cut
     /// short by the client itself.
     pub fn new(config: &TelegramConfig) -> Self {
-        let connector = HttpConnector::new();
+        let connector = TelegramConnector::new();
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self {
             api_base: config.api_base.trim_end_matches('/').to_string(),
@@ -277,7 +491,16 @@ impl TelegramApi {
             .await
             .map_err(|_| TelegramError::Transport("Bot API request timed out".to_string()))?
             .map_err(|error| {
-                TelegramError::Transport(format!("Bot API request failed: {error}"))
+                // Include the cause chain (for example the TLS handshake
+                // reason) without ever formatting the request URL, which
+                // carries the token.
+                let mut message = format!("Bot API request failed: {error}");
+                let mut source = std::error::Error::source(&error);
+                while let Some(cause) = source {
+                    message.push_str(&format!(": {cause}"));
+                    source = cause.source();
+                }
+                TelegramError::Transport(message)
             })?;
         let status = response.status();
         let bytes = timeout(
@@ -1901,5 +2124,34 @@ mod tests {
         assert_eq!(control_session_id("b"), "telegram-control:b");
         assert_eq!(run_consumer("r1"), "telegram:run:r1");
         assert_eq!(OFFSET_CONSUMER, "telegram:offset");
+    }
+
+    #[test]
+    fn default_config_builds_an_https_capable_client() {
+        let config = TelegramConfig::default();
+        assert_eq!(config.api_base, "https://api.telegram.org");
+        // Constructing the client with the default production base must
+        // succeed (no I/O happens here): the https scheme is served by the
+        // TLS connector, never rejected by an http-only connector.
+        let api = TelegramApi::new(&config);
+        let _ = api;
+    }
+
+    #[tokio::test]
+    async fn https_uri_is_accepted_by_the_connector() {
+        // A refused local connection proves the https scheme is accepted by
+        // the connector and reaches the network layer (an http-only
+        // connector would reject the scheme before any connection attempt).
+        let mut connector = TelegramConnector::new();
+        let uri: Uri = "https://127.0.0.1:1/bot1/getMe".parse().expect("uri");
+        let error = match connector.call(uri).await {
+            Ok(_) => panic!("the connection must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused,
+            "the https URI must reach the TCP layer: {error}"
+        );
     }
 }

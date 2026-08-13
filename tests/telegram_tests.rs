@@ -413,6 +413,59 @@ async fn client_other_4xx_is_typed_and_not_retried() {
     );
 }
 
+#[tokio::test]
+async fn client_https_api_base_is_handled_by_a_tls_connector() {
+    // A plain-text listener proves the https scheme is routed into a real
+    // TLS handshake: the client must speak a TLS ClientHello, never a
+    // plaintext HTTP request (an http-only connector would reject the
+    // https URL or send plaintext bytes).
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("fixture listener should bind");
+    let address = listener.local_addr().expect("fixture address");
+    let (greeting_tx, greeting_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept fixture request");
+        let mut head = [0_u8; 5];
+        let read = stream.read(&mut head).await.unwrap_or(0);
+        let _ = greeting_tx.send((head, read));
+        // Answer with non-TLS bytes so the handshake fails fast.
+        let _ = stream.write_all(b"this is not a TLS server\r\n").await;
+        let _ = stream.shutdown().await;
+    });
+    let config = TelegramConfig {
+        api_base: format!("https://{address}"),
+        ..test_config("http://127.0.0.1:1")
+    };
+    let api = TelegramApi::new(&config);
+    let error = api
+        .get_me()
+        .await
+        .expect_err("the TLS handshake must fail against a plain-text server");
+    assert!(
+        matches!(error, TelegramError::Transport(_)),
+        "https failure must be a typed transport failure: {error:?}"
+    );
+    assert!(
+        format!("{error}").contains("TLS") || format!("{error}").contains("corrupt"),
+        "the transport error should surface the TLS handshake reason: {error}"
+    );
+    let (head, read) = tokio::time::timeout(std::time::Duration::from_secs(5), greeting_rx)
+        .await
+        .expect("the connector must attempt a connection for https")
+        .expect("greeting channel");
+    assert_eq!(
+        read, 5,
+        "the client must send its handshake promptly, got {read} bytes"
+    );
+    assert_eq!(
+        &head[..3],
+        &[0x16, 0x03, 0x01],
+        "the first bytes must be a TLS ClientHello record (0x16 0x03 0x01), got {head:02x?}"
+    );
+}
+
 #[test]
 fn telegram_config_debug_redacts_the_bot_token() {
     let config = test_config("http://127.0.0.1:1");
