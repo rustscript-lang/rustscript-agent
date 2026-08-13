@@ -218,3 +218,145 @@ fn relative_markdown_links_resolve() {
         "expected several relative links to check, got {checked}"
     );
 }
+
+/// Splits a markdown table row (`| a | b | … |`) into its trimmed cells
+/// with inline-code backticks removed. Returns `None` for non-table lines.
+fn table_cells(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    if !line.starts_with('|') || !line.ends_with('|') {
+        return None;
+    }
+    let cells: Vec<String> = line
+        .split('|')
+        .map(|cell| cell.trim().replace('`', ""))
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    (!cells.is_empty()).then_some(cells)
+}
+
+#[test]
+fn canonical_env_table_rows_are_well_formed_with_key_defaults() {
+    // (variable, expected default cell, validation keyword the notes must
+    // mention). The values mirror `src/bin/rustscript-agent-gateway.rs`:
+    // exact "1" flag semantics, blank token rejection, port list validation,
+    // and the deny-by-default policy.
+    let key_rows: &[(&str, &str, &str)] = &[
+        (
+            "RUSTSCRIPT_AGENT_GATEWAY_ADDR",
+            "127.0.0.1:8090",
+            "fails startup",
+        ),
+        ("RUSTSCRIPT_AGENT_BEARER_TOKEN", "unset", "blank"),
+        ("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "unset", "1"),
+        ("RUSTSCRIPT_AGENT_ALLOW_SCHEMES", "https,wss", ""),
+        (
+            "RUSTSCRIPT_AGENT_ALLOW_PORTS",
+            "empty (deny all)",
+            "empty entries",
+        ),
+        ("RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS", "unset (false)", "1"),
+        ("RUSTSCRIPT_AGENT_STATE_DB", "unset (in-memory)", ""),
+    ];
+    let mut documented = Vec::new();
+    for line in canonical_env_section().lines() {
+        let Some(cells) = table_cells(line) else {
+            continue;
+        };
+        let Some(variable) = cells.first() else {
+            continue;
+        };
+        if !variable.starts_with("RUSTSCRIPT_AGENT_") {
+            continue;
+        }
+        assert_eq!(
+            cells.len(),
+            5,
+            "canonical env table row for {variable} must have 5 cells \
+             (variable, alias, type, default, notes): {line}"
+        );
+        let expected_alias = format!("PD_EDGE_{}", variable.strip_prefix("RUSTSCRIPT_").unwrap());
+        assert_eq!(
+            cells[1], expected_alias,
+            "alias column for {variable} must mirror the primary name"
+        );
+        for (key, default, note) in key_rows {
+            if variable == *key {
+                assert_eq!(cells[3], *default, "default cell for {key}");
+                if !note.is_empty() {
+                    assert!(
+                        cells[4].contains(note),
+                        "notes for {key} must keep the validation keyword {note:?}"
+                    );
+                }
+            }
+        }
+        documented.push(variable.clone());
+    }
+    for (key, _, _) in key_rows {
+        assert!(
+            documented.contains(&key.to_string()),
+            "canonical env table must document {key}"
+        );
+    }
+}
+
+#[test]
+fn native_config_fields_and_key_defaults_are_documented() {
+    let configuration = read_relative("docs/configuration.md");
+    let start = configuration
+        .find("## Native `AgentGatewayConfig` fields (library API)")
+        .unwrap_or_else(|| panic!("configuration.md must keep the native fields section heading"));
+    let section = &configuration[start..];
+    let end = section[1..]
+        .find("\n## ")
+        .map(|offset| offset + 1)
+        .unwrap_or(section.len());
+    let section = &section[..end];
+
+    let struct_fields = config_struct_fields();
+    let mut documented = Vec::new();
+    let mut defaults = std::collections::HashMap::new();
+    for line in section.lines() {
+        let Some(cells) = table_cells(line) else {
+            continue;
+        };
+        let Some(field) = cells.first() else { continue };
+        if field == "Field" || field == "---" {
+            continue;
+        }
+        documented.push(field.clone());
+        defaults.insert(field.clone(), cells.get(2).cloned());
+    }
+    let missing = struct_fields
+        .iter()
+        .filter(|field| !documented.contains(field))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "AgentGatewayConfig fields missing from docs/configuration.md: {missing:?}"
+    );
+    let fictional = documented
+        .iter()
+        .filter(|field| !struct_fields.contains(field))
+        .collect::<Vec<_>>();
+    assert!(
+        fictional.is_empty(),
+        "docs/configuration.md documents AgentGatewayConfig fields that do not exist: {fictional:?}"
+    );
+    // Key defaults mirror the `Default` impl in `src/config.rs`; a change on
+    // either side must update the doc row and this table together.
+    for (field, expected) in [
+        ("max_concurrent_runs", "8"),
+        ("run_timeout", "900 s"),
+        ("max_body_bytes", "4 MiB"),
+        ("max_events_per_run", "240"),
+        ("max_event_bytes", "32 KiB"),
+        ("fuel", "Some(10_000_000)"),
+    ] {
+        assert_eq!(
+            defaults.get(field).and_then(Option::as_deref),
+            Some(expected),
+            "default cell for native field {field} must stay {expected:?}"
+        );
+    }
+}

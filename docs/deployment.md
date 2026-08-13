@@ -80,9 +80,10 @@ warning; they are scheduled for removal before v1.
   host with a 5 000 ms busy timeout; the core does not enable WAL, so the
   default rollback-journal behavior applies.
 - **One gateway process per state file.** The storage worker owns a single
-  connection and SQLite serializes writers; running two gateways on the same
-  file causes lock contention and undefined behavior. Use one file per
-  instance.
+  connection and SQLite serializes writers; a second gateway on the same
+  file contends for the writer slot and fails with `SQLITE_BUSY` once the
+  5 000 ms busy timeout is exhausted. The gateway is not designed for
+  multi-process access to one state file; use one file per instance.
 - Without `RUSTSCRIPT_AGENT_STATE_DB` the gateway runs fully in memory:
   sessions, runs, jobs, and events are lost on restart.
 
@@ -97,11 +98,12 @@ warning; they are scheduled for removal before v1.
 - The gateway's own listener binds per `RUSTSCRIPT_AGENT_GATEWAY_ADDR`
   (default `127.0.0.1:8090`). TLS is not implemented; terminate TLS in a
   reverse proxy in front of the gateway.
-- Requests are authorized with `Authorization: Bearer <token>` (constant
-  time) when a token is configured; every route — including
-  `/health/detailed` — sits behind the middleware. Rate limiting is **not
-  implemented**; admission is bounded by `max_concurrent_runs`
-  (native config, 8 by default) and the body limit (4 MiB by default).
+- Requests are authorized with an `Authorization: Bearer <token>` header
+  (constant-time token comparison) when a token is configured; every route
+  — including `/health/detailed` — sits behind the middleware. Rate
+  limiting is **not implemented**; admission is bounded by
+  `max_concurrent_runs` (native config, 8 by default) and the body limit
+  (4 MiB by default).
 - Run execution is bounded: `run_timeout` (default 900 s), fuel
   (10 000 000 default), per-run event caps (`max_events_per_run` 240,
   `max_event_bytes` 32 KiB), and a 5 s cancellation grace.

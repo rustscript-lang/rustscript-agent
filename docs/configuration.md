@@ -36,7 +36,7 @@ wins. The aliases are scheduled for removal before v1 — do not rely on them.
 | Variable | Deprecated alias | Type | Default | Bounds / notes |
 | --- | --- | --- | --- | --- |
 | `RUSTSCRIPT_AGENT_GATEWAY_ADDR` | `PD_EDGE_AGENT_GATEWAY_ADDR` | string (`SocketAddr`) | `127.0.0.1:8090` | Bind address. An unparsable value fails startup. |
-| `RUSTSCRIPT_AGENT_BEARER_TOKEN` | `PD_EDGE_AGENT_BEARER_TOKEN` | string (secret) | unset | Required unless `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`. A blank value is rejected. Compared with a constant-time equality against the `Authorization: Bearer` header. Treat as a secret; see [Secrets](#secrets). |
+| `RUSTSCRIPT_AGENT_BEARER_TOKEN` | `PD_EDGE_AGENT_BEARER_TOKEN` | string (secret) | unset | Required unless `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`. A blank value is rejected. Compared in constant time against the token carried in the `Authorization: Bearer <token>` header. Treat as a secret; see [Secrets](#secrets). |
 | `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS` | `PD_EDGE_AGENT_ALLOW_ANONYMOUS` | flag | unset | Only the exact value `1` enables anonymous access. Local testing only. |
 | `RUSTSCRIPT_AGENT_ALLOW_HOSTS` | `PD_EDGE_AGENT_ALLOW_HOSTS` | comma-separated list | empty (deny all) | Every HTTP(S)/WS(S) destination host must be allowlisted. Empty list denies all hosts. |
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |

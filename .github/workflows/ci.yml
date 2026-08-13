@@ -5,6 +5,12 @@ on:
     branches: [master]
   pull_request:
 
+# Optional but recommended: cancel superseded runs on the same ref so a
+# fresh push or PR update does not queue behind an outdated run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # The agent depends on pd-vm through the path dependency `../rustscript`,
@@ -24,13 +30,20 @@ jobs:
     steps:
       - name: Checkout rustscript-agent
         uses: actions/checkout@v4
+        with:
+          # The agent must live in a directory named `rustscript-agent`
+          # relative to $GITHUB_WORKSPACE so the `path = "../rustscript"`
+          # dependency in Cargo.toml resolves to the sibling core checkout
+          # below. An explicit path keeps this independent of the default
+          # workspace-root layout; every run step below uses
+          # `working-directory: rustscript-agent` for the same reason.
+          path: rustscript-agent
 
       - name: Checkout pinned RustScript core (path dependency)
         uses: actions/checkout@v4
         with:
           repository: rustscript-lang/rustscript
-          # Checked out as a sibling of the agent repo so that the
-          # `path = "../rustscript"` dependency in Cargo.toml resolves.
+          # Sibling of the agent checkout, resolving `../rustscript`.
           path: rustscript
           ref: ${{ env.RUSTSCRIPT_CORE_REF }}
 
@@ -43,17 +56,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Format check
+        working-directory: rustscript-agent
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings denied)
+        working-directory: rustscript-agent
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
-
-      - name: Whitespace check
-        run: git diff --check
 
       # The default suite runs all non-ignored tests. #[ignore]d suites
       # (core repro driver and blocked provider parse/stream tests) stay
       # excluded until the core contract gate clears — see
       # plans/2026-08-13_a3-provider-core-blocker.md.
       - name: Test (workspace, all features, all targets)
+        working-directory: rustscript-agent
         run: cargo test --locked --all-features --all-targets
+
+      # `git diff --check` on a fresh checkout checks nothing (there is no
+      # unstaged diff), so fail on real drift instead: every step above must
+      # leave the working tree exactly as checked out. This catches tests
+      # writing state into the checkout instead of $RUSTSCRIPT_AGENT_TEST_TMP
+      # and generated files left dirty by a step.
+      - name: Working tree must stay clean
+        working-directory: rustscript-agent
+        run: git diff --exit-code
