@@ -1,8 +1,8 @@
 use std::fs;
 
 use rustscript_agent::domain::{
-    AgentEventEnvelope, InboundEnvelope, LlmEvent, LlmRequest, LlmResponse, ProviderError, Usage,
-    ToolDescriptor,
+    AgentEventEnvelope, InboundEnvelope, LlmEvent, LlmRequest, LlmResponse, ProviderError,
+    ToolDescriptor, Usage,
 };
 use rustscript_agent::{AgentConfig, AgentRunner, RunContext};
 use serde_json::Value;
@@ -95,7 +95,10 @@ fn canonical_fixtures_deserialize_into_the_frozen_typed_contracts() {
     let response: LlmResponse = read_fixture("llm_response.json");
     assert_eq!(response.id, "resp-test");
     assert_eq!(response.model, "test-model");
-    assert_eq!(response.content[0].text.as_deref(), Some("hello from the provider"));
+    assert_eq!(
+        response.content[0].text.as_deref(),
+        Some("hello from the provider")
+    );
     assert!(response.tool_calls.is_empty());
     assert_eq!(response.usage.total_tokens, 12);
     assert_eq!(response.finish_reason.as_deref(), Some("stop"));

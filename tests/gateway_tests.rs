@@ -2691,8 +2691,7 @@ async fn missing_parent_rejects_without_creating_a_session() {
 
 #[tokio::test]
 async fn failed_replay_persist_keeps_the_original_idempotency_record() {
-    let path =
-        std::env::temp_dir().join(format!("rustscript-agent-idem-{}.db", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("rustscript-agent-idem-{}.db", Uuid::new_v4()));
     let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
         .expect("SQLite state should open");
     let app = build_agent_gateway_app(state);
@@ -2748,11 +2747,13 @@ async fn failed_replay_persist_keeps_the_original_idempotency_record() {
 #[tokio::test]
 async fn failed_terminal_persist_never_publishes_or_marks_the_terminal() {
     let (port, arrived_rx, release_tx, fixture) = spawn_holding_fixture();
-    let mut http = rustscript_vm::HttpConfig::default();
-    http.allowed_hosts = vec!["127.0.0.1".to_string()];
-    http.allowed_schemes = vec!["http".to_string()];
-    http.allowed_ports = vec![port];
-    http.allow_private_ips = true;
+    let http = rustscript_vm::HttpConfig {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_schemes: vec!["http".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..rustscript_vm::HttpConfig::default()
+    };
     let path =
         std::env::temp_dir().join(format!("rustscript-agent-terminal-{}.db", Uuid::new_v4()));
     let source = format!(

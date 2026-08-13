@@ -33,7 +33,9 @@ pub struct AgentGatewayState {
 impl AgentGatewayState {
     pub fn new(config: AgentGatewayConfig) -> Result<Self, String> {
         let http_config = config.http.clone();
-        config.validate().map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        config
+            .validate()
+            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
         let store = Arc::new(RwLock::new(store::GatewayStore::default()));
         let service = Arc::new(AgentService::new(
             Arc::new(config),

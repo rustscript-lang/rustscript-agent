@@ -6,11 +6,7 @@
 //! No provider parser, agent loop, private host function, or SQL statement
 //! exists here.
 
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    time::Duration,
-};
+use std::{collections::HashMap, convert::Infallible, time::Duration};
 
 use axum::{
     Json, Router,
