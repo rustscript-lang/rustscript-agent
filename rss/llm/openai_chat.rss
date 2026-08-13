@@ -3,7 +3,12 @@
 // Maps the canonical LlmRequest (rss/llm/types.rss) onto the
 // /chat/completions wire protocol and back. Tool schemas arrive as
 // `schema_json` strings and are spliced into the encoded wire body because
-// RustScript's json::encode only accepts struct-shaped values.
+// RustScript's json::encode only accepts struct-shaped values (generic maps
+// are rejected by the type checker). Each tool and user message gets its own
+// indexed literal marker (`__RSS_TOOL_SCHEMA_<i>__`,
+// `__RSS_USER_PARTS_<i>__`), replaced by string_replace_literal (which
+// replaces ALL occurrences — see the plan's P3 marker note for the collision
+// surface).
 //
 // Compiler-contract notes for this adapter module (non-root module):
 // - Script-function calls inside statement-if bodies are rejected by the
@@ -71,8 +76,15 @@ struct WireRequest {
     reasoning_effort: string?
 }
 
-fn tool_schema_marker() -> string {
-    "__RSS_TOOL_SCHEMA__"
+/// Marker for one tool's raw schema. The encoded body carries the marker as
+/// the tool's `parameters` string and `chat_splice_tool_schemas` replaces it
+/// with the raw schema JSON (spliced because json::encode only accepts
+/// struct-shaped values). The marker is per-tool INDEXED: a shared marker
+/// would make every replace pass hit every tool's placeholder, so with two or
+/// more tools all schemas would collapse to the first tool's.
+fn tool_schema_marker(index: int) -> string {
+    let encoded: string = json::encode(index);
+    "__RSS_TOOL_SCHEMA_" + encoded + "__"
 }
 
 /// Marker for one user message's text parts. The encoded body carries the
@@ -384,7 +396,7 @@ fn chat_build_tools(tools: array) -> array<WireTool> {
                 function: {
                     name: name,
                     description: description,
-                    parameters: tool_schema_marker()
+                    parameters: tool_schema_marker(i)
                 }
             };
         }
@@ -394,7 +406,9 @@ fn chat_build_tools(tools: array) -> array<WireTool> {
 }
 
 /// Replaces each tool schema marker with the tool's raw schema JSON. The
-/// marker appears once per encoded tool, so one replace pass per tool.
+/// marker is unique per tool (indexed), so each replace pass touches exactly
+/// one placeholder — a shared marker would collapse every tool's schema to
+/// the first tool's.
 fn chat_splice_tool_schemas(body: string, tools: array) -> string {
     let mut result: string = body;
     let mut i = 0;
@@ -404,7 +418,7 @@ fn chat_splice_tool_schemas(body: string, tools: array) -> string {
             let schema_json: string = types::tool_schema_json(tool);
             result = string_replace_literal(
                 result,
-                "\"" + tool_schema_marker() + "\"",
+                "\"" + tool_schema_marker(i) + "\"",
                 schema_json
             );
         }

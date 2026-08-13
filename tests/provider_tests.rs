@@ -17,10 +17,10 @@
 //! `TypeMismatch("callable return schema")`, or `TypeMismatch("string")`
 //! even though every value is correctly typed. The streaming suites are
 //! additionally blocked because the frontend availability pass rejects
-//! closures that assign to captured locals (`local 'x' was moved earlier`),
-//! so an `http::client::sse` callback cannot aggregate deltas into a shared
-//! accumulator; `http::client::sse` is therefore not exposed in the
-//! restricted registry.
+//! closures that by-value-use a captured local (`local 'x' was moved
+//! earlier; use 'x.copy()' ...`), so an `http::client::sse` callback cannot
+//! aggregate deltas into a shared accumulator; `http::client::sse` is
+//! therefore not exposed in the restricted registry.
 //!
 //! Minimal repros and the exact commands are recorded in
 //! `plans/2026-08-13_a3-provider-core-blocker.md`; the committed, executable
@@ -28,10 +28,13 @@
 //! `tests/core_repro_driver.rs` (ignored by default). One trigger is avoided
 //! in the adapter source already (two-map functions must string-read only
 //! their SECOND map parameter; see `openai_chat_complete_dispatch`), but the
-//! remaining corruption is module-layout dependent and cannot be worked
-//! around from this repository. Two suites run green: the structured
-//! provider-error mapping (`openai_chat_provider_error_is_structured`) and
-//! the P1 standard-wire guard (`openai_chat_wire_format_is_standard`).
+//! remaining corruption reproduces even in a minimal root-module probe
+//! (`root_splice.rss`) and cannot be worked around from this repository.
+//! Four suites run green: the structured provider-error mapping
+//! (`openai_chat_provider_error_is_structured`), the P1 standard-wire guard
+//! (`openai_chat_wire_format_is_standard`), and the two marker-splice
+//! preservation guards (`openai_chat_wire_preserves_marker_like_user_text`,
+//! `openai_chat_wire_preserves_marker_like_tool_schema`).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -538,7 +541,147 @@ fn openai_chat_wire_format_is_standard() {
         wire["tools"][0]["function"]["parameters"]["required"][0],
         json!("path")
     );
-    assert_eq!(wire["tool_choice"], json!(null), "{wire}");
+    // Empty `tool_choice` is OMITTED from the wire body entirely (the struct
+    // encoder drops null optional fields; OpenAI treats an absent tool_choice
+    // as the default `auto`). The old `wire["tool_choice"] == null` assertion
+    // passed vacuously because serde_json indexes a missing key as Null —
+    // asserting absence on the parsed map plus a literal body check keeps that
+    // masking from hiding a regression that would emit `"tool_choice":null` or
+    // an empty string instead.
+    assert!(
+        !wire
+            .as_object()
+            .expect("wire body is a JSON object")
+            .contains_key("tool_choice"),
+        "empty tool_choice must be omitted from the wire body: {wire}"
+    );
+    assert!(
+        !recorded.body.contains("tool_choice"),
+        "wire body must not mention tool_choice at all: {}",
+        recorded.body
+    );
+}
+
+/// Marker-splice collision guard (P3, user text): the wire splices user
+/// content parts and tool schemas through literal markers
+/// (`__RSS_USER_PARTS_<i>__`, `__RSS_TOOL_SCHEMA_<i>__`), and
+/// `string_replace_literal` replaces every occurrence. A collision requires
+/// user text to be EXACTLY the full quoted marker string — marker-like
+/// fragments in ordinary or adversarial text (prefixes, embedded occurrences,
+/// suffixed forms) must pass through byte-identical. A collision-free
+/// structured build is blocked by the core (json::encode accepts only
+/// struct-shaped values, so the splice mechanism is forced; see the plan's
+/// P3 marker note).
+#[test]
+fn openai_chat_wire_preserves_marker_like_user_text() {
+    let body = read_fixture("openai_chat/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["messages"] = json!([
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "__RSS_USER_PARTS_"}]
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "prefix __RSS_TOOL_SCHEMA__ suffix"}
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "__RSS_USER_PARTS_0__ but not alone"
+                },
+                {
+                    "type": "text",
+                    "text": "__RSS_USER_PARTS_1__"
+                }
+            ]
+        }
+    ]);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let messages = wire["messages"].as_array().expect("messages array");
+    let texts = messages
+        .iter()
+        .filter(|message| message["role"] == json!("user"))
+        .flat_map(|message| {
+            message["content"]
+                .as_array()
+                .expect("user content parts array")
+                .iter()
+                .map(|part| part["text"].as_str().expect("text part").to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec![
+            "__RSS_USER_PARTS_",
+            "prefix __RSS_TOOL_SCHEMA__ suffix",
+            "__RSS_USER_PARTS_0__ but not alone",
+            "__RSS_USER_PARTS_1__",
+        ],
+        "marker-like user text must survive the splice byte-identical: {wire}"
+    );
+}
+
+/// Marker-splice collision guard (P3, tool schemas): a tool schema whose JSON
+/// text embeds the marker strings inside longer values (the only shapes
+/// ordinary or adversarial schemas can carry without being exactly the
+/// quoted marker) must be spliced in byte-identical across multi-tool passes.
+#[test]
+fn openai_chat_wire_preserves_marker_like_tool_schema() {
+    let body = read_fixture("openai_chat/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["tools"] = json!([
+        {
+            "name": "read_file",
+            "description": "schema __RSS_TOOL_SCHEMA_0__ here",
+            "schema_json": "{\"type\":\"object\",\"description\":\"marker __RSS_TOOL_SCHEMA_1__ inside\",\"properties\":{\"path\":{\"type\":\"string\"}}}"
+        },
+        {
+            "name": "search_files",
+            "description": "parts __RSS_USER_PARTS_0__ mention",
+            "schema_json": "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}}}"
+        }
+    ]);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let tools = wire["tools"].as_array().expect("tools array");
+    assert_eq!(
+        tools[0]["function"]["parameters"],
+        json!({"type":"object","description":"marker __RSS_TOOL_SCHEMA_1__ inside","properties":{"path":{"type":"string"}}}),
+        "tool schema must be spliced in byte-identical: {wire}"
+    );
+    assert_eq!(
+        tools[1]["function"]["parameters"],
+        json!({"type":"object","properties":{"pattern":{"type":"string"}}}),
+        "second tool schema must survive the multi-pass splice: {wire}"
+    );
+    assert_eq!(
+        tools[0]["function"]["description"],
+        json!("schema __RSS_TOOL_SCHEMA_0__ here")
+    );
+    assert_eq!(
+        tools[1]["function"]["description"],
+        json!("parts __RSS_USER_PARTS_0__ mention")
+    );
 }
 
 #[ignore = "core callable-schema corruption (see module doc)"]
@@ -601,16 +744,17 @@ fn openai_chat_invalid_json_fails_as_typed_invocation_error() {
 //
 // The streaming adapter (`openai_chat_stream`) is not implemented. Two
 // independent core-side blockers keep it out of agent reach in this revision:
-// (1) the frontend availability pass rejects closures that assign to captured
-// locals (`local 'x' was moved earlier`), so an SSE callback cannot aggregate
-// text deltas into a shared accumulator map; (2) the runtime callable-schema
-// corruption documented above would also hit any parse helper called from the
-// adapter module. `http::client::sse` is therefore not exposed in the
-// restricted registry. These tests stay ignored until the core clears.
-// Minimal repros: `tests/fixtures/core-repros/` (committed, independently
-// runnable via `tests/core_repro_driver.rs`, ignored).
+// (1) the frontend availability pass rejects closures that by-value-use a
+// captured local (`local 'x' was moved earlier; use 'x.copy()' ...`), so an
+// SSE callback cannot aggregate text deltas into a shared accumulator map;
+// (2) the runtime callable-schema corruption documented above would also hit
+// any parse helper called from the adapter module. `http::client::sse` is
+// therefore not exposed in the restricted registry. These tests stay ignored
+// until the core clears. Minimal repros: `tests/fixtures/core-repros/`
+// (committed, independently runnable via `tests/core_repro_driver.rs`,
+// ignored).
 
-#[ignore = "core: closure capture assignment rejected (Move) + callable-schema corruption (see module doc)"]
+#[ignore = "core: closure capture by-value-use rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_text_and_usage() {
     let events = sse_events(&read_fixture("openai_chat/stream.sse"));
@@ -641,7 +785,7 @@ fn openai_chat_stream_text_and_usage() {
     assert_eq!(wire["stream_options"]["include_usage"], json!(true));
 }
 
-#[ignore = "core: closure capture assignment rejected (Move) + callable-schema corruption (see module doc)"]
+#[ignore = "core: closure capture by-value-use rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_tool_call_chunk_aggregation() {
     let events = sse_events(&read_fixture("openai_chat/stream_tools.sse"));
@@ -671,7 +815,7 @@ fn openai_chat_stream_tool_call_chunk_aggregation() {
     assert_eq!(wire["stream"], json!(true));
 }
 
-#[ignore = "core: closure capture assignment rejected (Move) + callable-schema corruption (see module doc)"]
+#[ignore = "core: closure capture by-value-use rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_cancellation_is_typed() {
     let events = sse_events(&read_fixture("openai_chat/stream.sse"));
@@ -717,8 +861,10 @@ fn openai_chat_stream_cancellation_is_typed() {
 // streaming transcripts under `tests/fixtures/providers/openai_responses/`
 // document the wire contract; these tests stay ignored until the adapter is
 // implemented AND the core callable-schema corruption (module doc) clears.
-// The streaming transcript is data-only SSE (no `event:` prefix lines),
-// matching the real Responses API transport.
+// The streaming transcript mirrors the real Responses API transport: every
+// payload event carries an `event:` line whose value matches the `type`
+// field of its `data:` JSON payload, and the stream ends with a bare
+// `data: [DONE]`.
 
 #[ignore = "openai_responses adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
 #[test]
@@ -742,17 +888,39 @@ fn openai_responses_buffered_transcript_is_referenced() {
 
 #[ignore = "openai_responses adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
 #[test]
-fn openai_responses_stream_transcript_is_data_only_and_referenced() {
+fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced() {
     let events = sse_events(&read_fixture("openai_responses/stream.sse"));
+
+    // Real Responses API transport shape: each payload event is an
+    // `event: <type>` / `data: {json}` pair with the event name matching the
+    // payload's `type` field, and the stream ends with a bare `data: [DONE]`
+    // terminator.
+    let (done, payload_events) = events
+        .split_last()
+        .expect("stream fixture must have at least one event");
+    for event in payload_events {
+        let event_line = event
+            .lines()
+            .find(|line| line.starts_with("event: "))
+            .unwrap_or_else(|| panic!("event must carry an event: line: {event}"));
+        let data_line = event
+            .lines()
+            .find(|line| line.starts_with("data: "))
+            .unwrap_or_else(|| panic!("event must carry a data: line: {event}"));
+        let event_name = event_line.strip_prefix("event: ").expect("event name");
+        let payload: JsonValue =
+            serde_json::from_str(data_line.strip_prefix("data: ").expect("data payload"))
+                .unwrap_or_else(|error| panic!("data payload must be JSON ({error}): {event}"));
+        assert_eq!(
+            payload["type"].as_str(),
+            Some(event_name),
+            "event: line must match the data.type field: {event}"
+        );
+    }
     assert!(
-        !events.iter().any(|event| event.contains("event:")),
-        "Responses stream fixture must be data-only SSE (no event: lines)"
+        done.starts_with("data:") && done.contains("[DONE]"),
+        "stream must end with a bare data: [DONE] terminator, got: {done}"
     );
-    assert!(
-        events.iter().all(|event| event.starts_with("data:")),
-        "Responses stream fixture events must start with data:"
-    );
-    assert!(events.last().unwrap_or(&String::new()).contains("[DONE]"));
 
     let (port, _requests, fixture) = spawn_sse_fixture(events, false);
     let runner = harness_runner(port);

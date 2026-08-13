@@ -1,0 +1,12 @@
+// ROOT module control: identical closure shape, but the closure reads the
+// captured local through `state.copy()` (the exact remedy the error message
+// suggests), so the capture stays Copy and the external use after the
+// closure compiles and runs. Isolates the by-value capture as the trigger.
+pub fn run(context: map) -> map {
+    let state: string = "base";
+    let sink = |item| {
+        { action: "continue", text: state.copy() }
+    };
+    let _ = sink({});
+    { kind: "ok", text: state }
+}

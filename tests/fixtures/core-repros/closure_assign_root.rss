@@ -1,0 +1,18 @@
+// ROOT module probe: the SSE delta-aggregation pattern. The closure body
+// by-value-uses the captured accumulator local (`state`), which is a move in
+// RustScript's move semantics and forces CaptureBindingMode::Move on the
+// source slot; the external code that continues to use `state` after the
+// closure is rejected at compile time with
+// `local 'state' was moved earlier; use 'state.copy()' to copy it before
+// moving`. (Closure bodies are single expressions in this core revision, so
+// the by-value read is the expressible form of the assignment-to-captured
+// local the streaming adapter needs.) Fails identically as a root module:
+// the blocker is independent of module layout.
+pub fn run(context: map) -> map {
+    let state: string = "";
+    let sink = |item| {
+        { action: "continue", text: state }
+    };
+    let _ = sink({});
+    { kind: "ok", text: state }
+}

@@ -1,15 +1,22 @@
+event: response.created
 data: {"type":"response.created","response":{"id":"resp_01","object":"response","status":"in_progress","model":"gpt-4.1-mini"}}
 
+event: response.output_text.delta
 data: {"type":"response.output_text.delta","item_id":"msg_01","output_index":0,"delta":"The Responses "}
 
+event: response.output_text.delta
 data: {"type":"response.output_text.delta","item_id":"msg_01","output_index":0,"delta":"adapter streams."}
 
+event: response.function_call_arguments.delta
 data: {"type":"response.function_call_arguments.delta","item_id":"fc_01","output_index":1,"delta":"{\"path\":"}
 
+event: response.function_call_arguments.delta
 data: {"type":"response.function_call_arguments.delta","item_id":"fc_01","output_index":1,"delta":" \"README.md\"}"}
 
+event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_01","call_id":"call_xy","name":"read_file","arguments":"{\"path\": \"README.md\"}","status":"completed"}}
 
+event: response.completed
 data: {"type":"response.completed","response":{"id":"resp_01","object":"response","status":"completed","model":"gpt-4.1-mini","output":[{"type":"message","id":"msg_01","status":"completed","role":"assistant","content":[{"type":"output_text","text":"The Responses adapter streams."}]},{"type":"function_call","id":"fc_01","call_id":"call_xy","name":"read_file","arguments":"{\"path\": \"README.md\"}","status":"completed"}],"usage":{"input_tokens":30,"output_tokens":12,"total_tokens":42}}}
 
 data: [DONE]

@@ -16,7 +16,12 @@
 //!   parameter instead passes — the documented workaround.
 //! - `json_enc_e.rss`, `letif_a.rss`, `tailif_m2.rss` (+ `tailif_root.rss`):
 //!   compile-time strict-typing limits (annotated lets with unprovable
-//!   initializers inside expression-if branches).
+//!   initializers inside tail-position expression-if branches).
+//! - `closure_assign_root.rss` (+ `closure_read_root.rss` control): the
+//!   frontend availability pass rejects closures that by-value-use a captured
+//!   local (`local 'x' was moved earlier; use 'x.copy()' ...`), so the SSE
+//!   delta-aggregation pattern (accumulate into a shared accumulator from an
+//!   `http::client::sse` callback) is unexpressible even in a root module.
 //!
 //! This driver is `#[ignore]`d by default: it documents and re-verifies the
 //! core blocker on demand. Run with:
@@ -155,4 +160,35 @@ fn tailif_m2_annotated_let_in_tail_expr_if_is_rejected() {
         error.contains("concrete compile-time type"),
         "expected a compile rejection, got: {error}"
     );
+}
+
+/// The SSE stream blocker, isolated: a closure that by-value-uses a captured
+/// local (a move in RustScript's move semantics; closure bodies are single
+/// expressions, so the accumulator read is the expressible form of the
+/// aggregation pattern) forces the availability pass to move that local, so
+/// any later use outside the closure is rejected at compile time with
+/// `local '<name>' was moved earlier; use '<name>.copy()' ...`. This is the
+/// aggregation pattern `http::client::sse` needs (a callback accumulating
+/// deltas into a shared accumulator) and it fails identically in a minimal
+/// root module.
+#[ignore = "core compile-time limit repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+#[test]
+fn closure_assign_captured_local_then_external_use_is_rejected() {
+    let error =
+        run_repro("closure_assign_root.rss").expect_err("closure_assign must fail to compile/run");
+    assert!(
+        error.contains("was moved earlier") && error.contains("state.copy()"),
+        "expected the capture-move compile rejection mentioning 'state.copy()', got: {error}"
+    );
+}
+
+/// Control for the closure blocker: the identical closure shape reading the
+/// captured local through `state.copy()` (the exact remedy the error message
+/// suggests) leaves the local usable outside, so the probe compiles and runs
+/// — the by-value capture is the trigger.
+#[ignore = "core compile-time limit repro control (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+#[test]
+fn closure_read_captured_local_control_passes() {
+    let result = run_repro("closure_read_root.rss").expect("closure_read must pass");
+    assert!(format!("{result:?}").contains("ok"));
 }
