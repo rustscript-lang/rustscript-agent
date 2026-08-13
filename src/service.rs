@@ -10,13 +10,16 @@
 //! script events durably and live, and commits exactly one typed terminal
 //! transition. Stop, timeout, disconnect, and gateway halt map to typed core
 //! cancellation reasons. Terminal lifecycle handles are bounded by a
-//! configured TTL. A terminal commit that fails while storage is down
-//! registers the run as observably `terminal_pending` (never a false
-//! terminal): the admission permit is released immediately, and a bounded
-//! retry loop commits the typed terminal exactly once when storage recovers.
+//! configured TTL. A terminal commit that cannot be persisted durably is
+//! retried with bounded backoff (`terminal_persist_retries`/
+//! `terminal_persist_retry_delay`); if every attempt fails, the run becomes
+//! observably `terminal_pending` (never a false terminal): the admission
+//! permit is released immediately, and a bounded retry loop (janitor
+//! cadence) commits the typed terminal exactly once when storage recovers.
 //! After the retry window the durable side is left for restart recovery, so
 //! a sustained outage can neither exhaust capacity nor leak handles or live
-//! streams forever.
+//! streams forever. Nothing is ever published before the durable commit
+//! succeeds.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
@@ -701,17 +704,72 @@ impl AgentService {
             return;
         }
 
-        self.finish_completed(&run_id, &session_id, &output_text).await;
+        self.finish_completed(&run_id, &session_id, &output_text)
+            .await;
     }
 
+    /// Durably commits the completed terminal. The assistant message,
+    /// `message.delta`, and `run.completed` form one atomic delta: the whole
     /// Durably commits the completed terminal. The assistant message,
     /// `message.delta`, and `run.completed` form one atomic delta: the whole
     /// delta is persisted through the typed `run.terminal` transaction under
     /// the store lock and published only after the durable commit succeeds.
     /// On a persist failure the delta is rolled back, nothing is published,
-    /// and the run becomes observably `terminal_pending`; the bounded retry
-    /// loop commits the exact same terminal once storage recovers.
+    /// and the worker retries with bounded backoff
+    /// (`terminal_persist_retries`/`terminal_persist_retry_delay`); if every
+    /// attempt fails, the run becomes observably `terminal_pending` and the
+    /// bounded retry loop commits the exact same terminal once storage
+    /// recovers.
     async fn finish_completed(&self, run_id: &str, session_id: &str, output_text: &str) {
+        let attempts = 1 + self.inner.config.terminal_persist_retries;
+        for attempt in 0..attempts {
+            match self
+                .commit_completed_once(run_id, session_id, output_text)
+                .await
+            {
+                TerminalOutcome::Committed => {
+                    self.mark_terminal(run_id);
+                    return;
+                }
+                TerminalOutcome::NotActive => {
+                    // A stop landed between the worker check and this
+                    // commit; the typed cancellation path wins.
+                    self.finish_cancelled(run_id, "requested").await;
+                    return;
+                }
+                TerminalOutcome::SessionMissing => {
+                    self.finish_failed(run_id, failed_payload("session not found".to_string()))
+                        .await;
+                    return;
+                }
+                TerminalOutcome::TerminalPersistFailed { error, pending } => {
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(self.inner.config.terminal_persist_retry_delay).await;
+                    } else {
+                        tracing::error!(
+                            run_id,
+                            "completed terminal could not be persisted after bounded retries: {error}; \
+                             parked as pending"
+                        );
+                        self.register_pending_terminal(run_id, *pending);
+                        self.mark_terminal(run_id);
+                        self.spawn_terminal_retry(run_id.to_string());
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One durable attempt of the completed terminal delta. The started/
+    /// stopping race guard runs under the store lock: a stop that landed
+    /// before this commit wins (the typed cancellation path commits instead).
+    async fn commit_completed_once(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        output_text: &str,
+    ) -> TerminalOutcome {
         let service = self.clone();
         let run_id_for_commit = run_id.to_string();
         let session_id_for_commit = session_id.to_string();
@@ -719,11 +777,9 @@ impl AgentService {
         let retry_window = self.inner.config.terminal_commit_retry_window;
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
-        let outcome = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut store = service.inner.store.write();
             let persistence = service.persistence_handle();
-            // The started/stopping race guard: a stop that landed before this
-            // commit wins (the typed cancellation path commits instead).
             let run_active = store
                 .runs
                 .get(&run_id_for_commit)
@@ -807,42 +863,52 @@ impl AgentService {
             }
         })
         .await
-        .expect("terminal commit task must complete");
-        match outcome {
-            TerminalOutcome::Committed => self.mark_terminal(run_id),
-            TerminalOutcome::NotActive => {
-                self.finish_cancelled(run_id, "requested").await;
-            }
-            TerminalOutcome::SessionMissing => {
-                self.finish_failed(run_id, failed_payload("session not found".to_string()))
-                    .await;
-            }
-            TerminalOutcome::TerminalPersistFailed { error, pending } => {
-                tracing::error!(
-                    "failed to commit terminal state durably for {run_id}: {error}; \
-                     retrying within the bounded window"
-                );
-                self.register_pending_terminal(run_id, *pending);
-                self.mark_terminal(run_id);
-                self.spawn_terminal_retry(run_id.to_string());
-            }
-        }
+        .expect("terminal commit task must complete")
     }
 
     /// Cancels a run with the typed reason through a durable-first terminal
     /// commit: `run.terminal` commits the cancellation event and the status
-    /// change in one transaction, and only then is the event published. A
-    /// failed commit rolls the in-memory state back and hands the
-    /// cancellation to the bounded retry loop (`terminal_pending`), which
-    /// commits and publishes it exactly once when storage recovers.
+    /// change in one transaction, and only then is the event published. The
+    /// commit is retried with bounded backoff; on final failure the
+    /// cancellation is handed to the bounded retry loop (`terminal_pending`),
+    /// which commits and publishes it exactly once when storage recovers.
     pub(crate) async fn finish_cancelled(&self, run_id: &str, reason: &str) {
+        let attempts = 1 + self.inner.config.terminal_persist_retries;
+        for attempt in 0..attempts {
+            match self.commit_cancelled_once(run_id, reason).await {
+                TerminalOutcome::Committed => {
+                    self.mark_terminal(run_id);
+                    return;
+                }
+                TerminalOutcome::TerminalPersistFailed { error, pending } => {
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(self.inner.config.terminal_persist_retry_delay).await;
+                    } else {
+                        tracing::error!(
+                            run_id,
+                            "failed to commit cancellation durably after bounded retries: {error}; \
+                             retrying within the bounded window"
+                        );
+                        self.register_pending_terminal(run_id, *pending);
+                        self.mark_terminal(run_id);
+                        self.spawn_terminal_retry(run_id.to_string());
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// One durable attempt of the `run.cancelled` transition.
+    async fn commit_cancelled_once(&self, run_id: &str, reason: &str) -> TerminalOutcome {
         let service = self.clone();
         let run_id_for_commit = run_id.to_string();
         let reason_for_commit = reason.to_string();
         let retry_window = self.inner.config.terminal_commit_retry_window;
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
-        let outcome = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut store = service.inner.store.write();
             let persistence = service.persistence_handle();
             let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
@@ -864,7 +930,14 @@ impl AgentService {
                 max_events_per_run,
             );
             run.status = "cancelled".to_string();
-            match terminal_commit(persistence.as_deref(), run, "", "cancelled", &[&event], None) {
+            match terminal_commit(
+                persistence.as_deref(),
+                run,
+                "",
+                "cancelled",
+                &[&event],
+                None,
+            ) {
                 Ok(()) => {
                     if let Some(sender) = &run.sender {
                         let _ = sender.send(event);
@@ -888,35 +961,51 @@ impl AgentService {
             }
         })
         .await
-        .expect("terminal commit task must complete");
-        match outcome {
-            TerminalOutcome::Committed => self.mark_terminal(run_id),
-            TerminalOutcome::TerminalPersistFailed { error, pending } => {
-                tracing::error!(
-                    "failed to commit cancellation durably for {run_id}: {error}; \
-                     retrying within the bounded window"
-                );
-                self.register_pending_terminal(run_id, *pending);
-                self.mark_terminal(run_id);
-                self.spawn_terminal_retry(run_id.to_string());
-            }
-            _ => {}
-        }
+        .expect("terminal commit task must complete")
     }
 
     /// Fails a run through a durable-first terminal commit: `run.terminal`
     /// commits the failure event and the status change in one transaction,
-    /// and only then is the event published. A failed commit rolls the
-    /// in-memory state back and hands the failure to the bounded retry loop
-    /// (`terminal_pending`), which commits and publishes it exactly once when
-    /// storage recovers.
+    /// and only then is the event published. The commit is retried with
+    /// bounded backoff; on final failure the failure is handed to the bounded
+    /// retry loop (`terminal_pending`), which commits and publishes it
+    /// exactly once when storage recovers.
     pub(crate) async fn finish_failed(&self, run_id: &str, data: JsonValue) {
+        let attempts = 1 + self.inner.config.terminal_persist_retries;
+        for attempt in 0..attempts {
+            match self.commit_failed_once(run_id, data.clone()).await {
+                TerminalOutcome::Committed => {
+                    self.mark_terminal(run_id);
+                    return;
+                }
+                TerminalOutcome::TerminalPersistFailed { error, pending } => {
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(self.inner.config.terminal_persist_retry_delay).await;
+                    } else {
+                        tracing::error!(
+                            run_id,
+                            "failed to commit failure durably after bounded retries: {error}; \
+                             retrying within the bounded window"
+                        );
+                        self.register_pending_terminal(run_id, *pending);
+                        self.mark_terminal(run_id);
+                        self.spawn_terminal_retry(run_id.to_string());
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// One durable attempt of the `run.failed` transition.
+    async fn commit_failed_once(&self, run_id: &str, data: JsonValue) -> TerminalOutcome {
         let service = self.clone();
         let run_id_for_commit = run_id.to_string();
         let retry_window = self.inner.config.terminal_commit_retry_window;
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
-        let outcome = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut store = service.inner.store.write();
             let persistence = service.persistence_handle();
             let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
@@ -930,13 +1019,8 @@ impl AgentService {
             }
             let previous_status = run.status.clone();
             let previous_events = run.events.len();
-            let event = append_event_locked(
-                run,
-                "run.failed",
-                data,
-                max_event_bytes,
-                max_events_per_run,
-            );
+            let event =
+                append_event_locked(run, "run.failed", data, max_event_bytes, max_events_per_run);
             run.status = "failed".to_string();
             match terminal_commit(persistence.as_deref(), run, "", "failed", &[&event], None) {
                 Ok(()) => {
@@ -962,20 +1046,7 @@ impl AgentService {
             }
         })
         .await
-        .expect("terminal commit task must complete");
-        match outcome {
-            TerminalOutcome::Committed => self.mark_terminal(run_id),
-            TerminalOutcome::TerminalPersistFailed { error, pending } => {
-                tracing::error!(
-                    "failed to commit failure durably for {run_id}: {error}; \
-                     retrying within the bounded window"
-                );
-                self.register_pending_terminal(run_id, *pending);
-                self.mark_terminal(run_id);
-                self.spawn_terminal_retry(run_id.to_string());
-            }
-            _ => {}
-        }
+        .expect("terminal commit task must complete")
     }
 
     /// Builds the canonical structured run context (gateway-api plan 4.2)
@@ -1019,7 +1090,9 @@ impl AgentService {
         };
         context.to_vm_value()
     }
+}
 
+impl AgentService {
     /// Retries one run's pending terminal commit. Runs on a blocking thread
     /// with the store write lock held (durable-before-visible). On success
     /// the terminal events are published exactly once and the run record

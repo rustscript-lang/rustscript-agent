@@ -591,7 +591,7 @@ async fn session_chat_handler(
         }
         Err(_) => {
             cancellation.request(CancellationReason::Deadline);
-            let _ = tokio::time::timeout(Duration::from_secs(5), &mut worker).await;
+            let _ = tokio::time::timeout(state.config.cancellation_grace, &mut worker).await;
             return json_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "agent_timeout",
@@ -820,11 +820,12 @@ async fn create_run_handler(
         )
         .await;
         if outcome.is_err() {
-            service.finish_failed(
-                &worker_run_id,
-                failed_payload("agent worker exited without a terminal outcome".to_string()),
-            )
-            .await;
+            service
+                .finish_failed(
+                    &worker_run_id,
+                    failed_payload("agent worker exited without a terminal outcome".to_string()),
+                )
+                .await;
         }
     });
     json_response(

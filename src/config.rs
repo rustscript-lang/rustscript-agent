@@ -30,6 +30,14 @@ pub struct AgentGatewayConfig {
     /// run's permit/handle/stream are released and the durable side is left
     /// for restart recovery.
     pub terminal_commit_retry_window: Duration,
+    /// Bounded terminal-commit retries after a failed persist: the worker
+    /// retries this many additional times (with `terminal_persist_retry_delay`
+    /// backoff) before registering the terminal as pending for the bounded
+    /// retry loop.
+    pub terminal_persist_retries: usize,
+    /// Backoff between bounded terminal-commit retries.
+    pub terminal_persist_retry_delay: Duration,
+
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
     pub fuel: Option<u64>,
@@ -71,6 +79,9 @@ impl AgentGatewayConfig {
         if self.terminal_commit_retry_window.is_zero() {
             return Err("terminal_commit_retry_window must be positive".to_string());
         }
+        if self.terminal_persist_retry_delay.is_zero() {
+            return Err("terminal_persist_retry_delay must be positive".to_string());
+        }
         Ok(())
     }
 }
@@ -95,6 +106,9 @@ impl Default for AgentGatewayConfig {
             cancellation_grace: Duration::from_secs(5),
             janitor_interval: Duration::from_secs(5),
             terminal_commit_retry_window: Duration::from_secs(300),
+            terminal_persist_retries: 3,
+            terminal_persist_retry_delay: Duration::from_millis(25),
+
             http: HttpConfig::default(),
             sqlite,
             fuel: Some(10_000_000),
@@ -134,6 +148,18 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "broadcast_capacity must be a validated positive bound"
+        );
+    }
+
+    #[test]
+    fn terminal_persist_retry_delay_must_be_positive() {
+        let config = AgentGatewayConfig {
+            terminal_persist_retry_delay: Duration::ZERO,
+            ..AgentGatewayConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "terminal_persist_retry_delay must be a validated positive bound"
         );
     }
 }

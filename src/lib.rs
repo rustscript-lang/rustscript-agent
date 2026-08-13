@@ -18,8 +18,8 @@ pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
     LlmResponse, ProviderError, RunContext, Sampling, ToolCall, ToolDescriptor, Usage,
 };
-pub use gateway::{AgentGatewayState, build_agent_gateway_app};
 pub use gateway::store::GatewayPersistence;
+pub use gateway::{AgentGatewayState, build_agent_gateway_app};
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,

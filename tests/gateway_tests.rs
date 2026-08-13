@@ -6,7 +6,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use rustscript_agent::{
-    AgentGatewayConfig, AgentGatewayState, GatewayPersistence, build_agent_gateway_app,
+    AdmitError, AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentService,
+    GatewayPersistence, build_agent_gateway_app,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -449,6 +450,58 @@ async fn active_run_can_be_interrupted_as_a_subagent() {
     assert_eq!(body["status"], "interrupt_requested");
 }
 
+/// Admission request used to probe the service capacity permit directly,
+/// bypassing the HTTP persist middleware (which fail-closes every request
+/// with 500 while the durable store is down).
+async fn probe_admit(
+    service: &AgentService,
+    input: &str,
+) -> Result<rustscript_agent::AdmittedRun, AdmitError> {
+    service
+        .admit(AdmitRunRequest {
+            input: json!({"probe": input}),
+            platform: "probe".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+}
+
+/// Spawns the holding fixture and builds the config/source pair that parks a
+/// worker inside an HTTP call before its terminal commit.
+fn spawn_holding_run_env(
+    config_overrides: impl FnOnce(AgentGatewayConfig) -> AgentGatewayConfig,
+) -> (
+    u16,
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+    AgentGatewayConfig,
+    String,
+) {
+    let (port, arrived_rx, release_tx, fixture) = spawn_holding_fixture();
+    let http = rustscript_vm::HttpConfig {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_schemes: vec!["http".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..rustscript_vm::HttpConfig::default()
+    };
+    let source = format!(
+        r#"
+        use http;
+        pub fn run(input: map) -> string {{
+            http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+            "done";
+        }}
+        "#
+    );
+    let config = config_overrides(AgentGatewayConfig {
+        http,
+        ..AgentGatewayConfig::default()
+    });
+    (port, arrived_rx, release_tx, fixture, config, source)
+}
+
 /// Reads one run's full SSE body.
 async fn read_run_events(app: &axum::Router, run_id: &str) -> String {
     let response = app
@@ -811,13 +864,15 @@ async fn terminal_handles_are_released_after_the_configured_ttl() {
     assert_eq!(status, StatusCode::ACCEPTED);
     let run_id = run["run_id"].as_str().expect("run id");
     let _ = read_run_events(&app, run_id).await;
-    // The terminal handle is retained for replay handoff right after the run...
+    // The terminal handle is retained for replay handoff right after the run
+    // completes...
     assert_eq!(service.handle_count(), 1);
-    // ...and released by the janitor after the TTL.
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-    assert_eq!(
-        service.handle_count(),
-        0,
+    // ...and released by the janitor after the TTL (bounded polling, not a
+    // fixed sleep).
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || service.handle_count()
+            == 0)
+        .await,
         "terminal lifecycle handles must be released after the TTL"
     );
 }
@@ -2492,8 +2547,6 @@ async fn idempotent_run_replay_uses_the_single_api_chat_scope() {
     let _ = std::fs::remove_file(&path);
 }
 
-
-
 #[tokio::test]
 async fn live_run_context_carries_the_full_canonical_shape() {
     let state = AgentGatewayState::with_agent_source(
@@ -2710,20 +2763,20 @@ async fn failed_replay_persist_keeps_the_original_idempotency_record() {
     std::fs::remove_file(&path).expect("remove SQLite state");
     std::fs::create_dir(&path).expect("replace SQLite state with a directory");
 
-    // A replay must not touch persistence (it is read-only), but the gateway
-    // persist middleware still re-saves the snapshot after every request, so
-    // the response is an error while persistence is down.
-    let (down_status, _) =
+    // A replay is read-only: the in-memory fast path returns the original
+    // run without any durable write, so it succeeds even while persistence
+    // is down and leaves the durable idempotency record untouched.
+    let (down_status, down_replay) =
         json_request_with_key(&app, json!({"input": "replay-durable"}), "durable-key").await;
-    assert_ne!(
-        down_status,
-        StatusCode::ACCEPTED,
-        "the gateway persist middleware rejects requests while persistence is down"
+    assert_eq!(down_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        down_replay["run_id"], run_id,
+        "a read-only replay must return the original run while persistence is down"
     );
 
     // Restore the durable store in the same process: the original
-    // idempotency record must still be present (the failed replay must not
-    // have deleted it), so the next identical request replays the original
+    // idempotency record must still be present (the replay performed no
+    // durable write), so the next identical request replays the original
     // run instead of admitting a new one.
     std::fs::remove_dir(&path).expect("remove SQLite directory");
     std::fs::copy(&backup, &path).expect("restore SQLite state");
@@ -2745,35 +2798,19 @@ async fn failed_replay_persist_keeps_the_original_idempotency_record() {
 }
 
 #[tokio::test]
-async fn failed_terminal_persist_never_publishes_or_marks_the_terminal() {
-    let (port, arrived_rx, release_tx, fixture) = spawn_holding_fixture();
-    let http = rustscript_vm::HttpConfig {
-        allowed_hosts: vec!["127.0.0.1".to_string()],
-        allowed_schemes: vec!["http".to_string()],
-        allowed_ports: vec![port],
-        allow_private_ips: true,
-        ..rustscript_vm::HttpConfig::default()
-    };
+async fn failed_terminal_persist_parks_a_pending_terminal_without_publishing() {
+    let (_, arrived_rx, release_tx, fixture, config, source) =
+        spawn_holding_run_env(|config| AgentGatewayConfig {
+            terminal_persist_retries: 2,
+            terminal_persist_retry_delay: std::time::Duration::from_millis(5),
+            janitor_interval: std::time::Duration::from_millis(50),
+            ..config
+        });
     let path =
         std::env::temp_dir().join(format!("rustscript-agent-terminal-{}.db", Uuid::new_v4()));
-    let source = format!(
-        r#"
-        use http;
-        pub fn run(input: map) -> string {{
-            http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
-            "done";
-        }}
-        "#
-    );
-    let state = AgentGatewayState::with_agent_source_and_sqlite(
-        AgentGatewayConfig {
-            http,
-            ..AgentGatewayConfig::default()
-        },
-        source,
-        &path,
-    )
-    .expect("SQLite state should open");
+    let backup = path.with_extension("db.bak");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
+        .expect("SQLite state should open");
     let service = state.service();
     let app = build_agent_gateway_app(state);
 
@@ -2787,6 +2824,13 @@ async fn failed_terminal_persist_never_publishes_or_marks_the_terminal() {
     assert_eq!(status, StatusCode::ACCEPTED);
     let run_id = run["run_id"].as_str().expect("run id").to_string();
 
+    // Subscribe to the live SSE stream BEFORE storage breaks (while the
+    // gateway persist middleware still succeeds), so the stream stays open
+    // and can observe what is (and is not) published during the outage.
+    let sse_app = app.clone();
+    let sse_run_id = run_id.clone();
+    let mut sse_task = tokio::spawn(async move { read_run_events(&sse_app, &sse_run_id).await });
+
     // The worker is now parked inside the scripted HTTP call, before its
     // terminal commit. Awaiting (instead of blocking) keeps the current-thread
     // runtime polling the worker task.
@@ -2796,27 +2840,394 @@ async fn failed_terminal_persist_never_publishes_or_marks_the_terminal() {
         .expect("fixture arrival signal");
 
     // Break the durable store: SQLite cannot open a directory.
+    std::fs::copy(&path, &backup).expect("backup SQLite state");
     std::fs::remove_file(&path).expect("remove SQLite state");
     std::fs::create_dir(&path).expect("replace SQLite state with a directory");
 
-    // Release the script: the terminal commit cannot be persisted, so it
-    // must not publish the terminal and must not mark the run terminal.
+    // Release the script: every bounded commit attempt fails, so the worker
+    // parks the decided terminal as pending instead of leaving the run
+    // active forever with a leaked permit and a hanging SSE stream.
     release_tx.send(()).expect("release the held HTTP call");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let handle = service
-        .handle(&run_id)
-        .expect("run handle must still be retained");
     assert!(
-        !handle.is_terminal(),
-        "a failed terminal persist must not mark the run terminal"
+        wait_until(std::time::Duration::from_secs(10), || service
+            .pending_terminal_count()
+            == 1)
+        .await,
+        "the worker must park the pending terminal after bounded retries"
     );
-    let status = service.stop(&run_id).expect("run handle must still exist");
     assert_eq!(
-        status, "stopping",
-        "a failed terminal persist must leave the run active, not terminal"
+        service.stop(&run_id).as_deref(),
+        Some("terminal_pending"),
+        "a pending terminal is observable, not a committed terminal"
+    );
+
+    // stop() must not hang while the terminal is pending, and must not flip
+    // the status: the worker has exited and the outcome is decided.
+    assert_eq!(
+        service.stop(&run_id).as_deref(),
+        Some("terminal_pending"),
+        "a stop during the pending window must not mutate the run status"
+    );
+    assert_eq!(
+        service.stop(&run_id).as_deref(),
+        Some("terminal_pending"),
+        "stop() must stay idempotent while the terminal is pending"
+    );
+
+    // Nothing may be published while the durable store is down: the live
+    // stream stays open without a terminal event.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut sse_task)
+            .await
+            .is_err(),
+        "no terminal may be published while the durable store is down"
+    );
+
+    // Restore the durable store: the janitor commits the parked terminal,
+    // publishes it exactly once, and the live stream closes on it.
+    std::fs::remove_dir(&path).expect("remove SQLite directory");
+    std::fs::copy(&backup, &path).expect("restore SQLite state");
+    assert!(
+        wait_until(std::time::Duration::from_secs(15), || service
+            .stop(&run_id)
+            .as_deref()
+            == Some("completed"))
+        .await,
+        "the janitor must commit the parked terminal after storage recovery"
+    );
+    let text = tokio::time::timeout(std::time::Duration::from_secs(15), sse_task)
+        .await
+        .expect("the live stream must close after the recovered terminal")
+        .expect("SSE read task");
+    assert_eq!(
+        text.matches("event: run.completed").count(),
+        1,
+        "the recovered terminal must be published exactly once"
+    );
+
+    fixture.join().expect("fixture thread");
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    std::fs::remove_file(backup).expect("temporary SQLite backup should be removed");
+}
+
+#[tokio::test]
+async fn recovered_storage_commits_the_parked_terminal_once_and_releases_the_permit() {
+    let (_, arrived_rx, release_tx, fixture, config, source) =
+        spawn_holding_run_env(|config| AgentGatewayConfig {
+            max_concurrent_runs: 1,
+            terminal_persist_retries: 2,
+            terminal_persist_retry_delay: std::time::Duration::from_millis(5),
+            janitor_interval: std::time::Duration::from_millis(50),
+            ..config
+        });
+    let path = std::env::temp_dir().join(format!("rustscript-agent-recover-{}.db", Uuid::new_v4()));
+    let backup = path.with_extension("db.bak");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
+        .expect("SQLite state should open");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "hold-terminal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(15), arrived_rx)
+        .await
+        .expect("the worker must reach the held HTTP call")
+        .expect("fixture arrival signal");
+
+    std::fs::copy(&path, &backup).expect("backup SQLite state");
+    std::fs::remove_file(&path).expect("remove SQLite state");
+    std::fs::create_dir(&path).expect("replace SQLite state with a directory");
+
+    release_tx.send(()).expect("release the held HTTP call");
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || service
+            .pending_terminal_count()
+            == 1)
+        .await,
+        "the worker must park the pending terminal"
+    );
+
+    // The admission permit is released as soon as the terminal is registered
+    // as pending (never held during a storage outage): capacity 1 admits
+    // again immediately (probed directly, because the HTTP persist
+    // middleware fail-closes every request while storage is down). The probe
+    // admission itself can only fail on the unavailable durable store, never
+    // on capacity.
+    let second = probe_admit(&service, "second").await;
+    assert!(
+        !matches!(second, Err(AdmitError::RunLimitReached)),
+        "a pending terminal must never hold its capacity permit, got: {second:?}"
+    );
+
+    // Restore the durable store: the janitor must commit the parked
+    // terminal, publish it exactly once, and release the permit.
+    std::fs::remove_dir(&path).expect("remove SQLite directory");
+    std::fs::copy(&backup, &path).expect("restore SQLite state");
+    assert!(
+        wait_until(std::time::Duration::from_secs(15), || service
+            .stop(&run_id)
+            .as_deref()
+            == Some("completed"))
+        .await,
+        "the janitor must commit the parked terminal after storage recovery"
+    );
+    assert_eq!(
+        service.pending_terminal_count(),
+        0,
+        "a committed terminal must clear the pending registry"
+    );
+    assert_eq!(
+        service.stop(&run_id).as_deref(),
+        Some("completed"),
+        "the run record must reach its committed terminal status"
+    );
+
+    // The permit is released: capacity 1 admits again.
+    let (third_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "third"}),
+    )
+    .await;
+    assert_eq!(
+        third_status,
+        StatusCode::ACCEPTED,
+        "the terminal commit must release the capacity permit"
+    );
+
+    // The terminal was published exactly once.
+    let text = read_run_events(&app, &run_id).await;
+    assert_eq!(
+        text.matches("event: run.completed").count(),
+        1,
+        "the recovered terminal must be published exactly once"
+    );
+
+    // ... and it is durably persisted: a fresh gateway replays it once.
+    drop(app);
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload");
+    let restored_app = build_agent_gateway_app(restored);
+    let restored_text = read_run_events(&restored_app, &run_id).await;
+    assert_eq!(
+        restored_text.matches("event: run.completed").count(),
+        1,
+        "the recovered terminal must be persisted durably"
+    );
+
+    fixture.join().expect("fixture thread");
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    std::fs::remove_file(backup).expect("temporary SQLite backup should be removed");
+}
+
+#[tokio::test]
+async fn sustained_persistence_failure_never_permanently_exhausts_capacity() {
+    let (_, arrived_rx, release_tx, fixture, config, source) =
+        spawn_holding_run_env(|config| AgentGatewayConfig {
+            max_concurrent_runs: 1,
+            terminal_persist_retries: 2,
+            terminal_persist_retry_delay: std::time::Duration::from_millis(5),
+            janitor_interval: std::time::Duration::from_millis(50),
+            ..config
+        });
+    let path =
+        std::env::temp_dir().join(format!("rustscript-agent-capacity-{}.db", Uuid::new_v4()));
+    let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
+        .expect("SQLite state should open");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "hold-terminal"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(15), arrived_rx)
+        .await
+        .expect("the worker must reach the held HTTP call")
+        .expect("fixture arrival signal");
+
+    // Break the durable store for the rest of the test: every terminal
+    // commit attempt keeps failing.
+    std::fs::remove_file(&path).expect("remove SQLite state");
+    std::fs::create_dir(&path).expect("replace SQLite state with a directory");
+
+    release_tx.send(()).expect("release the held HTTP call");
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || service
+            .pending_terminal_count()
+            == 1)
+        .await,
+        "the worker must park the pending terminal"
+    );
+
+    // The permit is released as soon as the terminal is registered as
+    // pending, so a sustained outage can never permanently exhaust
+    // admission: capacity 1 admits again immediately (probed directly; the
+    // HTTP persist middleware fail-closes every request while storage is
+    // down). The probe admission can only fail on the unavailable durable
+    // store, never on capacity.
+    let boundary = probe_admit(&service, "boundary").await;
+    assert!(
+        !matches!(boundary, Err(AdmitError::RunLimitReached)),
+        "the pending run must never hold its permit, got: {boundary:?}"
+    );
+    let retry = probe_admit(&service, "retry").await;
+    assert!(
+        !matches!(retry, Err(AdmitError::RunLimitReached)),
+        "admission must stay available while the terminal is pending, got: {retry:?}"
+    );
+    // The permit is free: admission proceeds (and honestly fails on the
+    // unavailable durable store, which is not a capacity error).
+    assert_eq!(
+        service.pending_terminal_count(),
+        1,
+        "the pending state must stay observable after the permit is released"
+    );
+    assert_eq!(
+        service.stop(&run_id).as_deref(),
+        Some("terminal_pending"),
+        "no terminal may be committed while storage is down; the status must stay observable"
     );
 
     fixture.join().expect("fixture thread");
     std::fs::remove_dir(&path).expect("remove SQLite directory");
+}
+
+#[tokio::test]
+async fn failed_admission_persist_rolls_back_an_existing_sessions_message() {
+    let path =
+        std::env::temp_dir().join(format!("rustscript-agent-rollback-{}.db", Uuid::new_v4()));
+    let backup = path.with_extension("db.bak");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { \"ok\"; }",
+        &path,
+    )
+    .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+
+    let (create_status, created) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/api/sessions",
+        json!({"source": "yahu"}),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+    let session_id = created["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let (_, before) = json_request(
+        &app,
+        axum::http::Method::GET,
+        &format!("/api/sessions/{session_id}/messages"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        before["data"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "the existing session must start empty"
+    );
+
+    std::fs::copy(&path, &backup).expect("backup SQLite state");
+    std::fs::remove_file(&path).expect("remove SQLite state");
+    std::fs::create_dir(&path).expect("replace SQLite state with a directory");
+
+    // Admission against the existing session appends a user message, then
+    // fails to persist; the whole admission must roll back, including the
+    // message appended to the pre-existing session.
+    let (admit_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "rollback-me", "session_id": session_id}),
+    )
+    .await;
+    assert_ne!(
+        admit_status,
+        StatusCode::ACCEPTED,
+        "admission must fail while persistence is down"
+    );
+
+    // Restore storage and verify the existing session is unchanged: no user
+    // message leaked from the failed admission.
+    std::fs::remove_dir(&path).expect("remove SQLite directory");
+    std::fs::copy(&backup, &path).expect("restore SQLite state");
+    let (_, after) = json_request(
+        &app,
+        axum::http::Method::GET,
+        &format!("/api/sessions/{session_id}/messages"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        after["data"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "a failed admission must roll back the message appended to the existing session"
+    );
+
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    std::fs::remove_file(backup).expect("temporary SQLite backup should be removed");
+}
+
+#[tokio::test]
+async fn legacy_chat_timeout_is_bounded_while_the_worker_is_blocked() {
+    let (_, _arrived_rx, release_tx, fixture, config, source) =
+        spawn_holding_run_env(|config| AgentGatewayConfig {
+            run_timeout: std::time::Duration::from_millis(200),
+            cancellation_grace: std::time::Duration::from_millis(50),
+            ..config
+        });
+    let state =
+        AgentGatewayState::with_agent_source(config, source).expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+
+    let (create_status, created) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/api/sessions",
+        json!({"source": "yahu"}),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+    let session_id = created["session"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // The legacy chat completion path must bound the worker exit: even with
+    // the worker blocked inside the held HTTP call, the run_timeout fires
+    // and the response arrives well within run_timeout + cancellation_grace
+    // (a hardcoded 5s grace would blow this bound).
+    let chat_uri = format!("/api/sessions/{session_id}/chat");
+    let chat = json_request(
+        &app,
+        axum::http::Method::POST,
+        &chat_uri,
+        json!({"input": "hang"}),
+    );
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(3), chat)
+        .await
+        .expect("legacy chat must finish within run_timeout + cancellation_grace");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body["error"]["code"], "agent_timeout");
+
+    // Unblock the abandoned worker so the fixture thread can exit.
+    release_tx.send(()).expect("release the held HTTP call");
+    fixture.join().expect("fixture thread");
 }
