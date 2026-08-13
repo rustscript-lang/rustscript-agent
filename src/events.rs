@@ -64,28 +64,7 @@ pub fn validate_script_event(value: &VmValue) -> Result<&str, &'static str> {
 /// preserved); AgentService attaches run identity, sequence, and timestamp in
 /// `GatewayEvent`.
 pub fn script_event_data(value: &VmValue) -> Value {
-    crate::gateway::vm_value_to_json(value)
-}
-
-/// Outcome of one run's delivery task.
-#[derive(Default)]
-pub struct DeliveryOutcome {
-    /// First schema-violation message, if any event failed validation.
-    pub schema_violation: Option<String>,
-    /// At least one event could not be appended durably before publish.
-    pub persist_failed: bool,
-    /// Total events durably delivered.
-    pub delivered: usize,
-}
-
-impl DeliveryOutcome {
-    pub fn merge(&mut self, other: DeliveryOutcome) {
-        if self.schema_violation.is_none() {
-            self.schema_violation = other.schema_violation;
-        }
-        self.persist_failed |= other.persist_failed;
-        self.delivered += other.delivered;
-    }
+    crate::domain::vm_value_to_json(value)
 }
 
 /// Builds the canonical error payload for a schema-violating event.

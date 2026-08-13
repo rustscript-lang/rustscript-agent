@@ -25,8 +25,10 @@ use rustscript_vm::Value as VmValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
-use crate::gateway::{timestamp, vm_value_to_json};
+use crate::config::AgentGatewayConfig;
+use crate::domain::{timestamp, vm_value_to_json};
 use crate::{AgentConfig, AgentRunner};
 
 /// Response timeout for one storage command; the worker is dedicated and
@@ -110,7 +112,7 @@ struct StorageRunner {
 }
 
 impl StorageRunner {
-    fn open(config: &crate::gateway::AgentGatewayConfig, path: &Path) -> Result<Self, String> {
+    fn open(config: &AgentGatewayConfig, path: &Path) -> Result<Self, String> {
         let root = path.parent().unwrap_or_else(|| Path::new("."));
         let agent_config = AgentConfig {
             http: config.http.clone(),
@@ -141,7 +143,7 @@ impl StorageRunner {
             (VmValue::string("op"), VmValue::string(op)),
             (
                 VmValue::string("request_id"),
-                VmValue::string(uuid::Uuid::new_v4().to_string()),
+                VmValue::string(Uuid::new_v4().to_string()),
             ),
             (
                 VmValue::string("db_path"),
@@ -205,7 +207,7 @@ impl GatewayPersistence {
     /// compactions) block on the worker's bounded response and are meant to
     /// be called from blocking threads (`spawn_blocking`), never directly
     /// from Tokio request threads.
-    pub fn open(config: &crate::gateway::AgentGatewayConfig, path: &Path) -> Result<Self, String> {
+    pub fn open(config: &crate::config::AgentGatewayConfig, path: &Path) -> Result<Self, String> {
         let runner = StorageRunner::open(config, path)?;
         let (sender, requests) = mpsc::channel::<StorageRequest>();
         let (shutdown_sender, shutdown) = mpsc::channel::<()>();
@@ -823,4 +825,28 @@ fn json_array_strings(row: &[Value], index: usize, label: &str) -> Result<Vec<St
                 .ok_or_else(|| format!("{label} contains a non-string"))
         })
         .collect()
+}
+
+/// Appends one session message and updates the session view counters.
+pub(crate) fn append_message(
+    view: &mut SessionView,
+    messages: &mut Vec<SessionMessage>,
+    role: &str,
+    content: Value,
+    run_id: Option<String>,
+    finish_reason: Option<String>,
+) -> SessionMessage {
+    let message = SessionMessage {
+        id: Uuid::new_v4().to_string(),
+        session_id: view.id.clone(),
+        role: role.to_string(),
+        content,
+        created_at: timestamp(),
+        run_id,
+        finish_reason,
+    };
+    messages.push(message.clone());
+    view.message_count = messages.len();
+    view.updated_at = timestamp();
+    message
 }

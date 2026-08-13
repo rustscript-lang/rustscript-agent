@@ -1,5 +1,6 @@
 //! RSS run execution and the agent runtime.
 
+pub(crate) mod delivery;
 pub mod rss_runner;
 
 pub use rss_runner::{

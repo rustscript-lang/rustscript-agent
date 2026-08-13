@@ -6,17 +6,17 @@
 //! of stream. The structured run context is the sole callable argument; the
 //! script-visible event builtin is `stream::emit(value)`.
 
+pub mod config;
+pub mod domain;
 pub mod events;
 pub mod gateway;
 pub mod runtime;
-
-#[path = "gateway_store.rs"]
-pub(crate) mod gateway_store;
-
-pub use gateway_store::GatewayPersistence;
 pub mod service;
 
-pub use gateway::{AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app};
+pub use config::AgentGatewayConfig;
+pub use domain::RunContext;
+pub use gateway::{AgentGatewayState, build_agent_gateway_app};
+pub use gateway::store::GatewayPersistence;
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,

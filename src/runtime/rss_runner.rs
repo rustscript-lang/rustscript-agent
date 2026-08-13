@@ -45,6 +45,39 @@ pub const RUN_EPOCH_CHECK_INTERVAL: u32 = 1_000;
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
+/// Compiles one RSS agent source and drives its exported `run(context)` entry
+/// with the given delivery sink and cancellation. Shared by the AgentService
+/// worker and the legacy chat completion path.
+pub(crate) fn execute_rss_source(
+    source: &str,
+    http_config: HttpConfig,
+    sqlite_policy: SqlitePolicy,
+    context: Value,
+    sink: &mut dyn RunEventSink,
+    cancellation: &RunCancellation,
+) -> std::result::Result<Value, RunError> {
+    if source.len() > MAX_AGENT_SOURCE_BYTES {
+        return Err(RunError::Setup(VmError::HostError(format!(
+            "RSS source exceeds {} bytes",
+            MAX_AGENT_SOURCE_BYTES
+        ))));
+    }
+    let runner = AgentRunner::from_source(
+        source,
+        AgentConfig {
+            http: http_config,
+            sqlite: sqlite_policy,
+            fuel: None,
+        },
+    )
+    .map_err(|error| {
+        RunError::Vm(VmError::HostError(format!(
+            "compile RSS run source: {error}"
+        )))
+    })?;
+    runner.run_with_context_and_events(context, sink, cancellation)
+}
+
 #[derive(Debug)]
 pub enum AgentError {
     Io(std::io::Error),

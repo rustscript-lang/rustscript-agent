@@ -447,21 +447,31 @@ pub fn run(input: map) -> bool {
 
 #[test]
 fn native_agent_sources_do_not_define_private_host_functions() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for relative in [
-        "src/lib.rs",
-        "src/gateway.rs",
-        "src/gateway_store.rs",
-        "src/bin/rustscript-agent.rs",
-        "src/bin/rustscript-agent-gateway.rs",
-    ] {
-        let path = root.join(relative);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    collect_rs_files(&root, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "src/ must contain Rust sources to audit"
+    );
+    for path in sources {
         let source = fs::read_to_string(&path).expect("agent source should be readable");
         assert!(
             !source.contains("#[pd_host_function]"),
             "{} must not define private host functions",
             path.display()
         );
+    }
+}
+
+fn collect_rs_files(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory).expect("source directory should be readable") {
+        let path = entry.expect("directory entry should be readable").path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            out.push(path);
+        }
     }
 }
 
