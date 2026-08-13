@@ -1,0 +1,444 @@
+// A5 durable compaction policy (pure decision policy; no SQLite, no agent
+// loop).
+//
+// The exported `run(context)` decides a compaction from the message history
+// and returns the exact typed A2 storage command sequence to execute:
+//
+//   compaction.start -> message.compact -> compaction.commit
+//
+// and, on the failure path, builds the `compaction.fail` command. The caller
+// (the future script-owned runner; today the test harness) executes the
+// commands through the A2 typed storage service (`rss/storage/main.rss`)
+// and interprets the typed results. Because the A2 commit is one atomic
+// transaction (state -> committed, prefix marked compacted, session
+// generation advanced in the same transaction) and `message.compact` is a
+// guarded no-op until a committed compaction covers the range, any failure
+// before the commit leaves the original history fully intact and recoverable.
+//
+// Context (all fields typed; missing fields fall back to documented
+// defaults):
+//
+//   session_id: string
+//   run_id: string           run must be in status 'compacting' to commit
+//   compaction_id: string
+//   generation: int          CURRENT session generation; the plan targets
+//                            generation + 1 (the A2 storage contract guards
+//                            sessions.generation + 1 = plan generation)
+//   messages: array          ordered history, each entry:
+//                            {ordinal: int, role: string,
+//                             tool_call_id: string, content: array}
+//                            content parts follow the canonical shapes:
+//                            {type: "text", text} |
+//                            {type: "tool_call", tool_call_id, name,
+//                             arguments_json} |
+//                            {type: "tool_result", tool_call_id, content,
+//                             is_error}
+//   config: map              {max_context_messages, retained_tail, now_ms,
+//                             model, token_estimate}
+//
+// Decisions (kind discriminator):
+//
+//   compact.plan -> generation, source_start_ordinal, source_end_ordinal,
+//                   retained_tail_ordinal, summary_json, commands[3]
+//   compact.skip -> reason ("history_within_window" |
+//                           "history_within_retained_tail" |
+//                           "invalid_config"), messages,
+//                   max_context_messages, retained_tail
+//
+// A2 field semantics (fixed by the storage contract in rss/storage/):
+// the COMPACTED source range is [source_start_ordinal, source_end_ordinal]
+// (guarded by `source_start <= retained_tail_ordinal <= source_end` and the
+// commit's equality guard `source_end_ordinal = end_ordinal`), so the policy
+// records `retained_tail_ordinal = source_end_ordinal`: the retained tail is
+// every message AFTER the compacted range, and the commit atomically marks
+// only [source_start_ordinal, source_end_ordinal] compacted while advancing
+// the session generation. The tail window is never marked and the original
+// history is fully recoverable until the commit.
+//
+// Prefix selection: with `n` messages, the naive boundary is
+// `n - retained_tail`; the boundary is then pushed forward (to a fixpoint)
+// so that NO assistant tool-call message in the prefix is separated from
+// its tool-result messages. Tool results always follow their assistant
+// message, so a pushed boundary can only pull tool messages into the prefix
+// and the fixpoint terminates.
+//
+// Failure path: `run` with `command: "fail"` returns
+// {op: "compaction.fail", payload: {id, error_message, completed_at_ms}}.
+//
+// Compiler-contract notes: every helper takes at most ONE map parameter and
+// all helpers are same-module (the two-map-parameter and cross-module
+// accessor triggers documented in the A3 core blocker plan are avoided);
+// `json::encode` results live in a helper with a declared `string` return.
+
+use json;
+
+struct CompactSummary {
+    count: int,
+    source_start_ordinal: int,
+    source_end_ordinal: int,
+    retained_tail_ordinal: int
+}
+
+// ---------------------------------------------------------------------------
+// Typed context accessors (same-module; defensive dynamic navigation)
+// ---------------------------------------------------------------------------
+
+fn ctx_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Message navigation
+// ---------------------------------------------------------------------------
+
+/// One message from the history array, or an empty map when the index is
+/// out of range or the entry is not a map.
+fn message_at(messages: array, index: int) -> map {
+    let mut result: map = {};
+    if messages.has(index) {
+        if type(messages[index].copy()) == "map" {
+            let entry: map = messages[index].copy();
+            result = entry;
+        }
+    }
+    result
+}
+
+fn message_role(message: map) -> string {
+    ctx_string(message, "role", "")
+}
+
+fn message_ordinal(message: map) -> int {
+    ctx_int(message, "ordinal", 0)
+}
+
+fn message_tool_call_id(message: map) -> string {
+    ctx_string(message, "tool_call_id", "")
+}
+
+fn message_content(message: map) -> array {
+    ctx_array(message, "content")
+}
+
+fn part_at(content: array, index: int) -> map {
+    let mut result: map = {};
+    if content.has(index) {
+        if type(content[index].copy()) == "map" {
+            let entry: map = content[index].copy();
+            result = entry;
+        }
+    }
+    result
+}
+
+fn part_type(part: map) -> string {
+    ctx_string(part, "type", "")
+}
+
+fn part_tool_call_id(part: map) -> string {
+    ctx_string(part, "tool_call_id", "")
+}
+
+/// True when the message carries at least one `tool_call` content part.
+fn message_has_tool_calls(message: map) -> bool {
+    let content: array = message_content(message);
+    let mut found = false;
+    let mut index = 0;
+    while index < content.length {
+        let part: map = part_at(content, index);
+        if part_type(part) == "tool_call" {
+            found = true;
+        }
+        index += 1;
+    }
+    found
+}
+
+/// True when the message carries a `tool_call` content part with the given
+/// call id.
+fn message_has_call(message: map, call_id: string) -> bool {
+    let content: array = message_content(message);
+    let mut found = false;
+    let mut index = 0;
+    while index < content.length {
+        let part: map = part_at(content, index);
+        if part_type(part) == "tool_call" {
+            let part_id: string = part_tool_call_id(part);
+            if part_id == call_id {
+                found = true;
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// Prefix selection
+// ---------------------------------------------------------------------------
+
+/// Pushes the compaction boundary forward (to a fixpoint) so no assistant
+/// tool-call message inside the prefix is separated from its tool-result
+/// messages. Tool results always follow their assistant message, so each
+/// pass can only pull tool messages into the prefix and the loop terminates.
+fn compact_boundary(messages: array, start_boundary: int) -> int {
+    let mut boundary: int = start_boundary;
+    let mut changed = true;
+    while changed == true {
+        changed = false;
+        let mut index = 0;
+        while index < boundary {
+            let message: map = message_at(messages, index);
+            if message_role(message) == "assistant" {
+                if message_has_tool_calls(message) {
+                    let mut cursor: int = boundary;
+                    let mut latest_result: int = boundary - 1;
+                    while cursor < messages.length {
+                        let candidate: map = message_at(messages, cursor);
+                        if message_role(candidate) == "tool" {
+                            let result_id: string = message_tool_call_id(candidate);
+                            if message_has_call(message, result_id) {
+                                latest_result = cursor;
+                            }
+                        }
+                        cursor += 1;
+                    }
+                    if latest_result >= boundary {
+                        boundary = latest_result + 1;
+                        changed = true;
+                    }
+                }
+            }
+            index += 1;
+        }
+    }
+    boundary
+}
+
+// ---------------------------------------------------------------------------
+// Decision builders
+// ---------------------------------------------------------------------------
+
+fn compact_skip(reason: string, messages_count: int, max_context_messages: int, retained_tail: int) -> map {
+    {
+        kind: "compact.skip",
+        reason: reason,
+        messages: messages_count,
+        max_context_messages: max_context_messages,
+        retained_tail: retained_tail
+    }
+}
+
+/// Builds the struct-shaped summary value (json::encode only accepts
+/// struct-shaped values).
+fn compact_summary_struct(count: int, start: int, end: int, tail: int) -> CompactSummary {
+    {
+        count: count,
+        source_start_ordinal: start,
+        source_end_ordinal: end,
+        retained_tail_ordinal: tail
+    }
+}
+
+/// Encodes the compaction summary. `json::encode`'s return type is unknown
+/// to the type checker, so the annotated local lives here with a declared
+/// `string` return (the same pattern as the provider adapters).
+fn compact_summary_json(count: int, start: int, end: int, tail: int) -> string {
+    let encoded: string = json::encode(compact_summary_struct(count, start, end, tail));
+    encoded
+}
+
+fn compact_plan(
+    session_id: string,
+    run_id: string,
+    compaction_id: string,
+    generation: int,
+    messages: array,
+    boundary: int,
+    now_ms: int,
+    model: string,
+    token_estimate: int
+) -> map {
+    let plan_generation: int = generation + 1;
+    let source_start_ordinal: int = message_ordinal(message_at(messages, 0));
+    let source_end_ordinal: int = message_ordinal(message_at(messages, boundary - 1));
+    let retained_tail_ordinal: int = source_end_ordinal;
+    let summary_json: string = compact_summary_json(
+        boundary,
+        source_start_ordinal,
+        source_end_ordinal,
+        retained_tail_ordinal
+    );
+    {
+        kind: "compact.plan",
+        generation: plan_generation,
+        source_start_ordinal: source_start_ordinal,
+        source_end_ordinal: source_end_ordinal,
+        retained_tail_ordinal: retained_tail_ordinal,
+        summary_json: summary_json,
+        commands: [
+            {
+                op: "compaction.start",
+                payload: {
+                    id: compaction_id,
+                    session_id: session_id,
+                    run_id: run_id,
+                    generation: plan_generation,
+                    source_start_ordinal: source_start_ordinal,
+                    source_end_ordinal: source_end_ordinal,
+                    retained_tail_ordinal: retained_tail_ordinal,
+                    summary_json: summary_json,
+                    token_estimate: token_estimate,
+                    model: model,
+                    now_ms: now_ms
+                }
+            },
+            {
+                op: "message.compact",
+                payload: {
+                    session_id: session_id,
+                    start_ordinal: source_start_ordinal,
+                    end_ordinal: source_end_ordinal
+                }
+            },
+            {
+                op: "compaction.commit",
+                payload: {
+                    id: compaction_id,
+                    session_id: session_id,
+                    start_ordinal: source_start_ordinal,
+                    end_ordinal: source_end_ordinal,
+                    generation: plan_generation,
+                    completed_at_ms: now_ms
+                }
+            }
+        ]
+    }
+}
+
+/// The typed `compaction.fail` command for any failure in the sequence.
+fn fail_command(context: map) -> map {
+    let compaction_id: string = ctx_string(context, "compaction_id", "");
+    let error_message: string = ctx_string(context, "error_message", "");
+    let completed_at_ms: int = ctx_int(context, "completed_at_ms", 0);
+    {
+        op: "compaction.fail",
+        payload: {
+            id: compaction_id,
+            error_message: error_message,
+            completed_at_ms: completed_at_ms
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+/// Plans a compaction from the message history, or builds the typed fail
+/// command when `command: "fail"` is present in the context.
+pub fn run(context: map) -> map {
+    let command: string = ctx_string(context, "command", "plan");
+    let mut decision: map = plan_command(context);
+    if command == "fail" {
+        decision = fail_command(context);
+    }
+    decision
+}
+
+fn plan_command(context: map) -> map {
+    let session_id: string = ctx_string(context, "session_id", "");
+    let run_id: string = ctx_string(context, "run_id", "");
+    let compaction_id: string = ctx_string(context, "compaction_id", "");
+    let generation: int = ctx_int(context, "generation", 0);
+    let messages: array = ctx_array(context, "messages");
+    let config: map = ctx_map(context, "config");
+    let max_context_messages: int = ctx_int(config, "max_context_messages", 0);
+    let retained_tail: int = ctx_int(config, "retained_tail", 0);
+    let now_ms: int = ctx_int(config, "now_ms", 0);
+    let model: string = ctx_string(config, "model", "");
+    let token_estimate: int = ctx_int(config, "token_estimate", 0);
+    let messages_count: int = messages.length;
+    let mut decision: map = compact_skip(
+        "invalid_config",
+        messages_count,
+        max_context_messages,
+        retained_tail
+    );
+    if max_context_messages >= 1 {
+        if retained_tail >= 1 {
+            if messages_count <= max_context_messages {
+                decision = compact_skip(
+                    "history_within_window",
+                    messages_count,
+                    max_context_messages,
+                    retained_tail
+                );
+            } else {
+                let boundary: int = messages_count - retained_tail;
+                if boundary <= 0 {
+                    decision = compact_skip(
+                        "history_within_retained_tail",
+                        messages_count,
+                        max_context_messages,
+                        retained_tail
+                    );
+                } else {
+                    let adjusted: int = compact_boundary(messages, boundary);
+                    decision = compact_plan(
+                        session_id,
+                        run_id,
+                        compaction_id,
+                        generation,
+                        messages,
+                        adjusted,
+                        now_ms,
+                        model,
+                        token_estimate
+                    );
+                }
+            }
+        }
+    }
+    decision
+}

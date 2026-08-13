@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustscript_agent::{AgentConfig, AgentRunner};
 use rustscript_vm::Value;
-use serde_json::{Value as JsonValue, json};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 fn agent_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent")
@@ -230,7 +230,9 @@ fn loop_start_phase_emits_model_started_and_blocks_provider_call() {
     assert_eq!(decision["capability"], json!("provider.call"));
     assert_eq!(decision["turn"], json!(0));
     assert!(
-        decision["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+        decision["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
         "blocked provider.call must carry a typed reason"
     );
     let events = decision["events"]
@@ -281,7 +283,9 @@ fn loop_success_with_tool_calls_blocks_tool_dispatch() {
     assert_eq!(decision["capability"], json!("tool.dispatch"));
     assert_eq!(decision["turn"], json!(0));
     assert!(
-        decision["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+        decision["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
         "blocked tool.dispatch must carry a typed reason"
     );
     let events = decision["events"]
@@ -321,12 +325,30 @@ fn loop_retryable_error_retries_with_backoff() {
     let runner = loop_runner();
     let decision = decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_error(429, "rate_limit_error", "rate_limited", "slow down")),
+        provider_context(
+            0,
+            3,
+            0,
+            2,
+            provider_error(429, "rate_limit_error", "rate_limited", "slow down"),
+        ),
     );
     assert_eq!(decision["kind"], json!("retry"));
-    assert_eq!(decision["retry_count"], json!(1), "retry count must increment");
-    assert_eq!(decision["delay_ms"], json!(100), "first retry uses the base delay");
-    assert_eq!(decision["turn"], json!(0), "a retry does not consume a turn");
+    assert_eq!(
+        decision["retry_count"],
+        json!(1),
+        "retry count must increment"
+    );
+    assert_eq!(
+        decision["delay_ms"],
+        json!(100),
+        "first retry uses the base delay"
+    );
+    assert_eq!(
+        decision["turn"],
+        json!(0),
+        "a retry does not consume a turn"
+    );
     assert_eq!(
         decision["events"].as_array().expect("events").len(),
         0,
@@ -339,22 +361,48 @@ fn loop_backoff_doubles_then_caps() {
     let runner = loop_runner();
     let second = decide(
         &runner,
-        provider_context(0, 3, 1, 4, provider_error(503, "server_error", "unavailable", "busy")),
+        provider_context(
+            0,
+            3,
+            1,
+            4,
+            provider_error(503, "server_error", "unavailable", "busy"),
+        ),
     );
     assert_eq!(second["kind"], json!("retry"));
-    assert_eq!(second["delay_ms"], json!(200), "second retry doubles the delay");
+    assert_eq!(
+        second["delay_ms"],
+        json!(200),
+        "second retry doubles the delay"
+    );
     assert_eq!(second["retry_count"], json!(2));
     let third = decide(
         &runner,
-        provider_context(0, 3, 2, 4, provider_error(503, "server_error", "unavailable", "busy")),
+        provider_context(
+            0,
+            3,
+            2,
+            4,
+            provider_error(503, "server_error", "unavailable", "busy"),
+        ),
     );
     assert_eq!(third["delay_ms"], json!(400), "third retry doubles again");
     assert_eq!(third["retry_count"], json!(3));
     let capped = decide(
         &runner,
-        provider_context(0, 3, 3, 4, provider_error(503, "server_error", "unavailable", "busy")),
+        provider_context(
+            0,
+            3,
+            3,
+            4,
+            provider_error(503, "server_error", "unavailable", "busy"),
+        ),
     );
-    assert_eq!(capped["delay_ms"], json!(400), "backoff is capped at max_retry_delay_ms");
+    assert_eq!(
+        capped["delay_ms"],
+        json!(400),
+        "backoff is capped at max_retry_delay_ms"
+    );
     assert_eq!(capped["retry_count"], json!(4));
 }
 
@@ -363,7 +411,13 @@ fn loop_nonretryable_error_fails_run() {
     let runner = loop_runner();
     let decision = decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_error(400, "invalid_request_error", "bad_request", "no")),
+        provider_context(
+            0,
+            3,
+            0,
+            2,
+            provider_error(400, "invalid_request_error", "bad_request", "no"),
+        ),
     );
     assert_eq!(decision["kind"], json!("run.failed"));
     assert_eq!(decision["reason"], json!("non_retryable"));
@@ -385,7 +439,13 @@ fn loop_max_retries_exceeded_fails_run() {
     // 503 is retryable, but the budget is already exhausted.
     let decision = decide(
         &runner,
-        provider_context(0, 3, 2, 2, provider_error(503, "server_error", "unavailable", "busy")),
+        provider_context(
+            0,
+            3,
+            2,
+            2,
+            provider_error(503, "server_error", "unavailable", "busy"),
+        ),
     );
     assert_eq!(decision["kind"], json!("run.failed"));
     assert_eq!(decision["reason"], json!("max_retries_exceeded"));
@@ -399,7 +459,9 @@ fn loop_parallel_config_is_rejected() {
     assert_eq!(decision["kind"], json!("rejected"));
     assert_eq!(decision["code"], json!("parallel_not_supported"));
     assert!(
-        decision["message"].as_str().is_some_and(|message| !message.is_empty()),
+        decision["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
         "rejection must carry a typed message"
     );
 }
@@ -434,22 +496,35 @@ fn loop_full_serial_run_advances_turns_and_completes() {
     assert_eq!(start["capability"], json!("provider.call"));
     assert_eq!(start["events"][0]["type"], json!("model.started"));
 
-    let step = decide(&runner, provider_context(0, 3, 0, 2, provider_ok("hello", json!([]))));
+    let step = decide(
+        &runner,
+        provider_context(0, 3, 0, 2, provider_ok("hello", json!([]))),
+    );
     assert_eq!(step["kind"], json!("next.turn"));
     assert_eq!(step["turn"], json!(1));
 
     let start = decide(&runner, start_context(1, 3, loop_config(false, false)));
     assert_eq!(start["kind"], json!("blocked"));
-    assert_eq!(start["events"][0]["turn"], json!(1), "turn must increment across steps");
+    assert_eq!(
+        start["events"][0]["turn"],
+        json!(1),
+        "turn must increment across steps"
+    );
 
-    let step = decide(&runner, provider_context(1, 3, 0, 2, provider_ok("again", json!([]))));
+    let step = decide(
+        &runner,
+        provider_context(1, 3, 0, 2, provider_ok("again", json!([]))),
+    );
     assert_eq!(step["kind"], json!("next.turn"));
     assert_eq!(step["turn"], json!(2));
 
     let start = decide(&runner, start_context(2, 3, loop_config(false, false)));
     assert_eq!(start["events"][0]["turn"], json!(2));
 
-    let step = decide(&runner, provider_context(2, 3, 0, 2, provider_ok("done", json!([]))));
+    let step = decide(
+        &runner,
+        provider_context(2, 3, 0, 2, provider_ok("done", json!([]))),
+    );
     assert_eq!(step["kind"], json!("run.completed"));
     assert_eq!(step["turn"], json!(3));
 }
@@ -458,22 +533,43 @@ fn loop_full_serial_run_advances_turns_and_completes() {
 fn loop_decisions_never_invent_parallel_or_subagent_actions() {
     let runner = loop_runner();
     let mut decisions = Vec::new();
-    decisions.push(decide(&runner, start_context(0, 3, loop_config(false, false))));
+    decisions.push(decide(
+        &runner,
+        start_context(0, 3, loop_config(false, false)),
+    ));
     decisions.push(decide(
         &runner,
         provider_context(0, 3, 0, 2, provider_ok("hello", json!([]))),
     ));
     decisions.push(decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_ok("t", json!([{"id": "c", "name": "n", "arguments": {}}]))),
+        provider_context(
+            0,
+            3,
+            0,
+            2,
+            provider_ok("t", json!([{"id": "c", "name": "n", "arguments": {}}])),
+        ),
     ));
     decisions.push(decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_error(429, "rate_limit_error", "rl", "slow")),
+        provider_context(
+            0,
+            3,
+            0,
+            2,
+            provider_error(429, "rate_limit_error", "rl", "slow"),
+        ),
     ));
     decisions.push(decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_error(400, "invalid_request_error", "br", "no")),
+        provider_context(
+            0,
+            3,
+            0,
+            2,
+            provider_error(400, "invalid_request_error", "br", "no"),
+        ),
     ));
     for decision in &decisions {
         let text = decision.to_string();
@@ -508,7 +604,13 @@ fn loop_canonical_event_shapes() {
 
     let failed = decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_error(400, "invalid_request_error", "br", "no")),
+        provider_context(
+            0,
+            3,
+            0,
+            2,
+            provider_error(400, "invalid_request_error", "br", "no"),
+        ),
     );
     let failed_error = failed["error"]
         .as_object()
@@ -533,4 +635,861 @@ fn loop_fixture_context_deserializes() {
     let decision = decide(&runner, context);
     assert_eq!(decision["kind"], json!("blocked"));
     assert_eq!(decision["capability"], json!("provider.call"));
+}
+
+// ---------------------------------------------------------------------------
+// Compaction policy context builders (rss/agent/compact.rss)
+// ---------------------------------------------------------------------------
+
+fn compact_config(max_context_messages: i64, retained_tail: i64) -> JsonValue {
+    json!({
+        "max_context_messages": max_context_messages,
+        "retained_tail": retained_tail,
+        "now_ms": 1000,
+        "model": "test-model",
+        "token_estimate": 100
+    })
+}
+
+fn compact_context(
+    messages: JsonValue,
+    max_context_messages: i64,
+    retained_tail: i64,
+) -> JsonValue {
+    json!({
+        "session_id": "session-1",
+        "run_id": "run-1",
+        "compaction_id": "compaction-1",
+        "generation": 1,
+        "messages": messages,
+        "config": compact_config(max_context_messages, retained_tail)
+    })
+}
+
+fn msg_user(ordinal: i64, text: &str) -> JsonValue {
+    json!({"ordinal": ordinal, "role": "user", "tool_call_id": "", "content": [{"type": "text", "text": text}]})
+}
+
+fn msg_assistant(ordinal: i64, text: &str) -> JsonValue {
+    json!({"ordinal": ordinal, "role": "assistant", "tool_call_id": "", "content": [{"type": "text", "text": text}]})
+}
+
+fn msg_tool_call(ordinal: i64, call_id: &str) -> JsonValue {
+    json!({"ordinal": ordinal, "role": "assistant", "tool_call_id": "", "content": [{"type": "tool_call", "tool_call_id": call_id, "name": "read_file", "arguments_json": "{}"}]})
+}
+
+fn msg_tool_result(ordinal: i64, call_id: &str) -> JsonValue {
+    json!({"ordinal": ordinal, "role": "tool", "tool_call_id": call_id, "content": [{"type": "tool_result", "tool_call_id": call_id, "content": "ok", "is_error": false}]})
+}
+
+// ---------------------------------------------------------------------------
+// Compaction policy suite (rss/agent/compact.rss) — pure decisions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compact_plan_selects_prefix_and_keeps_tail() {
+    let runner = compact_runner();
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                msg_tool_call(2, "call-1"),
+                msg_tool_result(3, "call-1"),
+                msg_assistant(4, "done"),
+                msg_user(5, "next")
+            ]),
+            4,
+            2,
+        ),
+    );
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    // 5 messages, window 4, tail 2: the compacted prefix is ordinals 1..3;
+    // the retained tail is every message after ordinal 3 (the storage
+    // contract records retained_tail_ordinal == source_end_ordinal).
+    assert_eq!(
+        plan["generation"],
+        json!(2),
+        "plan generation is session generation + 1"
+    );
+    assert_eq!(plan["source_start_ordinal"], json!(1));
+    assert_eq!(plan["source_end_ordinal"], json!(3));
+    assert_eq!(plan["retained_tail_ordinal"], json!(3));
+    assert_eq!(
+        plan["commands"][1]["payload"]["end_ordinal"],
+        json!(3),
+        "message.compact marks the compacted prefix only"
+    );
+    assert_eq!(
+        plan["commands"][2]["payload"]["end_ordinal"],
+        json!(3),
+        "compaction.commit marks the compacted prefix only"
+    );
+    assert!(
+        plan["summary_json"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("source_end_ordinal")),
+        "plan must carry a JSON summary of the compacted range"
+    );
+}
+
+#[test]
+fn compact_plan_preserves_tool_call_result_pair() {
+    let runner = compact_runner();
+    // The tool result for call-1 lands at ordinal 4, inside the naive tail;
+    // the boundary must be pushed past it so the pair is never split.
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                msg_tool_call(2, "call-1"),
+                msg_user(3, "more"),
+                msg_tool_result(4, "call-1"),
+                msg_user(5, "next")
+            ]),
+            4,
+            2,
+        ),
+    );
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_end_ordinal"], json!(4));
+    assert_eq!(
+        plan["commands"][2]["payload"]["end_ordinal"],
+        json!(4),
+        "boundary must include the tool result"
+    );
+    assert_eq!(plan["retained_tail_ordinal"], json!(4));
+}
+
+#[test]
+fn compact_plan_cascades_across_nested_tool_pairs() {
+    let runner = compact_runner();
+    // call-2's result at ordinal 6 becomes part of the prefix only after the
+    // boundary is pushed past call-1's result; the fixpoint must cascade.
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                msg_tool_call(2, "call-1"),
+                msg_user(3, "more"),
+                msg_tool_result(4, "call-1"),
+                msg_tool_call(5, "call-2"),
+                msg_tool_result(6, "call-2"),
+                msg_user(7, "next")
+            ]),
+            4,
+            2,
+        ),
+    );
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_end_ordinal"], json!(6));
+    assert_eq!(
+        plan["commands"][2]["payload"]["end_ordinal"],
+        json!(6),
+        "boundary must cascade across nested pairs"
+    );
+    assert_eq!(plan["retained_tail_ordinal"], json!(6));
+}
+
+#[test]
+fn compact_plan_skips_history_within_window() {
+    let runner = compact_runner();
+    let decision = decide(
+        &runner,
+        compact_context(
+            json!([msg_user(1, "a"), msg_assistant(2, "b"), msg_user(3, "c")]),
+            5,
+            2,
+        ),
+    );
+    assert_eq!(decision["kind"], json!("compact.skip"));
+    assert_eq!(decision["reason"], json!("history_within_window"));
+    assert_eq!(decision["messages"], json!(3));
+}
+
+#[test]
+fn compact_plan_skips_when_tail_covers_history() {
+    let runner = compact_runner();
+    let decision = decide(
+        &runner,
+        compact_context(
+            json!([msg_user(1, "a"), msg_assistant(2, "b"), msg_user(3, "c")]),
+            2,
+            3,
+        ),
+    );
+    assert_eq!(decision["kind"], json!("compact.skip"));
+    assert_eq!(decision["reason"], json!("history_within_retained_tail"));
+}
+
+#[test]
+fn compact_plan_commands_match_typed_storage_contract() {
+    let runner = compact_runner();
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                msg_tool_call(2, "call-1"),
+                msg_tool_result(3, "call-1"),
+                msg_assistant(4, "done"),
+                msg_user(5, "next")
+            ]),
+            4,
+            2,
+        ),
+    );
+    let commands = plan["commands"]
+        .as_array()
+        .expect("compact.plan must carry the typed command sequence");
+    assert_eq!(commands.len(), 3, "start -> message.compact -> commit");
+    assert_eq!(commands[0]["op"], json!("compaction.start"));
+    assert_eq!(commands[1]["op"], json!("message.compact"));
+    assert_eq!(commands[2]["op"], json!("compaction.commit"));
+
+    let start_payload = commands[0]["payload"]
+        .as_object()
+        .expect("compaction.start payload");
+    assert_eq!(start_payload["id"], json!("compaction-1"));
+    assert_eq!(start_payload["session_id"], json!("session-1"));
+    assert_eq!(start_payload["run_id"], json!("run-1"));
+    assert_eq!(start_payload["generation"], json!(2));
+    assert_eq!(start_payload["source_start_ordinal"], json!(1));
+    assert_eq!(start_payload["source_end_ordinal"], json!(3));
+    assert_eq!(start_payload["retained_tail_ordinal"], json!(3));
+    assert_eq!(start_payload["model"], json!("test-model"));
+    assert_eq!(start_payload["token_estimate"], json!(100));
+    assert_eq!(start_payload["now_ms"], json!(1000));
+
+    let compact_payload = commands[1]["payload"]
+        .as_object()
+        .expect("message.compact payload");
+    assert_eq!(compact_payload["session_id"], json!("session-1"));
+    assert_eq!(compact_payload["start_ordinal"], json!(1));
+    assert_eq!(compact_payload["end_ordinal"], json!(3));
+
+    let commit_payload = commands[2]["payload"]
+        .as_object()
+        .expect("compaction.commit payload");
+    assert_eq!(commit_payload["id"], json!("compaction-1"));
+    assert_eq!(commit_payload["session_id"], json!("session-1"));
+    assert_eq!(commit_payload["start_ordinal"], json!(1));
+    assert_eq!(commit_payload["end_ordinal"], json!(3));
+    assert_eq!(commit_payload["generation"], json!(2));
+    assert_eq!(commit_payload["completed_at_ms"], json!(1000));
+}
+
+#[test]
+fn compact_fail_command_builds_typed_payload() {
+    let runner = compact_runner();
+    let fail = decide(
+        &runner,
+        json!({
+            "command": "fail",
+            "compaction_id": "compaction-1",
+            "error_message": "commit guard rejected the compaction",
+            "completed_at_ms": 1000
+        }),
+    );
+    assert_eq!(fail["op"], json!("compaction.fail"));
+    let payload = fail["payload"]
+        .as_object()
+        .expect("compaction.fail payload");
+    assert_eq!(payload["id"], json!("compaction-1"));
+    assert_eq!(
+        payload["error_message"],
+        json!("commit guard rejected the compaction")
+    );
+    assert_eq!(payload["completed_at_ms"], json!(1000));
+}
+
+#[test]
+fn compact_fixture_context_deserializes() {
+    let context = read_fixture("compaction_context.json");
+    assert_eq!(context["session_id"], json!("session-1"));
+    assert_eq!(context["generation"], json!(1));
+    assert_eq!(
+        context["messages"]
+            .as_array()
+            .expect("fixture messages")
+            .len(),
+        5
+    );
+    assert_eq!(context["config"]["max_context_messages"], json!(4));
+    assert_eq!(context["config"]["retained_tail"], json!(2));
+    // The fixture is a valid plan input.
+    let runner = compact_runner();
+    let plan = decide(&runner, context);
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_end_ordinal"], json!(3));
+    assert_eq!(plan["retained_tail_ordinal"], json!(3));
+}
+
+// ---------------------------------------------------------------------------
+// Compaction execution through the A2 typed storage service
+// ---------------------------------------------------------------------------
+
+fn temporary_root(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the Unix epoch")
+        .as_nanos();
+    let root = PathBuf::from("/mnt/TEMP/rustscript/agent-tests")
+        .join(format!("{label}-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&root).expect("temporary storage root should be created");
+    root
+}
+
+fn storage_command(
+    db_name: &str,
+    request_id: &str,
+    op: &str,
+    payload: JsonValue,
+    now_ms: i64,
+) -> Value {
+    Value::map(vec![
+        (Value::string("op"), Value::string(op)),
+        (Value::string("request_id"), Value::string(request_id)),
+        (Value::string("db_path"), Value::string(db_name)),
+        (Value::string("db_mode"), Value::string("read_write_create")),
+        (Value::string("busy_timeout_ms"), Value::Int(1_000)),
+        (Value::string("max_rows"), Value::Int(128)),
+        (Value::string("max_bytes"), Value::Int(65_536)),
+        (Value::string("max_events"), Value::Int(128)),
+        (Value::string("max_messages"), Value::Int(128)),
+        (Value::string("now_ms"), Value::Int(now_ms)),
+        (
+            Value::string("payload_json"),
+            Value::string(payload.to_string()),
+        ),
+    ])
+}
+
+fn run_storage_result(
+    runner: &AgentRunner,
+    db_name: &str,
+    request_id: &str,
+    op: &str,
+    payload: JsonValue,
+    now_ms: i64,
+) -> Result<JsonValue, rustscript_agent::RunError> {
+    let result =
+        runner.run_with_context(storage_command(db_name, request_id, op, payload, now_ms))?;
+    let Value::Map(result) = result else {
+        panic!("storage entrypoint should return a result map");
+    };
+    Ok(vm_value_to_json(&Value::Map(result)))
+}
+
+fn run_storage(
+    runner: &AgentRunner,
+    db_name: &str,
+    request_id: &str,
+    op: &str,
+    payload: JsonValue,
+    now_ms: i64,
+) -> JsonValue {
+    run_storage_result(runner, db_name, request_id, op, payload, now_ms)
+        .unwrap_or_else(|error| panic!("storage op {op} failed: {error:?}"))
+}
+
+fn result_data(result: &JsonValue) -> JsonValue {
+    result.get("data").cloned().unwrap_or(JsonValue::Null)
+}
+
+fn query_rows(result: &JsonValue) -> Vec<JsonMap<String, JsonValue>> {
+    let data = result_data(result);
+    let columns = data
+        .get("columns")
+        .and_then(JsonValue::as_array)
+        .expect("SQLite query data should contain columns");
+    data.get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("SQLite query data should contain rows")
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .zip(row.as_array().expect("SQLite row should be an array"))
+                .map(|(column, value)| {
+                    (
+                        column
+                            .as_str()
+                            .expect("SQLite column names should be strings")
+                            .to_string(),
+                        value.clone(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn first_query_row(result: &JsonValue) -> JsonMap<String, JsonValue> {
+    query_rows(result)
+        .into_iter()
+        .next()
+        .expect("query should yield one row")
+}
+
+fn session_payload(session_id: &str, now_ms: i64) -> JsonValue {
+    json!({
+        "id": session_id,
+        "profile": "default",
+        "platform": "test",
+        "account_id": "account-1",
+        "chat_id": "chat-1",
+        "thread_id": "",
+        "user_id": "user-1",
+        "generation": 1,
+        "system_prompt": "",
+        "model": "test-model",
+        "provider": "test-provider",
+        "toolset_hash": "test-tools",
+        "metadata_json": "{}",
+        "title": "",
+        "end_reason": "",
+        "now_ms": now_ms,
+    })
+}
+
+fn run_payload(run_id: &str, session_id: &str, now_ms: i64) -> JsonValue {
+    json!({
+        "id": run_id,
+        "session_id": session_id,
+        "parent_run_id": "",
+        "input_json": "{\"message\":\"hello\"}",
+        "provider": "test-provider",
+        "model": "test-model",
+        "script_hash": "test-script",
+        "idempotency_scope": "api:chat",
+        "idempotency_key": run_id,
+        "now_ms": now_ms,
+    })
+}
+
+fn transition_payload(run_id: &str, from_status: &str, to_status: &str, now_ms: i64) -> JsonValue {
+    json!({
+        "run_id": run_id,
+        "from_status": from_status,
+        "to_status": to_status,
+        "error_code": "",
+        "error_message": "",
+        "recovery_reason": "",
+        "now_ms": now_ms,
+    })
+}
+
+fn append_message(
+    storage: &AgentRunner,
+    db_name: &str,
+    message_id: &str,
+    role: &str,
+    tool_call_id: &str,
+    content_json: &str,
+    now_ms: i64,
+) {
+    let appended = run_storage(
+        storage,
+        db_name,
+        &format!("append-{message_id}"),
+        "message.append",
+        json!({
+            "id": message_id,
+            "session_id": "session-1",
+            "role": role,
+            "content_json": content_json,
+            "name": "",
+            "tool_call_id": tool_call_id,
+            "parent_message_id": "",
+            "token_estimate": 1,
+            "metadata_json": "{}",
+            "run_id": "",
+            "finish_reason": "",
+            "now_ms": now_ms,
+        }),
+        now_ms,
+    );
+    assert_eq!(
+        appended["ok"],
+        json!(true),
+        "message {message_id} should append"
+    );
+}
+
+/// Seeds a session, a run, the compacting status, and the five-message
+/// history used by the durable compaction tests.
+fn seed_compaction_history(storage: &AgentRunner, db_name: &str) {
+    run_storage(storage, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        storage,
+        db_name,
+        "session-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        storage,
+        db_name,
+        "run-1",
+        "run.create",
+        run_payload("run-1", "session-1", 3),
+        3,
+    );
+    let running = run_storage(
+        storage,
+        db_name,
+        "run-running",
+        "run.transition",
+        transition_payload("run-1", "queued", "running", 4),
+        4,
+    );
+    assert_eq!(
+        running["ok"],
+        json!(true),
+        "queued -> running must be an allowed transition"
+    );
+    let compacting = run_storage(
+        storage,
+        db_name,
+        "run-compacting",
+        "run.transition",
+        transition_payload("run-1", "running", "compacting", 5),
+        5,
+    );
+    assert_eq!(
+        compacting["ok"],
+        json!(true),
+        "running -> compacting must be an allowed transition"
+    );
+    append_message(
+        storage,
+        db_name,
+        "m-1",
+        "user",
+        "",
+        r#"[{"type":"text","text":"hello"}]"#,
+        6,
+    );
+    append_message(
+        storage,
+        db_name,
+        "m-2",
+        "assistant",
+        "",
+        r#"[{"type":"tool_call","tool_call_id":"call-1","name":"read_file","arguments_json":"{}"}]"#,
+        7,
+    );
+    append_message(
+        storage,
+        db_name,
+        "m-3",
+        "tool",
+        "call-1",
+        r#"[{"type":"tool_result","tool_call_id":"call-1","content":"ok","is_error":false}]"#,
+        8,
+    );
+    append_message(
+        storage,
+        db_name,
+        "m-4",
+        "assistant",
+        "",
+        r#"[{"type":"text","text":"done"}]"#,
+        9,
+    );
+    append_message(
+        storage,
+        db_name,
+        "m-5",
+        "user",
+        "",
+        r#"[{"type":"text","text":"next"}]"#,
+        10,
+    );
+}
+
+/// Rebuilds the structured policy context from the durable message history
+/// (message.list), exactly as the future script-owned runner would.
+fn durable_history_context(storage: &AgentRunner, db_name: &str) -> JsonValue {
+    let listed = run_storage(
+        storage,
+        db_name,
+        "history",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        1000,
+    );
+    let mut messages = Vec::new();
+    for row in query_rows(&listed) {
+        let ordinal = row["ordinal"].as_i64().unwrap_or(0);
+        let role = row["role"].as_str().unwrap_or("").to_string();
+        let tool_call_id = row["tool_call_id"].as_str().unwrap_or("").to_string();
+        let content_json = row["content_json"].as_str().unwrap_or("{}").to_string();
+        let content: JsonValue = serde_json::from_str(&content_json).unwrap_or(JsonValue::Null);
+        messages.push(json!({"ordinal": ordinal, "role": role, "tool_call_id": tool_call_id, "content": content}));
+    }
+    json!({
+        "session_id": "session-1",
+        "run_id": "run-1",
+        "compaction_id": "compaction-1",
+        "generation": 1,
+        "messages": messages,
+        "config": compact_config(4, 2)
+    })
+}
+
+/// Executes the plan's typed command sequence against the A2 storage service.
+///
+/// `compaction.start` is successful only when a pending row is actually
+/// created (a guarded insert that matches no run/session returns ok with an
+/// EMPTY result), and `compaction.commit` is successful only when its first
+/// statement matched the pending row (`rows_affected == 1`). `message.compact`
+/// is expected to be a guarded no-op before the commit (it only marks rows
+/// once the compaction is committed) so only a hard failure rejects it.
+fn execute_plan(storage: &AgentRunner, db_name: &str, plan: &JsonValue) -> Result<(), String> {
+    let commands = plan["commands"]
+        .as_array()
+        .expect("compact.plan should carry commands");
+    for command in commands {
+        let op = command["op"].as_str().expect("command should carry an op");
+        let payload = command["payload"].clone();
+        let result = run_storage_result(storage, db_name, &format!("exec-{op}"), op, payload, 1000)
+            .map_err(|error| format!("{op} invocation failed: {error:?}"))?;
+        if result["ok"] != json!(true) {
+            return Err(format!("{op} failed with code {}", result["code"]));
+        }
+        match op {
+            "compaction.start" => {
+                let rows = result["data"]["rows"]
+                    .as_array()
+                    .expect("compaction.start should carry rows");
+                if rows.is_empty() {
+                    return Err("compaction.start created no pending compaction row".to_string());
+                }
+            }
+            "compaction.commit" => {
+                let affected = result["data"]["results"][0]["rows_affected"]
+                    .as_i64()
+                    .unwrap_or(0);
+                if affected == 0 {
+                    return Err("compaction.commit matched no pending compaction".to_string());
+                }
+            }
+            "message.compact" => {}
+            other => return Err(format!("unexpected plan command {other}")),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn compaction_flow_commits_durably_and_retains_tail() {
+    let root = temporary_root("compaction-flow");
+    let storage = storage_runner(&root);
+    let db_name = "flow.db";
+    seed_compaction_history(&storage, db_name);
+
+    // The policy plans from the DURABLE history and produces the typed
+    // command sequence; the harness executes it through the storage service.
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_start_ordinal"], json!(1));
+    assert_eq!(plan["source_end_ordinal"], json!(3));
+    assert_eq!(plan["retained_tail_ordinal"], json!(3));
+    execute_plan(&storage, db_name, &plan).expect("compaction plan should execute");
+
+    // The compaction row is committed.
+    let compaction = run_storage(
+        &storage,
+        db_name,
+        "compaction-get",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        1000,
+    );
+    let row = first_query_row(&compaction);
+    assert_eq!(row["state"], json!("committed"));
+    assert_eq!(row["generation"], json!(2));
+    assert_eq!(row["source_start_ordinal"], json!(1));
+    assert_eq!(row["source_end_ordinal"], json!(3));
+    assert_eq!(row["retained_tail_ordinal"], json!(3));
+
+    // The prefix is marked compacted; the retained tail is untouched.
+    let listed = run_storage(
+        &storage,
+        db_name,
+        "messages",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        1000,
+    );
+    let compacted: Vec<i64> = query_rows(&listed)
+        .iter()
+        .map(|row| row["compacted"].as_i64().unwrap_or(0))
+        .collect();
+    assert_eq!(
+        compacted,
+        vec![1, 1, 1, 0, 0],
+        "prefix compacted, tail retained"
+    );
+
+    // The session generation advanced exactly once.
+    let session = run_storage(
+        &storage,
+        db_name,
+        "session-get",
+        "session.get",
+        json!({"session_id": "session-1"}),
+        1000,
+    );
+    let session_row = first_query_row(&session);
+    assert_eq!(session_row["generation"], json!(2));
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+#[test]
+fn compaction_failure_marks_failed_and_preserves_history() {
+    let root = temporary_root("compaction-failure");
+    let storage = storage_runner(&root);
+    let db_name = "failure.db";
+    seed_compaction_history(&storage, db_name);
+
+    let compact = compact_runner();
+    let plan = decide(&compact, durable_history_context(&storage, db_name));
+    assert_eq!(plan["kind"], json!("compact.plan"));
+
+    // Step 1: compaction.start creates the pending row.
+    let start = run_storage(
+        &storage,
+        db_name,
+        "step-start",
+        "compaction.start",
+        plan["commands"][0]["payload"].clone(),
+        1000,
+    );
+    assert_eq!(start["ok"], json!(true));
+    assert!(
+        !start["data"]["rows"]
+            .as_array()
+            .expect("compaction.start rows")
+            .is_empty(),
+        "pending compaction row must exist"
+    );
+    // Step 2: message.compact is the guarded no-op before the commit.
+    let sweep = run_storage(
+        &storage,
+        db_name,
+        "step-sweep",
+        "message.compact",
+        plan["commands"][1]["payload"].clone(),
+        1000,
+    );
+    assert_eq!(sweep["ok"], json!(true));
+
+    // The run leaves the compacting status before the commit, so the commit
+    // guard matches no pending row: a real failure, detected by the harness
+    // through the typed result (rows_affected == 0).
+    run_storage(
+        &storage,
+        db_name,
+        "run-leaves-compacting",
+        "run.transition",
+        transition_payload("run-1", "compacting", "running", 1000),
+        1000,
+    );
+    let commit = run_storage(
+        &storage,
+        db_name,
+        "step-commit",
+        "compaction.commit",
+        plan["commands"][2]["payload"].clone(),
+        1000,
+    );
+    assert_eq!(
+        commit["ok"],
+        json!(true),
+        "the storage envelope itself succeeds"
+    );
+    assert_eq!(
+        commit["data"]["results"][0]["rows_affected"],
+        json!(0),
+        "the commit guard must match nothing once the run left compacting"
+    );
+
+    // Any failure in the sequence routes to compaction.fail.
+    let fail = decide(
+        &compact,
+        json!({
+            "command": "fail",
+            "compaction_id": "compaction-1",
+            "error_message": "commit guard rejected the compaction",
+            "completed_at_ms": 1000
+        }),
+    );
+    assert_eq!(fail["op"], json!("compaction.fail"));
+    let failed = run_storage(
+        &storage,
+        db_name,
+        "step-fail",
+        "compaction.fail",
+        fail["payload"].clone(),
+        1000,
+    );
+    assert_eq!(failed["ok"], json!(true));
+
+    // The compaction is durably failed and nothing was half-committed.
+    let compaction = run_storage(
+        &storage,
+        db_name,
+        "compaction-get",
+        "compaction.get",
+        json!({"compaction_id": "compaction-1"}),
+        1000,
+    );
+    let row = first_query_row(&compaction);
+    assert_eq!(row["state"], json!("failed"));
+    assert_eq!(
+        row["error_message"],
+        json!("commit guard rejected the compaction"),
+        "the typed failure reason must be recorded"
+    );
+    let listed = run_storage(
+        &storage,
+        db_name,
+        "messages",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        1000,
+    );
+    let compacted: Vec<i64> = query_rows(&listed)
+        .iter()
+        .map(|row| row["compacted"].as_i64().unwrap_or(0))
+        .collect();
+    assert_eq!(
+        compacted,
+        vec![0, 0, 0, 0, 0],
+        "a failed compaction must leave the original history fully intact"
+    );
+    let session = run_storage(
+        &storage,
+        db_name,
+        "session-get",
+        "session.get",
+        json!({"session_id": "session-1"}),
+        1000,
+    );
+    let session_row = first_query_row(&session);
+    assert_eq!(
+        session_row["generation"],
+        json!(1),
+        "generation must not advance"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
 }
