@@ -5,6 +5,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use rustscript_agent::metrics::{StorageOp, TerminalRetryOutcome, TerminalStatus};
 use rustscript_agent::{
     AdmitError, AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentService,
     GatewayPersistence, build_agent_gateway_app,
@@ -4260,4 +4261,421 @@ async fn normal_terminal_end_never_requests_client_disconnect_cancellation() {
     assert_eq!(replayed.matches("event: run.completed").count(), 1);
     assert!(!replayed.contains("event: run.cancelled"));
     assert!(!replayed.contains("client_disconnect"));
+}
+/// A9: two concurrent stop requests racing the same active run must both
+/// succeed (the typed cancellation is idempotent) and the run must commit
+/// exactly one terminal — never two.
+#[tokio::test]
+async fn concurrent_stops_commit_exactly_one_terminal() {
+    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let http = rustscript_vm::HttpConfig {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_schemes: vec!["http".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..rustscript_vm::HttpConfig::default()
+    };
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            http,
+            ..AgentGatewayConfig::default()
+        },
+        format!(
+            r#"
+            use http;
+            pub fn run(input: map) -> string {{
+                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                "done";
+            }}
+            "#
+        ),
+    )
+    .expect("RSS source should compile");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "race"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    arrived.await.expect("the run must reach the fixture");
+
+    let stop_uri = format!("/v1/runs/{run_id}/stop");
+    let (first, second) = tokio::join!(
+        json_request(&app, axum::http::Method::POST, &stop_uri, Value::Null,),
+        json_request(&app, axum::http::Method::POST, &stop_uri, Value::Null,),
+    );
+    assert_eq!(first.0, StatusCode::OK, "the first stop must succeed");
+    assert_eq!(second.0, StatusCode::OK, "the second stop must succeed");
+
+    release.send(()).expect("release the fixture");
+    fixture.join().expect("fixture thread");
+    let text = read_run_events(&app, &run_id).await;
+    let terminals = text.matches("event: run.completed").count()
+        + text.matches("event: run.cancelled").count()
+        + text.matches("event: run.failed").count();
+    assert_eq!(
+        terminals, 1,
+        "two concurrent stops must still commit exactly one terminal, got: {text}"
+    );
+}
+
+/// A9: a stop that lands while the worker is inside the bounded terminal
+/// persist-retry loop (storage down, attempts failing) must never produce
+/// two terminals: the retry either commits its typed terminal or the typed
+/// cancellation path wins — exactly one terminal, counted exactly once.
+#[tokio::test]
+async fn stop_during_terminal_persist_retry_commits_exactly_one_terminal() {
+    let path = gateway_db_path("stop-during-retry");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            janitor_interval: std::time::Duration::from_millis(50),
+            terminal_commit_retry_window: std::time::Duration::from_secs(30),
+            terminal_persist_retries: 10,
+            terminal_persist_retry_delay: std::time::Duration::from_millis(50),
+            ..AgentGatewayConfig::default()
+        },
+        "pub fn run(input: map) -> string { \"done\"; }",
+        &path,
+    )
+    .expect("SQLite state should open");
+    let metrics = state.metrics();
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "retry"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+
+    // Break storage so the completed terminal cannot be persisted.
+    let broken = path.with_extension("db.broken");
+    std::fs::rename(&path, &broken).expect("move the db aside");
+    std::fs::create_dir(&path).expect("break storage with a directory");
+
+    // Deterministic signal: the first failed run.terminal attempt means the
+    // worker is inside the bounded persist-retry loop (no sleeps).
+    let in_retry = wait_until(std::time::Duration::from_secs(10), || {
+        metrics
+            .snapshot()
+            .storage_op_failures(StorageOp::RunTerminal)
+            >= 1
+    })
+    .await;
+    assert!(
+        in_retry,
+        "the worker must enter the terminal persist retry loop"
+    );
+
+    let (stop_status, _) = json_request(
+        &app,
+        axum::http::Method::POST,
+        &format!("/v1/runs/{run_id}/stop"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(stop_status, StatusCode::OK);
+
+    // Recover storage; whichever side wins (the retry's terminal or the
+    // typed cancellation), exactly one terminal is committed and counted.
+    std::fs::remove_dir(&path).expect("restore storage");
+    std::fs::rename(&broken, &path).expect("restore the db file");
+    let text = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        read_run_events(&app, &run_id),
+    )
+    .await
+    .expect("the run must reach exactly one terminal");
+    let terminals = text.matches("event: run.completed").count()
+        + text.matches("event: run.cancelled").count()
+        + text.matches("event: run.failed").count();
+    assert_eq!(
+        terminals, 1,
+        "a stop landing inside the terminal persist retry must never produce two terminals, got: {text}"
+    );
+    // The SSE body completes at publish time, inside the terminal commit;
+    // the permit/gauge release happens a scheduling step later. Wait for
+    // the observable terminal (bounded polling, not a fixed sleep).
+    let settled = wait_until(std::time::Duration::from_secs(10), || {
+        service.available_capacity() == AgentGatewayConfig::default().max_concurrent_runs
+    })
+    .await;
+    assert!(
+        settled,
+        "the permit must be released after the terminal resolves"
+    );
+    assert_eq!(
+        service.pending_terminal_count(),
+        0,
+        "the pending terminal must resolve after recovery"
+    );
+    let snapshot = metrics.snapshot();
+    let terminal_total = snapshot.runs_terminal_by(TerminalStatus::Completed)
+        + snapshot.runs_terminal_by(TerminalStatus::Cancelled)
+        + snapshot.runs_terminal_by(TerminalStatus::Failed);
+    assert_eq!(
+        terminal_total, 1,
+        "the registry must count exactly one terminal for the raced run"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A9: an SSE subscriber that falls behind the bounded broadcast buffer
+/// receives a typed lagged error (with the dropped count) and its stream
+/// ends — no silent gap, no fabricated terminal — and a fresh subscription
+/// replays the complete ordered history.
+#[tokio::test]
+async fn sse_subscriber_lag_emits_typed_error_and_replay_recovers() {
+    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let http = rustscript_vm::HttpConfig {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_schemes: vec!["http".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..rustscript_vm::HttpConfig::default()
+    };
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig {
+            broadcast_capacity: 2,
+            http,
+            ..AgentGatewayConfig::default()
+        },
+        format!(
+            r#"
+            use http;
+            use stream;
+            pub fn run(input: map) -> string {{
+                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                stream::emit({{"type": "model.delta", "delta": "a"}});
+                stream::emit({{"type": "model.delta", "delta": "b"}});
+                stream::emit({{"type": "model.delta", "delta": "c"}});
+                "done";
+            }}
+            "#
+        ),
+    )
+    .expect("RSS source should compile");
+    let metrics = state.metrics();
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "lag"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    // The script is parked inside the HTTP call before any event is emitted.
+    arrived.await.expect("the run must reach the fixture");
+
+    // Subscribe while the run is live, then hold the response unread.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/v1/runs/{run_id}/events"))
+                .body(Body::empty())
+                .expect("SSE request should build"),
+        )
+        .await
+        .expect("SSE route should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Release the script: three deltas and the two terminal events are
+    // broadcast into a capacity-2 channel while the subscriber is not
+    // reading — a deterministic lag (no sleeps).
+    release.send(()).expect("release the fixture");
+    let terminal = wait_until(std::time::Duration::from_secs(10), || {
+        service.available_capacity() == AgentGatewayConfig::default().max_concurrent_runs
+    })
+    .await;
+    assert!(terminal, "the run must reach its terminal");
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("SSE body should be readable");
+    let text = String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8");
+    // 5 broadcasts (a, b, c, message.delta, run.completed) with capacity 2:
+    // the subscriber missed 3 and must observe a typed lagged error, then
+    // the stream ends instead of presenting a gap.
+    assert!(
+        text.contains("event: error") && text.contains("event_lagged"),
+        "a lagging subscriber must get a typed lagged error, got: {text}"
+    );
+    assert!(
+        text.contains("\"dropped\":3"),
+        "the lagged error must carry the exact dropped count, got: {text}"
+    );
+    assert!(
+        !text.contains("event: model.delta") && !text.contains("event: run.completed"),
+        "no skipped event may be silently presented, got: {text}"
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.events_lagged, 3);
+    assert_eq!(snapshot.events_emitted, 3);
+
+    // A fresh subscription replays the complete ordered history: started,
+    // the three deltas, then the terminal events.
+    let replay = read_run_events(&app, &run_id).await;
+    assert_eq!(replay.matches("event: run.started").count(), 1);
+    assert_eq!(replay.matches("event: model.delta").count(), 3);
+    assert_eq!(replay.matches("event: run.completed").count(), 1);
+    let event_lines = replay
+        .lines()
+        .filter(|line| line.starts_with("event: "))
+        .collect::<Vec<_>>();
+    assert_eq!(event_lines.first(), Some(&"event: run.started"));
+    assert_eq!(
+        event_lines.last(),
+        Some(&"event: run.completed"),
+        "the replayed terminal must stay last, got: {replay}"
+    );
+    fixture.join().expect("fixture thread");
+}
+
+/// A9: closing the storage worker while a run is mid-flight must not hang
+/// or leak: delivery drops the unpersistable event (observable), the run
+/// parks as terminal_pending, the bounded retry fails fast and expires,
+/// the handle is released via its TTL, no terminal is fabricated, and
+/// restart recovery repairs the durable side exactly once.
+#[tokio::test]
+async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
+    let (port, arrived, release, fixture) = spawn_holding_fixture();
+    let http = rustscript_vm::HttpConfig {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_schemes: vec!["http".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..rustscript_vm::HttpConfig::default()
+    };
+    let path = gateway_db_path("worker-closure");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig {
+            janitor_interval: std::time::Duration::from_millis(50),
+            terminal_commit_retry_window: std::time::Duration::from_millis(300),
+            terminal_run_ttl: std::time::Duration::from_millis(500),
+            http,
+            ..AgentGatewayConfig::default()
+        },
+        format!(
+            r#"
+            use http;
+            use stream;
+            pub fn run(input: map) -> string {{
+                stream::emit({{"type": "model.delta", "delta": "e1"}});
+                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                stream::emit({{"type": "model.delta", "delta": "e2"}});
+                "done";
+            }}
+            "#
+        ),
+        &path,
+    )
+    .expect("SQLite state should open");
+    let metrics = state.metrics();
+    let service = state.service();
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "closure"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    // The script emitted e1 and is parked inside the HTTP call.
+    arrived.await.expect("the run must reach the fixture");
+
+    // Close the storage worker while the run is live (deterministic
+    // closure; every later command fails fast with a typed error).
+    persistence.shutdown();
+    release.send(()).expect("release the fixture");
+
+    // e2 cannot be appended durably and the terminal cannot be persisted:
+    // the run parks as terminal_pending (never a false terminal).
+    let parked = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 1
+    })
+    .await;
+    assert!(
+        parked,
+        "the run must enter the terminal-pending retry state"
+    );
+    assert_eq!(
+        metrics.snapshot().runs_terminal_pending,
+        1,
+        "the pending gauge must match the pending map"
+    );
+    assert!(
+        metrics.snapshot().events_dropped >= 1,
+        "the unpersistable event must be counted as dropped"
+    );
+    assert!(
+        metrics
+            .snapshot()
+            .storage_op_failures(StorageOp::EventAppend)
+            >= 1,
+        "the failed event append must be counted as a storage error"
+    );
+    assert_eq!(
+        service.available_capacity(),
+        AgentGatewayConfig::default().max_concurrent_runs,
+        "a terminal-pending run must not hold the admission permit"
+    );
+
+    // The bounded retry fails fast against the closed worker and then
+    // expires: the entry is dropped and the handle is released via its TTL.
+    let released = wait_until(std::time::Duration::from_secs(10), || {
+        service.handle_count() == 0
+    })
+    .await;
+    assert!(released, "the handle must be released via its TTL");
+    assert_eq!(
+        service.pending_terminal_count(),
+        0,
+        "the expired retry must stop"
+    );
+    assert!(
+        metrics
+            .snapshot()
+            .terminal_retries_by(TerminalRetryOutcome::RetryFailed)
+            >= 1,
+        "the closed-worker retries must be observable"
+    );
+
+    // No terminal was ever published by the old service.
+    let text = read_run_events(&app, &run_id).await;
+    assert!(
+        !text.contains("event: run.completed")
+            && !text.contains("event: run.cancelled")
+            && !text.contains("event: run.failed"),
+        "no fabricated terminal may be published, got: {text}"
+    );
+
+    // Restart recovery repairs the durable side exactly once.
+    drop(app);
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reload and recover");
+    let restored_app = build_agent_gateway_app(restored);
+    let text = read_run_events(&restored_app, &run_id).await;
+    assert_eq!(
+        text.matches("event: run.failed").count(),
+        1,
+        "restart recovery must fail the interrupted run exactly once, got: {text}"
+    );
+    fixture.join().expect("fixture thread");
+    let _ = std::fs::remove_file(&path);
 }
