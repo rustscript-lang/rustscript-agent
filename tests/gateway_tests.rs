@@ -2525,3 +2525,161 @@ async fn service_owned_terminal_events_emitted_by_scripts_are_rejected() {
         "no script-owned terminal may be committed, got: {text}"
     );
 }
+
+async fn json_request_with_key(app: &axum::Router, body: Value, key: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("response body should be readable");
+    (
+        status,
+        serde_json::from_slice(&body).expect("response should be JSON"),
+    )
+}
+
+async fn session_count(app: &axum::Router) -> usize {
+    let (_, sessions) = json_request(
+        app,
+        axum::http::Method::GET,
+        "/api/sessions?limit=50&offset=0",
+        Value::Null,
+    )
+    .await;
+    sessions["data"].as_array().map(Vec::len).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn idempotency_conflict_creates_no_session() {
+    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let app = build_agent_gateway_app(state);
+
+    let (first_status, _) =
+        json_request_with_key(&app, json!({"input": "conflict-original"}), "conflict-key").await;
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+
+    let (second_status, second) =
+        json_request_with_key(&app, json!({"input": "conflict-different"}), "conflict-key").await;
+    assert_eq!(second_status, StatusCode::CONFLICT);
+    assert_eq!(second["error"]["code"], "idempotency_key_reused");
+
+    assert_eq!(
+        session_count(&app).await,
+        1,
+        "an idempotency conflict must not create a new empty session"
+    );
+}
+
+#[tokio::test]
+async fn idempotent_replay_returns_the_original_run_and_creates_no_session() {
+    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let app = build_agent_gateway_app(state);
+
+    let (first_status, first) =
+        json_request_with_key(&app, json!({"input": "replay-original"}), "replay-key").await;
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    let run_id = first["run_id"].as_str().expect("run id").to_string();
+
+    let (second_status, second) =
+        json_request_with_key(&app, json!({"input": "replay-original"}), "replay-key").await;
+    assert_eq!(second_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        second["run_id"], run_id,
+        "an idempotent replay must return the original run"
+    );
+
+    assert_eq!(
+        session_count(&app).await,
+        1,
+        "an idempotent replay must not create a new empty session"
+    );
+}
+
+#[tokio::test]
+async fn missing_parent_rejects_without_creating_a_session() {
+    let state = AgentGatewayState::new(AgentGatewayConfig::default());
+    let app = build_agent_gateway_app(state);
+
+    let (status, body) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "child", "parent_run_id": "missing-run"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "parent_run_not_found");
+    assert_eq!(
+        session_count(&app).await,
+        0,
+        "a missing parent must reject admission without creating a session"
+    );
+}
+
+#[tokio::test]
+async fn failed_replay_persist_keeps_the_original_idempotency_record() {
+    let path =
+        std::env::temp_dir().join(format!("rustscript-agent-idem-{}.db", Uuid::new_v4()));
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let app = build_agent_gateway_app(state);
+
+    // The first admission durably commits the idempotency record.
+    let (first_status, first) =
+        json_request_with_key(&app, json!({"input": "replay-durable"}), "durable-key").await;
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    let run_id = first["run_id"].as_str().expect("run id").to_string();
+    // Wait for the run's terminal commit so the SQLite file is quiescent.
+    let _ = read_run_events(&app, &run_id).await;
+
+    // Break persistence: SQLite cannot open a directory.
+    let backup = path.with_extension("db.bak");
+    std::fs::copy(&path, &backup).expect("backup SQLite state");
+    std::fs::remove_file(&path).expect("remove SQLite state");
+    std::fs::create_dir(&path).expect("replace SQLite state with a directory");
+
+    // A replay must not touch persistence (it is read-only), but the gateway
+    // persist middleware still re-saves the snapshot after every request, so
+    // the response is an error while persistence is down.
+    let (down_status, _) =
+        json_request_with_key(&app, json!({"input": "replay-durable"}), "durable-key").await;
+    assert_ne!(
+        down_status,
+        StatusCode::ACCEPTED,
+        "the gateway persist middleware rejects requests while persistence is down"
+    );
+
+    // Restore the durable store in the same process: the original
+    // idempotency record must still be present (the failed replay must not
+    // have deleted it), so the next identical request replays the original
+    // run instead of admitting a new one.
+    std::fs::remove_dir(&path).expect("remove SQLite directory");
+    std::fs::copy(&backup, &path).expect("restore SQLite state");
+    let (restored_status, restored_replay) =
+        json_request_with_key(&app, json!({"input": "replay-durable"}), "durable-key").await;
+    assert_eq!(restored_status, StatusCode::ACCEPTED);
+    assert_eq!(
+        restored_replay["run_id"], run_id,
+        "the original idempotency record must survive a failed replay persist"
+    );
+    assert_eq!(
+        session_count(&app).await,
+        1,
+        "a failed replay persist must not leave a new session behind"
+    );
+
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    std::fs::remove_file(backup).expect("temporary SQLite backup should be removed");
+}

@@ -9,7 +9,6 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
-    hash::{Hash, Hasher},
     time::Duration,
 };
 
@@ -729,9 +728,7 @@ async fn create_run_handler(
             "extra": request.extra.clone(),
         }))
         .unwrap_or_default();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        canonical.hash(&mut hasher);
-        format!("fnv64:{:016x}", hasher.finish())
+        format!("fnv64:{:016x}", fnv1a64(canonical.as_bytes()))
     });
     let input = request.input.clone().unwrap_or(Value::Null);
     let text = input_text(&input);
@@ -1185,6 +1182,18 @@ fn job_payload(view: &JobView, now: u64) -> Value {
         "enabled": if view.enabled { 1 } else { 0 },
         "now_ms": now,
     })
+}
+
+/// FNV-1a 64-bit hash of the canonical idempotency payload. The `fnv64:`
+/// label matches the algorithm exactly, so persisted hashes stay
+/// unambiguous regardless of the platform's `DefaultHasher`.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn event_stream(
