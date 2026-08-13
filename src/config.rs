@@ -113,6 +113,22 @@ impl TelegramConfig {
         if !base.username().is_empty() || base.password().is_some() {
             return Err("telegram api_base must not embed credentials".to_string());
         }
+        // The token is embedded in the request URL by the Bot API protocol,
+        // so the base must be a bare origin: a query string, fragment, or
+        // path would smuggle state (and potentially the token) into the URL
+        // in ways the client never intends.
+        if !base.query().unwrap_or("").is_empty() {
+            return Err(
+                "telegram api_base must not carry a query string (the token must never enter a query)"
+                    .to_string(),
+            );
+        }
+        if base.fragment().is_some() {
+            return Err("telegram api_base must not carry a fragment".to_string());
+        }
+        if !matches!(base.path(), "" | "/") {
+            return Err("telegram api_base path must be empty or '/'".to_string());
+        }
         match base.scheme() {
             "https" => {}
             "http" => {
@@ -647,6 +663,44 @@ mod tests {
         explicit
             .validate()
             .expect("allow_insecure_localhost permits localhost http");
+    }
+
+    #[test]
+    fn telegram_api_base_rejects_query_fragment_and_path() {
+        let base = TelegramConfig {
+            bot_token: "123:abc".to_string(),
+            ..TelegramConfig::default()
+        };
+        // The token is embedded in the request URL by the Bot API protocol,
+        // so a query string, fragment, or path on the api_base would let
+        // configuration smuggle the token (or other state) into the URL in
+        // ways the client never intended. Only the bare origin (with an
+        // optional trailing slash) is valid.
+        for bad in [
+            "https://api.telegram.org/?x=1",
+            "https://api.telegram.org?x=1",
+            "https://api.telegram.org/#frag",
+            "https://api.telegram.org#frag",
+            "https://api.telegram.org/some/path",
+            "https://api.telegram.org/bot123:abc",
+        ] {
+            let config = TelegramConfig {
+                api_base: bad.to_string(),
+                ..base.clone()
+            };
+            assert!(
+                config.validate().is_err(),
+                "api_base {bad} must be rejected"
+            );
+        }
+        base.validate().expect("the default base must validate");
+        let trailing_slash = TelegramConfig {
+            api_base: "https://api.telegram.org/".to_string(),
+            ..base
+        };
+        trailing_slash
+            .validate()
+            .expect("a trailing-slash base is the same origin");
     }
 
     #[test]
