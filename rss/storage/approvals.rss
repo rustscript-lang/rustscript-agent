@@ -1,6 +1,7 @@
 use json;
 use sqlite;
 use self::schema as schema;
+use self::existence as existence;
 
 fn approvals_query_limits(max_rows: int, max_bytes: int) -> map<int> {
     { max_rows: max_rows, max_result_bytes: max_bytes }
@@ -35,17 +36,32 @@ struct ApprovalExpireInput {
 
 pub fn storage_approval_request(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: ApprovalRequestInput = json::decode::<ApprovalRequestInput>(payload_json);
-    sqlite::execute(
-        db_id,
-        "INSERT OR IGNORE INTO approvals (id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE runs.id = ? AND runs.session_id = ? AND runs.status IN ('running', 'waiting_approval')) AND NOT EXISTS (SELECT 1 FROM approvals existing JOIN runs owner ON owner.id = existing.run_id WHERE existing.id = ? AND owner.session_id <> ?)",
-        [&input.id, &input.run_id, &input.session_id, &input.tool_call_id, &input.tool_name, &input.arguments_json, &input.risk_class, &input.decision_scope, input.one_time.copy(), input.requested_at_ms.copy(), input.expires_at_ms.copy(), &input.run_id, &input.session_id, &input.id, &input.session_id]
-    );
-    sqlite::query(
-        db_id,
-        "SELECT id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms, resolved_at_ms, resolver, decision_reason FROM approvals WHERE id = ? AND session_id = ? LIMIT ?",
-        [&input.id, &input.session_id, (max_rows)],
-        approvals_query_limits(max_rows, max_bytes)
-    )
+    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
+    if !existence::run_exists(db_id, input.run_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "approval request references an unknown run or session", result: { columns: [], rows: [] } };
+    } else {
+        if !existence::session_exists(db_id, input.session_id.copy()) {
+            result = { ok: false, code: "run_not_found", message: "approval request references an unknown run or session", result: { columns: [], rows: [] } };
+        } else {
+            sqlite::execute(
+                db_id,
+                "INSERT OR IGNORE INTO approvals (id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE runs.id = ? AND runs.session_id = ? AND runs.status IN ('running', 'waiting_approval')) AND NOT EXISTS (SELECT 1 FROM approvals existing JOIN runs owner ON owner.id = existing.run_id WHERE existing.id = ? AND owner.session_id <> ?)",
+                [&input.id, &input.run_id, &input.session_id, &input.tool_call_id, &input.tool_name, &input.arguments_json, &input.risk_class, &input.decision_scope, input.one_time.copy(), input.requested_at_ms.copy(), input.expires_at_ms.copy(), &input.run_id, &input.session_id, &input.id, &input.session_id]
+            );
+            result = {
+                ok: true,
+                code: "ok",
+                message: "",
+                result: sqlite::query(
+                    db_id,
+                    "SELECT id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms, resolved_at_ms, resolver, decision_reason FROM approvals WHERE id = ? AND session_id = ? LIMIT ?",
+                    [&input.id, &input.session_id, (max_rows)],
+                    approvals_query_limits(max_rows, max_bytes)
+                )
+            };
+        }
+    }
+    result
 }
 
 pub fn storage_approval_get(db_id: int, approval_id: string, max_rows: int, max_bytes: int) -> map {

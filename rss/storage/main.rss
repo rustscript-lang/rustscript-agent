@@ -7,6 +7,9 @@ use self::runs as runs;
 use self::events as events;
 use self::approvals as approvals;
 use self::compactions as compactions;
+use self::jobs as jobs;
+use self::admission as admission;
+use self::load as load;
 
 struct StorageCommand {
     op: string,
@@ -34,7 +37,8 @@ struct StorageResult {
     truncated: bool,
     next_cursor: int,
     oldest_available_seq: int,
-    high_water_seq: int
+    high_water_seq: int,
+    recovered: int
 }
 
 struct StorageOpenOptions {
@@ -176,7 +180,8 @@ fn storage_ok(request_id: string, op: string, data: map, rows_affected: int, tru
         truncated: truncated,
         next_cursor: next_cursor,
         oldest_available_seq: 0,
-        high_water_seq: 0
+        high_water_seq: 0,
+        recovered: 0
     }
 }
 
@@ -209,8 +214,64 @@ fn storage_error(request_id: string, op: string, code: string, message: string) 
         truncated: false,
         next_cursor: 0,
         oldest_available_seq: 0,
-        high_water_seq: 0
+        high_water_seq: 0,
+        recovered: 0
     }
+}
+
+/// Unwraps a module result that carries either `{ok: true, result: <raw
+/// query map>}` or `{ok: false, code, message}` into the typed envelope.
+fn storage_unwrap(request_id: string, op: string, wrapped: map) -> StorageResult {
+    let ok_flag: bool = wrapped["ok"];
+    let mut result = storage_error(request_id, op, "unwrap_missing", "unwrap result missing");
+    if ok_flag == true {
+        let raw: map = wrapped["result"];
+        result = storage_raw_ok(request_id, op, raw);
+    } else {
+        let code: string = wrapped["code"];
+        let message: string = wrapped["message"];
+        result = storage_error(request_id, op, code, message);
+    }
+    result
+}
+
+/// Same unwrap for module results whose raw result is an atomic transaction
+/// results array.
+fn storage_unwrap_array(request_id: string, op: string, wrapped: map) -> StorageResult {
+    let ok_flag: bool = wrapped["ok"];
+    let mut result = storage_error(request_id, op, "unwrap_missing", "unwrap result missing");
+    if ok_flag == true {
+        let raw: array = wrapped["result"];
+        result = storage_array_ok(request_id, op, raw);
+    } else {
+        let code: string = wrapped["code"];
+        let message: string = wrapped["message"];
+        result = storage_error(request_id, op, code, message);
+    }
+    result
+}
+
+/// Returns the `rows_affected` count of the first statement result of an
+/// atomic transaction results array.
+fn storage_first_rows_affected(results: array) -> int {
+    let mut affected: int = 0;
+    if results.length > 0 {
+        let first: map = results[0];
+        let count: int = first["rows_affected"];
+        affected = count;
+    }
+    affected
+}
+
+/// Returns the `rows_affected` count of the statement result at `index`.
+fn storage_nth_rows_affected(results: array, index: int) -> int {
+    let mut affected: int = 0;
+    if results.length > index {
+        let first: map = results[index];
+        let count: int = first["rows_affected"];
+        affected = count;
+    }
+    affected
 }
 
 fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
@@ -232,7 +293,7 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
     } else if command.op == "session.touch" {
         result = storage_raw_ok(request_id, op, sessions::storage_session_touch(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.append" {
-        result = storage_raw_ok(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result = storage_unwrap(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.get" {
         let input: MessageIdInput = json::decode::<MessageIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, messages::storage_message_get(db_id, input.message_id, command.max_rows, command.max_bytes));
@@ -242,7 +303,7 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
     } else if command.op == "message.compact" {
         result = storage_raw_ok(request_id, op, messages::storage_message_mark_compacted(db_id, command.payload_json));
     } else if command.op == "run.create" {
-        result = storage_raw_ok(request_id, op, runs::storage_run_create(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result = storage_unwrap(request_id, op, runs::storage_run_create(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "run.get" {
         let input: RunIdInput = json::decode::<RunIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, runs::storage_run_get(db_id, input.run_id, command.max_rows, command.max_bytes));
@@ -250,14 +311,27 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         let input: RunListInput = json::decode::<RunListInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, runs::storage_run_list(db_id, input.session_id, input.status, command.max_rows, command.max_bytes));
     } else if command.op == "run.transition" {
-        result = storage_array_ok(request_id, op, runs::storage_run_transition(db_id, command.payload_json));
-    } else if command.op == "run.link_child" {
-        let link_result: map = runs::storage_run_link_child(db_id, command.payload_json);
-        if sqlite::rows_affected(link_result) == 0 {
-            result = storage_error(request_id, op, "run_not_found", "parent or child run does not exist");
+        let transition_results: array = runs::storage_run_transition(db_id, command.payload_json);
+        if storage_first_rows_affected(transition_results) == 0 {
+            result = storage_error(request_id, op, "transition_conflict", "run status transition matched no row");
         } else {
-            result = storage_raw_ok(request_id, op, link_result);
+            result = storage_array_ok(request_id, op, transition_results);
         }
+    } else if command.op == "run.terminal" {
+        result = storage_unwrap(request_id, op, runs::storage_run_terminal(db_id, command.payload_json));
+    } else if command.op == "admission.create" {
+        result = storage_unwrap(request_id, op, admission::storage_admission_create(db_id, command.payload_json));
+    } else if command.op == "session.delete" {
+        let delete_results: array = sessions::storage_session_delete(db_id, command.payload_json);
+        if storage_nth_rows_affected(delete_results, 1) == 0 {
+            result = storage_error(request_id, op, "session_not_found", "session does not exist");
+        } else {
+            result = storage_array_ok(request_id, op, delete_results);
+        }
+    } else if command.op == "load.all" {
+        result = storage_unwrap(request_id, op, load::storage_load_all(db_id, command.payload_json));
+    } else if command.op == "run.link_child" {
+        result = storage_unwrap(request_id, op, runs::storage_run_link_child(db_id, command.payload_json));
     } else if command.op == "run.list_children" {
         let input: RunIdInput = json::decode::<RunIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, runs::storage_run_list_children(db_id, input.run_id, command.max_rows, command.max_bytes));
@@ -268,9 +342,24 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
     } else if command.op == "idempotency.complete" {
         result = storage_raw_ok(request_id, op, runs::storage_run_idempotency_complete(db_id, command.payload_json));
     } else if command.op == "recovery.recover_active" {
-        result = storage_array_ok(request_id, op, runs::storage_run_recover_active(db_id, command.payload_json));
+        let recovery_results: array = runs::storage_run_recover_active(db_id, command.payload_json);
+        let recovered: int = storage_first_rows_affected(recovery_results);
+        result = {
+            request_id: request_id,
+            op: op,
+            ok: true,
+            code: "ok",
+            message: "",
+            data: { results: recovery_results },
+            rows_affected: 0,
+            truncated: false,
+            next_cursor: 0,
+            oldest_available_seq: 0,
+            high_water_seq: 0,
+            recovered: recovered
+        };
     } else if command.op == "event.append" {
-        result = storage_array_ok(request_id, op, events::storage_event_append(db_id, command.payload_json));
+        result = storage_unwrap_array(request_id, op, events::storage_event_append(db_id, command.payload_json));
     } else if command.op == "event.replay" {
         let replay_input: ReplayFloorInput = json::decode::<ReplayFloorInput>(command.payload_json);
         let floor: map = events::storage_event_retention(db_id, replay_input.run_id);
@@ -313,14 +402,14 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
             };
         }
     } else if command.op == "event.prune" {
-        result = storage_raw_ok(request_id, op, events::storage_event_prune(db_id, command.payload_json));
+        result = storage_array_ok(request_id, op, events::storage_event_prune(db_id, command.payload_json));
     } else if command.op == "delivery.get" {
         let input: DeliveryGetInput = json::decode::<DeliveryGetInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, events::storage_delivery_cursor_get(db_id, input.session_id, input.consumer, command.max_rows, command.max_bytes));
     } else if command.op == "delivery.advance" {
         result = storage_raw_ok(request_id, op, events::storage_delivery_cursor_advance(db_id, command.payload_json));
     } else if command.op == "approval.request" {
-        result = storage_raw_ok(request_id, op, approvals::storage_approval_request(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result = storage_unwrap(request_id, op, approvals::storage_approval_request(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "approval.get" {
         let input: ApprovalIdInput = json::decode::<ApprovalIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, approvals::storage_approval_get(db_id, input.approval_id, command.max_rows, command.max_bytes));
@@ -329,7 +418,7 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
     } else if command.op == "approval.expire" {
         result = storage_raw_ok(request_id, op, approvals::storage_approval_expire(db_id, command.payload_json));
     } else if command.op == "compaction.start" {
-        result = storage_raw_ok(request_id, op, compactions::storage_compaction_start(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result = storage_unwrap(request_id, op, compactions::storage_compaction_start(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "compaction.get" {
         let input: CompactionIdInput = json::decode::<CompactionIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, compactions::storage_compaction_get(db_id, input.compaction_id, command.max_rows, command.max_bytes));
@@ -340,6 +429,16 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         result = storage_array_ok(request_id, op, compactions::storage_compaction_commit(db_id, command.payload_json));
     } else if command.op == "compaction.fail" {
         result = storage_raw_ok(request_id, op, compactions::storage_compaction_fail(db_id, command.payload_json));
+    } else if command.op == "job.create" {
+        result = storage_unwrap(request_id, op, jobs::storage_job_create(db_id, command.payload_json, command.max_rows, command.max_bytes));
+    } else if command.op == "job.update" {
+        result = storage_unwrap(request_id, op, jobs::storage_job_update(db_id, command.payload_json, command.max_rows, command.max_bytes));
+    } else if command.op == "job.delete" {
+        result = storage_unwrap(request_id, op, jobs::storage_job_delete(db_id, command.payload_json));
+    } else if command.op == "job.get" {
+        result = storage_unwrap(request_id, op, jobs::storage_job_get(db_id, command.payload_json, command.max_rows, command.max_bytes));
+    } else if command.op == "job.list" {
+        result = storage_unwrap(request_id, op, jobs::storage_job_list(db_id, command.max_rows, command.max_bytes));
     }
     result
 }

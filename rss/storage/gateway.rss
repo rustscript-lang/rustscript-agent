@@ -1,3 +1,13 @@
+// LEGACY ADAPTER — NOT USED BY PRODUCTION.
+//
+// This module is the pre-A2-fix blob-per-record gateway storage path
+// (gateway_sessions/gateway_runs/gateway_jobs/gateway_events/
+// gateway_idempotency tables keyed by opaque record ids). Production now
+// reads and writes only the normalized typed schema through `main.rss`
+// (sessions/messages/runs/run_events/approvals/compactions/jobs/...), and
+// `main.rss` never imports this module. This file is retained solely as the
+// explicit legacy adapter for the unreleased prototype format (fixtures and
+// compatibility tests); it must not be re-wired into the gateway.
 use json;
 use sqlite;
 

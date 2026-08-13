@@ -1,6 +1,7 @@
 use json;
 use sqlite;
 use self::schema as schema;
+use self::existence as existence;
 
 fn events_query_limits(max_rows: int, max_bytes: int) -> map<int> {
     { max_rows: max_rows, max_result_bytes: if max_bytes < 4096 => { 4096 } else => { max_bytes } }
@@ -25,7 +26,8 @@ struct EventReplayInput {
 
 struct EventPruneInput {
     run_id: string,
-    max_events: int
+    max_events: int,
+    now_ms: int
 }
 
 struct CursorInput {
@@ -35,28 +37,34 @@ struct CursorInput {
     now_ms: int
 }
 
-pub fn storage_event_append(db_id: int, payload_json: string) -> array {
+pub fn storage_event_append(db_id: int, payload_json: string) -> map {
     let input: EventAppendInput = json::decode::<EventAppendInput>(payload_json);
-    let max_events: int = schema::max_events_limit(input.max_events.copy());
-    let statements = [
-        {
-            sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ?",
-            params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
-        },
-        {
-            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
-            params: [&input.run_id, &input.run_id, max_events.copy(), &input.run_id, max_events.copy()]
-        },
-        {
-            sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-            params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
-        },
-        {
-            sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
-            params: [input.now_ms.copy(), &input.run_id]
-        }
-    ];
-    sqlite::transaction(db_id, statements)
+    let mut result = { ok: true, code: "ok", message: "", result: [] };
+    if !existence::run_exists(db_id, input.run_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "event append targets an unknown run", result: [] };
+    } else {
+        let max_events: int = schema::max_events_limit(input.max_events.copy());
+        let statements = [
+            {
+                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ?",
+                params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
+            },
+            {
+                sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
+                params: [&input.run_id, &input.run_id, max_events.copy(), &input.run_id, max_events.copy()]
+            },
+            {
+                sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+                params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
+            },
+            {
+                sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
+                params: [input.now_ms.copy(), &input.run_id]
+            }
+        ];
+        result = { ok: true, code: "ok", message: "", result: sqlite::transaction(db_id, statements) };
+    }
+    result
 }
 
 /// Returns the persisted retention floor for one run: the oldest retained
@@ -87,13 +95,22 @@ pub fn storage_event_replay(db_id: int, payload_json: string) -> map {
     )
 }
 
-pub fn storage_event_prune(db_id: int, payload_json: string) -> map {
+/// Prunes a run's retained events down to `max_events` and updates the
+/// persisted retention floor/high-water in the same transaction, so the
+/// floor always matches what replay can actually serve.
+pub fn storage_event_prune(db_id: int, payload_json: string) -> array {
     let input: EventPruneInput = json::decode::<EventPruneInput>(payload_json);
-    sqlite::execute(
-        db_id,
-        "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END ELSE 0 END)",
-        [&input.run_id, &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy(), &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy()]
-    )
+    let statements = [
+        {
+            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END ELSE 0 END)",
+            params: [&input.run_id, &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy(), &input.run_id, input.max_events.copy(), input.max_events.copy(), input.max_events.copy()]
+        },
+        {
+            sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+            params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
+        }
+    ];
+    sqlite::transaction(db_id, statements)
 }
 
 pub fn storage_delivery_cursor_get(db_id: int, session_id: string, consumer: string, max_rows: int, max_bytes: int) -> map {

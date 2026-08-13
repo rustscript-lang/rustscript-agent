@@ -15,6 +15,10 @@ const STORAGE_FILES: &[&str] = &[
     "events.rss",
     "approvals.rss",
     "compactions.rss",
+    "jobs.rss",
+    "admission.rss",
+    "load.rss",
+    "existence.rss",
     "gateway.rss",
 ];
 
@@ -198,6 +202,8 @@ fn session_payload(session_id: &str, now_ms: i64) -> JsonValue {
         "provider": "test-provider",
         "toolset_hash": "test-tools",
         "metadata_json": "{}",
+        "title": "",
+        "end_reason": "",
         "now_ms": now_ms,
     })
 }
@@ -326,6 +332,8 @@ fn message_payload(message_id: &str, session_id: &str, _ordinal: i64, now_ms: i6
         "parent_message_id": "",
         "token_estimate": 1,
         "metadata_json": "{}",
+        "run_id": "",
+        "finish_reason": "",
         "now_ms": now_ms,
     })
 }
@@ -517,9 +525,34 @@ fn storage_rss_contract_files_are_present_and_use_generic_capabilities() {
         "idempotency_records",
         "recovery_records",
         "run_retention",
+        "jobs",
     ] {
         assert!(schema.contains(table), "schema.rss missing table {table}");
     }
+    for op in [
+        "admission.create",
+        "run.terminal",
+        "session.delete",
+        "load.all",
+        "job.create",
+        "job.update",
+        "job.delete",
+    ] {
+        assert!(
+            main.contains(op),
+            "main.rss must dispatch the production typed op {op}"
+        );
+    }
+    assert!(
+        !main.contains("gateway.rss"),
+        "production main.rss must never import the legacy gateway.rss adapter"
+    );
+    assert!(
+        fs::read_to_string(root.join("gateway.rss"))
+            .expect("gateway adapter")
+            .contains("LEGACY ADAPTER"),
+        "gateway.rss must be marked as a legacy adapter, not a production path"
+    );
 }
 
 /// The full production storage program compiles and serves typed commands
@@ -536,7 +569,7 @@ fn production_storage_commands_return_sqlite_results_and_preserve_idempotency() 
 
     let migration = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
     assert_eq!(migration["ok"], json!(true));
-    assert_eq!(result_data(&migration)["schema_version"], json!(3));
+    assert_eq!(result_data(&migration)["schema_version"], json!(4));
 
     let session_create = run_storage(
         &runner,
@@ -1467,9 +1500,9 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let runner = storage_runner(&root);
 
     let first = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
-    assert_eq!(result_data(&first)["schema_version"], json!(3));
+    assert_eq!(result_data(&first)["schema_version"], json!(4));
     let second = run_storage(&runner, db_name, "migrate-2", "migrate", json!({}), 2);
-    assert_eq!(result_data(&second)["schema_version"], json!(3));
+    assert_eq!(result_data(&second)["schema_version"], json!(4));
 
     // A released v1 database upgrades to v3 without re-running v1. The
     // crafter builds a real v1 schema by executing the production schema
@@ -1478,7 +1511,7 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let v1_crafter = released_v1_runner(&root);
     run_raw_sql(&v1_crafter, v1_db);
     let upgraded = run_storage(&runner, v1_db, "migrate-upgrade", "migrate", json!({}), 3);
-    assert_eq!(result_data(&upgraded)["schema_version"], json!(3));
+    assert_eq!(result_data(&upgraded)["schema_version"], json!(4));
     let run_created = run_storage(
         &runner,
         v1_db,
@@ -1545,6 +1578,1076 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
         .clone();
     assert_eq!(rows[0][0], json!(0), "no migration record after rollback");
     assert_eq!(rows[1][0], json!(0), "no v1 tables after rollback");
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P2-4: the core SQLite host does not enforce foreign keys (documented core
+/// blocker), so the RSS layer must explicitly reject every orphan write:
+/// run.create (unknown session / parent), message.append (unknown session),
+/// event.append (unknown run), approval.request (unknown run/session),
+/// compaction.start (unknown session/run), and run.link_child (unknown pair)
+/// all fail with typed errors and leave no rows behind.
+#[test]
+fn orphan_references_are_rejected_with_typed_errors() {
+    let root = temporary_root("orphans");
+    let runner = storage_runner(&root);
+    let db_name = "orphans.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+
+    let run_missing_session = run_storage(
+        &runner,
+        db_name,
+        "run-create-orphan",
+        "run.create",
+        run_payload("run-orphan", "session-ghost", 2),
+        2,
+    );
+    assert_eq!(run_missing_session["ok"], json!(false));
+    assert_eq!(run_missing_session["code"], json!("session_not_found"));
+
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 3),
+        3,
+    );
+    let run_missing_parent = run_storage(
+        &runner,
+        db_name,
+        "run-create-parent-orphan",
+        "run.create",
+        json!({
+            "id": "run-parent-orphan",
+            "session_id": "session-1",
+            "parent_run_id": "parent-ghost",
+            "input_json": "{}",
+            "provider": "p",
+            "model": "m",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "now_ms": 4,
+        }),
+        4,
+    );
+    assert_eq!(run_missing_parent["ok"], json!(false));
+    assert_eq!(run_missing_parent["code"], json!("parent_not_found"));
+
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-1",
+        "run.create",
+        run_payload("run-1", "session-1", 5),
+        5,
+    );
+    let message_orphan = run_storage(
+        &runner,
+        db_name,
+        "message-append-orphan",
+        "message.append",
+        message_payload("message-orphan", "session-ghost", 1, 6),
+        6,
+    );
+    assert_eq!(message_orphan["ok"], json!(false));
+    assert_eq!(message_orphan["code"], json!("session_not_found"));
+
+    let event_orphan = run_storage(
+        &runner,
+        db_name,
+        "event-append-orphan",
+        "event.append",
+        event_payload("run-ghost", "event-orphan", "model.delta", 7, 128),
+        7,
+    );
+    assert_eq!(event_orphan["ok"], json!(false));
+    assert_eq!(event_orphan["code"], json!("run_not_found"));
+
+    let approval_orphan = run_storage(
+        &runner,
+        db_name,
+        "approval-orphan",
+        "approval.request",
+        json!({
+            "id": "approval-orphan",
+            "run_id": "run-ghost",
+            "session_id": "session-1",
+            "tool_call_id": "tool-1",
+            "tool_name": "shell",
+            "arguments_json": "{}",
+            "risk_class": "execute",
+            "decision_scope": "",
+            "one_time": 0,
+            "requested_at_ms": 8,
+            "expires_at_ms": 0,
+        }),
+        8,
+    );
+    assert_eq!(approval_orphan["ok"], json!(false));
+    assert_eq!(approval_orphan["code"], json!("run_not_found"));
+
+    let compaction_orphan = run_storage(
+        &runner,
+        db_name,
+        "compaction-orphan",
+        "compaction.start",
+        json!({
+            "id": "compaction-orphan",
+            "session_id": "session-ghost",
+            "run_id": "run-1",
+            "generation": 1,
+            "source_start_ordinal": 1,
+            "source_end_ordinal": 1,
+            "retained_tail_ordinal": 1,
+            "summary_json": "{}",
+            "token_estimate": 0,
+            "model": "m",
+            "now_ms": 9,
+        }),
+        9,
+    );
+    assert_eq!(compaction_orphan["ok"], json!(false));
+    assert_eq!(compaction_orphan["code"], json!("run_not_found"));
+
+    // No orphan rows exist anywhere after the rejections.
+    let inspector = query_sql_runner(
+        &root,
+        "inspect-orphans",
+        &[
+            "CREATE TABLE IF NOT EXISTS probe (n INTEGER)",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM runs",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM messages",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM run_events",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM approvals",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM compactions",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM child_run_links",
+        ],
+        "SELECT n FROM probe ORDER BY n",
+    );
+    let inspected = inspector
+        .run_with_context(Value::map(vec![(
+            Value::string("db_name"),
+            Value::string(db_name),
+        )]))
+        .expect("orphan inspection should run");
+    let Value::Map(inspected) = inspected else {
+        panic!("inspection should return a map");
+    };
+    let rows = vm_value_to_json(&Value::Map(inspected))["rows"]
+        .as_array()
+        .expect("inspection rows")
+        .clone();
+    // Probe rows are sorted ascending; runs is the only non-zero count.
+    assert_eq!(rows[0][0], json!(0), "no orphan messages");
+    assert_eq!(rows[1][0], json!(0), "no orphan events");
+    assert_eq!(rows[2][0], json!(0), "no orphan approvals");
+    assert_eq!(rows[3][0], json!(0), "no orphan compactions");
+    assert_eq!(rows[4][0], json!(0), "no orphan child links");
+    assert_eq!(rows[5][0], json!(1), "only run-1 exists");
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P3: a run.transition that matches no row is a typed `transition_conflict`,
+/// never a silent success.
+#[test]
+fn transition_conflict_is_typed_when_no_row_matches() {
+    let root = temporary_root("transition-conflict");
+    let runner = storage_runner(&root);
+    let db_name = "transition.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-1",
+        "run.create",
+        run_payload("run-1", "session-1", 3),
+        3,
+    );
+    // Wrong from_status: the guarded UPDATE matches nothing.
+    let conflict = run_storage(
+        &runner,
+        db_name,
+        "run-transition-conflict",
+        "run.transition",
+        transition_payload("run-1", "completed", "running", 4),
+        4,
+    );
+    assert_eq!(conflict["ok"], json!(false));
+    assert_eq!(conflict["code"], json!("transition_conflict"));
+    // The run is untouched and no status_changed event was appended.
+    let run = run_storage(
+        &runner,
+        db_name,
+        "run-get-1",
+        "run.get",
+        json!({"run_id": "run-1"}),
+        5,
+    );
+    assert_eq!(first_query_row(&run)["status"], json!("queued"));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P3: run.link_child is idempotent — re-linking an existing pair is a
+/// success and never creates a duplicate row.
+#[test]
+fn link_child_is_idempotent() {
+    let root = temporary_root("link-idempotent");
+    let runner = storage_runner(&root);
+    let db_name = "links.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-parent",
+        "run.create",
+        run_payload("parent-1", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-child",
+        "run.create",
+        json!({
+            "id": "child-1",
+            "session_id": "session-1",
+            "parent_run_id": "parent-1",
+            "input_json": "{}",
+            "provider": "p",
+            "model": "m",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "now_ms": 4,
+        }),
+        4,
+    );
+    let link_payload = json!({
+        "parent_run_id": "parent-1",
+        "child_run_id": "child-1",
+        "ordinal": 0,
+        "relation": "subagent",
+        "state": "active",
+        "now_ms": 5,
+    });
+    let first = run_storage(
+        &runner,
+        db_name,
+        "link-1",
+        "run.link_child",
+        link_payload.clone(),
+        5,
+    );
+    assert_eq!(first["ok"], json!(true));
+    let second = run_storage(
+        &runner,
+        db_name,
+        "link-2",
+        "run.link_child",
+        link_payload,
+        6,
+    );
+    assert_eq!(second["ok"], json!(true), "re-linking must be idempotent");
+    let children = run_storage(
+        &runner,
+        db_name,
+        "list-children-1",
+        "run.list_children",
+        json!({"run_id": "parent-1"}),
+        7,
+    );
+    assert_eq!(
+        query_rows(&children).len(),
+        1,
+        "exactly one link row survives"
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P2-5: event.prune updates the persisted retention floor/high-water in the
+/// same transaction, so replay reports the pruned floor.
+#[test]
+fn event_prune_updates_retention_floor_and_high_water() {
+    let root = temporary_root("prune-retention");
+    let runner = storage_runner(&root);
+    let db_name = "prune.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-1",
+        "run.create",
+        run_payload("run-1", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-transition-1",
+        "run.transition",
+        transition_payload("run-1", "queued", "running", 4),
+        4,
+    );
+    let mut now_ms = 5;
+    for seq in 2..=40 {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("event-append-{seq}"),
+            "event.append",
+            event_payload("run-1", &format!("event-{seq}"), "model.delta", now_ms, 256),
+            now_ms,
+        );
+        now_ms += 1;
+    }
+    let pruned = run_storage(
+        &runner,
+        db_name,
+        "prune-1",
+        "event.prune",
+        json!({"run_id": "run-1", "max_events": 10, "now_ms": now_ms}),
+        now_ms,
+    );
+    assert_eq!(pruned["ok"], json!(true));
+    // 40 events + 1 transition event; retain the last 10 -> floor 31,
+    // high-water 40.
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-after-prune",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        now_ms + 1,
+    );
+    assert_eq!(replay["ok"], json!(false));
+    assert_eq!(replay["code"], json!("cursor_too_old"));
+    assert_eq!(replay["oldest_available_seq"], json!(31));
+    assert_eq!(replay["high_water_seq"], json!(40));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P1-2 (RSS layer): admission.create is one atomic transaction — a failed
+/// admission (unknown session) commits nothing, and a successful admission
+/// commits the session, user message, run, run.started event, retention
+/// floor, child link, and idempotency record together.
+#[test]
+fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
+    let root = temporary_root("admission");
+    let runner = storage_runner(&root);
+    let db_name = "admission.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+
+    let rejected = run_storage(
+        &runner,
+        db_name,
+        "admission-rejected",
+        "admission.create",
+        json!({
+            "session_id": "session-ghost",
+            "session_new": 0,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-ghost",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "run-rejected",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hello\"}",
+            "message_id": "message-rejected",
+            "message_run_id": "run-rejected",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "event_id": "event-rejected",
+            "now_ms": 2,
+            "expires_at_ms": 0,
+        }),
+        2,
+    );
+    assert_eq!(rejected["ok"], json!(false));
+    assert_eq!(rejected["code"], json!("session_not_found"));
+
+    let admitted = run_storage(
+        &runner,
+        db_name,
+        "admission-ok",
+        "admission.create",
+        json!({
+            "session_id": "session-1",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-1",
+            "model": "test-model",
+            "provider": "test-provider",
+            "system_prompt": "be helpful",
+            "run_id": "run-1",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hello\"}",
+            "message_id": "message-1",
+            "message_run_id": "run-1",
+            "script_hash": "script-hash",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "request-1",
+            "request_hash": "hash-1",
+            "event_id": "event-started-1",
+            "now_ms": 3,
+            "expires_at_ms": 0,
+        }),
+        3,
+    );
+    assert_eq!(admitted["ok"], json!(true));
+    let data = result_data(&admitted);
+    let run_row = data["run"]["rows"][0].as_array().expect("run row");
+    assert_eq!(run_row[0], json!("run-1"));
+    assert_eq!(run_row[1], json!("session-1"));
+    assert_eq!(run_row[3], json!("running"));
+    let session_row = data["session"]["rows"][0].as_array().expect("session row");
+    assert_eq!(session_row[0], json!("session-1"));
+    assert_eq!(session_row[9], json!("be helpful"));
+    let message_row = data["message"]["rows"][0].as_array().expect("message row");
+    assert_eq!(message_row[1], json!("session-1"));
+    assert_eq!(message_row[2], json!(1), "first message ordinal is 1");
+    assert_eq!(message_row[3], json!("user"));
+    let idempotency_row = data["idempotency"]["rows"][0]
+        .as_array()
+        .expect("idempotency row");
+    assert_eq!(idempotency_row[2], json!("hash-1"));
+    assert_eq!(idempotency_row[4], json!("run-1"));
+    assert_eq!(idempotency_row[5], json!("completed"));
+
+    // The run.started event is seq 1 and the retention floor is 1/1.
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-1",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        4,
+    );
+    let replay_rows = query_rows(&replay);
+    assert_eq!(replay_rows.len(), 1);
+    assert_eq!(replay_rows[0]["event_type"], json!("run.started"));
+    assert_eq!(replay_rows[0]["seq"], json!(1));
+    assert_eq!(replay["oldest_available_seq"], json!(1));
+    assert_eq!(replay["high_water_seq"], json!(1));
+
+    // The rejected admission left nothing behind: only the successful run,
+    // one message, and one event exist.
+    let inspector = query_sql_runner(
+        &root,
+        "inspect-admission",
+        &[
+            "CREATE TABLE IF NOT EXISTS probe (n INTEGER)",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM sessions",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM runs",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM messages",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM run_events",
+        ],
+        "SELECT n FROM probe ORDER BY n",
+    );
+    let inspected = inspector
+        .run_with_context(Value::map(vec![(
+            Value::string("db_name"),
+            Value::string(db_name),
+        )]))
+        .expect("admission inspection should run");
+    let Value::Map(inspected) = inspected else {
+        panic!("inspection should return a map");
+    };
+    let rows = vm_value_to_json(&Value::Map(inspected))["rows"]
+        .as_array()
+        .expect("inspection rows")
+        .clone();
+    assert_eq!(rows[0][0], json!(1), "one session");
+    assert_eq!(rows[1][0], json!(1), "one run");
+    assert_eq!(rows[2][0], json!(1), "one message");
+    assert_eq!(rows[3][0], json!(1), "one event");
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P1-3 (RSS layer): run.terminal commits the status change, the terminal
+/// events, the retention update, and the optional assistant message in one
+/// transaction; sequences are allocated as max+1 and returned for
+/// reconciliation.
+#[test]
+fn run_terminal_commits_atomically_and_returns_assigned_sequences() {
+    let root = temporary_root("terminal");
+    let runner = storage_runner(&root);
+    let db_name = "terminal.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "admission-1",
+        "admission.create",
+        json!({
+            "session_id": "session-1",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-1",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "run-1",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "message-1",
+            "message_run_id": "run-1",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "event_id": "event-started-1",
+            "now_ms": 2,
+            "expires_at_ms": 0,
+        }),
+        2,
+    );
+    // Two script events: seq 2 and 3.
+    for (seq, event_id) in [(2i64, "event-2"), (3, "event-3")] {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("event-append-{seq}"),
+            "event.append",
+            event_payload("run-1", event_id, "model.delta", seq + 1, 128),
+            seq + 1,
+        );
+    }
+
+    let terminal = run_storage(
+        &runner,
+        db_name,
+        "terminal-1",
+        "run.terminal",
+        json!({
+            "run_id": "run-1",
+            "to_status": "completed",
+            "error_code": "",
+            "error_message": "",
+            "event_1_id": "event-delta",
+            "event_1_type": "message.delta",
+            "event_1_payload": "{\"delta\":\"done\"}",
+            "event_2_id": "event-completed",
+            "event_2_type": "run.completed",
+            "event_2_payload": "{\"status\":\"completed\"}",
+            "event_count": 2,
+            "message_id": "message-assistant",
+            "message_session_id": "session-1",
+            "message_role": "assistant",
+            "message_content_json": "{\"text\":\"done\"}",
+            "message_run_id": "run-1",
+            "message_finish_reason": "stop",
+            "now_ms": 6,
+        }),
+        6,
+    );
+    assert_eq!(terminal["ok"], json!(true));
+    let data = result_data(&terminal);
+    let run_row = data["run"]["rows"][0].as_array().expect("run row");
+    assert_eq!(run_row[3], json!("completed"));
+    assert_eq!(run_row[18], json!(6), "finished_at_ms is set");
+    // Events 1..5 with assigned sequences; the terminal events are 4 and 5.
+    let event_rows = data["events"]["rows"].as_array().expect("event rows");
+    assert_eq!(event_rows.len(), 5);
+    let last = event_rows[4].as_array().expect("last event row");
+    assert_eq!(last[2], json!("event-completed"));
+    assert_eq!(last[0], json!(5), "terminal event sequence is max+1");
+    let second_last = event_rows[3].as_array().expect("second last event row");
+    assert_eq!(second_last[2], json!("event-delta"));
+    assert_eq!(second_last[0], json!(4));
+
+    // The assistant message is part of the same commit.
+    let message = run_storage(
+        &runner,
+        db_name,
+        "message-get-assistant",
+        "message.get",
+        json!({"message_id": "message-assistant"}),
+        7,
+    );
+    let message_row = first_query_row(&message);
+    assert_eq!(message_row["ordinal"], json!(2));
+    assert_eq!(message_row["role"], json!("assistant"));
+    assert_eq!(message_row["run_id"], json!("run-1"));
+    assert_eq!(message_row["finish_reason"], json!("stop"));
+
+    // A second terminal commit on the same run is a typed conflict (the
+    // status is no longer 'running'), so exactly one terminal exists.
+    let second_terminal = run_storage(
+        &runner,
+        db_name,
+        "terminal-2",
+        "run.terminal",
+        json!({
+            "run_id": "run-1",
+            "to_status": "cancelled",
+            "error_code": "",
+            "error_message": "",
+            "event_1_id": "event-dup",
+            "event_1_type": "run.cancelled",
+            "event_1_payload": "{}",
+            "event_2_id": "",
+            "event_2_type": "",
+            "event_2_payload": "",
+            "event_count": 1,
+            "message_id": "",
+            "message_session_id": "",
+            "message_role": "",
+            "message_content_json": "",
+            "message_run_id": "",
+            "message_finish_reason": "",
+            "now_ms": 8,
+        }),
+        8,
+    );
+    assert_eq!(second_terminal["ok"], json!(false));
+    assert_eq!(second_terminal["code"], json!("transition_conflict"));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P1-1 (RSS layer): load.all drains every page — more rows than a single
+/// 512-row page and more bytes than a single page's byte budget are both
+/// loaded completely, with no silent truncation.
+#[test]
+fn load_all_paginates_beyond_single_page_and_byte_limits() {
+    let root = temporary_root("load-all");
+    let runner = storage_runner(&root);
+    let db_name = "load-all.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+
+    // 600 sessions (more than one 512-row page) and one run with 600
+    // messages + 600 events (more than one page each).
+    let mut now_ms = 2;
+    for index in 0..600 {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("session-create-{index}"),
+            "session.create",
+            json!({
+                "id": format!("session-{index:03}"),
+                "profile": "default",
+                "platform": "test",
+                "account_id": format!("account-{index:03}"),
+                "chat_id": format!("chat-{index:03}"),
+                "thread_id": "",
+                "user_id": "user-1",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "test-model",
+                "provider": "test-provider",
+                "toolset_hash": "test-tools",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now_ms,
+            }),
+            now_ms,
+        );
+        now_ms += 1;
+    }
+    run_storage(
+        &runner,
+        db_name,
+        "admission-1",
+        "admission.create",
+        json!({
+            "session_id": "session-000",
+            "session_new": 0,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-000",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "run-1",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "message-admission",
+            "message_run_id": "run-1",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "event_id": "event-started-1",
+            "now_ms": now_ms,
+            "expires_at_ms": 0,
+        }),
+        now_ms,
+    );
+    now_ms += 1;
+    for ordinal in 1..=600 {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("message-append-{ordinal}"),
+            "message.append",
+            message_payload(
+                &format!("message-{ordinal:03}"),
+                "session-000",
+                ordinal,
+                now_ms,
+            ),
+            now_ms,
+        );
+        now_ms += 1;
+    }
+    for seq in 2..=600 {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("event-append-{seq}"),
+            "event.append",
+            event_payload(
+                "run-1",
+                &format!("event-{seq:03}"),
+                "model.delta",
+                now_ms,
+                2048,
+            ),
+            now_ms,
+        );
+        now_ms += 1;
+    }
+
+    let loaded = run_storage(
+        &runner,
+        db_name,
+        "load-all-1",
+        "load.all",
+        json!({"max_rows": 512, "max_bytes": 2 * 1024 * 1024}),
+        now_ms,
+    );
+    assert_eq!(loaded["ok"], json!(true));
+    let data = result_data(&loaded);
+    let sessions = data["sessions"].as_array().expect("sessions rows");
+    assert_eq!(sessions.len(), 600, "all sessions load across pages");
+    let runs = data["runs"].as_array().expect("runs rows");
+    assert_eq!(runs.len(), 1);
+    let messages = data["messages"].as_array().expect("messages rows");
+    assert_eq!(messages.len(), 601, "admission message + 600 appends");
+    let events = data["events"].as_array().expect("events rows");
+    assert_eq!(
+        events.len(),
+        256,
+        "retained tail obeys the 256-event retention clamp"
+    );
+    // Row shapes: sessions carry the id first; events carry seq first.
+    let session_first = sessions[0].as_array().expect("session row");
+    assert_eq!(session_first[0], json!("session-000"));
+    let event_first = events[0].as_array().expect("event row");
+    assert_eq!(
+        event_first[0],
+        json!(345),
+        "retained tail starts at seq 345"
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P1-4 (RSS layer): session.delete cascades every dependent row in one
+/// transaction, and jobs round-trip through the normalized table.
+#[test]
+fn session_delete_cascades_and_jobs_round_trip() {
+    let root = temporary_root("delete-jobs");
+    let runner = storage_runner(&root);
+    let db_name = "delete-jobs.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+
+    let job_create = run_storage(
+        &runner,
+        db_name,
+        "job-create-1",
+        "job.create",
+        json!({
+            "id": "job-1",
+            "name": "nightly",
+            "schedule_json": "{\"cron\":\"0 9 * * *\"}",
+            "prompt": "run the agent",
+            "deliver_json": "{\"channel\":\"telegram\"}",
+            "skills_json": "[\"demo\"]",
+            "repeat_count": 2,
+            "enabled": 1,
+            "now_ms": 2,
+        }),
+        2,
+    );
+    assert_eq!(job_create["ok"], json!(true));
+    let job_row = first_query_row(&job_create);
+    assert_eq!(job_row["id"], json!("job-1"));
+    assert_eq!(job_row["name"], json!("nightly"));
+    assert_eq!(job_row["enabled"], json!(1));
+
+    let job_update = run_storage(
+        &runner,
+        db_name,
+        "job-update-1",
+        "job.update",
+        json!({
+            "id": "job-1",
+            "name": "weekly",
+            "schedule_json": "{}",
+            "prompt": "updated",
+            "deliver_json": "{}",
+            "skills_json": "[]",
+            "repeat_count": 0,
+            "enabled": 0,
+            "now_ms": 3,
+        }),
+        3,
+    );
+    assert_eq!(first_query_row(&job_update)["enabled"], json!(0));
+
+    // Admission + terminal so the run has events and a child link candidate.
+    run_storage(
+        &runner,
+        db_name,
+        "admission-parent",
+        "admission.create",
+        json!({
+            "session_id": "session-1",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-1",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "parent-1",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "message-1",
+            "message_run_id": "parent-1",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "key-1",
+            "request_hash": "hash-1",
+            "event_id": "event-1",
+            "now_ms": 4,
+            "expires_at_ms": 0,
+        }),
+        4,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "admission-child",
+        "admission.create",
+        json!({
+            "session_id": "session-1",
+            "session_new": 0,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-1",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "child-1",
+            "parent_run_id": "parent-1",
+            "input_json": "{\"text\":\"child\"}",
+            "message_id": "message-2",
+            "message_run_id": "child-1",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "event_id": "event-2",
+            "now_ms": 5,
+            "expires_at_ms": 0,
+        }),
+        5,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "delivery-cursor-1",
+        "delivery.advance",
+        json!({
+            "session_id": "session-1",
+            "consumer": "sse",
+            "event_seq": 1,
+            "now_ms": 6,
+        }),
+        6,
+    );
+
+    let deleted = run_storage(
+        &runner,
+        db_name,
+        "session-delete-1",
+        "session.delete",
+        json!({"session_id": "session-1"}),
+        7,
+    );
+    assert_eq!(deleted["ok"], json!(true));
+
+    let inspector = query_sql_runner(
+        &root,
+        "inspect-delete",
+        &[
+            "CREATE TABLE IF NOT EXISTS probe (n INTEGER)",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM sessions",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM runs",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM messages",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM run_events",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM child_run_links",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM delivery_cursors",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM idempotency_records",
+            "INSERT INTO probe (n) SELECT COUNT(*) FROM jobs",
+        ],
+        "SELECT n FROM probe ORDER BY n",
+    );
+    let inspected = inspector
+        .run_with_context(Value::map(vec![(
+            Value::string("db_name"),
+            Value::string(db_name),
+        )]))
+        .expect("delete inspection should run");
+    let Value::Map(inspected) = inspected else {
+        panic!("inspection should return a map");
+    };
+    let rows = vm_value_to_json(&Value::Map(inspected))["rows"]
+        .as_array()
+        .expect("inspection rows")
+        .clone();
+    // Probe rows are sorted ascending: seven zero counts (everything
+    // session-scoped cascades, including run-scoped idempotency records)
+    // then the jobs count, which is independent of sessions.
+    assert_eq!(rows[0][0], json!(0), "session cascaded");
+    assert_eq!(rows[1][0], json!(0), "runs cascaded");
+    assert_eq!(rows[2][0], json!(0), "messages cascaded");
+    assert_eq!(rows[3][0], json!(0), "events cascaded");
+    assert_eq!(rows[4][0], json!(0), "child links cascaded");
+    assert_eq!(rows[5][0], json!(0), "delivery cursors cascaded");
+    assert_eq!(
+        rows[6][0],
+        json!(0),
+        "idempotency records cascade with their runs"
+    );
+    assert_eq!(rows[7][0], json!(1), "jobs are independent of sessions");
+
+    let job_list = run_storage(&runner, db_name, "job-list-1", "job.list", json!({}), 8);
+    assert_eq!(query_rows(&job_list).len(), 1);
+    let job_delete = run_storage(
+        &runner,
+        db_name,
+        "job-delete-1",
+        "job.delete",
+        json!({"job_id": "job-1"}),
+        9,
+    );
+    assert_eq!(job_delete["ok"], json!(true));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P2-1 (RSS layer): recovery reports how many runs it recovered so the
+/// gateway can loop bounded batches until every active run is recovered
+/// exactly once.
+#[test]
+fn recovery_reports_recovered_count_for_batched_loops() {
+    let root = temporary_root("recovery-count");
+    let runner = storage_runner(&root);
+    let db_name = "recovery-count.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    for index in 0..3 {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("run-create-{index}"),
+            "run.create",
+            run_payload(&format!("run-{index}"), "session-1", 3 + index),
+            3 + index,
+        );
+    }
+    let first = run_storage(
+        &runner,
+        db_name,
+        "recovery-first",
+        "recovery.recover_active",
+        json!({
+            "reason": "gateway_restart",
+            "details_json": "{}",
+            "now_ms": 10,
+            "max_rows": 128,
+            "max_bytes": 65_536,
+            "max_events": 128,
+        }),
+        10,
+    );
+    assert_eq!(first["recovered"], json!(3));
+    let second = run_storage(
+        &runner,
+        db_name,
+        "recovery-second",
+        "recovery.recover_active",
+        json!({
+            "reason": "gateway_restart",
+            "details_json": "{}",
+            "now_ms": 11,
+            "max_rows": 128,
+            "max_bytes": 65_536,
+            "max_events": 128,
+        }),
+        11,
+    );
+    assert_eq!(second["recovered"], json!(0), "second recovery is a no-op");
 
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }

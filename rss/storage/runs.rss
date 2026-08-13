@@ -1,6 +1,7 @@
 use json;
 use sqlite;
 use self::schema as schema;
+use self::existence as existence;
 
 fn runs_query_limits(max_rows: int, max_bytes: int) -> map<int> {
     { max_rows: max_rows, max_result_bytes: max_bytes }
@@ -36,6 +37,27 @@ struct ChildLinkInput {
     ordinal: int,
     relation: string,
     state: string,
+    now_ms: int
+}
+
+struct RunTerminalInput {
+    run_id: string,
+    to_status: string,
+    error_code: string,
+    error_message: string,
+    event_1_id: string,
+    event_1_type: string,
+    event_1_payload: string,
+    event_2_id: string,
+    event_2_type: string,
+    event_2_payload: string,
+    event_count: int,
+    message_id: string,
+    message_session_id: string,
+    message_role: string,
+    message_content_json: string,
+    message_run_id: string,
+    message_finish_reason: string,
     now_ms: int
 }
 
@@ -89,17 +111,32 @@ struct RecoveryBatchResult {
 
 pub fn storage_run_create(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: RunCreateInput = json::decode::<RunCreateInput>(payload_json);
-    sqlite::execute(
-        db_id,
-        "INSERT OR IGNORE INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, updated_at_ms) SELECT ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?)",
-        [&input.id, &input.session_id, &input.parent_run_id, &input.input_json, &input.provider, &input.model, &input.script_hash, &input.idempotency_scope, &input.idempotency_key, input.now_ms.copy(), input.now_ms.copy(), &input.id, &input.session_id]
-    );
-    sqlite::query(
-        db_id,
-        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? AND session_id = ? LIMIT ?",
-        [&input.id, &input.session_id, (max_rows)],
-        runs_query_limits(max_rows, max_bytes)
-    )
+    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
+    if !existence::session_exists(db_id, input.session_id.copy()) {
+        result = { ok: false, code: "session_not_found", message: "run create targets an unknown session", result: { columns: [], rows: [] } };
+    } else {
+        if input.parent_run_id.copy() != "" && !existence::run_exists(db_id, input.parent_run_id.copy()) {
+            result = { ok: false, code: "parent_not_found", message: "parent run does not exist", result: { columns: [], rows: [] } };
+        } else {
+            sqlite::execute(
+                db_id,
+                "INSERT OR IGNORE INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, updated_at_ms) SELECT ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))",
+                [&input.id, &input.session_id, &input.parent_run_id, &input.input_json, &input.provider, &input.model, &input.script_hash, &input.idempotency_scope, &input.idempotency_key, input.now_ms.copy(), input.now_ms.copy(), &input.id, &input.session_id, &input.session_id, &input.parent_run_id, &input.parent_run_id]
+            );
+            result = {
+                ok: true,
+                code: "ok",
+                message: "",
+                result: sqlite::query(
+                    db_id,
+                    "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? AND session_id = ? LIMIT ?",
+                    [&input.id, &input.session_id, (max_rows)],
+                    runs_query_limits(max_rows, max_bytes)
+                )
+            };
+        }
+    }
+    result
 }
 
 pub fn storage_run_get(db_id: int, run_id: string, max_rows: int, max_bytes: int) -> map {
@@ -145,11 +182,107 @@ pub fn storage_run_transition(db_id: int, payload_json: string) -> array {
 
 pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
     let input: ChildLinkInput = json::decode::<ChildLinkInput>(payload_json);
-    sqlite::execute(
+    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
+    if !existence::run_exists(db_id, input.parent_run_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
+    } else {
+        if !existence::run_exists(db_id, input.child_run_id.copy()) {
+            result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
+        } else {
+            // Idempotent: re-linking an existing pair is a no-op success,
+            // never an orphan write or a duplicate error.
+            sqlite::execute(
+                db_id,
+                "INSERT OR IGNORE INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ?)",
+                [&input.parent_run_id, &input.child_run_id, input.ordinal.copy(), &input.relation, &input.state, input.now_ms.copy(), &input.parent_run_id, &input.child_run_id]
+            );
+            result = {
+                ok: true,
+                code: "ok",
+                message: "",
+                result: sqlite::query(
+                    db_id,
+                    "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? AND child_run_id = ? LIMIT 1",
+                    [&input.parent_run_id, &input.child_run_id],
+                    { max_rows: 1, max_result_bytes: 4096 }
+                )
+            };
+        }
+    }
+    result
+}
+
+/// One atomic terminal commit: the run transitions to a terminal status and
+/// its terminal events (and optional assistant message) are appended in the
+/// same transaction, so a terminal state is durable before anything is
+/// published and a failed commit leaves no partial terminal state.
+/// Sequence numbers are allocated transactionally as `max(seq) + 1` per run;
+/// the returned rows let the caller reconcile in-memory sequences.
+pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
+    let input: RunTerminalInput = json::decode::<RunTerminalInput>(payload_json);
+    assert(storage_run_status_allowed(input.to_status.copy()));
+    let mut statements = [];
+    if input.event_count.copy() >= 1 {
+        statements[statements.length] = {
+            sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
+            params: [&input.run_id, &input.run_id, &input.event_1_id, &input.event_1_type, &input.event_1_payload, input.now_ms.copy(), &input.run_id]
+        };
+    }
+    if input.event_count.copy() >= 2 {
+        statements[statements.length] = {
+            sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
+            params: [&input.run_id, &input.run_id, &input.event_2_id, &input.event_2_type, &input.event_2_payload, input.now_ms.copy(), &input.run_id]
+        };
+    }
+    if input.message_id.copy() != "" {
+        statements[statements.length] = {
+            sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, ?, ?, '{}', ?, ?, ? FROM messages WHERE session_id = ? AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running') AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
+            params: [&input.message_id, &input.message_session_id, &input.message_role, &input.message_content_json, &input.message_run_id, &input.message_finish_reason, input.now_ms.copy(), &input.message_session_id, &input.run_id, &input.message_id, &input.message_session_id]
+        };
+        statements[statements.length] = {
+            sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ?",
+            params: [&input.message_session_id, input.now_ms.copy(), &input.message_session_id]
+        };
+    }
+    statements[statements.length] = {
+        sql: "UPDATE runs SET status = ?, error_code = ?, error_message = ?, recovery_reason = '', finished_at_ms = ?, updated_at_ms = ? WHERE id = ? AND status = 'running'",
+        params: [&input.to_status, &input.error_code, &input.error_message, input.now_ms.copy(), input.now_ms.copy(), &input.run_id]
+    };
+    statements[statements.length] = {
+        sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+        params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy(), &input.run_id, &input.to_status]
+    };
+    sqlite::transaction(db_id, statements);
+    let run_result: map = sqlite::query(
         db_id,
-        "INSERT INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ?)",
-        [&input.parent_run_id, &input.child_run_id, input.ordinal.copy(), &input.relation, &input.state, input.now_ms.copy(), &input.parent_run_id, &input.child_run_id]
-    )
+        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1",
+        [&input.run_id],
+        { max_rows: 1, max_result_bytes: 65536 }
+    );
+    let run_result_copy: map = run_result.copy();
+    let run_rows: array = run_result["rows"];
+    let mut result = { ok: true, code: "ok", message: "", result: { run: run_result_copy, events: { columns: [], rows: [] } } };
+    if run_rows.length == 0 {
+        result = { ok: false, code: "run_not_found", message: "terminal commit targets an unknown run", result: { run: run_result_copy, events: { columns: [], rows: [] } } };
+    } else {
+        // A terminal commit that matched no transition (the run was already
+        // terminal, or never running) is a typed conflict, never a silent
+        // success: the run row's status tells whether the transition landed.
+        let run_row: array = run_rows[0];
+        let run_status: string = run_row[3];
+        if run_status != input.to_status.copy() {
+            result = { ok: false, code: "transition_conflict", message: "run terminal transition matched no row", result: { run: run_result_copy, events: { columns: [], rows: [] } } };
+        } else {
+            let event_result: map = sqlite::query(
+                db_id,
+                "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?",
+                [&input.run_id, (512)],
+                { max_rows: 512, max_result_bytes: 2097152 }
+            );
+            result = { ok: true, code: "ok", message: "", result: { run: run_result_copy, events: event_result } };
+        }
+    }
+    result
 }
 
 pub fn storage_run_list_children(db_id: int, parent_run_id: string, max_rows: int, max_bytes: int) -> map {

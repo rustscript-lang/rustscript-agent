@@ -1,6 +1,7 @@
 use json;
 use sqlite;
 use self::schema as schema;
+use self::existence as existence;
 
 fn compactions_query_limits(max_rows: int, max_bytes: int) -> map<int> {
     { max_rows: max_rows, max_result_bytes: max_bytes }
@@ -38,17 +39,32 @@ struct CompactionFailInput {
 
 pub fn storage_compaction_start(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: CompactionStartInput = json::decode::<CompactionStartInput>(payload_json);
-    sqlite::execute(
-        db_id,
-        "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms WHERE compactions.state = 'failed'",
-        [&input.id, &input.session_id, &input.run_id, input.generation.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.retained_tail_ordinal.copy(), &input.summary_json, input.token_estimate.copy(), &input.model, input.now_ms.copy(), &input.session_id, input.generation.copy(), &input.run_id, &input.session_id, input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), &input.id, &input.session_id]
-    );
-    sqlite::query(
-        db_id,
-        "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE id = ? AND session_id = ? LIMIT ?",
-        [&input.id, &input.session_id, (max_rows)],
-        compactions_query_limits(max_rows, max_bytes)
-    )
+    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
+    if !existence::session_exists(db_id, input.session_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "compaction start references an unknown session or run", result: { columns: [], rows: [] } };
+    } else {
+        if !existence::run_exists(db_id, input.run_id.copy()) {
+            result = { ok: false, code: "run_not_found", message: "compaction start references an unknown session or run", result: { columns: [], rows: [] } };
+        } else {
+            sqlite::execute(
+                db_id,
+                "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms WHERE compactions.state = 'failed'",
+                [&input.id, &input.session_id, &input.run_id, input.generation.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.retained_tail_ordinal.copy(), &input.summary_json, input.token_estimate.copy(), &input.model, input.now_ms.copy(), &input.session_id, input.generation.copy(), &input.run_id, &input.session_id, input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), &input.id, &input.session_id]
+            );
+            result = {
+                ok: true,
+                code: "ok",
+                message: "",
+                result: sqlite::query(
+                    db_id,
+                    "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE id = ? AND session_id = ? LIMIT ?",
+                    [&input.id, &input.session_id, (max_rows)],
+                    compactions_query_limits(max_rows, max_bytes)
+                )
+            };
+        }
+    }
+    result
 }
 
 pub fn storage_compaction_get(db_id: int, compaction_id: string, max_rows: int, max_bytes: int) -> map {
