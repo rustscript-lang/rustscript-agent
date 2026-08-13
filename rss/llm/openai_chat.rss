@@ -622,7 +622,10 @@ fn chat_error_payload(body_text: string) -> map {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming (http::client::sse)
+// Streaming — typed not_implemented stub. `http::client::sse` is NOT exposed
+// in the restricted registry (no consumer): the closure capture-move blocker
+// (see plans/2026-08-13_a3-provider-core-blocker.md) keeps this path typed
+// and unreachable until the core allows shared-accumulator callbacks.
 // ---------------------------------------------------------------------------
 
 fn openai_chat_stream_dispatch(request: map, profile: map) -> map {

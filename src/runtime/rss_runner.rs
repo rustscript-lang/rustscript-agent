@@ -553,7 +553,9 @@ impl AgentRunner {
 
 /// Binds the restricted capability registry: JSON, bytes conversion, the
 /// invocation stream emit builtin, generic SQLite, and the HTTP client
-/// (buffered request plus the callable SSE stream). Ambient runtime
+/// (buffered request only — the callable SSE stream is NOT exposed while
+/// the A3 closure-capture blocker stands; see
+/// plans/2026-08-13_a3-provider-core-blocker.md). Ambient runtime
 /// input/emit builtins are intentionally absent from agent execution.
 pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), VmError> {
     let mut registry = HostFunctionRegistry::restricted();
