@@ -18,11 +18,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The agent depends on pd-vm through the path dependency `../rustscript`,
-  # and Cargo.lock in this repository is generated against exactly this core
-  # revision. CI checks out the core at this revision so `--locked` builds
-  # resolve. Bump this only together with a Cargo.lock refresh.
-  RUSTSCRIPT_CORE_REF: 06b37fd155be2b81ba4b41dbb6514e7b283f4f10
+  # The agent consumes pd-vm / pd-host-function from the canonical HTTPS Git
+  # remote, pinned to a full revision in Cargo.toml; Cargo.lock records that
+  # exact git source. `--locked` builds fetch exactly that revision from
+  # github.com into the cargo git cache — no sibling checkout of the core
+  # repository is required or used (tests/dependency_pin_tests.rs enforces
+  # the canonical source and full revision; bump only together with a
+  # Cargo.lock refresh).
   # Integration tests place temporary SQLite state and fixture scripts
   # here. Every suite honors this variable; without it they fall back to
   # /mnt/TEMP/rustscript/... which is the local-development default and
@@ -38,23 +40,6 @@ jobs:
         # Full-SHA pin, matching the rustscript-lang/rustscript CI policy
         # (actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5).
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          # The agent must live in a directory named `rustscript-agent`
-          # relative to $GITHUB_WORKSPACE so the `path = "../rustscript"`
-          # dependency in Cargo.toml resolves to the sibling core checkout
-          # below. An explicit path keeps this independent of the default
-          # workspace-root layout; every run step below uses
-          # `working-directory: rustscript-agent` for the same reason.
-          path: rustscript-agent
-
-      - name: Checkout pinned RustScript core (path dependency)
-        # Full-SHA pin, same policy as the sibling checkout above.
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          repository: rustscript-lang/rustscript
-          # Sibling of the agent checkout, resolving `../rustscript`.
-          path: rustscript
-          ref: ${{ env.RUSTSCRIPT_CORE_REF }}
 
       - name: Install Rust toolchain
         # Full-SHA pin, matching the rustscript-lang/rustscript CI policy
@@ -63,25 +48,26 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry and build target
+      - name: Cache cargo registry, git db, and build target
         # Full-SHA pin of the v2 tag (verified: v2 →
-        # 6323deb102c322ba6fcbdcafc7e3dddab59af2b6).
+        # 6323deb102c322ba6fcbdcafc7e3dddab59af2b6). Caches the fetched
+        # pinned core revision (cargo git db) plus registry and build
+        # target, so `cargo fetch`/test runs stay correct and fast.
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Format check
-        working-directory: rustscript-agent
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings denied)
-        working-directory: rustscript-agent
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
-      # The default suite runs all non-ignored tests. #[ignore]d suites
-      # (core repro driver and blocked provider parse/stream tests) stay
-      # excluded until the core contract gate clears — see
+      # The default suite runs all non-ignored tests. The only remaining
+      # #[ignore]d suites are the openai_responses / anthropic_messages
+      # placeholder references (not_implemented adapter stubs — pure agent
+      # work, unrelated to the core contract gate); the core repro driver
+      # and all OpenAI Chat suites run by default — see
       # plans/2026-08-13_a3-provider-core-blocker.md.
       - name: Test (workspace, all features, all targets)
-        working-directory: rustscript-agent
         run: cargo test --locked --all-features --all-targets
 
       # Whitespace diagnostic: `git diff --check` reports trailing-whitespace
@@ -89,7 +75,6 @@ jobs:
       # with no drift it is a no-op, which is the point — the authoritative
       # gate below is what actually fails on drift.
       - name: No whitespace errors in tracked changes
-        working-directory: rustscript-agent
         run: git diff --check
 
       # Fail on real drift instead: every step above must leave the working
@@ -99,7 +84,6 @@ jobs:
       # catches tests writing state into the checkout instead of
       # $RUSTSCRIPT_AGENT_TEST_TMP, and any file a step leaves behind.
       - name: Working tree must stay clean (tracked and untracked)
-        working-directory: rustscript-agent
         run: |
           status="$(git status --porcelain)"
           if [[ -n "$status" ]]; then

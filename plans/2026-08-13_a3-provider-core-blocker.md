@@ -1,20 +1,38 @@
 # A3 Provider Adapter Core Blocker
 
-Date: 2026-08-13 (updated 2026-08-13 after agent-side review passes: P3 evidence, wire-guard precision, and doc accuracy)
-Branch: `scope/agent-a3`
-Core checkout: `/mnt/TEMP/rustscript/agent-roadmap/rustscript` at `plan/callable-stream-integration` (06b37fd)
+Date: 2026-08-13 (re-evaluated 2026-08-15 after consuming the final core revision)
+Implementation: merged into `master` at `946e307`; A3 consume commit updates the dependency pin
+Core dependency: `https://github.com/rustscript-lang/rustscript.git` at full revision `fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e`
+
+Core implementation plan:
+[`2026-08-14_a3-rustscript-core-unblock.md`](2026-08-14_a3-rustscript-core-unblock.md)
 
 ## Status
 
+The 2026-08-15 consume pinned the final core revision `fd4b570…` (B1–B4
+plus the callable-streaming base plus the §11a parameter-liveness fix). The
+four A3 core blockers are fixed at the repro level and the residual
+slot-aliasing defect is cleared: `tests/core_repro_driver.rs` runs by
+default with every probe positive (including the converted five-parameter
+caller probe), the dependency pin is canonical HTTPS Git with no path
+dependency, the streaming adapter (`openai_chat_stream`) is implemented
+with `http::client::sse` exposed in the restricted registry, and the eight
+OpenAI Chat provider suites run by default and pass against the recorded
+wire fixtures (buffered, stream aggregation, cancellation, and the
+EOF-without-`[DONE]` fail-closed guard). No schema
+guard is bypassed and no fixture is weakened.
+
 A3 "shared adapters handle non-stream/stream text, tool calls, usage, reasoning
 fields, provider errors, and cancellation; profiles reuse adapters without
-copied parsers" is **partially blocked** by core compiler defects. Four suites
+copied parsers" is **implemented**. The four Responses/Anthropic suites remain
+placeholder `#[ignore]`d (adapter work, unrelated to core). Four suites
 are green (`openai_chat_provider_error_is_structured`, the P1 wire-format
 guard `openai_chat_wire_format_is_standard`, and the two marker-splice
 preservation guards `openai_chat_wire_preserves_marker_like_user_text` /
-`openai_chat_wire_preserves_marker_like_tool_schema`); the remaining
-non-stream suites and all streaming work are `#[ignore]`d until the core is
-fixed (see `tests/provider_tests.rs` module doc).
+`openai_chat_wire_preserves_marker_like_tool_schema`); the eight OpenAI
+Chat buffered/stream/cancellation suites run by default and pass at
+`fd4b570…`, including the EOF-without-`[DONE]` fail-closed guard (see
+`tests/provider_tests.rs` module doc).
 
 ## Symptom
 
@@ -117,7 +135,7 @@ Committed root-module probe (fails with the exact error above):
 `tests/fixtures/core-repros/closure_assign_root.rss`, plus the read-only
 control `closure_read_root.rss` (reads through `state.copy()` — the exact
 remedy the error message suggests — and passes). Driven by
-`tests/core_repro_driver.rs` (ignored by default).
+`tests/core_repro_driver.rs` (the negative control runs by default).
 
 ## Additional compile-time limitations of the same revision (worked around in the adapter source)
 
@@ -246,24 +264,27 @@ adapter module, so any future core fix must keep them working:
 ## Exact commands
 
 ```bash
-# Core blocker repro (runtime): compile + run the committed repro set
-cd /mnt/TEMP/rustscript/agent-roadmap/a3
-CARGO_TARGET_DIR=/mnt/TEMP/rustscript/agent-roadmap/target-a3 \
-  cargo test --test core_repro_driver -- --ignored --nocapture
-# Expect: 9 passed; root_splice/hop4 fail with typed TypeMismatch,
-#         root_splice2/hop13 pass as controls, closure_assign fails with
-#         the capture-move compile rejection, closure_read passes,
-#         compile-time repros rejected.
+# Core blocker repro set at the pinned revision: runs by default as the
+# B1–B4 regression guard.
+cd /home/wow/rustscript/rustscript-agent
+cargo test --test core_repro_driver
+# Expect: 11 passed, 0 ignored. root_splice/hop4/tailif/json_enc_e/letif_a
+# pass (B1/B2 fixed), closure_assign still rejected (preserved move
+# semantics), and BOTH param_aliasing probes pass (five-parameter caller
+# converted from the residual-defect failure assertion to positive at
+# fd4b570; two-parameter control unchanged).
 #
-# Full adapter flow: the ignored suites fail at runtime with the same family:
-cargo test --test provider_tests -- --ignored
+# Full adapter flow: 12 passed, 4 ignored (stub-only placeholders):
+cargo test --test provider_tests
+cargo test --test provider_tests -- --ignored   # 4 placeholders pass asserting not_implemented
 ```
 
 The repro sources live in `tests/fixtures/core-repros/` (`chain_m1.rss`
 provides the accessor module; `hop*`, `root_splice*`, `tailif*`, `letif*`,
-`json_enc_e`, `closure_assign_root`, `closure_read_root` cover each trigger)
-and are independently runnable through `tests/core_repro_driver.rs` (ignored
-by default, documented in its header).
+`json_enc_e`, `closure_assign_root`, `closure_read_root` cover each trigger;
+`param_aliasing*` cover the former residual defect) and are independently
+runnable through `tests/core_repro_driver.rs` (runs by default; both
+`param_aliasing_*` probes are positive assertions at `fd4b570…`).
 
 ## What is committed and green
 
@@ -273,32 +294,36 @@ by default, documented in its header).
   (user content parts array, tool/assistant string content, empty
   `tool_choice` omitted, per-tool indexed tool-schema and user-parts
   splices), response/error parsing, content string+parts compatibility;
-  streaming stays a typed `not_implemented` stub (see stream blocker above).
+  streaming (`openai_chat_stream`) is implemented with an
+  `http::client::sse` shared-accumulator closure and passes the stream
+  suites at `fd4b570…`.
 - `rss/llm/harness.rss` — test dispatch entry (no protocol logic).
 - `rss/providers/*.rss` — OpenRouter, DeepSeek, OpenCode Zen, OpenCode Go,
   custom profiles reusing the shared adapter (no copied parsers).
 - `tests/provider_tests.rs` — fixture server infrastructure, canonical
-  request/profile construction, 4 green suites (provider error, P1 wire
-  format, and the two marker-preservation guards), 11 documented ignored
-  suites (buffered parse, streaming, and blocked references for the
-  openai_responses/anthropic fixtures).
+  request/profile construction, 12 green suites (provider error, P1 wire
+  format, the two marker-preservation guards, and the eight OpenAI Chat
+  buffered/stream/cancellation suites including the EOF-without-`[DONE]`
+  fail-closed guard), 4 documented ignored
+  placeholder-reference suites for the openai_responses/anthropic fixtures.
 - `tests/fixtures/providers/**` — transcripts for chat buffered/stream,
   responses (event-typed SSE: `event:` lines matching `data.type` with a
   final `data: [DONE]`), anthropic, and error/malformed payloads.
 - `tests/fixtures/core-repros/` + `tests/core_repro_driver.rs` — committed,
-  independently runnable minimal repro set for the core blocker (runtime
-  schema corruption, strict-typing limits, closure capture-move).
+  independently runnable repro set for the B1–B4 fixes (positive) plus the
+  fd4b570 probe pair (`param_aliasing_*`) and its two-parameter control,
+  all positive and run by default.
 - `src/runtime/rss_runner.rs` — restricted registry exposes only consumed
-  capabilities: JSON, stream emit, `bytes::to_utf8`, SQLite, and
-  `http::client::request`. `bytes::from_utf8` and `http::client::sse` were
-  removed (no RSS consumer; see stream blocker).
+  capabilities: JSON, stream emit, `bytes::to_utf8`, SQLite,
+  `http::client::request`, and `http::client::sse` (consumed by the
+  streaming adapter since core revision fd4b570).
 
-## Still open when the core clears
+## Still open
 
-- Buffered response parsing suites (text/usage/reasoning, tool calls,
-  malformed payload, invalid JSON).
-- `openai_chat_stream` implementation (`http::client::sse` chunk
-  aggregation) plus its text/usage, tool-call chunk aggregation, and typed
-  cancellation suites.
+- Nothing: the eight OpenAI Chat suites run by default and pass at
+  `fd4b570…` (the residual slot-aliasing defect is fixed in core; repro and
+  fix record: unblock plan §11a).
 - `openai_responses` and `anthropic_messages` adapters (currently typed
+  `not_implemented` stubs) with their buffered/streaming transcripts — pure
+  agent work, unrelated to the core defect.
   `not_implemented` stubs) with their buffered/streaming transcripts.

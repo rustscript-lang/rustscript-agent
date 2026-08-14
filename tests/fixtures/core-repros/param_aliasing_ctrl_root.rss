@@ -1,0 +1,8 @@
+// Root for the fd4b570 slot-aliasing control (param_aliasing_ctrl_m2).
+use self::param_aliasing_ctrl_m2 as adapter;
+
+pub fn run(context: map) -> map {
+    let request: map = context["request"];
+    let cfg: map = { provider: "p", model: "m", base_url: "http://127.0.0.1:1", api_key: "k" };
+    adapter::chat_send_complete(request, cfg)
+}

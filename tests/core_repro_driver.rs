@@ -1,37 +1,52 @@
-//! Executable driver for the minimal core-blocker repro set.
+//! Executable driver for the A3 core-blocker repro set.
 //!
 //! The repro sources in `tests/fixtures/core-repros/` exercise the pd-vm
-//! callable-schema corruption documented in
-//! `plans/2026-08-13_a3-provider-core-blocker.md`:
+//! behaviors that blocked the A3 provider adapters before core revision
+//! `fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e` (B1–B4 plus the residual
+//! parameter-liveness fix):
 //!
 //! - `root_splice.rss` (+ `chain_m1.rss` accessor module): passing a
-//!   cross-module-accessor ARRAY result into a script function corrupts the
-//!   callee's prototype schema at runtime (`TypeMismatch("callable return
-//!   schema")` / `TypeMismatch("string")`).
-//! - `root_splice2.rss`: the same call with a literal `[]` argument passes —
-//!   control isolating the trigger to the cross-module array value.
-//! - `hop4_m2.rss` / `hop4_root.rss`: a function with two map parameters that
-//!   string-reads its FIRST map parameter and passes the second onward fails.
-//! - `hop13_m2.rss` / `hop13_root.rss`: the same layout reading the SECOND map
-//!   parameter instead passes — the documented workaround.
+//!   cross-module-accessor ARRAY result into a script function used to
+//!   corrupt the callee's prototype schema at runtime
+//!   (`TypeMismatch("callable return schema")` / `TypeMismatch("string")`).
+//!   B1 (callable schema identity across module merging) fixed it.
+//! - `root_splice2.rss`: the identical call with a literal `[]` argument —
+//!   control that always passed.
+//! - `hop4_m2.rss` / `hop4_root.rss`: a function with two map parameters
+//!   that string-reads its FIRST map parameter and passes the second onward
+//!   used to fail; `hop13_m2.rss` / `hop13_root.rss` (reading the SECOND map
+//!   parameter) was the documented workaround. B1 fixed both layouts.
 //! - `json_enc_e.rss`, `letif_a.rss`, `tailif_m2.rss` (+ `tailif_root.rss`):
-//!   compile-time strict-typing limits (annotated lets with unprovable
-//!   initializers inside tail-position expression-if branches).
-//! - `closure_assign_root.rss` (+ `closure_read_root.rss` control): the
-//!   frontend availability pass rejects closures that by-value-use a captured
-//!   local (`local 'x' was moved earlier; use 'x.copy()' ...`), so the SSE
-//!   delta-aggregation pattern (accumulate into a shared accumulator from an
-//!   `http::client::sse` callback) is unexpressible even in a root module.
+//!   annotated lets with unprovable initializers inside tail-position
+//!   expression-if branches were rejected by strict typing. B2 (branch-aware
+//!   expression-block type collection) fixed them.
+//! - `closure_assign_root.rss`: the frontend availability pass used to
+//!   reject closures that by-value-use a captured local
+//!   (`local 'state' was moved earlier; use 'state.copy()' ...`). B3 made
+//!   MUTATION of a captured mutable local select `BorrowMut` (shared capture
+//!   cells), which is what the SSE delta-aggregation pattern needs; a pure
+//!   by-value use of a movable value remains a move, so this probe stays a
+//!   NEGATIVE control (it must still be rejected).
+//! - `closure_read_root.rss`: the `.copy()` capture control — always passed.
 //!
-//! This driver is `#[ignore]`d by default: it documents and re-verifies the
-//! core blocker on demand. Run with:
+//! The residual slot-aliasing defect reported at d8cf291 (plan §11a) is
+//! fixed by `fd4b570` (`fix(compiler): keep parameters live for the whole
+//! body`): the liveness allocator now seeds parameter slots into the body
+//! live-out and re-marks them after every statement, so a local defined
+//! after body entry can no longer be colored onto a parameter slot. The
+//! committed probe pair `param_aliasing_root.rss` /
+//! `param_aliasing_ctrl_root.rss` guards the fix: the identical parse
+//! chain now passes from BOTH the two-parameter caller (control) and the
+//! five-parameter caller (the former `type mismatch: expected string`
+//! trigger), both run by default.
+//!
+//! This driver runs by default as the agent-side regression guard for the
+//! B1–B4 consume (see `plans/2026-08-14_a3-rustscript-core-unblock.md`).
+//! The native core tests for the same behaviors live in the core repository.
 //!
 //! ```bash
-//! cargo test --test core_repro_driver -- --ignored --nocapture
+//! cargo test --test core_repro_driver
 //! ```
-//!
-//! It must NOT be un-ignored until the core emits correct callable schemas for
-//! every script prototype in non-root modules.
 
 use std::path::PathBuf;
 
@@ -87,93 +102,75 @@ fn run_repro(name: &str) -> Result<Value, String> {
         .map_err(|error| error.to_string())
 }
 
-/// The core blocker: a cross-module accessor array result passed to a script
-/// function fails the runtime callable-schema guard.
-#[ignore = "core callable-schema corruption repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// B1: a cross-module accessor array result passed to a script function now
+/// keeps the callee's schema intact (was `TypeMismatch("string")`).
 #[test]
-fn root_splice_cross_module_array_corrupts_callee_schema() {
-    let error = run_repro("root_splice.rss").expect_err("root_splice must fail");
+fn root_splice_cross_module_array_preserves_callee_schema() {
+    let result = run_repro("root_splice.rss").expect("root_splice must run");
     assert!(
-        error.contains("type mismatch") || error.contains("TypeMismatch"),
-        "expected a typed VM schema failure, got: {error}"
+        format!("{result:?}").contains("kind"),
+        "expected the probe result, got: {result:?}"
     );
 }
 
-/// Control: the identical call with a literal array argument succeeds.
-#[ignore = "core callable-schema corruption repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// Control: the identical call with a literal array argument.
 #[test]
 fn root_splice2_literal_array_control_passes() {
     let result = run_repro("root_splice2.rss").expect("root_splice2 must pass");
     assert!(format!("{result:?}").contains("kind"));
 }
 
-/// Two-map function reading its FIRST map parameter fails.
-#[ignore = "core callable-schema corruption repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// B1: the two-map function reading its FIRST map parameter now passes (the
+/// former `hop4` corruption trigger).
 #[test]
-fn hop4_two_map_first_read_fails() {
-    let error = run_repro("hop4_root.rss").expect_err("hop4 must fail");
-    assert!(
-        error.contains("type mismatch") || error.contains("TypeMismatch"),
-        "expected a typed VM schema failure, got: {error}"
-    );
+fn hop4_two_map_first_read_passes() {
+    let result = run_repro("hop4_root.rss").expect("hop4 must pass");
+    assert!(format!("{result:?}").contains("kind"));
 }
 
-/// Control: the same layout reading the SECOND map parameter passes.
-#[ignore = "core callable-schema corruption repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// Control: the same layout reading the SECOND map parameter.
 #[test]
 fn hop13_two_map_second_read_passes() {
     let result = run_repro("hop13_root.rss").expect("hop13 must pass");
     assert!(format!("{result:?}").contains("kind"));
 }
 
-/// Compile-time limit: annotated let with json::encode initializer inside an
-/// expression-if branch is rejected by strict typing.
-#[ignore = "core compile-time limit repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// B2: annotated let with json::encode initializer inside an expression-if
+/// branch now compiles and runs.
 #[test]
-fn json_enc_e_annotated_let_in_expr_if_branch_is_rejected() {
-    let error = run_repro("json_enc_e.rss").expect_err("json_enc_e must fail to compile/run");
+fn json_enc_e_annotated_let_in_expr_if_branch_compiles() {
+    let result = run_repro("json_enc_e.rss").expect("json_enc_e must compile/run");
     assert!(
-        error.contains("concrete compile-time type"),
-        "expected a compile rejection, got: {error}"
+        format!("{result:?}").contains("text"),
+        "expected the branch value, got: {result:?}"
     );
 }
 
-/// Compile-time limit: annotated let with literal initializer inside an
-/// expression-if branch is rejected by strict typing.
-#[ignore = "core compile-time limit repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// B2: annotated let with literal initializer inside an expression-if branch
+/// now compiles and runs.
 #[test]
-fn letif_a_literal_let_in_expr_if_branch_is_rejected() {
-    let error = run_repro("letif_a.rss").expect_err("letif_a must fail to compile/run");
+fn letif_a_literal_let_in_expr_if_branch_compiles() {
+    let result = run_repro("letif_a.rss").expect("letif_a must compile/run");
     assert!(
-        error.contains("concrete compile-time type"),
-        "expected a compile rejection, got: {error}"
+        format!("{result:?}").contains("literal"),
+        "expected the branch value, got: {result:?}"
     );
 }
 
-/// Compile-time limit: annotated let inside a TAIL expression-if branch is
-/// rejected by strict typing.
-#[ignore = "core compile-time limit repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// B2: annotated let inside a TAIL expression-if branch now compiles.
 #[test]
-fn tailif_m2_annotated_let_in_tail_expr_if_is_rejected() {
-    let error = run_repro("tailif_root.rss").expect_err("tailif must fail to compile/run");
-    assert!(
-        error.contains("concrete compile-time type"),
-        "expected a compile rejection, got: {error}"
-    );
+fn tailif_m2_annotated_let_in_tail_expr_if_compiles() {
+    let result = run_repro("tailif_root.rss").expect("tailif must compile/run");
+    assert!(format!("{result:?}").contains("kind"));
 }
 
-/// The SSE stream blocker, isolated: a closure that by-value-uses a captured
-/// local (a move in RustScript's move semantics; closure bodies are single
-/// expressions, so the accumulator read is the expressible form of the
-/// aggregation pattern) forces the availability pass to move that local, so
-/// any later use outside the closure is rejected at compile time with
-/// `local '<name>' was moved earlier; use '<name>.copy()' ...`. This is the
-/// aggregation pattern `http::client::sse` needs (a callback accumulating
-/// deltas into a shared accumulator) and it fails identically in a minimal
-/// root module.
-#[ignore = "core compile-time limit repro (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// B3 negative control: a closure that by-value-uses a captured movable
+/// local still forces a move, so the later external use must still be
+/// rejected at compile time with the `state.copy()` remedy. B3 shares
+/// MUTATION captures (`BorrowMut` cells); pure by-value reads keep their
+/// move semantics.
 #[test]
-fn closure_assign_captured_local_then_external_use_is_rejected() {
+fn closure_assign_by_value_capture_still_rejects_external_use() {
     let error =
         run_repro("closure_assign_root.rss").expect_err("closure_assign must fail to compile/run");
     assert!(
@@ -182,13 +179,38 @@ fn closure_assign_captured_local_then_external_use_is_rejected() {
     );
 }
 
-/// Control for the closure blocker: the identical closure shape reading the
-/// captured local through `state.copy()` (the exact remedy the error message
-/// suggests) leaves the local usable outside, so the probe compiles and runs
-/// — the by-value capture is the trigger.
-#[ignore = "core compile-time limit repro control (see plans/2026-08-13_a3-provider-core-blocker.md)"]
+/// Control for the closure semantics: reading the captured local through
+/// `state.copy()` leaves the local usable outside, so the probe runs.
 #[test]
 fn closure_read_captured_local_control_passes() {
     let result = run_repro("closure_read_root.rss").expect("closure_read must pass");
     assert!(format!("{result:?}").contains("ok"));
+}
+
+/// fd4b570 (plan §11a fix): the five-parameter caller calling the shared
+/// parse chain through an expression-if now passes the VM callable-schema
+/// check. Before the fix (d8cf291) the local-slot colorer could alias a
+/// parameter slot with a local not live at body entry and the call failed
+/// with `type mismatch: expected string` although every value was
+/// correctly typed; the identical chain from a two-parameter caller
+/// (`param_aliasing_ctrl_root.rss`) always passed. Both probes run by
+/// default as the regression guard for the fd4b570 parameter-liveness fix.
+#[test]
+fn param_aliasing_five_param_caller_passes_vm_schema_check() {
+    let result = run_repro("param_aliasing_root.rss").expect("param_aliasing must pass");
+    assert!(
+        format!("{result:?}").contains("ok"),
+        "expected the parsed response, got: {result:?}"
+    );
+}
+
+/// Control for the fd4b570 repro: the identical parse chain and canned
+/// body called from a two-parameter caller.
+#[test]
+fn param_aliasing_two_param_caller_control_passes() {
+    let result = run_repro("param_aliasing_ctrl_root.rss").expect("control must pass");
+    assert!(
+        format!("{result:?}").contains("ok"),
+        "expected the control result, got: {result:?}"
+    );
 }

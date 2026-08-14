@@ -7,36 +7,48 @@ treated as available.
 
 ## 1. Delivery constraint: the core dependency is not released
 
-`rustscript-agent` depends on the RustScript VM through a **path
-dependency** (`pd-vm = { path = "../rustscript", ... }` in `Cargo.toml`).
+`rustscript-agent` depends on the RustScript VM through a **pinned Git
+dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e", ... }` in `Cargo.toml`.
 Consequences, stated plainly:
 
-- A build requires a checkout of `rustscript-lang/rustscript` next to this
-  repository (the agent repo at `<root>/rustscript-agent`, the core repo at
-  `<root>/rustscript`), at a revision whose `pd-vm` 0.1.0 matches this
-  repository's `Cargo.lock`.
-- The lockfile in this revision was generated against core revision
-  `06b37fd155be2b81ba4b41dbb6514e7b283f4f10` (branch
-  `plan/callable-stream-integration`). `cargo build/test --locked` fails if
-  the checked-out core revision no longer matches.
+- A build fetches the exact pinned core revision from the canonical HTTPS
+  remote into the local Cargo git cache. **No sibling checkout of the core
+  repository is required** — there is no `path` dependency, and CI builds
+  the same locked manifest without one.
+- `cargo build/test --locked` resolves the core source from `Cargo.lock`,
+  which records the canonical git source for both `pd-vm` and
+  `pd-host-function`:
+  `git+https://github.com/rustscript-lang/rustscript.git?rev=fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e#fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e`.
+  A build therefore needs network access to github.com (or a pre-warmed
+  Cargo git cache); it never reads the state of a local core checkout.
 - **There is no crates.io release of this crate, and none can be made until
   the core (`pd-vm`, `pd-host-function`, and their dependency edges) is
-  merged and published and the path dependency is replaced by a version
-  dependency.** CI pins the same core revision for exactly this reason.
-- Deployments therefore run from a source build of a pinned agent commit
-  plus a pinned core commit; record both revisions together in the
-  deployment manifest. Do not claim a "release" for a build of this branch.
+  merged and published and the Git dependency is replaced by a version
+  dependency.** CI pins the same locked source for exactly this reason.
+- Deployments therefore run from a source build of a pinned agent commit;
+  the core revision is fixed by the manifest and lockfile, so record the
+  agent commit (the lockfile already records the core revision). Do not
+  claim a "release" for a build of this branch.
 
 ## 2. Build
 
 ```bash
-# sibling checkouts required (see section 1)
 git clone https://github.com/rustscript-lang/rustscript-agent.git
-git clone https://github.com/rustscript-lang/rustscript.git
 cd rustscript-agent
 git checkout <pinned agent revision>
-cd ../rustscript && git checkout 06b37fd155be2b81ba4b41dbb6514e7b283f4f10 && cd ../rustscript-agent
 cargo build --release --locked
+```
+
+No core checkout is needed; `--locked` fetches the exact git revision
+recorded in `Cargo.lock` (section 1). Verify the resolved core source
+before deploying:
+
+```bash
+# The lockfile records the exact git source for pd-vm and pd-host-function:
+grep -A3 'name = "pd-vm"' Cargo.lock
+#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=fd4b570…#fd4b570…"
+# The resolved dependency graph shows the same source:
+cargo tree --locked -p rustscript-vm
 ```
 
 Artifacts: `target/release/rustscript-agent` (single-run runner) and
@@ -280,11 +292,11 @@ RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db
 ## 12. Container example
 
 ```dockerfile
-# Build stage: requires the pinned core checkout next to the agent repo.
+# Build stage: `--locked` fetches the pinned core revision from the
+# canonical HTTPS remote (section 1); no core checkout is copied in.
 FROM rust:1-slim AS build
 WORKDIR /src
 COPY rustscript-agent/ ./rustscript-agent/
-COPY rustscript/ ./rustscript/
 RUN cd rustscript-agent && cargo build --release --locked --bin rustscript-agent-gateway
 
 FROM debian:bookworm-slim

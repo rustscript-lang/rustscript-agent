@@ -1,0 +1,26 @@
+// Control for the fd4b570 slot-aliasing regression probe: the SAME parse
+// chain and the SAME canned body, but the caller has two parameters. This
+// shape passed even at d8cf291, isolating the corruption to the caller's
+// parameter-slot layout.
+use self::chain_m1 as types;
+use self::param_aliasing_parse as parse;
+
+pub fn chat_send_complete(request: map, cfg: map) -> map {
+    let provider: string = types::request_string(cfg, "provider");
+    let body: map = {
+        choices: [
+            {
+                index: 0,
+                message: { role: "assistant", content: "hi" },
+                finish_reason: "stop"
+            }
+        ],
+        usage: { prompt_tokens: 12, completion_tokens: 15, total_tokens: 27 }
+    };
+    let status: int = 200;
+    if status >= 200 && status < 300 => {
+        parse::chat_parse_response_body(body, status, provider)
+    } else => {
+        parse::fail(parse::error_new(status, "api_error", "http_error", "provider request failed", "", ""))
+    }
+}

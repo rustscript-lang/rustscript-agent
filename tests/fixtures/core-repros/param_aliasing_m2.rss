@@ -1,0 +1,39 @@
+// fd4b570 slot-aliasing regression probe: a five-parameter caller whose
+// four used parameters (model, base_url, api_key, provider; `request` is
+// unused by the canned body) call the shared parse chain through an
+// expression-if. At d8cf291 this failed the VM callable-schema check with
+// `type mismatch: expected string` because the local-slot colorer could
+// alias a parameter slot with a local not live at body entry; fd4b570
+// (`fix(compiler): keep parameters live for the whole body`) fixed it.
+// The identical parse chain from the two-parameter control caller
+// (param_aliasing_ctrl_m2.rss) always passed, isolating the corruption to
+// the caller's parameter-slot layout (see
+// plans/2026-08-14_a3-rustscript-core-unblock.md section 11a).
+use self::chain_m1 as types;
+use self::param_aliasing_parse as parse;
+
+pub fn chat_send_complete(
+    request: map,
+    model: string,
+    base_url: string,
+    api_key: string,
+    provider: string
+) -> map {
+    let body: map = {
+        choices: [
+            {
+                index: 0,
+                message: { role: "assistant", content: "hi" },
+                finish_reason: "stop"
+            }
+        ],
+        usage: { prompt_tokens: 12, completion_tokens: 15, total_tokens: 27 }
+    };
+    let status: int = 200;
+    let tag: string = model + base_url + api_key;
+    if status >= 200 && status < 300 => {
+        parse::chat_parse_response_body(body, status, provider)
+    } else => {
+        parse::fail(parse::error_new(status, "api_error", "http_error", "provider request failed " + tag, "", ""))
+    }
+}

@@ -10,13 +10,18 @@
 // replaces ALL occurrences — see the plan's P3 marker note for the collision
 // surface).
 //
-// Compiler-contract notes for this adapter module (non-root module):
-// - Script-function calls inside statement-if bodies are rejected by the
-//   runtime callable-schema guard in this compiler revision, so call
-//   dispatch uses expression-if branches and top-level statements; calls
-//   inside `while` bodies (including nested statement-ifs) are safe.
+// Compiler-contract notes for this adapter module (non-root module). Before
+// core revision d8cf291 the emitted callable schemas were corrupted for a
+// subset of call sites, and the notes below documented the worked-around
+// layout. B1–B4 plus the residual parameter-liveness fix (fd4b570; see
+// plans/2026-08-14_a3-rustscript-core-unblock.md) fixed the root causes;
+// the layout workarounds below remain as the adapter's stable shape:
+// - Script-function calls inside statement-if bodies were rejected by the
+//   runtime callable-schema guard; call dispatch therefore uses
+//   expression-if branches and top-level statements, and calls inside
+//   `while` bodies (including nested statement-ifs) are safe.
 // - Annotated locals whose initializer type the checker cannot prove (for
-//   example `json::encode` results) must live at function top level or in
+//   example `json::encode` results) live at function top level or in
 //   helpers with declared return types, never in expression-if branches.
 // - `bytes::to_utf8` requires a concretely typed argument, so the body is
 //   read into an annotated `bytes` local first.
@@ -111,10 +116,9 @@ pub fn openai_chat_call(request: map, profile: map) -> map {
 }
 
 /// Reads the profile fields (the only map read in this function) and hands
-/// them to the transport as primitives. The parameter order matters: this
-/// compiler revision corrupts the runtime callable schema when a function
-/// with two map parameters string-reads its FIRST map parameter and passes
-/// the other map onward, so `profile` (the read map) sits second.
+/// them to the transport as primitives. The parameter order is a retained
+/// layout workaround (see the file header): `profile` (the read map) sits
+/// second.
 fn openai_chat_complete_dispatch(request: map, profile: map) -> map {
     let base_url: string = types::profile_string(profile, "base_url");
     let api_key: string = types::profile_string(profile, "api_key");
@@ -622,11 +626,33 @@ fn chat_error_payload(body_text: string) -> map {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming — typed not_implemented stub. `http::client::sse` is NOT exposed
-// in the restricted registry (no consumer): the closure capture-move blocker
-// (see plans/2026-08-13_a3-provider-core-blocker.md) keeps this path typed
-// and unreachable until the core allows shared-accumulator callbacks.
+// Streaming — http::client::sse with a shared-accumulator closure
 // ---------------------------------------------------------------------------
+//
+// Consumes core revision fd4b570 (B1–B4 plus the §11a parameter-liveness
+// fix): the callable-schema fix (B1), the shared mutable closure capture
+// fix (B3), and the parameter-slot liveness fix (fd4b570) make the SSE
+// delta-aggregation pattern expressible and the module graph pass the VM
+// callable-schema guard. The callback closure mutates captured accumulator
+// locals (`text`, `stop_reason`, usage counters, `tools`) through BorrowMut
+// capture cells; after the stream completes the same locals are read to
+// build the canonical response. `http::client::sse` is exposed in the
+// restricted registry (see `src/runtime/rss_runner.rs`).
+//
+// The transport validates status and Content-Type itself: a non-2xx SSE
+// response fails the invocation as a typed host error, so the summary map
+// is not inspected for transport-level failures.
+//
+// Fail-closed contract (A3 review P2): the stream summary map carries
+// `outcome` — `"stopped"` when the callback returned `{action: "stop"}`
+// (the `[DONE]` terminator path) and `"eof"` when the server closed the
+// body without a stop (the callback sees the transport terminal
+// `kind: "end"` item and continues). A legal `[DONE]` stream must succeed,
+// so the shared `done` accumulator is set exactly where the callback
+// stops; EOF without `[DONE]` — partial text included — must fail closed
+// as a typed provider error instead of surfacing the partial accumulation
+// as `ok`. Cancellation never reaches this check: it fails the invocation
+// as a typed `Cancelled` error before the summary exists.
 
 fn openai_chat_stream_dispatch(request: map, profile: map) -> map {
     let base_url: string = types::profile_string(profile, "base_url");
@@ -636,5 +662,173 @@ fn openai_chat_stream_dispatch(request: map, profile: map) -> map {
 }
 
 fn openai_chat_stream(request: map, base_url: string, api_key: string, provider: string) -> map {
-    types::fail(types::error_request("not_implemented", "openai_chat streaming is not implemented"))
+    let model: string = types::request_string(request, "model");
+    if model == "" => {
+        types::fail(types::error_request("missing_model", "request.model is required"))
+    } else => {
+        chat_send_stream(request, model, base_url, api_key, provider)
+    }
+}
+
+/// The whole streaming path: wire building (same splices as the buffered
+/// path, with `stream: true` + `stream_options.include_usage`), the SSE
+/// transport with the accumulator closure, and canonical response
+/// construction from the accumulated locals.
+fn chat_send_stream(
+    request: map,
+    model: string,
+    base_url: string,
+    api_key: string,
+    provider: string
+) -> map {
+    let body_text: string = chat_encode_wire(request, model, true);
+    let url: string = base_url + "/chat/completions";
+    let body: string = chat_splice_tool_schemas(
+        chat_splice_user_parts(body_text, types::request_array(request, "messages")),
+        types::request_array(request, "tools")
+    );
+    let mut text: string = "";
+    let mut stop_reason: string = "";
+    let mut input_tokens: int = 0;
+    let mut output_tokens: int = 0;
+    let mut total_tokens: int = 0;
+    let mut tools: array = [];
+    let mut done = false;
+    let stream_result: map = http::client::sse({
+        method: "POST",
+        url: url,
+        headers: {
+            "content-type": "application/json",
+            "authorization": "Bearer " + api_key
+        },
+        body: body
+    }, |item| if item["kind"] == "event" => {
+        let data: string = item["data"].copy();
+        if data == "[DONE]" => {
+            done = true;
+            { action: "stop" }
+        } else => {
+            let chunk: map = json::decode(data);
+            let choices: array = types::request_array(chunk, "choices");
+            if choices.length > 0 => {
+                let choice: map = types::array_entry(choices, 0);
+                let delta: map = types::request_map(choice, "delta");
+                let content: string = types::request_string(delta, "content");
+                if content != "" {
+                    text = text + content;
+                }
+                let reason: string = types::request_string(choice, "finish_reason");
+                if reason != "" {
+                    stop_reason = reason;
+                }
+                let call_deltas: array = types::request_array(delta, "tool_calls");
+                if call_deltas.length > 0 {
+                    tools = chat_stream_merge_tool_calls(tools, call_deltas);
+                }
+                { action: "continue" }
+            } else => {
+                let usage: map = types::request_map(chunk, "usage");
+                if usage.has("total_tokens") {
+                    input_tokens = types::request_int(usage, "prompt_tokens", 0);
+                    output_tokens = types::request_int(usage, "completion_tokens", 0);
+                    total_tokens = types::request_int(usage, "total_tokens", 0);
+                }
+                { action: "continue" }
+            }
+        }
+    } else => {
+        { action: "continue" }
+    });
+    let outcome: string = types::request_string(stream_result, "outcome");
+    let status: int = types::request_int(stream_result, "status", 0);
+    if done && outcome == "stopped" => {
+        types::ok(types::response_new(
+            text,
+            chat_stream_parse_tool_calls(tools),
+            types::usage_new(input_tokens, output_tokens, total_tokens),
+            "",
+            stop_reason
+        ))
+    } else => {
+        types::fail(types::error_new(
+            status,
+            "api_error",
+            "stream_eof_without_done",
+            "provider stream ended without [DONE] terminator",
+            "",
+            ""
+        ))
+    }
+}
+
+/// Merges one chunk's tool-call deltas into the accumulator list. Each entry
+/// is `{index, id, name, args}`; a delta whose `index` already exists fills
+/// missing `id`/`name` and appends its `arguments` fragment to `args`.
+/// Returns a new array (the caller assigns the result back to the captured
+/// accumulator).
+fn chat_stream_merge_tool_calls(tools: array, deltas: array) -> array {
+    let mut merged: array = tools;
+    let mut i = 0;
+    while i < deltas.length {
+        let delta: map = types::array_entry(deltas, i);
+        let index: int = types::request_int(delta, "index", -1);
+        let id: string = types::request_string(delta, "id");
+        // The OpenAI wire places the tool-call name inside the nested
+        // `function` object (`function.name`); there is no top-level
+        // `name` field on the delta.
+        let function: map = types::request_map(delta, "function");
+        let name: string = types::request_string(function, "name");
+        let fragment: string = types::request_string(function, "arguments");
+        let mut found = false;
+        let mut j = 0;
+        while j < merged.length {
+            let existing: map = types::array_entry(merged, j);
+            if types::request_int(existing, "index", -1) == index {
+                let mut updated: map = existing;
+                if id != "" {
+                    updated["id"] = id;
+                }
+                if name != "" {
+                    updated["name"] = name;
+                }
+                if fragment != "" {
+                    updated["args"] = types::request_string(updated, "args") + fragment;
+                }
+                merged[j] = updated;
+                found = true;
+            }
+            j += 1;
+        }
+        if !found {
+            merged[merged.length] = {
+                index: index,
+                id: id,
+                name: name,
+                args: fragment
+            };
+        }
+        i += 1;
+    }
+    merged
+}
+
+/// Converts the accumulator entries into canonical `{id, name, arguments}`
+/// tool calls, decoding each accumulated `arguments` JSON fragment.
+fn chat_stream_parse_tool_calls(tools: array) -> array {
+    let mut calls: array = [];
+    let mut i = 0;
+    while i < tools.length {
+        let entry: map = types::array_entry(tools, i);
+        let id: string = types::request_string(entry, "id");
+        let name: string = types::request_string(entry, "name");
+        let args_text: string = types::request_string(entry, "args");
+        let mut args: map = {};
+        if args_text != "" {
+            let decoded: map = json::decode(args_text);
+            args = decoded;
+        }
+        calls[calls.length] = types::tool_call_new(id, name, args);
+        i += 1;
+    }
+    calls
 }

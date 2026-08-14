@@ -6,34 +6,41 @@
 //! headers, body) and replay real provider transcripts from
 //! `tests/fixtures/providers/`.
 //!
-//! # Core blocker (pd-vm compiler revision on `plan/callable-stream-integration`)
+//! # Core consume (pd-vm compiler revision fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e)
 //!
-//! The non-stream response-parsing tests below are `#[ignore]`d because the
-//! core compiler emits corrupted callable-prototype schemas for calls made
-//! from adapter modules whose layout matches `rss/llm/openai_chat.rss`
-//! (multiple maps, cross-module accessor results, same-module helpers).
-//! At runtime the VM fails the callable argument/return schema guard with
-//! `Invocation(Vm(TypeMismatch("callable argument schema")))`,
-//! `TypeMismatch("callable return schema")`, or `TypeMismatch("string")`
-//! even though every value is correctly typed. The streaming suites are
-//! additionally blocked because the frontend availability pass rejects
-//! closures that by-value-use a captured local (`local 'x' was moved
-//! earlier; use 'x.copy()' ...`), so an `http::client::sse` callback cannot
-//! aggregate deltas into a shared accumulator; `http::client::sse` is
-//! therefore not exposed in the restricted registry.
+//! The four A3 core blockers are fixed in the pinned core revision (B1:
+//! callable-schema identity across module merging; B2: tail expression-if
+//! branch-local typing; B3: shared mutable closure captures; B4: runtime
+//! string-key map encoding — see
+//! `plans/2026-08-14_a3-rustscript-core-unblock.md`). The committed B1–B4
+//! regression set in `tests/fixtures/core-repros/` runs by default through
+//! `tests/core_repro_driver.rs` (positive assertions plus the preserved
+//! by-value-capture rejection control).
 //!
-//! Minimal repros and the exact commands are recorded in
-//! `plans/2026-08-13_a3-provider-core-blocker.md`; the committed, executable
-//! repro set lives in `tests/fixtures/core-repros/` and is driven by
-//! `tests/core_repro_driver.rs` (ignored by default). One trigger is avoided
-//! in the adapter source already (two-map functions must string-read only
-//! their SECOND map parameter; see `openai_chat_complete_dispatch`), but the
-//! remaining corruption reproduces even in a minimal root-module probe
-//! (`root_splice.rss`) and cannot be worked around from this repository.
-//! Four suites run green: the structured provider-error mapping
-//! (`openai_chat_provider_error_is_structured`), the P1 standard-wire guard
-//! (`openai_chat_wire_format_is_standard`), and the two marker-splice
-//! preservation guards (`openai_chat_wire_preserves_marker_like_user_text`,
+//! The residual slot-aliasing defect reported at d8cf291 (plan §11a) is
+//! fixed by `fd4b570` (`fix(compiler): keep parameters live for the whole
+//! body`): the liveness allocator seeds parameter slots into the body
+//! live-out and re-marks them after every statement, so a local defined
+//! after body entry can no longer be colored onto a parameter slot.
+//! The OpenAI Chat suites below run by default and pass against the
+//! pinned revision, including the streaming path (buffered, stream
+//! aggregation, cancellation, and the EOF-without-`[DONE]` fail-closed
+//! guard from the A3 review P2). The committed `param_aliasing_*` repro
+//! pair in `tests/fixtures/core-repros/` (driven by
+//! `tests/core_repro_driver.rs`) guards the fix independently of the wire
+//! fixtures.
+//!
+//! The streaming adapter is implemented and correct (`openai_chat_stream`
+//! in `rss/llm/openai_chat.rss`, with `http::client::sse` exposed in the
+//! restricted registry). The `openai_responses` and `anthropic_messages`
+//! adapters remain typed `not_implemented` stubs (no production adapter is
+//! claimed); their transcript-reference suites stay `#[ignore]`d until
+//! that agent work exists. Four buffered suites are green and remain so:
+//! the structured provider-error mapping
+//! (`openai_chat_provider_error_is_structured`), the P1 standard-wire
+//! guard (`openai_chat_wire_format_is_standard`), and the two marker-splice
+//! preservation guards
+//! (`openai_chat_wire_preserves_marker_like_user_text`,
 //! `openai_chat_wire_preserves_marker_like_tool_schema`).
 
 use std::fs;
@@ -374,7 +381,6 @@ fn error_of(result: &JsonValue) -> &JsonMap<String, JsonValue> {
 // S1: OpenAI Chat Completions, buffered
 // ---------------------------------------------------------------------------
 
-#[ignore = "core callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_non_stream_text_usage_and_reasoning() {
     let body = read_fixture("openai_chat/response.json");
@@ -440,7 +446,6 @@ fn openai_chat_non_stream_text_usage_and_reasoning() {
     );
 }
 
-#[ignore = "core callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_non_stream_tool_calls() {
     let body = read_fixture("openai_chat/response_tools.json");
@@ -684,7 +689,6 @@ fn openai_chat_wire_preserves_marker_like_tool_schema() {
     );
 }
 
-#[ignore = "core callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_malformed_payload_is_typed() {
     let body = read_fixture("openai_chat/malformed.json");
@@ -708,7 +712,6 @@ fn openai_chat_malformed_payload_is_typed() {
     );
 }
 
-#[ignore = "core callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_invalid_json_fails_as_typed_invocation_error() {
     let (port, _requests, fixture) = spawn_json_fixture(200, "{not json".to_string());
@@ -742,19 +745,14 @@ fn openai_chat_invalid_json_fails_as_typed_invocation_error() {
 // S2: OpenAI Chat Completions, streaming (http::client::sse)
 // ---------------------------------------------------------------------------
 //
-// The streaming adapter (`openai_chat_stream`) is not implemented. Two
-// independent core-side blockers keep it out of agent reach in this revision:
-// (1) the frontend availability pass rejects closures that by-value-use a
-// captured local (`local 'x' was moved earlier; use 'x.copy()' ...`), so an
-// SSE callback cannot aggregate text deltas into a shared accumulator map;
-// (2) the runtime callable-schema corruption documented above would also hit
-// any parse helper called from the adapter module. `http::client::sse` is
-// therefore not exposed in the restricted registry. These tests stay ignored
-// until the core clears. Minimal repros: `tests/fixtures/core-repros/`
-// (committed, independently runnable via `tests/core_repro_driver.rs`,
-// ignored).
+// The streaming adapter (`openai_chat_stream`) is implemented against core
+// revision fd4b570 (B1 callable schemas + B3 shared BorrowMut capture
+// cells + the §11a parameter-liveness fix): the SSE callback aggregates
+// text/usage/tool-call deltas into captured accumulator locals read after
+// the stream completes, and `http::client::sse` is exposed in the
+// restricted registry. The suites below run by default and pass at the
+// pinned revision.
 
-#[ignore = "core: closure capture by-value-use rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_text_and_usage() {
     let events = sse_events(&read_fixture("openai_chat/stream.sse"));
@@ -785,7 +783,6 @@ fn openai_chat_stream_text_and_usage() {
     assert_eq!(wire["stream_options"]["include_usage"], json!(true));
 }
 
-#[ignore = "core: closure capture by-value-use rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_tool_call_chunk_aggregation() {
     let events = sse_events(&read_fixture("openai_chat/stream_tools.sse"));
@@ -815,10 +812,16 @@ fn openai_chat_stream_tool_call_chunk_aggregation() {
     assert_eq!(wire["stream"], json!(true));
 }
 
-#[ignore = "core: closure capture by-value-use rejected (Move) + callable-schema corruption (see module doc)"]
 #[test]
 fn openai_chat_stream_cancellation_is_typed() {
-    let events = sse_events(&read_fixture("openai_chat/stream.sse"));
+    // The held-open fixture must not terminate the stream itself: drop the
+    // terminal `data: [DONE]` event so only cancellation can end the run.
+    let mut events = sse_events(&read_fixture("openai_chat/stream.sse"));
+    assert_eq!(
+        events.pop().as_deref(),
+        Some("data: [DONE]\n\n"),
+        "the stream transcript must end with the [DONE] event"
+    );
     let (port, _requests, fixture) = spawn_sse_fixture(events, true);
     let runner = harness_runner(port);
     let request = canonical_request(port, true);
@@ -853,6 +856,50 @@ fn openai_chat_stream_cancellation_is_typed() {
     );
 }
 
+/// A3 review P2 guard: the adapter must fail CLOSED when the server EOFs the
+/// SSE body without the terminal `data: [DONE]` event. The transport reports
+/// `outcome: "eof"` (the callback sees the `kind: "end"` item and returns
+/// continue), and the adapter must not surface the accumulated partial text
+/// as `ok`. The failure is the canonical typed provider error (stable
+/// type/code/message), distinct from cancellation (which stays a typed
+/// `Cancelled` invocation error) and from a legal `[DONE]` stream (which
+/// stops the callback and reports `outcome: "stopped"`).
+#[test]
+fn openai_chat_stream_eof_without_done_fails_closed() {
+    // One valid text delta, then immediate EOF: no `data: [DONE]`, no usage
+    // event. `hold_open` false lets the fixture close the chunked body.
+    let events = vec![
+        "data: {\"id\":\"chatcmpl-eof1\",\"object\":\"chat.completion.chunk\",\"created\":1755000009,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial \"},\"finish_reason\":null}]}\n\n".to_string(),
+    ];
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+
+    assert!(
+        result["ok"] == json!(false),
+        "EOF without [DONE] must fail closed, got {result}"
+    );
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("api_error"));
+    assert_eq!(error["code"], json!("stream_eof_without_done"));
+    assert_eq!(error["status"], json!(200));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("[DONE]"),
+        "{error:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+}
+
 // ---------------------------------------------------------------------------
 // S3: OpenAI Responses adapter (blocked references)
 // ---------------------------------------------------------------------------
@@ -860,13 +907,13 @@ fn openai_chat_stream_cancellation_is_typed() {
 // `openai_responses.rss` is a typed `not_implemented` stub. The buffered and
 // streaming transcripts under `tests/fixtures/providers/openai_responses/`
 // document the wire contract; these tests stay ignored until the adapter is
-// implemented AND the core callable-schema corruption (module doc) clears.
-// The streaming transcript mirrors the real Responses API transport: every
+// implemented. The streaming transcript mirrors the real Responses API
+// transport: every
 // payload event carries an `event:` line whose value matches the `type`
 // field of its `data:` JSON payload, and the stream ends with a bare
 // `data: [DONE]`.
 
-#[ignore = "openai_responses adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[ignore = "openai_responses adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn openai_responses_buffered_transcript_is_referenced() {
     let body = read_fixture("openai_responses/response.json");
@@ -886,7 +933,7 @@ fn openai_responses_buffered_transcript_is_referenced() {
     assert_eq!(result["error"]["code"], json!("not_implemented"));
 }
 
-#[ignore = "openai_responses adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[ignore = "openai_responses adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced() {
     let events = sse_events(&read_fixture("openai_responses/stream.sse"));
@@ -945,9 +992,9 @@ fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced()
 // `anthropic_messages.rss` is a typed `not_implemented` stub. The buffered and
 // streaming transcripts under `tests/fixtures/providers/anthropic/` document
 // the wire contract; these tests stay ignored until the adapter is
-// implemented AND the core callable-schema corruption (module doc) clears.
+// implemented.
 
-#[ignore = "anthropic_messages adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[ignore = "anthropic_messages adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn anthropic_messages_buffered_transcript_is_referenced() {
     let body = read_fixture("anthropic/response.json");
@@ -967,7 +1014,7 @@ fn anthropic_messages_buffered_transcript_is_referenced() {
     assert_eq!(result["error"]["code"], json!("not_implemented"));
 }
 
-#[ignore = "anthropic_messages adapter is a not_implemented stub + core callable-schema corruption (see module doc)"]
+#[ignore = "anthropic_messages adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn anthropic_messages_stream_transcript_is_referenced() {
     let events = sse_events(&read_fixture("anthropic/stream.sse"));
