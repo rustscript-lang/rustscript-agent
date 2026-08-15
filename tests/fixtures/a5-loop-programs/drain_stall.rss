@@ -1,0 +1,62 @@
+// Runaway emitter for the P2 bounded-drain truncation fixture.
+//
+// Emits a 200-event burst (far beyond the tiny fixture channel capacity),
+// then performs ONE delayed provider-style round trip and would return
+// `run.completed`. With the SQLite RESERVED lock held by the race-control
+// helper, the delivery task stalls on the FIRST event's durable append
+// while the worker fills the bounded channel and blocks on backpressure —
+// the step deadline then fires, and the step's bounded drain cannot finish
+// within the cancellation grace. The service must durably write the typed
+// `run.truncated` marker BEFORE the terminal instead of silently dropping
+// the tail.
+use http;
+use stream;
+
+fn ctx_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key].copy()) == "string" {
+            let coerced: string = value[key].copy();
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn provider_url(context: map) -> string {
+    let mut url: string = "";
+    if context.has("provider_options") {
+        let options: map = context["provider_options"].copy();
+        if options.has("base_url") {
+            if type(options["base_url"].copy()) == "string" {
+                let base: string = options["base_url"].copy();
+                url = base + "/chat/completions";
+            }
+        }
+    }
+    url
+}
+
+pub fn agent_run(context: map) -> map {
+    let mut i: int = 0;
+    while i < 200 {
+        stream::emit({ type: "model.delta", delta: "d", turn: 0 });
+        i = i + 1;
+    }
+    let url: string = provider_url(context);
+    let response: map = http::client::request({
+        method: "POST",
+        url: url,
+        headers: {
+            "content-type": "application/json"
+        },
+        body: "{}"
+    });
+    {
+        kind: "run.completed",
+        text: "done",
+        turn: 0,
+        messages: [],
+        config: {}
+    }
+}

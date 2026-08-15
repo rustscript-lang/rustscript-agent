@@ -5074,6 +5074,107 @@ async fn gateway_reopen_fails_orphan_pending_compaction_even_when_run_is_termina
 }
 
 #[tokio::test]
+async fn gateway_reopen_expires_orphan_pending_approval_even_when_run_is_terminal() {
+    // A pending approval whose run is ALREADY terminal at restart is by
+    // definition an orphan: the park sequence never runs after a terminal
+    // commit, so such a row can only be a leftover of the crash window (or
+    // of the P2 deadline race where the blocking approval.request outlived
+    // the run deadline). The restart recovery must expire it durably —
+    // never leave it pending until the approval_timeout sweep.
+    let path = gateway_db_path("approval-orphan-crash-window");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should open");
+    let persistence = state
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let now = 2_000_000u64;
+    persistence
+        .admission_create(&json!({
+            "session_id": "orphan-approval-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "orphan-approval-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "orphan-approval-run",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "orphan-approval-message",
+            "message_run_id": "orphan-approval-run",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "orphan-approval-run",
+            "request_hash": "",
+            "event_id": "orphan-approval-event",
+            "now_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("admission should commit");
+    // The durable pending approval commits while the run is still running
+    // (the deadline race: the request's insert wins the lock race).
+    persistence
+        .approval_request(&json!({
+            "id": "orphan-approval",
+            "run_id": "orphan-approval-run",
+            "session_id": "orphan-approval-session",
+            "tool_call_id": "call-1",
+            "tool_name": "file.write",
+            "arguments_json": "{}",
+            "risk_class": "write",
+            "decision_scope": "",
+            "one_time": 1,
+            "requested_at_ms": now + 1,
+            "expires_at_ms": now + 600_000,
+        }))
+        .expect("approval should persist");
+    // The run reaches its terminal BEFORE the compensation can cancel the
+    // row (the crash window: the gateway dies between the insert and the
+    // cancel).
+    persistence
+        .run_transition(&json!({
+            "run_id": "orphan-approval-run",
+            "from_status": "running",
+            "to_status": "cancelled",
+            "error_code": "",
+            "error_message": "",
+            "recovery_reason": "",
+            "now_ms": now + 2,
+        }))
+        .expect("run should transition to cancelled");
+    drop(state);
+
+    // Production reopen: the restart load path expires the orphaned pending
+    // approval even though its run is already terminal (no run is
+    // recovered).
+    let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("SQLite state should reopen");
+    let restored_persistence = restored
+        .persistence()
+        .expect("persistence handle should be exposed");
+    let approval = restored_persistence
+        .approval_get("orphan-approval")
+        .expect("approval after reopen");
+    let row = approval["rows"][0].clone();
+    assert_eq!(
+        row[7],
+        json!("expired"),
+        "an orphaned pending approval on a terminal run must be expired by restart recovery"
+    );
+    let run = restored_persistence
+        .run_get("orphan-approval-run")
+        .expect("run after reopen");
+    assert_eq!(
+        run["rows"][0][3],
+        json!("cancelled"),
+        "the terminal run must stay terminal"
+    );
+    drop(restored);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
     // A7 service guard + A9 metrics guard coexist on every SSE stream: the
     // subscriber gauge tracks the exact live-stream count across
@@ -5286,4 +5387,78 @@ async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
         "the registry must count the dropped broadcasts"
     );
     fixture.join().expect("fixture thread");
+}
+
+#[tokio::test]
+async fn legacy_run_context_carries_the_inbound_platform() {
+    let db = gateway_db_path("legacy-platform");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(input: map) -> string { let platform: string = input[\"platform\"]; platform; }",
+        &db,
+    )
+    .expect("RSS source should compile");
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!("ping"),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "telegram".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+        })
+        .await
+        .expect("admission should succeed");
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ping".to_string()),
+    );
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(15) {
+        if let Some(handle) = service.handle(&admitted.run_id)
+            && handle.is_terminal()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let persistence = state.persistence().expect("durable persistence");
+    let data = persistence
+        .event_replay(&json!({
+            "run_id": admitted.run_id,
+            "after_seq": 1,
+            "max_events": 64,
+            "max_bytes": 65536,
+        }))
+        .expect("event replay");
+    let mut terminal_content = None;
+    if let Some(rows) = data.get("rows").and_then(Value::as_array) {
+        for row in rows {
+            if let Some(row) = row.as_array()
+                && row.get(3).and_then(Value::as_str) == Some("run.completed")
+            {
+                terminal_content = row.get(4).and_then(Value::as_str).and_then(|text| {
+                    serde_json::from_str::<Value>(text)
+                        .ok()
+                        .and_then(|payload| {
+                            payload["output"]["message"]["content"]
+                                .as_str()
+                                .map(String::from)
+                        })
+                });
+            }
+        }
+    }
+    let content = terminal_content.unwrap_or_default();
+    assert_eq!(
+        content.trim_matches('"'),
+        "telegram",
+        "the legacy run context must carry the inbound platform (the legacy \
+         path persists the JSON-encoded output text)"
+    );
 }

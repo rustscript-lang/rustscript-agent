@@ -287,16 +287,19 @@ fn pending_approval_resumes_exactly_once_after_approval() {
         .expect("bridge should open");
 
     let approval_id = bridge
-        .request_pending(&PendingApproval {
-            run_id: "r1".into(),
-            session_id: "s1".into(),
-            tool_call_id: "tool-1".into(),
-            tool_name: "file.write".into(),
-            arguments_json: "{}".into(),
-            risk: RiskClass::Write,
-            requested_at_ms: 40,
-            expires_at_ms: 0,
-        })
+        .request_pending(
+            &PendingApproval {
+                run_id: "r1".into(),
+                session_id: "s1".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "file.write".into(),
+                arguments_json: "{}".into(),
+                risk: RiskClass::Write,
+                requested_at_ms: 40,
+                expires_at_ms: 0,
+            },
+            "approval-exactly-once-1",
+        )
         .expect("pending approval should persist");
 
     // First approval resumes exactly once.
@@ -333,16 +336,19 @@ fn denied_approval_produces_typed_terminal_and_never_resumes() {
         .expect("bridge should open");
 
     let approval_id = bridge
-        .request_pending(&PendingApproval {
-            run_id: "r1".into(),
-            session_id: "s1".into(),
-            tool_call_id: "tool-1".into(),
-            tool_name: "terminal.run".into(),
-            arguments_json: "{}".into(),
-            risk: RiskClass::Execute,
-            requested_at_ms: 40,
-            expires_at_ms: 0,
-        })
+        .request_pending(
+            &PendingApproval {
+                run_id: "r1".into(),
+                session_id: "s1".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "terminal.run".into(),
+                arguments_json: "{}".into(),
+                risk: RiskClass::Execute,
+                requested_at_ms: 40,
+                expires_at_ms: 0,
+            },
+            "approval-denied-1",
+        )
         .expect("pending approval should persist");
 
     let denied = bridge
@@ -352,9 +358,11 @@ fn denied_approval_produces_typed_terminal_and_never_resumes() {
         Resolution::Terminal {
             approval_id: id,
             reason,
+            code,
         } => {
             assert_eq!(id, approval_id);
             assert_eq!(reason, "approval denied");
+            assert_eq!(code, "denied");
         }
         other => panic!("expected terminal on deny, got {other:?}"),
     }
@@ -381,16 +389,19 @@ fn expired_pending_approvals_are_swept_to_terminal() {
         .expect("bridge should open");
 
     let approval_id = bridge
-        .request_pending(&PendingApproval {
-            run_id: "r1".into(),
-            session_id: "s1".into(),
-            tool_call_id: "tool-1".into(),
-            tool_name: "file.write".into(),
-            arguments_json: "{}".into(),
-            risk: RiskClass::Write,
-            requested_at_ms: 40,
-            expires_at_ms: 1000,
-        })
+        .request_pending(
+            &PendingApproval {
+                run_id: "r1".into(),
+                session_id: "s1".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "file.write".into(),
+                arguments_json: "{}".into(),
+                risk: RiskClass::Write,
+                requested_at_ms: 40,
+                expires_at_ms: 1000,
+            },
+            "approval-expired-1",
+        )
         .expect("pending approval should persist");
 
     // Expire everything at or before now (now_ms well past the 1000 expiry).
@@ -417,17 +428,201 @@ fn request_pending_for_unknown_run_is_a_typed_failure() {
         .expect("bridge should open");
 
     let err = bridge
-        .request_pending(&PendingApproval {
-            run_id: "run-ghost".into(),
-            session_id: "s1".into(),
-            tool_call_id: "tool-1".into(),
-            tool_name: "file.write".into(),
-            arguments_json: "{}".into(),
-            risk: RiskClass::Write,
-            requested_at_ms: 40,
-            expires_at_ms: 0,
-        })
+        .request_pending(
+            &PendingApproval {
+                run_id: "run-ghost".into(),
+                session_id: "s1".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "file.write".into(),
+                arguments_json: "{}".into(),
+                risk: RiskClass::Write,
+                requested_at_ms: 40,
+                expires_at_ms: 0,
+            },
+            "approval-ghost-1",
+        )
         .expect_err("unknown run must be a typed approval failure");
     assert_eq!(err.code, "run_not_found");
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn request_pending_with_preknown_id_is_idempotent() {
+    let root = temporary_root("preknown-id");
+    let db = root.join("state.db");
+    let storage = StorageHarness::open(&root, "state.db");
+    storage.migrate();
+    storage.create_session("s1", 10);
+    storage.create_run("r1", "s1", 20);
+    storage.admit_to_waiting_approval("r1", 25);
+
+    let bridge = ApprovalBridge::open(&root, &db, AgentConfig::default(), NativeDenyPolicy::new())
+        .expect("bridge should open");
+
+    let request = PendingApproval {
+        run_id: "r1".into(),
+        session_id: "s1".into(),
+        tool_call_id: "tool-1".into(),
+        tool_name: "file.write".into(),
+        arguments_json: "{}".into(),
+        risk: RiskClass::Write,
+        requested_at_ms: 40,
+        expires_at_ms: 0,
+    };
+    // The approval id is known BEFORE the durable request starts and is
+    // passed idempotently: a late retry of the same request can never
+    // duplicate the row (the storage layer INSERT OR IGNOREs by id).
+    let first = bridge
+        .request_pending(&request, "preknown-1")
+        .expect("first request should persist");
+    assert_eq!(first, "preknown-1");
+    let second = bridge
+        .request_pending(&request, "preknown-1")
+        .expect("the idempotent retry must not fail");
+    assert_eq!(second, "preknown-1");
+
+    // Exactly one durable row, still pending.
+    let out = storage.command("approval.get", json!({"approval_id": "preknown-1"}), 50);
+    let rows = out["data"]["rows"]
+        .as_array()
+        .expect("approval.get must return the row array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "an idempotent retry must never duplicate the row"
+    );
+    assert_eq!(
+        rows[0][7].as_str(),
+        Some("pending"),
+        "the idempotent row stays pending"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cancel_expires_only_the_target_pending_row() {
+    let root = temporary_root("cancel-targeted");
+    let db = root.join("state.db");
+    let storage = StorageHarness::open(&root, "state.db");
+    storage.migrate();
+    storage.create_session("s1", 10);
+    storage.create_run("r1", "s1", 20);
+    storage.admit_to_waiting_approval("r1", 25);
+
+    let bridge = ApprovalBridge::open(&root, &db, AgentConfig::default(), NativeDenyPolicy::new())
+        .expect("bridge should open");
+
+    let request = PendingApproval {
+        run_id: "r1".into(),
+        session_id: "s1".into(),
+        tool_call_id: "tool-1".into(),
+        tool_name: "file.write".into(),
+        arguments_json: "{}".into(),
+        risk: RiskClass::Write,
+        requested_at_ms: 40,
+        expires_at_ms: 0,
+    };
+    bridge
+        .request_pending(&request, "cancel-target")
+        .expect("target row should persist");
+    // A second pending approval for the same run needs its own tool call
+    // (the storage contract is one pending approval per run+tool_call).
+    bridge
+        .request_pending(
+            &PendingApproval {
+                tool_call_id: "tool-2".into(),
+                ..request.clone()
+            },
+            "cancel-other",
+        )
+        .expect("other row should persist");
+
+    // Cancelling one specific id must never touch any other row (a
+    // legitimate park's approval keeps its id and stays pending).
+    let affected = bridge
+        .cancel("cancel-target", "deadline-compensation", 60)
+        .expect("cancel should run");
+    assert_eq!(affected, 1, "exactly the target row transitions");
+
+    let target = storage.command("approval.get", json!({"approval_id": "cancel-target"}), 70);
+    let target_rows = target["data"]["rows"]
+        .as_array()
+        .expect("target approval.get rows");
+    assert_eq!(target_rows.len(), 1);
+    assert_eq!(
+        target_rows[0][7].as_str(),
+        Some("expired"),
+        "the cancelled row must be durably expired"
+    );
+    let other = storage.command("approval.get", json!({"approval_id": "cancel-other"}), 70);
+    let other_rows = other["data"]["rows"]
+        .as_array()
+        .expect("other approval.get rows");
+    assert_eq!(
+        other_rows[0][7].as_str(),
+        Some("pending"),
+        "a legitimate park's approval must never be touched"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cancel_on_missing_or_resolved_row_is_a_typed_noop() {
+    let root = temporary_root("cancel-noop");
+    let db = root.join("state.db");
+    let storage = StorageHarness::open(&root, "state.db");
+    storage.migrate();
+    storage.create_session("s1", 10);
+    storage.create_run("r1", "s1", 20);
+    storage.admit_to_waiting_approval("r1", 25);
+
+    let bridge = ApprovalBridge::open(&root, &db, AgentConfig::default(), NativeDenyPolicy::new())
+        .expect("bridge should open");
+
+    // A cancel for an id that was never inserted (the request failed or the
+    // storage guard rejected it) is a typed no-op, never an error.
+    let missing = bridge
+        .cancel("never-inserted", "deadline-compensation", 60)
+        .expect("a missing row is a typed no-op");
+    assert_eq!(missing, 0);
+
+    // A cancel after the row was already resolved is a no-op too: the row
+    // keeps its durable approved state.
+    let request = PendingApproval {
+        run_id: "r1".into(),
+        session_id: "s1".into(),
+        tool_call_id: "tool-1".into(),
+        tool_name: "file.write".into(),
+        arguments_json: "{}".into(),
+        risk: RiskClass::Write,
+        requested_at_ms: 40,
+        expires_at_ms: 0,
+    };
+    let approval_id = bridge
+        .request_pending(&request, "cancel-resolved")
+        .expect("row should persist");
+    assert_eq!(
+        bridge
+            .resolve(&approval_id, true, "reviewer", 60)
+            .expect("resolve"),
+        Resolution::Resumed {
+            approval_id: approval_id.clone()
+        }
+    );
+    let after = bridge
+        .cancel("cancel-resolved", "deadline-compensation", 70)
+        .expect("cancel after resolve should run");
+    assert_eq!(after, 0, "an already-resolved row is not touched");
+    let out = storage.command(
+        "approval.get",
+        json!({"approval_id": "cancel-resolved"}),
+        80,
+    );
+    let rows = out["data"]["rows"].as_array().expect("approval.get rows");
+    assert_eq!(
+        rows[0][7].as_str(),
+        Some("approved"),
+        "an approved row must never be downgraded"
+    );
     fs::remove_dir_all(root).ok();
 }

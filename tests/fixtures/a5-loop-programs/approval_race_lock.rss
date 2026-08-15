@@ -1,0 +1,191 @@
+// Controllable SQLite lock helper for the A5 approval-park race fixtures.
+//
+// The sqlite host forbids raw BEGIN/ROLLBACK statements, so every hold uses
+// `sqlite::transaction` — a BEGIN IMMEDIATE transaction that holds a RESERVED
+// lock (blocking every other writer's BEGIN IMMEDIATE / write statements)
+// while a recursive-CTE query inside it runs, and auto-commits when the
+// statement finishes. A tight loop of short holds keeps the RESERVED lock
+// occupied almost continuously (the gaps between transactions are tens of
+// microseconds, far shorter than any storage command's contiguous lock
+// need), so the storage worker's statements block on their busy timeout.
+//
+// Communication with the test is via marker files under `markers_dir`
+// (io::* against the configured io root); every marker file is created by
+// the test before the helper starts, and each file's content flips between
+// "0" and "1". Context: {command, db_path, run_id, markers_dir}.
+//
+//   command "hold-begin": keeps RESERVED occupied from the moment
+//     markers_dir/phase_held=1 is written until phase_release=1, then
+//     signals phase_done=1. The durable approval.request blocks on it.
+//
+//   command "poll-shared": polls the approvals table for `run_id` with
+//     autocommit reads (each read releases its lock, so the approval.request
+//     commit is never blocked), then occupies RESERVED from the moment
+//     markers_dir/shared_held=1 is written until shared_release=1, then
+//     signals shared_done=1. The run transition's writer statements (and the
+//     `approval.required` append) block on it.
+use sqlite;
+use io;
+
+fn ctx_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key].copy()) == "string" {
+            let coerced: string = value[key].copy();
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn open_options(db_path: string) -> map {
+    {
+        path: db_path,
+        mode: "read_write_create",
+        busy_timeout_ms: 5000,
+        max_connections: 1,
+        limits: {
+            max_rows: 1000,
+            max_result_bytes: 65536,
+            max_statements: 64,
+            max_transaction_ms: 5000
+        }
+    }
+}
+
+fn marker_path(dir: string, name: string) -> string {
+    dir + "/" + name
+}
+
+fn read_marker(dir: string, name: string) -> string {
+    let path: string = marker_path(dir, name);
+    let handle: int = io::open(path, "r");
+    let text: string = io::read_all(handle);
+    io::close(handle);
+    text
+}
+
+fn write_marker(dir: string, name: string, value: string) -> bool {
+    let path: string = marker_path(dir, name);
+    let handle: int = io::open(path, "w");
+    let _written: int = io::write(handle, value);
+    io::flush(handle);
+    io::close(handle);
+    true
+}
+
+fn marker_is(dir: string, name: string, expected: string) -> bool {
+    let text: string = read_marker(dir, name);
+    text == expected
+}
+
+fn hold_span(db: int) -> bool {
+    sqlite::transaction(db, [
+        {
+            sql: "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 3000000) SELECT count(*) FROM cnt",
+            params: [],
+            query: true
+        }
+    ]);
+    true
+}
+
+fn approval_row_found(db: int, run_id: string) -> bool {
+    let result: map = sqlite::query(
+        db,
+        "SELECT 1 FROM approvals WHERE run_id = ? LIMIT 1",
+        [run_id],
+        { max_rows: 1, max_result_bytes: 4096 }
+    );
+    let rows: array = result["rows"];
+    rows.length >= 1
+}
+
+fn pending_approval_row_found(db: int, run_id: string) -> bool {
+    let result: map = sqlite::query(
+        db,
+        "SELECT 1 FROM approvals WHERE run_id = ? AND state = 'pending' LIMIT 1",
+        [run_id],
+        { max_rows: 1, max_result_bytes: 4096 }
+    );
+    let rows: array = result["rows"];
+    rows.length >= 1
+}
+
+fn hold_begin(db_path: string, markers_dir: string) -> map {
+    let db: int = sqlite::open(open_options(db_path));
+    write_marker(markers_dir, "phase_held", "1");
+    // One continuous RESERVED hold (no gaps): every storage writer blocks on
+    // its busy timeout until the transaction auto-commits.
+    hold_span(db);
+    write_marker(markers_dir, "phase_done", "1");
+    sqlite::close(db);
+    { ok: true }
+}
+
+fn poll_shared(db_path: string, run_id: string, markers_dir: string) -> map {
+    let db: int = sqlite::open(open_options(db_path));
+    let mut found = false;
+    while found == false {
+        found = approval_row_found(db, run_id);
+    }
+    write_marker(markers_dir, "shared_held", "1");
+    hold_span(db);
+    write_marker(markers_dir, "shared_done", "1");
+    sqlite::close(db);
+    { ok: true }
+}
+
+// Holds RESERVED continuously until the test writes phase_release=1 (the
+// gaps between hold spans are tens of microseconds, far shorter than any
+// storage command's contiguous lock need). Used by the deadline-orphan and
+// drain-stall fixtures: the durable approval.request (or the delivery
+// event append) stays blocked until the test decides to release.
+fn hold_until_release(db_path: string, markers_dir: string) -> map {
+    let db: int = sqlite::open(open_options(db_path));
+    write_marker(markers_dir, "phase_held", "1");
+    let mut released = false;
+    while released == false {
+        released = marker_is(markers_dir, "phase_release", "1");
+        hold_span(db);
+    }
+    write_marker(markers_dir, "phase_done", "1");
+    sqlite::close(db);
+    { ok: true }
+}
+
+// Polls until NO pending approval row exists for `run_id` (autocommit
+// reads never block writers), then signals no_pending=1. The assertion
+// window for the P2 deadline-orphan compensation: a pending orphan row
+// would keep this loop spinning until the bounded test deadline.
+fn wait_no_pending(db_path: string, run_id: string, markers_dir: string) -> map {
+    let db: int = sqlite::open(open_options(db_path));
+    let mut clear = false;
+    while clear == false {
+        clear = !pending_approval_row_found(db, run_id);
+    }
+    write_marker(markers_dir, "no_pending", "1");
+    sqlite::close(db);
+    { ok: true }
+}
+
+pub fn run(context: map) -> map {
+    let command: string = ctx_string(context, "command", "");
+    let db_path: string = ctx_string(context, "db_path", "");
+    let run_id: string = ctx_string(context, "run_id", "");
+    let markers_dir: string = ctx_string(context, "markers_dir", "");
+    let mut result: map = { ok: false, error: "unknown command" };
+    if command == "hold-begin" {
+        result = hold_begin(db_path, markers_dir);
+    }
+    if command == "poll-shared" {
+        result = poll_shared(db_path, run_id, markers_dir);
+    }
+    if command == "hold-until-release" {
+        result = hold_until_release(db_path, markers_dir);
+    }
+    if command == "wait-no-pending" {
+        result = wait_no_pending(db_path, run_id, markers_dir);
+    }
+    result
+}

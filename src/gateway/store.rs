@@ -90,6 +90,12 @@ pub struct GatewayPersistence {
     max_events: i64,
     broadcast_capacity: usize,
     metrics: Arc<crate::metrics::Metrics>,
+    /// The state database file name (as the RSS storage program addresses
+    /// it); the production serial loop's compaction plan needs it.
+    db_file: String,
+    /// The state database's parent directory (SQLite root for the loop's
+    /// durable commands and the approval bridge).
+    db_root: Option<PathBuf>,
 }
 
 /// One serialized storage request for the dedicated worker thread.
@@ -239,7 +245,24 @@ impl GatewayPersistence {
             max_events: config.max_events_per_run as i64,
             broadcast_capacity: config.broadcast_capacity,
             metrics,
+            db_file: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            db_root: path.parent().map(|parent| parent.to_path_buf()),
         })
+    }
+
+    /// The state database file name (as the RSS storage program addresses
+    /// it); the production serial loop's compaction plan needs it.
+    pub fn db_file_name(&self) -> &str {
+        &self.db_file
+    }
+
+    /// The state database's parent directory (the SQLite root the storage
+    /// program and the approval bridge run under).
+    pub fn db_root(&self) -> Option<&Path> {
+        self.db_root.as_deref()
     }
 
     /// Closes the storage worker deterministically: signals it to exit,
@@ -465,6 +488,13 @@ impl GatewayPersistence {
         self.command_data("compaction.commit", payload)
     }
 
+    /// Marks the compacted message range (guarded no-op until a committed
+    /// compaction covers it) — one step of the A5 loop's durable compaction
+    /// execution.
+    pub fn message_compact(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("message.compact", payload)
+    }
+
     pub fn compaction_fail(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("compaction.fail", payload)
     }
@@ -566,6 +596,9 @@ pub(crate) struct RunRecord {
     pub(crate) run_id: String,
     pub(crate) session_id: String,
     pub(crate) parent_run_id: Option<String>,
+    /// The inbound platform that admitted the run (`api_server`, `telegram`,
+    /// ...); the run context carries it so scripts can branch on the source.
+    pub(crate) platform: String,
     pub(crate) status: String,
     pub(crate) events: Vec<GatewayEvent>,
     /// Live delivery channel; `None` once the run's stream was closed (the
@@ -611,6 +644,9 @@ pub(crate) struct SessionView {
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
     pub(crate) message_count: usize,
+    /// The session's durable generation (advances exactly once per committed
+    /// compaction); the serial loop's compaction plan targets generation + 1.
+    pub(crate) generation: u64,
     pub(crate) end_reason: Option<String>,
 }
 
@@ -619,10 +655,20 @@ pub(crate) struct SessionMessage {
     pub(crate) id: String,
     pub(crate) session_id: String,
     pub(crate) role: String,
+    /// The message-level pair id mirroring the durable messages.tool_call_id
+    /// column (tool messages carry the tool_result part's call id): the
+    /// production loop context carries it so compaction plans pair assistant
+    /// tool-call messages with their tool results across reloads.
+    pub(crate) tool_call_id: String,
     pub(crate) content: Value,
     pub(crate) created_at: u64,
     pub(crate) run_id: Option<String>,
     pub(crate) finish_reason: Option<String>,
+    /// True once a committed compaction covered this row: new run contexts
+    /// filter compacted rows even when the durable count is within the
+    /// window (the row stays in the DB for audit; only the provider-facing
+    /// history drops it).
+    pub(crate) compacted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -707,6 +753,7 @@ impl GatewayStore {
                 created_at: int_cell(&row, 15, "session created_at")? as u64,
                 updated_at: int_cell(&row, 16, "session updated_at")? as u64,
                 message_count: 0,
+                generation: int_cell(&row, 7, "session generation")? as u64,
                 end_reason: optional_string(&row, 18),
             };
             if sessions
@@ -732,10 +779,16 @@ impl GatewayStore {
                 id: string_cell(&row, 1, "message id")?,
                 session_id: session_id.clone(),
                 role: string_cell(&row, 3, "message role")?,
+                // The durable messages.tool_call_id column (load.all row
+                // layout: ordinal, id, session_id, role, content_json, name,
+                // tool_call_id, parent_message_id, token_estimate,
+                // compacted, ...).
+                tool_call_id: string_cell(&row, 6, "message tool_call_id")?,
                 content: json_cell(&row, 4, "message content")?,
                 created_at: int_cell(&row, 13, "message created_at")? as u64,
                 run_id: optional_string(&row, 11),
                 finish_reason: optional_string(&row, 12),
+                compacted: int_cell(&row, 9, "message compacted")? != 0,
             };
             messages_by_session
                 .entry(session_id)
@@ -759,10 +812,15 @@ impl GatewayStore {
                 return Err(format!("run references unknown session: {session_id}"));
             }
             let (sender, _) = broadcast::channel(broadcast_capacity);
+            let platform = sessions
+                .get(&session_id)
+                .map(|session| session.view.source.clone())
+                .unwrap_or_default();
             let run = RunRecord {
                 run_id: run_id.clone(),
                 session_id,
                 parent_run_id: optional_string(&row, 2),
+                platform,
                 status: memory_status(&string_cell(&row, 3, "run status")?).to_string(),
                 events: Vec::new(),
                 sender: Some(sender),
@@ -929,6 +987,7 @@ fn json_array_strings(row: &[Value], index: usize, label: &str) -> Result<Vec<St
 }
 
 /// Appends one session message and updates the session view counters.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_message(
     view: &mut SessionView,
     messages: &mut Vec<SessionMessage>,
@@ -936,15 +995,19 @@ pub(crate) fn append_message(
     content: Value,
     run_id: Option<String>,
     finish_reason: Option<String>,
+    compacted: bool,
+    tool_call_id: &str,
 ) -> SessionMessage {
     let message = SessionMessage {
         id: Uuid::new_v4().to_string(),
         session_id: view.id.clone(),
         role: role.to_string(),
+        tool_call_id: tool_call_id.to_string(),
         content,
         created_at: timestamp(),
         run_id,
         finish_reason,
+        compacted,
     };
     messages.push(message.clone());
     view.message_count = messages.len();

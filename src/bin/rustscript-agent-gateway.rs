@@ -145,24 +145,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(std::io::Error::other)?;
     }
 
+    // Provider options for the production serial loop (direct adapters need
+    // base_url + api_key; profile modules merge these overrides).
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_PROVIDER_BASE_URL",
+        "PD_EDGE_AGENT_PROVIDER_BASE_URL",
+    )? {
+        config
+            .provider_options
+            .as_object_mut()
+            .expect("provider_options is an object")
+            .insert("base_url".to_string(), serde_json::Value::String(value));
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_PROVIDER_API_KEY",
+        "PD_EDGE_AGENT_PROVIDER_API_KEY",
+    )? {
+        config
+            .provider_options
+            .as_object_mut()
+            .expect("provider_options is an object")
+            .insert("api_key".to_string(), serde_json::Value::String(value));
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_PROVIDER_MODEL",
+        "PD_EDGE_AGENT_PROVIDER_MODEL",
+    )? {
+        config
+            .provider_options
+            .as_object_mut()
+            .expect("provider_options is an object")
+            .insert("model".to_string(), serde_json::Value::String(value));
+    }
+    if let Some(value) = env_value("RUSTSCRIPT_AGENT_MAX_TURNS", "PD_EDGE_AGENT_MAX_TURNS")? {
+        config.max_turns = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid RUSTSCRIPT_AGENT_MAX_TURNS: {value:?}"))?;
+    }
+    if let Some(value) = env_value("RUSTSCRIPT_AGENT_MAX_RETRIES", "PD_EDGE_AGENT_MAX_RETRIES")? {
+        config.max_retries = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid RUSTSCRIPT_AGENT_MAX_RETRIES: {value:?}"))?;
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_APPROVAL_MODE",
+        "PD_EDGE_AGENT_APPROVAL_MODE",
+    )? {
+        config.approval_mode = value;
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_APPROVAL_TIMEOUT_SECS",
+        "PD_EDGE_AGENT_APPROVAL_TIMEOUT_SECS",
+    )? {
+        config.approval_timeout =
+            std::time::Duration::from_secs(value.parse::<u64>().map_err(|_| {
+                format!("invalid RUSTSCRIPT_AGENT_APPROVAL_TIMEOUT_SECS: {value:?}")
+            })?);
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_MAX_CONTEXT_MESSAGES",
+        "PD_EDGE_AGENT_MAX_CONTEXT_MESSAGES",
+    )? {
+        config.max_context_messages = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid RUSTSCRIPT_AGENT_MAX_CONTEXT_MESSAGES: {value:?}"))?;
+    }
+    if let Some(value) = env_value(
+        "RUSTSCRIPT_AGENT_RETAINED_TAIL",
+        "PD_EDGE_AGENT_RETAINED_TAIL",
+    )? {
+        config.retained_tail = value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid RUSTSCRIPT_AGENT_RETAINED_TAIL: {value:?}"))?;
+    }
+    if let Some(value) = env_value("RUSTSCRIPT_AGENT_STREAM", "PD_EDGE_AGENT_STREAM")? {
+        config.stream = match value.as_str() {
+            "1" => true,
+            "0" => false,
+            other => return Err(format!("invalid RUSTSCRIPT_AGENT_STREAM: {other:?}").into()),
+        };
+    }
+
     let script = match env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")? {
         Some(path) => Some(fs::read_to_string(path)?),
         None => None,
     };
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
-    let state = match (script, state_db) {
-        (Some(source), Some(path)) => {
-            AgentGatewayState::with_agent_source_and_sqlite(config, source, path)
-                .map_err(std::io::Error::other)?
-        }
-        (Some(source), None) => {
-            AgentGatewayState::with_agent_source(config, source).map_err(std::io::Error::other)?
-        }
-        (None, Some(path)) => {
-            AgentGatewayState::with_sqlite_path(config, path).map_err(std::io::Error::other)?
-        }
-        (None, None) => AgentGatewayState::new(config).map_err(std::io::Error::other)?,
-    };
+    let state =
+        match (script, state_db) {
+            (Some(source), Some(path)) => {
+                AgentGatewayState::with_agent_source_and_sqlite(config, source, path)
+                    .map_err(std::io::Error::other)?
+            }
+            (Some(source), None) => AgentGatewayState::with_agent_source(config, source)
+                .map_err(std::io::Error::other)?,
+            (None, Some(path)) => {
+                AgentGatewayState::with_default_agent_program_and_sqlite(config, path)
+                    .map_err(std::io::Error::other)?
+            }
+            (None, None) => AgentGatewayState::with_default_agent_program(config)
+                .map_err(std::io::Error::other)?,
+        };
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!(

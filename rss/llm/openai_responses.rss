@@ -235,6 +235,12 @@ fn responses_append_message_by_role(
     let role: string = types::message_role(message);
     if role == "user" => {
         responses_append_user_message(wire, message)
+    } else if role == "tool" => {
+        // The canonical `tool` message the serial loop appends carries one
+        // `tool_result` part per executed call; the Responses wire renders
+        // it as one `function_call_output` item per part (the user-message
+        // path already builds exactly that shape).
+        responses_append_user_message(wire, message)
     } else if role == "assistant" => {
         responses_append_assistant_message(wire, message)
     } else => {

@@ -206,7 +206,9 @@ fn anthropic_system_text(messages: array) -> string {
 
 /// Converts canonical messages into wire messages. Each message carries its
 /// `content` blocks as a runtime array of maps; only user/assistant roles are
-/// emitted (`system` is hoisted to the top-level field by the caller).
+/// emitted (`system` is hoisted to the top-level field by the caller, and a
+/// canonical `tool` message — the serial loop's shape — becomes the legal
+/// `user` role the Messages API requires, keeping its `tool_result` blocks).
 fn anthropic_build_messages(messages: array) -> array {
     let mut wire: array = [];
     let mut i = 0;
@@ -215,9 +217,13 @@ fn anthropic_build_messages(messages: array) -> array {
         if message.has("role") {
             let role: string = types::message_role(message);
             if role != "system" {
+                let mut wire_role: string = role;
+                if wire_role == "tool" {
+                    wire_role = "user";
+                }
                 let blocks: array = anthropic_build_content_blocks(message);
                 wire[wire.length] = {
-                    "role": role,
+                    "role": wire_role,
                     "content": blocks
                 };
             }
@@ -264,11 +270,14 @@ fn anthropic_text_block(part: map) -> map {
     }
 }
 
+/// The official Messages tool_result block: the canonical `tool_call_id` is
+/// preserved under the wire field name `tool_use_id` (the value must equal the
+/// id of the `tool_use` block it answers).
 fn anthropic_tool_result_block(part: map) -> map {
     let is_error: bool = types::request_bool(part, "is_error", false);
     {
         "type": "tool_result",
-        "tool_call_id": types::request_string(part, "tool_call_id"),
+        "tool_use_id": types::request_string(part, "tool_call_id"),
         "content": types::request_string(part, "content"),
         "is_error": is_error
     }

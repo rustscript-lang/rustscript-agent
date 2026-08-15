@@ -174,6 +174,12 @@ fn chat_append_message_by_role(wire: array, message: map) -> array {
     let role: string = types::message_role(message);
     if role == "user" => {
         chat_append_user_message(wire, message)
+    } else if role == "tool" => {
+        // The canonical `tool` message the serial loop appends carries one
+        // `tool_result` part per executed call; the OpenAI wire convention
+        // renders it as one dedicated `tool` role message per part (the
+        // user-message path already builds exactly that shape).
+        chat_append_user_message(wire, message)
     } else if role == "assistant" => {
         chat_append_assistant_message(wire, message)
     } else => {

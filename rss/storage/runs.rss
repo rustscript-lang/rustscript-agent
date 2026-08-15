@@ -371,6 +371,18 @@ pub fn storage_run_recover_active(db_id: int, payload_json: string) -> array {
             params: [input.now_ms.copy(), input.now_ms.copy(), &input.reason]
         },
         {
+            // After a restart EVERY pending approval whose run is ALREADY
+            // terminal is an orphan: the park sequence never runs after a
+            // terminal commit, so such a row can only be a leftover of the
+            // crash window (or of the P2 deadline race where the blocking
+            // approval.request outlived the run deadline and its insert won
+            // the lock race). The sweep is unconditional — like the
+            // compaction fail-sweep below — instead of being limited to
+            // recovered runs.
+            sql: "UPDATE approvals SET state = 'expired', resolved_at_ms = ? WHERE state = 'pending' AND run_id IN (SELECT id FROM runs WHERE status IN ('completed', 'failed', 'cancelled'))",
+            params: [input.now_ms.copy()]
+        },
+        {
             // After a restart EVERY pending compaction is an interrupted
             // leftover: a crash between the run terminal commit and
             // compaction.fail leaves a pending row whose run is already

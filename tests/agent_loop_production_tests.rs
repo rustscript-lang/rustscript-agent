@@ -452,7 +452,6 @@ fn loop_config(mode: &str) -> JsonValue {
         "parallel": false,
         "task": false,
         "max_output_tokens": 128,
-        "state_db": "",
         "now_ms": 0
     })
 }
@@ -763,9 +762,19 @@ fn loop_approval_pending_yields_a_wait_decision_with_typed_approval() {
         decision["approval"]["arguments"]["path"],
         json!(root.join("out.txt"))
     );
+    // The loop yields the typed wait decision WITHOUT emitting the durable
+    // approval.required event: the service emits it after the bridge
+    // persisted the real approval id (exactly once per park), so the last
+    // script-visible event here is the tool start, never a placeholder.
     assert_eq!(
         events.last().expect("last event")["type"],
-        json!("approval.required")
+        json!("tool.started")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "approval.required"),
+        "the loop must not emit a placeholder approval.required"
     );
     // The run must not have dispatched the tool while waiting.
     assert!(!root.join("out.txt").exists());
@@ -1038,12 +1047,11 @@ fn seed_loop_compaction_history(storage: &AgentRunner, db_name: &str) {
     }
 }
 
-fn durable_history_context(port: u16, root: &std::path::Path, db_name: &str) -> JsonValue {
+fn durable_history_context(port: u16, root: &std::path::Path) -> JsonValue {
     let mut context = base_context(port, loop_config("auto"));
     context["run_id"] = json!("run-1");
     context["config"]["max_context_messages"] = json!(6);
     context["config"]["retained_tail"] = json!(2);
-    context["config"]["state_db"] = json!(db_name);
     context["config"]["generation"] = json!(1);
     context["config"]["message_count"] = json!(8);
     context["config"]["compaction_id"] = json!("compact:session-1:2");
@@ -1165,7 +1173,7 @@ fn loop_compaction_plans_then_executes_start_mark_commit() {
 
     let server = spawn_scripted_json_server(vec![(200, wire_text("compacted and answered"))]);
     let runner = loop_runner(server.port(), &root);
-    let context = durable_history_context(server.port(), &root, db_name);
+    let context = durable_history_context(server.port(), &root);
 
     // First invocation: the long history exceeds the window -> compact plan.
     let (plan_decision, events) = run_loop(&runner, context);
@@ -1285,7 +1293,7 @@ fn loop_compaction_failure_records_fail_durably_and_keeps_history_recoverable() 
 
     let server = spawn_scripted_json_server(vec![(200, wire_text("after failed compaction"))]);
     let runner = loop_runner(server.port(), &root);
-    let context = durable_history_context(server.port(), &root, db_name);
+    let context = durable_history_context(server.port(), &root);
     let (plan_decision, _) = run_loop(&runner, context);
     assert_eq!(result_kind(&plan_decision), "compact");
 
@@ -1537,5 +1545,247 @@ fn loop_backoff_zero_and_negative_inputs_are_clamped() {
     zero_cap["max_retries"] = json!(4);
     let (decision, _) = run_loop(&runner, zero_cap);
     assert_eq!(decision["delay_ms"], json!(0), "a zero cap clamps any base");
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+// ---------------------------------------------------------------------------
+// A5 review fixes: typed approval envelope failure, compaction pair
+// preservation, and the typed expired tool result.
+// ---------------------------------------------------------------------------
+
+/// Copies the crate's `rss/` module tree into `root/rss` so a test can patch
+/// one policy module and recompile the production loop against the patched
+/// tree (the module graph resolves relative to the entry file).
+fn copy_rss_tree(root: &std::path::Path) -> PathBuf {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss");
+    let target = root.join("rss");
+    copy_dir(&source, &target);
+    target
+}
+
+fn copy_dir(source: &std::path::Path, target: &std::path::Path) {
+    fs::create_dir_all(target).expect("copy dir create");
+    for entry in fs::read_dir(source).expect("copy dir read") {
+        let entry = entry.expect("copy dir entry");
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to);
+        } else {
+            fs::copy(&from, &to).expect("copy file");
+        }
+    }
+}
+
+/// Compiles the production loop from a (possibly patched) rss tree.
+fn patched_loop_runner(
+    port: u16,
+    root: &std::path::Path,
+    rss_root: &std::path::Path,
+) -> AgentRunner {
+    let mut config = AgentConfig::for_hosts(["127.0.0.1"]);
+    config.http.allowed_schemes = vec!["http".to_string()];
+    config.http.allowed_ports = vec![port];
+    config.http.allow_private_ips = true;
+    config = config.with_sqlite_root(root).with_io_policy(IoPolicy {
+        allowed_roots: vec![root.to_string_lossy().into_owned()],
+        allow_write: true,
+        allow_process: false,
+        max_read_bytes: 1024 * 1024,
+        max_write_bytes: 1024 * 1024,
+    });
+    AgentRunner::from_file_with_entry(
+        rss_root.join("agent/main.rss"),
+        config,
+        PRODUCTION_LOOP_ENTRY,
+    )
+    .expect("patched production loop program should compile")
+}
+
+/// An approval policy envelope that OMITS the `action` key is a typed
+/// `invalid_approval_action` failure — never a silent deny and never a
+/// pending wait. The patched policy fixture returns the non-conforming
+/// envelope only for the fixture-only `missing-action` mode (the real policy
+/// never does).
+#[test]
+fn loop_approval_envelope_missing_action_fails_typed_invalid_approval_action() {
+    let root = temporary_root("approval-missing-action");
+    let rss_root = copy_rss_tree(&root);
+    let approval_path = rss_root.join("harness/approval.rss");
+    let source = fs::read_to_string(&approval_path).expect("copied approval policy");
+    let old_envelope = "        {\n            ok: true,\n            decision: {\n                tool_name: tool_name,\n                risk_class: risk_class,\n                mode: mode,\n                action: action,\n                native_hard_deny: hard_deny\n            }\n        }";
+    let new_envelope = "        let envelope: map = if mode == \"missing-action\" => {\n            {\n                ok: true,\n                decision: {\n                    tool_name: tool_name,\n                    risk_class: risk_class,\n                    mode: mode,\n                    native_hard_deny: hard_deny\n                }\n            }\n        } else => {\n            {\n                ok: true,\n                decision: {\n                    tool_name: tool_name,\n                    risk_class: risk_class,\n                    mode: mode,\n                    action: action,\n                    native_hard_deny: hard_deny\n                }\n            }\n        };\n        envelope";
+    assert!(
+        source.contains(old_envelope),
+        "the approval policy fixture anchor must match the copied module"
+    );
+    fs::write(&approval_path, source.replace(old_envelope, new_envelope))
+        .expect("patched approval policy should be written");
+
+    let server = spawn_scripted_json_server(vec![(
+        200,
+        wire_tool_calls(json!([tool_call(
+            "call-1",
+            "file.write",
+            json!({"path": root.join("x.txt"), "content": "x"})
+        )])),
+    )]);
+    let runner = patched_loop_runner(server.port(), &root, &rss_root);
+    let mut context = base_context(server.port(), loop_config("auto"));
+    context["config"]["approval_mode"] = json!("missing-action");
+    let (decision, events) = run_loop(&runner, context);
+
+    assert_eq!(
+        result_kind(&decision),
+        "run.failed",
+        "a non-conforming approval envelope must fail the run typed"
+    );
+    assert_eq!(
+        decision["error"]["code"],
+        json!("invalid_approval_action"),
+        "the typed failure carries the invalid_approval_action code"
+    );
+    assert!(
+        !events.iter().any(|event| event["type"] == "tool.completed"),
+        "the missing action must never become a silent tool denial"
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the loop must not continue to a second provider round after the typed failure"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// The compaction boundary must push forward (fixpoint) so a tool pair
+/// straddling the naive boundary is never split — even when the pair ids
+/// arrive ONLY inside the content parts (the durable service context shape),
+/// compact.rss must read them from the parts.
+#[test]
+fn loop_compaction_plan_falls_back_to_content_parts_for_pair_ids() {
+    let root = temporary_root("compaction-pair-parts");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("answered"))]);
+    let runner = loop_runner(server.port(), &root);
+    let mut context = base_context(server.port(), loop_config("auto"));
+    context["run_id"] = json!("run-1");
+    context["config"]["max_context_messages"] = json!(6);
+    context["config"]["retained_tail"] = json!(2);
+    context["config"]["generation"] = json!(1);
+    context["config"]["message_count"] = json!(8);
+    context["config"]["compaction_id"] = json!("compact:session-1:2");
+    // NOTE: the entries carry NO message-level `tool_call_id` (the service
+    // context shape before the review fix); the pair ids live only in the
+    // content parts.
+    let mut messages = Vec::new();
+    for index in 1..=5 {
+        let role = if index % 2 == 1 { "user" } else { "assistant" };
+        messages.push(json!({
+            "ordinal": index,
+            "role": role,
+            "content": [{"type": "text", "text": format!("message {index}")}]
+        }));
+    }
+    // The tool pair straddles the naive boundary (6): the assistant call is
+    // the last prefix message and its tool result is the first tail message.
+    messages.push(json!({
+        "ordinal": 6,
+        "role": "assistant",
+        "content": [{"type": "tool_call", "tool_call_id": "call-pair", "name": "file.read", "arguments_json": "{}"}]
+    }));
+    messages.push(json!({
+        "ordinal": 7,
+        "role": "tool",
+        "content": [{"type": "tool_result", "tool_call_id": "call-pair", "content": "{}", "is_error": false}]
+    }));
+    messages.push(json!({
+        "ordinal": 8,
+        "role": "user",
+        "content": [{"type": "text", "text": "message 8"}]
+    }));
+    context["messages"] = json!(messages);
+
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "compact");
+    let plan = decision["plan"].clone();
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(plan["source_start_ordinal"], json!(1));
+    assert_eq!(
+        plan["source_end_ordinal"],
+        json!(7),
+        "the boundary must push across the tool result so the pair is never split"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// An expired approval resume folds a typed `approval_expired` tool result
+/// into the conversation (never the generic deny code) and the loop
+/// continues.
+#[test]
+fn loop_approval_resume_expired_folds_a_typed_approval_expired_tool_result() {
+    let root = temporary_root("approval-expired");
+    let server = spawn_scripted_json_server(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("expired.txt"), "content": "expired"})
+            )])),
+        ),
+        (200, wire_text("expired and continued")),
+    ]);
+    let runner = loop_runner(server.port(), &root);
+    let (wait, _) = run_loop(&runner, base_context(server.port(), loop_config("manual")));
+    assert_eq!(result_kind(&wait), "approval.wait");
+
+    let mut resume = base_context(server.port(), loop_config("manual"));
+    resume["phase"] = json!("approval.resume");
+    resume["approval"] = json!({
+        "approval_id": "approval-1",
+        "tool_call_id": "call-1",
+        "tool_name": "file.write",
+        "arguments": {"path": root.join("expired.txt"), "content": "expired"},
+        "risk_class": "write",
+        "resolved": false,
+        "outcome": "expired",
+        "reason": "approval expired"
+    });
+    resume["tool_calls"] = wait["tool_calls"].clone();
+    resume["tool_index"] = wait["tool_index"].clone();
+    resume["messages"] = wait["messages"].clone();
+    resume["turn"] = wait["turn"].clone();
+    let (decision, events) = run_loop(&runner, resume);
+
+    assert_eq!(result_kind(&decision), "run.completed");
+    assert!(
+        !root.join("expired.txt").exists(),
+        "the expired tool must never dispatch"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "approval.resolved")
+    );
+    // The canonical tool message the model sees carries the typed expiry.
+    let messages = decision["messages"].as_array().expect("messages");
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("the typed tool message must be appended");
+    let part_content = tool_message["content"][0]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        part_content.contains("approval_expired"),
+        "the expired resume must carry the typed approval_expired code, got: {part_content}"
+    );
+    assert!(
+        !part_content.contains("approval_denied"),
+        "the expired resume must never use the deny code"
+    );
+
     fs::remove_dir_all(&root).expect("temporary root should be removed");
 }

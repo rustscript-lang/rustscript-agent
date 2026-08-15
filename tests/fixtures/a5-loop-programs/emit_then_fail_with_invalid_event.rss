@@ -1,0 +1,26 @@
+// Custom production-loop program for the A5 drain-before-terminal fixtures.
+//
+// Emits one VALID `model.started` event and one schema-violating event, then
+// fails with a typed invocation error. The delivery path records the schema
+// violation; the service must drain and surface it (typed `run.failed` with
+// `invalid_event_schema`) even on the invocation-error branch — the old
+// code committed the invocation error without ever checking the delivery
+// outcome on the error branches.
+use stream;
+use json;
+
+fn emit_marker(kind: string) -> map {
+    stream::emit({
+        type: kind,
+        turn: 0,
+        model: "test-model"
+    });
+    { ok: true }
+}
+
+pub fn agent_run(context: map) -> map {
+    emit_marker("model.started");
+    emit_marker("not_a_canonical_event");
+    let broken: map = json::decode("{not json");
+    broken
+}

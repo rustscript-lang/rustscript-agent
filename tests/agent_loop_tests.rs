@@ -242,6 +242,54 @@ fn compact_plan_preserves_tool_call_result_pair() {
     assert_eq!(plan["retained_tail_ordinal"], json!(4));
 }
 
+/// A tool message WITHOUT the message-level `tool_call_id` whose content
+/// carries MULTIPLE tool_result parts must pair through the FIRST part's id
+/// (the same rule as the Rust mirror `first_tool_result_call_id` in
+/// src/service.rs). The old fallback took the LAST part's id, so a
+/// multi-result tool message with the assistant's id first would NOT push
+/// the boundary and the pair would be split.
+#[test]
+fn compact_fallback_uses_the_first_tool_result_part_id() {
+    let runner = compact_runner();
+    let plan = decide(
+        &runner,
+        compact_context(
+            json!([
+                msg_user(1, "hello"),
+                msg_tool_call(2, "call-1"),
+                msg_user(3, "more"),
+                // No message-level tool_call_id: the fallback scans the
+                // content parts. The FIRST part pairs with the assistant's
+                // call; the second is a different (already-consumed) call.
+                json!({
+                    "ordinal": 4,
+                    "role": "tool",
+                    "tool_call_id": "",
+                    "content": [
+                        {"type": "tool_result", "tool_call_id": "call-1", "content": "ok", "is_error": false},
+                        {"type": "tool_result", "tool_call_id": "call-9", "content": "ok", "is_error": false}
+                    ]
+                }),
+                msg_user(5, "next")
+            ]),
+            4,
+            2,
+        ),
+    );
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    assert_eq!(
+        plan["source_end_ordinal"],
+        json!(4),
+        "the boundary must push past the multi-result tool message through its FIRST part's id"
+    );
+    assert_eq!(
+        plan["commands"][2]["payload"]["end_ordinal"],
+        json!(4),
+        "the commit range must cover the whole tool message"
+    );
+    assert_eq!(plan["retained_tail_ordinal"], json!(4));
+}
+
 #[test]
 fn compact_plan_cascades_across_nested_tool_pairs() {
     let runner = compact_runner();

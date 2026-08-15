@@ -449,6 +449,7 @@ async fn create_session_handler(
             created_at: now,
             updated_at: now,
             message_count: 0,
+            generation: 1,
             end_reason: None,
         };
         if store.sessions.contains_key(&id) {
@@ -802,6 +803,8 @@ async fn session_chat_handler(
             input,
             None,
             None,
+            false,
+            "",
         );
         let assistant_message = append_message(
             &mut session.view,
@@ -810,6 +813,8 @@ async fn session_chat_handler(
             output,
             None,
             Some("stop".to_string()),
+            false,
+            "",
         );
         let durable = (|| -> Result<(), String> {
             let Some(persistence) = persistence else {

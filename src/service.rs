@@ -22,8 +22,9 @@
 //! succeeds.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rustscript_vm::{CancellationReason, HttpConfig, InvocationError, Value as VmValue};
@@ -40,11 +41,14 @@ use crate::gateway::store::{
     SessionRecord, SessionView, append_message,
 };
 use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
+use crate::runtime::approval_bridge::{
+    ApprovalBridge, NativeDenyPolicy, PendingApproval, Resolution, RiskClass,
+};
 use crate::runtime::delivery::{
-    ChannelEventSink, DeliveryContext, append_event_locked, run_delivery_task,
+    ChannelEventSink, DeliveryContext, DeliveryOutcome, append_event_locked, run_delivery_task,
 };
 use crate::runtime::rss_runner::execute_rss_source;
-use crate::{RunCancellation, RunError};
+use crate::{AgentConfig, AgentRunner, RunCancellation, RunError};
 
 /// One run whose terminal state could not be committed durably. The worker
 /// has already exited; a bounded retry loop (janitor cadence) commits the
@@ -223,12 +227,68 @@ struct AgentServiceInner {
     store: Arc<RwLock<GatewayStore>>,
     persistence: Option<Arc<GatewayPersistence>>,
     agent_source: Option<Arc<String>>,
+    /// The production serial loop program (`rss/agent/main.rss`); when
+    /// present, the worker drives the RSS-owned loop instead of the legacy
+    /// single-shot source.
+    agent_program: Option<Arc<AgentRunner>>,
+    /// The durable approval bridge over the A2 storage program; `None` in
+    /// in-memory-only mode (approval.wait then fails the run typed).
+    approval: Option<Arc<ApprovalBridge>>,
+    /// Runs parked on a durable pending approval: run_id -> the approval id
+    /// and the loop state needed to resume exactly once.
+    parked: Mutex<HashMap<String, ParkedRun>>,
     http_config: HttpConfig,
     capacity: Arc<Semaphore>,
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
     metrics: Arc<Metrics>,
+}
+
+/// The production A2 storage program path. The default resolves relative to
+/// the crate's manifest directory; `RUSTSCRIPT_STORAGE_PROGRAM` overrides it
+/// (deployment without the source tree, and the no-source-tree tests). The
+/// loader is fallible, so a missing program is a typed error, never a panic.
+fn storage_program_path() -> std::path::PathBuf {
+    match std::env::var_os("RUSTSCRIPT_STORAGE_PROGRAM") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("rss")
+            .join("storage")
+            .join("main.rss"),
+    }
+}
+
+/// One run parked on a durable pending approval. The resume re-invokes the
+/// loop with `phase: "approval.resume"` and the exact loop state from the
+/// `approval.wait` decision (durable sequencing; restart recovery fails
+/// interrupted runs and their approvals, so the in-memory park is bounded by
+/// admission capacity). The ORIGINAL run deadline rides along: the park time
+/// counts against the run's wall clock and a resume never resets it.
+///
+/// Once the bridge has durably resolved the row, the OUTCOME is recorded on
+/// the park: a resume that fails to transition the run back to `running`
+/// restores the park WITH the recorded decision, so a retry never re-resolves
+/// the durable row and never downgrades an approve to a deny.
+#[derive(Clone)]
+struct ParkedRun {
+    approval_id: String,
+    base_context: JsonValue,
+    state: JsonValue,
+    deadline: std::time::Instant,
+    /// The durable bridge outcome when the row was resolved but the run
+    /// transition failed (`None` while the row is still pending).
+    resolution: Option<ParkedResolution>,
+}
+
+/// One recorded durable bridge outcome: `resolved` (the loop dispatches the
+/// call when true), the typed `outcome` (`approved` | `denied` | `expired`),
+/// and the terminal reason.
+#[derive(Clone)]
+struct ParkedResolution {
+    resolved: bool,
+    outcome: String,
+    reason: String,
 }
 
 impl AgentService {
@@ -239,13 +299,84 @@ impl AgentService {
         agent_source: Option<Arc<String>>,
         http_config: HttpConfig,
         metrics: Arc<Metrics>,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        Self::build(
+            config,
+            store,
+            persistence,
+            agent_source,
+            None,
+            http_config,
+            metrics,
+        )
+    }
+
+    /// Constructs the service with the production serial loop program (the
+    /// RSS-owned loop the worker drives) plus the durable approval bridge.
+    pub(crate) fn with_program(
+        config: Arc<AgentGatewayConfig>,
+        store: Arc<RwLock<GatewayStore>>,
+        persistence: Option<Arc<GatewayPersistence>>,
+        program: AgentRunner,
+        http_config: HttpConfig,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, String> {
+        Self::build(
+            config,
+            store,
+            persistence,
+            None,
+            Some(program),
+            http_config,
+            metrics,
+        )
+    }
+
+    fn build(
+        config: Arc<AgentGatewayConfig>,
+        store: Arc<RwLock<GatewayStore>>,
+        persistence: Option<Arc<GatewayPersistence>>,
+        agent_source: Option<Arc<String>>,
+        agent_program: Option<AgentRunner>,
+        http_config: HttpConfig,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, String> {
         let capacity = Arc::new(Semaphore::new(config.max_concurrent_runs));
+        // The durable approval bridge composes the production A2 storage
+        // program. Construction is fallible: a deployment without the source
+        // tree answers a typed error instead of panicking (the gateway
+        // constructors propagate it), so a missing program can never take
+        // the process down.
+        let approval = match persistence.as_ref() {
+            Some(persistence) => {
+                let root = storage_program_path();
+                let mut agent_config = AgentConfig {
+                    http: http_config.clone(),
+                    sqlite: config.sqlite.clone(),
+                    io: config.io.clone(),
+                    fuel: config.fuel,
+                };
+                if let Some(parent) = persistence.db_root() {
+                    agent_config = agent_config.with_sqlite_root(parent);
+                }
+                let storage = AgentRunner::from_file(&root, agent_config)
+                    .map_err(|error| format!("compile the built-in storage program: {error}"))?;
+                Some(Arc::new(ApprovalBridge::new(
+                    storage,
+                    persistence.db_file_name().to_string(),
+                    NativeDenyPolicy::new(),
+                )))
+            }
+            None => None,
+        };
         let inner = Arc::new(AgentServiceInner {
             config,
             store,
             persistence,
             agent_source,
+            agent_program: agent_program.map(Arc::new),
+            approval,
+            parked: Mutex::new(HashMap::new()),
             http_config,
             capacity,
             runs: Mutex::new(HashMap::new()),
@@ -254,7 +385,7 @@ impl AgentService {
             metrics,
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
-        Self { inner }
+        Ok(Self { inner })
     }
 
     pub fn config(&self) -> &Arc<AgentGatewayConfig> {
@@ -404,6 +535,7 @@ impl AgentService {
                 created_at: now,
                 updated_at: now,
                 message_count: 0,
+                generation: 1,
                 end_reason: None,
             };
             Some(view)
@@ -523,10 +655,12 @@ impl AgentService {
             id: message_id.clone(),
             session_id: session_id.clone(),
             role: "user".to_string(),
+            tool_call_id: String::new(),
             content: request.input.clone(),
             created_at: now,
             run_id: Some(run_id.clone()),
             finish_reason: None,
+            compacted: false,
         });
         session.view.message_count = session.messages.len();
         session.view.updated_at = now;
@@ -544,6 +678,7 @@ impl AgentService {
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             parent_run_id: request.parent_run_id.clone(),
+            platform: request.platform.clone(),
             status: "started".to_string(),
             events: vec![started_event],
             sender: Some(sender),
@@ -642,6 +777,26 @@ impl AgentService {
                 reason = "requested",
                 "typed cancellation requested for the run"
             );
+            // A run parked on a pending approval has no worker to observe the
+            // cancellation: transition it back to `running` durably and
+            // commit the typed cancellation now.
+            if self
+                .inner
+                .parked
+                .lock()
+                .expect("parked lock")
+                .remove(run_id)
+                .is_some()
+            {
+                let service = self.clone();
+                let run_id = run_id.to_string();
+                tokio::spawn(async move {
+                    service
+                        .transition_run(&run_id, "waiting_approval", "running")
+                        .await;
+                    service.finish_cancelled(&run_id, "requested").await;
+                });
+            }
             Some("stopping".to_string())
         } else {
             Some(status)
@@ -812,6 +967,24 @@ impl AgentService {
             return;
         }
 
+        // The production serial loop: the RSS-owned loop program is driven
+        // here (lifecycle, capability composition, durable sequencing); the
+        // legacy single-shot source path remains for inline sources.
+        if let Some(program) = self.inner.agent_program.clone() {
+            let base_context = self.build_production_loop_context(&run_id, &session_id);
+            self.drive_production_loop(
+                program,
+                &run_id,
+                &session_id,
+                base_context,
+                "start",
+                JsonValue::Object(Default::default()),
+                Instant::now() + self.inner.config.run_timeout,
+            )
+            .await;
+            return;
+        }
+
         let output_text = if let Some(source) = self.inner.agent_source.clone() {
             let http_config = self.inner.http_config.clone();
             let sqlite_policy = self.inner.config.sqlite.clone();
@@ -868,13 +1041,44 @@ impl AgentService {
             // delivery task drains the remaining events and then exits. Wait
             // only the configured cancellation grace for the drain so the
             // terminal commit always follows the last durably delivered
-            // script event.
-            let delivery_outcome =
-                tokio::time::timeout(self.inner.config.cancellation_grace, delivery)
-                    .await
-                    .ok()
-                    .and_then(|result| result.ok())
-                    .unwrap_or_default();
+            // script event. When the drain cannot finish within the grace,
+            // the tail is NOT silently dropped: the typed `run.truncated`
+            // marker is durably appended BEFORE the terminal (a marker
+            // failure is the typed persistence_unavailable terminal).
+            let (delivery_outcome, truncation_reason) =
+                match tokio::time::timeout(self.inner.config.cancellation_grace, delivery).await {
+                    Ok(Ok(outcome)) => (outcome, None),
+                    Ok(Err(_)) => (DeliveryOutcome::default(), Some("delivery_task_failed")),
+                    Err(_) => (DeliveryOutcome::default(), Some("delivery_drain_timeout")),
+                };
+            if let Some(reason) = truncation_reason
+                && let Err(error) = self.append_truncation_marker(&run_id, reason).await
+            {
+                tracing::error!(
+                    run_id,
+                    error = %truncate_for_log(&error, 256),
+                    "the truncation marker could not be persisted; the run fails typed"
+                );
+                // A stop that raced the drain keeps its typed cancellation
+                // (never downgraded to a failure); otherwise the run fails
+                // with the typed persistence contract — never a silent tail
+                // drop.
+                if self.run_is_stopping(&run_id) {
+                    self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
+                        .await;
+                    return;
+                }
+                self.finish_failed(
+                    &run_id,
+                    json!({
+                        "status": "failed",
+                        "error_code": "persistence_unavailable",
+                        "error_message": "a run event could not be appended durably",
+                    }),
+                )
+                .await;
+                return;
+            }
             match outcome {
                 WorkerOutcome::Completed(value) => {
                     if let Some(reason) = delivery_outcome.schema_violation {
@@ -1024,6 +1228,8 @@ impl AgentService {
                 JsonValue::String(output_text_for_commit.clone()),
                 Some(run_id_for_commit.clone()),
                 Some("stop".to_string()),
+                false,
+                "",
             );
             let run = store
                 .runs
@@ -1303,11 +1509,14 @@ impl AgentService {
             .and_then(|session| session.view.provider.clone())
             .or_else(|| self.inner.config.provider.clone());
         let parent_run_id = run.and_then(|run| run.parent_run_id.clone());
+        let platform = run
+            .map(|run| run.platform.clone())
+            .unwrap_or_else(|| "api_server".to_string());
         let context = RunContext {
             run_id: run_id.to_string(),
             session_id: session_id.to_string(),
             parent_run_id,
-            platform: "api_server".to_string(),
+            platform,
             input: JsonValue::String(input.to_string()),
             messages,
             system_prompt,
@@ -1315,17 +1524,1596 @@ impl AgentService {
             provider,
             // Provider options and tool schemas arrive with the provider and
             // tool milestones; the canonical shape is present from the start.
-            provider_options: JsonValue::Object(Default::default()),
+            provider_options: self.inner.config.provider_options.clone(),
             tool_schemas: JsonValue::Array(Vec::new()),
             limits: json!({
                 "max_events": self.inner.config.max_events_per_run,
                 "max_event_bytes": self.inner.config.max_event_bytes,
                 "timeout_ms": self.inner.config.run_timeout.as_millis(),
+                "max_turns": self.inner.config.max_turns,
+                "max_retries": self.inner.config.max_retries,
+                "base_retry_delay_ms": self.inner.config.base_retry_delay_ms,
+                "max_retry_delay_ms": self.inner.config.max_retry_delay_ms,
+                "approval_mode": self.inner.config.approval_mode,
+                "max_context_messages": self.inner.config.max_context_messages,
+                "retained_tail": self.inner.config.retained_tail,
+                "stream": self.inner.config.stream,
+                "parallel": self.inner.config.parallel,
+                "task": self.inner.config.task,
             }),
             metadata: JsonValue::Object(Default::default()),
         };
         context.to_vm_value()
     }
+
+    /// Builds the canonical PRODUCTION serial loop context (A5 plan section
+    /// 4): the flat typed fields the loop reads (`turn`, `retry_count`,
+    /// `max_turns`, `max_retries`, `model`, `provider`, `provider_options`,
+    /// `system_prompt`, `messages`, `last_text`) plus the nested `config` map
+    /// (`base_retry_delay_ms`, `max_retry_delay_ms`, `max_context_messages`,
+    /// `retained_tail`, `approval_mode`, `native_hard_deny`, `stream`,
+    /// `parallel`, `task`, `max_output_tokens`, `now_ms`, `generation`,
+    /// `message_count`, `compaction_id`). The session messages are
+    /// normalized to canonical `{ordinal, role, tool_call_id, content}`
+    /// entries whose ordinals mirror the durable per-session message
+    /// ordinals (insertion order), so the loop's compaction plan references
+    /// real rows; `tool_call_id` mirrors the durable messages.tool_call_id
+    /// column (pair preservation across reloads) and content is normalized
+    /// to the canonical content-part array.
+    fn build_production_loop_context(&self, run_id: &str, session_id: &str) -> VmValue {
+        let config = &self.inner.config;
+        let store = self.inner.store.read();
+        let session = store.sessions.get(session_id);
+        let run = store.runs.get(run_id);
+        // The provider-facing history EXCLUDES compacted rows (a committed
+        // compaction covered them), even when the durable count is within the
+        // window. Ordinals keep mirroring the durable rows (position + 1), so
+        // a later compaction plan still references real rows.
+        let messages: Vec<JsonValue> = session
+            .map(|session| {
+                session
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| !message.compacted)
+                    .map(|(index, message)| {
+                        json!({
+                            "ordinal": index + 1,
+                            "role": message.role,
+                            // The message-level pair id mirrors the durable
+                            // messages.tool_call_id column: compaction plans
+                            // pair assistant tool-call messages with their
+                            // tool results across reloads.
+                            "tool_call_id": message.tool_call_id,
+                            "content": canonical_message_content(&message.content),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let system_prompt = session
+            .and_then(|session| session.view.system_prompt.clone())
+            .unwrap_or_default();
+        let model = session
+            .map(|session| session.view.model.clone())
+            .unwrap_or_else(|| config.model.clone());
+        let provider = session
+            .and_then(|session| session.view.provider.clone())
+            .or_else(|| config.provider.clone())
+            .unwrap_or_default();
+        let generation = session.map(|session| session.view.generation).unwrap_or(1);
+        let message_count = session.map(|session| session.messages.len()).unwrap_or(0);
+        let platform = run
+            .map(|run| run.platform.clone())
+            .or_else(|| session.map(|session| session.view.source.clone()))
+            .unwrap_or_default();
+        let context = json!({
+            "run_id": run_id,
+            "session_id": session_id,
+            "platform": platform,
+            "turn": 0,
+            "retry_count": 0,
+            "max_turns": config.max_turns,
+            "max_retries": config.max_retries,
+            "model": model,
+            "provider": provider,
+            "provider_options": config.provider_options.clone(),
+            "system_prompt": system_prompt,
+            "messages": messages,
+            "last_text": "",
+            "config": {
+                "base_retry_delay_ms": config.base_retry_delay_ms,
+                "max_retry_delay_ms": config.max_retry_delay_ms,
+                "max_context_messages": config.max_context_messages,
+                "retained_tail": config.retained_tail,
+                "approval_mode": config.approval_mode.clone(),
+                "native_hard_deny": false,
+                "stream": config.stream,
+                "parallel": config.parallel,
+                "task": config.task,
+                "max_output_tokens": 1024,
+                "now_ms": timestamp(),
+                "generation": generation,
+                "message_count": message_count,
+                "compaction_id": format!("compact:{session_id}:{}", generation + 1),
+            }
+        });
+        json_to_vm_value(&context)
+    }
+
+    // -----------------------------------------------------------------------
+    // Production serial loop driver (RSS-owned loop, service-owned lifecycle)
+    // -----------------------------------------------------------------------
+
+    /// Drives the RSS-owned production loop: one invocation per step, typed
+    /// decisions executed here (retry sleep, approval park, compaction, typed
+    /// terminals), re-invocation with the carried state. The whole run is
+    /// bounded by `deadline` — the ORIGINAL run deadline (a resume after a
+    /// park passes the parked deadline, so park time counts against the run
+    /// wall clock); cancellation is typed.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_production_loop(
+        &self,
+        program: Arc<AgentRunner>,
+        run_id: &str,
+        session_id: &str,
+        base_context: VmValue,
+        initial_phase: &str,
+        initial_state: JsonValue,
+        deadline: Instant,
+    ) {
+        let mut base_json = vm_value_to_json(&base_context);
+        let mut phase = initial_phase.to_string();
+        let mut state = initial_state;
+        // The durable message watermark: every in-run message whose ordinal
+        // exceeds it is persisted durably before the loop continues (the
+        // loop's assistant tool-call / tool-result appends are durable-first).
+        let mut durable_ordinal = base_json["config"]["message_count"].as_i64().unwrap_or(0);
+        loop {
+            let Some(handle) = self
+                .inner
+                .runs
+                .lock()
+                .expect("runs lock")
+                .get(run_id)
+                .cloned()
+            else {
+                return;
+            };
+            if handle.cancel.requested().is_some() {
+                self.finish_cancelled(run_id, handle_cancel_reason(&handle, "requested"))
+                    .await;
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                handle.cancel.request(CancellationReason::Deadline);
+                // The typed reason on the handle wins (a stop that raced the
+                // deadline keeps its own reason).
+                self.finish_cancelled(run_id, handle_cancel_reason(&handle, "deadline"))
+                    .await;
+                return;
+            }
+            let context = self.loop_step_context(&base_json, &phase, &state);
+            let outcome = self
+                .invoke_loop_step(Arc::clone(&program), run_id, context, remaining)
+                .await;
+            let decision = match outcome {
+                LoopStepOutcome::Decision(decision) => decision,
+                LoopStepOutcome::Cancelled => return,
+            };
+            // Durable-first message sync: the loop's in-run appends (assistant
+            // tool-call and tool-result messages) must be persisted before the
+            // next step, a park, or the terminal commit.
+            match self
+                .sync_durable_messages(run_id, session_id, &decision, durable_ordinal)
+                .await
+            {
+                Ok(new_ordinal) => {
+                    durable_ordinal = new_ordinal;
+                    // The compaction gate plans over the CURRENT durable
+                    // count, so the refreshed watermark feeds the next step's
+                    // context.
+                    base_json["config"]["message_count"] = json!(durable_ordinal);
+                }
+                Err(error) => {
+                    self.finish_failed(
+                        run_id,
+                        json!({
+                            "status": "failed",
+                            "error_code": "persistence_unavailable",
+                            "error_message": format!(
+                                "a tool-cycle message could not be appended durably: {error}"
+                            ),
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+            }
+            // The loop's continuation decisions carry the CURRENT config
+            // (generation/message_count advance across internal turns and
+            // compactions); merge it back so a park/resume or the next
+            // invocation plans with the fresh durable state. The compaction
+            // id is canonicalized from the generation (the pinned core has
+            // no int-to-string conversion).
+            if let Some(config) = decision["config"].as_object() {
+                for (key, value) in config {
+                    base_json["config"][key] = value.clone();
+                }
+                if let Some(generation) = base_json["config"]["generation"].as_i64() {
+                    base_json["config"]["compaction_id"] =
+                        json!(format!("compact:{session_id}:{}", generation + 1));
+                }
+            }
+            match decision["kind"].as_str().unwrap_or("") {
+                "run.completed" => {
+                    let text = decision["text"].as_str().unwrap_or("").to_string();
+                    self.finish_completed(run_id, session_id, &text).await;
+                    return;
+                }
+                "run.failed" => {
+                    self.finish_failed(run_id, self.failed_decision_payload(&decision))
+                        .await;
+                    return;
+                }
+                "retry" => {
+                    let delay_ms = decision["delay_ms"].as_i64().unwrap_or(0).max(0) as u64;
+                    tokio::time::sleep(Duration::from_millis(delay_ms).min(remaining)).await;
+                    phase = "start".to_string();
+                    state = decision_state(&decision);
+                }
+                "approval.wait" => {
+                    match self
+                        .park_for_approval(run_id, &base_json, &decision, deadline)
+                        .await
+                    {
+                        ParkOutcome::Parked => return,
+                        ParkOutcome::Cancelled => {
+                            // A stop (or the deadline) landed before the park
+                            // could be durably created: commit the typed
+                            // cancellation now — no pending approval row and
+                            // no park were created after the stop.
+                            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                                handle.cancel.request(CancellationReason::Deadline);
+                            }
+                            self.finish_cancelled(
+                                run_id,
+                                handle_cancel_reason(&handle, "deadline"),
+                            )
+                            .await;
+                            return;
+                        }
+                        ParkOutcome::Failed => {
+                            self.finish_failed(
+                                run_id,
+                                json!({
+                                    "status": "failed",
+                                    "error_code": "approval_unavailable",
+                                    "error_message": "a durable approval could not be persisted for the pending tool call",
+                                }),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                "compact" => {
+                    let (ok, error) = self.execute_compaction(run_id, &decision).await;
+                    phase = "compact.result".to_string();
+                    let mut next = decision_state(&decision);
+                    next["compact_ok"] = json!(ok);
+                    next["compact_error"] = json!(error);
+                    state = next;
+                    if ok {
+                        // The commit advanced the session generation: refresh
+                        // the base config so a SECOND compaction in the same
+                        // run plans the next generation with a fresh
+                        // compaction id (never a stale-generation conflict).
+                        if let Some(generation) = decision["plan"]["generation"].as_i64() {
+                            base_json["config"]["generation"] = json!(generation);
+                            base_json["config"]["compaction_id"] =
+                                json!(format!("compact:{session_id}:{}", generation + 1));
+                        }
+                    }
+                }
+                "parallel.handoff" | "subagent.handoff" => {
+                    let code = if decision["kind"] == "parallel.handoff" {
+                        "parallel_execution_unavailable"
+                    } else {
+                        "task_execution_unavailable"
+                    };
+                    let message = decision["message"]
+                        .as_str()
+                        .unwrap_or("parallel/subagent execution is not available")
+                        .to_string();
+                    self.finish_failed(
+                        run_id,
+                        json!({
+                            "status": "failed",
+                            "error_code": code,
+                            "error_message": message,
+                            "blocked_reason": decision["blocked_reason"],
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                other => {
+                    self.finish_failed(
+                        run_id,
+                        json!({
+                            "status": "failed",
+                            "error_code": "invalid_loop_decision",
+                            "error_message": format!("the serial loop produced an unknown decision kind: {other}"),
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// True while the run must not create new durable approval/compaction
+    /// state: a typed cancellation was requested or the in-memory status is
+    /// `stopping`. The checks run before every durable side effect.
+    fn run_is_stopping(&self, run_id: &str) -> bool {
+        let Some(handle) = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .cloned()
+        else {
+            return true;
+        };
+        if handle.cancel.requested().is_some() {
+            return true;
+        }
+        self.inner
+            .store
+            .read()
+            .runs
+            .get(run_id)
+            .is_some_and(|run| run.status == "stopping")
+    }
+
+    /// One loop invocation with its own bounded delivery path (events are
+    /// durably appended before publish by the delivery task). Bounded by the
+    /// remaining run deadline; a timeout cancels with the typed deadline
+    /// reason.
+    async fn invoke_loop_step(
+        &self,
+        program: Arc<AgentRunner>,
+        run_id: &str,
+        context: JsonValue,
+        remaining: Duration,
+    ) -> LoopStepOutcome {
+        let Some(handle) = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .cloned()
+        else {
+            return LoopStepOutcome::Cancelled;
+        };
+        let cancellation = handle.cancel.clone();
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel(self.inner.config.event_channel_capacity);
+        let delivery = tokio::spawn(run_delivery_task(
+            DeliveryContext {
+                store: Arc::clone(&self.inner.store),
+                persistence: self.inner.persistence.clone(),
+                config: Arc::clone(&self.inner.config),
+                metrics: Arc::clone(&self.inner.metrics),
+            },
+            run_id.to_string(),
+            receiver,
+        ));
+        let mut sink = ChannelEventSink(sender);
+        let context_vm = json_to_vm_value(&context);
+        let cancellation_for_worker = cancellation.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            program.run_with_context_and_events(context_vm, &mut sink, &cancellation_for_worker)
+        });
+        // The terminal action each non-decision branch must commit AFTER the
+        // delivery drain (never before).
+        enum TerminalAction {
+            Cancel(&'static str),
+            Fail(JsonValue),
+        }
+        let (outcome, terminal) = match tokio::time::timeout(remaining, &mut worker).await {
+            Ok(Ok(Ok(value))) => (LoopStepOutcome::Decision(vm_value_to_json(&value)), None),
+            Ok(Ok(Err(error))) => match error {
+                // A typed invocation failure fails the run (never a
+                // fabricated terminal).
+                RunError::Invocation(rustscript_vm::InvocationError::Cancelled(reason)) => (
+                    LoopStepOutcome::Cancelled,
+                    Some(TerminalAction::Cancel(handle_cancel_reason(
+                        &handle,
+                        reason.as_str(),
+                    ))),
+                ),
+                other => (
+                    LoopStepOutcome::Cancelled,
+                    Some(TerminalAction::Fail(failed_payload(other.to_string()))),
+                ),
+            },
+            Ok(Err(error)) => (
+                LoopStepOutcome::Cancelled,
+                Some(TerminalAction::Fail(failed_payload(format!(
+                    "RSS worker join failed: {error}"
+                )))),
+            ),
+            Err(_) => {
+                // The step deadline is authoritative: cancel with the typed
+                // deadline reason and wait only the configured grace. A stop
+                // that raced the deadline keeps its own typed reason.
+                cancellation.request(CancellationReason::Deadline);
+                let _ =
+                    tokio::time::timeout(self.inner.config.cancellation_grace, &mut worker).await;
+                (
+                    LoopStepOutcome::Cancelled,
+                    Some(TerminalAction::Cancel(handle_cancel_reason(
+                        &handle, "deadline",
+                    ))),
+                )
+            }
+        };
+        // Drain the delivery path (bounded) so the terminal commit ALWAYS
+        // follows the last durably delivered script event — including the
+        // cancel/error/join/timeout branches, whose tail events would
+        // otherwise race (or be dropped by) the terminal commit. When the
+        // drain cannot finish within the cancellation grace (a runaway
+        // worker keeps the bounded channel fed while the delivery task is
+        // stalled), the tail is NOT silently dropped: the typed
+        // `run.truncated` marker is durably appended BEFORE the terminal so
+        // a replay always sees the truncation boundary; if even the marker
+        // cannot be persisted, the run fails with the typed
+        // persistence_unavailable contract.
+        let (delivery_outcome, truncation_reason) =
+            match tokio::time::timeout(self.inner.config.cancellation_grace, delivery).await {
+                Ok(Ok(outcome)) => (outcome, None),
+                Ok(Err(_)) => (DeliveryOutcome::default(), Some("delivery_task_failed")),
+                Err(_) => (DeliveryOutcome::default(), Some("delivery_drain_timeout")),
+            };
+        if let Some(reason) = truncation_reason
+            && let Err(error) = self.append_truncation_marker(run_id, reason).await
+        {
+            tracing::error!(
+                run_id,
+                error = %truncate_for_log(&error, 256),
+                "the truncation marker could not be persisted; the run fails typed"
+            );
+            // A stop that raced the drain keeps its typed cancellation
+            // (never downgraded to a failure); otherwise the run fails with
+            // the typed persistence contract — never a silent tail drop.
+            if self.run_is_stopping(run_id) {
+                self.finish_cancelled(run_id, handle_cancel_reason(&handle, "requested"))
+                    .await;
+                return LoopStepOutcome::Cancelled;
+            }
+            self.finish_failed(
+                run_id,
+                json!({
+                    "status": "failed",
+                    "error_code": "persistence_unavailable",
+                    "error_message": "a run event could not be appended durably",
+                }),
+            )
+            .await;
+            return LoopStepOutcome::Cancelled;
+        }
+        if let Some(reason) = delivery_outcome.schema_violation {
+            self.finish_failed(run_id, events::schema_violation_error(&reason))
+                .await;
+            return LoopStepOutcome::Cancelled;
+        }
+        if delivery_outcome.persist_failed {
+            self.finish_failed(
+                run_id,
+                json!({
+                    "status": "failed",
+                    "error_code": "persistence_unavailable",
+                    "error_message": "a run event could not be appended durably",
+                }),
+            )
+            .await;
+            return LoopStepOutcome::Cancelled;
+        }
+        match terminal {
+            Some(TerminalAction::Cancel(reason)) => {
+                self.finish_cancelled(run_id, reason).await;
+            }
+            Some(TerminalAction::Fail(payload)) => {
+                self.finish_failed(run_id, payload).await;
+            }
+            None => {}
+        }
+        outcome
+    }
+
+    /// Merges the loop's base context with the current phase and the carried
+    /// loop state into one typed context map.
+    fn loop_step_context(&self, base: &JsonValue, phase: &str, state: &JsonValue) -> JsonValue {
+        let mut context = base.clone();
+        if let (JsonValue::Object(fields), JsonValue::Object(state_fields)) = (&mut context, state)
+        {
+            fields.insert("phase".to_string(), JsonValue::String(phase.to_string()));
+            for (key, value) in state_fields {
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+        context
+    }
+
+    /// Persists a durable pending approval (bridge), emits the
+    /// `approval.required` event with the REAL bridge id, transitions the run
+    /// to `waiting_approval`, and parks the exact loop state for an
+    /// exactly-once resume. A stop/cancel that lands before the durable write
+    /// (or during the storage round trip) cancels the park instead: no
+    /// pending approval row is created after a stop, and the run can never be
+    /// wedged by a park racing a stop.
+    async fn park_for_approval(
+        &self,
+        run_id: &str,
+        base_context: &JsonValue,
+        decision: &JsonValue,
+        deadline: Instant,
+    ) -> ParkOutcome {
+        let Some(bridge) = self.inner.approval.clone() else {
+            return ParkOutcome::Failed;
+        };
+        // B: no durable approval write may start after a stop/cancel, and a
+        // parked run whose deadline already passed must not be created (the
+        // deadline keeps counting while we park).
+        if self.run_is_stopping(run_id) {
+            return ParkOutcome::Cancelled;
+        }
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return ParkOutcome::Cancelled;
+        }
+        let approval = &decision["approval"];
+        let session_id = self
+            .inner
+            .store
+            .read()
+            .runs
+            .get(run_id)
+            .map(|run| run.session_id.clone())
+            .unwrap_or_default();
+        let tool_call_id = approval["tool_call_id"].as_str().unwrap_or("").to_string();
+        let tool_name = approval["tool_name"].as_str().unwrap_or("").to_string();
+        let arguments_json =
+            serde_json::to_string(&approval["arguments"]).unwrap_or_else(|_| "{}".to_string());
+        let risk = match approval["risk_class"].as_str() {
+            Some("read") => RiskClass::Read,
+            Some("write") => RiskClass::Write,
+            Some("execute") => RiskClass::Execute,
+            _ => RiskClass::Privileged,
+        };
+        let now = timestamp() as i64;
+        let request = PendingApproval {
+            run_id: run_id.to_string(),
+            session_id,
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            arguments_json,
+            risk,
+            requested_at_ms: now,
+            expires_at_ms: now + self.inner.config.approval_timeout.as_millis() as i64,
+        };
+        // P2-5: the durable approval request runs on a BLOCKING thread (never
+        // a Tokio worker — SQLite/VM stalls must not occupy the request
+        // runtime), bounded by the run's remaining deadline so a stuck
+        // bridge cannot wedge the run (the typed deadline cancellation path
+        // stays reachable).
+        //
+        // Final P2 (deadline orphan): the approval id is generated BEFORE
+        // the request starts and passed idempotently (the storage layer
+        // INSERT OR IGNOREs by id — a retry can never duplicate the row),
+        // and the JoinHandle is KEPT. When the deadline fires first, the
+        // background request still completes — and if its insert wins the
+        // lock race, a pending row exists with NO park and NO
+        // `approval.required` event. The compensation watcher awaits the
+        // join and durably cancels THAT SPECIFIC row the moment the request
+        // completes, so no park-less orphan can wait out the 600s
+        // approval_timeout sweep.
+        let remaining_deadline = deadline.saturating_duration_since(Instant::now());
+        let approval_id = Uuid::new_v4().to_string();
+        let bridge_for_block = bridge.clone();
+        let request_for_block = request;
+        let id_for_block = approval_id.clone();
+        let mut join = tokio::task::spawn_blocking(move || {
+            bridge_for_block.request_pending(&request_for_block, &id_for_block)
+        });
+        let approval_id = match tokio::time::timeout(remaining_deadline, &mut join).await {
+            Ok(Ok(Ok(approval_id))) => approval_id,
+            Ok(Ok(Err(error))) => {
+                tracing::error!(
+                    run_id,
+                    error = %truncate_for_log(&error.to_string(), 256),
+                    "durable approval request failed; the run fails typed"
+                );
+                // The request may still have persisted the row before the
+                // typed failure (a storage command can fail mid-way):
+                // compensate that specific id the moment the worker returns.
+                let service_for_comp = self.clone();
+                let run_id_for_comp = run_id.to_string();
+                let id_for_comp = approval_id.clone();
+                tokio::spawn(async move {
+                    let _ = join.await;
+                    let _ = service_for_comp
+                        .cancel_abandoned_approval(&run_id_for_comp, &id_for_comp)
+                        .await;
+                });
+                return ParkOutcome::Failed;
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    run_id,
+                    error = %truncate_for_log(&error.to_string(), 256),
+                    "durable approval request worker failed; the run fails typed"
+                );
+                let service_for_comp = self.clone();
+                let run_id_for_comp = run_id.to_string();
+                let id_for_comp = approval_id.clone();
+                tokio::spawn(async move {
+                    let _ = join.await;
+                    let _ = service_for_comp
+                        .cancel_abandoned_approval(&run_id_for_comp, &id_for_comp)
+                        .await;
+                });
+                return ParkOutcome::Failed;
+            }
+            Err(_) => {
+                // The run's remaining deadline passed while the durable
+                // request was in flight: cancel typed (the request itself
+                // completes in the background; no park exists yet). The
+                // compensation below expires the specific row if — and the
+                // moment — the late request actually persisted it.
+                tracing::warn!(
+                    run_id,
+                    "durable approval request outlived the run deadline; cancelling typed"
+                );
+                let service_for_comp = self.clone();
+                let run_id_for_comp = run_id.to_string();
+                let id_for_comp = approval_id.clone();
+                tokio::spawn(async move {
+                    // The join resolves only AFTER the blocking storage
+                    // command returned, so an Ok(id) result means the row
+                    // exists (durably): cancel it immediately. An Err result
+                    // means no row was created — the guarded cancel is still
+                    // attempted as a typed no-op.
+                    let _ = join.await;
+                    let _ = service_for_comp
+                        .cancel_abandoned_approval(&run_id_for_comp, &id_for_comp)
+                        .await;
+                });
+                return ParkOutcome::Cancelled;
+            }
+        };
+        // B: re-check after the blocking storage round trip — a stop that
+        // landed meanwhile must not see a new park.
+        if self.run_is_stopping(run_id) {
+            return ParkOutcome::Cancelled;
+        }
+        if !self
+            .transition_run(run_id, "running", "waiting_approval")
+            .await
+        {
+            if self.run_is_stopping(run_id) {
+                return ParkOutcome::Cancelled;
+            }
+            return ParkOutcome::Failed;
+        }
+        // The park is inserted BEFORE the notification event: the run is
+        // observable as parked the moment the durable transition lands, so a
+        // resolution that races the event append still finds the park.
+        self.inner.parked.lock().expect("parked lock").insert(
+            run_id.to_string(),
+            ParkedRun {
+                approval_id: approval_id.clone(),
+                base_context: base_context.clone(),
+                state: decision_state(decision),
+                // C: the ORIGINAL run deadline rides along; a resume passes
+                // it back so the park time counts against the wall clock.
+                deadline,
+                // The row is still pending; the durable outcome is recorded
+                // only once the bridge resolves it (see ParkedRun docs).
+                resolution: None,
+            },
+        );
+        // P2-4: re-check atomically AFTER the park insert — a stop/cancel
+        // that landed during the durable transition must not see a new park
+        // or a post-stop approval.required event (the run would otherwise sit
+        // parked until the approval_timeout expiry sweep — the default 600s).
+        if self.run_is_stopping(run_id) {
+            self.inner
+                .parked
+                .lock()
+                .expect("parked lock")
+                .remove(run_id);
+            // The park transition may have committed durably while the stop
+            // landed: move the durable status back to `running` so the typed
+            // terminal can commit (the A2 run.terminal contract requires a
+            // `running` source state).
+            let _ = self
+                .transition_run(run_id, "waiting_approval", "running")
+                .await;
+            return ParkOutcome::Cancelled;
+        }
+        // H: the approval.required event is emitted HERE with the real
+        // bridge-generated id, durably appended before publish, exactly once
+        // per park (the loop no longer emits a placeholder with an empty id).
+        let turn = decision["turn"].as_i64().unwrap_or(0);
+        if let Err(error) = self
+            .append_approval_required_event(
+                run_id,
+                &approval_id,
+                &tool_call_id,
+                &tool_name,
+                risk.as_str(),
+                turn,
+            )
+            .await
+        {
+            tracing::error!(
+                run_id,
+                error = %truncate_for_log(&error, 256),
+                "approval.required could not be appended durably; the run fails typed"
+            );
+            // Un-wedge: remove the park (a stop may have already removed it)
+            // so the run can never be stuck parked.
+            self.inner
+                .parked
+                .lock()
+                .expect("parked lock")
+                .remove(run_id);
+            if self.run_is_stopping(run_id) {
+                // The append was rejected because a stop landed: cancel typed
+                // (the durable status is still waiting_approval; move it back
+                // to running so the typed terminal can commit).
+                let _ = self
+                    .transition_run(run_id, "waiting_approval", "running")
+                    .await;
+                return ParkOutcome::Cancelled;
+            }
+            let _ = self
+                .transition_run(run_id, "waiting_approval", "running")
+                .await;
+            return ParkOutcome::Failed;
+        }
+        tracing::info!(run_id, "run parked on a pending approval");
+        ParkOutcome::Parked
+    }
+
+    /// Final-P2 compensation for an approval whose blocking `approval.request`
+    /// outlived the run deadline (or failed mid-way): the moment the
+    /// background request completes, durably cancel (expire) THAT SPECIFIC
+    /// row. Targeted by id and pending-only — a legitimate park's row (a
+    /// different id) is never touched, and a missing row is a typed no-op.
+    /// One bounded storage round trip on a blocking thread; a failure is
+    /// logged (the restart-recovery orphan sweep and the janitor expiry
+    /// sweep remain as the durable backstops).
+    async fn cancel_abandoned_approval(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+    ) -> Result<(), String> {
+        let Some(bridge) = self.inner.approval.clone() else {
+            return Ok(());
+        };
+        let run_id_for_block = run_id.to_string();
+        let approval_id_for_block = approval_id.to_string();
+        let resolver = "deadline-compensation".to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = timestamp() as i64;
+            match bridge.cancel(&approval_id_for_block, &resolver, now) {
+                Ok(affected) => {
+                    if affected > 0 {
+                        tracing::info!(
+                            run_id = %run_id_for_block,
+                            approval_id = %approval_id_for_block,
+                            "abandoned approval durably cancelled after the run deadline"
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(format!("approval.cancel failed: {error}")),
+            }
+        })
+        .await
+        .map_err(|error| format!("approval cancel worker failed: {error}"))?
+    }
+
+    /// Durably appends the typed `run.truncated` marker (reason + drain
+    /// bounds only — never event payloads, tool arguments, or any other
+    /// sensitive run data) BEFORE the terminal of a step whose bounded
+    /// delivery drain exceeded the cancellation grace. Mirrors the
+    /// approval.required append path: store lock + durable `event.append`,
+    /// in-memory rollback on failure.
+    async fn append_truncation_marker(&self, run_id: &str, reason: &str) -> Result<(), String> {
+        let service = self.clone();
+        let run_id_for_block = run_id.to_string();
+        let reason_for_block = reason.to_string();
+        let grace_ms = self.inner.config.cancellation_grace.as_millis() as i64;
+        let channel_capacity = self.inner.config.event_channel_capacity as i64;
+        let max_event_bytes = self.inner.config.max_event_bytes;
+        let max_events = self.inner.config.max_events_per_run;
+        tokio::task::spawn_blocking(move || {
+            let mut store = service.inner.store.write();
+            let Some(run) = store.runs.get_mut(&run_id_for_block) else {
+                return Err("the run is gone".to_string());
+            };
+            if matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "cancelled" | "terminal_pending" | "stopping"
+            ) {
+                return Err("the run already reached a terminal or is stopping".to_string());
+            }
+            let event = append_event_locked(
+                run,
+                "run.truncated",
+                events::truncation_marker(&reason_for_block, grace_ms, channel_capacity),
+                max_event_bytes,
+                max_events,
+            );
+            let payload = json!({
+                "run_id": run_id_for_block,
+                "event_id": event.event_id,
+                "event_type": event.event,
+                "payload_json": serde_json::to_string(&event.data)
+                    .unwrap_or_else(|_| "{}".to_string()),
+                "now_ms": timestamp(),
+                "max_events": max_events,
+            });
+            let durable = match service.persistence_handle() {
+                Some(persistence) => persistence.event_append(&payload).map(|_| ()),
+                None => Ok(()),
+            };
+            match durable {
+                Ok(()) => {
+                    if let Some(sender) = &run.sender {
+                        let _ = sender.send(event);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    run.events
+                        .retain(|existing| existing.event_id != event.event_id);
+                    Err(format!("run.truncated event append failed: {error}"))
+                }
+            }
+        })
+        .await
+        .map_err(|error| format!("truncation marker worker failed: {error}"))?
+    }
+
+    /// Durably appends and publishes the `approval.required` event carrying
+    /// the bridge-generated approval id (the loop's placeholder emission was
+    /// removed; this is the single exact-once emission per park).
+    async fn append_approval_required_event(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        risk_class: &str,
+        turn: i64,
+    ) -> Result<(), String> {
+        let service = self.clone();
+        let run_id_for_block = run_id.to_string();
+        let approval_id_for_block = approval_id.to_string();
+        let tool_call_id_for_block = tool_call_id.to_string();
+        let tool_name_for_block = tool_name.to_string();
+        let risk_class_for_block = risk_class.to_string();
+        let max_event_bytes = self.inner.config.max_event_bytes;
+        let max_events = self.inner.config.max_events_per_run;
+        tokio::task::spawn_blocking(move || {
+            let mut store = service.inner.store.write();
+            let Some(run) = store.runs.get_mut(&run_id_for_block) else {
+                return Err("the run is gone".to_string());
+            };
+            if matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "cancelled" | "terminal_pending" | "stopping"
+            ) {
+                // P2-4: a stop that landed before this closure ran (the
+                // park-insert re-check is the primary guard; this status
+                // check closes the last microsecond of the race) must never
+                // see a post-stop approval.required event.
+                return Err("the run already reached a terminal or is stopping".to_string());
+            }
+            let event = append_event_locked(
+                run,
+                "approval.required",
+                json!({
+                    "approval_id": approval_id_for_block,
+                    "tool_call_id": tool_call_id_for_block,
+                    "tool_name": tool_name_for_block,
+                    "risk_class": risk_class_for_block,
+                    "turn": turn,
+                }),
+                max_event_bytes,
+                max_events,
+            );
+            let payload = json!({
+                "run_id": run_id_for_block,
+                "event_id": event.event_id,
+                "event_type": event.event,
+                "payload_json": serde_json::to_string(&event.data)
+                    .unwrap_or_else(|_| "{}".to_string()),
+                "now_ms": timestamp(),
+                "max_events": max_events,
+            });
+            let durable = match service.persistence_handle() {
+                Some(persistence) => persistence.event_append(&payload).map(|_| ()),
+                None => Ok(()),
+            };
+            match durable {
+                Ok(()) => {
+                    if let Some(sender) = &run.sender {
+                        let _ = sender.send(event);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    run.events
+                        .retain(|existing| existing.event_id != event.event_id);
+                    Err(format!("approval.required event append failed: {error}"))
+                }
+            }
+        })
+        .await
+        .map_err(|error| format!("approval event worker failed: {error}"))?
+    }
+
+    /// Persists every in-run message whose ordinal exceeds the durable
+    /// watermark (the loop appends assistant tool-call and tool-result
+    /// messages inline; they must be durably committed before the loop
+    /// continues, parks, or commits a terminal). Returns the new watermark.
+    /// Durable-first: any failure fails the run typed — the loop never
+    /// continues on unpersisted history. In-memory-only mode mirrors the
+    /// same messages into the session (a second run on the same session
+    /// must never silently lose the first run's tool cycle).
+    async fn sync_durable_messages(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        decision: &JsonValue,
+        durable_ordinal: i64,
+    ) -> Result<i64, String> {
+        let Some(messages) = decision["messages"].as_array() else {
+            return Ok(durable_ordinal);
+        };
+        let mut watermark = durable_ordinal;
+        for message in messages {
+            let ordinal = message["ordinal"].as_i64().unwrap_or(0);
+            if ordinal <= watermark {
+                continue;
+            }
+            let content = message["content"].clone();
+            // The message-level pair id (the loop's canonical shape) mirrors
+            // the durable messages.tool_call_id column; the content-part
+            // scan is the fallback for history shapes without the
+            // message-level field.
+            let tool_call_id = message["tool_call_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| first_tool_result_call_id(&content));
+            let payload = json!({
+                "id": Uuid::new_v4().to_string(),
+                "session_id": session_id,
+                "role": message["role"].as_str().unwrap_or("").to_string(),
+                "content_json": serde_json::to_string(&content)
+                    .unwrap_or_else(|_| "[]".to_string()),
+                "name": "",
+                "tool_call_id": tool_call_id,
+                "parent_message_id": "",
+                "token_estimate": 0,
+                "metadata_json": "{}",
+                "run_id": run_id,
+                "finish_reason": "",
+                "now_ms": timestamp(),
+            });
+            let service = self.clone();
+            let run_id_for_block = run_id.to_string();
+            let session_id_for_block = session_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                service.persist_loop_message(&run_id_for_block, &session_id_for_block, &payload)
+            })
+            .await
+            .map_err(|error| format!("durable message worker failed: {error}"))??;
+            watermark = ordinal;
+        }
+        Ok(watermark)
+    }
+
+    /// One message append: the durable append (when durable storage is
+    /// configured) plus the matching in-memory session mirror (durable
+    /// first; the in-memory row is applied only after the commit succeeded).
+    /// The in-memory mirror ALWAYS runs, so an in-memory-only gateway keeps
+    /// the session history complete across runs in the same session.
+    fn persist_loop_message(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        payload: &JsonValue,
+    ) -> Result<(), String> {
+        if let Some(persistence) = self.inner.persistence.clone() {
+            persistence
+                .message_append(payload)
+                .map_err(|error| format!("durable message append failed: {error}"))?;
+        }
+        let mut store = self.inner.store.write();
+        let Some(session) = store.sessions.get_mut(session_id) else {
+            return Ok(());
+        };
+        session.messages.push(SessionMessage {
+            id: payload["id"].as_str().unwrap_or("").to_string(),
+            session_id: session_id.to_string(),
+            role: payload["role"].as_str().unwrap_or("").to_string(),
+            // The message-level pair id mirrors the durable column so a
+            // reload (or a later compaction in this run) still pairs the
+            // assistant tool-call with its tool result.
+            tool_call_id: payload["tool_call_id"].as_str().unwrap_or("").to_string(),
+            content: payload["content_json"]
+                .as_str()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or(JsonValue::Null),
+            created_at: payload["now_ms"].as_u64().unwrap_or(0),
+            run_id: Some(run_id.to_string()),
+            finish_reason: None,
+            compacted: false,
+        });
+        session.view.message_count = session.messages.len();
+        session.view.updated_at = timestamp();
+        Ok(())
+    }
+
+    /// Executes the RSS-planned compaction commands (`compaction.start` ->
+    /// `message.compact` -> `compaction.commit`) while the run is durably
+    /// `compacting`, then transitions back to `running`. On a step failure a
+    /// pending row is durably failed; the loop resumes with the typed result
+    /// and the full history (recoverable).
+    async fn execute_compaction(&self, run_id: &str, decision: &JsonValue) -> (bool, String) {
+        let Some(persistence) = self.inner.persistence.clone() else {
+            return (false, "no durable storage is configured".to_string());
+        };
+        // B: no durable compaction work may start after a stop/cancel.
+        if self.run_is_stopping(run_id) {
+            return (
+                false,
+                "the run was stopped before the compaction started".to_string(),
+            );
+        }
+        if !self.transition_run(run_id, "running", "compacting").await {
+            return (
+                false,
+                "the run could not transition to compacting".to_string(),
+            );
+        }
+        let plan = decision["plan"].clone();
+        let mut commands: Vec<(String, JsonValue)> = plan["commands"]
+            .as_array()
+            .map(|commands| {
+                commands
+                    .iter()
+                    .filter_map(|command| {
+                        let op = command["op"].as_str()?.to_string();
+                        Some((op, command["payload"].clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let start_ordinal = plan["source_start_ordinal"].as_i64().unwrap_or(0);
+        let end_ordinal = plan["source_end_ordinal"].as_i64().unwrap_or(0);
+        let generation = plan["generation"].as_i64().unwrap_or(0);
+        let session_id = commands
+            .first()
+            .and_then(|(_, payload)| payload["session_id"].as_str())
+            .unwrap_or("")
+            .to_string();
+        // The canonical compaction id is service-owned (`compact:{session}:{generation}`):
+        // the loop's carried config may trail after an internal compaction
+        // (the pinned core has no int-to-string conversion), so the plan's
+        // command ids are canonicalized before execution — the A2 storage's
+        // per-(session, generation) identity and the idempotent-resume path
+        // both key on this exact id.
+        for (_, payload) in &mut commands {
+            if payload.get("id").is_some() {
+                payload["id"] = json!(format!("compact:{session_id}:{generation}"));
+            }
+        }
+        let service = self.clone();
+        let run_id_for_block = run_id.to_string();
+        let session_id_for_block = session_id;
+        let result = tokio::task::spawn_blocking(move || {
+            // B: re-check inside the blocking worker, immediately before any
+            // durable write — a stop that landed during the transition must
+            // not create a compaction row.
+            if service.run_is_stopping(&run_id_for_block) {
+                let _ = persistence.run_transition(&json!({
+                    "run_id": run_id_for_block,
+                    "from_status": "compacting",
+                    "to_status": "running",
+                    "error_code": "",
+                    "error_message": "",
+                    "recovery_reason": "",
+                    "now_ms": timestamp(),
+                }));
+                return Some("the run was stopped during the compaction".to_string());
+            }
+            let mut error = None;
+            let mut start_ok = false;
+            for (op, payload) in &commands {
+                let step = match op.as_str() {
+                    "compaction.start" => persistence.compaction_start(payload),
+                    "message.compact" => persistence.message_compact(payload),
+                    "compaction.commit" => persistence.compaction_commit(payload),
+                    // E: an unknown compaction command is a typed failure, never
+                    // a silent continue (the plan may drift from the storage
+                    // contract).
+                    other => {
+                        error = Some(format!("{other}: unknown compaction command in the plan"));
+                        break;
+                    }
+                };
+                match step {
+                    Ok(value) if compaction_command_ok(op, &value) => {
+                        if op == "compaction.start" {
+                            start_ok = true;
+                        }
+                        continue;
+                    }
+                    Ok(value) => {
+                        let code = value
+                            .get("code")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("storage_error")
+                            .to_string();
+                        let message = value
+                            .get("message")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        error = Some(format!("{op} failed: {code} {message}"));
+                        break;
+                    }
+                    Err(e) => {
+                        error = Some(format!("{op} failed: {e}"));
+                        break;
+                    }
+                }
+            }
+            // A pending row that never committed is durably failed (the A2
+            // fail command; a rejected start fabricated no row).
+            if let Some(error) = error.as_ref()
+                && start_ok
+                && let Some(payload) = commands.first().map(|(_, payload)| payload)
+            {
+                let _ = persistence.compaction_fail(&json!({
+                    "id": payload["id"],
+                    "error_message": error,
+                    "completed_at_ms": timestamp(),
+                }));
+            }
+            // The run returns to `running` either way (terminals require it).
+            let _ = persistence.run_transition(&json!({
+                "run_id": run_id_for_block,
+                "from_status": "compacting",
+                "to_status": "running",
+                "error_code": "",
+                "error_message": "",
+                "recovery_reason": "",
+                "now_ms": timestamp(),
+            }));
+            if error.is_none() {
+                // E/G: mirror the committed compaction in memory: mark the
+                // covered range compacted and advance the session generation
+                // (new runs filter the compacted rows; the next plan in this
+                // run targets the refreshed generation).
+                let mut store = service.inner.store.write();
+                if let Some(session) = store.sessions.get_mut(&session_id_for_block) {
+                    for (index, message) in session.messages.iter_mut().enumerate() {
+                        let ordinal = (index + 1) as i64;
+                        if ordinal >= start_ordinal && ordinal <= end_ordinal {
+                            message.compacted = true;
+                        }
+                    }
+                    session.view.generation = generation as u64;
+                }
+            }
+            error
+        })
+        .await
+        .unwrap_or_else(|error| Some(format!("compaction worker failed: {error}")));
+        match result {
+            None => (true, String::new()),
+            Some(error) => (false, error),
+        }
+    }
+
+    /// Durable run status transition through the A2 storage program. The
+    /// typed `run.transition` data is `{results: [{rows_affected, ...}]}`;
+    /// the transition matched exactly when the first result row reports at
+    /// least one affected row.
+    async fn transition_run(&self, run_id: &str, from_status: &str, to_status: &str) -> bool {
+        let Some(persistence) = self.inner.persistence.clone() else {
+            // In-memory-only mode has no durable status to transition.
+            return true;
+        };
+        let run_id = run_id.to_string();
+        let from_status = from_status.to_string();
+        let to_status = to_status.to_string();
+        tokio::task::spawn_blocking(move || {
+            persistence
+                .run_transition(&json!({
+                    "run_id": run_id,
+                    "from_status": from_status,
+                    "to_status": to_status,
+                    "error_code": "",
+                    "error_message": "",
+                    "recovery_reason": "",
+                    "now_ms": timestamp(),
+                }))
+                .map(|value| run_transition_matched(&value))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// The typed run.failed payload for a `run.failed` decision.
+    fn failed_decision_payload(&self, decision: &JsonValue) -> JsonValue {
+        let error = &decision["error"];
+        json!({
+            "status": "failed",
+            "error_code": error["code"].as_str().unwrap_or("provider_error"),
+            "error_message": error["message"].as_str().unwrap_or("provider request failed"),
+            "provider_error": {
+                "status": error["status"],
+                "type": error["type"],
+                "code": error["code"],
+                "message": error["message"],
+                "param": error["param"],
+                "request_id": error["request_id"],
+            },
+            "reason": decision["reason"],
+        })
+    }
+
+    /// Resolves a parked run's approval exactly once and resumes the loop:
+    /// `Resumed` resumes with `resolved: true`; a deny/expire terminal
+    /// resumes with `resolved: false` plus the typed outcome (`denied` |
+    /// `expired`) so the loop folds the typed `approval_denied` /
+    /// `approval_expired` tool result into the conversation; `AlreadyResolved`
+    /// is a strict typed no-op — it never resumes with `resolved:false`.
+    ///
+    /// Once the bridge durably resolves the row, the OUTCOME is recorded on
+    /// the park: a transition failure restores the park WITH the recorded
+    /// decision, so a retry never re-resolves the durable row (and never
+    /// downgrades an approve to a deny). A bridge or transition failure NEVER
+    /// drops the park while the run is still active: the park is restored so
+    /// a retry (or the expiry sweep, or a stop) stays reachable — a failed
+    /// resolution can never wedge the run.
+    pub fn resolve_run_approval(&self, run_id: &str, approve: bool) -> Result<(), String> {
+        let parked = self
+            .inner
+            .parked
+            .lock()
+            .expect("parked lock")
+            .remove(run_id)
+            .ok_or_else(|| "no pending approval is parked for this run".to_string())?;
+        let Some(bridge) = self.inner.approval.clone() else {
+            self.restore_park_if_active(run_id, &parked);
+            return Err("the durable approval bridge is not available".to_string());
+        };
+        let now = timestamp() as i64;
+        // The durable outcome (resolved, typed outcome, reason). A park that
+        // already records the bridge outcome skips the resolve entirely: the
+        // durable row is terminal and a second resolve could only downgrade
+        // the recorded decision (an approve re-resolved after the row moved
+        // to `approved` surfaces as AlreadyResolved and would read as a
+        // deny).
+        let (resolved, outcome, reason) = match &parked.resolution {
+            Some(recorded) => (
+                recorded.resolved,
+                recorded.outcome.clone(),
+                recorded.reason.clone(),
+            ),
+            None => {
+                let resolution = match bridge.resolve(&parked.approval_id, approve, "gateway", now)
+                {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        // A storage failure must not consume the park:
+                        // restore it so the caller (or the sweep) can
+                        // retry.
+                        self.restore_park_if_active(run_id, &parked);
+                        return Err(error.to_string());
+                    }
+                };
+                match resolution {
+                    Resolution::Resumed { .. } => (true, "approved".to_string(), String::new()),
+                    Resolution::Terminal { reason, code, .. } => {
+                        (false, code.clone(), reason.clone())
+                    }
+                    Resolution::AlreadyResolved => {
+                        // Strict no-op: the durable row is already terminal
+                        // (a foreign expire/resolve landed first). The park
+                        // is restored so the expiry resume path (the sweep's
+                        // own resolve) can still pick it up — but this call
+                        // never resumes the run with `resolved:false` and
+                        // never re-resolves the row.
+                        self.restore_park_if_active(run_id, &parked);
+                        return Err("approval already resolved".to_string());
+                    }
+                }
+            }
+        };
+        if !self.transition_run_blocking(run_id, "waiting_approval", "running") {
+            // The run may have moved (a stop or a concurrent terminal): only
+            // restore the park while the run is still an active, un-cancelled
+            // candidate — otherwise the run is on its way to a terminal and
+            // re-parking would wedge it. The restored park CARRIES the
+            // durable outcome so a retry resumes with the same decision.
+            let mut restored = parked.clone();
+            restored.resolution = Some(ParkedResolution {
+                resolved,
+                outcome: outcome.clone(),
+                reason: reason.clone(),
+            });
+            if !self.restore_park_if_active(run_id, &restored) {
+                tracing::warn!(
+                    run_id,
+                    approval_id = %parked.approval_id,
+                    "parked run could not transition back to running and is no longer active"
+                );
+            }
+            return Err("the run could not transition back to running".to_string());
+        }
+        let service = self.clone();
+        let run_id = run_id.to_string();
+        let session_id = service
+            .inner
+            .store
+            .read()
+            .runs
+            .get(&run_id)
+            .map(|run| run.session_id.clone())
+            .unwrap_or_default();
+        let program = match service.inner.agent_program.clone() {
+            Some(program) => program,
+            None => return Err("the production loop program is not available".to_string()),
+        };
+        let base_context = json_to_vm_value(&parked.base_context);
+        let deadline = parked.deadline;
+        tokio::spawn(async move {
+            let mut state = parked.state;
+            let approval = state.get("approval").cloned().unwrap_or_else(|| json!({}));
+            state["approval"] = json!({
+                "approval_id": parked.approval_id,
+                "tool_call_id": approval["tool_call_id"],
+                "tool_name": approval["tool_name"],
+                "arguments": approval["arguments"],
+                "risk_class": approval["risk_class"],
+                "resolved": resolved,
+                "outcome": outcome,
+                "reason": reason,
+            });
+            service
+                .drive_production_loop(
+                    program,
+                    &run_id,
+                    &session_id,
+                    base_context,
+                    "approval.resume",
+                    state,
+                    // C: the ORIGINAL run deadline — the resume must not
+                    // reset the wall clock.
+                    deadline,
+                )
+                .await;
+        });
+        Ok(())
+    }
+
+    /// Re-inserts one taken park when the run is still an active,
+    /// un-cancelled candidate (never re-park a stopped/terminal run).
+    /// Returns whether the park was restored.
+    fn restore_park_if_active(&self, run_id: &str, parked: &ParkedRun) -> bool {
+        let active = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .is_some_and(|handle| handle.cancel.requested().is_none());
+        if active {
+            self.inner
+                .parked
+                .lock()
+                .expect("parked lock")
+                .insert(run_id.to_string(), parked.clone());
+        }
+        active
+    }
+
+    /// Blocking variant of the run transition (resolution path).
+    fn transition_run_blocking(&self, run_id: &str, from_status: &str, to_status: &str) -> bool {
+        let Some(persistence) = self.inner.persistence.clone() else {
+            return true;
+        };
+        persistence
+            .run_transition(&json!({
+                "run_id": run_id,
+                "from_status": from_status,
+                "to_status": to_status,
+                "error_code": "",
+                "error_message": "",
+                "recovery_reason": "",
+                "now_ms": timestamp(),
+            }))
+            .map(|value| run_transition_matched(&value))
+            .unwrap_or(false)
+    }
+
+    /// Expires every parked approval whose durable row has passed its
+    /// deadline and resumes the affected runs with the typed expired tool
+    /// result. Called on the janitor cadence; bounded by admission capacity.
+    /// The whole sweep (the typed `approval.expire` command plus the per-run
+    /// storage reads) runs on a blocking worker so Tokio threads are never
+    /// occupied by storage stalls.
+    fn expire_parked_approvals(&self) {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.expire_parked_approvals_blocking());
+    }
+
+    fn expire_parked_approvals_blocking(&self) {
+        // D: the typed approval.expire sweep marks every pending row at or
+        // before now as durably `expired`.
+        if let Some(bridge) = self.inner.approval.clone() {
+            let now = timestamp() as i64;
+            if let Err(error) = bridge.expire(now) {
+                tracing::warn!(
+                    error = %truncate_for_log(&error.to_string(), 256),
+                    "approval expire sweep failed; parked runs will retry on the next tick"
+                );
+            }
+        }
+        let candidates: Vec<(String, String)> = self
+            .inner
+            .parked
+            .lock()
+            .expect("parked lock")
+            .iter()
+            .map(|(run_id, parked)| (run_id.clone(), parked.approval_id.clone()))
+            .collect();
+        for (run_id, approval_id) in candidates {
+            let Some(persistence) = self.inner.persistence.clone() else {
+                continue;
+            };
+            // One bounded storage round-trip per parked run on the janitor
+            // cadence (parked runs are bounded by admission capacity).
+            let expired = persistence
+                .approval_get(&approval_id)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("rows")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|rows| rows.first())
+                        .and_then(JsonValue::as_array)
+                        .and_then(|row| row.get(7))
+                        .and_then(JsonValue::as_str)
+                        .map(|state| state == "expired")
+                })
+                .unwrap_or(false);
+            if expired && let Err(error) = self.resolve_run_approval(&run_id, false) {
+                tracing::warn!(run_id, approval_id, error = %error, "expired approval sweep failed");
+            }
+        }
+    }
+}
+
+/// One invocation outcome of a production loop step.
+enum LoopStepOutcome {
+    /// The loop produced a typed decision map.
+    Decision(JsonValue),
+    /// The step ended with a typed terminal (already committed).
+    Cancelled,
+}
+
+/// Outcome of one durable approval park attempt.
+enum ParkOutcome {
+    /// The approval row, the `approval.required` event, and the park are all
+    /// durable; the run waits for a resolution.
+    Parked,
+    /// A stop/cancel (or the run deadline) landed before the park could be
+    /// created: no durable approval row and no park exist; the drive loop
+    /// commits the typed cancellation.
+    Cancelled,
+    /// The durable bridge or event append failed; the run fails typed.
+    Failed,
+}
+
+/// The `tool_call_id` of the first `tool_result` content part of one
+/// canonical message (the durable messages.tool_call_id column mirror).
+fn first_tool_result_call_id(content: &JsonValue) -> String {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|part| part["type"] == "tool_result")
+        .and_then(|part| part["tool_call_id"].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The loop state carried by a decision (everything except the `kind`
+/// discriminator).
+fn decision_state(decision: &JsonValue) -> JsonValue {
+    let mut state = decision.clone();
+    if let JsonValue::Object(fields) = &mut state {
+        fields.remove("kind");
+    }
+    state
+}
+
+/// Converts one JSON value into a VM value (the service-side mirror of the
+/// renderer).
+fn json_to_vm_value(value: &JsonValue) -> VmValue {
+    crate::domain::json_to_vm_value(value)
+}
+
+/// Normalizes one stored message content to the canonical content-part array
+/// the serial loop and the provider adapters consume: a plain string becomes
+/// a single text part, an array passes through, anything else is empty.
+fn canonical_message_content(content: &JsonValue) -> JsonValue {
+    match content {
+        JsonValue::String(text) => json!([{"type": "text", "text": text}]),
+        JsonValue::Array(_) => content.clone(),
+        _ => JsonValue::Array(Vec::new()),
+    }
+}
+
+/// True when a typed compaction command's DATA payload reports success:
+/// `compaction.start` returns the inserted row query (non-empty `rows`);
+/// `message.compact` is the guarded no-op before the commit (the A2
+/// contract: it returns a successful envelope with zero affected rows, and
+/// the commit itself marks the range); `compaction.commit` returns the
+/// transition `{results: [...]}` array and must match the pending row.
+fn compaction_command_ok(op: &str, data: &JsonValue) -> bool {
+    match op {
+        "compaction.start" => data
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false),
+        "message.compact" => true,
+        "compaction.commit" => run_transition_matched(data),
+        _ => true,
+    }
+}
+
+/// True when a typed `run.transition` data payload (`{results:
+/// [{rows_affected, ...}]}`) matched exactly one run row.
+fn run_transition_matched(data: &JsonValue) -> bool {
+    data.get("results")
+        .and_then(JsonValue::as_array)
+        .and_then(|results| results.first())
+        .and_then(JsonValue::as_object)
+        .and_then(|first| first.get("rows_affected"))
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0)
+        >= 1
 }
 
 impl AgentService {
@@ -1790,6 +3578,14 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
                     .expect("terminal lock")
                     .is_none_or(|terminal_at| terminal_at + ttl > now)
             });
+            drop(runs);
+            // The bounded approval expiry sweep: parked runs whose durable
+            // approval passed its deadline resume with a typed expired tool
+            // result (the loop folds it and continues).
+            let service = AgentService {
+                inner: Arc::clone(&inner),
+            };
+            service.expire_parked_approvals();
         }
     });
 }

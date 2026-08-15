@@ -34,8 +34,24 @@ pub const SERVICE_OWNED_EVENTS: &[&str] = &[
     "run.completed",
     "run.cancelled",
     "run.failed",
+    "run.truncated",
     "message.delta",
 ];
+
+/// Builds the typed truncation marker payload for a step whose bounded
+/// delivery drain could not finish within the cancellation grace. The
+/// marker carries only the reason and the drain bounds — never event
+/// payloads, tool arguments, or any other sensitive run data — and is
+/// durably appended BEFORE the terminal so a replay can never mistake a
+/// truncated stream for a complete one.
+pub fn truncation_marker(reason: &str, grace_ms: i64, channel_capacity: i64) -> Value {
+    json!({
+        "reason": reason,
+        "grace_ms": grace_ms,
+        "channel_capacity": channel_capacity,
+        "dropped": true,
+    })
+}
 
 /// Validates one `stream::emit(value)` payload against the agent event schema.
 ///

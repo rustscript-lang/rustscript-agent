@@ -419,6 +419,8 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         result = storage_raw_ok(request_id, op, approvals::storage_approval_resolve(db_id, command.payload_json));
     } else if command.op == "approval.expire" {
         result = storage_raw_ok(request_id, op, approvals::storage_approval_expire(db_id, command.payload_json));
+    } else if command.op == "approval.cancel" {
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_cancel(db_id, command.payload_json));
     } else if command.op == "compaction.start" {
         result = storage_unwrap(request_id, op, compactions::storage_compaction_start(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "compaction.get" {

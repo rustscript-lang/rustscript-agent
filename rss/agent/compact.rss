@@ -168,8 +168,33 @@ fn message_ordinal(message: map) -> int {
     ctx_int(message, "ordinal", 0)
 }
 
+/// The message-level pair id of one message: the message-level
+/// `tool_call_id` field when present, else the FIRST `tool_result` content
+/// part's id (tool messages), else the empty string. The durable service
+/// context carries the message-level id; the content-part fallback keeps the
+/// pair logic correct for any history shape (a tool result whose call id
+/// lives only in its content part is still paired with its assistant call).
+/// The FIRST part is the one that mirrors the Rust-side
+/// `first_tool_result_call_id` (src/service.rs) — a multi-result tool
+/// message pairs through its earliest result.
 fn message_tool_call_id(message: map) -> string {
-    ctx_string(message, "tool_call_id", "")
+    let mut result: string = ctx_string(message, "tool_call_id", "");
+    if result == "" {
+        let content: array = message_content(message);
+        let mut index = 0;
+        let mut found = false;
+        while index < content.length {
+            if found == false {
+                let part: map = part_at(content, index);
+                if part_type(part) == "tool_result" {
+                    result = part_tool_call_id(part);
+                    found = true;
+                }
+            }
+            index += 1;
+        }
+    }
+    result
 }
 
 fn message_content(message: map) -> array {

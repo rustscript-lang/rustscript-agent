@@ -16,10 +16,10 @@ pub use telegram_render::{EventRenderer, RenderAction, TELEGRAM_MAX_UTF16, chunk
 /// [`AgentGatewayState`].
 pub mod store;
 
-use std::{path::Path as FsPath, sync::Arc};
-
 use parking_lot::RwLock;
 use rustscript_vm::HttpConfig;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
 
 use crate::config::AgentGatewayConfig;
 use crate::metrics::Metrics;
@@ -54,7 +54,7 @@ impl AgentGatewayState {
             None,
             http_config.clone(),
             Arc::clone(&metrics),
-        ));
+        )?);
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -92,7 +92,7 @@ impl AgentGatewayState {
             agent_source.clone(),
             http_config.clone(),
             Arc::clone(&metrics),
-        ));
+        )?);
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -142,7 +142,7 @@ impl AgentGatewayState {
             agent_source.clone(),
             http_config.clone(),
             Arc::clone(&metrics),
-        ));
+        )?);
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -181,7 +181,7 @@ impl AgentGatewayState {
             None,
             http_config.clone(),
             Arc::clone(&metrics),
-        ));
+        )?);
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -196,6 +196,100 @@ impl AgentGatewayState {
         Arc::clone(&self.service)
     }
 
+    /// Builds the gateway with the BUILT-IN production serial loop program
+    /// (`rss/agent/main.rss`, entry [`PRODUCTION_LOOP_ENTRY`]) — the default
+    /// agent available in the real gateway without test injection. The
+    /// program is compiled once with the gateway's http/io capability
+    /// policy.
+    pub fn with_default_agent_program(config: AgentGatewayConfig) -> Result<Self, String> {
+        let program = compile_builtin_agent_program(&config)?;
+        Self::with_program(config, program)
+    }
+
+    /// Like [`Self::with_default_agent_program`] but with the durable SQLite
+    /// state path (approvals, compaction, events survive restarts).
+    pub fn with_default_agent_program_and_sqlite(
+        config: AgentGatewayConfig,
+        path: impl AsRef<FsPath>,
+    ) -> Result<Self, String> {
+        let program = compile_builtin_agent_program(&config)?;
+        Self::with_program_and_sqlite(config, program, path)
+    }
+
+    /// Builds the gateway over an ALREADY-COMPILED agent program (the same
+    /// production entry contract as the built-in default) — the seam used by
+    /// the fixtures to drive a patched module graph through the real
+    /// service, and by embedders that compile the program themselves.
+    pub fn with_program(
+        config: AgentGatewayConfig,
+        program: crate::AgentRunner,
+    ) -> Result<Self, String> {
+        let http_config = config.http.clone();
+        config
+            .validate()
+            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let store = Arc::new(RwLock::new(store::GatewayStore::default()));
+        let metrics = Arc::new(Metrics::default());
+        let service = Arc::new(AgentService::with_program(
+            Arc::new(config),
+            Arc::clone(&store),
+            None,
+            program,
+            http_config.clone(),
+            Arc::clone(&metrics),
+        )?);
+        Ok(Self {
+            config: Arc::clone(service.config()),
+            store,
+            service,
+            agent_source: None,
+            http_config,
+            metrics,
+        })
+    }
+
+    /// Like [`Self::with_program`] but with the durable SQLite state path
+    /// (approvals, compaction, events survive restarts).
+    pub fn with_program_and_sqlite(
+        config: AgentGatewayConfig,
+        program: crate::AgentRunner,
+        path: impl AsRef<FsPath>,
+    ) -> Result<Self, String> {
+        let http_config = config.http.clone();
+        config
+            .validate()
+            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let metrics = Arc::new(Metrics::default());
+        let persistence = Arc::new(
+            store::GatewayPersistence::open_with_metrics(
+                &config,
+                path.as_ref(),
+                Arc::clone(&metrics),
+            )
+            .map_err(|error| format!("open gateway SQLite state: {error}"))?,
+        );
+        let loaded_store = persistence
+            .load()
+            .map_err(|error| format!("load gateway SQLite state: {error}"))?;
+        let store = Arc::new(RwLock::new(loaded_store));
+        let service = Arc::new(AgentService::with_program(
+            Arc::new(config),
+            Arc::clone(&store),
+            Some(persistence),
+            program,
+            http_config.clone(),
+            Arc::clone(&metrics),
+        )?);
+        Ok(Self {
+            config: Arc::clone(service.config()),
+            store,
+            service,
+            agent_source: None,
+            http_config,
+            metrics,
+        })
+    }
+
     /// The bounded metrics registry shared by the service, delivery, storage
     /// worker, and API handlers.
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -207,4 +301,24 @@ impl AgentGatewayState {
     pub fn persistence(&self) -> Option<Arc<store::GatewayPersistence>> {
         self.service.persistence_handle()
     }
+}
+
+/// Compiles the built-in production serial loop program
+/// (`rss/agent/main.rss`, entry [`PRODUCTION_LOOP_ENTRY`]) with the
+/// gateway's http/io/sqlite capability policy.
+fn compile_builtin_agent_program(
+    config: &AgentGatewayConfig,
+) -> Result<crate::AgentRunner, String> {
+    let agent_config = crate::AgentConfig {
+        http: config.http.clone(),
+        sqlite: config.sqlite.clone(),
+        io: config.io.clone(),
+        fuel: config.fuel,
+    };
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("rss")
+        .join("agent")
+        .join("main.rss");
+    crate::AgentRunner::from_file_with_entry(source, agent_config, crate::PRODUCTION_LOOP_ENTRY)
+        .map_err(|error| format!("compile the built-in agent program: {error}"))
 }

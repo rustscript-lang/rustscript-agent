@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use rustscript_vm::{HttpConfig, IoPolicy, SqlitePolicy};
+use serde_json::Value;
 
 /// Telegram Bot API adapter configuration.
 ///
@@ -207,6 +208,40 @@ impl Default for TelegramConfig {
 pub struct AgentGatewayConfig {
     pub model: String,
     pub provider: Option<String>,
+    /// Canonical provider options for the production serial loop
+    /// (`provider_options` in the run context): `{base_url, api_key, model,
+    /// ...}` for direct adapters; profile modules merge these overrides.
+    pub provider_options: Value,
+    /// Bounded serial-loop turns (a tool round consumes one turn).
+    pub max_turns: usize,
+    /// Retries allowed per turn before the typed `max_retries_exceeded`
+    /// terminal.
+    pub max_retries: usize,
+    /// Exponential backoff base for provider retries (milliseconds).
+    pub base_retry_delay_ms: u64,
+    /// Exponential backoff cap for provider retries (milliseconds).
+    pub max_retry_delay_ms: u64,
+    /// Approval mode fed to the A4 approval policy: `auto` | `manual` |
+    /// `never` | `all`.
+    pub approval_mode: String,
+    /// Lifetime of a pending approval before the expire sweep resumes the
+    /// parked run with a typed expired tool result.
+    pub approval_timeout: Duration,
+    /// Durable-history compaction window: when the session history exceeds
+    /// this, the loop plans and the service executes a compaction. `0`
+    /// disables the gate.
+    pub max_context_messages: usize,
+    /// Retained tail after a compaction (never marked, stays in context).
+    pub retained_tail: usize,
+    /// Stream transport flag passed to the adapters (`stream: true` uses the
+    /// SSE transport).
+    pub stream: bool,
+    /// Parallel orchestration requested (A6 handoff; typed non-executable
+    /// until the A7 run-admission interface wires the native supervisor).
+    pub parallel: bool,
+    /// Task/subagent delegation requested (A6 handoff; typed
+    /// non-executable).
+    pub task: bool,
     pub agent_name: String,
     pub bearer_token: Option<String>,
     pub max_body_bytes: usize,
@@ -304,6 +339,18 @@ impl AgentGatewayConfig {
             telegram
                 .validate()
                 .map_err(|error| format!("invalid Telegram configuration: {error}"))?;
+        }
+        if !matches!(
+            self.approval_mode.as_str(),
+            "auto" | "manual" | "never" | "all"
+        ) {
+            return Err(format!(
+                "approval_mode must be one of auto|manual|never|all, got {}",
+                self.approval_mode
+            ));
+        }
+        if self.approval_timeout.is_zero() {
+            return Err("approval_timeout must be positive".to_string());
         }
         Ok(())
     }
@@ -421,6 +468,18 @@ impl Default for AgentGatewayConfig {
         Self {
             model: "local-agent".to_string(),
             provider: Some("local-agent".to_string()),
+            provider_options: Value::Object(Default::default()),
+            max_turns: 8,
+            max_retries: 2,
+            base_retry_delay_ms: 1000,
+            max_retry_delay_ms: 30_000,
+            approval_mode: "auto".to_string(),
+            approval_timeout: Duration::from_secs(600),
+            max_context_messages: 64,
+            retained_tail: 8,
+            stream: true,
+            parallel: false,
+            task: false,
             agent_name: "local-rss-agent".to_string(),
             bearer_token: None,
             max_body_bytes: 4 * 1024 * 1024,

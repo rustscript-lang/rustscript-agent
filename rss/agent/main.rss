@@ -3,7 +3,7 @@
 // The exported `run(context)` is a step function: ONE typed context map in,
 // ONE discriminated decision map out. The loop state machine, canonical
 // LlmRequest construction, provider/profile dispatch, tool registry +
-// approval + dispatch, event emission, and durable compaction execution all
+// approval + dispatch, event emission, and durable compaction planning all
 // live in this module (and the harness/llm/storage modules it composes).
 // Rust (AgentService) owns lifecycle (timeout, cancel, retry sleep),
 // capability composition (http/io/sqlite policy), approval persistence, and
@@ -20,12 +20,19 @@
 //                        re-invokes with retry_count + 1, same turn
 //   approval.wait     -> service persists the approval durably, parks the
 //                        run (waiting_approval), and resumes exactly once
-//   compact           -> service transitions the run to 'compacting' and
-//                        re-invokes with phase "compacting"
-//   compacted         -> service transitions back to 'running' and
-//                        re-invokes phase "start" with the trimmed messages
-//   compact.failed    -> service transitions back to 'running'; the typed
-//                        failure is durable and the history is untouched
+//   compact           -> service transitions the run to 'compacting',
+//                        executes the planned typed commands
+//                        (compaction.start -> message.compact ->
+//                        compaction.commit, or compaction.fail on a typed
+//                        rejection), then re-invokes with phase
+//                        "compact.result" carrying compact_ok/compact_error
+//   compact.result    -> the loop emits compact.completed, trims the
+//                        compacted prefix on success (and advances the
+//                        carried generation so a SECOND compaction in the
+//                        same run targets the next generation), and
+//                        continues with the provider call; on failure the
+//                        full history is retained and the run continues
+//                        (recoverable)
 //   parallel.handoff / subagent.handoff -> typed, executable:false; the
 //                        serial loop never invents parallel/subagent
 //                        outcomes (A6 native supervision needs the A7
@@ -36,10 +43,19 @@
 // turn, retry_count, last_text, tool_calls, tool_index, plan) so the
 // service can re-invoke; the service copies typed fields only.
 //
+// The message history is SEEDED by the service from the durable session
+// (build_production_loop_context) — there is NO message.list read gate in
+// the loop. Seeded and in-run entries are canonical {ordinal, role,
+// tool_call_id, content} maps: ordinals mirror the durable per-session
+// message ordinals and tool messages carry the message-level tool_call_id
+// that mirrors the durable messages.tool_call_id column, so compaction
+// plans (compact.rss) reference real rows and pair assistant tool-call
+// messages with their tool results across reloads.
+//
 // Context (flat, typed; missing fields fall back to documented defaults):
 //
 //   run_id, session_id: string
-//   phase: "start" | "approval.resume" | "compacting"
+//   phase: "start" | "approval.resume" | "compact.result"
 //   turn: int            completed model rounds so far (0 initially)
 //   retry_count: int     retries consumed on the current turn
 //   max_turns: int       turns allowed before the run terminates (bounded)
@@ -59,14 +75,15 @@
 //   config: map         {base_retry_delay_ms, max_retry_delay_ms,
 //                        max_context_messages, retained_tail,
 //                        approval_mode, native_hard_deny, stream,
-//                        parallel, task, max_output_tokens, state_db,
-//                        now_ms}
+//                        parallel, task, max_output_tokens, now_ms,
+//                        generation, message_count, compaction_id}
 //   approval: map       (phase "approval.resume") {approval_id,
 //                        tool_call_id, tool_name, arguments, risk_class,
-//                        resolved, reason}
+//                        resolved, outcome ("approved" | "denied" |
+//                        "expired"), reason}
 //   tool_calls: array   (phase "approval.resume") the round's call list
 //   tool_index: int     (phase "approval.resume") the pending call index
-//   plan: map           (phase "compacting") the compact.plan decision
+//   plan: map           (phase "compact.result") the compact.plan decision
 //
 // Compiler-contract notes (pinned core fd4b570, B1-B4 fixed): cross-module
 // script calls are placed at function top level, in expression-if branches,
@@ -185,14 +202,15 @@ fn run_failed_decision(turn: int, reason: string, error: map) -> map {
     { kind: "run.failed", turn: turn, reason: reason, error: error }
 }
 
-fn retry_decision(delay_ms: int, retry_count: int, turn: int, messages: array, last_text: string) -> map {
+fn retry_decision(delay_ms: int, retry_count: int, turn: int, messages: array, last_text: string, config: map) -> map {
     {
         kind: "retry",
         delay_ms: delay_ms,
         retry_count: retry_count,
         turn: turn,
         messages: messages,
-        last_text: last_text
+        last_text: last_text,
+        config: config
     }
 }
 
@@ -203,7 +221,8 @@ fn approval_wait_decision(
     index: int,
     messages: array,
     turn: int,
-    last_text: string
+    last_text: string,
+    config: map
 ) -> map {
     {
         kind: "approval.wait",
@@ -218,18 +237,20 @@ fn approval_wait_decision(
         tool_index: index,
         messages: messages,
         turn: turn,
-        last_text: last_text
+        last_text: last_text,
+        config: config
     }
 }
 
-fn compact_decision(plan: map, messages: array, turn: int, last_text: string) -> map {
+fn compact_decision(plan: map, messages: array, turn: int, last_text: string, config: map) -> map {
     {
         kind: "compact",
         plan: plan,
         messages: messages,
         turn: turn,
         retry_count: 0,
-        last_text: last_text
+        last_text: last_text,
+        config: config
     }
 }
 
@@ -535,7 +556,7 @@ fn provider_result(context: map, turn: int, max_turns: int, retry_count: int, re
         types::error_request("malformed_provider_result", "provider call result is not decidable")
     );
     if ok_flag == true {
-        decision = provider_ok_result(context, turn, max_turns, retry_count, result, last_text);
+        decision = provider_ok_result(context, turn, max_turns, retry_count, result);
     } else {
         decision = provider_error_result(context, turn, retry_count, result, last_text);
     }
@@ -544,8 +565,11 @@ fn provider_result(context: map, turn: int, max_turns: int, retry_count: int, re
 
 /// Success path: canonical `model.delta` + `model.completed`; text-only
 /// completes the run (the final assistant message is service-owned), tool
-/// calls enter the tool cycle with the assistant message appended.
-fn provider_ok_result(context: map, turn: int, max_turns: int, retry_count: int, result: map, last_text: string) -> map {
+/// calls enter the tool cycle with the assistant message appended. The
+/// CURRENT round's text becomes the cycle's last_text: a max-turn terminal
+/// after a tool cycle must carry this round's real text, never a stale or
+/// empty one.
+fn provider_ok_result(context: map, turn: int, max_turns: int, retry_count: int, result: map) -> map {
     let response: map = ctx_map(result, "response");
     let text: string = types::request_string(response, "text");
     let tool_calls: array = types::request_array(response, "tool_calls");
@@ -566,7 +590,7 @@ fn provider_ok_result(context: map, turn: int, max_turns: int, retry_count: int,
     if tool_calls.length > 0 {
         let mut messages: array = ctx_array(context, "messages");
         messages[messages.length] = assistant_message(next_ordinal(messages), text, tool_calls.copy());
-        decision = tool_cycle(context, turn, messages, tool_calls, 0, last_text);
+        decision = tool_cycle(context, turn, messages, tool_calls, 0, text);
     }
     decision
 }
@@ -585,7 +609,7 @@ fn provider_error_result(context: map, turn: int, retry_count: int, result: map,
         let base: int = ctx_int(config, "base_retry_delay_ms", 1000);
         let cap: int = ctx_int(config, "max_retry_delay_ms", 30000);
         let delay: int = backoff_delay_ms(base, retry_count, cap);
-        decision = retry_decision(delay, retry_count + 1, turn, ctx_array(context, "messages"), last_text);
+        decision = retry_decision(delay, retry_count + 1, turn, ctx_array(context, "messages"), last_text, config);
     }
     decision
 }
@@ -662,8 +686,10 @@ fn tool_step(context: map, turn: int, messages: array, tool_calls: array, index:
 }
 
 /// Approval policy: approve -> real dispatch; deny -> typed denial; pending
-/// -> `approval.required` + `approval.wait` (the durable bridge persists and
-/// the service parks the run).
+/// -> `approval.wait` (the SERVICE persists the durable approval and emits
+/// `approval.required` with the real bridge id exactly once — the loop never
+/// emits a placeholder with an empty id). An unrecognized policy action is a
+/// typed failure, never a silent deny or a pending.
 fn approval_step(context: map, turn: int, messages: array, tool_calls: array, index: int, call: map, registry_result: map, last_text: string) -> map {
     let config: map = ctx_map(context, "config");
     let descriptor: map = ctx_map(registry_result, "descriptor");
@@ -676,45 +702,51 @@ fn approval_step(context: map, turn: int, messages: array, tool_calls: array, in
         approval_mode: ctx_string(config, "approval_mode", "auto"),
         native_hard_deny: ctx_bool(config, "native_hard_deny", false)
     });
-    let action: string = approval_action(decision_result);
+    let ok_flag: bool = ctx_bool(decision_result, "ok", false);
     let mut decision: map = run_failed_decision(
         turn,
         "non_retryable",
         types::error_request("approval_policy_unavailable", name)
     );
-    if action == "approve" {
-        decision = tool_dispatch(context, turn, messages, tool_calls, index, call, true, "", last_text);
-    } else if action == "deny" {
-        decision = tool_dispatch(
-            context,
-            turn,
-            messages,
-            tool_calls,
-            index,
-            call,
-            false,
-            "approval policy denied " + name,
-            last_text
-        );
-    } else {
-        let call_id: string = types::request_string(call, "id");
-        stream::emit({
-            type: "approval.required",
-            approval_id: "",
-            tool_call_id: call_id,
-            tool_name: name,
-            risk_class: risk,
-            turn: turn
-        });
-        decision = approval_wait_decision(call, risk, tool_calls, index, messages, turn, last_text);
+    if ok_flag == true {
+        let action: string = approval_action(decision_result);
+        if action == "approve" {
+            decision = tool_dispatch(context, turn, messages, tool_calls, index, call, true, "", "approved", last_text);
+        } else if action == "deny" {
+            decision = tool_dispatch(
+                context,
+                turn,
+                messages,
+                tool_calls,
+                index,
+                call,
+                false,
+                "approval policy denied " + name,
+                "denied",
+                last_text
+            );
+        } else if action == "pending" {
+            decision = approval_wait_decision(call, risk, tool_calls, index, messages, turn, last_text, config);
+        } else {
+            decision = run_failed_decision(
+                turn,
+                "non_retryable",
+                types::error_request(
+                    "invalid_approval_action",
+                    "the approval policy returned an unrecognized action: " + action
+                )
+            );
+        }
     }
     decision
 }
 
-/// The policy action from the approval decision envelope.
+/// The policy action from the approval decision envelope. A missing or
+/// unrecognized action resolves to the EMPTY string — the caller folds it
+/// into the typed `invalid_approval_action` failure (never a silent deny).
 fn approval_action(decision_result: map) -> string {
     let decision: map = ctx_map(decision_result, "decision");
-    ctx_string(decision, "action", "deny")
+    ctx_string(decision, "action", "")
 }
 
 /// A typed `is_error` tool result for a call the registry cannot dispatch
@@ -739,6 +771,7 @@ fn tool_result_step(context: map, turn: int, messages: array, tool_calls: array,
     updated[updated.length] = {
         ordinal: next_ordinal(messages),
         role: "tool",
+        tool_call_id: call_id,
         content: [{
             type: "tool_result",
             tool_call_id: call_id,
@@ -749,15 +782,21 @@ fn tool_result_step(context: map, turn: int, messages: array, tool_calls: array,
     tool_cycle(context, turn, updated, tool_calls, index + 1, last_text)
 }
 
-/// Dispatches one call (approved) or produces the typed denial (denied /
-/// expired), appends the canonical tool message, and continues the cycle.
-fn tool_dispatch(context: map, turn: int, messages: array, tool_calls: array, index: int, call: map, approved: bool, reason: string, last_text: string) -> map {
+/// Dispatches one call (approved) or produces the typed denial/expiry tool
+/// result (denied / expired — the `outcome` discriminator picks the typed
+/// code), appends the canonical tool message (with the message-level
+/// `tool_call_id` the durable column mirrors), and continues the cycle.
+fn tool_dispatch(context: map, turn: int, messages: array, tool_calls: array, index: int, call: map, approved: bool, reason: string, outcome: string, last_text: string) -> map {
     let name: string = types::request_string(call, "name");
     let call_id: string = types::request_string(call, "id");
     let result: map = if approved == true => {
         execute_tool(name, types::request_map(call, "arguments"))
     } else => {
-        typed_denial(name, reason)
+        if outcome == "expired" => {
+            typed_expiry(name, reason)
+        } else => {
+            typed_denial(name, reason)
+        }
     };
     let is_error: bool = !ctx_bool(result, "ok", false);
     let content: string = tool_result_content(result, is_error);
@@ -772,6 +811,7 @@ fn tool_dispatch(context: map, turn: int, messages: array, tool_calls: array, in
     updated[updated.length] = {
         ordinal: next_ordinal(messages),
         role: "tool",
+        tool_call_id: call_id,
         content: [{
             type: "tool_result",
             tool_call_id: call_id,
@@ -782,12 +822,23 @@ fn tool_dispatch(context: map, turn: int, messages: array, tool_calls: array, in
     tool_cycle(context, turn, updated, tool_calls, index + 1, last_text)
 }
 
-/// The typed denial/expiry tool result: `is_error` with the typed reason —
-/// never a fabricated success.
+/// The typed denial tool result: `is_error` with the `approval_denied`
+/// code — never a fabricated success.
 fn typed_denial(name: string, reason: string) -> map {
     {
         ok: false,
         code: "approval_denied",
+        message: reason,
+        tool: name
+    }
+}
+
+/// The typed expiry tool result: `is_error` with the `approval_expired`
+/// code — the expired resume is distinguishable from a deny.
+fn typed_expiry(name: string, reason: string) -> map {
+    {
+        ok: false,
+        code: "approval_expired",
         message: reason,
         tool: name
     }
@@ -852,7 +903,10 @@ fn execute_tool(name: string, arguments: map) -> map {
 
 /// Rebuilds the context for the next turn and continues the loop inline —
 /// the turn budget is enforced here (the next provider round only starts
-/// while `next_turn < max_turns`).
+/// while `next_turn < max_turns`). The carried config's `message_count` is
+/// refreshed to the current in-run maximum ordinal: every in-run message is
+/// durably appended by the service (same ordinals), so the compaction gate
+/// plans over the true durable count even across internal turns.
 fn continue_next_turn(context: map, turn: int, messages: array, last_text: string) -> map {
     let next_turn: int = turn + 1;
     let max_turns: int = ctx_int(context, "max_turns", 1);
@@ -863,6 +917,9 @@ fn continue_next_turn(context: map, turn: int, messages: array, last_text: strin
         next_context["retry_count"] = 0;
         next_context["messages"] = messages;
         next_context["last_text"] = last_text;
+        let mut next_config: map = ctx_map(context, "config");
+        next_config["message_count"] = next_ordinal(messages) - 1;
+        next_context["config"] = next_config;
         decision = start_turn(next_context, next_turn, max_turns, last_text);
     }
     decision
@@ -874,7 +931,9 @@ fn continue_next_turn(context: map, turn: int, messages: array, last_text: strin
 
 /// Phase "approval.resume": the durable bridge resolved exactly once. The
 /// pending call is dispatched when approved, or folded into a typed
-/// `is_error` tool result when denied/expired; the cycle then continues.
+/// `is_error` tool result when denied/expired — the typed `outcome`
+/// discriminator (`approved` | `denied` | `expired`) selects the
+/// `approval_denied` / `approval_expired` code; the cycle then continues.
 fn approval_resume_phase(context: map) -> map {
     let approval: map = ctx_map(context, "approval");
     let tool_calls: array = ctx_array(context, "tool_calls");
@@ -886,6 +945,7 @@ fn approval_resume_phase(context: map) -> map {
     let call_id: string = types::request_string(approval, "tool_call_id");
     let resolved: bool = ctx_bool(approval, "resolved", false);
     let reason: string = types::request_string(approval, "reason");
+    let outcome: string = types::request_string(approval, "outcome");
     stream::emit({
         type: "approval.resolved",
         approval_id: approval_id,
@@ -897,7 +957,7 @@ fn approval_resume_phase(context: map) -> map {
     let call: map = loop_array_entry(tool_calls, index);
     let mut decision: map = rejected_decision("approval_mismatch", "resume tool call does not match the pending approval", turn);
     if types::request_string(call, "id") == call_id {
-        decision = tool_dispatch(context, turn, messages, tool_calls, index, call, resolved, reason, last_text);
+        decision = tool_dispatch(context, turn, messages, tool_calls, index, call, resolved, reason, outcome, last_text);
     }
     decision
 }
@@ -939,7 +999,7 @@ fn compact_plan_decision(context: map, turn: int, last_text: string) -> map {
     let plan: map = compact_run(compact_context);
     if ctx_string(plan, "kind", "") == "compact.plan" => {
         stream::emit({ type: "compact.started", turn: turn });
-        compact_decision(plan, messages, turn, last_text)
+        compact_decision(plan, messages, turn, last_text, config)
     } else => {
         provider_attempt(context, turn, ctx_int(context, "max_turns", 1), 0, last_text)
     }
@@ -966,9 +1026,11 @@ fn db_resident_messages(messages: array, message_count: int) -> array {
 }
 
 /// Phase "compact.result": the service executed the planned commands. On
-/// success the compacted prefix is trimmed from the in-run list; on failure
-/// the full history is retained (the typed failure was recorded durably).
-/// Either way the loop continues with the provider call.
+/// success the compacted prefix is trimmed from the in-run list and the
+/// carried config advances generation/compaction_id (a SECOND compaction in
+/// the same run — even across internal turns — targets the next generation);
+/// on failure the full history is retained (the typed failure was recorded
+/// durably). Either way the loop continues with the provider call.
 fn compact_result_phase(context: map) -> map {
     let plan: map = ctx_map(context, "plan");
     let ok_flag: bool = ctx_bool(context, "compact_ok", false);
@@ -985,6 +1047,13 @@ fn compact_result_phase(context: map) -> map {
     let mut next_context: map = context;
     if ok_flag {
         next_context["messages"] = compact_trim(messages, plan);
+        // The committed generation advances the carried config (an int; the
+        // SERVICE canonicalizes the next compaction_id from it, since the
+        // pinned core has no int-to-string conversion builtin).
+        let committed_generation: int = ctx_int(plan, "generation", 0);
+        let mut next_config: map = ctx_map(context, "config");
+        next_config["generation"] = committed_generation;
+        next_context["config"] = next_config;
     }
     provider_attempt(next_context, turn, ctx_int(context, "max_turns", 1), 0, last_text)
 }

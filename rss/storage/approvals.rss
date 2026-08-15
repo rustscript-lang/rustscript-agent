@@ -34,6 +34,12 @@ struct ApprovalExpireInput {
     now_ms: int
 }
 
+struct ApprovalCancelInput {
+    id: string,
+    resolver: string,
+    resolved_at_ms: int
+}
+
 pub fn storage_approval_request(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: ApprovalRequestInput = json::decode::<ApprovalRequestInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
@@ -89,5 +95,18 @@ pub fn storage_approval_expire(db_id: int, payload_json: string) -> map {
         db_id,
         "UPDATE approvals SET state = 'expired', resolved_at_ms = ?, resolver = 'storage-expiry' WHERE state = 'pending' AND expires_at_ms > 0 AND expires_at_ms <= ?",
         [input.now_ms.copy(), input.now_ms.copy()]
+    )
+}
+
+// Targeted cancellation of ONE approval id: the P2 deadline-orphan
+// compensation expires exactly the row whose blocking approval.request
+// outlived the run deadline (pending-only, so a resolved row is never
+// downgraded and a different id — a legitimate park — is never touched).
+pub fn storage_approval_cancel(db_id: int, payload_json: string) -> map {
+    let input: ApprovalCancelInput = json::decode::<ApprovalCancelInput>(payload_json);
+    sqlite::execute(
+        db_id,
+        "UPDATE approvals SET state = 'expired', resolver = ?, decision_reason = 'cancelled after the run deadline', resolved_at_ms = ? WHERE id = ? AND state = 'pending'",
+        [&input.resolver, input.resolved_at_ms.copy(), &input.id]
     )
 }

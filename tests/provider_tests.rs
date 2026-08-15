@@ -1434,8 +1434,9 @@ fn anthropic_messages_buffered_text_tool_use_and_usage() {
         json!("tool_result")
     );
     assert_eq!(
-        wire["messages"][1]["content"][0]["tool_call_id"],
-        json!("call_ab12")
+        wire["messages"][1]["content"][0]["tool_use_id"],
+        json!("call_ab12"),
+        "the tool_result block must carry the official tool_use_id field (preserving the canonical tool_call_id): {wire}"
     );
     assert_eq!(wire["messages"][1]["content"][0]["content"], json!("ok"));
     assert_eq!(wire["messages"][2]["role"], json!("assistant"));
@@ -1979,6 +1980,103 @@ fn anthropic_messages_missing_max_output_tokens_fails_closed() {
         requests.recv_timeout(Duration::from_secs(1)).is_err(),
         "no transport call may be made when max_output_tokens is absent"
     );
+}
+
+/// P2-5: a canonical `tool`-role message (the serial loop's shape) must be
+/// emitted as the Messages API's legal `user` role carrying the `tool_result`
+/// content block, with the official `tool_use_id` field preserving the
+/// canonical `tool_call_id` value. The Messages API accepts only user and
+/// assistant roles; a wire `role: "tool"` message would be rejected.
+#[test]
+fn anthropic_messages_role_tool_message_is_emitted_as_user_with_tool_result_block() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    // The canonical tool message the serial loop appends carries role "tool".
+    request["messages"][1]["role"] = json!("tool");
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let tool_message = &wire["messages"][1];
+    assert_eq!(
+        tool_message["role"],
+        json!("user"),
+        "a canonical tool message must be emitted as the legal user role: {wire}"
+    );
+    assert_eq!(
+        tool_message["content"][0]["type"],
+        json!("tool_result"),
+        "the tool content must stay a tool_result block: {wire}"
+    );
+    assert_eq!(
+        tool_message["content"][0]["tool_use_id"],
+        json!("call_ab12"),
+        "the official tool_use_id field must preserve the canonical tool_call_id: {wire}"
+    );
+    assert_eq!(tool_message["content"][0]["content"], json!("ok"));
+    assert_eq!(tool_message["content"][0]["is_error"], json!(false));
+    for message in wire["messages"].as_array().expect("messages") {
+        assert_ne!(
+            message["role"],
+            json!("tool"),
+            "the Anthropic wire may never carry a tool role: {wire}"
+        );
+    }
+}
+
+/// P2-6: the custom profile adapter with `adapter: "anthropic_messages"` must
+/// route through the SAME role conversion (a canonical `tool` message becomes
+/// the legal `user` role with a `tool_result` block carrying the preserved
+/// `tool_use_id`).
+#[test]
+fn custom_anthropic_adapter_role_tool_message_is_emitted_as_user_with_tool_result_block() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["messages"][1]["role"] = json!("tool");
+    request["provider_options"]["adapter"] = json!("anthropic_messages");
+    request["provider_options"]["model"] = json!("test-model");
+
+    let (result, _) = run_adapter("profile:custom", request, profile("custom", port), &runner);
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /v1/messages HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(
+        wire["messages"][1]["role"],
+        json!("user"),
+        "the custom anthropic adapter must emit the legal user role: {wire}"
+    );
+    assert_eq!(
+        wire["messages"][1]["content"][0]["type"],
+        json!("tool_result"),
+        "{wire}"
+    );
+    assert_eq!(
+        wire["messages"][1]["content"][0]["tool_use_id"],
+        json!("call_ab12"),
+        "the custom anthropic adapter must preserve the tool_use_id: {wire}"
+    );
+    for message in wire["messages"].as_array().expect("messages") {
+        assert_ne!(
+            message["role"],
+            json!("tool"),
+            "the custom anthropic wire may never carry a tool role: {wire}"
+        );
+    }
 }
 
 /// P2-3: canonical `tool_choice` must be mapped onto the Anthropic object

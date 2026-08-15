@@ -1,0 +1,27 @@
+// Custom production-loop program for the A5 drain-before-terminal fixtures.
+//
+// Emits eight canonical `model.started` events and then fails with a typed
+// invocation error (`json::decode` of invalid JSON). The service must drain
+// the fresh delivery path BEFORE committing the terminal, so every tail
+// event is durably appended and replayed before `run.failed`.
+use stream;
+use json;
+
+fn emit_model_started() -> map {
+    stream::emit({
+        type: "model.started",
+        turn: 0,
+        model: "test-model"
+    });
+    { ok: true }
+}
+
+pub fn agent_run(context: map) -> map {
+    let mut index = 0;
+    while index < 8 {
+        emit_model_started();
+        index += 1;
+    }
+    let broken: map = json::decode("{not json");
+    broken
+}

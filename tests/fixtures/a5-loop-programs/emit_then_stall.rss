@@ -1,0 +1,55 @@
+// Custom production-loop program for the A5 drain-before-terminal fixtures.
+//
+// Emits one canonical `model.started` event, then blocks on a
+// provider-style HTTP call to the `base_url` carried in the canonical
+// `provider_options` (the fixture server stalls). A stop() or the run
+// deadline cancels the call; the already-emitted tail event must be durably
+// appended and replayed BEFORE the typed `run.cancelled` terminal.
+use stream;
+use http;
+
+fn emit_model_started() -> map {
+    stream::emit({
+        type: "model.started",
+        turn: 0,
+        model: "test-model"
+    });
+    { ok: true }
+}
+
+fn ctx_options(context: map) -> map {
+    let mut options: map = {};
+    if context.has("provider_options") {
+        if type(context["provider_options"]) == "map" {
+            let coerced: map = context["provider_options"];
+            options = coerced;
+        }
+    }
+    options
+}
+
+fn provider_url(context: map) -> string {
+    let options: map = ctx_options(context);
+    let mut url: string = "";
+    if options.has("base_url") {
+        if type(options["base_url"].copy()) == "string" {
+            let base: string = options["base_url"].copy();
+            url = base;
+        }
+    }
+    url
+}
+
+pub fn agent_run(context: map) -> map {
+    emit_model_started();
+    let url: string = provider_url(context);
+    let response: map = http::client::request({
+        method: "POST",
+        url: url,
+        headers: {
+            "content-type": "application/json"
+        },
+        body: "{}"
+    });
+    response
+}

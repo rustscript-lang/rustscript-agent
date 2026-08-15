@@ -51,6 +51,17 @@ wins. The aliases are scheduled for removal before v1 — do not rely on them.
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_WINDOW_MS` | `PD_EDGE_AGENT_RATE_LIMIT_WINDOW_MS` | integer milliseconds | `60000` | Refill window shared by both dimensions. Must be positive and at most 86 400 000 ms (24 h). |
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_MAX_BUCKETS` | `PD_EDGE_AGENT_RATE_LIMIT_MAX_BUCKETS` | integer `usize` | `10000` | Upper bound on tracked buckets (per-IP and per-account combined); at the bound the stalest bucket is evicted, so memory is bounded. |
 | `RUSTSCRIPT_AGENT_CLIENT_DISCONNECT_POLICY` | `PD_EDGE_AGENT_CLIENT_DISCONNECT_POLICY` | enum | `keep-running` | `keep-running`: the run survives every subscriber disconnect and events stay replayable by cursor. `cancel-on-disconnect`: the run is cancelled with the typed `client_disconnect` reason when the LAST subscriber disconnects while it is still active. Unknown spellings fail startup. |
+| Production serial loop (A5) |
+| `RUSTSCRIPT_AGENT_PROVIDER_BASE_URL` | `PD_EDGE_AGENT_PROVIDER_BASE_URL` | URL | unset | Provider endpoint base for the built-in serial loop. Direct adapters (`openai_chat`, `openai_responses`, `anthropic_messages`) require it; profile modules merge it as an override. |
+| `RUSTSCRIPT_AGENT_PROVIDER_API_KEY` | `PD_EDGE_AGENT_PROVIDER_API_KEY` | string (secret) | unset | Provider API key for the built-in serial loop. Never logged; see [Secrets](#secrets). |
+| `RUSTSCRIPT_AGENT_PROVIDER_MODEL` | `PD_EDGE_AGENT_PROVIDER_MODEL` | string | unset | Model override merged into the provider options of the built-in serial loop. |
+| `RUSTSCRIPT_AGENT_MAX_TURNS` | `PD_EDGE_AGENT_MAX_TURNS` | integer `usize` | `8` | Bounded serial-loop turns (a tool round consumes one turn); a runaway tool loop terminates at this bound. |
+| `RUSTSCRIPT_AGENT_MAX_RETRIES` | `PD_EDGE_AGENT_MAX_RETRIES` | integer `usize` | `2` | Provider retries allowed per turn before the typed `max_retries_exceeded` terminal. |
+| `RUSTSCRIPT_AGENT_APPROVAL_MODE` | `PD_EDGE_AGENT_APPROVAL_MODE` | enum | `auto` | Approval mode fed to the A4 approval policy: `auto`, `manual`, `never`, or `all`. Anything else fails startup validation. |
+| `RUSTSCRIPT_AGENT_APPROVAL_TIMEOUT_SECS` | `PD_EDGE_AGENT_APPROVAL_TIMEOUT_SECS` | integer seconds | `600` | Lifetime of a pending approval; the janitor sweep resumes the parked run with a typed expired tool result after it. |
+| `RUSTSCRIPT_AGENT_MAX_CONTEXT_MESSAGES` | `PD_EDGE_AGENT_MAX_CONTEXT_MESSAGES` | integer `usize` | `64` | Durable-history compaction window; when the session history exceeds it the loop plans and the service executes a compaction. `0` disables the gate. |
+| `RUSTSCRIPT_AGENT_RETAINED_TAIL` | `PD_EDGE_AGENT_RETAINED_TAIL` | integer `usize` | `8` | Retained tail after a compaction (never marked, stays in context). |
+| `RUSTSCRIPT_AGENT_STREAM` | `PD_EDGE_AGENT_STREAM` | flag | `1` | Stream transport flag passed to the provider adapters (`1` uses the SSE transport, `0` buffered). Only the exact values `0`/`1` are accepted. |
 | Telegram adapter (A8) |
 | `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN` | `PD_EDGE_AGENT_TELEGRAM_BOT_TOKEN` | string (secret) | unset (adapter disabled) | Bot API token. When set, the Telegram poller starts alongside the API server; a blank value fails startup. Never logged; see [Secrets](#secrets). |
 | `RUSTSCRIPT_AGENT_TELEGRAM_API_BASE` | `PD_EDGE_AGENT_TELEGRAM_API_BASE` | URL | `https://api.telegram.org` | Bot API base. Must be a bare origin: `https` only (an `http` base is rejected unless the host is localhost AND `RUSTSCRIPT_AGENT_TELEGRAM_ALLOW_INSECURE_LOCALHOST=1`), no credentials, query, fragment, or path. |
@@ -100,6 +111,18 @@ above; every other field is set by embedding code.
 | --- | --- | --- | --- |
 | `model` | `String` | `"local-agent"` | — |
 | `provider` | `Option<String>` | `Some("local-agent")` | — |
+| `provider_options` | `serde_json::Value` | `{}` | Canonical provider options for the built-in serial loop (`base_url`, `api_key`, `model`, ...). Direct adapters require `base_url`; profile modules merge these as overrides. See `RUSTSCRIPT_AGENT_PROVIDER_*` above. |
+| `max_turns` | `usize` | 8 | Bounded serial-loop turns; a runaway tool loop terminates at this bound. See `RUSTSCRIPT_AGENT_MAX_TURNS`. |
+| `max_retries` | `usize` | 2 | Provider retries per turn before the typed `max_retries_exceeded` terminal. See `RUSTSCRIPT_AGENT_MAX_RETRIES`. |
+| `base_retry_delay_ms` | `u64` | 1000 | Exponential backoff base for provider retries. |
+| `max_retry_delay_ms` | `u64` | 30000 | Exponential backoff cap for provider retries. |
+| `approval_mode` | `String` | `"auto"` | One of `auto`/`manual`/`never`/`all`; anything else fails validation. Fed to the A4 approval policy. See `RUSTSCRIPT_AGENT_APPROVAL_MODE`. |
+| `approval_timeout` | `Duration` | 600 s | Must be positive. Lifetime of a pending approval; the janitor sweep resumes the parked run with a typed expired tool result after it. See `RUSTSCRIPT_AGENT_APPROVAL_TIMEOUT_SECS`. |
+| `max_context_messages` | `usize` | 64 | Durable-history compaction window; `0` disables the gate. See `RUSTSCRIPT_AGENT_MAX_CONTEXT_MESSAGES`. |
+| `retained_tail` | `usize` | 8 | Retained tail after a compaction. See `RUSTSCRIPT_AGENT_RETAINED_TAIL`. |
+| `stream` | `bool` | `true` | Stream transport flag passed to the provider adapters. See `RUSTSCRIPT_AGENT_STREAM`. |
+| `parallel` | `bool` | `false` | Parallel orchestration requested (A6 handoff; typed non-executable until the A7 run-admission interface wires the native supervisor). |
+| `task` | `bool` | `false` | Task/subagent delegation requested (A6 handoff; typed non-executable). |
 | `agent_name` | `String` | `"local-rss-agent"` | Reported by `/health/detailed`. |
 | `bearer_token` | `Option<String>` | `None` | Blank tokens rejected by the binary. |
 | `max_body_bytes` | `usize` | 4 MiB | Must be positive. HTTP request body limit (`DefaultBodyLimit`). |
@@ -190,6 +213,14 @@ page bounds.
 | `MAX_AGENT_SOURCE_BYTES` | 1 MiB | Agent sources (and the storage program) over this bound are rejected at load/compile time. |
 | `RUN_EPOCH_DEADLINE_TICKS` | 1 000 000 000 | Epoch budget granted to one cancellable run; the cancellation watcher jumps the epoch past it. |
 | `RUN_EPOCH_CHECK_INTERVAL` | 1 000 | Interpreter operations between epoch checks on cancellable runs. |
+
+The built-in RSS programs (the serial agent loop `rss/agent/main.rss` and
+the A2 storage program `rss/storage/main.rss`) are compiled from the crate's
+source tree at construction. A deployment without the source tree must ship
+them (or set `RUSTSCRIPT_STORAGE_PROGRAM` to an absolute storage-program
+path); a missing storage program is a typed construction error that fails
+startup cleanly — never a panic. This variable is read by the library (not
+by the binaries), so it is not part of the canonical env table above.
 
 ## Secrets
 
