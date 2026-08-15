@@ -32,16 +32,20 @@
 //!
 //! The streaming adapter is implemented and correct (`openai_chat_stream`
 //! in `rss/llm/openai_chat.rss`, with `http::client::sse` exposed in the
-//! restricted registry). The `openai_responses` adapter remains a typed
-//! `not_implemented` stub (no production adapter is claimed); its
-//! transcript-reference suite stays `#[ignore]`d until that agent work
-//! exists. The `anthropic_messages` adapter is production (buffered and
-//! streaming) against the `/v1/messages` wire contract, including
-//! tool_use/tool_result blocks, thinking (reasoning), structured provider
-//! errors, marker-like text pass-through (structural wire built as a single
-//! json::encode of a nested runtime map, core B4), stream error events,
+//! restricted registry). The `anthropic_messages` adapter is production
+//! (buffered and streaming) against the `/v1/messages` wire contract,
+//! including tool_use/tool_result blocks, thinking (reasoning), structured
+//! provider errors, marker-like text pass-through (structural wire built as a
+//! single json::encode of a nested runtime map, core B4), stream error events,
 //! cancellation, and the EOF-without-`message_stop` fail-closed guard (A3
-//! review).
+//! review). The OpenAI Responses adapter is likewise implemented and correct
+//! (`openai_responses` in `rss/llm/openai_responses.rss`): buffered wire
+//! building over the `/responses` endpoint (`input` items, Responses tool
+//! shape), buffered response parsing (text/reasoning/function_call output
+//! items + top-level usage), and the streaming path
+//! (`openai_responses_stream` aggregating `response.output_text.delta`,
+//! `response.function_call_arguments.delta`, `response.output_item.done`, and
+//! `response.completed` events with the same fail-closed EOF guard).
 //! Four OpenAI buffered suites are green and remain so:
 //! the structured provider-error mapping
 //! (`openai_chat_provider_error_is_structured`), the P1 standard-wire
@@ -980,11 +984,125 @@ fn openai_chat_stream_eof_without_done_fails_closed() {
 // field of its `data:` JSON payload, and the stream ends with a bare
 // `data: [DONE]`.
 
-#[ignore = "openai_responses adapter is a not_implemented stub (see module doc)"]
 #[test]
-fn openai_responses_buffered_transcript_is_referenced() {
+fn openai_responses_buffered_text_tool_usage_reasoning() {
     let body = read_fixture("openai_responses/response.json");
-    let (port, _requests, fixture) = spawn_json_fixture(200, body);
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let response = response_of(&result);
+    assert_eq!(
+        response["text"],
+        json!("The Responses adapter maps canonical events to output items.")
+    );
+    assert_eq!(
+        response["reasoning"],
+        json!("Reasoned about the adapter mapping.")
+    );
+    assert_eq!(response["stop_reason"], json!("tool_calls"));
+    assert_eq!(response["usage"]["input_tokens"], json!(25));
+    assert_eq!(response["usage"]["output_tokens"], json!(18));
+    assert_eq!(response["usage"]["total_tokens"], json!(43));
+    let calls = response["tool_calls"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], json!("call_xy"));
+    assert_eq!(calls[0]["name"], json!("read_file"));
+    assert_eq!(
+        calls[0]["arguments"]["path"],
+        json!("plans/2026-07-30_rustscript-agent-gateway-api.md")
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
+    assert_eq!(
+        header(&recorded, "authorization").as_deref(),
+        Some("Bearer test-key")
+    );
+    assert_eq!(
+        header(&recorded, "content-type").as_deref(),
+        Some("application/json")
+    );
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["model"], json!("test-model"));
+    assert_eq!(wire["stream"], json!(false));
+    assert_eq!(wire["max_output_tokens"], json!(128));
+    let input = wire["input"].as_array().expect("input array");
+    assert_eq!(input.len(), 4);
+    // user message -> plain string content
+    assert_eq!(input[0]["role"], json!("user"));
+    assert_eq!(input[0]["content"], json!("hello"));
+    // tool result -> function_call_output item
+    assert_eq!(input[1]["type"], json!("function_call_output"));
+    assert_eq!(input[1]["call_id"], json!("call_ab12"));
+    assert_eq!(input[1]["output"], json!("ok"));
+    // assistant message -> plain string content
+    assert_eq!(input[2]["role"], json!("assistant"));
+    assert_eq!(input[2]["content"], json!("Let me read the file."));
+    // assistant tool call -> function_call item
+    assert_eq!(input[3]["type"], json!("function_call"));
+    assert_eq!(input[3]["call_id"], json!("call_ab12"));
+    assert_eq!(input[3]["name"], json!("read_file"));
+    assert_eq!(
+        input[3]["arguments"],
+        json!("{\"path\":\"README.md\"}")
+    );
+    // tools: Responses shape {type, function:{name, description, parameters}}
+    assert_eq!(wire["tools"][0]["type"], json!("function"));
+    assert_eq!(wire["tools"][0]["function"]["name"], json!("read_file"));
+    assert_eq!(
+        wire["tools"][0]["function"]["parameters"]["required"][0],
+        json!("path")
+    );
+}
+
+#[test]
+fn openai_responses_stream_text_tool_usage() {
+    let events = sse_events(&read_fixture("openai_responses/stream.sse"));
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let response = response_of(&result);
+    assert_eq!(response["text"], json!("The Responses adapter streams."));
+    assert_eq!(response["stop_reason"], json!("tool_calls"));
+    assert_eq!(response["usage"]["input_tokens"], json!(30));
+    assert_eq!(response["usage"]["output_tokens"], json!(12));
+    assert_eq!(response["usage"]["total_tokens"], json!(42));
+    let calls = response["tool_calls"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], json!("call_xy"));
+    assert_eq!(calls[0]["name"], json!("read_file"));
+    assert_eq!(calls[0]["arguments"]["path"], json!("README.md"));
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+}
+
+#[test]
+fn openai_responses_provider_error_is_structured() {
+    let body = read_fixture("openai_responses/error.json");
+    let (port, _requests, fixture) = spawn_json_fixture(400, body);
     let runner = harness_runner(port);
     let request = canonical_request(port, false);
 
@@ -997,46 +1115,29 @@ fn openai_responses_buffered_transcript_is_referenced() {
     fixture.join().expect("fixture thread");
 
     assert!(result["ok"] == json!(false), "{result}");
-    assert_eq!(result["error"]["code"], json!("not_implemented"));
+    let error = error_of(&result);
+    assert_eq!(error["status"], json!(400));
+    assert_eq!(error["type"], json!("invalid_request_error"));
+    assert_eq!(error["code"], json!("unsupported_parameter"));
+    assert_eq!(error["param"], json!("reasoning"));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("reasoning")
+    );
 }
 
-#[ignore = "openai_responses adapter is a not_implemented stub (see module doc)"]
+/// A3 review P2 guard applied to the Responses stream: the adapter must fail
+/// CLOSED when the server EOFs the SSE body without the terminal
+/// `data: [DONE]` event, surfacing the canonical typed provider error instead
+/// of accumulated partial text.
 #[test]
-fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced() {
-    let events = sse_events(&read_fixture("openai_responses/stream.sse"));
-
-    // Real Responses API transport shape: each payload event is an
-    // `event: <type>` / `data: {json}` pair with the event name matching the
-    // payload's `type` field, and the stream ends with a bare `data: [DONE]`
-    // terminator.
-    let (done, payload_events) = events
-        .split_last()
-        .expect("stream fixture must have at least one event");
-    for event in payload_events {
-        let event_line = event
-            .lines()
-            .find(|line| line.starts_with("event: "))
-            .unwrap_or_else(|| panic!("event must carry an event: line: {event}"));
-        let data_line = event
-            .lines()
-            .find(|line| line.starts_with("data: "))
-            .unwrap_or_else(|| panic!("event must carry a data: line: {event}"));
-        let event_name = event_line.strip_prefix("event: ").expect("event name");
-        let payload: JsonValue =
-            serde_json::from_str(data_line.strip_prefix("data: ").expect("data payload"))
-                .unwrap_or_else(|error| panic!("data payload must be JSON ({error}): {event}"));
-        assert_eq!(
-            payload["type"].as_str(),
-            Some(event_name),
-            "event: line must match the data.type field: {event}"
-        );
-    }
-    assert!(
-        done.starts_with("data:") && done.contains("[DONE]"),
-        "stream must end with a bare data: [DONE] terminator, got: {done}"
-    );
-
-    let (port, _requests, fixture) = spawn_sse_fixture(events, false);
+fn openai_responses_stream_eof_without_done_fails_closed() {
+    let events = vec![
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_01\",\"output_index\":0,\"delta\":\"partial \"}\n\n".to_string(),
+    ];
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
     let runner = harness_runner(port);
     let request = canonical_request(port, true);
 
@@ -1048,8 +1149,26 @@ fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced()
     );
     fixture.join().expect("fixture thread");
 
-    assert!(result["ok"] == json!(false), "{result}");
-    assert_eq!(result["error"]["code"], json!("not_implemented"));
+    assert!(
+        result["ok"] == json!(false),
+        "EOF without [DONE] must fail closed, got {result}"
+    );
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("api_error"));
+    assert_eq!(error["code"], json!("stream_eof_without_done"));
+    assert_eq!(error["status"], json!(200));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("[DONE]"),
+        "{error:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
 }
 
 // ---------------------------------------------------------------------------

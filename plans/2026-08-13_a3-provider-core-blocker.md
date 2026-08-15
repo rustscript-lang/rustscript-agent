@@ -22,17 +22,28 @@ wire fixtures (buffered, stream aggregation, cancellation, and the
 EOF-without-`[DONE]` fail-closed guard). No schema
 guard is bypassed and no fixture is weakened.
 
+The OpenAI Responses adapter (`rss/llm/openai_responses.rss`) is also
+implemented and correct: buffered wire building over the `/responses`
+endpoint (`input` items, Responses tool shape, plain-string message
+content), buffered response parsing (text/reasoning/function_call output
+items + top-level usage), and the streaming path
+(`openai_responses_stream` aggregating `response.output_text.delta`,
+`response.function_call_arguments.delta`, `response.output_item.done`, and
+`response.completed` events, with the same fail-closed EOF-without-`[DONE]`
+guard). Its four suites run by default and pass (buffered
+text/tool/usage/reasoning, structured provider error, stream
+text/tool/usage, and the EOF-without-`[DONE]` fail-closed guard).
+
 A3 "shared adapters handle non-stream/stream text, tool calls, usage, reasoning
 fields, provider errors, and cancellation; profiles reuse adapters without
-copied parsers" is **implemented**. The four Responses/Anthropic suites remain
-placeholder `#[ignore]`d (adapter work, unrelated to core). Four suites
-are green (`openai_chat_provider_error_is_structured`, the P1 wire-format
-guard `openai_chat_wire_format_is_standard`, and the two marker-splice
-preservation guards `openai_chat_wire_preserves_marker_like_user_text` /
-`openai_chat_wire_preserves_marker_like_tool_schema`); the eight OpenAI
-Chat buffered/stream/cancellation suites run by default and pass at
-`fd4b570…`, including the EOF-without-`[DONE]` fail-closed guard (see
-`tests/provider_tests.rs` module doc).
+copied parsers" is **implemented**. The Anthropic Messages suites remain
+placeholder `#[ignore]`d (adapter work, unrelated to core). The OpenAI Chat
+wire-format and marker-preservation guards
+(`openai_chat_wire_format_is_standard`, the two
+`openai_chat_wire_preserves_marker_like_*` suites, and
+`openai_chat_provider_error_is_structured`) run by default and pass at
+`fd4b570…`, alongside the OpenAI Chat buffered/stream/cancellation suites
+and the new OpenAI Responses suites.
 
 ## Symptom
 
@@ -274,9 +285,9 @@ cargo test --test core_repro_driver
 # converted from the residual-defect failure assertion to positive at
 # fd4b570; two-parameter control unchanged).
 #
-# Full adapter flow: 12 passed, 4 ignored (stub-only placeholders):
+# Full adapter flow: 16 passed, 2 ignored (anthropic stub placeholders only):
 cargo test --test provider_tests
-cargo test --test provider_tests -- --ignored   # 4 placeholders pass asserting not_implemented
+cargo test --test provider_tests -- --ignored   # 2 placeholders pass asserting not_implemented
 ```
 
 The repro sources live in `tests/fixtures/core-repros/` (`chain_m1.rss`
@@ -297,15 +308,26 @@ runnable through `tests/core_repro_driver.rs` (runs by default; both
   streaming (`openai_chat_stream`) is implemented with an
   `http::client::sse` shared-accumulator closure and passes the stream
   suites at `fd4b570…`.
+- `rss/llm/openai_responses.rss` — buffered adapter over the `/responses`
+  endpoint: heterogeneous `input` item building (user/assistant messages as
+  plain-string content, tool results as `function_call_output`, assistant
+  calls as `function_call`), Responses tool shape with indexed schema
+  splice, response/error parsing of `output` items (text/reasoning/
+  function_call) and top-level `usage`; streaming (`openai_responses_stream`)
+  aggregates `response.output_text.delta` / `response.function_call_arguments.delta`
+  / `response.output_item.done` / `response.completed` events with the same
+  fail-closed EOF-without-`[DONE]` guard as the chat adapter.
 - `rss/llm/harness.rss` — test dispatch entry (no protocol logic).
 - `rss/providers/*.rss` — OpenRouter, DeepSeek, OpenCode Zen, OpenCode Go,
   custom profiles reusing the shared adapter (no copied parsers).
 - `tests/provider_tests.rs` — fixture server infrastructure, canonical
-  request/profile construction, 12 green suites (provider error, P1 wire
-  format, the two marker-preservation guards, and the eight OpenAI Chat
-  buffered/stream/cancellation suites including the EOF-without-`[DONE]`
-  fail-closed guard), 4 documented ignored
-  placeholder-reference suites for the openai_responses/anthropic fixtures.
+  request/profile construction, and 16 green suites: the OpenAI Chat
+  buffered/stream/cancellation suites (including the EOF-without-`[DONE]`
+  fail-closed guard), the four OpenAI Responses suites (buffered
+  text/tool/usage/reasoning, structured provider error, stream
+  text/tool/usage, and the EOF-without-`[DONE]` fail-closed guard), plus the
+  provider-error, P1 wire-format, and marker-preservation guards. 2 documented
+  ignored placeholder-reference suites remain for the anthropic fixtures.
 - `tests/fixtures/providers/**` — transcripts for chat buffered/stream,
   responses (event-typed SSE: `event:` lines matching `data.type` with a
   final `data: [DONE]`), anthropic, and error/malformed payloads.
@@ -316,14 +338,12 @@ runnable through `tests/core_repro_driver.rs` (runs by default; both
 - `src/runtime/rss_runner.rs` — restricted registry exposes only consumed
   capabilities: JSON, stream emit, `bytes::to_utf8`, SQLite,
   `http::client::request`, and `http::client::sse` (consumed by the
-  streaming adapter since core revision fd4b570).
+  streaming adapters since core revision fd4b570).
 
 ## Still open
 
-- Nothing: the eight OpenAI Chat suites run by default and pass at
-  `fd4b570…` (the residual slot-aliasing defect is fixed in core; repro and
-  fix record: unblock plan §11a).
-- `openai_responses` and `anthropic_messages` adapters (currently typed
-  `not_implemented` stubs) with their buffered/streaming transcripts — pure
-  agent work, unrelated to the core defect.
-  `not_implemented` stubs) with their buffered/streaming transcripts.
+- Nothing for the OpenAI Chat and OpenAI Responses adapters: the sixteen
+  provider suites run by default and pass at `fd4b570…`.
+- `anthropic_messages` adapter (currently a typed `not_implemented` stub)
+  with its buffered/streaming transcripts — pure agent work, unrelated to
+  the core defect.
