@@ -8,7 +8,10 @@
 // tool. A provider call that would succeed and a tool dispatch that would
 // run are both returned as typed BLOCKED capability states, so no success is
 // ever fabricated and no private builtin is added. Parallel/subagent/task
-// execution is rejected outright (A6 excluded).
+// execution is not executed here: when `config.parallel` or `config.task` is
+// set, the serial loop returns a typed HANDOFF decision deferring to the A6
+// decision policies (`parallel.rss` for parallel orchestration, `subagents.rss`
+// for subagent/task delegation) instead of rejecting outright.
 //
 // Context (all fields typed; missing fields fall back to documented
 // defaults):
@@ -43,8 +46,12 @@
 //                   {status, type, code, message, param, request_id} and a
 //                   reason ("non_retryable" | "max_retries_exceeded"); the
 //                   service commits the service-owned run.failed event
-//   rejected     -> typed rejection (parallel_not_supported,
-//                   task_not_supported, unknown_phase)
+//   rejected     -> typed rejection (unknown_phase)
+//   parallel.handoff -> when config.parallel is set: defers to the parallel
+//                   policy (`parallel.rss`); carries the run_id as the future
+//                   parent of any child runs
+//   subagent.handoff -> when config.task is set: defers to the subagent
+//                   policy (`subagents.rss`)
 //
 // Every decision carries an `events` array of canonical event descriptors:
 //
@@ -164,6 +171,26 @@ fn run_failed_decision(turn: int, reason: string, error: map) -> map {
 
 fn rejected_decision(code: string, message: string, turn: int) -> map {
     { kind: "rejected", code: code, message: message, turn: turn, events: [] }
+}
+
+/// A6 handoff: when parallel/task execution is requested, the serial loop does
+/// not execute it (it never invents parallel/subagent actions) — it defers to
+/// the dedicated A6 decision policies with a typed handoff decision carrying
+/// the current run id as the future parent of any child runs. The handoff is
+/// explicit non-executable-with-reason: the serial loop is a pure decision /
+/// handoff layer and cannot itself drive concurrent child runs, so it never
+/// fakes a parallel/subagent outcome.
+fn handoff_decision(phase: string, capability: string, parent_run_id: string, turn: int, message: string) -> map {
+    {
+        kind: phase,
+        capability: capability,
+        parent_run_id: parent_run_id,
+        turn: turn,
+        message: message,
+        executable: false,
+        blocked_reason: "the serial loop defers parallel/subagent execution to the dedicated native supervisor; it cannot itself advertise a parallel or subagent result",
+        events: []
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,15 +344,28 @@ pub fn run(context: map) -> map {
     let max_retries: int = ctx_int(context, "max_retries", 0);
     let phase: string = ctx_string(context, "phase", "");
     let model: string = ctx_string(context, "model", "");
+    let run_id: string = ctx_string(context, "run_id", "");
     let provider: map = ctx_map(context, "provider");
     let config: map = ctx_map(context, "config");
     let parallel: bool = ctx_bool(config, "parallel", false);
     let task: bool = ctx_bool(config, "task", false);
     let mut decision: map = rejected_decision("unknown_phase", "run phase is not recognized by the serial loop policy", turn);
     if parallel == true {
-        decision = rejected_decision("parallel_not_supported", "parallel/subagent execution is excluded from the serial loop policy", turn);
+        decision = handoff_decision(
+            "parallel.handoff",
+            "parallel.plan",
+            run_id,
+            turn,
+            "parallel orchestration requested; the serial loop defers to the A6 parallel policy (parallel.rss)"
+        );
     } else if task == true {
-        decision = rejected_decision("task_not_supported", "task delegation is excluded from the serial loop policy", turn);
+        decision = handoff_decision(
+            "subagent.handoff",
+            "subagent.admit",
+            run_id,
+            turn,
+            "task delegation requested; the serial loop defers to the A6 subagent policy (subagents.rss)"
+        );
     } else if phase == "start" {
         decision = start_phase(turn, max_turns, model);
     } else if phase == "provider_result" {

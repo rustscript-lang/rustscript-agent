@@ -1,0 +1,294 @@
+// A6 subagent supervision policy (pure decision policy; no concurrent
+// execution in the script).
+//
+// This module decides admission and cancellation for child runs of one parent
+// run, reusing the existing A2 parent/child contract
+// (`AdmitRunRequest.parent_run_id`, the `child_run_links` storage and the
+// `run.link_child` / `run.list_children` commands) and the canonical
+// `subagent.started` / `subagent.completed` script events. Like parallel.rss
+// it never spawns or cancels anything in the script: RustScript is strictly
+// synchronous and single-threaded, so a policy script cannot itself drive N
+// child runs concurrently (the narrowed A6 CORE_BLOCKER is only this
+// script-internal task surface — plans/2026-08-15_a6-core-blocker.md). The
+// exported `run(context)` returns a typed DECISION (admit / cancel /
+// rejected) that a native supervisor consumes; the decision layer never
+// fabricates a success, never a private host function, and never direct SQL.
+//
+// Native ownership (the embedding layer, crate::runtime::subagent_supervisor
+// + AgentService): the native supervisor consumes `subagent.admit`, really
+// admits the child via `AdmitRunRequest` carrying `parent_run_id`, issues
+// `run.link_child`, drives the child to its terminal, and only then emits the
+// canonical `subagent.started` / `subagent.completed` events. It also
+// translates `subagent.cancel` into typed cancellations of the listed
+// children. That is generic lifecycle + concurrency only; the decision (WHAT
+// to admit / cancel) stays in RSS.
+//
+// Context (all fields typed; missing fields fall back to documented
+// defaults):
+//
+//   parent_run_id: string   the run that owns this child
+//   child: map              proposed child run descriptor {id, input, model,
+//                           ...}
+//   depth: int              current nesting depth
+//   max_depth: int          maximum allowed depth (0 = unlimited)
+//   current_fanout: int     children already admitted under this parent
+//   max_fanout: int         total children bound per parent (0 = unlimited)
+//   parent_status: string   "active" | "stopping" | "cancelling" |
+//                           "completed" | "cancelled" | "failed"
+//   children: array         existing child link states
+//                           [{child_run_id, state}, ...] (from
+//                           run.list_children); "pending"/"active" children
+//                           are cancellable, terminal states are not
+//
+// Decisions (kind discriminator):
+//
+//   subagent.admit -> { kind, parent_run_id, child_run_id, ordinal,
+//                       isolation, executable, blocked_reason, events }
+//       child_run_id: from child.id (the proposed child's run id), or "" if
+//           the descriptor carries none (the native layer assigns it).
+//       ordinal:      current_fanout (the next child link ordinal).
+//       isolation:    { separate_run_context: true, shared_history: false,
+//                       parent_link: parent_run_id } — the child is a
+//                       distinct run with its own context; the native layer
+//                       must grant it this isolation.
+//       executable:   false, with a blocked_reason: the RSS decision layer
+//                       itself cannot run a concurrent child; the native
+//                       supervisor executes the plan.
+//       events:       [] — NEVER a fabricated `subagent.started` or a
+//                       fabricated `run.link_child`. Those lifecycle
+//                       artifacts are emitted by the native supervisor only
+//                       after the child is genuinely admitted and linked.
+//   subagent.cancel -> { kind, parent_run_id, child_run_ids, reason, events }
+//       Parent cancellation propagation: issued when parent_status is
+//       "stopping" or "cancelling"; child_run_ids lists every pending/active
+//       child of this parent so the native layer cancels them all.
+//   subagent.rejected -> { kind, code, message, events } for depth/fanout /
+//                        invalid parent / terminal-parent rejections. A
+//                       terminal parent never gets new admissions or events
+//                       (no post-terminal side effects).
+//
+// The policy never emits service-owned run.* events.
+
+// ---------------------------------------------------------------------------
+// Typed context accessors (same-module; defensive dynamic navigation)
+// ---------------------------------------------------------------------------
+
+fn ctx_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Decision builders
+// ---------------------------------------------------------------------------
+
+// Decision of admission (`admitted_decision`) is a pure *authorization*:
+// it names which child under which parent is admissible and what isolation
+// the native executor must give it, and it is explicitly marked
+// `executable:false` with a `blocked_reason` because the DECISION layer
+// itself cannot run a concurrent child. The lifecycle artifacts a reader
+// might expect from an admission (a canonical `subagent.started` event and
+// the durable `run.link_child` command) are NOT fabricated here: they are
+// produced by the native supervisor only once the child is *really*
+// admitted and linked (see crate::runtime::subagent_supervisor and the
+// execution-owned event emission). This keeps the decision honest: it never
+// pretends a child started or that a link exists before the native layer
+// actually created and linked the run.
+fn admitted_decision(
+    parent_run_id: string,
+    child_run_id: string,
+    ordinal: int,
+    isolation: map
+) -> map {
+    {
+        kind: "subagent.admit",
+        parent_run_id: parent_run_id,
+        child_run_id: child_run_id,
+        ordinal: ordinal,
+        isolation: isolation,
+        executable: false,
+        blocked_reason: "the subagent decision alone cannot run a concurrent child run; the native supervisor admits, links, and emits subagent.started/subagent.completed only after the child is genuinely admitted",
+        events: []
+    }
+}
+
+fn cancel_decision(parent_run_id: string, child_run_ids: array, reason: string) -> map {
+    {
+        kind: "subagent.cancel",
+        parent_run_id: parent_run_id,
+        child_run_ids: child_run_ids,
+        reason: reason,
+        events: []
+    }
+}
+
+fn rejected_decision(code: string, message: string, parent_run_id: string) -> map {
+    { kind: "subagent.rejected", code: code, message: message, parent_run_id: parent_run_id, events: [] }
+}
+
+// ---------------------------------------------------------------------------
+// Parent status helpers
+// ---------------------------------------------------------------------------
+
+/// A terminal parent must never receive new admissions or new events.
+fn parent_terminal(status: string) -> bool {
+    let mut terminal = false;
+    if status == "completed" {
+        terminal = true;
+    }
+    if status == "cancelled" {
+        terminal = true;
+    }
+    if status == "failed" {
+        terminal = true;
+    }
+    terminal
+}
+
+/// An in-flight parent cancellation ("stopping"/"cancelling") propagates to
+/// every pending/active child.
+fn parent_cancelling(status: string) -> bool {
+    let mut cancelling = false;
+    if status == "stopping" {
+        cancelling = true;
+    }
+    if status == "cancelling" {
+        cancelling = true;
+    }
+    cancelling
+}
+
+// ---------------------------------------------------------------------------
+// Child link state helpers
+// ---------------------------------------------------------------------------
+
+/// Collects the child_run_id of every pending/active child (terminal child
+/// states are never cancelled).
+fn active_child_ids(children: array) -> array {
+    let mut ids: array = [];
+    let mut i = 0;
+    while i < children.length {
+        let entry: map = children[i];
+        let state: string = ctx_string(entry, "state", "");
+        let terminal_child = state == "completed" || state == "cancelled" || state == "failed";
+        if terminal_child == false {
+            let child_id: string = ctx_string(entry, "child_run_id", "");
+            if child_id != "" {
+                ids[ids.length] = child_id;
+            }
+        }
+        i += 1;
+    }
+    ids
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+pub fn run(context: map) -> map {
+    let parent_run_id: string = ctx_string(context, "parent_run_id", "");
+    let child: map = ctx_map(context, "child");
+    let depth: int = ctx_int(context, "depth", 0);
+    let max_depth: int = ctx_int(context, "max_depth", 0);
+    let current_fanout: int = ctx_int(context, "current_fanout", 0);
+    let max_fanout: int = ctx_int(context, "max_fanout", 0);
+    let parent_status: string = ctx_string(context, "parent_status", "active");
+    let children: array = ctx_array(context, "children");
+    let child_run_id: string = ctx_string(child, "id", "");
+
+    // Rejection checks are independent and set a typed code/message; only
+    // when none fires (active parent, within depth/fanout budgets) is the
+    // child admitted.
+    let mut rejected_code: string = "";
+    let mut rejected_message: string = "";
+    if parent_terminal(parent_status) {
+        // A terminal parent can neither admit children nor emit further
+        // events: no post-terminal side effects.
+        rejected_code = "parent_terminal";
+        rejected_message =
+            "subagent admission refused: the parent run is terminal and must not spawn further children";
+    } else if parent_cancelling(parent_status) {
+        rejected_code = "parent_cancelled";
+        rejected_message = "subagent admission refused: the parent run is cancelling; children are cancelled instead";
+    } else {
+        // Depth and fanout are independent budgets; both must pass for an
+        // admission (an in-budget depth check must not skip the fanout check).
+        if max_depth > 0 {
+            if depth >= max_depth {
+                rejected_code = "depth_exceeded";
+                rejected_message =
+                    "subagent admission refused: nesting depth exceeds max_depth";
+            }
+        }
+        if rejected_code == "" {
+            if max_fanout > 0 {
+                if current_fanout >= max_fanout {
+                    rejected_code = "fanout_exceeded";
+                    rejected_message =
+                        "subagent admission refused: parent fanout exceeds max_fanout";
+                }
+            }
+        }
+    }
+
+    let mut decision: map = rejected_decision(rejected_code, rejected_message, parent_run_id);
+    if rejected_code == "" {
+        let ordinal: int = current_fanout;
+        // The isolation contract stays part of the decision (the native
+        // executor must grant the child a separate context). The lifecycle
+        // artifacts (subagent.started event, run.link_child) are NOT
+        // fabricated here; the native supervisor emits them only after it
+        // has really admitted and linked the child.
+        let isolation: map = {
+            separate_run_context: true,
+            shared_history: false,
+            parent_link: parent_run_id
+        };
+        decision = admitted_decision(parent_run_id, child_run_id, ordinal, isolation);
+    } else if rejected_code == "parent_cancelled" {
+        // Parent cancellation propagates: cancel every pending/active child.
+        let ids: array = active_child_ids(children);
+        decision = cancel_decision(parent_run_id, ids, "parent_cancelled");
+    }
+    decision
+}

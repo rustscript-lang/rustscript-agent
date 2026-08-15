@@ -21,12 +21,15 @@ pub use domain::{
 };
 pub use gateway::store::GatewayPersistence;
 pub use gateway::{AgentGatewayState, build_agent_gateway_app};
+pub use runtime::approval_bridge::{
+    ApprovalBridge, ApprovalDecision, ApprovalError, ApprovalMode, NativeDenyPolicy,
+    PendingApproval, Resolution, RiskClass,
+};
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
 };
-pub use runtime::{
-    ApprovalBridge, ApprovalDecision, ApprovalError, ApprovalMode, NativeDenyPolicy,
-    PendingApproval, Resolution, RiskClass,
+pub use runtime::subagent_supervisor::{
+    ChildExecutor, ChildOutcome, ChildSpec, SupervisionMode, SupervisorCancel, supervise_batch,
 };
 pub use service::{AdmitError, AdmitRunRequest, AdmittedRun, AgentService, RunHandle};

@@ -10,7 +10,8 @@
 //!   `model.started` / `model.completed` event descriptors and the
 //!   service-owned `run.failed` terminal descriptor. Provider calls and tool
 //!   dispatch are typed BLOCKED capabilities (never fabricated success), and
-//!   parallel/task execution is rejected (A6 excluded).
+//!   parallel/task configuration now defers to the A6 decision policies via a
+//!   typed handoff decision (it never executes parallel/subagent actions).
 //! - `compact.rss` — durable compaction policy: prefix selection over the
 //!   message history that never splits an assistant tool-call message from
 //!   its tool-result messages and always keeps a retained tail window, plus
@@ -191,6 +192,7 @@ fn loop_context(
         "max_retries": max_retries,
         "phase": phase,
         "model": "test-model",
+        "run_id": "run-1",
         "provider": provider,
         "config": config
     })
@@ -462,25 +464,44 @@ fn loop_max_retries_exceeded_fails_run() {
 }
 
 #[test]
-fn loop_parallel_config_is_rejected() {
+fn loop_parallel_config_defers_to_parallel_policy() {
     let runner = loop_runner();
     let decision = decide(&runner, start_context(0, 3, loop_config(true, false)));
-    assert_eq!(decision["kind"], json!("rejected"));
-    assert_eq!(decision["code"], json!("parallel_not_supported"));
+    assert_eq!(decision["kind"], json!("parallel.handoff"));
+    assert_eq!(decision["capability"], json!("parallel.plan"));
+    // The serial loop carries its own run id as the future parent of any
+    // child runs the parallel policy would admit.
+    assert_eq!(decision["parent_run_id"], json!("run-1"));
     assert!(
         decision["message"]
             .as_str()
             .is_some_and(|message| !message.is_empty()),
-        "rejection must carry a typed message"
+        "handoff must carry a typed message"
+    );
+    // The handoff is an explicit non-executable deferral: the serial loop
+    // cannot itself advertise a parallel result.
+    assert_eq!(decision["executable"], json!(false));
+    assert!(
+        decision["blocked_reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "handoff must carry a typed blocked_reason"
     );
 }
 
 #[test]
-fn loop_task_config_is_rejected() {
+fn loop_task_config_defers_to_subagent_policy() {
     let runner = loop_runner();
     let decision = decide(&runner, start_context(0, 3, loop_config(false, true)));
-    assert_eq!(decision["kind"], json!("rejected"));
-    assert_eq!(decision["code"], json!("task_not_supported"));
+    assert_eq!(decision["kind"], json!("subagent.handoff"));
+    assert_eq!(decision["capability"], json!("subagent.admit"));
+    assert_eq!(decision["executable"], json!(false));
+    assert!(
+        decision["blocked_reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "handoff must carry a typed blocked_reason"
+    );
 }
 
 #[test]

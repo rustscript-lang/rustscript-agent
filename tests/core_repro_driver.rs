@@ -59,6 +59,12 @@ fn repro(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn a6_repro(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/a6-core-repros")
+        .join(name)
+}
+
 fn run_repro(name: &str) -> Result<Value, String> {
     let config = AgentConfig::for_hosts(["127.0.0.1"]);
     let runner = AgentRunner::from_file(repro(name), config).map_err(|error| error.to_string())?;
@@ -212,5 +218,22 @@ fn param_aliasing_two_param_caller_control_passes() {
     assert!(
         format!("{result:?}").contains("ok"),
         "expected the control result, got: {result:?}"
+    );
+}
+
+/// A6 narrowed CORE_BLOCKER: the RustScript LANGUAGE (synchronous,
+/// single-threaded) and the restricted inline registry expose no
+/// script-internal generic task surface, so a policy script cannot itself
+/// call `task::spawn`. The fixture is scoped to that ONE actual surface
+/// (`task::spawn` only — no await_all/await/cancel is claimed), and it is
+/// wired into CI here so the narrowing stays honest.
+#[test]
+fn a6_no_task_script_cannot_call_task_spawn() {
+    let config = AgentConfig::default();
+    let error = AgentRunner::from_file(a6_repro("no_task_child_capability.rss"), config)
+        .expect_err("a policy script must not be able to call task::spawn");
+    assert!(
+        error.to_string().contains("task::spawn"),
+        "expected the task::spawn unknown-namespace rejection, got: {error}"
     );
 }

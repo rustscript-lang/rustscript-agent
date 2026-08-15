@@ -1,0 +1,267 @@
+// A6 parallel execution policy (pure decision policy; no concurrent
+// execution in the script).
+//
+// This module decides HOW a batch of child tasks would run in parallel under
+// bounded concurrency and ordered/race/fail-fast supervision. It never spawns
+// anything itself: RustScript is synchronous and single-threaded, so a policy
+// script cannot own concurrent execution (the narrowed A6 CORE_BLOCKER is
+// exactly this script-internal task surface — plans/2026-08-15_a6-core-
+// blocker.md and the scoped repro under
+// tests/fixtures/a6-core-repros/no_task_child_capability.rss). The exported
+// `run(context)` therefore returns a typed execution PLAN that a native
+// supervisor consumes, and it never fabricates a success and never uses a
+// private host function or direct SQL.
+//
+// The native supervisor (crate::runtime::subagent_supervisor) interprets this
+// plan to admit child runs via the existing `AdmitRunRequest.parent_run_id` /
+// `run.link_child` A2 storage, drive them with bounded concurrency, collect
+// ordered results, cancel losers on race first-success, cancel siblings on
+// fail-fast, and propagate parent cancellation. That execution/supervision
+// layer is native lifecycle + concurrency only (never a private host
+// function). The decision (WHAT / how-many / how-ordered) stays in RSS; the
+// native engine owns the running of children.
+//
+// Context (all fields typed; missing fields fall back to documented
+// defaults):
+//
+//   parent_run_id: string   the run that owns this batch (children link to it)
+//   batch: array            ordered task descriptors (one per ordered slot),
+//                           each {index, id, input, ...}
+//   mode: string            "all" | "race" | "fail_fast"
+//   ordered: bool           preserve submission order in result slots
+//   max_concurrency: int    bound on children admitted in one window (>=1)
+//   max_fanout: int         total children bound per parent (0 = unlimited)
+//   current_fanout: int     children already admitted under this parent
+//   depth: int              current nesting depth
+//   max_depth: int          maximum allowed depth (0 = unlimited)
+//
+// Decisions (kind discriminator):
+//
+//   parallel.plan -> { kind, parent_run_id, windows, ordered_slots,
+//                      supervision, events }
+//       windows:       array of windows; each window is an array of batch
+//                      indices admitted concurrently (chunked by
+//                      max_concurrency), so a batch of N under C concurrency
+//                      yields ceil(N/C) windows and no window exceeds C.
+//                      This is the input the native supervisor consumes for
+//                      bounded concurrency.
+//       ordered_slots: array of {index, window} aligned to the batch, the
+//                      result slots in submission order the native engine
+//                      must fill.
+//       supervision:   { mode, cancel_rule, max_concurrency, fanout_used,
+//                        depth }
+//                      cancel_rule is "none" for "all",
+//                      "cancel_losers_on_first_success" for "race",
+//                      "cancel_siblings_on_first_failure" for "fail_fast".
+//                      The native supervisor turns this into the race /
+//                      fail-fast sibling/executor cancellation behaviour.
+//       events:        [] — the policy never fabricates a subagent.started /
+//                      subagent.completed; those canonical script events
+//                      (src/events.rs) are emitted by the native execution
+//                      layer only after a child is really admitted.
+//   parallel.rejected -> { kind, code, message, turn } for depth/fanout/
+//                        invalid-config rejections.
+//
+// The policy never emits subagent.started/subagent.completed itself; those
+// canonical script events (src/events.rs) are emitted by the native execution
+// layer only after a child is really admitted.
+
+// ---------------------------------------------------------------------------
+// Typed context accessors (same-module; defensive dynamic navigation)
+// ---------------------------------------------------------------------------
+
+fn ctx_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn ctx_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Decision builders
+// ---------------------------------------------------------------------------
+
+fn rejected_decision(code: string, message: string, depth: int) -> map {
+    { kind: "parallel.rejected", code: code, message: message, depth: depth, events: [] }
+}
+
+fn plan_decision(
+    parent_run_id: string,
+    windows: array,
+    ordered_slots: array,
+    mode: string,
+    cancel_rule: string,
+    max_concurrency: int,
+    fanout_used: int,
+    depth: int
+) -> map {
+    {
+        kind: "parallel.plan",
+        parent_run_id: parent_run_id,
+        windows: windows,
+        ordered_slots: ordered_slots,
+        supervision: {
+            mode: mode,
+            cancel_rule: cancel_rule,
+            max_concurrency: max_concurrency,
+            fanout_used: fanout_used,
+            depth: depth
+        },
+        executable: false,
+        blocked_reason: "RSS script-internal task surface absent; a native supervisor executes this plan with bounded concurrency, ordered slots, and race/fail-fast cancellation after real child admission",
+        events: []
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan computation
+// ---------------------------------------------------------------------------
+
+/// Windows: chunks of batch indices, each window at most `max_concurrency`
+/// wide, preserving submission order. A zero batch yields no windows.
+fn build_windows(batch_len: int, max_concurrency: int) -> array {
+    let mut windows: array = [];
+    let mut start = 0;
+    while start < batch_len {
+        let mut window: array = [];
+        let mut k = 0;
+        while k < max_concurrency {
+            let idx: int = start + k;
+            if idx >= batch_len {
+                break;
+            }
+            window[window.length] = idx;
+            k += 1;
+        }
+        windows[windows.length] = window;
+        start += max_concurrency;
+    }
+    windows
+}
+
+/// Ordered result slots aligned to the batch: one {index, window} entry per
+/// batch item, in submission order. window is the window number (0-based)
+/// that admits this item.
+fn build_ordered_slots(batch_len: int, max_concurrency: int) -> array {
+    let mut slots: array = [];
+    let mut idx = 0;
+    while idx < batch_len {
+        let window: int = if max_concurrency > 0 => {
+            (idx / max_concurrency)
+        } else => {
+            0
+        };
+        slots[slots.length] = { index: idx, window: window };
+        idx += 1;
+    }
+    slots
+}
+
+/// Supervision rule derived from the requested mode.
+fn cancel_rule(mode: string) -> string {
+    let mut rule: string = "none";
+    if mode == "race" {
+        rule = "cancel_losers_on_first_success";
+    } else if mode == "fail_fast" {
+        rule = "cancel_siblings_on_first_failure";
+    }
+    rule
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+pub fn run(context: map) -> map {
+    let parent_run_id: string = ctx_string(context, "parent_run_id", "");
+    let batch: array = ctx_array(context, "batch");
+    let mode: string = ctx_string(context, "mode", "all");
+    let max_concurrency: int = ctx_int(context, "max_concurrency", 1);
+    let max_fanout: int = ctx_int(context, "max_fanout", 0);
+    let current_fanout: int = ctx_int(context, "current_fanout", 0);
+    let depth: int = ctx_int(context, "depth", 0);
+    let max_depth: int = ctx_int(context, "max_depth", 0);
+    let batch_len: int = batch.length;
+
+    // Rejection checks (depth/fanout/invalid config) are independent and set
+    // a typed code/message; only when none fires is the plan computed.
+    let mut rejected_code: string = "";
+    let mut rejected_message: string = "";
+    if max_concurrency < 1 {
+        rejected_code = "invalid_config";
+        rejected_message = "parallel plan requires max_concurrency >= 1";
+    }
+    if rejected_code == "" {
+        if max_depth > 0 {
+            if depth >= max_depth {
+                rejected_code = "depth_exceeded";
+                rejected_message = "parallel batch exceeds the configured max_depth";
+            }
+        }
+    }
+    if rejected_code == "" {
+        if max_fanout > 0 {
+            let projected: int = current_fanout + batch_len;
+            if projected > max_fanout {
+                rejected_code = "fanout_exceeded";
+                rejected_message = "parallel batch exceeds the configured max_fanout";
+            }
+        }
+    }
+
+    let mut decision: map = rejected_decision(rejected_code, rejected_message, depth);
+    if rejected_code == "" {
+        let windows: array = build_windows(batch_len, max_concurrency);
+        let ordered_slots: array = build_ordered_slots(batch_len, max_concurrency);
+        let rule: string = cancel_rule(mode);
+        let fanout_used: int = current_fanout + batch_len;
+        decision = plan_decision(
+            parent_run_id,
+            windows,
+            ordered_slots,
+            mode,
+            rule,
+            max_concurrency,
+            fanout_used,
+            depth
+        );
+    }
+    decision
+}

@@ -2106,8 +2106,130 @@ fn link_child_is_idempotent() {
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
 
-/// P2-5: event.prune updates the persisted retention floor/high-water in the
-/// same transaction, so replay reports the pruned floor.
+/// A6 subagent supervision storage contract: the `run.link_child` command
+/// the subagent policy emits (`relation: "subagent"`, `state: "active"`)
+/// durably records each child under its parent, `run.list_children` returns
+/// the fanout in ordinal order, and the parent/child identity survives child
+/// terminal transitions (so parent-cancellation propagation can enumerate
+/// pending/active children). This is the A2 storage half of the A6 policy
+/// that is buildable without the missing generic task/child capability.
+#[test]
+fn subagent_supervision_links_and_fanout_are_durable() {
+    let root = temporary_root("a6-subagent-links");
+    let runner = storage_runner(&root);
+    let db_name = "a6-subagent.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-parent",
+        "run.create",
+        run_payload("parent-1", "session-1", 3),
+        3,
+    );
+    // Admit three children under the parent, mirroring the subagent policy's
+    // admit path: run.create carries parent_run_id, then run.link_child
+    // records the durable link exactly as the policy's link command describes.
+    for i in 0..3 {
+        let child_id = format!("child-{i}");
+        run_storage(
+            &runner,
+            db_name,
+            &format!("run-create-{i}"),
+            "run.create",
+            json!({
+                "id": child_id,
+                "session_id": "session-1",
+                "parent_run_id": "parent-1",
+                "input_json": "{}",
+                "provider": "p",
+                "model": "m",
+                "script_hash": "s",
+                "idempotency_scope": "api:chat",
+                "idempotency_key": "",
+                "now_ms": 4 + i,
+            }),
+            4 + i,
+        );
+        let link = run_storage(
+            &runner,
+            db_name,
+            &format!("link-{i}"),
+            "run.link_child",
+            json!({
+                "parent_run_id": "parent-1",
+                "child_run_id": child_id,
+                "ordinal": i,
+                "relation": "subagent",
+                "state": "active",
+                "now_ms": 10 + i,
+            }),
+            10 + i,
+        );
+        assert_eq!(link["ok"], json!(true), "child {i} link must be durable");
+    }
+    // Fanout: list_children returns the three subagent links in ordinal order.
+    let children = run_storage(
+        &runner,
+        db_name,
+        "list-children",
+        "run.list_children",
+        json!({"run_id": "parent-1"}),
+        13,
+    );
+    let rows = query_rows(&children);
+    assert_eq!(rows.len(), 3, "parent fanout must be exactly three");
+    assert_eq!(rows[0]["child_run_id"], json!("child-0"));
+    assert_eq!(rows[0]["ordinal"], json!(0));
+    assert_eq!(rows[0]["relation"], json!("subagent"));
+    assert_eq!(rows[1]["child_run_id"], json!("child-1"));
+    assert_eq!(rows[2]["child_run_id"], json!("child-2"));
+    assert_eq!(rows[2]["ordinal"], json!(2));
+    // Every child row carries the durable parent_run_id.
+    let child = run_storage(
+        &runner,
+        db_name,
+        "run-get-child",
+        "run.get",
+        json!({"run_id": "child-0"}),
+        14,
+    );
+    let child_row = first_query_row(&child);
+    assert_eq!(child_row["parent_run_id"], json!("parent-1"));
+    // A child reaching terminal keeps its link (parent-cancellation
+    // enumeration can still see the full fanout; the policy filters by state).
+    run_storage(
+        &runner,
+        db_name,
+        "run-transition-child-completed",
+        "run.transition",
+        transition_payload("child-0", "queued", "completed", 15),
+        15,
+    );
+    let after = run_storage(
+        &runner,
+        db_name,
+        "list-children-after-terminal",
+        "run.list_children",
+        json!({"run_id": "parent-1"}),
+        16,
+    );
+    assert_eq!(
+        query_rows(&after).len(),
+        3,
+        "terminal children keep their durable link"
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
 #[test]
 fn event_prune_updates_retention_floor_and_high_water() {
     let root = temporary_root("prune-retention");

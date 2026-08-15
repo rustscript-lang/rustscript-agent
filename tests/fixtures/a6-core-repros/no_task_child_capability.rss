@@ -1,0 +1,28 @@
+// CORE_BLOCKER (narrowed) A6 minimal repro: the RustScript LANGUAGE
+// (strictly synchronous, single-threaded) and the restricted inline
+// registry have NO script-internal generic task capability, so a policy
+// SCRIPT cannot itself `spawn`/`await`/`resume` a concurrent child run
+// inside its own source. This is a scripting-language limitation only; it
+// does NOT block the native/embedding supervision layer (a native
+// SubagentSupervisor drives child runs and consumes the RSS policy plans
+// from parallel.rss / subagents.rss). See
+// plans/2026-08-15_a6-core-blocker.md (narrowed) and crate::runtime
+// native supervisor.
+//
+// This repro attempts exactly ONE thing, the only surface actually tested
+// here: the reserved `task` namespace builtin `task::spawn`, which the
+// restricted registry does not expose (the restricted registry binds only
+// json/bytes/stream/sqlite/http — no task namespace).
+//
+//   let _handle = task::spawn(parent_run_id, { input: "child work" });
+//
+// Expected: `AgentRunner::from_source` fails to compile this with an
+// unknown-namespace / no-such-builtin error for `task::spawn`. No
+// `task::await`/`task::await_all`/`task::cancel` or language-level
+// async/await is claimed or attempted here — this repro is scoped to the
+// actual `task::spawn` surface only.
+pub fn run(context: map) -> map {
+    let parent_run_id: string = context["parent_run_id"];
+    let _handle = task::spawn(parent_run_id, { input: "child work" });
+    { ok: true, handle: _handle }
+}
