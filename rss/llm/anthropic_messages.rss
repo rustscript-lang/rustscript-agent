@@ -1,6 +1,613 @@
 // Anthropic Messages adapter (protocol mapping only; no agent loop).
+//
+// Maps the canonical LlmRequest (rss/llm/types.rss) onto the
+// /v1/messages wire protocol and back.
+//
+// The wire body is built as a nested runtime string-key map (core revision
+// fd4b570 B4, "runtime string-key map encoding"): maps, arrays of maps, and
+// values decoded with json::decode are encoded together in ONE json::encode
+// call. There is therefore no marker-splice mechanism and no cross-message
+// marker collision surface (A3 review P1); tool schemas and tool_use arguments
+// travel as `schema_json` / `arguments_json` strings in the canonical request
+// and are decoded with json::decode before being embedded as `input_schema` /
+// `input` objects.
+//
+// Request-contract mapping (A3 review P2):
+//   - system-role canonical messages are promoted to the top-level `system`
+//     field, and wire `messages` carries only user/assistant roles;
+//   - tool_result blocks carry the canonical `is_error` flag;
+//   - `max_output_tokens` maps to `max_tokens`; a missing/zero
+//     `max_output_tokens` fails closed with a typed request error BEFORE any
+//     transport call (the Messages API rejects `max_tokens: 0`);
+//   - canonical `tool_choice` maps to the Anthropic object shape when present.
+//
+// Compiler-contract notes for this adapter module (non-root module). Before
+// core revision d8cf291 the emitted callable schemas were corrupted for a
+// subset of call sites; B1–B4 plus the residual parameter-liveness fix
+// (fd4b570) fixed the root causes. The layout notes from the OpenAI Chat
+// adapter apply here too:
+// - Script-function calls inside statement-if bodies were rejected by the
+//   runtime callable-schema guard; call dispatch therefore uses
+//   expression-if branches and top-level statements, and calls inside
+//   `while` bodies (including nested statement-ifs) are safe.
+// - Annotated locals whose initializer type the checker cannot prove live at
+//   function top level or in helpers with declared return types.
+use json;
+use bytes;
+use http;
 use self::types as types;
 
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
 pub fn anthropic_messages_call(request: map, profile: map) -> map {
-    types::fail(types::error_request("not_implemented", "anthropic_messages adapter is not implemented"))
+    let max_output: int = types::request_int(request, "max_output_tokens", 0);
+    if max_output <= 0 => {
+        types::fail(types::error_request(
+            "max_output_tokens_required",
+            "request.max_output_tokens must be a positive integer (Anthropic requires max_tokens >= 1)"
+        ))
+    } else => {
+        let stream: bool = types::request_bool(request, "stream", false);
+        if stream => {
+            anthropic_stream_dispatch(request, profile)
+        } else => {
+            anthropic_complete_dispatch(request, profile)
+        }
+    }
+}
+
+fn anthropic_complete_dispatch(request: map, profile: map) -> map {
+    let base_url: string = types::profile_string(profile, "base_url");
+    let api_key: string = types::profile_string(profile, "api_key");
+    anthropic_complete(request, base_url, api_key)
+}
+
+fn anthropic_complete(request: map, base_url: string, api_key: string) -> map {
+    let model: string = types::request_string(request, "model");
+    if model == "" => {
+        types::fail(types::error_request("missing_model", "request.model is required"))
+    } else => {
+        anthropic_send_complete(request, model, base_url, api_key)
+    }
+}
+
+/// The whole buffered path: wire building and the buffered transport call.
+/// Every script call here is at top level or in an expression-if branch.
+fn anthropic_send_complete(
+    request: map,
+    model: string,
+    base_url: string,
+    api_key: string
+) -> map {
+    let body: string = anthropic_encode_wire(request, model, false);
+    let url: string = base_url + "/v1/messages";
+    let response: map = http::client::request({
+        method: "POST",
+        url: url,
+        headers: {
+            "content-type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01"
+        },
+        body: body
+    });
+    let status: int = response["status"].copy();
+    if status >= 200 && status < 300 => {
+        anthropic_parse_response(response, status)
+    } else => {
+        anthropic_parse_error(response, status)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire request building (single json::encode of a nested runtime map)
+// ---------------------------------------------------------------------------
+
+/// Builds the complete wire request as a nested runtime string-key map and
+/// encodes it once. No marker splicing: tool schemas and tool_use `input`
+/// objects are decoded and embedded directly.
+fn anthropic_encode_wire(request: map, model: string, stream: bool) -> string {
+    let wire: map = anthropic_build_wire(request, model, stream);
+    let body_text: string = json::encode(wire);
+    body_text
+}
+
+fn anthropic_build_wire(request: map, model: string, stream: bool) -> map {
+    let system_text: string = anthropic_system_text(
+        types::request_array(request, "messages")
+    );
+    let messages: array = anthropic_build_messages(
+        types::request_array(request, "messages")
+    );
+    let tools_built: array = anthropic_build_tools(types::request_array(request, "tools"));
+    let sampling: map = types::request_map(request, "sampling");
+    let temperature_raw: map = types::sampling_float(sampling, "temperature");
+    let top_p_raw: map = types::sampling_float(sampling, "top_p");
+    let temperature_present: bool = temperature_raw["present"];
+    let temperature_value: float = temperature_raw["value"];
+    let top_p_present: bool = top_p_raw["present"];
+    let top_p_value: float = top_p_raw["value"];
+    let max_output: int = types::request_int(request, "max_output_tokens", 0);
+    let tool_choice_raw: string = types::request_string(request, "tool_choice");
+    let tc_map: map = anthropic_tool_choice_map(tool_choice_raw);
+    let mut wire: map = {
+        "model": model,
+        "max_tokens": max_output,
+        "messages": messages,
+        "stream": stream
+    };
+    if tools_built.length > 0 {
+        wire["tools"] = tools_built;
+    }
+    if system_text != "" {
+        wire["system"] = system_text;
+    }
+    if tool_choice_raw != "" {
+        wire["tool_choice"] = tc_map;
+    }
+    if temperature_present {
+        wire["temperature"] = temperature_value;
+    }
+    if top_p_present {
+        wire["top_p"] = top_p_value;
+    }
+    wire
+}
+
+/// Canonical `tool_choice` (OpenAI-style string or tool name) -> Anthropic
+/// object shape. `auto` stays `{type: auto}`; `any`/`none`/`required` collapse
+/// to `{type: any}`; any other non-empty value is treated as a specific tool
+/// name (`{type: tool, name}`).
+fn anthropic_tool_choice_map(choice: string) -> map {
+    if choice == "auto" => {
+        { "type": "auto" }
+    } else if choice == "any" => {
+        { "type": "any" }
+    } else if choice == "none" => {
+        { "type": "any" }
+    } else if choice == "required" => {
+        { "type": "any" }
+    } else => {
+        { "type": "tool", "name": choice }
+    }
+}
+
+/// Concatenates the text of every `system`-role canonical message into a
+/// single top-level `system` string. System messages never appear in `messages`.
+fn anthropic_system_text(messages: array) -> string {
+    let mut text: string = "";
+    let mut i = 0;
+    while i < messages.length {
+        let message: map = types::array_entry(messages, i);
+        if message.has("role") {
+            if types::message_role(message) == "system" {
+                let parts: array = types::message_content(message);
+                let mut j = 0;
+                while j < parts.length {
+                    let part: map = types::array_entry(parts, j);
+                    if part.has("type") {
+                        if types::part_type(part) == "text" {
+                            if text != "" {
+                                text = text + "\n";
+                            }
+                            text = text + types::request_string(part, "text");
+                        }
+                    }
+                    j += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    text
+}
+
+/// Converts canonical messages into wire messages. Each message carries its
+/// `content` blocks as a runtime array of maps; only user/assistant roles are
+/// emitted (`system` is hoisted to the top-level field by the caller).
+fn anthropic_build_messages(messages: array) -> array {
+    let mut wire: array = [];
+    let mut i = 0;
+    while i < messages.length {
+        let message: map = types::array_entry(messages, i);
+        if message.has("role") {
+            let role: string = types::message_role(message);
+            if role != "system" {
+                let blocks: array = anthropic_build_content_blocks(message);
+                wire[wire.length] = {
+                    "role": role,
+                    "content": blocks
+                };
+            }
+        }
+        i += 1;
+    }
+    wire
+}
+
+/// One canonical message's content block array. Text parts -> text blocks;
+/// user tool_result parts -> tool_result blocks (with `is_error`); assistant
+/// tool_call parts -> tool_use blocks with the decoded `input` object.
+fn anthropic_build_content_blocks(message: map) -> array {
+    let parts: array = types::message_content(message);
+    let mut blocks: array = [];
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        if part.has("type") {
+            let part_type: string = types::part_type(part);
+            let mut block: map = {};
+            if part_type == "text" {
+                block = anthropic_text_block(part);
+            }
+            if part_type == "tool_result" {
+                block = anthropic_tool_result_block(part);
+            }
+            if part_type == "tool_call" {
+                block = anthropic_tool_use_block(part);
+            }
+            if block.has("type") {
+                blocks[blocks.length] = block;
+            }
+        }
+        i += 1;
+    }
+    blocks
+}
+
+fn anthropic_text_block(part: map) -> map {
+    {
+        "type": "text",
+        "text": types::request_string(part, "text")
+    }
+}
+
+fn anthropic_tool_result_block(part: map) -> map {
+    let is_error: bool = types::request_bool(part, "is_error", false);
+    {
+        "type": "tool_result",
+        "tool_call_id": types::request_string(part, "tool_call_id"),
+        "content": types::request_string(part, "content"),
+        "is_error": is_error
+    }
+}
+
+fn anthropic_tool_use_block(part: map) -> map {
+    let input: map = anthropic_decode_args(
+        types::request_string(part, "arguments_json")
+    );
+    {
+        "type": "tool_use",
+        "id": types::request_string(part, "tool_call_id"),
+        "name": types::request_string(part, "name"),
+        "input": input
+    }
+}
+
+/// Decodes a canonical `arguments_json`/`schema_json` string into a map. Empty
+/// input decodes to an empty object; a structurally invalid JSON string fails
+/// the invocation (fail-closed), consistent with the response parser.
+fn anthropic_decode_args(text: string) -> map {
+    let mut result: map = {};
+    if text != "" {
+        let decoded: map = json::decode(text);
+        result = decoded;
+    }
+    result
+}
+
+fn anthropic_build_tools(tools: array) -> array {
+    let mut wire: array = [];
+    let mut i = 0;
+    while i < tools.length {
+        let tool: map = types::array_entry(tools, i);
+        if tool.has("name") {
+            let input_schema: map = anthropic_decode_args(
+                types::tool_schema_json(tool)
+            );
+            wire[wire.length] = {
+                "name": types::tool_name(tool),
+                "description": types::tool_description(tool),
+                "input_schema": input_schema
+            };
+        }
+        i += 1;
+    }
+    wire
+}
+
+// ---------------------------------------------------------------------------
+// Buffered response parsing
+// ---------------------------------------------------------------------------
+
+fn anthropic_parse_response(response: map, status: int) -> map {
+    let body_bytes: bytes = response["body"];
+    let body_text: string = bytes::to_utf8(body_bytes);
+    let body: map = json::decode(body_text);
+    anthropic_parse_response_body(body, status)
+}
+
+fn anthropic_parse_response_body(body: map, status: int) -> map {
+    let content: array = types::request_array(body, "content");
+    let mut text: string = "";
+    let mut reasoning: string = "";
+    let mut calls: array = [];
+    let mut i = 0;
+    while i < content.length {
+        let block: map = types::array_entry(content, i);
+        if block.has("type") {
+            let block_type: string = types::part_type(block);
+            if block_type == "text" {
+                text = text + types::request_string(block, "text");
+            }
+            if block_type == "thinking" {
+                reasoning = reasoning + types::request_string(block, "thinking");
+            }
+            if block_type == "tool_use" {
+                let id: string = types::request_string(block, "id");
+                let name: string = types::request_string(block, "name");
+                let input: map = types::request_map(block, "input");
+                calls[calls.length] = types::tool_call_new(id, name, input);
+            }
+        }
+        i += 1;
+    }
+    let usage: map = types::request_map(body, "usage");
+    let input_tokens: int = types::request_int(usage, "input_tokens", 0);
+    let output_tokens: int = types::request_int(usage, "output_tokens", 0);
+    let total_tokens: int = input_tokens + output_tokens;
+    let stop_reason: string = types::request_string(body, "stop_reason");
+    types::ok(types::response_new(
+        text,
+        calls,
+        types::usage_new(input_tokens, output_tokens, total_tokens),
+        reasoning,
+        stop_reason
+    ))
+}
+
+fn anthropic_parse_error(response: map, status: int) -> map {
+    let body_bytes: bytes = response["body"];
+    let body_text: string = bytes::to_utf8(body_bytes);
+    let error_obj: map = anthropic_error_payload(body_text);
+    let mut error_type: string = "api_error";
+    let mut code: string = "http_error";
+    let mut message: string = "provider request failed";
+    let payload_type: string = types::request_string(error_obj, "type");
+    let payload_message: string = types::request_string(error_obj, "message");
+    if payload_type != "" {
+        error_type = payload_type;
+        code = payload_type;
+    }
+    if payload_message != "" {
+        message = payload_message;
+    }
+    types::fail(types::error_new(status, error_type.copy(), code, message, "", ""))
+}
+
+/// Extracts the `error` object from a non-2xx JSON body. A structurally
+/// invalid body yields an empty map and the caller falls back to the default
+/// `api_error`/`http_error` shape; a body that is not JSON at all fails the
+/// invocation (the same contract as `anthropic_parse_response`).
+fn anthropic_error_payload(body_text: string) -> map {
+    let decoded: map = json::decode(body_text);
+    if type(decoded) == "map" => {
+        types::request_map(decoded, "error")
+    } else => {
+        {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming — http::client::sse with a shared-accumulator closure
+// ---------------------------------------------------------------------------
+//
+// Consumes core revision fd4b570 (B1–B4 plus the §11a parameter-liveness
+// fix). The callback aggregates text/thinking/tool-use deltas and the
+// message-level usage into captured accumulator locals through BorrowMut
+// capture cells; after the stream completes the same locals are read to
+// build the canonical response.
+//
+// The transport validates status and Content-Type itself: a non-2xx SSE
+// response fails the invocation as a typed host error.
+//
+// Fail-closed contract: the Anthropic stream is terminated by the
+// `message_stop` event (there is no `[DONE]` marker). The callback sets the
+// shared `done` accumulator exactly there and returns `{action: "stop"}`, so
+// a legal stream reports `outcome: "stopped"`. A mid-stream `error` event
+// records the structured provider error and stops; the adapter surfaces that
+// error. EOF without `message_stop` — partial text included — must fail
+// closed as a typed provider error instead of surfacing the partial
+// accumulation as `ok`.
+
+fn anthropic_stream_dispatch(request: map, profile: map) -> map {
+    let base_url: string = types::profile_string(profile, "base_url");
+    let api_key: string = types::profile_string(profile, "api_key");
+    anthropic_stream(request, base_url, api_key)
+}
+
+fn anthropic_stream(request: map, base_url: string, api_key: string) -> map {
+    let model: string = types::request_string(request, "model");
+    if model == "" => {
+        types::fail(types::error_request("missing_model", "request.model is required"))
+    } else => {
+        anthropic_send_stream(request, model, base_url, api_key)
+    }
+}
+
+fn anthropic_send_stream(
+    request: map,
+    model: string,
+    base_url: string,
+    api_key: string
+) -> map {
+    let body: string = anthropic_encode_wire(request, model, true);
+    let url: string = base_url + "/v1/messages";
+    let mut text: string = "";
+    let mut reasoning: string = "";
+    let mut stop_reason: string = "";
+    let mut input_tokens: int = 0;
+    let mut output_tokens: int = 0;
+    let mut tools: array = [];
+    let mut done = false;
+    let mut stream_errored = false;
+    let mut error_type: string = "";
+    let mut error_message: string = "";
+    let stream_result: map = http::client::sse({
+        method: "POST",
+        url: url,
+        headers: {
+            "content-type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01"
+        },
+        body: body
+    }, |item| if item["kind"] == "event" => {
+        let data: string = item["data"].copy();
+        let chunk: map = json::decode(data);
+        let event_type: string = types::request_string(chunk, "type");
+        if event_type == "message_start" => {
+            let message: map = types::request_map(chunk, "message");
+            let usage: map = types::request_map(message, "usage");
+            input_tokens = types::request_int(usage, "input_tokens", 0);
+            { action: "continue" }
+        } else if event_type == "content_block_start" => {
+            let index: int = types::request_int(chunk, "index", -1);
+            let cb: map = types::request_map(chunk, "content_block");
+            let cb_type: string = types::request_string(cb, "type");
+            if cb_type == "tool_use" {
+                tools = anthropic_stream_add_tool(
+                    tools,
+                    index,
+                    types::request_string(cb, "id"),
+                    types::request_string(cb, "name")
+                );
+            }
+            { action: "continue" }
+        } else if event_type == "content_block_delta" => {
+            let index: int = types::request_int(chunk, "index", -1);
+            let delta: map = types::request_map(chunk, "delta");
+            let delta_type: string = types::request_string(delta, "type");
+            if delta_type == "text_delta" {
+                text = text + types::request_string(delta, "text");
+            }
+            if delta_type == "thinking_delta" {
+                reasoning = reasoning + types::request_string(delta, "thinking");
+            }
+            if delta_type == "input_json_delta" {
+                tools = anthropic_stream_append_tool_input(
+                    tools,
+                    index,
+                    types::request_string(delta, "partial_json")
+                );
+            }
+            { action: "continue" }
+        } else if event_type == "message_delta" => {
+            let d: map = types::request_map(chunk, "delta");
+            stop_reason = types::request_string(d, "stop_reason");
+            let usage: map = types::request_map(chunk, "usage");
+            output_tokens = types::request_int(usage, "output_tokens", 0);
+            { action: "continue" }
+        } else if event_type == "message_stop" => {
+            done = true;
+            { action: "stop" }
+        } else if event_type == "error" => {
+            let err: map = types::request_map(chunk, "error");
+            stream_errored = true;
+            error_type = types::request_string(err, "type");
+            error_message = types::request_string(err, "message");
+            { action: "stop" }
+        } else => {
+            { action: "continue" }
+        }
+    } else => {
+        { action: "continue" }
+    });
+    let outcome: string = types::request_string(stream_result, "outcome");
+    let status: int = types::request_int(stream_result, "status", 0);
+    if stream_errored => {
+        let mut code: string = error_type.copy();
+        if code == "" {
+            code = "api_error";
+        }
+        types::fail(types::error_new(
+            status,
+            error_type.copy(),
+            code,
+            error_message,
+            "",
+            ""
+        ))
+    } else if done && outcome == "stopped" => {
+        let total_tokens: int = input_tokens + output_tokens;
+        types::ok(types::response_new(
+            text,
+            anthropic_stream_parse_tool_calls(tools),
+            types::usage_new(input_tokens, output_tokens, total_tokens),
+            reasoning,
+            stop_reason
+        ))
+    } else => {
+        types::fail(types::error_new(
+            status,
+            "api_error",
+            "stream_eof_without_stop",
+            "provider stream ended without message_stop terminator",
+            "",
+            ""
+        ))
+    }
+}
+
+/// Adds a tool_use block accumulator entry keyed by content-block index.
+fn anthropic_stream_add_tool(tools: array, index: int, id: string, name: string) -> array {
+    let mut result: array = tools;
+    result[result.length] = {
+        index: index,
+        id: id,
+        name: name,
+        args: ""
+    };
+    result
+}
+
+/// Appends one `input_json_delta` fragment to the matching accumulator
+/// entry's args. Returns a new array (the caller assigns the result back to
+/// the captured accumulator).
+fn anthropic_stream_append_tool_input(tools: array, index: int, fragment: string) -> array {
+    let mut result: array = tools;
+    let mut i = 0;
+    while i < result.length {
+        let entry: map = types::array_entry(result, i);
+        if types::request_int(entry, "index", -1) == index {
+            let mut updated: map = entry;
+            updated["args"] = types::request_string(updated, "args") + fragment;
+            result[i] = updated;
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Converts the accumulator entries into canonical `{id, name, arguments}`
+/// tool calls, decoding each accumulated `args` JSON fragment.
+fn anthropic_stream_parse_tool_calls(tools: array) -> array {
+    let mut calls: array = [];
+    let mut i = 0;
+    while i < tools.length {
+        let entry: map = types::array_entry(tools, i);
+        let id: string = types::request_string(entry, "id");
+        let name: string = types::request_string(entry, "name");
+        let args_text: string = types::request_string(entry, "args");
+        let mut args: map = {};
+        if args_text != "" {
+            let decoded: map = json::decode(args_text);
+            args = decoded;
+        }
+        calls[calls.length] = types::tool_call_new(id, name, args);
+        i += 1;
+    }
+    calls
 }

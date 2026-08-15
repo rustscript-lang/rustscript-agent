@@ -32,10 +32,17 @@
 //!
 //! The streaming adapter is implemented and correct (`openai_chat_stream`
 //! in `rss/llm/openai_chat.rss`, with `http::client::sse` exposed in the
-//! restricted registry). The `openai_responses` and `anthropic_messages`
-//! adapters remain typed `not_implemented` stubs (no production adapter is
-//! claimed); their transcript-reference suites stay `#[ignore]`d until
-//! that agent work exists. Four buffered suites are green and remain so:
+//! restricted registry). The `openai_responses` adapter remains a typed
+//! `not_implemented` stub (no production adapter is claimed); its
+//! transcript-reference suite stays `#[ignore]`d until that agent work
+//! exists. The `anthropic_messages` adapter is production (buffered and
+//! streaming) against the `/v1/messages` wire contract, including
+//! tool_use/tool_result blocks, thinking (reasoning), structured provider
+//! errors, marker-like text pass-through (structural wire built as a single
+//! json::encode of a nested runtime map, core B4), stream error events,
+//! cancellation, and the EOF-without-`message_stop` fail-closed guard (A3
+//! review).
+//! Four OpenAI buffered suites are green and remain so:
 //! the structured provider-error mapping
 //! (`openai_chat_provider_error_is_structured`), the P1 standard-wire
 //! guard (`openai_chat_wire_format_is_standard`), the marker-like-text
@@ -1046,19 +1053,110 @@ fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced()
 }
 
 // ---------------------------------------------------------------------------
-// S4: Anthropic Messages adapter (blocked references)
+// S4: Anthropic Messages adapter (production)
 // ---------------------------------------------------------------------------
 //
-// `anthropic_messages.rss` is a typed `not_implemented` stub. The buffered and
-// streaming transcripts under `tests/fixtures/providers/anthropic/` document
-// the wire contract; these tests stay ignored until the adapter is
-// implemented.
+// `anthropic_messages.rss` is the production adapter for the Messages API.
+// It maps the canonical LlmRequest (rss/llm/types.rss) onto the
+// `/v1/messages` wire protocol and back, including tool_use/tool_result
+// content blocks, thinking blocks (reasoning), and streaming via
+// `http::client::sse`. Buffered and streaming transcripts live under
+// `tests/fixtures/providers/anthropic/`.
 
-#[ignore = "anthropic_messages adapter is a not_implemented stub (see module doc)"]
 #[test]
-fn anthropic_messages_buffered_transcript_is_referenced() {
+fn anthropic_messages_buffered_text_tool_use_and_usage() {
     let body = read_fixture("anthropic/response.json");
-    let (port, _requests, fixture) = spawn_json_fixture(200, body);
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, events) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let response = response_of(&result);
+    assert_eq!(
+        response["text"],
+        json!("The Anthropic adapter maps tool_use blocks to canonical tool calls.")
+    );
+    assert_eq!(
+        response["reasoning"],
+        json!("The user wants a mapping; consider a tool_use block.")
+    );
+    assert_eq!(response["stop_reason"], json!("tool_use"));
+    assert_eq!(response["usage"]["input_tokens"], json!(21));
+    assert_eq!(response["usage"]["output_tokens"], json!(14));
+    assert_eq!(response["usage"]["total_tokens"], json!(35));
+    let calls = response["tool_calls"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], json!("toolu_01"));
+    assert_eq!(calls[0]["name"], json!("read_file"));
+    assert_eq!(
+        calls[0]["arguments"]["path"],
+        json!("rss/llm/anthropic_messages.rss")
+    );
+    assert!(
+        events.is_empty(),
+        "buffered calls emit no events: {events:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /v1/messages HTTP/1.1");
+    assert_eq!(header(&recorded, "x-api-key").as_deref(), Some("test-key"));
+    assert_eq!(
+        header(&recorded, "content-type").as_deref(),
+        Some("application/json")
+    );
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["model"], json!("test-model"));
+    assert_eq!(wire["max_tokens"], json!(128));
+    assert_eq!(wire["stream"], json!(false));
+    assert_eq!(wire["temperature"], json!(0.7));
+    assert_eq!(wire["messages"][0]["role"], json!("user"));
+    assert_eq!(wire["messages"][0]["content"][0]["type"], json!("text"));
+    assert_eq!(wire["messages"][0]["content"][0]["text"], json!("hello"));
+    assert_eq!(wire["messages"][1]["role"], json!("user"));
+    assert_eq!(
+        wire["messages"][1]["content"][0]["type"],
+        json!("tool_result")
+    );
+    assert_eq!(
+        wire["messages"][1]["content"][0]["tool_call_id"],
+        json!("call_ab12")
+    );
+    assert_eq!(wire["messages"][1]["content"][0]["content"], json!("ok"));
+    assert_eq!(wire["messages"][2]["role"], json!("assistant"));
+    assert_eq!(wire["messages"][2]["content"][0]["type"], json!("text"));
+    assert_eq!(
+        wire["messages"][2]["content"][0]["text"],
+        json!("Let me read the file.")
+    );
+    assert_eq!(wire["messages"][2]["content"][1]["type"], json!("tool_use"));
+    assert_eq!(wire["messages"][2]["content"][1]["id"], json!("call_ab12"));
+    assert_eq!(
+        wire["messages"][2]["content"][1]["name"],
+        json!("read_file")
+    );
+    assert_eq!(
+        wire["messages"][2]["content"][1]["input"],
+        json!({"path": "README.md"})
+    );
+    assert_eq!(wire["tools"][0]["name"], json!("read_file"));
+    assert_eq!(
+        wire["tools"][0]["input_schema"]["required"][0],
+        json!("path")
+    );
+}
+
+#[test]
+fn anthropic_messages_buffered_provider_error_is_structured() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, _requests, fixture) = spawn_json_fixture(400, body);
     let runner = harness_runner(port);
     let request = canonical_request(port, false);
 
@@ -1071,13 +1169,158 @@ fn anthropic_messages_buffered_transcript_is_referenced() {
     fixture.join().expect("fixture thread");
 
     assert!(result["ok"] == json!(false), "{result}");
-    assert_eq!(result["error"]["code"], json!("not_implemented"));
+    let error = error_of(&result);
+    assert_eq!(error["status"], json!(400));
+    assert_eq!(error["type"], json!("invalid_request_error"));
+    assert!(error["code"].as_str().is_some(), "{error:?}");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("max_tokens"),
+        "{error:?}"
+    );
 }
 
-#[ignore = "anthropic_messages adapter is a not_implemented stub (see module doc)"]
+/// P1 wire-format guard (Anthropic): the recorded request must carry the
+/// standard Messages wire shape — user/assistant `content` as a parts array
+/// of `{type, ...}` blocks (text/tool_result/tool_use), tool schemas spliced
+/// into `input_schema`, no custom `content_parts` field, and an explicit
+/// `max_tokens`. The fixture replies 400 so the run follows the already-green
+/// error path; the wire is built and recorded before the response is parsed.
 #[test]
-fn anthropic_messages_stream_transcript_is_referenced() {
+fn anthropic_messages_wire_format_is_standard() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /v1/messages HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert!(
+        !recorded.body.contains("content_parts"),
+        "wire must not contain the custom content_parts field: {}",
+        recorded.body
+    );
+    assert!(
+        wire.as_object()
+            .expect("wire object")
+            .contains_key("max_tokens")
+    );
+    assert!(wire.as_object().expect("wire object").contains_key("model"));
+    assert_eq!(wire["messages"][0]["role"], json!("user"));
+    assert_eq!(wire["messages"][0]["content"][0]["type"], json!("text"));
+    assert_eq!(wire["messages"][0]["content"][0]["text"], json!("hello"));
+    assert_eq!(wire["messages"][1]["role"], json!("user"));
+    assert_eq!(
+        wire["messages"][1]["content"][0]["type"],
+        json!("tool_result")
+    );
+    assert_eq!(wire["messages"][2]["role"], json!("assistant"));
+    assert_eq!(wire["messages"][2]["content"][1]["type"], json!("tool_use"));
+    assert_eq!(
+        wire["tools"][0]["input_schema"]["required"][0],
+        json!("path")
+    );
+    assert!(
+        !wire
+            .as_object()
+            .expect("wire object")
+            .contains_key("tool_choice"),
+        "Anthropic wire must not carry an OpenAI tool_choice field: {wire}"
+    );
+}
+
+#[test]
+fn anthropic_messages_malformed_payload_is_typed() {
+    let body = "{not json".to_string();
+    let (port, _requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let context = Value::map(vec![
+        (Value::string("kind"), Value::string("anthropic_messages")),
+        (Value::string("request"), json_to_vm_value(&request)),
+        (
+            Value::string("profile"),
+            json_to_vm_value(&profile("anthropic", port)),
+        ),
+    ]);
+    let error = runner
+        .run_with_context(context)
+        .expect_err("invalid JSON must fail the invocation, not fabricate a response");
+    fixture.join().expect("fixture thread");
+
+    assert!(
+        matches!(
+            error,
+            RunError::Invocation(rustscript_vm::InvocationError::Host { .. })
+        ),
+        "expected a typed host failure, got {error:?}"
+    );
+    assert!(error.to_string().contains("json_decode failed"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// S5: Anthropic Messages, streaming (http::client::sse)
+// ---------------------------------------------------------------------------
+//
+// The streaming adapter (`anthropic_stream`) aggregates text/thinking/tool-use
+// deltas and message-level usage into captured accumulator locals, and stops
+// on the Anthropic `message_stop` event (there is no `[DONE]` marker).
+
+#[test]
+fn anthropic_messages_stream_text_thinking_tool_use_and_usage() {
     let events = sse_events(&read_fixture("anthropic/stream.sse"));
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let response = response_of(&result);
+    assert_eq!(response["text"], json!("The Anthropic adapter streams."));
+    assert_eq!(response["reasoning"], json!("Think about the mapping."));
+    assert_eq!(response["stop_reason"], json!("tool_use"));
+    assert_eq!(response["usage"]["input_tokens"], json!(21));
+    assert_eq!(response["usage"]["output_tokens"], json!(14));
+    assert_eq!(response["usage"]["total_tokens"], json!(35));
+    let calls = response["tool_calls"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], json!("toolu_02"));
+    assert_eq!(calls[0]["name"], json!("read_file"));
+    assert_eq!(calls[0]["arguments"], json!({"path": "README.md"}));
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /v1/messages HTTP/1.1");
+    assert_eq!(header(&recorded, "x-api-key").as_deref(), Some("test-key"));
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+}
+
+/// A mid-stream Anthropic `error` event (e.g. `overloaded_error`) must be
+/// surfaced as a structured typed provider error, not accumulated text.
+#[test]
+fn anthropic_messages_stream_error_is_structured() {
+    let events = sse_events(&read_fixture("anthropic/stream_error.sse"));
     let (port, _requests, fixture) = spawn_sse_fixture(events, false);
     let runner = harness_runner(port);
     let request = canonical_request(port, true);
@@ -1091,5 +1334,414 @@ fn anthropic_messages_stream_transcript_is_referenced() {
     fixture.join().expect("fixture thread");
 
     assert!(result["ok"] == json!(false), "{result}");
-    assert_eq!(result["error"]["code"], json!("not_implemented"));
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("overloaded_error"));
+    assert_eq!(error["code"], json!("overloaded_error"));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("Overloaded"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn anthropic_messages_stream_cancellation_is_typed() {
+    // The held-open fixture must not terminate the stream itself: drop the
+    // terminal `message_stop` event so only cancellation can end the run.
+    let mut events = sse_events(&read_fixture("anthropic/stream.sse"));
+    assert_eq!(
+        events.pop().as_deref(),
+        Some("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+        "the stream transcript must end with the message_stop event"
+    );
+    let (port, _requests, fixture) = spawn_sse_fixture(events, true);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+    let context = Value::map(vec![
+        (Value::string("kind"), Value::string("anthropic_messages")),
+        (Value::string("request"), json_to_vm_value(&request)),
+        (
+            Value::string("profile"),
+            json_to_vm_value(&profile("anthropic", port)),
+        ),
+    ]);
+
+    let cancellation = RunCancellation::new();
+    let trigger = cancellation.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        trigger.request(rustscript_vm::CancellationReason::Requested);
+    });
+    let mut sink = RecordingSink::default();
+    let error = runner
+        .run_with_context_and_events(context, &mut sink, &cancellation)
+        .expect_err("cancelling a held-open stream must terminate the run");
+    canceller.join().expect("canceller thread");
+    fixture.join().expect("fixture thread");
+
+    assert!(
+        matches!(
+            error,
+            RunError::Invocation(rustscript_vm::InvocationError::Cancelled { .. })
+        ),
+        "expected a typed cancellation, got {error:?}"
+    );
+}
+
+/// A3 review P2 guard (Anthropic): the adapter must fail CLOSED when the
+/// server EOFs the SSE body without the terminal `message_stop` event. The
+/// transport reports `outcome: "eof"`, and the adapter must not surface the
+/// accumulated partial text as `ok`. The failure is the canonical typed
+/// provider error, distinct from cancellation and from a legal `message_stop`
+/// stream.
+#[test]
+fn anthropic_messages_stream_eof_without_stop_fails_closed() {
+    // One valid text delta, then immediate EOF: no `message_stop`, no
+    // `message_delta`. `hold_open` false lets the fixture close the chunked
+    // body.
+    let events = vec![
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial \"}}\n\n".to_string(),
+    ];
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(
+        result["ok"] == json!(false),
+        "EOF without message_stop must fail closed, got {result}"
+    );
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("api_error"));
+    assert_eq!(error["code"], json!("stream_eof_without_stop"));
+    assert_eq!(error["status"], json!(200));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("message_stop"),
+        "{error:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /v1/messages HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+}
+
+/// Marker-like text pass-through guard: the Anthropic wire is built
+/// structurally (single json::encode of a nested runtime map, core B4), so no
+/// marker string is ever interpreted or spliced. Marker-like fragments in
+/// ordinary or adversarial user text pass through the wire byte-identical.
+#[test]
+fn anthropic_messages_wire_preserves_marker_like_user_text() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["messages"] = json!([
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "__RSS_ANTHROPIC_CONTENT_"}]
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "prefix __RSS_ANTHROPIC_SCHEMA__ suffix"}
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "__RSS_ANTHROPIC_CONTENT_0__ but not alone"
+                },
+                {"type": "text", "text": "__RSS_ANTHROPIC_INPUT_0_1__"}
+            ]
+        }
+    ]);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let messages = wire["messages"].as_array().expect("messages array");
+    let texts = messages
+        .iter()
+        .filter(|message| message["role"] == json!("user"))
+        .flat_map(|message| {
+            message["content"]
+                .as_array()
+                .expect("user content parts array")
+                .iter()
+                .map(|part| part["text"].as_str().expect("text part").to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec![
+            "__RSS_ANTHROPIC_CONTENT_",
+            "prefix __RSS_ANTHROPIC_SCHEMA__ suffix",
+            "__RSS_ANTHROPIC_CONTENT_0__ but not alone",
+            "__RSS_ANTHROPIC_INPUT_0_1__",
+        ],
+        "marker-like user text must survive the splice byte-identical: {wire}"
+    );
+}
+
+/// Marker-like text pass-through guard (tool schemas): a tool schema whose
+/// JSON embeds marker-like strings must reach `input_schema` byte-identical
+/// across multi-tool requests (no marker splice exists to collide).
+#[test]
+fn anthropic_messages_wire_preserves_marker_like_tool_schema() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["tools"] = json!([
+        {
+            "name": "read_file",
+            "description": "schema __RSS_ANTHROPIC_SCHEMA_0__ here",
+            "schema_json": "{\"type\":\"object\",\"description\":\"marker __RSS_ANTHROPIC_SCHEMA_1__ inside\",\"properties\":{\"path\":{\"type\":\"string\"}}}"
+        },
+        {
+            "name": "search_files",
+            "description": "parts __RSS_ANTHROPIC_CONTENT_0__ mention",
+            "schema_json": "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}}}"
+        }
+    ]);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let tools = wire["tools"].as_array().expect("tools array");
+    assert_eq!(
+        tools[0]["input_schema"],
+        json!({"type":"object","description":"marker __RSS_ANTHROPIC_SCHEMA_1__ inside","properties":{"path":{"type":"string"}}}),
+        "tool schema must be spliced in byte-identical: {wire}"
+    );
+    assert_eq!(
+        tools[1]["input_schema"],
+        json!({"type":"object","properties":{"pattern":{"type":"string"}}}),
+        "second tool schema must survive the multi-pass splice: {wire}"
+    );
+    assert_eq!(
+        tools[0]["description"],
+        json!("schema __RSS_ANTHROPIC_SCHEMA_0__ here")
+    );
+    assert_eq!(
+        tools[1]["description"],
+        json!("parts __RSS_ANTHROPIC_CONTENT_0__ mention")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic request contract (A3 review P1/P2 findings)
+// ---------------------------------------------------------------------------
+//
+// The production adapter builds the wire shape with a single json::encode of a
+// nested runtime map (core B4: string-key maps), so no marker splice exists to
+// collide. These guards pin the intended canonical -> wire mapping.
+
+/// P1: a user text part that is EXACTLY a later message's content marker must
+/// pass through byte-identical. Under the old marker-splice mechanism this was
+/// the exact-equality collision (the later pass re-scans earlier-spliced
+/// content and corrupts it).
+#[test]
+fn anthropic_messages_exact_marker_collision_preserved() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    // message index 2's content marker appears verbatim in an EARLIER message.
+    request["messages"] = json!([
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "__RSS_ANTHROPIC_CONTENT_2__"}]
+        },
+        {"role": "user", "content": [{"type": "text", "text": "middle"}]},
+        {"role": "user", "content": [{"type": "text", "text": "third"}]}
+    ]);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(
+        wire["messages"][0]["content"][0]["text"],
+        json!("__RSS_ANTHROPIC_CONTENT_2__"),
+        "exact later content marker in earlier user text must pass through: {wire}"
+    );
+}
+
+/// P2-1: a canonical tool_result's `is_error` must be mapped onto the wire
+/// tool_result block (it was dropped before).
+#[test]
+fn anthropic_messages_maps_is_error_on_tool_result() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["messages"][1]["content"][0]["is_error"] = json!(true);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(
+        wire["messages"][1]["content"][0]["is_error"],
+        json!(true),
+        "tool_result is_error must be mapped onto the wire: {wire}"
+    );
+}
+
+/// P2-2: a canonical request that omits `max_output_tokens` must NOT send
+/// `max_tokens: 0`. The adapter fails closed with a typed request error before
+/// any transport call.
+#[test]
+fn anthropic_messages_missing_max_output_tokens_fails_closed() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["max_output_tokens"] = json!(0);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    let error = error_of(&result);
+    assert_eq!(error["status"], json!(0), "{error:?}");
+    assert_eq!(
+        error["type"],
+        json!("invalid_request_error"),
+        "missing max_output_tokens must be a typed pre-flight request error: {error:?}"
+    );
+    assert_eq!(
+        error["code"],
+        json!("max_output_tokens_required"),
+        "{error:?}"
+    );
+    assert!(
+        requests.recv_timeout(Duration::from_secs(1)).is_err(),
+        "no transport call may be made when max_output_tokens is absent"
+    );
+}
+
+/// P2-3: canonical `tool_choice` must be mapped onto the Anthropic object
+/// shape (and omitted when absent).
+#[test]
+fn anthropic_messages_maps_tool_choice() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["tool_choice"] = json!("auto");
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(
+        wire["tool_choice"],
+        json!({"type": "auto"}),
+        "tool_choice='auto' must map to Anthropic {{type: auto}}: {wire}"
+    );
+}
+
+/// P2-4: a canonical `system` message must be promoted to the top-level
+/// `system` field, leaving only user/assistant messages on the wire.
+#[test]
+fn anthropic_messages_promotes_system_to_top_level() {
+    let body = read_fixture("anthropic/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["messages"] = json!([
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "You are a helpful assistant."}]
+        },
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+    ]);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert!(
+        wire.as_object()
+            .expect("wire object")
+            .contains_key("system"),
+        "system-role content must be promoted to the top-level system field: {wire}"
+    );
+    assert_eq!(wire["system"], json!("You are a helpful assistant."));
+    assert_eq!(wire["messages"].as_array().expect("messages").len(), 1);
+    assert_eq!(wire["messages"][0]["role"], json!("user"));
+    for message in wire["messages"].as_array().expect("messages") {
+        assert_ne!(
+            message["role"],
+            json!("system"),
+            "no wire message may carry a system role: {wire}"
+        );
+    }
 }
