@@ -1,84 +1,100 @@
-// A5 serial loop policy skeleton (pure decision policy; no provider
-// transport, no storage, no tool runner).
+// A5 production serial agent loop (script-owned).
 //
-// The exported `run(context)` is a state-machine step function: ONE typed
-// context map in, ONE discriminated decision map out. The future
-// script-owned runner (A7/A8) will drive this policy around real provider
-// calls; in this skeleton the policy NEVER calls a provider or dispatches a
-// tool. A provider call that would succeed and a tool dispatch that would
-// run are both returned as typed BLOCKED capability states, so no success is
-// ever fabricated and no private builtin is added. Parallel/subagent/task
-// execution is not executed here: when `config.parallel` or `config.task` is
-// set, the serial loop returns a typed HANDOFF decision deferring to the A6
-// decision policies (`parallel.rss` for parallel orchestration, `subagents.rss`
-// for subagent/task delegation) instead of rejecting outright.
+// The exported `run(context)` is a step function: ONE typed context map in,
+// ONE discriminated decision map out. The loop state machine, canonical
+// LlmRequest construction, provider/profile dispatch, tool registry +
+// approval + dispatch, event emission, and durable compaction execution all
+// live in this module (and the harness/llm/storage modules it composes).
+// Rust (AgentService) owns lifecycle (timeout, cancel, retry sleep),
+// capability composition (http/io/sqlite policy), approval persistence, and
+// durable terminal sequencing; it never parses provider wire and never
+// writes agent policy.
 //
-// Context (all fields typed; missing fields fall back to documented
-// defaults):
+// The loop runs internally across provider calls and tool rounds and yields
+// a decision ONLY when an external service side effect is required:
 //
-//   turn: int            completed turns so far (0 initially)
-//   max_turns: int       turns allowed before the run terminates
-//   retry_count: int     retries already consumed on the current turn
+//   run.completed     -> service commits the terminal exactly once (the
+//                        final text-only assistant message is service-owned)
+//   run.failed        -> service commits the typed terminal exactly once
+//   retry             -> service sleeps delay_ms (bounded backoff) and
+//                        re-invokes with retry_count + 1, same turn
+//   approval.wait     -> service persists the approval durably, parks the
+//                        run (waiting_approval), and resumes exactly once
+//   compact           -> service transitions the run to 'compacting' and
+//                        re-invokes with phase "compacting"
+//   compacted         -> service transitions back to 'running' and
+//                        re-invokes phase "start" with the trimmed messages
+//   compact.failed    -> service transitions back to 'running'; the typed
+//                        failure is durable and the history is untouched
+//   parallel.handoff / subagent.handoff -> typed, executable:false; the
+//                        serial loop never invents parallel/subagent
+//                        outcomes (A6 native supervision needs the A7
+//                        run-admission interface)
+//   rejected          -> typed unknown-phase/state failure
+//
+// Every decision that must continue carries the full loop state (messages,
+// turn, retry_count, last_text, tool_calls, tool_index, plan) so the
+// service can re-invoke; the service copies typed fields only.
+//
+// Context (flat, typed; missing fields fall back to documented defaults):
+//
+//   run_id, session_id: string
+//   phase: "start" | "approval.resume" | "compacting"
+//   turn: int            completed model rounds so far (0 initially)
+//   retry_count: int     retries consumed on the current turn
+//   max_turns: int       turns allowed before the run terminates (bounded)
 //   max_retries: int     retries allowed per turn
-//   phase: string        "start" | "provider_result"
 //   model: string        model name carried by model.* event descriptors
-//   provider: map        canonical call result {ok, response, error}
-//                        (rss/llm/types.rss shape); ignored in phase "start"
-//   config: map          {base_retry_delay_ms, max_retry_delay_ms,
-//                         parallel, task}
+//   provider: string     adapter/profile name ("openai_chat" |
+//                        "openai_responses" | "anthropic_messages" |
+//                        "openrouter" | "deepseek" | "opencode_zen" |
+//                        "opencode_go" | "custom")
+//   provider_options: map  {base_url, api_key, model, ...} for direct
+//                        adapters; profile modules read them from the
+//                        canonical request
+//   system_prompt: string (prepended as a system message when non-empty)
+//   messages: array     canonical message history (seeded from the durable
+//                        session by the service; appended inline by the
+//                        loop)
+//   config: map         {base_retry_delay_ms, max_retry_delay_ms,
+//                        max_context_messages, retained_tail,
+//                        approval_mode, native_hard_deny, stream,
+//                        parallel, task, max_output_tokens, state_db,
+//                        now_ms}
+//   approval: map       (phase "approval.resume") {approval_id,
+//                        tool_call_id, tool_name, arguments, risk_class,
+//                        resolved, reason}
+//   tool_calls: array   (phase "approval.resume") the round's call list
+//   tool_index: int     (phase "approval.resume") the pending call index
+//   plan: map           (phase "compacting") the compact.plan decision
 //
-// Decisions (kind discriminator):
-//
-//   blocked      -> capability "provider.call" | "tool.dispatch" with a
-//                   typed reason; events carry the canonical descriptors to
-//                   emit before the (blocked) action. A blocked
-//                   "tool.dispatch" decision carries turn + 1: a tool-call
-//                   cycle CONSUMES the turn budget, so a runaway tool loop
-//                   terminates once the next start phase is refused at
-//                   max_turns (the completed model call's event still
-//                   carries the turn it started in).
-//   retry        -> delay_ms (exponential backoff, capped), retry_count
-//                   (incremented), turn unchanged
-//   next.turn    -> turn + 1 (a turn without tool calls completed)
-//   run.completed-> terminal decision after the last allowed turn (the
-//                   service commits the service-owned run.completed event)
-//   run.failed   -> terminal decision carrying the typed ProviderError
-//                   {status, type, code, message, param, request_id} and a
-//                   reason ("non_retryable" | "max_retries_exceeded"); the
-//                   service commits the service-owned run.failed event
-//   rejected     -> typed rejection (unknown_phase)
-//   parallel.handoff -> when config.parallel is set: defers to the parallel
-//                   policy (`parallel.rss`); carries the run_id as the future
-//                   parent of any child runs
-//   subagent.handoff -> when config.task is set: defers to the subagent
-//                   policy (`subagents.rss`)
-//
-// Every decision carries an `events` array of canonical event descriptors:
-//
-//   model.started:    {type: "model.started", turn, model}
-//   model.completed:  {type: "model.completed", turn, text, tool_calls}
-//
-// `tool_calls` on model.completed is pinned to the exact number of
-// `tool_call` entries in the canonical `response.tool_calls` array: 0 for a
-// text-only completion, N for N calls in one response.
-//
-// Backoff is `min(max(base, 0) * 2^retry_count, max(cap, 0))` with defined
-// edge semantics: negative or zero inputs clamp to 0 (a zero delay is a
-// valid immediate retry), a base above the cap clamps to the cap on entry,
-// and doubling SATURATES at the cap so no i64 input can overflow.
-//
-// run.failed / run.completed are SERVICE-OWNED event types (src/events.rs);
-// the policy only describes the terminal decision, it never emits them.
-//
-// Compiler-contract notes: all helpers are same-module, and arrays passed
-// onward are built in this module (no cross-module accessor array values).
-// Every helper takes at most ONE map parameter EXCEPT `provider_result`,
-// which takes the canonical `provider` + `config` pair. The two-map trigger
-// documented in the A3 core blocker plan fires only when a function with
-// two map parameters reads the FIRST map's fields and passes the SECOND map
-// onward to another script function; `provider_result` reads fields of both
-// maps but never passes a map onward — only scalars and the in-module
-// events array cross call boundaries.
+// Compiler-contract notes (pinned core fd4b570, B1-B4 fixed): cross-module
+// script calls are placed at function top level, in expression-if branches,
+// or inside `while` bodies; annotated locals whose initializer type the
+// checker cannot prove live in helpers with declared return types;
+// `json::encode` / `json::decode` results cross boundaries through declared
+// `string` / `map` / `array` returns.
+
+use json;
+use stream;
+use super::llm::types as types;
+use super::llm::openai_chat as openai_chat;
+use super::llm::openai_responses as openai_responses;
+use super::llm::anthropic_messages as anthropic_messages;
+use super::providers::openrouter as openrouter;
+use super::providers::deepseek as deepseek;
+use super::providers::opencode_zen as opencode_zen;
+use super::providers::opencode_go as opencode_go;
+use super::providers::custom as custom;
+// The harness/storage/compact modules export `run`, which collides with the
+// loop's exported entry in this compiler's flat-import semantics; they are
+// imported with explicit named clauses and bound under aliases.
+use super::harness::registry::{run as registry_run};
+use super::harness::file::{run as file_run};
+use super::harness::patch::{run as patch_run};
+use super::harness::terminal::{run as terminal_run};
+use super::harness::approval::{run as approval_run};
+use self::compact::{run as compact_run};
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -139,47 +155,93 @@ fn ctx_array(value: map, key: string) -> array {
     result
 }
 
+/// One entry from a dynamic array, or an empty map when the index is out of
+/// range or the entry is not a map.
+fn loop_array_entry(items: array, index: int) -> map {
+    let mut result: map = {};
+    if items.has(index) {
+        if type(items[index].copy()) == "map" {
+            let entry: map = items[index].copy();
+            result = entry;
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Decision builders
 // ---------------------------------------------------------------------------
 
-fn blocked_decision(capability: string, reason: string, turn: int, events: array) -> map {
+fn run_completed_decision(turn: int, text: string, messages: array) -> map {
     {
-        kind: "blocked",
-        capability: capability,
-        reason: reason,
+        kind: "run.completed",
         turn: turn,
-        events: events
+        text: text,
+        messages: messages
     }
 }
 
-fn retry_decision(delay_ms: int, retry_count: int, turn: int) -> map {
-    { kind: "retry", delay_ms: delay_ms, retry_count: retry_count, turn: turn, events: [] }
-}
-
-fn next_turn_decision(turn: int, events: array) -> map {
-    { kind: "next.turn", turn: turn, events: events }
-}
-
-fn run_completed_decision(turn: int, events: array) -> map {
-    { kind: "run.completed", turn: turn, events: events }
-}
-
 fn run_failed_decision(turn: int, reason: string, error: map) -> map {
-    { kind: "run.failed", turn: turn, reason: reason, error: error, events: [] }
+    { kind: "run.failed", turn: turn, reason: reason, error: error }
+}
+
+fn retry_decision(delay_ms: int, retry_count: int, turn: int, messages: array, last_text: string) -> map {
+    {
+        kind: "retry",
+        delay_ms: delay_ms,
+        retry_count: retry_count,
+        turn: turn,
+        messages: messages,
+        last_text: last_text
+    }
+}
+
+fn approval_wait_decision(
+    call: map,
+    risk_class: string,
+    tool_calls: array,
+    index: int,
+    messages: array,
+    turn: int,
+    last_text: string
+) -> map {
+    {
+        kind: "approval.wait",
+        approval: {
+            approval_id: "",
+            tool_call_id: types::request_string(call, "id"),
+            tool_name: types::request_string(call, "name"),
+            arguments: types::request_map(call, "arguments"),
+            risk_class: risk_class
+        },
+        tool_calls: tool_calls,
+        tool_index: index,
+        messages: messages,
+        turn: turn,
+        last_text: last_text
+    }
+}
+
+fn compact_decision(plan: map, messages: array, turn: int, last_text: string) -> map {
+    {
+        kind: "compact",
+        plan: plan,
+        messages: messages,
+        turn: turn,
+        retry_count: 0,
+        last_text: last_text
+    }
 }
 
 fn rejected_decision(code: string, message: string, turn: int) -> map {
-    { kind: "rejected", code: code, message: message, turn: turn, events: [] }
+    { kind: "rejected", code: code, message: message, turn: turn }
 }
 
-/// A6 handoff: when parallel/task execution is requested, the serial loop does
-/// not execute it (it never invents parallel/subagent actions) — it defers to
-/// the dedicated A6 decision policies with a typed handoff decision carrying
-/// the current run id as the future parent of any child runs. The handoff is
-/// explicit non-executable-with-reason: the serial loop is a pure decision /
-/// handoff layer and cannot itself drive concurrent child runs, so it never
-/// fakes a parallel/subagent outcome.
+/// A6 handoff: when parallel/task execution is requested, the serial loop
+/// does not execute it and never invents a parallel/subagent outcome — it
+/// defers with a typed, non-executable handoff decision (the A6 native
+/// supervisor needs the A7 run-admission interface to drive real child
+/// runs).
 fn handoff_decision(phase: string, capability: string, parent_run_id: string, turn: int, message: string) -> map {
     {
         kind: phase,
@@ -227,11 +289,7 @@ fn error_is_retryable(error: map) -> bool {
 
 /// Exponential backoff for the attempt AFTER `retry_count` failures:
 /// `min(max(base, 0) * 2^retry_count, max(cap, 0))` with defined edge
-/// semantics. Negative or zero inputs clamp to 0 (a zero delay is a valid
-/// immediate retry), a base above the cap clamps to the cap on entry, and
-/// doubling SATURATES at the cap: the loop breaks once the delay reaches
-/// the cap or the zero fixed point, so the delay never overflows and the
-/// function terminates for ANY i64 inputs (including a huge retry_count).
+/// semantics (clamp, saturate, terminate for any i64 inputs).
 fn backoff_delay_ms(base: int, retry_count: int, cap: int) -> int {
     let mut delay: int = base;
     let mut ceiling: int = cap;
@@ -260,96 +318,713 @@ fn backoff_delay_ms(base: int, retry_count: int, cap: int) -> int {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical request construction
+// ---------------------------------------------------------------------------
+
+/// Tool descriptors from the A4 bounded registry (name, description,
+/// schema_json) — the model-facing tool list.
+fn request_tool_descriptors() -> array {
+    let mut tools: array = [];
+    tools[tools.length] = registry_tool_descriptor("file.read");
+    tools[tools.length] = registry_tool_descriptor("file.write");
+    tools[tools.length] = registry_tool_descriptor("patch.apply");
+    tools[tools.length] = registry_tool_descriptor("terminal.run");
+    tools
+}
+
+/// One registry descriptor converted to the canonical request tool shape.
+fn registry_tool_descriptor(name: string) -> map {
+    let descriptor: map = registry_describe(name);
+    {
+        name: name,
+        description: types::request_string(descriptor, "description"),
+        schema_json: types::request_string(descriptor, "schema_json")
+    }
+}
+
+fn registry_describe(name: string) -> map {
+    let result: map = registry_run({ op: "describe", tool_name: name });
+    ctx_map(result, "descriptor")
+}
+
+/// Prepends the system prompt as a system message when present.
+fn messages_with_system(messages: array, system_prompt: string) -> array {
+    let mut result: array = messages;
+    if system_prompt != "" {
+        let mut with_system: array = [];
+        with_system[with_system.length] = {
+            role: "system",
+            content: [{ type: "text", text: system_prompt }]
+        };
+        let mut index = 0;
+        while index < messages.length {
+            with_system[with_system.length] = messages[index].copy();
+            index += 1;
+        }
+        result = with_system;
+    }
+    result
+}
+
+/// Builds the canonical LlmRequest (rss/llm/types.rss shape) from the loop
+/// context: model, messages (with system prompt, ordinals stripped), registry
+/// tools, sampling, stream flag, and provider_options.
+fn build_request(context: map, messages: array) -> map {
+    let config: map = ctx_map(context, "config");
+    {
+        model: ctx_string(context, "model", ""),
+        messages: messages_with_system(request_messages(messages), ctx_string(context, "system_prompt", "")),
+        tools: request_tool_descriptors(),
+        tool_choice: "auto",
+        reasoning: "",
+        sampling: { temperature: null, top_p: null },
+        max_output_tokens: ctx_int(config, "max_output_tokens", 1024),
+        stream: ctx_bool(config, "stream", true),
+        provider_options: ctx_map(context, "provider_options")
+    }
+}
+
+/// Strips the internal `ordinal` field from the loop's message entries — the
+/// canonical request carries only `{role, content}`.
+fn request_messages(messages: array) -> array {
+    let mut request: array = [];
+    let mut index = 0;
+    while index < messages.length {
+        let entry: map = loop_array_entry(messages, index);
+        request[request.length] = {
+            role: types::request_string(entry, "role"),
+            content: types::request_array(entry, "content")
+        };
+        index += 1;
+    }
+    request
+}
+
+/// The next internal ordinal for an appended message (max in-run ordinal +
+/// 1, or 1 for an empty list). Ordinals mirror the durable session message
+/// ordinals so compaction plans reference real rows.
+fn next_ordinal(messages: array) -> int {
+    let mut ordinal: int = 0;
+    let mut index = 0;
+    while index < messages.length {
+        let entry: map = loop_array_entry(messages, index);
+        let entry_ordinal: int = ctx_int(entry, "ordinal", 0);
+        if entry_ordinal > ordinal {
+            ordinal = entry_ordinal;
+        }
+        index += 1;
+    }
+    ordinal + 1
+}
+
+/// Builds the adapter profile for direct adapter dispatch from the
+/// provider_options; profile modules merge these overrides themselves.
+fn build_profile(provider: string, options: map) -> map {
+    {
+        provider: provider,
+        base_url: types::request_string(options, "base_url"),
+        api_key: types::request_string(options, "api_key"),
+        model: types::request_string(options, "model"),
+        adapter: types::request_string(options, "adapter"),
+        capabilities: types::request_map(options, "capabilities")
+    }
+}
+
+/// Dispatches one provider call by name to the completed adapters / profile
+/// modules. Cross-module calls live in expression-if branches (the pinned
+/// core's documented layout for this module graph).
+fn provider_call(request: map, provider: string, profile: map) -> map {
+    if provider == "openai_chat" => {
+        openai_chat::openai_chat_call(request, profile)
+    } else if provider == "openai_responses" => {
+        openai_responses::openai_responses_call(request, profile)
+    } else if provider == "anthropic_messages" => {
+        anthropic_messages::anthropic_messages_call(request, profile)
+    } else if provider == "openrouter" => {
+        openrouter::call(request)
+    } else if provider == "deepseek" => {
+        deepseek::call(request)
+    } else if provider == "opencode_zen" => {
+        opencode_zen::call(request)
+    } else if provider == "opencode_go" => {
+        opencode_go::call(request)
+    } else if provider == "custom" => {
+        custom::call(request)
+    } else => {
+        types::fail(types::error_request("unknown_provider", provider))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase handlers
 // ---------------------------------------------------------------------------
 
-/// Phase "start": emit `model.started` for the upcoming turn and attempt the
-/// provider call. The call itself is a typed blocked capability in this
-/// skeleton (the A3 core blocker holds the adapters); the harness injects
-/// synthetic results instead of the policy fabricating success.
-fn start_phase(turn: int, max_turns: int, model: string) -> map {
-    let mut decision: map = run_completed_decision(turn, []);
+/// Phase "start": bounded by max_turns; at a turn boundary (retry_count 0)
+/// the compaction gate runs first, then `model.started` + the provider call.
+fn start_phase(context: map) -> map {
+    let turn: int = ctx_int(context, "turn", 0);
+    let max_turns: int = ctx_int(context, "max_turns", 1);
+    let retry_count: int = ctx_int(context, "retry_count", 0);
+    let last_text: string = ctx_string(context, "last_text", "");
+    let mut decision: map = run_completed_decision(turn, last_text, ctx_array(context, "messages"));
     if turn < max_turns {
-        let mut events: array = [];
-        events[events.length] = { type: "model.started", turn: turn, model: model };
-        decision = blocked_decision(
-            "provider.call",
-            "serial loop skeleton: provider call is a typed blocked capability while the A3 core blocker stands",
+        if retry_count == 0 {
+            decision = start_turn(context, turn, max_turns, last_text);
+        } else {
+            decision = provider_attempt(context, turn, max_turns, retry_count, last_text);
+        }
+    }
+    decision
+}
+
+/// First attempt of a turn: the durable compaction gate, then the provider
+/// call.
+fn start_turn(context: map, turn: int, max_turns: int, last_text: string) -> map {
+    let messages: array = ctx_array(context, "messages");
+    let config: map = ctx_map(context, "config");
+    let window: int = ctx_int(config, "max_context_messages", 0);
+    let compact_needed: bool = window >= 1 && messages.length > window;
+    if compact_needed => {
+        compact_plan_decision(context, turn, last_text)
+    } else => {
+        provider_attempt(context, turn, max_turns, 0, last_text)
+    }
+}
+
+/// One provider attempt for the current turn: `model.started` on the first
+/// attempt only, canonical request, adapter call, typed result handling.
+fn provider_attempt(context: map, turn: int, max_turns: int, retry_count: int, last_text: string) -> map {
+    if retry_count == 0 {
+        stream::emit({
+            type: "model.started",
+            turn: turn,
+            model: ctx_string(context, "model", "")
+        });
+    }
+    let provider: string = ctx_string(context, "provider", "");
+    let options: map = ctx_map(context, "provider_options");
+    let missing_base: bool = direct_adapter(provider) && types::request_string(options, "base_url") == "";
+    let mut decision: map = run_failed_decision(
+        turn,
+        "non_retryable",
+        types::error_request(
+            "missing_base_url",
+            "provider options must carry base_url for the direct adapter " + provider
+        )
+    );
+    if missing_base == false {
+        let request: map = build_request(context, ctx_array(context, "messages"));
+        let result: map = provider_call(request, provider, build_profile(provider, options));
+        decision = provider_result(context, turn, max_turns, retry_count, result, last_text);
+    }
+    decision
+}
+
+/// Direct adapters require `provider_options.base_url`; profile modules
+/// carry their own endpoint metadata.
+fn direct_adapter(provider: string) -> bool {
+    provider == "openai_chat" || provider == "openai_responses" || provider == "anthropic_messages"
+}
+
+/// Handles the typed `{ok, response, error}` call result.
+fn provider_result(context: map, turn: int, max_turns: int, retry_count: int, result: map, last_text: string) -> map {
+    let ok_flag: bool = ctx_bool(result, "ok", false);
+    let mut decision: map = run_failed_decision(
+        turn,
+        "non_retryable",
+        types::error_request("malformed_provider_result", "provider call result is not decidable")
+    );
+    if ok_flag == true {
+        decision = provider_ok_result(context, turn, max_turns, retry_count, result, last_text);
+    } else {
+        decision = provider_error_result(context, turn, retry_count, result, last_text);
+    }
+    decision
+}
+
+/// Success path: canonical `model.delta` + `model.completed`; text-only
+/// completes the run (the final assistant message is service-owned), tool
+/// calls enter the tool cycle with the assistant message appended.
+fn provider_ok_result(context: map, turn: int, max_turns: int, retry_count: int, result: map, last_text: string) -> map {
+    let response: map = ctx_map(result, "response");
+    let text: string = types::request_string(response, "text");
+    let tool_calls: array = types::request_array(response, "tool_calls");
+    let config: map = ctx_map(context, "config");
+    stream::emit({
+        type: "model.delta",
+        turn: turn,
+        delta: text,
+        stream: ctx_bool(config, "stream", true)
+    });
+    stream::emit({
+        type: "model.completed",
+        turn: turn,
+        text: text,
+        tool_calls: tool_calls.length
+    });
+    let mut decision: map = run_completed_decision(turn + 1, text, ctx_array(context, "messages"));
+    if tool_calls.length > 0 {
+        let mut messages: array = ctx_array(context, "messages");
+        messages[messages.length] = assistant_message(next_ordinal(messages), text, tool_calls.copy());
+        decision = tool_cycle(context, turn, messages, tool_calls, 0, last_text);
+    }
+    decision
+}
+
+/// Error path: typed retry/backoff or typed terminal failure.
+fn provider_error_result(context: map, turn: int, retry_count: int, result: map, last_text: string) -> map {
+    let error: map = ctx_map(result, "error");
+    let max_retries: int = ctx_int(context, "max_retries", 2);
+    let mut decision: map = run_failed_decision(turn, "non_retryable", error);
+    if !error_is_retryable(error) {
+        decision = run_failed_decision(turn, "non_retryable", error);
+    } else if retry_count >= max_retries {
+        decision = run_failed_decision(turn, "max_retries_exceeded", error);
+    } else {
+        let config: map = ctx_map(context, "config");
+        let base: int = ctx_int(config, "base_retry_delay_ms", 1000);
+        let cap: int = ctx_int(config, "max_retry_delay_ms", 30000);
+        let delay: int = backoff_delay_ms(base, retry_count, cap);
+        decision = retry_decision(delay, retry_count + 1, turn, ctx_array(context, "messages"), last_text);
+    }
+    decision
+}
+
+/// One canonical assistant message: internal ordinal, text part plus one
+/// `tool_call` part per requested call.
+fn assistant_message(ordinal: int, text: string, tool_calls: array) -> map {
+    let mut parts: array = [];
+    if text != "" {
+        parts[parts.length] = { type: "text", text: text };
+    }
+    let mut index = 0;
+    while index < tool_calls.length {
+        let call: map = loop_array_entry(tool_calls, index);
+        let arguments: map = types::request_map(call, "arguments");
+        parts[parts.length] = {
+            type: "tool_call",
+            tool_call_id: types::request_string(call, "id"),
+            name: types::request_string(call, "name"),
+            arguments_json: encode_json(arguments)
+        };
+        index += 1;
+    }
+    { ordinal: ordinal, role: "assistant", content: parts }
+}
+
+// ---------------------------------------------------------------------------
+// Tool cycle
+// ---------------------------------------------------------------------------
+
+/// Processes one tool call per step: registry -> approval -> dispatch (or
+/// typed denial / approval.wait); after the last call the loop continues
+/// with the next turn inline. The continuation is NOT evaluated eagerly —
+/// the cycle decision must be produced first (an eager default would recurse
+/// into the next turn before dispatching the current call).
+fn tool_cycle(context: map, turn: int, messages: array, tool_calls: array, index: int, last_text: string) -> map {
+    let mut decision: map = rejected_decision("tool_cycle_invalid", "tool cycle state is not decidable", turn);
+    if index < tool_calls.length {
+        decision = tool_step(context, turn, messages, tool_calls, index, last_text);
+    } else {
+        decision = continue_next_turn(context, turn, messages, last_text);
+    }
+    decision
+}
+
+fn tool_step(context: map, turn: int, messages: array, tool_calls: array, index: int, last_text: string) -> map {
+    let call: map = loop_array_entry(tool_calls, index);
+    let name: string = types::request_string(call, "name");
+    let call_id: string = types::request_string(call, "id");
+    stream::emit({ type: "tool.started", tool_call_id: call_id, name: name, turn: turn });
+    let registry_result: map = registry_run({ op: "describe", tool_name: name });
+    let mut decision: map = run_failed_decision(
+        turn,
+        "non_retryable",
+        types::error_request("tool_registry_unavailable", name)
+    );
+    if ctx_bool(registry_result, "ok", false) == true {
+        decision = approval_step(context, turn, messages, tool_calls, index, call, registry_result, last_text);
+    } else {
+        let code: string = types::request_string(registry_result, "code");
+        decision = tool_result_step(
+            context,
             turn,
-            events
+            messages,
+            tool_calls,
+            index,
+            call,
+            true,
+            code + ": no bounded capability is registered for this tool",
+            last_text
         );
     }
     decision
 }
 
-/// Phase "provider_result": decide from the canonical typed call result.
-fn provider_result(turn: int, max_turns: int, retry_count: int, max_retries: int, provider: map, config: map) -> map {
-    let ok_flag: bool = ctx_bool(provider, "ok", false);
-    let mut decision: map = rejected_decision("unknown_phase", "provider result is not decidable", turn);
-    if ok_flag == true {
-        let response: map = ctx_map(provider, "response");
-        let text: string = ctx_string(response, "text", "");
-        let tool_calls: array = ctx_array(response, "tool_calls");
-        let mut events: array = [];
-        events[events.length] = {
-            type: "model.completed",
-            turn: turn,
-            text: text,
-            tool_calls: tool_calls.length
-        };
-        if tool_calls.length > 0 {
-            // A tool-call cycle consumes the turn budget: the dispatch
-            // decision carries the turn the run continues at after the
-            // tools finish (turn + 1), so a runaway tool loop terminates
-            // once the next start phase is refused at max_turns.
-            let next_turn: int = turn + 1;
-            decision = blocked_decision(
-                "tool.dispatch",
-                "serial loop skeleton: tool dispatch is a typed blocked capability; no tool runner is wired; the tool cycle consumes the turn budget",
-                next_turn,
-                events
-            );
-        } else {
-            let next_turn: int = turn + 1;
-            if next_turn >= max_turns {
-                decision = run_completed_decision(next_turn, events);
-            } else {
-                decision = next_turn_decision(next_turn, events);
-            }
-        }
+/// Approval policy: approve -> real dispatch; deny -> typed denial; pending
+/// -> `approval.required` + `approval.wait` (the durable bridge persists and
+/// the service parks the run).
+fn approval_step(context: map, turn: int, messages: array, tool_calls: array, index: int, call: map, registry_result: map, last_text: string) -> map {
+    let config: map = ctx_map(context, "config");
+    let descriptor: map = ctx_map(registry_result, "descriptor");
+    let name: string = types::request_string(call, "name");
+    let risk: string = types::request_string(descriptor, "risk_class");
+    let decision_result: map = approval_run({
+        op: "decide",
+        tool_name: name,
+        risk_class: risk,
+        approval_mode: ctx_string(config, "approval_mode", "auto"),
+        native_hard_deny: ctx_bool(config, "native_hard_deny", false)
+    });
+    let action: string = approval_action(decision_result);
+    let mut decision: map = run_failed_decision(
+        turn,
+        "non_retryable",
+        types::error_request("approval_policy_unavailable", name)
+    );
+    if action == "approve" {
+        decision = tool_dispatch(context, turn, messages, tool_calls, index, call, true, "", last_text);
+    } else if action == "deny" {
+        decision = tool_dispatch(
+            context,
+            turn,
+            messages,
+            tool_calls,
+            index,
+            call,
+            false,
+            "approval policy denied " + name,
+            last_text
+        );
     } else {
-        let error: map = ctx_map(provider, "error");
-        if !error_is_retryable(error) {
-            decision = run_failed_decision(turn, "non_retryable", error);
-        } else if retry_count >= max_retries {
-            decision = run_failed_decision(turn, "max_retries_exceeded", error);
-        } else {
-            let base: int = ctx_int(config, "base_retry_delay_ms", 1000);
-            let cap: int = ctx_int(config, "max_retry_delay_ms", 30000);
-            let delay: int = backoff_delay_ms(base, retry_count, cap);
-            decision = retry_decision(delay, retry_count + 1, turn);
+        let call_id: string = types::request_string(call, "id");
+        stream::emit({
+            type: "approval.required",
+            approval_id: "",
+            tool_call_id: call_id,
+            tool_name: name,
+            risk_class: risk,
+            turn: turn
+        });
+        decision = approval_wait_decision(call, risk, tool_calls, index, messages, turn, last_text);
+    }
+    decision
+}
+
+/// The policy action from the approval decision envelope.
+fn approval_action(decision_result: map) -> string {
+    let decision: map = ctx_map(decision_result, "decision");
+    ctx_string(decision, "action", "deny")
+}
+
+/// A typed `is_error` tool result for a call the registry cannot dispatch
+/// (unknown tool): the model sees the typed failure and the loop continues.
+fn tool_result_step(context: map, turn: int, messages: array, tool_calls: array, index: int, call: map, approved: bool, reason: string, last_text: string) -> map {
+    let name: string = types::request_string(call, "name");
+    let call_id: string = types::request_string(call, "id");
+    let result: map = if approved == true => {
+        { ok: false, code: "unknown_tool", message: reason, tool: name }
+    } else => {
+        typed_denial(name, reason)
+    };
+    let content: string = tool_result_content(result, true);
+    stream::emit({
+        type: "tool.completed",
+        tool_call_id: call_id,
+        name: name,
+        ok: false,
+        turn: turn
+    });
+    let mut updated: array = messages;
+    updated[updated.length] = {
+        ordinal: next_ordinal(messages),
+        role: "tool",
+        content: [{
+            type: "tool_result",
+            tool_call_id: call_id,
+            content: content,
+            is_error: true
+        }]
+    };
+    tool_cycle(context, turn, updated, tool_calls, index + 1, last_text)
+}
+
+/// Dispatches one call (approved) or produces the typed denial (denied /
+/// expired), appends the canonical tool message, and continues the cycle.
+fn tool_dispatch(context: map, turn: int, messages: array, tool_calls: array, index: int, call: map, approved: bool, reason: string, last_text: string) -> map {
+    let name: string = types::request_string(call, "name");
+    let call_id: string = types::request_string(call, "id");
+    let result: map = if approved == true => {
+        execute_tool(name, types::request_map(call, "arguments"))
+    } else => {
+        typed_denial(name, reason)
+    };
+    let is_error: bool = !ctx_bool(result, "ok", false);
+    let content: string = tool_result_content(result, is_error);
+    stream::emit({
+        type: "tool.completed",
+        tool_call_id: call_id,
+        name: name,
+        ok: !is_error,
+        turn: turn
+    });
+    let mut updated: array = messages;
+    updated[updated.length] = {
+        ordinal: next_ordinal(messages),
+        role: "tool",
+        content: [{
+            type: "tool_result",
+            tool_call_id: call_id,
+            content: content,
+            is_error: is_error
+        }]
+    };
+    tool_cycle(context, turn, updated, tool_calls, index + 1, last_text)
+}
+
+/// The typed denial/expiry tool result: `is_error` with the typed reason —
+/// never a fabricated success.
+fn typed_denial(name: string, reason: string) -> map {
+    {
+        ok: false,
+        code: "approval_denied",
+        message: reason,
+        tool: name
+    }
+}
+
+/// Serializes one tool result map into the canonical tool_result content.
+/// `json::encode`'s return type is unknown to the checker, so the annotated
+/// local lives here with a declared `string` return.
+fn tool_result_content(result: map, is_error: bool) -> string {
+    let mut payload: map = result;
+    if is_error {
+        payload["is_error"] = true;
+    }
+    let encoded: string = json::encode(payload);
+    encoded
+}
+
+/// `json::encode` bridge with a declared return type.
+fn encode_json(value: map) -> string {
+    let encoded: string = json::encode(value);
+    encoded
+}
+
+/// Bounded capability dispatch by tool name (cross-module harness calls in
+/// expression-if branches). The terminal gap (core `io::popen` lacks a
+/// per-invocation timeout and argv form) is returned as a typed
+/// `capability_unavailable` result — never fabricated success.
+fn execute_tool(name: string, arguments: map) -> map {
+    if name == "file.read" => {
+        file_run({
+            op: "read",
+            path: types::request_string(arguments, "path"),
+            max_bytes: 0
+        })
+    } else if name == "file.write" => {
+        file_run({
+            op: "write",
+            path: types::request_string(arguments, "path"),
+            content: types::request_string(arguments, "content")
+        })
+    } else if name == "patch.apply" => {
+        patch_run({
+            op: "apply",
+            path: types::request_string(arguments, "path"),
+            from: types::request_string(arguments, "from"),
+            to: types::request_string(arguments, "to")
+        })
+    } else if name == "terminal.run" => {
+        terminal_run({
+            op: "run",
+            command: types::request_string(arguments, "command"),
+            timeout_ms: types::request_int(arguments, "timeout_ms", 0)
+        })
+    } else => {
+        {
+            ok: false,
+            code: "unknown_tool",
+            message: "no bounded capability is registered for this tool"
         }
+    }
+}
+
+/// Rebuilds the context for the next turn and continues the loop inline —
+/// the turn budget is enforced here (the next provider round only starts
+/// while `next_turn < max_turns`).
+fn continue_next_turn(context: map, turn: int, messages: array, last_text: string) -> map {
+    let next_turn: int = turn + 1;
+    let max_turns: int = ctx_int(context, "max_turns", 1);
+    let mut decision: map = run_completed_decision(next_turn, last_text, messages);
+    if next_turn < max_turns {
+        let mut next_context: map = context;
+        next_context["turn"] = next_turn;
+        next_context["retry_count"] = 0;
+        next_context["messages"] = messages;
+        next_context["last_text"] = last_text;
+        decision = start_turn(next_context, next_turn, max_turns, last_text);
     }
     decision
 }
 
 // ---------------------------------------------------------------------------
-// Entry
+// Approval resume
 // ---------------------------------------------------------------------------
 
-pub fn run(context: map) -> map {
+/// Phase "approval.resume": the durable bridge resolved exactly once. The
+/// pending call is dispatched when approved, or folded into a typed
+/// `is_error` tool result when denied/expired; the cycle then continues.
+fn approval_resume_phase(context: map) -> map {
+    let approval: map = ctx_map(context, "approval");
+    let tool_calls: array = ctx_array(context, "tool_calls");
+    let index: int = ctx_int(context, "tool_index", 0);
     let turn: int = ctx_int(context, "turn", 0);
-    let max_turns: int = ctx_int(context, "max_turns", 1);
-    let retry_count: int = ctx_int(context, "retry_count", 0);
-    let max_retries: int = ctx_int(context, "max_retries", 0);
-    let phase: string = ctx_string(context, "phase", "");
-    let model: string = ctx_string(context, "model", "");
+    let messages: array = ctx_array(context, "messages");
+    let last_text: string = ctx_string(context, "last_text", "");
+    let approval_id: string = types::request_string(approval, "approval_id");
+    let call_id: string = types::request_string(approval, "tool_call_id");
+    let resolved: bool = ctx_bool(approval, "resolved", false);
+    let reason: string = types::request_string(approval, "reason");
+    stream::emit({
+        type: "approval.resolved",
+        approval_id: approval_id,
+        tool_call_id: call_id,
+        resolved: resolved,
+        reason: reason,
+        turn: turn
+    });
+    let call: map = loop_array_entry(tool_calls, index);
+    let mut decision: map = rejected_decision("approval_mismatch", "resume tool call does not match the pending approval", turn);
+    if types::request_string(call, "id") == call_id {
+        decision = tool_dispatch(context, turn, messages, tool_calls, index, call, resolved, reason, last_text);
+    }
+    decision
+}
+
+// ---------------------------------------------------------------------------
+// Durable compaction
+// ---------------------------------------------------------------------------
+
+/// Plans a compaction from the DB-resident portion of the in-run message
+/// list (entries whose internal ordinals mirror durable session rows) when
+/// the history exceeds the configured window, and yields the `compact`
+/// decision carrying the typed A2 command sequence. The SERVICE executes the
+/// plan commands (compaction.start -> message.compact -> compaction.commit,
+/// or compaction.fail on any typed rejection) — script-to-script construction
+/// of the A2 `StorageCommand` struct is blocked by a core gap (see
+/// plans/2026-08-15_a5-production-serial-loop.md and the core repro fixture);
+/// executing the RSS-planned typed commands is durable sequencing, the
+/// service's ownership lane.
+fn compact_plan_decision(context: map, turn: int, last_text: string) -> map {
+    let config: map = ctx_map(context, "config");
+    let session_id: string = ctx_string(context, "session_id", "");
     let run_id: string = ctx_string(context, "run_id", "");
-    let provider: map = ctx_map(context, "provider");
+    let messages: array = ctx_array(context, "messages");
+    let generation: int = ctx_int(config, "generation", 0);
+    let compact_context: map = {
+        session_id: session_id,
+        run_id: run_id,
+        compaction_id: ctx_string(config, "compaction_id", ""),
+        generation: generation,
+        messages: db_resident_messages(messages, ctx_int(config, "message_count", 0)),
+        config: {
+            max_context_messages: ctx_int(config, "max_context_messages", 0),
+            retained_tail: ctx_int(config, "retained_tail", 0),
+            now_ms: ctx_int(config, "now_ms", 0),
+            model: ctx_string(context, "model", ""),
+            token_estimate: 0
+        }
+    };
+    let plan: map = compact_run(compact_context);
+    if ctx_string(plan, "kind", "") == "compact.plan" => {
+        stream::emit({ type: "compact.started", turn: turn });
+        compact_decision(plan, messages, turn, last_text)
+    } else => {
+        provider_attempt(context, turn, ctx_int(context, "max_turns", 1), 0, last_text)
+    }
+}
+
+/// The DB-resident portion of the in-run message list: entries whose
+/// internal ordinal does not exceed the durable message count carried by the
+/// service. The compaction plan must only reference rows that exist in the
+/// session's message table (the A2 start guard verifies the range endpoints).
+fn db_resident_messages(messages: array, message_count: int) -> array {
+    let mut resident: array = [];
+    let mut index = 0;
+    while index < messages.length {
+        let entry: map = loop_array_entry(messages, index);
+        let ordinal: int = ctx_int(entry, "ordinal", 0);
+        if ordinal >= 1 {
+            if ordinal <= message_count {
+                resident[resident.length] = entry;
+            }
+        }
+        index += 1;
+    }
+    resident
+}
+
+/// Phase "compact.result": the service executed the planned commands. On
+/// success the compacted prefix is trimmed from the in-run list; on failure
+/// the full history is retained (the typed failure was recorded durably).
+/// Either way the loop continues with the provider call.
+fn compact_result_phase(context: map) -> map {
+    let plan: map = ctx_map(context, "plan");
+    let ok_flag: bool = ctx_bool(context, "compact_ok", false);
+    let error: string = ctx_string(context, "compact_error", "");
+    let messages: array = ctx_array(context, "messages");
+    let turn: int = ctx_int(context, "turn", 0);
+    let last_text: string = ctx_string(context, "last_text", "");
+    stream::emit({
+        type: "compact.completed",
+        ok: ok_flag,
+        error: error,
+        turn: turn
+    });
+    let mut next_context: map = context;
+    if ok_flag {
+        next_context["messages"] = compact_trim(messages, plan);
+    }
+    provider_attempt(next_context, turn, ctx_int(context, "max_turns", 1), 0, last_text)
+}
+
+/// Trims the compacted prefix from the in-run message list (the plan's
+/// `count`, decoded from the struct summary).
+fn compact_trim(messages: array, plan: map) -> array {
+    let summary: map = json::decode(ctx_string(plan, "summary_json", "{}"));
+    let count: int = ctx_int(summary, "count", 0);
+    let mut trimmed: array = [];
+    let mut index = count;
+    while index < messages.length {
+        trimmed[trimmed.length] = messages[index].copy();
+        index += 1;
+    }
+    trimmed
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+//
+// The exported entry is `agent_run`, NOT `run`: every imported harness /
+// storage module also exports `run`, and the pinned core flattens ALL merged
+// modules' exported callables into one name-keyed table
+// (`Program::exported_callables`, `Vm::resolve_exported_callable`), so a
+// multi-module program cannot expose a root entry named `run` without
+// resolving to an arbitrary module's function. This is a documented core gap
+// (see plans/2026-08-15_a5-production-serial-loop.md and the
+// `a5-core-repros` fixtures); the embedding resolves the unique
+// `agent_run` entry for the production loop.
+
+pub fn agent_run(context: map) -> map {
+    let phase: string = ctx_string(context, "phase", "start");
+    let run_id: string = ctx_string(context, "run_id", "");
+    let turn: int = ctx_int(context, "turn", 0);
     let config: map = ctx_map(context, "config");
     let parallel: bool = ctx_bool(config, "parallel", false);
     let task: bool = ctx_bool(config, "task", false);
-    let mut decision: map = rejected_decision("unknown_phase", "run phase is not recognized by the serial loop policy", turn);
+    let mut decision: map = rejected_decision("unknown_phase", "run phase is not recognized by the serial loop", turn);
     if parallel == true {
         decision = handoff_decision(
             "parallel.handoff",
@@ -367,9 +1042,11 @@ pub fn run(context: map) -> map {
             "task delegation requested; the serial loop defers to the A6 subagent policy (subagents.rss)"
         );
     } else if phase == "start" {
-        decision = start_phase(turn, max_turns, model);
-    } else if phase == "provider_result" {
-        decision = provider_result(turn, max_turns, retry_count, max_retries, provider, config);
+        decision = start_phase(context);
+    } else if phase == "approval.resume" {
+        decision = approval_resume_phase(context);
+    } else if phase == "compact.result" {
+        decision = compact_result_phase(context);
     }
     decision
 }

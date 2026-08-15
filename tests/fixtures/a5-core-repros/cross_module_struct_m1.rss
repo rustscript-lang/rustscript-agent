@@ -1,0 +1,10 @@
+// A5 core repro — module A: declares a struct and exports a function that
+// takes it as its typed parameter (the A2 `StorageCommand` shape).
+struct Cmd {
+    op: string,
+    payload: string
+}
+
+pub fn run(command: Cmd) -> map {
+    { ok: true, op: command.op.copy() }
+}

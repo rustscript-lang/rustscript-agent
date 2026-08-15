@@ -1,0 +1,13 @@
+// A5 core repro — root: tries to construct the module's struct-typed
+// parameter. Struct type names resolve per module in the pinned core, so a
+// script module cannot construct or even NAME another module's struct type,
+// and passing a dynamic map for a struct-typed script-to-script parameter is
+// rejected by the strict callable-schema check. The loop therefore cannot
+// itself execute the A2 storage program; the service executes the RSS-planned
+// typed commands (durable sequencing). This repro documents the gap.
+use self::cross_module_struct_m1::{run as m1_run};
+
+pub fn run(context: map) -> map {
+    let command: Cmd = { op: "x", payload: "y" };
+    m1_run(command)
+}

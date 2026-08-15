@@ -1,0 +1,7 @@
+// A5 core repro — module A: exports its own `run` entry (like every harness /
+// storage module). The root imports it and exports a DIFFERENT entry; the
+// root's context only carries the root entry's fields.
+pub fn run(context: map) -> map {
+    let op: string = context["op"];
+    { origin: "m1", op: op }
+}

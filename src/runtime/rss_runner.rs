@@ -358,11 +358,23 @@ impl Default for RunCancellation {
 }
 
 /// Compiles and drives one exported `run(context)` callable per run.
+///
+/// The legacy entry contract is the exported `run` callable. The production
+/// serial loop program (`rss/agent/main.rss`) exposes its entry as
+/// `agent_run` because the pinned core flattens every merged module's
+/// exported callables into one name-keyed table and a multi-module program
+/// cannot carry a second exported `run` (the harness/storage modules export
+/// `run` themselves) — see plans/2026-08-15_a5-production-serial-loop.md.
 #[derive(Clone, Debug)]
 pub struct AgentRunner {
     program: rustscript_vm::Program,
     config: AgentConfig,
+    entry: String,
 }
+
+/// The production serial loop's exported entry (unique across the merged
+/// module graph; see [`AgentRunner`]).
+pub const PRODUCTION_LOOP_ENTRY: &str = "agent_run";
 
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
@@ -375,7 +387,11 @@ impl AgentRunner {
         let program = compile_source(source)
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
-        Ok(Self { program, config })
+        Ok(Self {
+            program,
+            config,
+            entry: "run".to_string(),
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
@@ -390,7 +406,24 @@ impl AgentRunner {
         let program = rustscript_vm::compile_source_file(&path)
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
-        Ok(Self { program, config })
+        Ok(Self {
+            program,
+            config,
+            entry: "run".to_string(),
+        })
+    }
+
+    /// Compiles a program whose exported entry is not `run` — used for the
+    /// production serial loop (`rss/agent/main.rss`, entry [`PRODUCTION_LOOP_ENTRY`])
+    /// whose merged module graph contains other modules exporting `run`.
+    pub fn from_file_with_entry(
+        path: impl AsRef<Path>,
+        config: AgentConfig,
+        entry: &str,
+    ) -> Result<Self> {
+        let mut runner = Self::from_file(path, config)?;
+        runner.entry = entry.to_string();
+        Ok(runner)
     }
 
     /// Runs the exported `run(context)` entry with no event sink and no
@@ -435,7 +468,7 @@ impl AgentRunner {
         }
         self.drive_root_frame(&mut vm, cancellation)?;
         let callable = vm
-            .resolve_exported_callable("run")
+            .resolve_exported_callable(&self.entry)
             .map_err(|_| RunError::NoEntry)?;
         let arity = match &callable {
             Value::Callable(callable) => self

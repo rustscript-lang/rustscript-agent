@@ -1,0 +1,15 @@
+// A5 core repro — root: imports a module that also exports `run` (named
+// clause, so no compile-time binding conflict) and exposes its OWN `run`
+// entry. The pinned core flattens every merged module's exported callables
+// into one name-keyed table (`Program::exported_callables`), so
+// `Vm::resolve_exported_callable("run")` returns the FIRST entry named `run`
+// in that table — which is not necessarily the root's. The embedding
+// therefore resolves a UNIQUE entry name for the production loop
+// (`agent_run`); a root entry named `run` in a multi-module program resolves
+// to an arbitrary module's function. This repro documents the gap.
+use self::dup_entry_m1::{run as m1_run};
+
+pub fn run(context: map) -> map {
+    let phase: string = context["phase"];
+    { origin: "root", phase: phase }
+}

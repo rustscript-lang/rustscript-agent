@@ -237,3 +237,50 @@ fn a6_no_task_script_cannot_call_task_spawn() {
         "expected the task::spawn unknown-namespace rejection, got: {error}"
     );
 }
+
+/// A5 CORE_BLOCKER (exported-entry ambiguity): the pinned core flattens every
+/// merged module's exported callables into one name-keyed table, so a root
+/// entry named `run` in a multi-module program does not reliably resolve to
+/// the root's function. The production loop therefore exposes its entry as
+/// `agent_run` (unique across the merged graph) and the embedding resolves
+/// that name. The fixture (root + module both exporting `run`) documents the
+/// gap: resolving "run" executes the imported module's function, which reads
+/// fields the root-shaped context does not carry.
+#[test]
+fn a5_duplicate_run_entry_resolves_to_an_imported_module_function() {
+    let config = AgentConfig::default();
+    let runner = AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/a5-core-repros/dup_entry_root.rss"),
+        config,
+    )
+    .expect("the repro program should compile");
+    let context = Value::map(vec![(Value::string("phase"), Value::string("start"))]);
+    let result = runner.run_with_context(context);
+    assert!(
+        matches!(result, Err(ref error) if error.to_string().contains("map key not found")),
+        "resolving 'run' must execute the imported module's function (the gap), got: {result:?}"
+    );
+}
+
+/// A5 CORE_BLOCKER (cross-module struct construction): struct type names
+/// resolve per module, so a script module cannot construct (or name) another
+/// module's struct-typed parameter, and the strict callable-schema check
+/// rejects a dynamic map for a struct-typed script-to-script parameter. The
+/// loop therefore cannot itself execute the A2 storage program; the service
+/// executes the RSS-planned typed commands.
+#[test]
+fn a5_cross_module_struct_construction_is_rejected() {
+    let config = AgentConfig::default();
+    let error = AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/a5-core-repros/cross_module_struct_root.rss"),
+        config,
+    )
+    .expect_err("a root module must not be able to construct another module's struct");
+    let message = error.to_string();
+    assert!(
+        message.contains("unknown struct schema 'Cmd'") || message.contains("type mismatch"),
+        "expected the per-module struct resolution rejection, got: {message}"
+    );
+}

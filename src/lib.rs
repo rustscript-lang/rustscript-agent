@@ -26,8 +26,9 @@ pub use runtime::approval_bridge::{
     PendingApproval, Resolution, RiskClass,
 };
 pub use runtime::rss_runner::{
-    AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
-    RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
+    AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, PRODUCTION_LOOP_ENTRY,
+    RUN_EPOCH_CHECK_INTERVAL, RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError,
+    RunError, RunEventSink,
 };
 pub use runtime::subagent_supervisor::{
     ChildExecutor, ChildOutcome, ChildSpec, SupervisionMode, SupervisorCancel, supervise_batch,
