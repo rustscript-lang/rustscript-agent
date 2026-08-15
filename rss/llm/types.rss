@@ -18,9 +18,10 @@
 //   provider_options: {base_url, api_key, model, ...}
 //
 // Tool arguments and schemas travel as JSON strings (`arguments_json`,
-// `schema_json`) because RustScript's `json::encode` only accepts
-// struct-shaped values; the adapters splice them into the encoded wire body.
-// The canonical response carries parsed maps:
+// `schema_json`); the chat adapter `json::decode`s them into runtime maps and
+// embeds them in the encoded wire body (core revision fd4b570 / B4 admits
+// runtime string-key maps to `json::encode`). The canonical response carries
+// parsed maps:
 //
 //   response: {text, tool_calls: [{id, name, arguments: map}],
 //              usage: {input_tokens, output_tokens, total_tokens},

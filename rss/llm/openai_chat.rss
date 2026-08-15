@@ -1,14 +1,15 @@
 // OpenAI Chat Completions adapter (protocol mapping only; no agent loop).
 //
 // Maps the canonical LlmRequest (rss/llm/types.rss) onto the
-// /chat/completions wire protocol and back. Tool schemas arrive as
-// `schema_json` strings and are spliced into the encoded wire body because
-// RustScript's json::encode only accepts struct-shaped values (generic maps
-// are rejected by the type checker). Each tool and user message gets its own
-// indexed literal marker (`__RSS_TOOL_SCHEMA_<i>__`,
-// `__RSS_USER_PARTS_<i>__`), replaced by string_replace_literal (which
-// replaces ALL occurrences — see the plan's P3 marker note for the collision
-// surface).
+// /chat/completions wire protocol and back. With core revision fd4b570 (B4),
+// `json::encode` admits runtime string-key maps recursively, so the wire
+// request is built as a runtime map and encoded directly — no marker-based
+// splicing, and no struct-shaped placeholder layout. Tool schemas arrive as
+// `schema_json` strings, are `json::decode`d into nested runtime maps, and
+// are embedded in place; user message content parts are embedded as real
+// arrays. A user text that equals any previous marker string survives
+// byte-identical because it is a real string value, never re-interpreted as a
+// marker.
 //
 // Compiler-contract notes for this adapter module (non-root module). Before
 // core revision d8cf291 the emitted callable schemas were corrupted for a
@@ -29,78 +30,6 @@ use json;
 use bytes;
 use http;
 use self::types as types;
-
-struct WireTextPart {
-    type: string,
-    text: string
-}
-
-struct WireFunction {
-    name: string,
-    description: string,
-    parameters: string
-}
-
-struct WireTool {
-    type: string,
-    function: WireFunction
-}
-
-struct WireFunctionCall {
-    name: string,
-    arguments: string
-}
-
-struct WireToolCall {
-    id: string,
-    type: string,
-    function: WireFunctionCall
-}
-
-struct WireMessage {
-    role: string,
-    content: string?,
-    tool_call_id: string?,
-    tool_calls: array<WireToolCall>?
-}
-
-struct WireStreamOptions {
-    include_usage: bool
-}
-
-struct WireRequest {
-    model: string,
-    messages: array<WireMessage>,
-    tools: array<WireTool>?,
-    tool_choice: string?,
-    temperature: float?,
-    top_p: float?,
-    max_tokens: int?,
-    stream: bool,
-    stream_options: WireStreamOptions?,
-    reasoning_effort: string?
-}
-
-/// Marker for one tool's raw schema. The encoded body carries the marker as
-/// the tool's `parameters` string and `chat_splice_tool_schemas` replaces it
-/// with the raw schema JSON (spliced because json::encode only accepts
-/// struct-shaped values). The marker is per-tool INDEXED: a shared marker
-/// would make every replace pass hit every tool's placeholder, so with two or
-/// more tools all schemas would collapse to the first tool's.
-fn tool_schema_marker(index: int) -> string {
-    let encoded: string = json::encode(index);
-    "__RSS_TOOL_SCHEMA_" + encoded + "__"
-}
-
-/// Marker for one user message's text parts. The encoded body carries the
-/// marker as the message's `content` string and `chat_splice_user_parts`
-/// replaces it with the raw JSON parts array (same splice mechanism as tool
-/// schemas), producing the standard `"content": [{"type":"text",...}]` wire
-/// shape.
-fn user_parts_marker(index: int) -> string {
-    let encoded: string = json::encode(index);
-    "__RSS_USER_PARTS_" + encoded + "__"
-}
 
 // ---------------------------------------------------------------------------
 // Entry
@@ -135,10 +64,10 @@ fn openai_chat_complete(request: map, base_url: string, api_key: string, provide
     }
 }
 
-/// The whole completion path: wire building, tool-schema splicing, and the
-/// buffered transport call. Every script call here is at top level or in an
-/// expression-if branch (statement-if bodies must not contain calls in this
-/// module; see the file header).
+/// The whole completion path: wire building and the buffered transport call.
+/// Every script call here is at top level or in an expression-if branch
+/// (statement-if bodies must not contain calls in this module; see the file
+/// header).
 fn chat_send_complete(
     request: map,
     model: string,
@@ -146,12 +75,8 @@ fn chat_send_complete(
     api_key: string,
     provider: string
 ) -> map {
-    let body_text: string = chat_encode_wire(request, model, false);
+    let body: string = chat_encode_wire(request, model, false);
     let url: string = base_url + "/chat/completions";
-    let body: string = chat_splice_tool_schemas(
-        chat_splice_user_parts(body_text, types::request_array(request, "messages")),
-        types::request_array(request, "tools")
-    );
     let response: map = http::client::request({
         method: "POST",
         url: url,
@@ -172,8 +97,14 @@ fn chat_send_complete(
 // ---------------------------------------------------------------------------
 // Wire request building
 // ---------------------------------------------------------------------------
+//
+// The wire request is built as a runtime string-key map and encoded with a
+// single `json::encode` call (core revision fd4b570 / B4 admits runtime maps
+// recursively). No struct-shaped placeholders and no marker-based splicing:
+// tool `parameters` are `json::decode`d schema maps embedded in place, and
+// user message `content` parts are embedded as real arrays.
 
-/// Encodes the wire request struct as JSON. `json::encode`'s return type is
+/// Encodes the wire request map as JSON. `json::encode`'s return type is
 /// unknown to the type checker, so the annotated local lives here with a
 /// declared `string` return.
 fn chat_encode_wire(request: map, model: string, stream: bool) -> string {
@@ -181,20 +112,10 @@ fn chat_encode_wire(request: map, model: string, stream: bool) -> string {
     body_text
 }
 
-fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
-    let messages: array<WireMessage> = chat_build_messages(
-        types::request_array(request, "messages")
-    );
-    let tools: array<WireTool> = chat_build_tools(types::request_array(request, "tools"));
-    let mut wire_tools: array<WireTool>? = null;
-    if tools.length > 0 {
-        wire_tools = tools;
-    }
+fn chat_build_wire(request: map, model: string, stream: bool) -> map {
+    let messages: array = chat_build_messages(types::request_array(request, "messages"));
+    let tools: array = chat_build_tools(types::request_array(request, "tools"));
     let tool_choice: string = types::request_string(request, "tool_choice");
-    let mut wire_tool_choice: string? = null;
-    if tool_choice != "" {
-        wire_tool_choice = tool_choice;
-    }
     let reasoning: string = types::request_string(request, "reasoning");
     let sampling: map = types::request_map(request, "sampling");
     let temperature_raw: map = types::sampling_float(sampling, "temperature");
@@ -204,60 +125,55 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
     let top_p_present: bool = top_p_raw["present"];
     let top_p_value: float = top_p_raw["value"];
     let max_output: int = types::request_int(request, "max_output_tokens", 0);
-    let mut temperature: float? = null;
-    let mut top_p: float? = null;
-    let mut max_tokens: int? = null;
-    let mut stream_options: WireStreamOptions? = null;
-    let mut reasoning_effort: string? = null;
-    if temperature_present {
-        temperature = temperature_value;
-    }
-    if top_p_present {
-        top_p = top_p_value;
-    }
-    if max_output > 0 {
-        max_tokens = max_output;
-    }
-    if stream {
-        stream_options = { include_usage: true };
-    }
-    if reasoning != "" {
-        reasoning_effort = reasoning;
-    }
-    {
+    let mut wire: map = {
         model: model,
         messages: messages,
-        tools: wire_tools,
-        tool_choice: wire_tool_choice,
-        temperature: temperature,
-        top_p: top_p,
-        max_tokens: max_tokens,
-        stream: stream,
-        stream_options: stream_options,
-        reasoning_effort: reasoning_effort
+        stream: stream
+    };
+    if tools.length > 0 {
+        wire["tools"] = tools;
     }
+    if tool_choice != "" {
+        wire["tool_choice"] = tool_choice;
+    }
+    if temperature_present {
+        wire["temperature"] = temperature_value;
+    }
+    if top_p_present {
+        wire["top_p"] = top_p_value;
+    }
+    if max_output > 0 {
+        wire["max_tokens"] = max_output;
+    }
+    if stream {
+        wire["stream_options"] = { include_usage: true };
+    }
+    if reasoning != "" {
+        wire["reasoning_effort"] = reasoning;
+    }
+    wire
 }
 
 /// Converts canonical messages into wire messages. User `tool_result` parts
 /// become dedicated `tool` role messages; assistant `tool_call` parts become
 /// assistant `tool_calls`.
-fn chat_build_messages(messages: array) -> array<WireMessage> {
-    let mut wire: array<WireMessage> = [];
+fn chat_build_messages(messages: array) -> array {
+    let mut wire: array = [];
     let mut i = 0;
     while i < messages.length {
         let message: map = types::array_entry(messages, i);
         if message.has("role") {
-            wire = chat_append_message_by_role(wire, message, i);
+            wire = chat_append_message_by_role(wire, message);
         }
         i += 1;
     }
     wire
 }
 
-fn chat_append_message_by_role(wire: array<WireMessage>, message: map, index: int) -> array<WireMessage> {
+fn chat_append_message_by_role(wire: array, message: map) -> array {
     let role: string = types::message_role(message);
     if role == "user" => {
-        chat_append_user_message(wire, message, index)
+        chat_append_user_message(wire, message)
     } else if role == "assistant" => {
         chat_append_assistant_message(wire, message)
     } else => {
@@ -266,11 +182,11 @@ fn chat_append_message_by_role(wire: array<WireMessage>, message: map, index: in
 }
 
 /// Appends one `user` message (only when it carries text parts; the wire
-/// `content` holds a marker that `chat_splice_user_parts` replaces with the
-/// standard parts array) plus one `tool` message per tool_result part.
-fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) -> array<WireMessage> {
+/// `content` holds the real parts array) plus one `tool` message per
+/// tool_result part.
+fn chat_append_user_message(wire: array, message: map) -> array {
     let parts: array = types::message_content(message);
-    let mut result: array<WireMessage> = wire;
+    let mut result: array = wire;
     let mut i = 0;
     while i < parts.length {
         let part: map = types::array_entry(parts, i);
@@ -281,29 +197,26 @@ fn chat_append_user_message(wire: array<WireMessage>, message: map, index: int) 
                 result[result.length] = {
                     role: "tool",
                     content: content,
-                    tool_call_id: tool_call_id,
-                    tool_calls: null
+                    tool_call_id: tool_call_id
                 };
             }
         }
         i += 1;
     }
-    let text_parts: array<WireTextPart> = chat_user_text_parts(message);
+    let text_parts: array = chat_user_text_parts(message);
     if text_parts.length > 0 {
         result[result.length] = {
             role: "user",
-            content: user_parts_marker(index),
-            tool_call_id: null,
-            tool_calls: null
+            content: text_parts
         };
     }
     result
 }
 
 /// The `[{type: "text", text}]` parts of one canonical user message.
-fn chat_user_text_parts(message: map) -> array<WireTextPart> {
+fn chat_user_text_parts(message: map) -> array {
     let parts: array = types::message_content(message);
-    let mut text_parts: array<WireTextPart> = [];
+    let mut text_parts: array = [];
     let mut i = 0;
     while i < parts.length {
         let part: map = types::array_entry(parts, i);
@@ -319,10 +232,10 @@ fn chat_user_text_parts(message: map) -> array<WireTextPart> {
 }
 
 /// Appends one `assistant` message with text content and/or tool_calls.
-fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> array<WireMessage> {
+fn chat_append_assistant_message(wire: array, message: map) -> array {
     let parts: array = types::message_content(message);
     let mut text: string = "";
-    let mut tool_calls: array<WireToolCall> = [];
+    let mut tool_calls: array = [];
     let mut i = 0;
     while i < parts.length {
         let part: map = types::array_entry(parts, i);
@@ -345,25 +258,19 @@ fn chat_append_assistant_message(wire: array<WireMessage>, message: map) -> arra
         }
         i += 1;
     }
-    let mut content: string? = null;
+    let mut wire_message: map = { role: "assistant" };
     if text != "" {
-        content = text;
+        wire_message["content"] = text;
     }
-    let mut wire_calls: array<WireToolCall>? = null;
     if tool_calls.length > 0 {
-        wire_calls = tool_calls;
+        wire_message["tool_calls"] = tool_calls;
     }
-    let mut result: array<WireMessage> = wire;
-    result[result.length] = {
-        role: "assistant",
-        content: content,
-        tool_call_id: null,
-        tool_calls: wire_calls
-    };
+    let mut result: array = wire;
+    result[result.length] = wire_message;
     result
 }
 
-fn chat_append_simple_message(wire: array<WireMessage>, role: string, message: map) -> array<WireMessage> {
+fn chat_append_simple_message(wire: array, role: string, message: map) -> array {
     let parts: array = types::message_content(message);
     let mut text: string = "";
     let mut i = 0;
@@ -377,86 +284,37 @@ fn chat_append_simple_message(wire: array<WireMessage>, role: string, message: m
         }
         i += 1;
     }
-    let mut result: array<WireMessage> = wire;
-    result[result.length] = {
-        role: role,
-        content: text,
-        tool_call_id: null,
-        tool_calls: null
-    };
+    let mut result: array = wire;
+    result[result.length] = { role: role, content: text };
     result
 }
 
-fn chat_build_tools(tools: array) -> array<WireTool> {
-    let mut wire: array<WireTool> = [];
+fn chat_build_tools(tools: array) -> array {
+    let mut wire: array = [];
     let mut i = 0;
     while i < tools.length {
         let tool: map = types::array_entry(tools, i);
         if tool.has("name") {
             let name: string = types::tool_name(tool);
             let description: string = types::tool_description(tool);
+            let schema_json: string = types::tool_schema_json(tool);
+            let mut parameters: map = {};
+            if schema_json != "" {
+                let decoded: map = json::decode(schema_json);
+                parameters = decoded;
+            }
             wire[wire.length] = {
                 type: "function",
                 function: {
                     name: name,
                     description: description,
-                    parameters: tool_schema_marker(i)
+                    parameters: parameters
                 }
             };
         }
         i += 1;
     }
     wire
-}
-
-/// Replaces each tool schema marker with the tool's raw schema JSON. The
-/// marker is unique per tool (indexed), so each replace pass touches exactly
-/// one placeholder — a shared marker would collapse every tool's schema to
-/// the first tool's.
-fn chat_splice_tool_schemas(body: string, tools: array) -> string {
-    let mut result: string = body;
-    let mut i = 0;
-    while i < tools.length {
-        let tool: map = types::array_entry(tools, i);
-        if tool.has("schema_json") {
-            let schema_json: string = types::tool_schema_json(tool);
-            result = string_replace_literal(
-                result,
-                "\"" + tool_schema_marker(i) + "\"",
-                schema_json
-            );
-        }
-        i += 1;
-    }
-    result
-}
-
-/// Replaces each user-parts marker (`__RSS_USER_PARTS_<index>__`, with the
-/// surrounding quotes) with the JSON-encoded `[{type: "text", text}]` array,
-/// so user messages carry the standard OpenAI content-parts wire shape.
-/// The marker index is the canonical message position, matching
-/// `chat_append_user_message`'s marker assignment.
-fn chat_splice_user_parts(body: string, messages: array) -> string {
-    let mut result: string = body;
-    let mut i = 0;
-    while i < messages.length {
-        let message: map = types::array_entry(messages, i);
-        if message.has("role") {
-            if types::message_role(message) == "user" {
-                let text_parts: array<WireTextPart> = chat_user_text_parts(message);
-                if text_parts.length > 0 {
-                    let encoded: string = json::encode(text_parts);
-                    result = string_replace_literal(
-                        result,
-                        "\"" + user_parts_marker(i) + "\"",
-                        encoded
-                    );
-                }
-            }
-        }
-        i += 1;
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -670,8 +528,8 @@ fn openai_chat_stream(request: map, base_url: string, api_key: string, provider:
     }
 }
 
-/// The whole streaming path: wire building (same splices as the buffered
-/// path, with `stream: true` + `stream_options.include_usage`), the SSE
+/// The whole streaming path: wire building (same runtime-map encode as the
+/// buffered path, with `stream: true` + `stream_options.include_usage`), the SSE
 /// transport with the accumulator closure, and canonical response
 /// construction from the accumulated locals.
 fn chat_send_stream(
@@ -681,12 +539,8 @@ fn chat_send_stream(
     api_key: string,
     provider: string
 ) -> map {
-    let body_text: string = chat_encode_wire(request, model, true);
+    let body: string = chat_encode_wire(request, model, true);
     let url: string = base_url + "/chat/completions";
-    let body: string = chat_splice_tool_schemas(
-        chat_splice_user_parts(body_text, types::request_array(request, "messages")),
-        types::request_array(request, "tools")
-    );
     let mut text: string = "";
     let mut stop_reason: string = "";
     let mut input_tokens: int = 0;

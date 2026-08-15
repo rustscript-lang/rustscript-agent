@@ -38,10 +38,15 @@
 //! that agent work exists. Four buffered suites are green and remain so:
 //! the structured provider-error mapping
 //! (`openai_chat_provider_error_is_structured`), the P1 standard-wire
-//! guard (`openai_chat_wire_format_is_standard`), and the two marker-splice
-//! preservation guards
-//! (`openai_chat_wire_preserves_marker_like_user_text`,
-//! `openai_chat_wire_preserves_marker_like_tool_schema`).
+//! guard (`openai_chat_wire_format_is_standard`), the marker-like-text
+//! preservation guard
+//! (`openai_chat_wire_preserves_marker_like_user_text`), and the marker-like
+//! tool-schema guard (`openai_chat_wire_preserves_marker_like_tool_schema`).
+//! These marker-like guards now exercise the runtime-map wire builder (the
+//! adapter no longer splices literal markers; text and schema strings are
+//! real JSON values), and the true-collision guard
+//! (`openai_chat_wire_runtime_map_avoids_marker_collision`) proves a message
+//! whose text equals a former marker survives byte-identical.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -686,6 +691,61 @@ fn openai_chat_wire_preserves_marker_like_tool_schema() {
     assert_eq!(
         tools[1]["function"]["description"],
         json!("parts __RSS_USER_PARTS_0__ mention")
+    );
+}
+
+/// Marker-splice collision guard (true collision, RED on splice, GREEN on
+/// runtime-map): a user message whose text is EXACTLY the full quoted marker
+/// of a LATER user message. `chat_splice_user_parts` replaces every
+/// occurrence of the quoted marker, and the later pass runs after the earlier
+/// message's parts have already been spliced in — so the earlier message's
+/// already-spliced text (which equals that marker) is corrupted by the later
+/// pass. This is exactly the failure the runtime-map migration eliminates:
+/// when the wire body is built as a runtime map and `json::encode`d, user
+/// text is a real string value and is never re-interpreted as a marker.
+#[test]
+fn openai_chat_wire_runtime_map_avoids_marker_collision() {
+    let body = read_fixture("openai_chat/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    let runner = harness_runner(port);
+    // Message 0's text is EXACTLY the marker that message 1's splice pass will
+    // replace with message 1's parts array. Under the marker-splice
+    // implementation the later pass (`string_replace_literal` replaces ALL
+    // occurrences) corrupts message 0's already-spliced text.
+    let mut request = canonical_request(port, false);
+    request["messages"] = json!([
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "__RSS_USER_PARTS_1__"}]
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        }
+    ]);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let messages = wire["messages"].as_array().expect("messages array");
+    let texts = messages
+        .iter()
+        .filter(|message| message["role"] == json!("user"))
+        .flat_map(|message| {
+            message["content"]
+                .as_array()
+                .expect("user content parts array")
+                .iter()
+                .map(|part| part["text"].as_str().expect("text part").to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        vec!["__RSS_USER_PARTS_1__", "hello"],
+        "a message whose text equals a later marker must survive byte-identical: {wire}"
     );
 }
 
