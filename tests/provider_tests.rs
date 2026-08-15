@@ -1052,17 +1052,124 @@ fn openai_responses_buffered_text_tool_usage_reasoning() {
     assert_eq!(input[3]["type"], json!("function_call"));
     assert_eq!(input[3]["call_id"], json!("call_ab12"));
     assert_eq!(input[3]["name"], json!("read_file"));
-    assert_eq!(
-        input[3]["arguments"],
-        json!("{\"path\":\"README.md\"}")
-    );
-    // tools: Responses shape {type, function:{name, description, parameters}}
+    assert_eq!(input[3]["arguments"], json!("{\"path\":\"README.md\"}"));
+    // tools: Responses official FLAT shape {type, name, description,
+    // parameters} — NOT nested under a `function` key.
     assert_eq!(wire["tools"][0]["type"], json!("function"));
-    assert_eq!(wire["tools"][0]["function"]["name"], json!("read_file"));
+    assert_eq!(wire["tools"][0]["name"], json!("read_file"));
     assert_eq!(
-        wire["tools"][0]["function"]["parameters"]["required"][0],
-        json!("path")
+        wire["tools"][0]["description"],
+        json!("Read bounded text from a workspace file")
     );
+    assert_eq!(wire["tools"][0]["parameters"]["required"][0], json!("path"));
+    assert!(
+        wire["tools"][0].get("function").is_none(),
+        "Responses tools are flat, not nested under function: {wire}"
+    );
+    // tool_choice / parallel_tool_calls are absent from this canonical
+    // request's provider_options, so they must be OMITTED from the wire
+    // entirely. serde_json indexes a missing key as Null, so assert absence
+    // via get().is_none() plus a literal body check.
+    assert!(
+        wire.get("tool_choice").is_none(),
+        "missing tool_choice must be omitted from the wire body: {wire}"
+    );
+    assert!(
+        wire.get("parallel_tool_calls").is_none(),
+        "missing parallel_tool_calls must be omitted from the wire body: {wire}"
+    );
+    assert!(
+        !recorded.body.contains("tool_choice"),
+        "wire body must not mention tool_choice at all: {}",
+        recorded.body
+    );
+    assert!(
+        !recorded.body.contains("parallel_tool_calls"),
+        "wire body must not mention parallel_tool_calls at all: {}",
+        recorded.body
+    );
+}
+
+/// Provider-level knobs carried in the canonical request's `provider_options`
+/// (tool_choice, parallel_tool_calls) must reach the BUFFERED Responses wire.
+#[test]
+fn openai_responses_buffered_provider_options_reach_wire() {
+    let body = read_fixture("openai_responses/response.json");
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["provider_options"]["tool_choice"] = json!("required");
+    request["provider_options"]["parallel_tool_calls"] = json!(true);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["tool_choice"], json!("required"));
+    assert_eq!(wire["parallel_tool_calls"], json!(true));
+}
+
+/// Review P2: `tool_choice` is canonical at the TOP LEVEL of the request
+/// (types.rss contract), exactly like the chat adapter. A top-level value
+/// must reach the BUFFERED Responses wire even when `provider_options`
+/// carries no alias.
+#[test]
+fn openai_responses_buffered_top_level_tool_choice_reaches_wire() {
+    let body = read_fixture("openai_responses/response.json");
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["tool_choice"] = json!("required");
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["tool_choice"], json!("required"));
+    assert!(
+        wire.get("parallel_tool_calls").is_none(),
+        "parallel_tool_calls must stay omitted when absent: {wire}"
+    );
+}
+
+/// Review P2 priority: when BOTH the canonical top-level `tool_choice` and
+/// the legacy `provider_options.tool_choice` alias are present, the
+/// TOP-LEVEL value wins.
+#[test]
+fn openai_responses_buffered_tool_choice_priority_top_level_wins() {
+    let body = read_fixture("openai_responses/response.json");
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["tool_choice"] = json!("none");
+    request["provider_options"]["tool_choice"] = json!("required");
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["tool_choice"], json!("none"));
 }
 
 #[test]
@@ -1097,6 +1204,44 @@ fn openai_responses_stream_text_tool_usage() {
     assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
     let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
     assert_eq!(wire["stream"], json!(true));
+    // Absent provider knobs must be omitted from the STREAM wire too.
+    assert!(
+        wire.get("tool_choice").is_none(),
+        "missing tool_choice must be omitted from the stream wire: {wire}"
+    );
+    assert!(
+        wire.get("parallel_tool_calls").is_none(),
+        "missing parallel_tool_calls must be omitted from the stream wire: {wire}"
+    );
+}
+
+/// Provider-level knobs carried in the canonical request's `provider_options`
+/// must reach the STREAM Responses wire (tool_choice plus a present-but-false
+/// parallel_tool_calls, proving presence-aware emission).
+#[test]
+fn openai_responses_stream_provider_options_reach_wire() {
+    let events = sse_events(&read_fixture("openai_responses/stream.sse"));
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, true);
+    request["provider_options"]["tool_choice"] = json!("auto");
+    request["provider_options"]["parallel_tool_calls"] = json!(false);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+    assert_eq!(wire["tool_choice"], json!("auto"));
+    assert_eq!(wire["parallel_tool_calls"], json!(false));
 }
 
 #[test]
@@ -1169,6 +1314,50 @@ fn openai_responses_stream_eof_without_done_fails_closed() {
     assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
     let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
     assert_eq!(wire["stream"], json!(true));
+}
+
+/// A3 review P2 guard extension: a stream that terminates with the
+/// `data: [DONE]` terminator but NEVER delivers the terminal
+/// `response.completed` event is malformed and must fail CLOSED too (the
+/// completion event is what carries the terminal usage/status; a `[DONE]`
+/// without it must not surface as a successful partial response).
+#[test]
+fn openai_responses_stream_done_without_completed_fails_closed() {
+    let events = vec!["data: [DONE]\n\n".to_string()];
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(
+        result["ok"] == json!(false),
+        "[DONE] without response.completed must fail closed, got {result}"
+    );
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("api_error"));
+    assert_eq!(error["code"], json!("stream_missing_completion"));
+    assert_eq!(error["status"], json!(200));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("response.completed"),
+        "{error:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+    assert!(wire.get("tool_choice").is_none());
+    assert!(wire.get("parallel_tool_calls").is_none());
 }
 
 // ---------------------------------------------------------------------------

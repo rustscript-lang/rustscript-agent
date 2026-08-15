@@ -10,12 +10,22 @@
 //                                {type: "tool_result", tool_call_id, content, is_error} |
 //                                {type: "tool_call", tool_call_id, name, arguments_json}]}]
 //   tools: [{name, description, schema_json}]
-//   tool_choice: string | null
+//   tool_choice: string | null          (canonical, top-level)
 //   reasoning: string | null
 //   sampling: {temperature: float|null, top_p: float|null}
 //   max_output_tokens: int
 //   stream: bool
-//   provider_options: {base_url, api_key, model, ...}
+//   provider_options: {base_url, api_key, model, ...,
+//                      parallel_tool_calls: bool}
+//
+// `tool_choice` is canonical at the TOP LEVEL (as in the chat adapter). The
+// Responses adapter additionally honors a legacy
+// `provider_options.tool_choice` alias for older callers, but a top-level
+// value always wins when both are present. `parallel_tool_calls` is a
+// provider_options knob (Responses wire field) and is presence-aware: it is
+// emitted only when the key is present with a bool value — absent means
+// omitted from the wire, an explicit false stays false (disables parallel
+// calls).
 //
 // Tool arguments and schemas travel as JSON strings (`arguments_json`,
 // `schema_json`); the chat adapter `json::decode`s them into runtime maps and
