@@ -1,0 +1,80 @@
+// A4 approval policy (gateway-api plan section 4.5 / A4).
+//
+// Pure decision policy mapping (tool, risk_class, approval_mode) to a typed
+// action: "approve" | "pending" | "deny". The `native_hard_deny` input is a
+// native hard upper bound: when it is set, the policy MUST return "deny" for
+// every mode — RSS approval policy can narrow but never widen a native deny.
+//
+// Modes:
+//   auto    -> auto-approve read-only/trusted, require pending for higher risk
+//   manual  -> always require a pending approval
+//   never   -> never auto-approve; deny everything
+//   all     -> approve everything (unless native hard-deny)
+//
+// This module performs no I/O and no storage access; it only classifies a
+// decision. Persistence of a pending approval and exactly-once resume are the
+// native approval bridge's responsibility.
+
+fn auto_action(risk_class: string) -> string {
+    if risk_class == "read" => { "approve" } else => { "pending" }
+}
+
+// Exported `run(context)` -> discriminated result map.
+// context: {
+//   op: "decide",
+//   tool_name: string,
+//   risk_class: string,
+//   approval_mode: "auto"|"manual"|"never"|"all",
+//   native_hard_deny?: bool
+// }
+pub fn run(context: map) -> map {
+    let op: string = context["op"];
+    if op == "decide" => {
+        let tool_name: string = context["tool_name"];
+        let risk_class: string = context["risk_class"];
+        let mode: string = context["approval_mode"];
+        let hard_deny: bool = if context.has("native_hard_deny") => {
+            let value: bool = context["native_hard_deny"];
+            value
+        } else => {
+            false
+        };
+        let action: string = if hard_deny => {
+            "deny"
+        } else => {
+            if mode == "all" => {
+                "approve"
+            } else => {
+                if mode == "never" => {
+                    "deny"
+                } else => {
+                    if mode == "manual" => {
+                        "pending"
+                    } else => {
+                        if mode == "auto" => {
+                            auto_action(risk_class)
+                        } else => {
+                            "deny"
+                        }
+                    }
+                }
+            }
+        };
+        {
+            ok: true,
+            decision: {
+                tool_name: tool_name,
+                risk_class: risk_class,
+                mode: mode,
+                action: action,
+                native_hard_deny: hard_deny
+            }
+        }
+    } else => {
+        {
+            ok: false,
+            code: "unknown_op",
+            message: "approval op is not recognized"
+        }
+    }
+}

@@ -1,0 +1,48 @@
+// A4 bounded patch tool (gateway-api plan section 3 / A4).
+//
+// Maps `patch.apply` to a bounded read -> apply -> write over the generic
+// `io::*` capability. The replacement is a literal context match
+// (`string_replace_literal`): if the context is absent the file is left
+// unchanged and a typed `context_not_found` failure is returned. Native root,
+// write, and byte bounds are enforced by the `IoPolicy`; this module composes
+// only generic capabilities.
+use io;
+
+// Exported `run(context)` -> discriminated result map.
+// context: { op: "apply", path: string, from: string, to: string }
+pub fn run(context: map) -> map {
+    let op: string = context["op"];
+    if op == "apply" => {
+        let path: string = context["path"];
+        let from: string = context["from"];
+        let to: string = context["to"];
+        let handle: int = io::open(path, "r");
+        let original: string = io::read_all(handle);
+        io::close(handle);
+        if string_contains(original, from) => {
+            let patched: string = string_replace_literal(original, from, to);
+            let write_handle: int = io::open(path, "w");
+            let _written: int = io::write(write_handle, patched);
+            io::flush(write_handle);
+            io::close(write_handle);
+            {
+                ok: true,
+                code: "ok",
+                message: "",
+                data: { bytes: patched.length }
+            }
+        } else => {
+            {
+                ok: false,
+                code: "context_not_found",
+                message: "patch context was not found in the file; file left unchanged"
+            }
+        }
+    } else => {
+        {
+            ok: false,
+            code: "unknown_op",
+            message: "patch op is not recognized"
+        }
+    }
+}

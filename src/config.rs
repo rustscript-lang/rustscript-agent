@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use rustscript_vm::{HttpConfig, SqlitePolicy};
+use rustscript_vm::{HttpConfig, IoPolicy, SqlitePolicy};
 
 /// Telegram Bot API adapter configuration.
 ///
@@ -246,6 +246,10 @@ pub struct AgentGatewayConfig {
 
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
+    /// Generic I/O capability policy (file roots, write/process grants, byte
+    /// limits). Defaults to the fully-restricted policy; the harness tools
+    /// can only narrow it.
+    pub io: IoPolicy,
     pub fuel: Option<u64>,
     /// Optional Telegram adapter configuration. When present, the gateway
     /// binary starts the Telegram poller alongside the API server on the
@@ -438,6 +442,7 @@ impl Default for AgentGatewayConfig {
 
             http: HttpConfig::default(),
             sqlite,
+            io: IoPolicy::default(),
             fuel: Some(10_000_000),
             telegram: None,
         }

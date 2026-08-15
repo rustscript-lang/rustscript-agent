@@ -1,0 +1,48 @@
+// A4 bounded file tool (gateway-api plan section 3 / A4).
+//
+// Maps the `file.read` / `file.write` model tools to the generic `io::*`
+// capability. Native hard bounds are enforced by the `IoPolicy` configured on
+// the VM: a path outside the allowed roots (after canonicalization, so
+// symlink/traversal escapes are closed) fails the run with a typed capability
+// error, writes require the native write grant, and reads/writes are capped by
+// the native byte limits. This module contains no private host function and no
+// direct filesystem implementation; it composes only generic capabilities.
+use io;
+
+// Exported `run(context)` -> discriminated result map.
+// context: { op: "read" | "write", path: string, content?: string }
+pub fn run(context: map) -> map {
+    let op: string = context["op"];
+    let path: string = context["path"];
+    if op == "read" => {
+        let handle: int = io::open(path, "r");
+        let text: string = io::read_all(handle);
+        io::close(handle);
+        {
+            ok: true,
+            code: "ok",
+            message: "",
+            data: { text: text, bytes: text.length }
+        }
+    } else => {
+        if op == "write" => {
+            let content: string = context["content"];
+            let handle: int = io::open(path, "w");
+            let _written: int = io::write(handle, content);
+            io::flush(handle);
+            io::close(handle);
+            {
+                ok: true,
+                code: "ok",
+                message: "",
+                data: { bytes: content.length }
+            }
+        } else => {
+            {
+                ok: false,
+                code: "unknown_op",
+                message: "file op is not recognized"
+            }
+        }
+    }
+}

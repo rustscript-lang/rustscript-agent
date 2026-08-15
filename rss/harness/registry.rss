@@ -1,0 +1,148 @@
+// A4 bounded tool registry: maps model tool schemas to bounded generic
+// capabilities and their native risk class (gateway-api plan section 4.5).
+//
+// The registry is pure policy. It declares, for each model-facing tool, the
+// JSON schema, the bounded generic capability it maps to (`io.file` via
+// generic `io::*` builtins, `io.process` for a bounded foreground terminal),
+// and the native risk class used by the approval policy. It performs no I/O
+// itself; dispatch is delegated to the capability module (`file.rss`,
+// `patch.rss`, `terminal.rss`).
+//
+// Native hard upper bound: `io::*` execution is gated by the native
+// `IoPolicy` configured on the VM (allowed roots, write/process grants, byte
+// limits). RSS policy can only narrow these; it cannot widen them.
+
+// ---------------------------------------------------------------------------
+// Tool descriptors
+// ---------------------------------------------------------------------------
+
+fn file_read_schema() -> map {
+    {
+        type: "object",
+        properties: {
+            path: { type: "string", description: "path within the native io root" },
+            max_bytes: { type: "integer", description: "bounded read size (native cap)" }
+        },
+        required: [ "path" ]
+    }
+}
+
+fn file_write_schema() -> map {
+    {
+        type: "object",
+        properties: {
+            path: { type: "string", description: "path within the native io root" },
+            content: { type: "string", description: "text content to write" }
+        },
+        required: [ "path", "content" ]
+    }
+}
+
+fn patch_apply_schema() -> map {
+    {
+        type: "object",
+        properties: {
+            path: { type: "string", description: "path within the native io root" },
+            from: { type: "string", description: "exact context to replace" },
+            to: { type: "string", description: "replacement text" }
+        },
+        required: [ "path", "from", "to" ]
+    }
+}
+
+fn terminal_run_schema() -> map {
+    {
+        type: "object",
+        properties: {
+            command: { type: "string", description: "foreground command" }
+        },
+        required: [ "command" ]
+    }
+}
+
+// Each entry carries the model-facing schema and the mapped generic
+// capability + native risk class. `bounded` is true when the capability
+// enforces native root/size/output boundaries.
+pub fn file_read_descriptor() -> map {
+    {
+        name: "file.read",
+        description: "read a file within the native io root",
+        capability: "io.file",
+        risk_class: "read",
+        bounded: true,
+        schema: file_read_schema()
+    }
+}
+
+pub fn file_write_descriptor() -> map {
+    {
+        name: "file.write",
+        description: "write a file within the native io root",
+        capability: "io.file",
+        risk_class: "write",
+        bounded: true,
+        schema: file_write_schema()
+    }
+}
+
+pub fn patch_apply_descriptor() -> map {
+    {
+        name: "patch.apply",
+        description: "apply a bounded context replacement to a file",
+        capability: "io.file",
+        risk_class: "write",
+        bounded: true,
+        schema: patch_apply_schema()
+    }
+}
+
+pub fn terminal_run_descriptor() -> map {
+    {
+        name: "terminal.run",
+        description: "run a bounded foreground command",
+        capability: "io.process",
+        risk_class: "execute",
+        bounded: true,
+        schema: terminal_run_schema()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry entry point
+// ---------------------------------------------------------------------------
+
+// Exported `run(context)` -> discriminated result map.
+// context: { op: "describe", tool_name: string }
+pub fn run(context: map) -> map {
+    let op: string = context["op"];
+    let tool_name: string = context["tool_name"];
+    if op == "describe" => {
+        if tool_name == "file.read" => {
+            { ok: true, descriptor: file_read_descriptor() }
+        } else => {
+            if tool_name == "file.write" => {
+                { ok: true, descriptor: file_write_descriptor() }
+            } else => {
+                if tool_name == "patch.apply" => {
+                    { ok: true, descriptor: patch_apply_descriptor() }
+                } else => {
+                    if tool_name == "terminal.run" => {
+                        { ok: true, descriptor: terminal_run_descriptor() }
+                    } else => {
+                        {
+                            ok: false,
+                            code: "unknown_tool",
+                            message: "no bounded capability is registered for this tool"
+                        }
+                    }
+                }
+            }
+        }
+    } else => {
+        {
+            ok: false,
+            code: "unknown_op",
+            message: "registry op is not recognized"
+        }
+    }
+}

@@ -1,0 +1,49 @@
+// A4 bounded terminal tool (gateway-api plan section 3 / A4).
+//
+// Maps `terminal.run` to the generic process capability (`io::popen`).
+//
+// CORE_BLOCKER: the generic process capability in the pinned core
+// (`rustscript-lang/rustscript@fd4b570`, `io::popen(command: string,
+// mode: string)`) spawns a shell string via `sh -c` and exposes NO
+// per-invocation timeout parameter and NO argv-array form. A "bounded
+// foreground terminal" therefore cannot enforce its two required native
+// boundaries:
+//   - timeout: a runaway command blocks `io::read_all` until the process
+//     exits (only a 1s *cleanup* wait exists, never a per-command bound);
+//   - command-args: only a shell string is accepted, so command arguments
+//     cannot be passed/validated as a structured argv array.
+//
+// Rather than fabricate a bounded execution, this module reports a typed
+// `capability_unavailable` decision for the missing `process_timeout` and
+// `process_argv` boundaries. It performs no private process implementation
+// and no private host function: it composes only the generic capability, and
+// refuses to claim bounds the generic capability cannot enforce.
+//
+// Suggested core contract (see A4 plan §CORE_BLOCKER): a generic
+// process-execution builtin that takes (argv: array, timeout_ms: int,
+// output_max_bytes: int) and enforces the timeout and argv boundaries
+// natively, mirroring how `IoPolicy` already enforces file roots/writes/bytes.
+
+// Exported `run(context)` -> discriminated result map.
+// context: { op: "run", command: string, timeout_ms?: int, args?: array }
+pub fn run(context: map) -> map {
+    let op: string = context["op"];
+    if op == "run" => {
+        let command: string = context["command"];
+        // The generic process capability at fd4b570 cannot bound this call.
+        // Report the typed blocker; never fabricate success.
+        {
+            ok: false,
+            code: "capability_unavailable",
+            blocker: "process_timeout_unavailable",
+            message: "generic process capability lacks a per-invocation timeout (and argv-array form); a bounded foreground terminal is blocked pending core",
+            command: command
+        }
+    } else => {
+        {
+            ok: false,
+            code: "unknown_op",
+            message: "terminal op is not recognized"
+        }
+    }
+}

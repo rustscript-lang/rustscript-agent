@@ -120,6 +120,7 @@ impl StorageRunner {
         let agent_config = AgentConfig {
             http: config.http.clone(),
             sqlite: config.sqlite.clone(),
+            io: config.io.clone(),
             fuel: config.fuel,
         }
         .with_sqlite_root(root);

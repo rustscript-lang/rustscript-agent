@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use rustscript_vm::{
     CallReturn, CancellationReason, EpochHandle, HostAsyncBridge, HostFunctionRegistry, HostFuture,
     HostFutureOutput, HttpConfig, HttpHostExt, InvocationError, InvocationItem, InvocationPoll,
-    SqliteHostExt, SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source,
+    IoHostExt, IoPolicy, SqliteHostExt, SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus,
+    VmYieldReason, compile_source,
 };
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
@@ -67,6 +67,7 @@ pub(crate) fn execute_rss_source(
         AgentConfig {
             http: http_config,
             sqlite: sqlite_policy,
+            io: IoPolicy::default(),
             fuel: None,
         },
     )
@@ -105,6 +106,7 @@ impl From<std::io::Error> for AgentError {
 pub struct AgentConfig {
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
+    pub io: IoPolicy,
     pub fuel: Option<u64>,
 }
 
@@ -113,6 +115,7 @@ impl AgentConfig {
         Self {
             http,
             sqlite: SqlitePolicy::default(),
+            io: IoPolicy::default(),
             fuel: Some(10_000_000),
         }
     }
@@ -132,12 +135,27 @@ impl AgentConfig {
                 ..HttpConfig::default()
             },
             sqlite: SqlitePolicy::default(),
+            io: IoPolicy::default(),
             fuel: Some(10_000_000),
         }
     }
 
     pub fn with_sqlite_root(mut self, root: impl AsRef<Path>) -> Self {
         self.sqlite.database_root = Some(root.as_ref().to_string_lossy().into_owned());
+        self
+    }
+
+    /// Restricts the generic I/O capability (file reads/writes and foreground
+    /// process execution) to the given root(s) with optional write/process
+    /// grants and byte limits. This is the native hard upper bound: RSS policy
+    /// can only narrow it, never widen it.
+    pub fn with_io_root(mut self, root: impl AsRef<Path>) -> Self {
+        self.io.allowed_roots = vec![root.as_ref().to_string_lossy().into_owned()];
+        self
+    }
+
+    pub fn with_io_policy(mut self, io: IoPolicy) -> Self {
+        self.io = io;
         self
     }
 }
@@ -404,6 +422,7 @@ impl AgentRunner {
         vm.configure_http(self.config.http.clone())
             .map_err(RunError::Setup)?;
         vm.configure_sqlite(self.config.sqlite.clone());
+        vm.configure_io(self.config.io.clone());
         bind_restricted_registry(&mut vm).map_err(RunError::Setup)?;
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
@@ -574,6 +593,14 @@ pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), V
         "sqlite::next_cursor",
         "http::client::request",
         "http::client::sse",
+        "io::open",
+        "io::read_all",
+        "io::read_line",
+        "io::write",
+        "io::flush",
+        "io::close",
+        "io::exists",
+        "io::popen",
     ] {
         registry.allow_builtin(name)?;
     }

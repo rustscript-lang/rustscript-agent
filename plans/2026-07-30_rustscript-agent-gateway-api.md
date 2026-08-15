@@ -236,6 +236,14 @@ Implement `plans/2026-08-09_agent-durable-state.md`.
 
 **Criteria:** model schemas map to bounded generic capabilities; auto/manual/never/all approval modes pass; hard-deny policy remains native; pause/resume is durable.
 
+**Status (2026-08-15):** Implemented as a single commit — see
+`plans/2026-08-15_a4-harness-approvals.md`. `registry/file/patch/approval.rss`,
+`approval_bridge.rs`, and focused harness/approval suites are green. The
+bounded-foreground-terminal **timeout and command-args (argv) boundaries are a
+CORE_BLOCKER** on the pinned core `fd4b570`: the generic `io::popen` has no
+per-invocation timeout and only a shell-string form. `terminal.rss` reports a
+typed `capability_unavailable` instead of fabricating bounded execution.
+
 ### Milestone A5: RSS agent loop and compaction
 
 **Files:**

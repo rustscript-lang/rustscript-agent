@@ -121,6 +121,7 @@ above; every other field is set by embedding code.
 | `telegram` | `Option<TelegramConfig>` | `None` (disabled) | When present, the gateway starts the Telegram poller alongside the API server on the same service/store. Validated by `TelegramConfig::validate` (non-blank token, bare-origin https api_base, positive bounds, allowlists may stay empty — deny-by-default). See the `RUSTSCRIPT_AGENT_TELEGRAM_*` variables and `docs/deployment.md`. |
 | `http` | `HttpConfig` | core defaults (below) | Validated by the core (`HttpConfig::validate`). |
 | `sqlite` | `SqlitePolicy` | core defaults, `max_statements = 1024` | — |
+| `io` | `IoPolicy` | fully-restricted (no roots, no write, no process) | Native hard upper bound for the bounded harness tools (`file`/`patch`/`terminal`): `allowed_roots`, `allow_write`, `allow_process`, `max_read_bytes`, `max_write_bytes`. RSS policy can only narrow this, never widen it. |
 | `fuel` | `Option<u64>` | `Some(10_000_000)` | VM fuel budget; `None` disables the fuel cap. |
 
 `RateLimitConfig` bounds: `enabled` (master switch), `ip_burst`, `account_burst`,
