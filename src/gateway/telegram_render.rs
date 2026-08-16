@@ -74,10 +74,16 @@ impl EventRenderer {
             }
             "tool.requested" => send_line(&format!("[tool] {} requested", tool_name(data))),
             "tool.completed" => send_line(&format!("[tool] {} completed", tool_name(data))),
-            "approval.required" => send_line(&format!(
-                "[approval] {} requires approval (pending)",
-                tool_name(data)
-            )),
+            "approval.required" => {
+                let line = match data.get("approval_id").and_then(Value::as_str) {
+                    Some(approval_id) => format!(
+                        "[approval] {} requires approval (pending) — /approve {approval_id} or /deny {approval_id}",
+                        tool_name(data)
+                    ),
+                    None => format!("[approval] {} requires approval (pending)", tool_name(data)),
+                };
+                send_line(&line)
+            }
             "approval.resolved" => send_line(&format!(
                 "[approval] {}: {}",
                 tool_name(data),
@@ -340,7 +346,7 @@ mod tests {
             (
                 "approval.required",
                 json!({"tool_call": {"id": "t1", "name": "web_search"}, "approval_id": "a1"}),
-                "[approval] web_search requires approval (pending)",
+                "[approval] web_search requires approval (pending) — /approve a1 or /deny a1",
             ),
             (
                 "approval.resolved",

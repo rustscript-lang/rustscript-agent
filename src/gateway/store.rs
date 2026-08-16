@@ -519,7 +519,7 @@ impl GatewayPersistence {
         let migrated = self
             .command_data("migrate", &json!({}))
             .map_err(|error| format!("migrate gateway state: {error}"))?;
-        if migrated.get("schema_version") != Some(&json!(4)) {
+        if migrated.get("schema_version") != Some(&json!(5)) {
             return Err(format!(
                 "gateway schema migrated to an unexpected version: {migrated}"
             ));

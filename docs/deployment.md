@@ -204,6 +204,35 @@ API server; it is enabled by setting `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`.
   usernames), `allowed_chats`, and `allowed_users` all start empty and an
   empty list denies everything. Configure all three before enabling the
   token in production; a denied sender gets a plain "not allowed" reply.
+- **Commands wire into the shared AgentService** (the same service the API
+  server uses): a plain message admits a run; `/run <text>` admits with the
+  argument as input and echoes the durable run id and admission status (a
+  bare `/run` with no text is a usage error and never admits); `/stop`
+  cancels the session's active run with the typed cancellation; `/status`
+  reports the durable session and latest run state; `/new` cancels
+  the active run, waits for its terminal, and resets the conversation (same
+  deterministic session id). `/approve <id>` and `/deny <id>` resolve ONE
+  durable pending approval by its explicit id — the resolving Telegram user
+  is persisted as the approval actor and the source message as the reason.
+  Resolution is gated on TWO durable checks: the approval must belong to the
+  same chat/session AND the sender must be the run's durable ORIGIN actor
+  (the `telegram:<user_id>` recorded on the run row at admission — the
+  allowlist is only the entry permission, it never authorizes approval).
+  A foreign chat, a non-owner sender in the same chat, or an owner-less
+  pre-v5 run is answered with the IDENTICAL "no such approval" shape as an
+  unknown id — existence and state never leak and the park is never
+  consumed; the origin binding survives restarts because it is persisted.
+  Every failure (missing/ambiguous/unknown id, already resolved, stopped
+  run) is a typed reply that never resumes the run; a `/stop` that consumes
+  a parked approval cancels the durable approval row immediately
+  (`approval.cancel`, resolver `gateway-stop`) instead of waiting for the
+  TTL sweep. `/compact` reports the typed compaction
+  availability: compaction is planned and executed by the active agent loop
+  when the durable history exceeds the configured window, so an active run
+  gets the loop-managed answer and a session without an active run gets the
+  typed no-run answer — the gateway never claims a manual compaction ran.
+  Approvals and compaction rows are never created or resolved outside the
+  AgentService.
 - **Retries are bounded**: 429 answers sleep `retry_after` (capped at
   `max_429_backoff`, 30 s by default) for at most 3 rounds; 5xx answers use
   capped exponential backoff for at most 3 rounds; an unauthorized failure

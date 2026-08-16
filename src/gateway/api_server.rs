@@ -1170,6 +1170,7 @@ async fn create_run_handler(
             platform: "api_server".to_string(),
             idempotency_key,
             idempotency_hash: request_hash,
+            origin_actor: None,
         })
         .await
     {

@@ -584,7 +584,7 @@ fn production_storage_commands_return_sqlite_results_and_preserve_idempotency() 
 
     let migration = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
     assert_eq!(migration["ok"], json!(true));
-    assert_eq!(result_data(&migration)["schema_version"], json!(4));
+    assert_eq!(result_data(&migration)["schema_version"], json!(5));
 
     let session_create = run_storage(
         &runner,
@@ -1515,9 +1515,9 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let runner = storage_runner(&root);
 
     let first = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
-    assert_eq!(result_data(&first)["schema_version"], json!(4));
+    assert_eq!(result_data(&first)["schema_version"], json!(5));
     let second = run_storage(&runner, db_name, "migrate-2", "migrate", json!({}), 2);
-    assert_eq!(result_data(&second)["schema_version"], json!(4));
+    assert_eq!(result_data(&second)["schema_version"], json!(5));
 
     // A released v1 database upgrades to v3 without re-running v1. The
     // crafter builds a real v1 schema by executing the production schema
@@ -1525,8 +1525,21 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let v1_db = "upgrade.db";
     let v1_crafter = released_v1_runner(&root);
     run_raw_sql(&v1_crafter, v1_db);
+    // A real v1-era RUN row (the v1 runs table has no origin_actor column):
+    // after the v5 upgrade the ALTER adds the column with the empty default,
+    // so old rows survive and read an EMPTY origin actor (typed-rejected by
+    // the telegram owner gate — never fabricated or fatal).
+    let old_row_crafter = raw_sql_runner(
+        &root,
+        "craft-old-run",
+        &[
+            "INSERT INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms) VALUES ('old-session', 'telegram', 'telegram', 'fixture_bot', '555', '', '555', 1, 'active', '', 'm', 'p', '', '{}', 0, 1, 1)",
+            "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms) VALUES ('old-run', 'old-session', '', 'running', '{}', 'p', 'm', '', '', '', 0, 0, 0, '', '', '', 1, 1, 0, 1)",
+        ],
+    );
+    run_raw_sql(&old_row_crafter, v1_db);
     let upgraded = run_storage(&runner, v1_db, "migrate-upgrade", "migrate", json!({}), 3);
-    assert_eq!(result_data(&upgraded)["schema_version"], json!(4));
+    assert_eq!(result_data(&upgraded)["schema_version"], json!(5));
     let run_created = run_storage(
         &runner,
         v1_db,
@@ -1539,6 +1552,28 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
         run_created["ok"],
         json!(true),
         "upgraded schema must serve commands"
+    );
+    // The v5 ALTER preserved the pre-v5 row and its origin column is empty.
+    let old_run = run_storage(
+        &runner,
+        v1_db,
+        "upgrade-old-run",
+        "run.get",
+        json!({"run_id": "old-run"}),
+        5,
+    );
+    let old_row = first_query_row(&old_run);
+    assert_eq!(old_row["id"], json!("old-run"));
+    assert_eq!(
+        old_row["origin_actor"],
+        json!(""),
+        "a pre-v5 run row must keep an empty origin actor after the upgrade"
+    );
+    // run.get serves the v5 row shape (21 columns: 20 v1 + origin_actor).
+    assert_eq!(
+        query_rows(&old_run)[0].len(),
+        21,
+        "the upgraded run row must expose the v5 column shape"
     );
 
     // An interrupted migration rolls back atomically: a poisoned
@@ -2338,6 +2373,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "event-rejected",
             "now_ms": 2,
             "expires_at_ms": 0,
@@ -2370,6 +2406,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "request-1",
             "request_hash": "hash-1",
+            "origin_actor": "",
             "event_id": "event-started-1",
             "now_ms": 3,
             "expires_at_ms": 0,
@@ -2485,6 +2522,7 @@ fn run_terminal_commits_atomically_and_returns_assigned_sequences() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "event-started-1",
             "now_ms": 2,
             "expires_at_ms": 0,
@@ -2659,6 +2697,7 @@ fn load_all_paginates_beyond_single_page_and_byte_limits() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "event-started-1",
             "now_ms": now_ms,
             "expires_at_ms": 0,
@@ -2816,6 +2855,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "key-1",
             "request_hash": "hash-1",
+            "origin_actor": "",
             "event_id": "event-1",
             "now_ms": 4,
             "expires_at_ms": 0,
@@ -2845,6 +2885,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "event-2",
             "now_ms": 5,
             "expires_at_ms": 0,

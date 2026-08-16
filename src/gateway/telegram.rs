@@ -598,7 +598,7 @@ use crate::AgentGatewayState;
 use crate::domain::{InboundEnvelope, fnv1a64, timestamp};
 use crate::gateway::store::{GatewayEvent, SessionRecord, SessionView};
 use crate::gateway::telegram_render::{EventRenderer, RenderAction};
-use crate::service::{AdmitError, AdmitRunRequest, failed_payload};
+use crate::service::{AdmitError, AdmitRunRequest, AdmittedRun, failed_payload};
 
 /// Delivery cursor consumer for the global getUpdates offset (hangs on the
 /// control session).
@@ -702,7 +702,7 @@ fn push_bounded<T>(window: &mut VecDeque<T>, value: T, capacity: usize) {
 }
 
 /// Parses one message text into a known command and its remaining content.
-/// Only the four canonical commands are recognized; anything else (including
+/// Only the seven canonical commands are recognized; anything else (including
 /// unknown `/x` tokens) is plain conversation text.
 pub(crate) fn parse_command(text: &str) -> (Option<String>, String) {
     let trimmed = text.trim();
@@ -715,7 +715,10 @@ pub(crate) fn parse_command(text: &str) -> (Option<String>, String) {
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if matches!(name.as_str(), "new" | "stop" | "status" | "compact") {
+        if matches!(
+            name.as_str(),
+            "new" | "stop" | "status" | "compact" | "run" | "approve" | "deny"
+        ) {
             return (Some(name), args.to_string());
         }
     }
@@ -1373,16 +1376,49 @@ async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: 
             .await
         }
         Some("compact") => {
-            // Explicitly unavailable: compaction is A5-scoped and not wired
-            // here; never advertise it as complete.
-            let _ = reply(
+            cmd_compact(
+                runtime,
                 api,
                 chat_id,
                 message.message_thread_id,
-                "/compact is not available yet: compaction is blocked until the A5 integration lands; \
-                 your conversation is unchanged.",
+                &session_id,
             )
-            .await;
+            .await
+        }
+        Some("run") => {
+            cmd_run(
+                runtime,
+                api,
+                &envelope,
+                &session_id,
+                chat_id,
+                message.message_thread_id,
+            )
+            .await
+        }
+        Some("approve") => {
+            cmd_approval(
+                runtime,
+                api,
+                &envelope,
+                chat_id,
+                message.message_thread_id,
+                &session_id,
+                true,
+            )
+            .await
+        }
+        Some("deny") => {
+            cmd_approval(
+                runtime,
+                api,
+                &envelope,
+                chat_id,
+                message.message_thread_id,
+                &session_id,
+                false,
+            )
+            .await
         }
         _ => {
             admit_text(
@@ -1788,15 +1824,17 @@ async fn ensure_session(
 
 /// Plain text: atomic admission through the shared AgentService with a
 /// durable message-level idempotency key, so a re-fetched update after a
-/// crash can never create a second run.
-async fn admit_text(
+/// crash can never create a second run. On a FRESH admission the worker and
+/// the delivery renderer are spawned; `admit_and_spawn` returns the admitted
+/// run so callers can echo its durable identity (`/run`).
+async fn admit_and_spawn(
     runtime: &AdapterRuntime,
     api: &TelegramApi,
     envelope: &InboundEnvelope,
     session_id: &str,
     chat_id: i64,
     thread_id: Option<i64>,
-) {
+) -> Option<AdmittedRun> {
     if runtime
         .active_runs
         .lock()
@@ -1810,7 +1848,7 @@ async fn admit_text(
             "A run is already active in this chat — send /stop to cancel it.",
         )
         .await;
-        return;
+        return None;
     }
     let canonical = serde_json::to_string(&json!({
         "input": envelope.content,
@@ -1841,7 +1879,7 @@ async fn admit_text(
             "Storage is unavailable; try again shortly.",
         )
         .await;
-        return;
+        return None;
     }
     let admitted = runtime
         .state
@@ -1852,6 +1890,10 @@ async fn admit_text(
             platform: "telegram".to_string(),
             idempotency_key: Some(idempotency_key),
             idempotency_hash: Some(idempotency_hash),
+            // The durable per-run origin actor: recorded for DM and group
+            // alike, persisted by admission, and read back durably for the
+            // `/approve`/`/deny` owner check (never in-memory-only).
+            origin_actor: Some(format!("telegram:{}", envelope.user_id)),
             ..AdmitRunRequest::default()
         })
         .await;
@@ -1860,7 +1902,7 @@ async fn admit_text(
             if admitted_run.replayed {
                 // The same message already produced this run (durable
                 // idempotency across restarts); never start a second one.
-                return;
+                return None;
             }
             runtime
                 .active_runs
@@ -1876,13 +1918,14 @@ async fn admit_text(
                 &runtime.state,
                 &runtime.config,
                 session_id,
-                admitted_run.run_id,
+                admitted_run.run_id.clone(),
                 chat_id,
                 thread_id,
                 Arc::clone(&runtime.active_runs),
                 Arc::clone(&runtime.epochs),
                 Arc::clone(&runtime.advance_failures),
             );
+            Some(admitted_run)
         }
         Err(AdmitError::RunLimitReached) => {
             let _ = reply(
@@ -1892,6 +1935,7 @@ async fn admit_text(
                 "The agent is at capacity; try again shortly.",
             )
             .await;
+            None
         }
         Err(AdmitError::Persistence(message)) => {
             tracing::warn!("telegram admission persistence failure: {message}");
@@ -1902,6 +1946,7 @@ async fn admit_text(
                 "Storage is unavailable; try again shortly.",
             )
             .await;
+            None
         }
         Err(AdmitError::Halting) => {
             let _ = reply(
@@ -1911,6 +1956,7 @@ async fn admit_text(
                 "The gateway is shutting down; try again shortly.",
             )
             .await;
+            None
         }
         Err(error) => {
             let _ = reply(
@@ -1920,8 +1966,328 @@ async fn admit_text(
                 &format!("Could not start the run: {error}."),
             )
             .await;
+            None
         }
     }
+}
+
+/// Plain text: the same real admission path as `/run`, without the identity
+/// echo.
+async fn admit_text(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    envelope: &InboundEnvelope,
+    session_id: &str,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) {
+    let _ = admit_and_spawn(runtime, api, envelope, session_id, chat_id, thread_id).await;
+}
+
+/// `/run`: admits a real run through the shared AgentService (same durable
+/// idempotency path as plain text), spawns the worker and the delivery
+/// renderer, and echoes the DURABLE run id and admission status back to the
+/// chat. The command's argument becomes the run input.
+async fn cmd_run(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    envelope: &InboundEnvelope,
+    session_id: &str,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) {
+    // A bare `/run` (no input text) is a usage error and MUST NOT admit a
+    // run: an empty input would otherwise start a run with no instruction.
+    if envelope.content.trim().is_empty() {
+        let _ = reply(api, chat_id, thread_id, "Usage: /run <text>.").await;
+        return;
+    }
+    let Some(admitted) =
+        admit_and_spawn(runtime, api, envelope, session_id, chat_id, thread_id).await
+    else {
+        // The admission path already replied (gate busy, capacity, storage,
+        // replayed duplicate) — nothing else to say.
+        return;
+    };
+    let _ = reply(
+        api,
+        chat_id,
+        thread_id,
+        &format!(
+            "Run {} started (status: {}).",
+            admitted.run_id, admitted.status
+        ),
+    )
+    .await;
+}
+
+/// `/approve` / `/deny`: resolves ONE explicit durable approval id through
+/// the shared AgentService (`resolve_run_approval_as`), with the sending
+/// Telegram user persisted as the actor and the source message as the reason.
+/// Every failure mode is a typed reply and NEVER resumes the run: a missing
+/// or ambiguous id, an unknown id, an approval belonging to another chat
+/// (session isolation), an already-resolved row, or a park that a stop
+/// consumed.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_approval(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    envelope: &InboundEnvelope,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_id: &str,
+    approve: bool,
+) {
+    let command = if approve { "/approve" } else { "/deny" };
+    let args = envelope.content.trim();
+    if args.is_empty() {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            &format!("Usage: {command} <approval_id>."),
+        )
+        .await;
+        return;
+    }
+    if args.split_whitespace().count() > 1 {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            &format!("Usage: {command} <approval_id> — one id only."),
+        )
+        .await;
+        return;
+    }
+    let approval_id = args.to_string();
+    // The durable per-run origin actor: the allowlist is only the ENTRY
+    // permission; the OWNER gate below compares the sender against the
+    // run's durable origin actor.
+    let actor = format!("telegram:{}", envelope.user_id);
+    let Some(persistence) = runtime.state.persistence() else {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "Storage is unavailable; try again shortly.",
+        )
+        .await;
+        return;
+    };
+    // One blocking storage round-trip: the durable approval row AND the
+    // owning run's durable origin actor (`run.get` column 21 —
+    // `runs.origin_actor`, schema v5). Both reads are durable, so the owner
+    // binding is verifiable after a restart and never an in-memory-only map.
+    let persistence_for_block = persistence.clone();
+    let approval_id_for_block = approval_id.clone();
+    let lookup =
+        tokio::task::spawn_blocking(move || -> Result<(Option<Vec<Value>>, String), String> {
+            let data = persistence_for_block
+                .approval_get(&approval_id_for_block)
+                .map_err(|error| error.to_string())?;
+            let row = data
+                .get("rows")
+                .and_then(Value::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(Value::as_array)
+                .cloned();
+            let origin = match row.as_ref() {
+                Some(row) => {
+                    let run_id = row.get(1).and_then(Value::as_str).unwrap_or_default();
+                    if run_id.is_empty() {
+                        String::new()
+                    } else {
+                        let run_data = persistence_for_block
+                            .run_get(run_id)
+                            .map_err(|error| error.to_string())?;
+                        // Column 21 = origin_actor (v1 run columns + v5).
+                        run_data
+                            .get("rows")
+                            .and_then(Value::as_array)
+                            .and_then(|rows| rows.first())
+                            .and_then(Value::as_array)
+                            .and_then(|run_row| run_row.get(20))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    }
+                }
+                None => String::new(),
+            };
+            Ok((row, origin))
+        })
+        .await;
+    let (row, origin) = match lookup {
+        Ok(Ok((row, origin))) => (row, origin),
+        Ok(Err(error)) => {
+            tracing::warn!("telegram approval lookup failed: {error}");
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "Could not read the approval; try again shortly.",
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "Storage is unavailable; try again shortly.",
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(row) = row else {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            &format!("No such approval: {approval_id}."),
+        )
+        .await;
+        return;
+    };
+    // The durable row: id, run_id, session_id, ..., state, ..., resolver,
+    // decision_reason.
+    let durable_session = row.get(2).and_then(Value::as_str).unwrap_or_default();
+    // Cross-session oracle: a foreign chat/session, a non-owner sender, or
+    // an owner-less pre-v5 run is the IDENTICAL typed shape as an unknown
+    // id — existence and state never leak, the park is never touched, and
+    // the owner can still resolve later. Only an approval that passes BOTH
+    // the session check AND the durable-owner check reaches the
+    // already-resolved/expired details.
+    if durable_session != session_id || origin.is_empty() || origin != actor {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            &format!("No such approval: {approval_id}."),
+        )
+        .await;
+        return;
+    }
+    let durable_state = row.get(7).and_then(Value::as_str).unwrap_or("?");
+    if durable_state != "pending" {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            &format!("Approval {approval_id} is already resolved (state: {durable_state})."),
+        )
+        .await;
+        return;
+    }
+    let run_id = row
+        .get(1)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if run_id.is_empty() {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            &format!("Could not resolve approval {approval_id}."),
+        )
+        .await;
+        return;
+    }
+    // The resolving actor and reason are persisted on the durable row; the
+    // resolution itself runs on a blocking thread (bounded storage call).
+    let reason = format!(
+        "{} via telegram message {}",
+        if approve { "approved" } else { "denied" },
+        envelope.message_id
+    );
+    let service = runtime.state.service();
+    let service_for_block = service.clone();
+    let run_id_for_block = run_id.clone();
+    let actor_for_block = actor.clone();
+    let reason_for_block = reason.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        service_for_block.resolve_run_approval_as(
+            &run_id_for_block,
+            approve,
+            &actor_for_block,
+            &reason_for_block,
+        )
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(_) => Err("the approval resolution worker failed".to_string()),
+    };
+    let message = match outcome {
+        Ok(()) => format!(
+            "Approval {approval_id} {}; the run continues.",
+            if approve { "approved" } else { "denied" }
+        ),
+        Err(error) if error.contains("already resolved") => {
+            format!("Approval {approval_id} was already resolved.")
+        }
+        Err(error) if error.contains("no pending approval is parked") => format!(
+            "Approval {approval_id} is not waiting on this gateway; the run may have stopped."
+        ),
+        Err(error) if error.contains("bridge is not available") => {
+            "Approval resolution is unavailable; try again shortly.".to_string()
+        }
+        Err(error) => format!("Could not resolve approval {approval_id}: {error}."),
+    };
+    let _ = reply(api, chat_id, thread_id, &message).await;
+}
+
+/// `/compact`: answers with the typed availability of the REAL A5
+/// compaction. Compaction is planned and executed by the active agent loop
+/// (the service executes the loop-planned storage commands while the run is
+/// durably `compacting`); there is NO manual trigger on the service, so an
+/// active run gets the loop-managed answer and a session without an active
+/// run gets the typed no-run answer. Never claims a compaction happened.
+async fn cmd_compact(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_id: &str,
+) {
+    let (has_session, active_run) = {
+        let store = runtime.state.store.read();
+        let has_session = store.sessions.contains_key(session_id);
+        let active_run = session_active_run(&runtime.active_runs, &store, session_id);
+        (has_session, active_run)
+    };
+    if !has_session {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "No conversation yet in this chat — send a message to start one.",
+        )
+        .await;
+        return;
+    }
+    if active_run.is_some() {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "Compaction is managed by the active agent loop; it runs automatically when the \
+             conversation exceeds the configured window. There is no manual compaction trigger.",
+        )
+        .await;
+        return;
+    }
+    let _ = reply(
+        api,
+        chat_id,
+        thread_id,
+        "No active run in this chat; there is nothing to compact.",
+    )
+    .await;
 }
 
 /// Spawns the run worker with the same panic guard as the API server: a
@@ -2516,6 +2882,22 @@ mod tests {
         assert_eq!(
             parse_command("/status detail"),
             (Some("status".to_string()), "detail".to_string())
+        );
+        assert_eq!(
+            parse_command("/run write the file"),
+            (Some("run".to_string()), "write the file".to_string())
+        );
+        assert_eq!(
+            parse_command("/approve abc-123"),
+            (Some("approve".to_string()), "abc-123".to_string())
+        );
+        assert_eq!(
+            parse_command("/deny abc-123 extra"),
+            (Some("deny".to_string()), "abc-123 extra".to_string())
+        );
+        assert_eq!(
+            parse_command("/run"),
+            (Some("run".to_string()), String::new())
         );
         assert_eq!(
             parse_command("/unknown x"),

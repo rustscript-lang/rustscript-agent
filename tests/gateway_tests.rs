@@ -1153,6 +1153,7 @@ async fn failed_admission_leaves_no_resurrecting_partial_state() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": event_id,
             "now_ms": now,
             "expires_at_ms": 0,
@@ -1437,6 +1438,7 @@ async fn approval_and_compaction_repository_round_trip_restart() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "repo-event",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -1582,6 +1584,7 @@ async fn production_load_drains_beyond_page_and_byte_boundaries() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "event-started",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -3287,6 +3290,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "crash-run",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "crash-event",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -3386,6 +3390,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "crash-run-2",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "crash-event-retry",
             "now_ms": now + 5,
             "expires_at_ms": 0,
@@ -4880,6 +4885,7 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             platform: "api_server".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission must be open before the halt");
@@ -4899,6 +4905,7 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             platform: "api_server".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await;
     assert!(
@@ -4976,6 +4983,7 @@ async fn gateway_reopen_fails_orphan_pending_compaction_even_when_run_is_termina
             "idempotency_scope": "api:chat",
             "idempotency_key": "orphan-run",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "orphan-event",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -5107,6 +5115,7 @@ async fn gateway_reopen_expires_orphan_pending_approval_even_when_run_is_termina
             "idempotency_scope": "api:chat",
             "idempotency_key": "orphan-approval-run",
             "request_hash": "",
+            "origin_actor": "",
             "event_id": "orphan-approval-event",
             "now_ms": now,
             "expires_at_ms": 0,
@@ -5410,6 +5419,7 @@ async fn legacy_run_context_carries_the_inbound_platform() {
             platform: "telegram".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");

@@ -174,6 +174,13 @@ pub struct AdmitRunRequest {
     pub platform: String,
     pub idempotency_key: Option<String>,
     pub idempotency_hash: Option<String>,
+    /// The durable per-run origin actor (for example `telegram:<user_id>`
+    /// for the Telegram adapter). Persisted onto the run's storage row at
+    /// admission; `None`/empty for transports that do not carry an origin
+    /// (API-server admissions). Telegram `/approve`/`/deny` resolution is
+    /// gated on this durable actor, so the binding survives restarts and is
+    /// never an in-memory-only map.
+    pub origin_actor: Option<String>,
 }
 
 /// Result of an accepted (or idempotently replayed) admission.
@@ -627,6 +634,7 @@ impl AgentService {
             "idempotency_scope": "api:chat",
             "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
             "request_hash": request.idempotency_hash.clone().unwrap_or_default(),
+            "origin_actor": request.origin_actor.clone().unwrap_or_default(),
             "event_id": event_id,
             "now_ms": now,
             "expires_at_ms": 0,
@@ -836,18 +844,26 @@ impl AgentService {
             );
             // A run parked on a pending approval has no worker to observe the
             // cancellation: transition it back to `running` durably and
-            // commit the typed cancellation now.
-            if self
+            // commit the typed cancellation now. The consumed park's durable
+            // approval row is cancelled via the A5 `approval.cancel` op in
+            // the SAME task: the row transitions pending -> expired promptly
+            // (never left for the default TTL sweep). The storage update is
+            // pending-only, so a resolve that already landed before the stop
+            // is never downgraded — stop/resolve stay exactly-once.
+            if let Some(parked) = self
                 .inner
                 .parked
                 .lock()
                 .expect("parked lock")
                 .remove(run_id)
-                .is_some()
             {
                 let service = self.clone();
                 let run_id = run_id.to_string();
+                let approval_id = parked.approval_id;
                 tokio::spawn(async move {
+                    if let Some(bridge) = service.inner.approval.clone() {
+                        let _ = bridge.cancel(&approval_id, "gateway-stop", timestamp() as i64);
+                    }
                     service
                         .transition_run(&run_id, "waiting_approval", "running")
                         .await;
@@ -2864,12 +2880,12 @@ impl AgentService {
     /// Legacy service surface (the expiry sweep and the A5 fixtures): the
     /// resolution outcome is mapped to `Ok(())` / a legacy `String` error.
     /// The API surface uses [`Self::resolve_run_approval_for`], which carries
-    /// the run + approval id, actor/reason, and the typed outcome/error.
+    /// the run + approval id, actor/reason, and the typed outcome/error; the
+    /// Telegram surface uses [`Self::resolve_run_approval_as`] with the
+    /// sending user as the actor and the source message as the reason. All
+    /// three surfaces share the exact-once core [`Self::resolve_parked_approval`].
     pub fn resolve_run_approval(&self, run_id: &str, approve: bool) -> Result<(), String> {
-        match self.resolve_parked_approval(run_id, None, approve, "gateway", "") {
-            Ok(_) => Ok(()),
-            Err(error) => Err(error.legacy_message()),
-        }
+        self.resolve_run_approval_as(run_id, approve, "gateway", "")
     }
 
     /// The API approval surface: resolves the parked run's approval by run +
@@ -2890,10 +2906,30 @@ impl AgentService {
         self.resolve_parked_approval(run_id, Some(approval_id), approve, actor, reason)
     }
 
+    /// The Telegram approval surface: resolves the parked run's approval
+    /// with the sending user as the durable actor and the source message as
+    /// the reason (an empty reason keeps the default resolver text). The
+    /// typed outcome is mapped to the legacy `String` surface so the
+    /// Telegram matchers see the same "already resolved" / "no pending
+    /// approval is parked" / "bridge is not available" texts.
+    pub fn resolve_run_approval_as(
+        &self,
+        run_id: &str,
+        approve: bool,
+        actor: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        match self.resolve_parked_approval(run_id, None, approve, actor, reason) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.legacy_message()),
+        }
+    }
+
     /// The shared exact-once resolution core. `expected_approval_id` is the
-    /// API's id check (the legacy surface passes `None`); `resolver` /
-    /// `reason` are recorded on the durable row (the legacy surface passes
-    /// `"gateway"` / `""`, byte-identical to the previous payloads).
+    /// API's id check (the legacy and Telegram surfaces pass `None`);
+    /// `resolver` / `reason` are recorded on the durable row (the legacy
+    /// surface passes `"gateway"` / `""`, byte-identical to the previous
+    /// payloads).
     fn resolve_parked_approval(
         &self,
         run_id: &str,

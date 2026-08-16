@@ -25,6 +25,7 @@ struct AdmissionCreateInput {
     idempotency_scope: string,
     idempotency_key: string,
     request_hash: string,
+    origin_actor: string,
     event_id: string,
     now_ms: int,
     expires_at_ms: int
@@ -93,8 +94,8 @@ pub fn storage_admission_create(db_id: int, payload_json: string) -> map {
                 params: [&input.message_id, &input.session_id, &input.input_json, &input.message_run_id, input.now_ms.copy(), &input.session_id, &input.message_id, &input.session_id]
             };
             statements[statements.length] = {
-                sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))",
-                params: [&input.run_id, &input.session_id, &input.parent_run_id, &input.input_json, &input.provider, &input.model, &input.script_hash, &input.idempotency_scope, &input.idempotency_key, input.now_ms.copy(), input.now_ms.copy(), input.now_ms.copy(), &input.run_id, &input.session_id, &input.session_id, &input.parent_run_id, &input.parent_run_id]
+                sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, origin_actor, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))",
+                params: [&input.run_id, &input.session_id, &input.parent_run_id, &input.input_json, &input.provider, &input.model, &input.script_hash, &input.idempotency_scope, &input.idempotency_key, &input.origin_actor, input.now_ms.copy(), input.now_ms.copy(), input.now_ms.copy(), &input.run_id, &input.session_id, &input.session_id, &input.parent_run_id, &input.parent_run_id]
             };
             if input.parent_run_id.copy() != "" {
                 statements[statements.length] = {
@@ -122,7 +123,7 @@ pub fn storage_admission_create(db_id: int, payload_json: string) -> map {
     let query_run_id: string = if replay => { existing_run_id } else => { input.run_id.copy() };
     let run_result: map = sqlite::query(
         db_id,
-        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1",
+        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms, origin_actor FROM runs WHERE id = ? LIMIT 1",
         [&query_run_id],
         { max_rows: 1, max_result_bytes: 65536 }
     );

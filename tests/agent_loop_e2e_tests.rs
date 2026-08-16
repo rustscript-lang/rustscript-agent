@@ -276,6 +276,7 @@ async fn admit_and_wait(
             platform: "test".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");
@@ -518,6 +519,7 @@ async fn e2e_cancel_mid_run_commits_typed_cancelled_terminal() {
             platform: "test".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");
@@ -583,6 +585,7 @@ async fn e2e_approval_wait_resume_is_exactly_once_and_completes() {
             platform: "test".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");
@@ -668,6 +671,7 @@ async fn e2e_approval_denied_folds_a_typed_tool_result_and_the_loop_continues() 
             platform: "test".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");
@@ -855,6 +859,7 @@ async fn e2e_compaction_executes_durably_and_advances_generation() {
             platform: "test".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");
@@ -943,6 +948,7 @@ async fn admit_and_spawn(
             platform: platform.to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");
@@ -2244,6 +2250,7 @@ async fn e2e_compaction_pair_boundary_preserves_the_pair_and_provider_sees_no_da
             platform: "test".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");
@@ -3274,6 +3281,7 @@ async fn e2e_unknown_compaction_command_is_a_typed_failure_and_the_run_continues
             platform: "test".to_string(),
             idempotency_key: None,
             idempotency_hash: None,
+            origin_actor: None,
         })
         .await
         .expect("admission should succeed");

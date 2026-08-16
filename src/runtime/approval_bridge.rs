@@ -296,7 +296,8 @@ impl ApprovalBridge {
 
     /// Like [`Self::resolve`], but records the caller-supplied `reason` as
     /// the durable `decision_reason` (an empty reason keeps the default
-    /// text, so the existing callers' payloads are byte-identical).
+    /// text, so the existing callers' payloads are byte-identical). The
+    /// Telegram gateway persists the resolving actor and the source message.
     pub fn resolve_with_reason(
         &self,
         approval_id: &str,

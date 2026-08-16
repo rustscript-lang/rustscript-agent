@@ -21,6 +21,7 @@ use futures_util::StreamExt;
 use rustscript_agent::config::TelegramConfig;
 use rustscript_agent::gateway::telegram::{TelegramApi, TelegramError};
 use rustscript_agent::service::AdmitRunRequest;
+use rustscript_vm::IoPolicy;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
@@ -934,11 +935,11 @@ async fn adapter_commands_new_status_compact_respond_explicitly() {
     );
     let compact = sends
         .iter()
-        .find(|text| text.contains("/compact"))
+        .find(|text| text.contains("nothing to compact"))
         .expect("/compact must reply");
     assert!(
-        compact.contains("not available") || compact.contains("blocked"),
-        "/compact must be explicitly unavailable, got: {compact}"
+        compact.contains("nothing to compact"),
+        "/compact must answer with the typed no-run state, got: {compact}"
     );
     assert!(
         !compact.contains("completed"),
@@ -989,7 +990,7 @@ async fn adapter_renders_delta_edits_and_status_lines_from_agent_events() {
     );
     for expected in [
         "[tool] web_search requested",
-        "[approval] web_search requires approval (pending)",
+        "[approval] web_search requires approval (pending) — /approve a1 or /deny a1",
         "[approval] web_search: approved",
         "[done]",
     ] {
@@ -1048,9 +1049,8 @@ async fn adapter_status_sends_never_rewrite_the_delta_edit_target() {
         sends
             .iter()
             .any(|text| text == "[tool] web_search requested")
-            && sends
-                .iter()
-                .any(|text| text == "[approval] web_search requires approval (pending)")
+            && sends.iter().any(|text| text
+                == "[approval] web_search requires approval (pending) — /approve a1 or /deny a1")
             && sends
                 .iter()
                 .any(|text| text == "[approval] web_search: approved")
@@ -2313,6 +2313,1466 @@ async fn adapter_stop_command_cancels_the_active_run() {
     })
     .await;
     adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+// ---------------------------------------------------------------------------
+// A8 → A5 wiring: /run, /approve, /deny, /compact against the REAL service.
+// ---------------------------------------------------------------------------
+
+/// One canonical update fixture for a private-chat text message.
+fn update_fixture(
+    update_id: i64,
+    message_id: i64,
+    chat_id: i64,
+    user_id: i64,
+    text: &str,
+) -> Value {
+    json!({
+        "ok": true,
+        "result": [{
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "date": 1700000000,
+                "chat": {"id": chat_id, "type": "private"},
+                "from": {"id": user_id, "is_bot": false, "first_name": "Alice"},
+                "text": text
+            }
+        }]
+    })
+}
+
+/// Source whose runs echo the run input as a delta (for /run argument flow).
+const RUN_ECHO_SOURCE: &str = r#"
+use stream;
+pub fn run(input: map) -> string {
+    let text: string = input["input"];
+    stream::emit({"type": "model.delta", "delta": text});
+    "ok";
+}
+"#;
+
+/// Scripted provider server for the REAL A5 production loop (one thread,
+/// sequential connections, scripted per-request responses).
+struct ScriptedProvider {
+    port: u16,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    shutdown: std::sync::mpsc::Sender<()>,
+}
+
+impl ScriptedProvider {
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ScriptedProvider {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+    }
+}
+
+fn spawn_scripted_provider(responses: Vec<(u16, String)>) -> ScriptedProvider {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
+    let port = listener.local_addr().expect("local addr").port();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let count = std::sync::Arc::clone(&requests);
+    std::thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking fixture listener");
+        let mut served = 0usize;
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    let mut content_length = None;
+                    loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                request.extend_from_slice(&buffer[..read]);
+                                let text = String::from_utf8_lossy(&request);
+                                if content_length.is_none() {
+                                    content_length = text.lines().find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                                    });
+                                }
+                                let head_end = text.find("\r\n\r\n").unwrap_or(0);
+                                if let Some(length) = content_length
+                                    && request.len() >= head_end + 4 + length
+                                {
+                                    break;
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let (status, body) = responses.get(served).cloned().unwrap_or_else(|| {
+                        responses.last().cloned().unwrap_or((200, String::new()))
+                    });
+                    served += 1;
+                    let reason = if status == 200 { "OK" } else { "Error" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    ScriptedProvider {
+        port,
+        requests,
+        shutdown: shutdown_tx,
+    }
+}
+
+fn wire_text(text: &str) -> String {
+    json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+    .to_string()
+}
+
+fn wire_tool_calls(calls: Value) -> String {
+    json!({
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "", "tool_calls": calls},
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+    })
+    .to_string()
+}
+
+fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments.to_string()}
+    })
+}
+
+/// The production-loop gateway config for one scripted provider.
+fn a5_gateway_config(server_port: u16, root: &std::path::Path) -> AgentGatewayConfig {
+    AgentGatewayConfig {
+        provider: Some("openai_chat".to_string()),
+        model: "test-model".to_string(),
+        provider_options: json!({
+            "base_url": format!("http://127.0.0.1:{server_port}"),
+            "api_key": "test-key",
+            "model": "test-model"
+        }),
+        http: rustscript_vm::HttpConfig {
+            allowed_schemes: vec!["http".to_string()],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            allowed_ports: vec![server_port],
+            allow_private_ips: true,
+            ..rustscript_vm::HttpConfig::default()
+        },
+        io: IoPolicy {
+            allowed_roots: vec![root.to_string_lossy().into_owned()],
+            allow_write: true,
+            allow_process: false,
+            max_read_bytes: 1024 * 1024,
+            max_write_bytes: 1024 * 1024,
+        },
+        run_timeout: std::time::Duration::from_secs(60),
+        base_retry_delay_ms: 20,
+        max_retry_delay_ms: 40,
+        stream: false,
+        ..AgentGatewayConfig::default()
+    }
+}
+
+/// The durable status of one run (column 3 of `run.get` rows).
+fn durable_run_status(gateway: &AgentGatewayState, run_id: &str) -> String {
+    let persistence = gateway.persistence().expect("durable persistence");
+    let data = persistence.run_get(run_id).expect("run get");
+    data.get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_array)
+        .and_then(|row| row.get(3))
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// The durable origin actor of one run (column 21 of `run.get` rows — the
+/// v5 `runs.origin_actor` column appended after the v1 run columns).
+fn durable_run_origin(gateway: &AgentGatewayState, run_id: &str) -> String {
+    let persistence = gateway.persistence().expect("durable persistence");
+    let data = persistence.run_get(run_id).expect("run get");
+    data.get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_array)
+        .and_then(|row| row.get(20))
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// The durable approval row (`approval.get` columns: id, run_id, session_id,
+/// tool_call_id, tool_name, arguments_json, risk_class, state, ...,
+/// resolver, decision_reason).
+fn durable_approval_row(gateway: &AgentGatewayState, approval_id: &str) -> Vec<Value> {
+    let persistence = gateway.persistence().expect("durable persistence");
+    let data = persistence.approval_get(approval_id).expect("approval get");
+    data.get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_array)
+        .cloned()
+        .expect("approval row")
+}
+
+/// The bridge-generated approval id carried by the run's durable
+/// `approval.required` event.
+fn parked_approval_id(gateway: &AgentGatewayState, run_id: &str) -> String {
+    let persistence = gateway.persistence().expect("durable persistence");
+    let data = persistence
+        .event_replay(&json!({
+            "run_id": run_id,
+            "after_seq": 1,
+            "max_events": 512,
+            "max_bytes": 65536,
+        }))
+        .expect("event replay");
+    data.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .find_map(|row| {
+            if row.get(3).and_then(Value::as_str) != Some("approval.required") {
+                return None;
+            }
+            let payload: Value = row
+                .get(4)
+                .and_then(Value::as_str)
+                .and_then(|payload| serde_json::from_str(payload).ok())?;
+            payload
+                .get("approval_id")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .expect("approval.required must carry the bridge approval id")
+}
+
+/// Waits for the `/run` reply, then returns the echoed durable run id.
+async fn run_id_from_reply(state: &FixtureState) -> String {
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.starts_with("Run "))
+    })
+    .await;
+    state
+        .sent_texts()
+        .iter()
+        .find(|text| text.starts_with("Run "))
+        .expect("run reply")
+        .strip_prefix("Run ")
+        .expect("run reply prefix")
+        .split(' ')
+        .next()
+        .expect("run id")
+        .to_string()
+}
+
+async fn wait_for_durable_status(gateway: &AgentGatewayState, run_id: &str, status: &str) {
+    wait_until(std::time::Duration::from_secs(40), || {
+        durable_run_status(gateway, run_id) == status
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_run_command_admits_a_real_run_and_echoes_its_durable_identity() {
+    let (base, state) = spawn_fixture().await;
+    push_update(
+        &state,
+        update_fixture(20, 109, 555, 555, "/run hello there"),
+    );
+    let db = telegram_db_path("run-command");
+    let gateway = test_state(RUN_ECHO_SOURCE, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    // The /run reply echoes the durable run id and the admission status.
+    let run_id = run_id_from_reply(&state).await;
+    let reply = state
+        .sent_texts()
+        .iter()
+        .find(|text| text.starts_with("Run "))
+        .expect("run reply")
+        .clone();
+    assert!(
+        reply.contains(&run_id) && reply.contains("started"),
+        "the /run reply must echo the durable run id and status, got: {reply}"
+    );
+    assert_eq!(
+        reply,
+        format!("Run {run_id} started (status: started)."),
+        "the reply must carry exactly the durable admission status"
+    );
+    assert!(
+        !reply.contains("TEST-SECRET-TOKEN"),
+        "the reply must never contain a secret"
+    );
+
+    // The worker REALLY ran with the command's argument as the input.
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| text == "hello there")
+    })
+    .await;
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_run_command_duplicate_update_admits_only_one_run() {
+    let (base, state) = spawn_fixture().await;
+    // Same message_id (durable idempotency key), two update_ids.
+    push_update(&state, update_fixture(21, 105, 555, 555, "/run dup"));
+    push_update(&state, update_fixture(22, 105, 555, 555, "/run dup"));
+    let db = telegram_db_path("run-dedup");
+    let gateway = test_state(RUN_ECHO_SOURCE, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let sends = state.sent_texts();
+    assert_eq!(
+        sends.iter().filter(|text| *text == "dup").count(),
+        1,
+        "the duplicated /run update must admit exactly one run: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| text.starts_with("Run ")).count(),
+        1,
+        "exactly one /run confirmation reply: {sends:?}"
+    );
+    assert_eq!(
+        sends.iter().filter(|text| *text == "[done]").count(),
+        1,
+        "one run must render one terminal line: {sends:?}"
+    );
+
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+/// P3: a bare `/run` (no input text) is a usage error — it must reply with
+/// the usage line and MUST NOT admit a run (no durable run, no worker, no
+/// identity echo).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_bare_run_returns_usage_without_admitting() {
+    let (base, state) = spawn_fixture().await;
+    push_update(&state, update_fixture(26, 107, 555, 555, "/run"));
+    let db = telegram_db_path("bare-run");
+    let gateway = test_state(RUN_ECHO_SOURCE, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("Usage: /run"))
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let sends = state.sent_texts();
+    assert!(
+        !sends.iter().any(|text| text.starts_with("Run ")),
+        "a bare /run must never admit a run: {sends:?}"
+    );
+    let usage = sends
+        .iter()
+        .find(|text| text.contains("Usage: /run"))
+        .expect("bare /run usage reply");
+    assert!(
+        usage.starts_with("Usage: /run"),
+        "the reply must be the typed usage line, got: {usage}"
+    );
+
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_approve_command_resolves_the_real_parked_approval_and_executes_the_tool() {
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-approve-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("approve root");
+    let server = spawn_scripted_provider(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("approved.txt"), "content": "approved"})
+            )])),
+        ),
+        (200, wire_text("approved and done")),
+    ]);
+    let db = telegram_db_path("a8-approve");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    // /run admits the run; the production loop parks it on a durable approval.
+    push_update(
+        &state,
+        update_fixture(30, 110, 555, 555, "/run write the file"),
+    );
+    let run_id = run_id_from_reply(&state).await;
+    wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+    assert!(
+        !root.join("approved.txt").exists(),
+        "the tool must not execute while waiting"
+    );
+    let approval_id = parked_approval_id(&gateway, &run_id);
+
+    // The renderer surfaces the REAL approval id and the resolution commands.
+    let expected_line = format!(
+        "[approval] file.write requires approval (pending) — /approve {approval_id} or /deny {approval_id}"
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().contains(&expected_line)
+    })
+    .await;
+
+    // /approve with the explicit id resolves the durable row exactly once.
+    push_update(
+        &state,
+        update_fixture(31, 111, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("Approval {approval_id} approved; the run continues."))
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("approved.txt")).expect("written"),
+        "approved",
+        "the approved tool must really execute"
+    );
+    let row = durable_approval_row(&gateway, &approval_id);
+    assert_eq!(row[7], json!("approved"), "durable approval state");
+    assert_eq!(
+        row[13],
+        json!("telegram:555"),
+        "the actor must be persisted"
+    );
+    assert_eq!(
+        row[14],
+        json!("approved via telegram message 555:111"),
+        "the reason must be persisted"
+    );
+    assert_eq!(server.request_count(), 2, "exactly one resume");
+
+    // A second /approve is a typed no-op and NEVER resumes the run.
+    push_update(
+        &state,
+        update_fixture(32, 112, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("already resolved"))
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        server.request_count(),
+        2,
+        "the second /approve must never resume the run"
+    );
+
+    adapter.shutdown().await;
+    drop(gateway);
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_deny_command_folds_a_typed_denial_and_the_loop_continues() {
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-deny-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("deny root");
+    let server = spawn_scripted_provider(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("denied.txt"), "content": "denied"})
+            )])),
+        ),
+        (200, wire_text("the tool was denied")),
+    ]);
+    let db = telegram_db_path("a8-deny");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    push_update(
+        &state,
+        update_fixture(40, 120, 555, 555, "/run write the file"),
+    );
+    let run_id = run_id_from_reply(&state).await;
+    wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+    let approval_id = parked_approval_id(&gateway, &run_id);
+
+    push_update(
+        &state,
+        update_fixture(41, 121, 555, 555, &format!("/deny {approval_id}")),
+    );
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("Approval {approval_id} denied; the run continues."))
+    })
+    .await;
+    assert!(
+        !root.join("denied.txt").exists(),
+        "the denied tool must never execute"
+    );
+    let row = durable_approval_row(&gateway, &approval_id);
+    assert_eq!(row[7], json!("denied"), "durable approval state");
+    assert_eq!(
+        row[13],
+        json!("telegram:555"),
+        "the actor must be persisted"
+    );
+    assert_eq!(
+        row[14],
+        json!("denied via telegram message 555:121"),
+        "the reason must be persisted"
+    );
+    assert_eq!(
+        server.request_count(),
+        2,
+        "the loop continued after the denial"
+    );
+
+    adapter.shutdown().await;
+    drop(gateway);
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_approval_command_errors_are_typed_and_never_resume() {
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-approval-errors-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("errors root");
+    let server = spawn_scripted_provider(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("approved.txt"), "content": "approved"})
+            )])),
+        ),
+        (200, wire_text("approved and done")),
+    ]);
+    let db = telegram_db_path("a8-approval-errors");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    push_update(
+        &state,
+        update_fixture(50, 130, 555, 555, "/run write the file"),
+    );
+    let run_id = run_id_from_reply(&state).await;
+    wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+    let approval_id = parked_approval_id(&gateway, &run_id);
+
+    // Typed usage errors: missing id, unknown id, and ambiguous multi-token id.
+    push_update(&state, update_fixture(51, 131, 555, 555, "/approve"));
+    push_update(&state, update_fixture(52, 132, 555, 555, "/approve nope"));
+    push_update(
+        &state,
+        update_fixture(53, 133, 555, 555, &format!("/approve {approval_id} extra")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("Usage: /approve <approval_id>."))
+    })
+    .await;
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("No such approval: nope"))
+    })
+    .await;
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("one id only"))
+    })
+    .await;
+    assert_eq!(
+        durable_run_status(&gateway, &run_id),
+        "waiting_approval",
+        "usage errors must not touch the parked run"
+    );
+
+    // Cross-session oracle: the same approval id from another chat is a
+    // typed PERMISSION error with the IDENTICAL observable shape as an
+    // unknown id (existence/state must never leak across sessions), never
+    // resumes, and must not consume the park.
+    push_update(
+        &state,
+        update_fixture(54, 134, -1001234, 555, &format!("/approve {approval_id}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("No such approval: {approval_id}."))
+    })
+    .await;
+    assert_eq!(
+        durable_run_status(&gateway, &run_id),
+        "waiting_approval",
+        "a foreign-chat /approve must never resume the run"
+    );
+    assert_eq!(
+        durable_approval_row(&gateway, &approval_id)[7],
+        json!("pending"),
+        "the foreign-chat attempt must leave the row pending"
+    );
+
+    // The owning chat can still resolve the SAME approval.
+    push_update(
+        &state,
+        update_fixture(55, 135, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("approved.txt")).expect("written"),
+        "approved"
+    );
+
+    adapter.shutdown().await;
+    drop(gateway);
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_approval_requires_the_durable_origin_actor() {
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-owner-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("owner root");
+    let server = spawn_scripted_provider(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("approved.txt"), "content": "approved"})
+            )])),
+        ),
+        (200, wire_text("approved and done")),
+    ]);
+    let db = telegram_db_path("a8-owner");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    // Both 555 (the /run initiator) and 777 are allowlisted — the allowlist
+    // is only the ENTRY permission and must never substitute for the
+    // per-run durable origin actor.
+    let mut telegram = test_config(&base);
+    telegram.allowed_users = vec![555, 777];
+    let adapter = spawn_adapter(gateway.clone(), telegram).await;
+
+    // /run by 555 parks the run on a durable approval.
+    push_update(
+        &state,
+        update_fixture(30, 110, 555, 555, "/run write the file"),
+    );
+    let run_id = run_id_from_reply(&state).await;
+    wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+    let approval_id = parked_approval_id(&gateway, &run_id);
+
+    // The durable origin actor of the run is the initiator telegram:555.
+    assert_eq!(
+        durable_run_origin(&gateway, &run_id),
+        "telegram:555",
+        "the run must durably record its origin actor"
+    );
+
+    // A different allowlisted user in the SAME chat must not resolve or
+    // consume the park: identical oracle shape, row stays pending, run stays
+    // parked.
+    push_update(
+        &state,
+        update_fixture(31, 111, 555, 777, &format!("/approve {approval_id}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("No such approval: {approval_id}."))
+    })
+    .await;
+    assert_eq!(
+        durable_run_status(&gateway, &run_id),
+        "waiting_approval",
+        "a non-owner /approve must never resume the run"
+    );
+    assert_eq!(
+        durable_approval_row(&gateway, &approval_id)[7],
+        json!("pending"),
+        "a non-owner attempt must never consume the park"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(server.request_count(), 1, "no tool round for a non-owner");
+
+    // The ORIGINAL initiator can still resolve the same approval.
+    push_update(
+        &state,
+        update_fixture(32, 112, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("approved.txt")).expect("written"),
+        "approved"
+    );
+    assert_eq!(
+        durable_approval_row(&gateway, &approval_id)[13],
+        json!("telegram:555"),
+        "the resolving actor is the durable origin actor"
+    );
+
+    adapter.shutdown().await;
+    drop(gateway);
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// P2 cross-session oracle: resolving a REAL approval from a foreign chat
+/// and probing an id that never existed must produce the IDENTICAL typed
+/// reply shape (modulo the id itself) — existence and state never leak
+/// across sessions. Only an approval that passes the session AND the
+/// durable-owner check may reveal already-resolved/expired details.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_cross_session_approval_oracle_returns_identical_shapes() {
+    // A known UUID that was never requested: the canonical probe id.
+    const NEVER_ID: &str = "00000000-0000-0000-0000-000000000000";
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-oracle-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("oracle root");
+    let server = spawn_scripted_provider(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("approved.txt"), "content": "approved"})
+            )])),
+        ),
+        (200, wire_text("approved and done")),
+    ]);
+    let db = telegram_db_path("a8-oracle");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    // Chat 555 admits and parks a REAL approval.
+    push_update(
+        &state,
+        update_fixture(30, 110, 555, 555, "/run write the file"),
+    );
+    let run_id = run_id_from_reply(&state).await;
+    wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+    let approval_id = parked_approval_id(&gateway, &run_id);
+
+    // Probe 1 — a never-existing id in the owning chat (owner, same session):
+    // the canonical "no such approval" shape.
+    push_update(
+        &state,
+        update_fixture(33, 113, 555, 555, &format!("/approve {NEVER_ID}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("No such approval: {NEVER_ID}."))
+    })
+    .await;
+
+    // Probe 2 — the REAL approval id from a FOREIGN chat/session: exactly
+    // the same observable shape as the never-existing id.
+    push_update(
+        &state,
+        update_fixture(34, 114, -1001234, 555, &format!("/approve {approval_id}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("No such approval: {approval_id}."))
+    })
+    .await;
+
+    // The two replies are the identical template modulo the id: strip the
+    // id position and compare.
+    let sent_texts = state.sent_texts();
+    let never_reply = sent_texts
+        .iter()
+        .find(|text| **text == format!("No such approval: {NEVER_ID}."))
+        .expect("never-id reply");
+    let foreign_reply = sent_texts
+        .iter()
+        .find(|text| **text == format!("No such approval: {approval_id}."))
+        .expect("foreign-chat reply");
+    assert_eq!(
+        never_reply.replace(NEVER_ID, "<id>"),
+        foreign_reply.replace(&approval_id, "<id>"),
+        "foreign-session and never-existing probes must be byte-identical in shape"
+    );
+
+    // Neither probe consumed the park: the owner still resolves.
+    push_update(
+        &state,
+        update_fixture(35, 115, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+    // The owner's second /approve passes the session+owner checks and only
+    // THEN reveals the already-resolved detail (state never leaked to the
+    // foreign probes).
+    push_update(
+        &state,
+        update_fixture(36, 116, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| {
+            *text == format!("Approval {approval_id} is already resolved (state: approved).")
+        })
+    })
+    .await;
+
+    adapter.shutdown().await;
+    drop(gateway);
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// A pre-v5 run (empty durable `origin_actor`, exactly what an existing
+/// database admitted before the v5 origin column carried) with a pending
+/// approval must be typed-rejected with the IDENTICAL shape as an unknown
+/// id — even from the owning chat and session. The owner-less row is safely
+/// rejected (never resolved, never resumed, never consumed), because no
+/// durable actor can be verified for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_approval_ownerless_old_row_is_a_typed_no_op() {
+    const NEVER_ID: &str = "00000000-0000-0000-0000-000000000000";
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-old-ownerless-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("old-row root");
+    let server = spawn_scripted_provider(vec![]);
+    let db = telegram_db_path("a8-old-ownerless");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    // Craft the pre-v5 durable state: the telegram session, a run whose
+    // origin_actor is EMPTY (a v4-era admission), and its pending approval.
+    let persistence = gateway.persistence().expect("durable persistence");
+    let session_id = "telegram:fixture_bot:555:";
+    let now = 1_000_000u64;
+    let run_id = Uuid::new_v4().to_string();
+    let approval_id = Uuid::new_v4().to_string();
+    persistence
+        .session_create(&json!({
+            "id": session_id,
+            "profile": "telegram",
+            "platform": "telegram",
+            "account_id": "fixture_bot",
+            "chat_id": "555",
+            "thread_id": "",
+            "user_id": "555",
+            "generation": 1,
+            "system_prompt": "",
+            "model": "test-model",
+            "provider": "",
+            "toolset_hash": "",
+            "metadata_json": "{}",
+            "title": "",
+            "end_reason": "",
+            "now_ms": now,
+        }))
+        .expect("old-row session");
+    persistence
+        .admission_create(&json!({
+            "session_id": session_id,
+            "session_new": 0,
+            "profile": "telegram",
+            "platform": "telegram",
+            "account_id": "fixture_bot",
+            "model": "test-model",
+            "provider": "openai_chat",
+            "system_prompt": "",
+            "run_id": run_id,
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"old row\"}",
+            "message_id": Uuid::new_v4().to_string(),
+            "message_run_id": run_id,
+            "script_hash": "",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": Uuid::new_v4().to_string(),
+            "now_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("old-row admission");
+    persistence
+        .approval_request(&json!({
+            "id": approval_id,
+            "run_id": run_id,
+            "session_id": session_id,
+            "tool_call_id": "call-old",
+            "tool_name": "file.write",
+            "arguments_json": "{}",
+            "risk_class": "write",
+            "decision_scope": "one_time",
+            "one_time": 1,
+            "requested_at_ms": now,
+            "expires_at_ms": 0,
+        }))
+        .expect("old-row approval request");
+    assert_eq!(
+        durable_run_origin(&gateway, &run_id),
+        "",
+        "the pre-v5 row must carry no durable origin actor"
+    );
+    assert_eq!(
+        durable_approval_row(&gateway, &approval_id)[7],
+        json!("pending"),
+        "the crafted approval must be pending"
+    );
+
+    // The owner chat probes the never-existing id and the REAL owner-less
+    // approval: both are the identical typed shape, and the park survives.
+    push_update(
+        &state,
+        update_fixture(40, 120, 555, 555, &format!("/approve {NEVER_ID}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("No such approval: {NEVER_ID}."))
+    })
+    .await;
+    push_update(
+        &state,
+        update_fixture(41, 121, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| *text == format!("No such approval: {approval_id}."))
+    })
+    .await;
+    let sent_texts = state.sent_texts();
+    let never_reply = sent_texts
+        .iter()
+        .find(|text| **text == format!("No such approval: {NEVER_ID}."))
+        .expect("never-id reply");
+    let old_reply = sent_texts
+        .iter()
+        .find(|text| **text == format!("No such approval: {approval_id}."))
+        .expect("ownerless-id reply");
+    assert_eq!(
+        never_reply.replace(NEVER_ID, "<id>"),
+        old_reply.replace(&approval_id, "<id>"),
+        "an owner-less pre-v5 approval must be byte-identical to a never-existing id"
+    );
+    assert_eq!(
+        durable_approval_row(&gateway, &approval_id)[7],
+        json!("pending"),
+        "the owner-less attempt must never consume the park"
+    );
+    assert_eq!(
+        durable_run_status(&gateway, &run_id),
+        "running",
+        "the owner-less run must never be resumed"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        server.request_count(),
+        0,
+        "no tool round for an owner-less row"
+    );
+
+    adapter.shutdown().await;
+    drop(gateway);
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// The durable origin binding must hold across a gateway restart: the owner
+/// check reads the DURABLE runs.origin_actor (never an in-memory-only map),
+/// so a fresh process on the same database enforces the same contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_approval_owner_binding_survives_restart() {
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-restart-owner-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("restart root");
+    let server = spawn_scripted_provider(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("approved.txt"), "content": "approved"})
+            )])),
+        ),
+        (200, wire_text("approved and done")),
+        // Phase 2 runs on the SAME scripted provider (the responses repeat
+        // the LAST entry once exhausted): the phase-2 `/run` must park on a
+        // fresh tool round, so the phase-1 approve and the phase-2 run each
+        // need their own tool/text pair (4 responses total).
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-2",
+                "file.write",
+                json!({"path": root.join("approved.txt"), "content": "approved again"})
+            )])),
+        ),
+        (200, wire_text("approved and done again")),
+    ]);
+    let db = telegram_db_path("a8-restart-owner");
+    let mut telegram = test_config(&base);
+    telegram.allowed_users = vec![555, 777];
+
+    // Phase 1: a fresh gateway parks a run; 777 is rejected with the oracle
+    // shape; the durable origin column records telegram:555.
+    {
+        let mut config = a5_gateway_config(server.port(), &root);
+        config.approval_mode = "manual".to_string();
+        let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+            .expect("phase 1 gateway");
+        let adapter = spawn_adapter(gateway.clone(), telegram.clone()).await;
+        push_update(
+            &state,
+            update_fixture(30, 110, 555, 555, "/run write the file"),
+        );
+        let run_id = run_id_from_reply(&state).await;
+        wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+        let approval_id = parked_approval_id(&gateway, &run_id);
+        assert_eq!(
+            durable_run_origin(&gateway, &run_id),
+            "telegram:555",
+            "the origin actor must be durably persisted"
+        );
+        push_update(
+            &state,
+            update_fixture(31, 111, 555, 777, &format!("/approve {approval_id}")),
+        );
+        wait_until(std::time::Duration::from_secs(30), || {
+            state
+                .sent_texts()
+                .iter()
+                .any(|text| *text == format!("No such approval: {approval_id}."))
+        })
+        .await;
+        assert_eq!(
+            durable_approval_row(&gateway, &approval_id)[7],
+            json!("pending"),
+            "phase 1: the non-owner attempt must leave the row pending"
+        );
+        // The stop leaves the park cleanly (and expires the row — P3), so
+        // the phase-2 run starts from a stable gate. The OWNER resolves it
+        // first so the durable row is terminal before the restart.
+        push_update(
+            &state,
+            update_fixture(32, 112, 555, 555, &format!("/approve {approval_id}")),
+        );
+        wait_for_durable_status(&gateway, &run_id, "completed").await;
+        // The renderer must flush the terminal before shutdown: a trailing
+        // delivery cursor would make the phase-2 adapter's resume re-render
+        // the phase-1 run and hold the active-run gate against the new /run.
+        wait_until(std::time::Duration::from_secs(30), || {
+            state.sent_texts().iter().any(|text| text == "[done]")
+        })
+        .await;
+        adapter.shutdown().await;
+        drop(gateway);
+    }
+
+    // Phase 2: a fresh gateway on the SAME durable database (no in-memory
+    // carry-over) enforces the identical owner contract.
+    {
+        let mut config = a5_gateway_config(server.port(), &root);
+        config.approval_mode = "manual".to_string();
+        let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+            .expect("phase 2 gateway");
+        let adapter = spawn_adapter(gateway.clone(), telegram).await;
+        // The restart's undelivered catch-up renderer (if any) must finish
+        // and release the session gate BEFORE the new /run is admitted.
+        let sent_before_resume = state.sent_texts().len();
+        wait_until(std::time::Duration::from_secs(30), || {
+            state
+                .sent_texts()
+                .iter()
+                .skip(sent_before_resume)
+                .any(|text| text == "[done]")
+        })
+        .await;
+        push_update(
+            &state,
+            update_fixture(37, 117, 555, 555, "/run write the file again"),
+        );
+        // The fixture retains phase-1 replies; only a NEW "Run " reply can
+        // belong to the phase-2 admission, so wait past the phase-1 count.
+        let sent_before = state.sent_texts().len();
+        wait_until(std::time::Duration::from_secs(30), || {
+            state.sent_texts().len() > sent_before
+                && state
+                    .sent_texts()
+                    .iter()
+                    .skip(sent_before)
+                    .any(|text| text.starts_with("Run "))
+        })
+        .await;
+        let run_id = state
+            .sent_texts()
+            .iter()
+            .skip(sent_before)
+            .find(|text| text.starts_with("Run "))
+            .expect("phase-2 run reply")
+            .strip_prefix("Run ")
+            .expect("run reply prefix")
+            .split(' ')
+            .next()
+            .expect("run id")
+            .to_string();
+        wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+        let approval_id = parked_approval_id(&gateway, &run_id);
+        push_update(
+            &state,
+            update_fixture(38, 118, 555, 777, &format!("/approve {approval_id}")),
+        );
+        wait_until(std::time::Duration::from_secs(30), || {
+            state
+                .sent_texts()
+                .iter()
+                .any(|text| *text == format!("No such approval: {approval_id}."))
+        })
+        .await;
+        assert_eq!(
+            durable_run_status(&gateway, &run_id),
+            "waiting_approval",
+            "phase 2: the non-owner must still be rejected after a restart"
+        );
+        push_update(
+            &state,
+            update_fixture(39, 119, 555, 555, &format!("/approve {approval_id}")),
+        );
+        wait_for_durable_status(&gateway, &run_id, "completed").await;
+        adapter.shutdown().await;
+        drop(gateway);
+    }
+
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_approval_after_stop_is_a_typed_no_op() {
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-stop-race-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("race root");
+    let server = spawn_scripted_provider(vec![(
+        200,
+        wire_tool_calls(json!([tool_call(
+            "call-1",
+            "file.write",
+            json!({"path": root.join("never.txt"), "content": "never"})
+        )])),
+    )]);
+    let db = telegram_db_path("a8-stop-race");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    push_update(
+        &state,
+        update_fixture(60, 140, 555, 555, "/run write the file"),
+    );
+    let run_id = run_id_from_reply(&state).await;
+    wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+    let approval_id = parked_approval_id(&gateway, &run_id);
+
+    // /stop cancels the parked run (typed); the P3 park consumption cancels
+    // the durable approval row via the A5 `approval.cancel` op — expired
+    // promptly, NOT left pending for the default TTL.
+    push_update(&state, update_fixture(61, 141, 555, 555, "/stop"));
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("Stopping the active run"))
+    })
+    .await;
+    wait_for_durable_status(&gateway, &run_id, "cancelled").await;
+    // The consumed park's approval row must transition to expired WITHOUT
+    // waiting for the TTL expiry sweep.
+    wait_until(std::time::Duration::from_secs(20), || {
+        durable_approval_row(&gateway, &approval_id)[7] == json!("expired")
+    })
+    .await;
+    assert_eq!(
+        durable_approval_row(&gateway, &approval_id)[13],
+        json!("gateway-stop"),
+        "the stop-consuming cancel records the gateway-stop resolver"
+    );
+    // A late /approve of the same durable id is a typed no-op: the owner
+    // passes the session+owner checks and only THEN sees the expired detail;
+    // the run is never resumed.
+    push_update(
+        &state,
+        update_fixture(62, 142, 555, 555, &format!("/approve {approval_id}")),
+    );
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| {
+            *text == format!("Approval {approval_id} is already resolved (state: expired).")
+        })
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        durable_run_status(&gateway, &run_id),
+        "cancelled",
+        "a late /approve must never resurrect a stopped run"
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "no tool round may start after the stop"
+    );
+    assert!(
+        !root.join("never.txt").exists(),
+        "the tool must never execute"
+    );
+
+    adapter.shutdown().await;
+    drop(gateway);
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_compact_reports_typed_availability_for_active_and_terminal_runs() {
+    let (base, state) = spawn_fixture().await;
+    // A real ACTIVE run without the A5 provider chain: the legacy source
+    // parks in a holding HTTP call, so the run stays durably non-terminal
+    // and its renderer holds the session gate.
+    let (port, _arrived, release_tx, holding) = spawn_holding_fixture();
+    let (config, source) = holding_config_and_source(port);
+    push_update(
+        &state,
+        update_fixture(70, 150, 555, 555, "/run write the file"),
+    );
+    let db = telegram_db_path("a8-compact");
+    let gateway = test_state(&source, &db, |_config| config.clone());
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    // The run is durably active (parked mid-run; the session gate is held).
+    let run_id = run_id_from_reply(&state).await;
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| text == "before")
+    })
+    .await;
+    assert!(
+        !matches!(
+            durable_run_status(&gateway, &run_id).as_str(),
+            "completed" | "failed" | "cancelled"
+        ),
+        "the run must be durably active while /compact is tested"
+    );
+
+    // Active run: /compact answers the typed loop-managed state; there is
+    // no manual compaction trigger on the service.
+    push_update(&state, update_fixture(71, 151, 555, 555, "/compact"));
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("no manual compaction trigger"))
+    })
+    .await;
+    let sends = state.sent_texts();
+    let active_compact = sends
+        .iter()
+        .find(|text| text.contains("no manual compaction trigger"))
+        .expect("active /compact reply");
+    assert!(
+        !active_compact.contains("completed"),
+        "an active-run /compact must never claim a compaction happened"
+    );
+
+    // Release the run: it completes, its renderer delivers the terminal
+    // line, and the session gate is released.
+    let _ = release_tx.send(());
+    holding.join().expect("holding fixture");
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+
+    // Terminal run: /compact answers the typed no-active-run state.
+    push_update(&state, update_fixture(73, 153, 555, 555, "/compact"));
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("nothing to compact"))
+    })
+    .await;
+
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_status_reflects_durable_state_across_restart() {
+    let (base, state) = spawn_fixture().await;
+    push_update(&state, fixture_json("updates_dm.json"));
+    let db = telegram_db_path("status-durable");
+
+    // Phase 1: one completed run, then /status reports the durable status.
+    let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    wait_until(std::time::Duration::from_secs(30), || {
+        state.sent_texts().iter().any(|text| text == "[done]")
+    })
+    .await;
+    push_update(&state, update_fixture(23, 200, 555, 555, "/status"));
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("latest run") && text.contains("completed"))
+    })
+    .await;
+    let phase1 = state
+        .sent_texts()
+        .iter()
+        .find(|text| text.contains("latest run"))
+        .expect("phase 1 /status reply")
+        .clone();
+    adapter.shutdown().await;
+    drop(gateway);
+
+    // Phase 2: a fresh gateway on the SAME durable state reports the same
+    // completed run without any in-memory carry-over.
+    let restored = test_state(ECHO_SOURCE, &db, |config| config);
+    let adapter2 = spawn_adapter(restored.clone(), test_config(&base)).await;
+    push_update(&state, update_fixture(24, 201, 555, 555, "/status"));
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("latest run") && text.contains("completed"))
+    })
+    .await;
+    let phase2 = state
+        .sent_texts()
+        .iter()
+        .rfind(|text| text.contains("latest run"))
+        .expect("phase 2 /status reply")
+        .clone();
+    assert_eq!(phase1, phase2, "/status must read the durable state");
+    assert!(
+        !phase2.contains("TEST-SECRET-TOKEN"),
+        "the status reply must never contain a secret"
+    );
+
+    adapter2.shutdown().await;
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
