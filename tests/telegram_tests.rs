@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
+    body::{Body, to_bytes},
     extract::{Path, Query, State},
+    http::{Method, Request, StatusCode},
     response::IntoResponse,
     routing::post,
 };
@@ -669,7 +671,7 @@ fn api_base_http_is_rejected_outside_localhost_without_the_escape_hatch() {
 // ---------------------------------------------------------------------------
 
 use rustscript_agent::{
-    AgentGatewayConfig, AgentGatewayState,
+    AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app,
     gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
     gateway::utf16_len,
 };
@@ -3554,6 +3556,152 @@ async fn adapter_approval_owner_binding_survives_restart() {
         drop(gateway);
     }
 
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+    std::fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// One API approval-resolution request through the real router; returns
+/// (status, body) — used by the cross-gate race below.
+async fn api_approve(app: &axum::Router, run_id: &str, approval_id: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/runs/{run_id}/approvals/{approval_id}/approve"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"actor": "reviewer-alice", "reason": "cross-gate race"}).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("response body should be readable");
+    (
+        status,
+        serde_json::from_slice(&body).expect("response should be JSON"),
+    )
+}
+
+/// Cross-gate exact-once: the API surface (A7) and the Telegram surface (A8)
+/// resolve the SAME durable approval concurrently. Exactly one resume may
+/// reach the provider; the losing resolver must get a typed no-resume reply
+/// (API `409 already_resolved`/`no_pending_approval`, Telegram "already
+/// resolved"/"is not waiting on this gateway") and the durable approval row
+/// is resolved exactly once by exactly one of the two actors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_and_telegram_resolving_the_same_approval_resume_exactly_once() {
+    let (base, state) = spawn_fixture().await;
+    let root = telegram_test_root().join(format!("a8-cross-race-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("race root");
+    let server = spawn_scripted_provider(vec![
+        (
+            200,
+            wire_tool_calls(json!([tool_call(
+                "call-1",
+                "file.write",
+                json!({"path": root.join("raced.txt"), "content": "raced"})
+            )])),
+        ),
+        (200, wire_text("raced and done")),
+    ]);
+    let db = telegram_db_path("a8-cross-race");
+    let mut config = a5_gateway_config(server.port(), &root);
+    config.approval_mode = "manual".to_string();
+    let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
+        .expect("gateway with the built-in production loop");
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+    let app = build_agent_gateway_app(gateway.clone());
+
+    // /run admits the run (durable origin_actor = telegram:555) and the
+    // production loop parks it on a durable approval.
+    push_update(
+        &state,
+        update_fixture(30, 110, 555, 555, "/run race the approval"),
+    );
+    let run_id = run_id_from_reply(&state).await;
+    wait_for_durable_status(&gateway, &run_id, "waiting_approval").await;
+    let approval_id = parked_approval_id(&gateway, &run_id);
+    let provider_calls_before = server.request_count();
+    assert_eq!(
+        provider_calls_before, 1,
+        "exactly one admission round before the race"
+    );
+
+    // Race the two surfaces on the SAME durable approval id.
+    let (api_result, _) = tokio::join!(api_approve(&app, &run_id, &approval_id), async {
+        push_update(
+            &state,
+            update_fixture(31, 111, 555, 555, &format!("/approve {approval_id}")),
+        );
+    });
+
+    // Exactly one resume: the run completes and the provider saw exactly one
+    // more request — never two.
+    wait_for_durable_status(&gateway, &run_id, "completed").await;
+    wait_until(std::time::Duration::from_secs(10), || {
+        server.request_count() > provider_calls_before
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(
+        server.request_count(),
+        provider_calls_before + 1,
+        "concurrent API + Telegram resolution must resume exactly once"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("raced.txt")).expect("written"),
+        "raced",
+        "the single resumed run must execute the approved tool"
+    );
+
+    // Exactly one resolver won; the other got a typed no-resume reply. The
+    // API loser is `409` with `already_resolved` or `no_pending_approval`;
+    // the Telegram loser replies "already resolved" or "is not waiting on
+    // this gateway". Either side may win — never both.
+    let api_won = matches!(api_result, (StatusCode::OK, _));
+    let api_lost_typed = matches!(
+        api_result,
+        (StatusCode::CONFLICT, ref body)
+            if body["error"]["code"] == json!("already_resolved")
+                || body["error"]["code"] == json!("no_pending_approval")
+    );
+    assert!(
+        api_won || api_lost_typed,
+        "the API resolution must be a typed winner or a typed no-op, got {api_result:?}"
+    );
+    let telegram_won = state
+        .sent_texts()
+        .iter()
+        .any(|text| text.contains("the run continues"));
+    let telegram_lost_typed = state.sent_texts().iter().any(|text| {
+        text.contains("already resolved") || text.contains("is not waiting on this gateway")
+    });
+    assert!(
+        telegram_won || telegram_lost_typed,
+        "the Telegram resolution must be a typed winner or a typed no-op"
+    );
+    assert_ne!(
+        api_won, telegram_won,
+        "exactly one surface may win the race"
+    );
+
+    // The durable approval row is resolved exactly once by exactly one of
+    // the two actors.
+    let row = durable_approval_row(&gateway, &approval_id);
+    assert_eq!(row[7], json!("approved"), "durable approval state");
+    let resolver = row[13].as_str().expect("resolver").to_string();
+    assert!(
+        resolver == "reviewer-alice" || resolver == "telegram:555",
+        "the durable resolver must be exactly one of the two racing actors, got {resolver:?}"
+    );
+
+    adapter.shutdown().await;
+    drop(gateway);
     std::fs::remove_file(&db).expect("temporary db should be removed");
     std::fs::remove_dir_all(&root).expect("temporary root should be removed");
 }
