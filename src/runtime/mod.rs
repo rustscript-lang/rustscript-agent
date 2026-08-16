@@ -16,4 +16,5 @@ pub use approval_bridge::{
 };
 pub use subagent_supervisor::{
     ChildExecutor, ChildOutcome, ChildSpec, SupervisionMode, SupervisorCancel, supervise_batch,
+    supervise_batch_bounded,
 };

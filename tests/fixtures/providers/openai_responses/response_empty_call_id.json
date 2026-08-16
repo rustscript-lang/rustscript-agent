@@ -1,0 +1,18 @@
+{
+  "id": "resp_empty_call_id",
+  "object": "response",
+  "created_at": 1755000006,
+  "status": "completed",
+  "model": "gpt-4.1-mini",
+  "output": [
+    {
+      "type": "function_call",
+      "id": "fc_empty_call_id",
+      "call_id": "",
+      "name": "read_file",
+      "arguments": "{\"path\":\"README.md\"}"
+    }
+  ],
+  "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+  "error": null
+}

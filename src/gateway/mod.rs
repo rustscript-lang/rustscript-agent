@@ -200,6 +200,12 @@ impl AgentGatewayState {
         Arc::clone(&self.service)
     }
 
+    /// The shared in-memory store (diagnostics and fixture stalling; the
+    /// same store the service owns).
+    pub fn store(&self) -> Arc<RwLock<store::GatewayStore>> {
+        Arc::clone(&self.store)
+    }
+
     /// Builds the gateway with the BUILT-IN production serial loop program
     /// (`rss/agent/main.rss`, entry [`PRODUCTION_LOOP_ENTRY`]) — the default
     /// agent available in the real gateway without test injection. The

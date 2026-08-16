@@ -1,4 +1,4 @@
-//! A5 production serial loop — end-to-end fixtures through the REAL service.
+//! A5/A6 production serial loop — end-to-end fixtures through the REAL service.
 //!
 //! Every fixture drives `AgentGatewayState::with_default_agent_program[_and_sqlite]`
 //! (the built-in `rss/agent/main.rss` program compiled at construction — no
@@ -6,13 +6,18 @@
 //! asserts the durable outcome through `GatewayPersistence` (events replay +
 //! run records). Coverage: text-only round, tool round (real io root),
 //! provider retry/error, cancel, approval wait/resume exact-once + deny,
-//! max-turn runaway, durable compaction, and the typed A6 handoff terminal.
+//! max-turn runaway, durable compaction, and the A6 native supervisor
+//! wiring: real child runs through AgentService (bounded concurrency on the
+//! real wire, race/fail-fast cancellation, approval-gated batches, exact-once
+//! child lifecycle events, depth/fanout rejection, parent-stop propagation,
+//! and durable child links that survive a restart).
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -170,6 +175,36 @@ fn wire_text(text: &str) -> String {
             "finish_reason": "stop"
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+    .to_string()
+}
+
+/// The OpenAI Responses wire text response: the `output` item array with a
+/// single assistant `message` carrying `output_text` parts.
+fn wire_responses_text(text: &str) -> String {
+    json!({
+        "id": "resp-1",
+        "object": "response",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        }],
+        "status": "completed"
+    })
+    .to_string()
+}
+
+/// The Anthropic Messages wire text response: the top-level `content` block
+/// array with one `text` block and a `stop_reason`.
+fn wire_anthropic_text(text: &str) -> String {
+    json!({
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
     })
     .to_string()
 }
@@ -909,28 +944,2736 @@ async fn e2e_compaction_executes_durably_and_advances_generation() {
     fs::remove_dir_all(&root).expect("temporary root should be removed");
 }
 
+// ---------------------------------------------------------------------------
+// A6 native supervisor wiring: real child runs through AgentService
+// ---------------------------------------------------------------------------
+
+/// One rule of the concurrency probe server: the first rule whose needle
+/// appears in the request body wins (status, body, hold delay).
+#[derive(Clone)]
+struct ProbeRule {
+    needle: String,
+    status: u16,
+    body: String,
+    delay_ms: u64,
+}
+
+/// Thread-per-connection fixture server that counts concurrent in-flight
+/// requests (the real 2-concurrency timing probe) and answers each request
+/// from the rule table (so child runs can be scripted to succeed, fail, or
+/// stall by their input text).
+struct ProbeServer {
+    port: u16,
+    requests: Arc<AtomicUsize>,
+    peak_concurrent: Arc<AtomicUsize>,
+    /// Request bodies in connection-accept order (each as raw HTTP text).
+    bodies: Arc<Mutex<Vec<String>>>,
+    shutdown: mpsc::Sender<()>,
+}
+
+impl ProbeServer {
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    /// The observed peak of concurrently in-flight requests.
+    fn peak_concurrent(&self) -> usize {
+        self.peak_concurrent.load(Ordering::SeqCst)
+    }
+
+    /// The JSON body of the Nth request (0-based, connection order).
+    fn request_body(&self, index: usize) -> Option<JsonValue> {
+        let bodies = self.bodies.lock().expect("probe bodies lock");
+        let raw = bodies.get(index)?;
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().trim_end();
+        serde_json::from_str(body).ok()
+    }
+
+    /// All captured raw request bodies in connection order.
+    fn request_bodies(&self) -> Vec<String> {
+        self.bodies.lock().expect("probe bodies lock").clone()
+    }
+}
+
+impl Drop for ProbeServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+    }
+}
+
+fn spawn_probe_server(rules: Vec<ProbeRule>) -> ProbeServer {
+    spawn_probe_server_impl(rules, None)
+}
+
+/// A probe server that serves the canonical 429 rate-limit error for the
+/// FIRST request whose body contains `throttle_needle` (a retryable
+/// provider round), then serves the rule table for every later request —
+/// the provider retry must succeed on its second attempt.
+fn spawn_probe_server_with_first_round_429(
+    throttle_needle: &str,
+    rules: Vec<ProbeRule>,
+) -> ProbeServer {
+    spawn_probe_server_impl(rules, Some(throttle_needle.to_string()))
+}
+
+fn spawn_probe_server_impl(rules: Vec<ProbeRule>, throttle: Option<String>) -> ProbeServer {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
+    let port = listener.local_addr().expect("local addr").port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let count = Arc::clone(&requests);
+    let active_for_loop = Arc::clone(&active);
+    let peak_for_loop = Arc::clone(&peak);
+    let bodies_for_loop = Arc::clone(&bodies);
+    let throttled = Arc::new(AtomicBool::new(false));
+    thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking fixture listener");
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let active_conn = Arc::clone(&active_for_loop);
+                    let peak_conn = Arc::clone(&peak_for_loop);
+                    let bodies_conn = Arc::clone(&bodies_for_loop);
+                    let rules_for_conn = rules.clone();
+                    let throttle_for_conn = throttle.clone();
+                    let throttled_for_conn = Arc::clone(&throttled);
+                    thread::spawn(move || {
+                        let in_flight = active_conn.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak_conn.fetch_max(in_flight, Ordering::SeqCst);
+                        let body = read_request_body(&stream);
+                        bodies_conn
+                            .lock()
+                            .expect("probe bodies lock")
+                            .push(body.clone());
+                        // The first-round 429 throttle: the FIRST request
+                        // whose body carries the needle is answered with the
+                        // retryable rate-limit error; every later request
+                        // falls through to the rule table.
+                        if let Some(needle) = throttle_for_conn.as_deref()
+                            && body.contains(needle)
+                            && !throttled_for_conn.swap(true, Ordering::SeqCst)
+                        {
+                            let (status, response_body) = wire_error(
+                                429,
+                                "rate_limit_error",
+                                "rate_limit_exceeded",
+                                "slow down",
+                            );
+                            let response = format!(
+                                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                response_body.len(),
+                                response_body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            active_conn.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
+                        let matched = rules_for_conn
+                            .iter()
+                            .find(|rule| body.contains(&rule.needle));
+                        let (status, response_body, delay_ms) = matched
+                            .map(|rule| (rule.status, rule.body.clone(), rule.delay_ms))
+                            .unwrap_or((200, String::new(), 0));
+                        if delay_ms > 0 {
+                            thread::sleep(Duration::from_millis(delay_ms));
+                        }
+                        let reason = if status == 200 { "OK" } else { "Error" };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        active_conn.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    ProbeServer {
+        port,
+        requests,
+        peak_concurrent: peak,
+        bodies,
+        shutdown: shutdown_tx,
+    }
+}
+
+fn read_request_body(stream: &TcpStream) -> String {
+    let mut stream = stream.try_clone().expect("clone fixture stream");
+    stream
+        .set_nonblocking(true)
+        .expect("nonblocking fixture stream");
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut content_length = None;
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if content_length.is_none() {
+                    content_length = text.lines().find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                    });
+                }
+                let head_end = text.find("\r\n\r\n").unwrap_or(0);
+                if let Some(length) = content_length
+                    && request.len() >= head_end + 4 + length
+                {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// Deterministic FNV-1a 64-bit hash (the service's child admission key
+/// hash — the test replica lets a fixture pre-admit the exact child the
+/// executor would admit).
+fn fnv1a64(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Admits a run with a STRUCTURED input (the parallel/task delegation
+/// request) and spawns the worker exactly like the API server does.
+async fn admit_structured(
+    service: &Arc<AgentService>,
+    input: JsonValue,
+) -> rustscript_agent::AdmittedRun {
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input,
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "test".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+            origin_actor: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            session_messages: Vec::new(),
+        })
+        .await
+        .expect("admission should succeed");
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), String::new()),
+    );
+    admitted
+}
+
+fn child_events<'a>(
+    events: &'a [(i64, String, JsonValue)],
+    event_type: &str,
+) -> Vec<&'a JsonValue> {
+    events
+        .iter()
+        .filter(|(_, ty, _)| ty == event_type)
+        .map(|(_, _, payload)| payload)
+        .collect()
+}
+
+/// The parent's continuation request body carries the folded tool messages
+/// (`tool_call_id` parts); child requests carry only plain user text.
+const PARENT_RULE: &str = "tool_call_id";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_parallel_handoff_is_a_typed_terminal_never_fabricated() {
-    let root = temporary_root("e2e-handoff");
-    let server = spawn_scripted_server(vec![(200, wire_text("unused"))], 0);
+async fn e2e_parallel_execution_admits_real_children_with_bounded_concurrency_and_ordered_slots() {
+    let root = temporary_root("e2e-parallel-real");
+    let mut rules = Vec::new();
+    for index in 0..4 {
+        rules.push(ProbeRule {
+            needle: format!("job-{index}"),
+            status: 200,
+            body: wire_text(&format!("R-{index}")),
+            delay_ms: 300,
+        });
+    }
+    rules.push(ProbeRule {
+        needle: PARENT_RULE.to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    });
+    let server = spawn_probe_server(rules);
     let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
         config.parallel = true;
     });
-    let admitted =
-        admit_and_wait(&state.service(), "parallel please", Duration::from_secs(30)).await;
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "parent_marker": "PARENT",
+            "tasks": [
+                {"id": "t0", "input": "job-0"},
+                {"id": "t1", "input": "job-1"},
+                {"id": "t2", "input": "job-2"},
+                {"id": "t3", "input": "job-3"},
+            ],
+            "mode": "all",
+            "max_concurrency": 2,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
 
-    assert_eq!(durable_run_status(&state, &admitted.run_id), "failed");
-    let events = replayed_events(&state, &admitted.run_id);
-    let failed = events
-        .iter()
-        .find(|(_, event_type, _)| event_type == "run.failed")
-        .expect("typed run.failed event");
-    assert_eq!(
-        failed.2["error_code"],
-        json!("parallel_execution_unavailable"),
-        "the handoff must be a typed unavailable terminal, never fabricated success"
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    // Four children really ran (one provider round each) plus the parent's
+    // continuation round.
+    assert_eq!(server.request_count(), 5);
+    // The parent's continuation request (the round after the folded results)
+    // must be provider-legal: every tool result follows a matching assistant
+    // tool call in the SAME request (no dangling results — real OpenAI
+    // Chat/Responses and Anthropic contracts reject those).
+    let continuation = server
+        .request_body(4)
+        .expect("the parent continuation request body");
+    assert!(
+        !request_has_dangling_tool_result(&continuation),
+        "the parent continuation request must carry no dangling tool result: {continuation}"
     );
-    assert_eq!(server.request_count(), 0, "no provider call for a handoff");
+    // The plan's max_concurrency=2 was enforced with REAL overlap: the peak
+    // of concurrent in-flight provider requests is exactly 2, never more.
+    assert_eq!(
+        server.peak_concurrent(),
+        2,
+        "bounded concurrency must hold on the real wire"
+    );
+
+    // Child lifecycle events exactly once per child, all before the parent's
+    // terminal: 4 started + 4 completed.
+    let events = replayed_events(&state, &admitted.run_id);
+    let started = child_events(&events, "subagent.started");
+    let completed = child_events(&events, "subagent.completed");
+    assert_eq!(
+        started.len(),
+        4,
+        "one subagent.started per real child admission"
+    );
+    assert_eq!(
+        completed.len(),
+        4,
+        "one subagent.completed per durable child terminal"
+    );
+    let run_completed_seq = events
+        .iter()
+        .find(|(_, ty, _)| ty == "run.completed")
+        .map(|(seq, _, _)| *seq)
+        .expect("parent terminal");
+    for (seq, _, _) in &events {
+        assert!(
+            *seq <= run_completed_seq,
+            "no child event after the parent terminal"
+        );
+    }
+
+    // Durable child links: one row per child under the parent.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 4, "durable child_run_links rows");
+    // Every child is a REAL run: durable row exists, parent_run_id links back,
+    // its session is independent of the parent's session, status completed.
+    let parent_session = {
+        let data = persistence
+            .run_get(&admitted.run_id)
+            .expect("parent run row");
+        data.get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .and_then(|row| row.get(1))
+            .and_then(JsonValue::as_str)
+            .expect("parent session id")
+            .to_string()
+    };
+    for row in rows {
+        let child_id = row
+            .get(1)
+            .and_then(JsonValue::as_str)
+            .expect("child id")
+            .to_string();
+        let child = persistence.run_get(&child_id).expect("child run row");
+        let child_row = child
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .expect("child row");
+        assert_eq!(
+            child_row.get(2).and_then(JsonValue::as_str),
+            Some(admitted.run_id.as_str()),
+            "child run must carry the parent link"
+        );
+        assert_eq!(
+            child_row.get(3).and_then(JsonValue::as_str),
+            Some("completed"),
+            "child run reaches a durable completed terminal"
+        );
+        let child_session = child_row.get(1).and_then(JsonValue::as_str).unwrap_or("");
+        assert_ne!(
+            child_session, parent_session,
+            "each child gets an isolated session, never the parent's"
+        );
+    }
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parallel_race_first_success_cancels_losers_and_never_starts_the_rest() {
+    let root = temporary_root("e2e-parallel-race");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "fast".to_string(),
+            status: 200,
+            body: wire_text("R-fast"),
+            delay_ms: 50,
+        },
+        ProbeRule {
+            needle: "slow".to_string(),
+            status: 200,
+            body: wire_text("R-slow"),
+            delay_ms: 600,
+        },
+        ProbeRule {
+            needle: PARENT_RULE.to_string(),
+            status: 200,
+            body: wire_text("parent done"),
+            delay_ms: 0,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "fast"},
+                {"id": "t1", "input": "slow"},
+                {"id": "t2", "input": "never-2"},
+                {"id": "t3", "input": "never-3"},
+            ],
+            "mode": "race",
+            "max_concurrency": 2,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    let started = child_events(&events, "subagent.started");
+    let completed = child_events(&events, "subagent.completed");
+    // Only the two racing children were ever admitted (both started, exactly
+    // once each); the remaining slots never started.
+    assert_eq!(started.len(), 2, "only the racing pair is admitted");
+    assert_eq!(
+        completed.len(),
+        2,
+        "both admitted children reach a durable terminal"
+    );
+    let statuses: Vec<&str> = completed
+        .iter()
+        .map(|payload| payload["status"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(statuses.len(), 2);
+    assert!(
+        statuses.contains(&"completed"),
+        "the race winner completes: {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&"cancelled"),
+        "the race loser is cancelled: {statuses:?}"
+    );
+    // Only the two racing children have durable run rows (the never-started
+    // slots admit nothing).
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "never-started slots leave no links and no runs"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parallel_fail_fast_first_failure_cancels_siblings_and_never_starts_the_rest() {
+    let root = temporary_root("e2e-parallel-failfast");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "boom".to_string(),
+            status: 400,
+            body: wire_error(400, "invalid_request_error", "bad_request", "boom").1,
+            delay_ms: 50,
+        },
+        ProbeRule {
+            needle: PARENT_RULE.to_string(),
+            status: 200,
+            body: wire_text("parent done"),
+            delay_ms: 0,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "boom"},
+                {"id": "t1", "input": "never-1"},
+                {"id": "t2", "input": "never-2"},
+            ],
+            "mode": "fail_fast",
+            "max_concurrency": 1,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    let started = child_events(&events, "subagent.started");
+    let completed = child_events(&events, "subagent.completed");
+    assert_eq!(
+        started.len(),
+        1,
+        "only the first sibling is admitted before the failure"
+    );
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0]["status"],
+        json!("failed"),
+        "the failed sibling reaches a durable failed terminal"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "fail-fast siblings are cancelled before admission"
+    );
+    assert_eq!(
+        server.request_count(),
+        2,
+        "the failed child's provider round plus the parent's"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// A6 sparse-parallel ordinal fix — REAL E2E. One parent run drives a
+/// fail-fast parallel batch whose slots t1 and t2 are cancelled before they
+/// start: they consume ordinal identities 1 and 2 but create NO
+/// child_run_links row (links.len() == 1 while 3 ordinals are consumed). The
+/// durable parent-level ordinal allocator must reserve the full range [0,1,2]
+/// so ANY follow-up batch of the same parent starts strictly past it — never
+/// reusing 1 or 2. Under the OLD `links.len()` ordinal base a follow-up batch
+/// would resume at ordinal 1 and collide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parallel_sparse_batch_reserves_refused_ordinals_durably_for_followup_batches() {
+    let root = temporary_root("e2e-parallel-sparse-ordinals");
+    let server = spawn_scripted_server(
+        vec![
+            (
+                400,
+                wire_error(400, "invalid_request_error", "bad_request", "boom").1,
+            ),
+            (200, wire_text("parent done")),
+        ],
+        0,
+    );
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    // First batch is fail-fast: slot t0 is ADMITTED (ordinal 0) and fails;
+    // the interior/tail slots t1 and t2 are cancelled BEFORE they ever start
+    // — they consume ordinal identities 1 and 2 but create NO child_run_links
+    // row (a SPARSE batch: links.len() understates the ordinals consumed).
+    // The durable parent-level ordinal allocator must reserve the full range
+    // [0,1,2] so a later batch of the SAME parent never reuses 1 or 2.
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "boom"},
+                {"id": "t1", "input": "never-1"},
+                {"id": "t2", "input": "never-2"},
+            ],
+            "mode": "fail_fast",
+            "max_concurrency": 1,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    assert_eq!(
+        server.request_count(),
+        2,
+        "the failing child's provider round plus the parent's continuation"
+    );
+
+    // Only t0 was ever admitted; t1/t2 never started (cancelled before
+    // admission), so exactly one subagent.started at ordinal 0.
+    let events = replayed_events(&state, &admitted.run_id);
+    let started = child_events(&events, "subagent.started");
+    assert_eq!(started.len(), 1, "only the admitted child starts");
+    assert_eq!(started[0]["ordinal"], json!(0));
+
+    // The sparse batch CONSUMED three ordinals (0,1,2), but only ordinal 0
+    // has a durable child link. The durable allocator high-water must be 3 —
+    // a `links.len()` base (1) would under-reserve the refused slots.
+    let persistence = state.persistence().expect("durable persistence");
+    assert_eq!(
+        persistence
+            .parent_ordinal_next(&admitted.run_id, "parallel")
+            .expect("durable parent ordinal high-water"),
+        3,
+        "the durable allocator must reserve the refused/cancelled-before-start ordinals (links.len() would under-reserve)"
+    );
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let link_rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(link_rows.len(), 1, "only the admitted child is linked");
+    assert_eq!(link_rows[0][2], json!(0));
+
+    // A SECOND batch of the same parent is allocated strictly PAST the
+    // consumed range — the durable allocator grants base 3 for a 2-slot
+    // follow-up (ordinals 3,4), never reusing 0, 1, or 2.
+    assert_eq!(
+        persistence
+            .allocate_ordinals(&admitted.run_id, "parallel", 2)
+            .expect("follow-up batch allocation"),
+        3,
+        "a follow-up batch must never reuse a consumed sparse ordinal"
+    );
+    assert_eq!(
+        persistence
+            .parent_ordinal_next(&admitted.run_id, "parallel")
+            .expect("high-water after follow-up"),
+        5
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parallel_batch_approval_parks_durably_then_resumes_and_executes_children() {
+    let root = temporary_root("e2e-parallel-approval");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "job-0".to_string(),
+            status: 200,
+            body: wire_text("R-0"),
+            delay_ms: 0,
+        },
+        ProbeRule {
+            needle: PARENT_RULE.to_string(),
+            status: 200,
+            body: wire_text("parent done"),
+            delay_ms: 0,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "manual".to_string();
+        config.parallel = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [{"id": "t0", "input": "job-0"}],
+            "mode": "all",
+            "max_concurrency": 1,
+        }),
+    )
+    .await;
+
+    // The parallel delegation is approval-gated (A4): the run parks on the
+    // durable pending approval and no child is admitted while waiting.
+    wait_for(Duration::from_secs(15), || {
+        durable_run_status(&state, &admitted.run_id) == "waiting_approval"
+    });
+    let parked_events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&parked_events, "subagent.started").is_empty(),
+        "no child starts while the batch approval is pending"
+    );
+
+    state
+        .service()
+        .resolve_run_approval(&admitted.run_id, true)
+        .expect("approval resolution");
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    let types = event_types(&events);
+    assert!(types.contains(&"approval.required".to_string()));
+    assert!(types.contains(&"approval.resolved".to_string()));
+    // After the durable approval, the child is really admitted exactly once
+    // and reaches its durable terminal exactly once.
+    assert_eq!(child_events(&events, "subagent.started").len(), 1);
+    assert_eq!(child_events(&events, "subagent.completed").len(), 1);
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(server.request_count(), 2);
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_subagent_real_child_admission_is_linked_isolated_and_folded() {
+    let root = temporary_root("e2e-subagent-real");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "child job".to_string(),
+            status: 200,
+            body: wire_text("R-child"),
+            delay_ms: 0,
+        },
+        ProbeRule {
+            needle: PARENT_RULE.to_string(),
+            status: 200,
+            body: wire_text("parent done"),
+            delay_ms: 0,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.task = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "child": {"id": "c1", "input": "child job"},
+            "depth": 0,
+            "max_depth": 4,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    let started = child_events(&events, "subagent.started");
+    let completed = child_events(&events, "subagent.completed");
+    assert_eq!(started.len(), 1, "exactly one real child admission");
+    assert_eq!(completed.len(), 1, "exactly one durable child terminal");
+    assert_eq!(completed[0]["status"], json!("completed"));
+    assert!(
+        started[0]["seq"].is_null() || completed[0].get("child_run_id").is_some(),
+        "the completed event carries the real child run id"
+    );
+
+    // The child is a REAL run: durable row, parent link, isolated session.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 1);
+    // The durable link row (admission contract): relation "subagent"; the
+    // state REALLY advances pending (admission) -> active (native link) ->
+    // the child's terminal — the observed child terminal is completed here.
+    let relation = rows[0].get(3).and_then(JsonValue::as_str).unwrap_or("?");
+    assert_eq!(relation, "subagent");
+    let link_state = rows[0].get(4).and_then(JsonValue::as_str).unwrap_or("?");
+    assert_eq!(
+        link_state, "completed",
+        "the durable link state must advance to the child's observed terminal"
+    );
+    let child_id = rows[0]
+        .get(1)
+        .and_then(JsonValue::as_str)
+        .expect("child id");
+    let child = persistence.run_get(child_id).expect("child run row");
+    let child_row = child
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(JsonValue::as_array)
+        .expect("child row");
+    assert_eq!(
+        child_row.get(2).and_then(JsonValue::as_str),
+        Some(admitted.run_id.as_str()),
+        "child run carries the parent link"
+    );
+    assert_eq!(
+        child_row.get(3).and_then(JsonValue::as_str),
+        Some("completed")
+    );
+    let parent_session = {
+        let data = persistence
+            .run_get(&admitted.run_id)
+            .expect("parent run row");
+        data.get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .and_then(|row| row.get(1))
+            .and_then(JsonValue::as_str)
+            .expect("parent session id")
+            .to_string()
+    };
+    assert_ne!(
+        child_row.get(1).and_then(JsonValue::as_str).unwrap_or(""),
+        parent_session,
+        "the child's session is independent"
+    );
+    // The parent's continuation provider round carries the child outcome
+    // folded into history (the loop kept reasoning with the real result).
+    assert_eq!(server.request_count(), 2);
+    // The continuation request is provider-legal: the folded child result is
+    // preceded by the matching assistant tool call in the same request.
+    let continuation = server
+        .request_body(1)
+        .expect("the parent continuation request body");
+    assert!(
+        !request_has_dangling_tool_result(&continuation),
+        "the subagent continuation request must carry no dangling tool result: {continuation}"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// The parent continuation request after a parallel handoff must be legal on
+/// EVERY direct adapter wire: OpenAI Chat (dedicated `tool` messages),
+/// OpenAI Responses (`function_call` / `function_call_output` items), and
+/// Anthropic Messages (`tool_use` / `tool_result` blocks) all reject a tool
+/// result that does not follow a matching assistant tool call in the same
+/// request. Delegation is input-driven, so the loop itself must synthesize
+/// the matching pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parallel_continuation_request_has_no_dangling_tool_results_on_every_adapter() {
+    for provider in ["openai_chat", "openai_responses", "anthropic_messages"] {
+        let root = temporary_root(&format!("e2e-no-dangling-{provider}"));
+        // The child requests carry the task needle; the parent's continuation
+        // request carries the folded child output ("R-0") regardless of the
+        // provider wire shape.
+        let server = spawn_probe_server(vec![
+            ProbeRule {
+                needle: "job-0".to_string(),
+                status: 200,
+                body: match provider {
+                    "openai_responses" => wire_responses_text("R-0"),
+                    "anthropic_messages" => wire_anthropic_text("R-0"),
+                    _ => wire_text("R-0"),
+                },
+                delay_ms: 0,
+            },
+            ProbeRule {
+                needle: "job-1".to_string(),
+                status: 200,
+                body: match provider {
+                    "openai_responses" => wire_responses_text("R-1"),
+                    "anthropic_messages" => wire_anthropic_text("R-1"),
+                    _ => wire_text("R-1"),
+                },
+                delay_ms: 0,
+            },
+            ProbeRule {
+                needle: "R-0".to_string(),
+                status: 200,
+                body: match provider {
+                    "openai_responses" => wire_responses_text("parent done"),
+                    "anthropic_messages" => wire_anthropic_text("parent done"),
+                    _ => wire_text("parent done"),
+                },
+                delay_ms: 0,
+            },
+        ]);
+        let state = spawn_state(server.port(), &root, true, |config| {
+            config.provider = Some(provider.to_string());
+            config.approval_mode = "all".to_string();
+            config.parallel = true;
+        });
+        let admitted = admit_structured(
+            &state.service(),
+            json!({
+                "tasks": [
+                    {"id": "t0", "input": "job-0"},
+                    {"id": "t1", "input": "job-1"},
+                ],
+                "mode": "all",
+                "max_concurrency": 2,
+            }),
+        )
+        .await;
+        wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+        assert_eq!(
+            durable_run_status(&state, &admitted.run_id),
+            "completed",
+            "provider {provider} completes after folding the results"
+        );
+        assert_eq!(
+            server.request_count(),
+            3,
+            "provider {provider} child rounds + continuation"
+        );
+        let bodies = server.request_bodies();
+        let continuation = bodies
+            .iter()
+            .find(|raw| raw.contains("R-0"))
+            .and_then(|raw| serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap_or_default()).ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "provider {provider}: no captured body carries the folded child output; bodies: {:?}",
+                    bodies.iter().map(|raw| raw.chars().take(1600).collect::<String>()).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            !request_has_dangling_tool_result(&continuation),
+            "provider {provider} continuation must carry no dangling tool result: {continuation}"
+        );
+        fs::remove_dir_all(&root).expect("temporary root should be removed");
+    }
+}
+
+/// The DENIED delegation path (approval_mode never — no approval gate, no
+/// handoff) folds the typed denial as a full matching pair: the parent's
+/// continuation request must be provider-legal with no dangling tool result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_denied_delegation_continuation_request_has_no_dangling_tool_result() {
+    let root = temporary_root("e2e-denied-delegation");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "approval_denied".to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "never".to_string();
+        config.task = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({"child": {"id": "c1", "input": "child job"}}),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&events, "subagent.started").is_empty(),
+        "a denied delegation never starts a child"
+    );
+    // The parent's continuation request folds the typed denial and is
+    // provider-legal (the synthesized assistant tool_call precedes the
+    // tool result).
+    assert_eq!(
+        server.request_count(),
+        1,
+        "only the parent continuation round"
+    );
+    let continuation = server
+        .request_body(0)
+        .expect("the parent continuation request body");
+    assert!(
+        continuation.to_string().contains("approval_denied"),
+        "the typed denial must reach the provider in history: {continuation}"
+    );
+    assert!(
+        !request_has_dangling_tool_result(&continuation),
+        "the denied-delegation continuation must carry no dangling tool result: {continuation}"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// The NATIVE deny policy (A4 `NativeDenyPolicy` through
+/// `ApprovalBridge::decide`) is production-reachable for parallel
+/// delegation: the typed denial is folded, the loop continues reasoning,
+/// and NO child is ever admitted or started — even though the RSS
+/// approval gate (approval_mode all) approved the handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parallel_native_deny_policy_folds_typed_denial_and_never_starts_children() {
+    let root = temporary_root("e2e-parallel-native-deny");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "approval_denied".to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.native_deny_tools = vec!["parallel.run".to_string()];
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [{"id": "t0", "input": "job-0"}, {"id": "t1", "input": "job-1"}],
+            "mode": "all",
+            "max_concurrency": 2,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&events, "subagent.started").is_empty(),
+        "a natively-denied parallel batch never starts a child"
+    );
+    assert!(
+        child_events(&events, "subagent.completed").is_empty(),
+        "a natively-denied parallel batch never completes a child"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    assert!(
+        links["rows"].as_array().is_none_or(Vec::is_empty),
+        "a natively-denied parallel batch leaves no child links"
+    );
+    // The typed denial reaches the provider in history and the continuation
+    // request stays provider-legal (no dangling tool result).
+    assert_eq!(
+        server.request_count(),
+        1,
+        "only the parent continuation round"
+    );
+    let continuation = server
+        .request_body(0)
+        .expect("the parent continuation request body");
+    assert!(
+        continuation.to_string().contains("approval_denied"),
+        "the native denial must be folded into history: {continuation}"
+    );
+    assert!(
+        !request_has_dangling_tool_result(&continuation),
+        "the denied continuation must carry no dangling tool result: {continuation}"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// The NATIVE deny policy denies SUBAGENT delegation by risk class
+/// (`execute`): the typed denial is folded and no child is ever admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_subagent_native_deny_policy_folds_typed_denial_and_never_starts_the_child() {
+    let root = temporary_root("e2e-subagent-native-deny");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "approval_denied".to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.task = true;
+        config.native_deny_risks = vec!["execute".to_string()];
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({"child": {"id": "c1", "input": "child job"}}),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&events, "subagent.started").is_empty(),
+        "a natively-denied subagent never starts"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    assert!(
+        links["rows"].as_array().is_none_or(Vec::is_empty),
+        "a natively-denied subagent leaves no child link"
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "only the parent continuation round"
+    );
+    let continuation = server
+        .request_body(0)
+        .expect("the parent continuation request body");
+    assert!(
+        continuation.to_string().contains("approval_denied"),
+        "the risk-class native denial must be folded into history: {continuation}"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// The `native_hard_deny` CONFIG surface (fed to the RSS approval policy,
+/// not approval_mode never) denies delegation in production: the typed
+/// denial is folded and no child is ever admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_native_hard_deny_config_denies_delegation_in_production() {
+    let root = temporary_root("e2e-hard-deny-config");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "approval_denied".to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.native_hard_deny = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [{"id": "t0", "input": "job-0"}],
+            "mode": "all",
+            "max_concurrency": 1,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&events, "subagent.started").is_empty(),
+        "native_hard_deny must deny the delegation before any child starts"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    assert!(
+        links["rows"].as_array().is_none_or(Vec::is_empty),
+        "native_hard_deny leaves no child links"
+    );
+    let continuation = server
+        .request_body(0)
+        .expect("the parent continuation request body");
+    assert!(
+        continuation.to_string().contains("approval_denied"),
+        "native_hard_deny must fold the typed denial: {continuation}"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// A natively-denied delegation NEVER parks: in approval_mode auto (which
+/// would otherwise park the execute-class delegation), no durable approval
+/// row is created and the loop continues with the typed denial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_native_deny_prevents_the_park_in_auto_mode() {
+    let root = temporary_root("e2e-native-deny-no-park");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "approval_denied".to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "auto".to_string();
+        config.task = true;
+        config.native_deny_tools = vec!["subagent.run".to_string()];
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({"child": {"id": "c1", "input": "child job"}}),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&events, "subagent.started").is_empty(),
+        "a natively-denied delegation never starts a child"
+    );
+    assert!(
+        event_types(&events)
+            .iter()
+            .all(|ty| ty != "approval.required"),
+        "a natively-denied delegation must never create a durable approval park"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    assert!(
+        links["rows"].as_array().is_none_or(Vec::is_empty),
+        "a natively-denied delegation leaves no child links"
+    );
+    // The run completed by itself (no park, no resume): the typed denial was
+    // folded and the loop continued immediately.
+    assert_eq!(
+        server.request_count(),
+        1,
+        "only the parent continuation round"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// A retryable provider error (429) on the parent's FIRST provider round
+/// after a handoff must NEVER re-enter the delegation gate: the RSS loop
+/// state carries the delegation-completed flag, so the retry goes directly
+/// to the provider phase. With UNLIMITED fanout (max_fanout = 0), a gate
+/// re-entry would re-admit every child — this test proves the child
+/// calls, subagent.started/completed events, folded result pairs, and
+/// durable links are all EXACT-ONCE. (This replaces the previous
+/// mirror-fanout e2e whose premise — the retry re-entering the gate and
+/// triggering a second handoff — was the bug being fixed; the policy-level
+/// fanout rejection stays covered by `parallel_tests.rs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parallel_unlimited_fanout_429_retry_is_exact_once() {
+    let root = temporary_root("e2e-parallel-429-exact-once");
+    let mut rules = Vec::new();
+    for index in 0..4 {
+        rules.push(ProbeRule {
+            needle: format!("job-{index}"),
+            status: 200,
+            body: wire_text(&format!("R-{index}")),
+            delay_ms: 0,
+        });
+    }
+    rules.push(ProbeRule {
+        needle: PARENT_RULE.to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    });
+    // The FIRST request whose body carries "R-0" (the parent's first
+    // continuation after the folded results) is a retryable 429; the
+    // retried attempt succeeds.
+    let server = spawn_probe_server_with_first_round_429("R-0", rules);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.base_retry_delay_ms = 0;
+        config.max_retry_delay_ms = 0;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "job-0"},
+                {"id": "t1", "input": "job-1"},
+                {"id": "t2", "input": "job-2"},
+                {"id": "t3", "input": "job-3"},
+            ],
+            "mode": "all",
+            "max_concurrency": 2,
+            // UNLIMITED fanout: a gate re-entry would admit 4 MORE
+            // children (the deterministic slot keys replay) and duplicate
+            // every lifecycle artifact.
+            "max_fanout": 0,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    // 4 child rounds + 2 parent attempts (the first throttled 429, the
+    // retried continuation) — never 4 + 4 + 2.
+    assert_eq!(
+        server.request_count(),
+        6,
+        "exactly four child rounds and two parent attempts — the retry must not re-admit children"
+    );
+    // The successful (second) parent continuation carries the folded
+    // result pair EXACTLY ONCE per child: 4 assistant tool calls + 4 tool
+    // results, never 8.
+    let bodies = server.request_bodies();
+    let continuations = bodies
+        .iter()
+        .filter(|raw| raw.contains(PARENT_RULE))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        continuations.len(),
+        2,
+        "two parent continuation requests (throttled 429 + retried success)"
+    );
+    let final_continuation: JsonValue = continuations
+        .last()
+        .and_then(|raw| serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap_or_default()).ok())
+        .expect("the final continuation body");
+    // On the OpenAI Chat wire a tool result is a `role: "tool"` message
+    // with a message-level `tool_call_id` (string content) — one per folded
+    // child result, exactly once per child.
+    let tool_results = final_continuation
+        .get("messages")
+        .and_then(JsonValue::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        tool_results, 4,
+        "the result pair is folded exactly once per child in the final continuation"
+    );
+    assert!(
+        !request_has_dangling_tool_result(&final_continuation),
+        "the final continuation carries no dangling tool result"
+    );
+
+    // Child lifecycle events exactly once per child: 4 started + 4
+    // completed, all before the parent's terminal.
+    let events = replayed_events(&state, &admitted.run_id);
+    let started = child_events(&events, "subagent.started");
+    let completed = child_events(&events, "subagent.completed");
+    assert_eq!(started.len(), 4, "one subagent.started per real child");
+    assert_eq!(
+        completed.len(),
+        4,
+        "one subagent.completed per durable child terminal"
+    );
+    let run_completed_seq = events
+        .iter()
+        .find(|(_, ty, _)| ty == "run.completed")
+        .map(|(seq, _, _)| *seq)
+        .expect("parent terminal");
+    for (seq, _, _) in &events {
+        assert!(
+            *seq <= run_completed_seq,
+            "no child event after the parent terminal"
+        );
+    }
+
+    // Durable links: exactly one row per child, every child completed.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 4, "one durable child_run_links row per child");
+    for row in &rows {
+        let child_id = row.get(1).and_then(JsonValue::as_str).expect("child id");
+        assert_eq!(
+            durable_run_status(&state, child_id),
+            "completed",
+            "every child reaches a durable completed terminal: {child_id}"
+        );
+        assert_eq!(
+            row.get(4).and_then(JsonValue::as_str),
+            Some("completed"),
+            "the child link state stays terminal — never regressed to active"
+        );
+    }
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// The `supervise_batch_bounded` grace-drop path (children still in flight
+/// when the deadline + grace expire) must NOT leak: the RAII guard cancels
+/// the admitted children, every child reaches a durable terminal, and the
+/// capacity permits are all released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_grace_drop_cancels_in_flight_children_and_releases_permits() {
+    let root = temporary_root("e2e-grace-drop");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "hung".to_string(),
+        status: 200,
+        body: wire_text("never"),
+        delay_ms: 8_000,
+    }]);
+    let max_concurrent = 4usize;
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.max_concurrent_runs = max_concurrent;
+        // The batch deadline + a SHORT grace expire while both children are
+        // hung on their provider rounds: the children's own deadlines land
+        // AFTER the batch's grace window, so the in-flight slot futures are
+        // REALLY dropped (the grace-drop window) and the RAII guard must
+        // compensate.
+        config.run_timeout = Duration::from_secs(2);
+        config.cancellation_grace = Duration::from_millis(20);
+    });
+    let service = state.service();
+    let admitted = admit_structured(
+        &service,
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "hung"},
+                {"id": "t1", "input": "hung"},
+            ],
+            "mode": "all",
+            "max_concurrency": 2,
+        }),
+    )
+    .await;
+    wait_terminal(&service, &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "cancelled");
+    // Every admitted child reaches a DURABLE terminal (cancelled) within a
+    // bounded time — no orphaned run holds a permit forever.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(!rows.is_empty(), "the admitted children are durably linked");
+    for row in &rows {
+        let child_id = row.get(1).and_then(JsonValue::as_str).expect("child id");
+        wait_for(Duration::from_secs(30), || {
+            durable_run_status(&state, child_id) != "started"
+                && durable_run_status(&state, child_id) != "running"
+        });
+        assert!(
+            matches!(
+                durable_run_status(&state, child_id).as_str(),
+                "cancelled" | "failed"
+            ),
+            "the grace-dropped child reaches a durable terminal: {child_id}"
+        );
+    }
+    // All capacity permits are released: the parent AND both children are
+    // terminal, so every permit is back.
+    wait_for(Duration::from_secs(30), || {
+        service.available_capacity() == max_concurrent
+    });
+    assert_eq!(
+        service.available_capacity(),
+        max_concurrent,
+        "the grace drop must release every permit"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// An admission whose storage critical section stalls LONGER than the batch
+/// deadline + grace (the admission is still in flight when the slot future
+/// is dropped) must NOT orphan the child: the PRE-admission RAII guard
+/// (created before the `admit` await) starts a provably-bounded compensation
+/// watcher that, the moment the detached admission completes, immediately
+/// cancels the child, commits its durable terminal, and releases the
+/// permit/handle/link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_admission_in_flight_drop_stalling_past_grace_is_compensated() {
+    let root = temporary_root("e2e-admission-stall");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "hung".to_string(),
+        status: 200,
+        body: wire_text("never"),
+        delay_ms: 8_000,
+    }]);
+    let max_concurrent = 4usize;
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.max_concurrent_runs = max_concurrent;
+        // The batch deadline + a SHORT grace expire while the child's
+        // admission is still blocked in its storage critical section (the
+        // store write lock): the slot future is REALLY dropped with the
+        // admission in flight.
+        config.run_timeout = Duration::from_secs(2);
+        config.cancellation_grace = Duration::from_millis(20);
+    });
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({
+                "tasks": [{"id": "t0", "input": "hung"}],
+                "mode": "all",
+                "max_concurrency": 1,
+            }),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "test".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+            origin_actor: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            session_messages: Vec::new(),
+        })
+        .await
+        .expect("the parent admission should succeed");
+    // The store WRITE lock is now free (the parent admission completed).
+    // Hold the shared READ lock (readers barge past waiting writers) so the
+    // child's admission critical section stalls past the batch grace. The
+    // guard is a synchronous parking_lot guard: it must not span an await,
+    // so the stall uses a synchronous sleep (the second runtime worker keeps
+    // the parent's tasks running).
+    let store = state.store();
+    let store_guard = store.read();
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), String::new()),
+    );
+    std::thread::sleep(Duration::from_millis(2_500));
+    drop(store_guard);
+    wait_terminal(&service, &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "cancelled");
+    // The child never ran a provider round: no worker was ever spawned on
+    // it (the parent never reached the provider either).
+    assert_eq!(
+        server.request_count(),
+        0,
+        "the stalled admission's child must never execute a provider round"
+    );
+    // The late-completing admission really created one child link; the
+    // compensation durably terminates the child and releases every permit.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the detached admission created one child link"
+    );
+    let child_id = rows[0]
+        .get(1)
+        .and_then(JsonValue::as_str)
+        .expect("child id")
+        .to_string();
+    wait_for(Duration::from_secs(30), || {
+        matches!(
+            durable_run_status(&state, &child_id).as_str(),
+            "cancelled" | "failed"
+        )
+    });
+    let child_status = durable_run_status(&state, &child_id);
+    assert!(
+        matches!(child_status.as_str(), "cancelled" | "failed"),
+        "the admission-in-flight child reaches a durable terminal: {child_status}"
+    );
+    // If the parent already committed its terminal, the active-parent guard
+    // intentionally rejects this late mirror update. A terminal state is also
+    // valid when the update won before the parent terminal race.
+    let observed_link_state = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children")
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(4))
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        matches!(
+            observed_link_state.as_str(),
+            "pending" | "active" | "completed" | "failed" | "cancelled"
+        ),
+        "the durable link retains a valid lifecycle state: {observed_link_state}"
+    );
+    // Every capacity permit is released (parent + child both terminal).
+    wait_for(Duration::from_secs(30), || {
+        service.available_capacity() == max_concurrent
+    });
+    assert_eq!(
+        service.available_capacity(),
+        max_concurrent,
+        "the in-flight admission drop must release every permit"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+// ---------------------------------------------------------------------------
+// A6 final P2 (review round): compensation watcher lifecycle + durable
+// canonical-event append
+// ---------------------------------------------------------------------------
+
+/// Final P2 #1 (RED): the pre-admission compensation watcher must NOT give up
+/// after the old wall-clock bound — `terminal_commit_retry_window × 5` polls
+/// of 100 ms (500 ms with the SHORT 1 s window configured here) — and leave
+/// an orphan. The detached admission is stalled LONGER than the old bound
+/// (2.5 s): with the old watcher the child would stay durably `running` with
+/// a held permit and no worker. The watcher must keep polling (bounded only
+/// by service shutdown), find the late-completing admission, and compensate
+/// it past the old give-up point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_admission_in_flight_drop_past_old_watcher_bound_is_still_compensated() {
+    let root = temporary_root("e2e-admission-past-bound");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "hung".to_string(),
+        status: 200,
+        body: wire_text("never"),
+        delay_ms: 8_000,
+    }]);
+    let max_concurrent = 4usize;
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.max_concurrent_runs = max_concurrent;
+        // A SHORT terminal-commit window: the OLD watcher bound was
+        // window × 5 attempts × 100 ms = 500 ms. The 2.5 s stall below
+        // exceeds it, so only a watcher without a wall-clock give-up can
+        // still compensate the late admission.
+        config.terminal_commit_retry_window = Duration::from_secs(1);
+        config.run_timeout = Duration::from_secs(2);
+        config.cancellation_grace = Duration::from_millis(20);
+    });
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({
+                "tasks": [{"id": "t0", "input": "hung"}],
+                "mode": "all",
+                "max_concurrency": 1,
+            }),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "test".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+            origin_actor: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            session_messages: Vec::new(),
+        })
+        .await
+        .expect("the parent admission should succeed");
+    // The store READ lock stalls the child's admission critical section past
+    // the batch grace (the slot future is REALLY dropped with the admission
+    // in flight) AND past the OLD watcher give-up point.
+    let store = state.store();
+    let store_guard = store.read();
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), String::new()),
+    );
+    std::thread::sleep(Duration::from_millis(2_500));
+    drop(store_guard);
+    wait_terminal(&service, &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "cancelled");
+    // The child never ran a provider round: no worker was ever spawned on it.
+    assert_eq!(
+        server.request_count(),
+        0,
+        "the stalled admission's child must never execute a provider round"
+    );
+    // The late-completing admission really created one child link.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the detached admission created one child link"
+    );
+    let child_id = rows[0]
+        .get(1)
+        .and_then(JsonValue::as_str)
+        .expect("child id")
+        .to_string();
+    // THE P2 assertion: the child still reaches a durable terminal although
+    // the admission completed AFTER the old watcher give-up point (500 ms).
+    wait_for(Duration::from_secs(10), || {
+        matches!(
+            durable_run_status(&state, &child_id).as_str(),
+            "cancelled" | "failed"
+        )
+    });
+    let child_status = durable_run_status(&state, &child_id);
+    assert!(
+        matches!(child_status.as_str(), "cancelled" | "failed"),
+        "the admission-in-flight child is compensated past the old watcher \
+         bound: {child_status}"
+    );
+    // The child may finish after the parent terminal. In that race the
+    // active-parent guard intentionally rejects a late link-state write;
+    // a terminal link is also valid when the write won before the race.
+    let observed_link_state = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children")
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(4))
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        matches!(
+            observed_link_state.as_str(),
+            "pending" | "active" | "completed" | "failed" | "cancelled"
+        ),
+        "the durable link retains a valid lifecycle state: {observed_link_state}"
+    );
+    // Every capacity permit is released (parent + child both terminal).
+    wait_for(Duration::from_secs(10), || {
+        service.available_capacity() == max_concurrent
+    });
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// Final P2 #1 (RED): the compensation watcher's lifecycle is bounded by
+/// service shutdown, and a storage that NEVER returns leaves no
+/// permanently-running durable row on the normal recovery path. The
+/// admission is stalled forever: the watcher keeps polling (deduplicated per
+/// deterministic slot key — at most one watcher per key), exits when the
+/// service stops admitting (the SIGINT path), and the late admission — if it
+/// ever completes after the watcher exited — is durably failed by the
+/// restart-recovery orphan sweep when the state is reopened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_compensation_watcher_stops_on_shutdown_and_restart_recovers() {
+    let root = temporary_root("e2e-watcher-shutdown");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "hung".to_string(),
+        status: 200,
+        body: wire_text("never"),
+        delay_ms: 8_000,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.max_concurrent_runs = 4;
+        config.terminal_commit_retry_window = Duration::from_secs(1);
+        config.run_timeout = Duration::from_secs(2);
+        config.cancellation_grace = Duration::from_millis(20);
+    });
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({
+                "tasks": [{"id": "t0", "input": "hung"}],
+                "mode": "all",
+                "max_concurrency": 1,
+            }),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "test".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+            origin_actor: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            session_messages: Vec::new(),
+        })
+        .await
+        .expect("the parent admission should succeed");
+    let store = state.store();
+    // The admission is stalled FOREVER (the read lock is released only at
+    // the end of the test).
+    let store_guard = store.read();
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), String::new()),
+    );
+    // The batch grace-drop happened (~2 s): exactly ONE watcher is live for
+    // the deterministic slot key (repeated drops of the same key never spawn
+    // a second watcher), still polling because the admission never returned.
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(
+        service.compensation_watcher_count(),
+        1,
+        "one deduplicated watcher per deterministic admission key"
+    );
+    // Service shutdown (SIGINT path): admission closes and the watcher ends
+    // with the service — it never outlives the process.
+    service.stop_admission();
+    wait_for(Duration::from_secs(5), || {
+        service.compensation_watcher_count() == 0
+    });
+    // Storage NEVER returned: the admission commit is transactional, so no
+    // durable child row (and no durable link) was ever created by the
+    // stalled admission.
+    let persistence = state.persistence().expect("durable persistence");
+    assert!(
+        persistence
+            .list_children(&admitted.run_id)
+            .expect("list children")
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .map(|rows| rows.is_empty())
+            .unwrap_or(true),
+        "no durable child link exists while the admission never completed"
+    );
+    // Release the stall: the detached admission now completes AFTER the
+    // watcher exited (the shutdown/restart window) and lands durably
+    // `running` with no worker and no watcher.
+    drop(store_guard);
+    wait_for(Duration::from_secs(10), || {
+        persistence
+            .run_list("", "running")
+            .ok()
+            .map(|data| {
+                data.get("rows")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|rows| !rows.is_empty())
+            })
+            .unwrap_or(false)
+    });
+    // The normal recovery path (restart) must not leave permanently-running
+    // rows: the restart-recovery orphan sweep durably fails every interrupted
+    // `running` row on the next open.
+    let reopened = spawn_state_with_db(server.port(), &root, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    let reopened_persistence = reopened.persistence().expect("durable persistence");
+    let running = reopened_persistence
+        .run_list("", "running")
+        .expect("run list after restart");
+    assert_eq!(
+        running
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .map(|rows| rows.len())
+            .unwrap_or(0),
+        0,
+        "restart recovery leaves no permanently-running rows"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// Final P2 #1 (RED): the compensation-watcher task count is bounded by the
+/// admission/concurrency upper bound — a watcher exists only for a REAL
+/// in-flight admission, never for a slot the admission refused. With
+/// `max_concurrent_runs = 3` (the parent holds one permit) a 4-task batch
+/// admits exactly 2 children; the 2 refused slots are typed failures and
+/// produce no watcher, so the live watcher count never exceeds
+/// `capacity - 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_compensation_watcher_count_is_bounded_by_admission_capacity() {
+    let root = temporary_root("e2e-watcher-bound");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "hung".to_string(),
+        status: 200,
+        body: wire_text("never"),
+        delay_ms: 8_000,
+    }]);
+    let capacity = 3usize;
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+        config.max_concurrent_runs = capacity;
+        config.terminal_commit_retry_window = Duration::from_secs(1);
+        // A WIDE deadline margin: the children are admitted (links appear)
+        // and the store READ lock is taken LONG before the batch deadline
+        // fires, so the grace-drop always lands while the compensation is
+        // stalled — even under heavy parallel-suite load.
+        config.run_timeout = Duration::from_secs(4);
+        config.cancellation_grace = Duration::from_millis(20);
+    });
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({
+                "tasks": [
+                    {"id": "t0", "input": "hung"},
+                    {"id": "t1", "input": "hung"},
+                    {"id": "t2", "input": "hung"},
+                    {"id": "t3", "input": "hung"},
+                ],
+                "mode": "all",
+                "max_concurrency": 4,
+            }),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "test".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+            origin_actor: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            session_messages: Vec::new(),
+        })
+        .await
+        .expect("the parent admission should succeed");
+    // The children are admitted FIRST (the store is free), then the store
+    // READ lock is taken to stall the batch-grace compensation: every
+    // watcher stays registered while its durable terminal commit waits for
+    // the write lock — a STABLE, observable count. Synchronization is the
+    // DURABLE link row (created at admission time, independent of the
+    // provider server's serial connection handling).
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), String::new()),
+    );
+    let persistence = state.persistence().expect("durable persistence");
+    wait_for(Duration::from_secs(10), || {
+        persistence
+            .list_children(&admitted.run_id)
+            .ok()
+            .map(|data| {
+                data.get("rows")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|rows| rows.len() >= capacity - 1)
+            })
+            .unwrap_or(false)
+    });
+    let store = state.store();
+    let store_guard = store.read();
+    // The batch grace-drop lands while the compensation is stalled by the
+    // store READ lock: the parent holds one permit, so exactly
+    // `capacity - 1` children were admitted and are in flight. The refused
+    // slots (capacity) are typed failures and spawn NO watcher, so the live
+    // count is bounded by the admission upper bound — and stays stable
+    // until the lock is released.
+    std::thread::sleep(Duration::from_millis(4_500));
+    wait_for(Duration::from_secs(10), || {
+        service.compensation_watcher_count() == capacity - 1
+    });
+    // Releasing the store lets the compensation terminal commits land; every
+    // watcher then exits and unregisters (no leaked watcher tasks).
+    drop(store_guard);
+    wait_for(Duration::from_secs(15), || {
+        service.compensation_watcher_count() == 0
+    });
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// Final P2 #2 (RED): the canonical `subagent.completed` append is never
+/// `let _=`-ignored. A durable append fault (injected) is retried with the
+/// bounded retry; when storage recovers the event lands EXACTLY once (never
+/// a duplicate) and the child's real outcome is folded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_subagent_completed_append_fault_is_retried_exactly_once() {
+    let root = temporary_root("e2e-completed-retry");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "child job".to_string(),
+            status: 200,
+            body: wire_text("R-child"),
+            delay_ms: 0,
+        },
+        ProbeRule {
+            needle: PARENT_RULE.to_string(),
+            status: 200,
+            body: wire_text("parent done"),
+            delay_ms: 0,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.task = true;
+    });
+    // Fault injection: the FIRST durable `subagent.completed` append fails;
+    // the bounded retry must recover and still emit the event exactly once.
+    state
+        .persistence()
+        .expect("durable persistence")
+        .fail_next_event_appends("subagent.completed", 1);
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "child": {"id": "c1", "input": "child job"},
+            "depth": 0,
+            "max_depth": 4,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    // The child really completed: its durable terminal is committed.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 1);
+    let child_id = rows[0]
+        .get(1)
+        .and_then(JsonValue::as_str)
+        .expect("child id")
+        .to_string();
+    assert_eq!(durable_run_status(&state, &child_id), "completed");
+    // The retried canonical event exists EXACTLY once (no duplicate) and the
+    // started event is untouched by the fault.
+    let events = replayed_events(&state, &admitted.run_id);
+    assert_eq!(child_events(&events, "subagent.started").len(), 1);
+    assert_eq!(
+        child_events(&events, "subagent.completed").len(),
+        1,
+        "the retried append emits subagent.completed exactly once"
+    );
+    // The child's real output was folded into the parent's continuation
+    // (the retry path never turns a recovered event into a typed failure).
+    assert!(
+        server
+            .request_bodies()
+            .iter()
+            .filter(|raw| raw.contains(PARENT_RULE))
+            .any(|raw| raw.contains("R-child")),
+        "the parent folds the child's real completed output"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// Final P2 #2 (RED): when the durable `subagent.completed` append keeps
+/// failing past the bounded retries, the failure is promoted to a TYPED
+/// parent failure — the child's outcome/output never reaches the parent's
+/// history before (or without) the durable event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_subagent_completed_append_failure_promotes_to_typed_parent_failure() {
+    let root = temporary_root("e2e-completed-fail");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "child job".to_string(),
+            status: 200,
+            body: wire_text("R-child"),
+            delay_ms: 0,
+        },
+        ProbeRule {
+            needle: PARENT_RULE.to_string(),
+            status: 200,
+            body: wire_text("parent done"),
+            delay_ms: 0,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.task = true;
+    });
+    // Fault injection: EVERY `subagent.completed` append fails (far more
+    // than the bounded retry attempts) — the durable event can never land.
+    state
+        .persistence()
+        .expect("durable persistence")
+        .fail_next_event_appends("subagent.completed", 32);
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "child": {"id": "c1", "input": "child job"},
+            "depth": 0,
+            "max_depth": 4,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    // The parent still completes: the typed slot failure is folded and the
+    // loop continues reasoning.
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    // The child's DURABLE terminal is completed (the child really ran), but
+    // no `subagent.completed` event ever became durable.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 1);
+    let child_id = rows[0]
+        .get(1)
+        .and_then(JsonValue::as_str)
+        .expect("child id")
+        .to_string();
+    assert_eq!(durable_run_status(&state, &child_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert_eq!(child_events(&events, "subagent.started").len(), 1);
+    assert_eq!(
+        child_events(&events, "subagent.completed").len(),
+        0,
+        "no subagent.completed event exists when the durable append failed"
+    );
+    // The parent's durable history carries the TYPED failure, never the
+    // child's completed output — the outcome must not precede the durable
+    // event.
+    let parent_row = persistence
+        .run_get(&admitted.run_id)
+        .expect("parent run row");
+    let parent_session = parent_row
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(JsonValue::as_array)
+        .and_then(|row| row.get(1))
+        .and_then(JsonValue::as_str)
+        .expect("parent session id")
+        .to_string();
+    let messages = durable_message_rows(&state, &parent_session);
+    let rendered: Vec<String> = messages
+        .iter()
+        .map(|(_, _, content, _)| serde_json::to_string(content).unwrap_or_default())
+        .collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|text| text.contains("completed_event_append_failed")),
+        "the typed append failure is folded into the parent's history"
+    );
+    assert!(
+        rendered.iter().all(|text| !text.contains("R-child")),
+        "the child's completed output must never precede the durable event"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// A REPLAYED child admission (the deterministic slot key already admitted —
+/// for example a re-executed handoff) must never re-drive the child: no
+/// second worker, no re-emitted `subagent.started`/`subagent.completed`, no
+/// link regression. The executor awaits the EXISTING run's terminal and
+/// reports its durable outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_replayed_child_admission_never_re_drives_a_terminal_child() {
+    let root = temporary_root("e2e-replay-terminal-child");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "job-0".to_string(),
+            status: 200,
+            body: wire_text("R-0"),
+            delay_ms: 0,
+        },
+        // The parent's continuation carries the folded pair (message-level
+        // tool_call_id on the OpenAI wire) and the child's output text.
+        ProbeRule {
+            needle: PARENT_RULE.to_string(),
+            status: 200,
+            body: wire_text("parent done"),
+            delay_ms: 0,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    let service = state.service();
+    // Admit the parent with the structured delegation input FIRST (its run
+    // id keys the deterministic child idempotency key).
+    let parent = service
+        .admit(AdmitRunRequest {
+            input: json!({
+                "tasks": [{"id": "t0", "input": "job-0"}],
+                "mode": "all",
+                "max_concurrency": 1,
+            }),
+            session_id: None,
+            model: None,
+            provider: None,
+            parent_run_id: None,
+            instructions: None,
+            platform: "test".to_string(),
+            idempotency_key: None,
+            idempotency_hash: None,
+            origin_actor: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            session_messages: Vec::new(),
+        })
+        .await
+        .expect("the parent admission should succeed");
+    // Admit the child DIRECTLY with the exact deterministic key/hash
+    // `execute_child` derives for slot 0 of the parallel batch, and drive it
+    // to its durable terminal (provider round #1).
+    let slot_key = format!("child:{}:parallel:0", parent.run_id);
+    let slot_hash = fnv1a64(&format!(
+        "{slot_key}:{}:test-model",
+        serde_json::to_string(&json!("job-0")).expect("input json")
+    ));
+    let child = service
+        .admit(AdmitRunRequest {
+            input: json!("job-0"),
+            session_id: None,
+            model: Some("test-model".to_string()),
+            provider: None,
+            parent_run_id: Some(parent.run_id.clone()),
+            instructions: None,
+            platform: "agent:child".to_string(),
+            idempotency_key: Some(slot_key),
+            idempotency_hash: Some(slot_hash),
+            origin_actor: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            session_messages: Vec::new(),
+        })
+        .await
+        .expect("the direct child admission should succeed");
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(child.run_id.clone(), String::new()),
+    );
+    wait_terminal(&service, &child.run_id, Duration::from_secs(60)).await;
+    assert_eq!(durable_run_status(&state, &child.run_id), "completed");
+    // The child link already reached its terminal (pending -> completed).
+    let persistence = state.persistence().expect("durable persistence");
+    let _ = persistence
+        .link_state(&json!({
+            "parent_run_id": parent.run_id,
+            "child_run_id": child.run_id,
+            "ordinal": 0,
+            "relation": "",
+            "state": "completed",
+            "now_ms": 0,
+        }))
+        .expect("link state");
+    let requests_after_child = server.request_count();
+
+    // NOW the parent runs: the gate approves, the handoff executes, and
+    // `execute_child` re-admits the SAME slot -> idempotent replay of the
+    // terminal child.
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(parent.run_id.clone(), String::new()),
+    );
+    wait_terminal(&service, &parent.run_id, Duration::from_secs(60)).await;
+    assert_eq!(durable_run_status(&state, &parent.run_id), "completed");
+    assert_eq!(
+        server.request_count(),
+        requests_after_child + 1,
+        "the replay must not re-drive the terminal child: exactly one parent continuation round"
+    );
+    // No lifecycle artifact is re-emitted for the replayed child.
+    let events = replayed_events(&state, &parent.run_id);
+    assert_eq!(
+        child_events(&events, "subagent.started").len(),
+        0,
+        "a replayed admission never re-emits subagent.started"
+    );
+    assert_eq!(
+        child_events(&events, "subagent.completed").len(),
+        0,
+        "a replayed admission never re-emits subagent.completed"
+    );
+    // The child's durable status is untouched (still completed — never
+    // re-driven) and the link stays terminal (never regressed to active).
+    assert_eq!(
+        durable_run_status(&state, &child.run_id),
+        "completed",
+        "the replayed child is never re-driven"
+    );
+    let links = persistence
+        .list_children(&parent.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 1, "exactly one durable link row");
+    assert_eq!(
+        rows[0].get(4).and_then(JsonValue::as_str),
+        Some("completed"),
+        "the link state stays terminal — never regressed to active"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// Re-entering `run_worker` on an ALREADY-TERMINAL run must be a strict
+/// no-op: no provider call, no message, no event side effects. Every
+/// `run_worker` entry first checks the authoritative active status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_run_worker_on_a_terminal_run_is_a_strict_noop() {
+    let root = temporary_root("e2e-run-worker-terminal-noop");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "hello".to_string(),
+        status: 200,
+        body: wire_text("hi"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |_| {});
+    let service = state.service();
+    let admitted = admit_and_wait(&service, "hello", Duration::from_secs(60)).await;
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let requests_after_first = server.request_count();
+    let events_after_first = replayed_events(&state, &admitted.run_id);
+
+    // Re-enter the worker on the terminal run (as a replayed admission
+    // would) and give it time to do damage if it were going to.
+    tokio::spawn(
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), String::new()),
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        server.request_count(),
+        requests_after_first,
+        "a terminal run must never execute a provider round"
+    );
+    assert_eq!(
+        replayed_events(&state, &admitted.run_id),
+        events_after_first,
+        "a terminal run must never emit new events"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+/// A stop that lands while a child is in flight and another slot is still
+/// QUEUED must never start the queued child: the pre-admit re-check (and
+/// the supervision cancel) is authoritative after the stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_stop_with_a_queued_slot_never_starts_the_queued_child() {
+    let root = temporary_root("e2e-stop-queued-slot");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: "hung".to_string(),
+        status: 200,
+        body: wire_text("never"),
+        delay_ms: 8_000,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    let service = state.service();
+    let admitted = admit_structured(
+        &service,
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "hung"},
+                {"id": "t1", "input": "never-1"},
+            ],
+            "mode": "all",
+            // Only ONE slot in flight at a time: slot 1 is queued behind
+            // the hung slot 0 when the stop lands.
+            "max_concurrency": 1,
+        }),
+    )
+    .await;
+    // Wait until the in-flight child is REALLY started (the durable
+    // subagent.started event), THEN stop: the stop must never start the
+    // queued slot 1.
+    wait_for(Duration::from_secs(15), || {
+        replayed_events(&state, &admitted.run_id)
+            .iter()
+            .any(|(_, ty, _)| ty == "subagent.started")
+    });
+    service.stop(&admitted.run_id).expect("stop");
+    wait_terminal(&service, &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "cancelled");
+    let events = replayed_events(&state, &admitted.run_id);
+    let started = child_events(&events, "subagent.started");
+    assert_eq!(
+        started.len(),
+        1,
+        "exactly the in-flight child started; the queued child never starts after the stop"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    assert_eq!(
+        links["rows"].as_array().map(Vec::len).unwrap_or(0),
+        1,
+        "the queued child leaves no link"
+    );
+    // Nothing follows the parent's terminal.
+    let events = replayed_events(&state, &admitted.run_id);
+    assert_eq!(
+        event_types(&events).last().map(String::as_str),
+        Some("run.cancelled"),
+        "nothing may follow the parent's terminal"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_subagent_admission_refused_is_never_started_and_folds_typed() {
+    let root = temporary_root("e2e-subagent-refused");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: PARENT_RULE.to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.task = true;
+        // The parent holds the ONLY capacity permit: the child admission is
+        // refused by the real semaphore.
+        config.max_concurrent_runs = 1;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({"child": {"id": "c1", "input": "child job"}}),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&events, "subagent.started").is_empty(),
+        "a refused admission must never emit subagent.started"
+    );
+    assert!(
+        child_events(&events, "subagent.completed").is_empty(),
+        "a refused admission must never emit subagent.completed"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 0, "no child link for a refused admission");
+    // The typed refusal is folded and the parent continues (its own provider
+    // round still runs).
+    assert_eq!(server.request_count(), 1);
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_subagent_depth_rejection_never_admits_nor_starts() {
+    let root = temporary_root("e2e-subagent-depth");
+    let server = spawn_probe_server(vec![ProbeRule {
+        needle: PARENT_RULE.to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    }]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.task = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "child": {"id": "c1", "input": "child job"},
+            // The nesting budget is already exhausted: the subagent policy
+            // rejects the admission (depth_exceeded), so nothing starts.
+            "depth": 1,
+            "max_depth": 1,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+    let events = replayed_events(&state, &admitted.run_id);
+    assert!(
+        child_events(&events, "subagent.started").is_empty(),
+        "a depth-rejected admission must never start a child"
+    );
+    let links = state
+        .persistence()
+        .expect("durable persistence")
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 0, "no child link for a rejected admission");
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the parent continues reasoning after the rejection"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parent_stop_propagates_cancellation_to_in_flight_children() {
+    let root = temporary_root("e2e-parent-stop");
+    let server = spawn_probe_server(vec![
+        ProbeRule {
+            needle: "slow-1".to_string(),
+            status: 200,
+            body: wire_text("R-slow-1"),
+            delay_ms: 30_000,
+        },
+        ProbeRule {
+            needle: "slow-2".to_string(),
+            status: 200,
+            body: wire_text("R-slow-2"),
+            delay_ms: 30_000,
+        },
+    ]);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    let service = state.service();
+    let admitted = admit_structured(
+        &service,
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "slow-1"},
+                {"id": "t1", "input": "slow-2"},
+            ],
+            "mode": "all",
+            "max_concurrency": 2,
+        }),
+    )
+    .await;
+    // Both children are admitted and stalled on their provider rounds.
+    wait_for(Duration::from_secs(15), || server.request_count() >= 2);
+    let status = service.stop(&admitted.run_id).expect("stop");
+    assert_eq!(status, "stopping");
+    wait_terminal(&service, &admitted.run_id, Duration::from_secs(60)).await;
+
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "cancelled");
+    // Parent cancellation propagates: both children are durably cancelled.
+    let persistence = state.persistence().expect("durable persistence");
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let child_id = row.get(1).and_then(JsonValue::as_str).expect("child id");
+        assert_eq!(
+            durable_run_status(&state, child_id),
+            "cancelled",
+            "the stopped parent's child must be cancelled durably"
+        );
+    }
+    // No post-terminal side effects: no child event lands after the parent's
+    // run.cancelled terminal.
+    let events = replayed_events(&state, &admitted.run_id);
+    let cancelled_seq = events
+        .iter()
+        .find(|(_, ty, _)| ty == "run.cancelled")
+        .map(|(seq, _, _)| *seq)
+        .expect("parent cancelled terminal");
+    assert_eq!(
+        event_types(&events).last().map(String::as_str),
+        Some("run.cancelled"),
+        "nothing may follow the parent's terminal"
+    );
+    for (seq, ty, _) in &events {
+        assert!(
+            *seq <= cancelled_seq,
+            "no event may land after the parent's terminal: {ty} at seq {seq}"
+        );
+    }
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_child_links_and_child_events_survive_restart() {
+    let root = temporary_root("e2e-a6-restart");
+    let mut rules = Vec::new();
+    for index in 0..2 {
+        rules.push(ProbeRule {
+            needle: format!("job-{index}"),
+            status: 200,
+            body: wire_text(&format!("R-{index}")),
+            delay_ms: 0,
+        });
+    }
+    rules.push(ProbeRule {
+        needle: PARENT_RULE.to_string(),
+        status: 200,
+        body: wire_text("parent done"),
+        delay_ms: 0,
+    });
+    let server = spawn_probe_server(rules);
+    let state = spawn_state(server.port(), &root, true, |config| {
+        config.approval_mode = "all".to_string();
+        config.parallel = true;
+    });
+    let admitted = admit_structured(
+        &state.service(),
+        json!({
+            "tasks": [
+                {"id": "t0", "input": "job-0"},
+                {"id": "t1", "input": "job-1"},
+            ],
+            "mode": "all",
+            "max_concurrency": 1,
+        }),
+    )
+    .await;
+    wait_terminal(&state.service(), &admitted.run_id, Duration::from_secs(60)).await;
+    assert_eq!(durable_run_status(&state, &admitted.run_id), "completed");
+
+    // Reopen the durable state (restart): the child links, the child run
+    // rows (with parent identity), and the child lifecycle events all
+    // survive in the state database.
+    let mut config = base_config(server.port(), &root, true);
+    config.approval_mode = "all".to_string();
+    let reopened =
+        AgentGatewayState::with_default_agent_program_and_sqlite(config, root.join("state.db"))
+            .expect("reopened state with the built-in agent program");
+    let persistence = reopened.persistence().expect("durable persistence");
+
+    let links = persistence
+        .list_children(&admitted.run_id)
+        .expect("list children");
+    let rows = links
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .expect("link rows");
+    assert_eq!(rows.len(), 2, "durable child links survive a restart");
+    for row in rows {
+        let child_id = row.get(1).and_then(JsonValue::as_str).expect("child id");
+        let child = persistence.run_get(child_id).expect("child run row");
+        let child_row = child
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .expect("child row");
+        assert_eq!(
+            child_row.get(2).and_then(JsonValue::as_str),
+            Some(admitted.run_id.as_str()),
+            "the child's parent identity survives a restart"
+        );
+        assert_eq!(
+            child_row.get(3).and_then(JsonValue::as_str),
+            Some("completed"),
+            "the child's durable terminal survives a restart"
+        );
+    }
+    let events = persistence
+        .event_replay(&json!({
+            "run_id": admitted.run_id,
+            "after_seq": 1,
+            "max_events": 512,
+            "max_bytes": 65536,
+        }))
+        .expect("event replay after restart");
+    let mut started = 0;
+    let mut completed = 0;
+    if let Some(rows) = events.get("rows").and_then(JsonValue::as_array) {
+        for row in rows {
+            if let Some(row) = row.as_array() {
+                let ty = row.get(3).and_then(JsonValue::as_str).unwrap_or("?");
+                if ty == "subagent.started" {
+                    started += 1;
+                }
+                if ty == "subagent.completed" {
+                    completed += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(started, 2, "child started events survive a restart");
+    assert_eq!(completed, 2, "child completed events survive a restart");
 
     fs::remove_dir_all(&root).expect("temporary root should be removed");
 }
@@ -1369,10 +4112,12 @@ async fn b1_stop_before_the_approval_park_never_wedges_the_run() {
 
     // Stop as soon as the provider answered the tool-call round: the durable
     // park lands a few storage round trips later, so the stop races the park.
-    wait_tight(Duration::from_secs(10), || server.request_count() >= 1);
+    // The terminal bound is generous: the full-suite parallel load can
+    // stretch the park/stop race well past interactive latencies.
+    wait_tight(Duration::from_secs(30), || server.request_count() >= 1);
     let status = service.stop(&admitted.run_id).expect("stop");
     assert_eq!(status, "stopping");
-    wait_terminal(&service, &admitted.run_id, Duration::from_secs(15)).await;
+    wait_terminal(&service, &admitted.run_id, Duration::from_secs(45)).await;
     assert_eq!(
         durable_run_status(&state, &admitted.run_id),
         "cancelled",

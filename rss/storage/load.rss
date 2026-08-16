@@ -45,12 +45,19 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
         page_size,
         load_cap
     );
+    let child_links = load_page(
+        db_id,
+        "SELECT rowid AS _cursor, parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+        page_size,
+        load_cap
+    );
     let mut failed: bool = false;
     let mut failure_message: string = "";
     let sessions_overload: bool = sessions["overload"];
     let runs_overload: bool = runs["overload"];
     let jobs_overload: bool = jobs["overload"];
     let idempotency_overload: bool = idempotency["overload"];
+    let child_links_overload: bool = child_links["overload"];
     if sessions_overload == true {
         failed = true;
         failure_message = "gateway session state exceeds the load cap";
@@ -73,10 +80,17 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
             failure_message = "gateway idempotency state exceeds the load cap";
         }
     }
+    if failed == false {
+        if child_links_overload == true {
+            failed = true;
+            failure_message = "gateway child-link state exceeds the load cap";
+        }
+    }
     let sessions_rows: array = sessions["rows"];
     let runs_rows: array = runs["rows"];
     let jobs_rows: array = jobs["rows"];
     let idempotency_rows: array = idempotency["rows"];
+    let child_links_rows: array = child_links["rows"];
     let mut messages = [];
     if failed == false {
         let session_rows: array = sessions_rows;
@@ -177,7 +191,8 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
             runs: runs_rows,
             events: events,
             jobs: jobs_rows,
-            idempotency: idempotency_rows
+            idempotency: idempotency_rows,
+            child_links: child_links_rows
         }
     };
     if failed == true {
@@ -191,7 +206,8 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
                 runs: runs_rows,
                 events: events,
                 jobs: jobs_rows,
-                idempotency: idempotency_rows
+                idempotency: idempotency_rows,
+                child_links: child_links_rows
             }
         };
     }

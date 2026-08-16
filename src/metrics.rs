@@ -18,6 +18,8 @@ pub enum AdmitRejectReason {
     RunLimitReached = 0,
     IdempotencyConflict = 1,
     ParentNotFound = 2,
+    /// A child admission rejected because the parent run is terminal/stopping.
+    ParentNotActive = 7,
     SessionNotFound = 3,
     Persistence = 4,
     Invalid = 5,
@@ -27,10 +29,11 @@ pub enum AdmitRejectReason {
 }
 
 impl AdmitRejectReason {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::RunLimitReached,
         Self::IdempotencyConflict,
         Self::ParentNotFound,
+        Self::ParentNotActive,
         Self::SessionNotFound,
         Self::Persistence,
         Self::Invalid,
@@ -42,6 +45,7 @@ impl AdmitRejectReason {
             Self::RunLimitReached => "run_limit_reached",
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::ParentNotFound => "parent_not_found",
+            Self::ParentNotActive => "parent_not_active",
             Self::SessionNotFound => "session_not_found",
             Self::Persistence => "persistence",
             Self::Invalid => "invalid",

@@ -11,6 +11,16 @@ pub fn run_exists(db_id: int, run_id: string) -> bool {
     rows.length > 0
 }
 
+/// A parent is linkable only while its lifecycle is active. The check is
+/// repeated inside each link write's SQL predicate so a terminal transition
+/// that wins the SQLite write lock cannot be followed by a late link side
+/// effect.
+pub fn run_active(db_id: int, run_id: string) -> bool {
+    let result: map = sqlite::query(db_id, "SELECT 1 FROM runs WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval', 'compacting') LIMIT 1", [run_id], { max_rows: 1, max_result_bytes: 4096 });
+    let rows: array = result["rows"];
+    rows.length > 0
+}
+
 pub fn session_exists(db_id: int, session_id: string) -> bool {
     let result: map = sqlite::query(db_id, "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", [session_id], { max_rows: 1, max_result_bytes: 4096 });
     let rows: array = result["rows"];

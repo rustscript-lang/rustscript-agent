@@ -1298,6 +1298,63 @@ fn openai_chat_wire_distinguishes_completion_token_field() {
     );
 }
 
+#[test]
+fn openai_responses_buffered_empty_call_id_gets_deterministic_non_empty_fallback() {
+    let body = read_fixture("openai_responses/response_empty_call_id.json");
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    let _ = requests.recv().expect("recorded request");
+
+    assert_eq!(result["ok"], json!(true), "{result}");
+    let response = response_of(&result);
+    let calls = response["tool_calls"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    let id = calls[0]["id"].as_str().expect("fallback call id");
+    assert!(
+        !id.is_empty(),
+        "empty provider call_id must never reach callers"
+    );
+    assert_eq!(id, "responses-call-0", "fallback must be deterministic");
+}
+
+#[test]
+fn openai_responses_stream_empty_call_id_gets_deterministic_non_empty_fallback() {
+    let events = vec![
+        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_empty_stream\",\"call_id\":\"\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n".to_string(),
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n".to_string(),
+        "data: [DONE]\n\n".to_string(),
+    ];
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    let _ = requests.recv().expect("recorded request");
+
+    assert_eq!(result["ok"], json!(true), "{result}");
+    let calls = response_of(&result)["tool_calls"]
+        .as_array()
+        .expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], json!("responses-call-0"));
+    assert!(!calls[0]["id"].as_str().unwrap_or("").is_empty());
+}
+
 /// Provider-level knobs carried in the canonical request's `provider_options`
 /// (tool_choice, parallel_tool_calls) must reach the BUFFERED Responses wire.
 #[test]

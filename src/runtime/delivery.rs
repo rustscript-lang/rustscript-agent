@@ -219,6 +219,27 @@ pub(crate) fn restore_events_after_failed_append(
 pub(crate) fn append_event_locked(
     run: &mut RunRecord,
     event_type: &str,
+    data: Value,
+    max_event_bytes: usize,
+    max_events_per_run: usize,
+) -> GatewayEvent {
+    append_event_locked_with_id(
+        run,
+        Uuid::new_v4().to_string(),
+        event_type,
+        data,
+        max_event_bytes,
+        max_events_per_run,
+    )
+}
+
+/// Appends one event with a caller-owned stable id. Lifecycle retries use this
+/// path so an ambiguous durable success is retried as the same event rather
+/// than allocating a second sequence/id.
+pub(crate) fn append_event_locked_with_id(
+    run: &mut RunRecord,
+    event_id: String,
+    event_type: &str,
     mut data: Value,
     max_event_bytes: usize,
     max_events_per_run: usize,
@@ -248,7 +269,7 @@ pub(crate) fn append_event_locked(
     }
     let seq = run.events.last().map(|event| event.seq + 1).unwrap_or(1);
     let event = GatewayEvent {
-        event_id: Uuid::new_v4().to_string(),
+        event_id,
         seq,
         event: event_type.to_string(),
         run_id: run.run_id.clone(),
@@ -355,6 +376,7 @@ mod tests {
                 parent_run_id: None,
                 request_overrides: Value::Null,
                 platform: "api_server".to_string(),
+                input: Value::Null,
                 status: "running".to_string(),
                 events: Vec::new(),
                 sender: None,

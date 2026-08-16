@@ -626,3 +626,14 @@ fn cancel_on_missing_or_resolved_row_is_a_typed_noop() {
     );
     fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn native_deny_policy_is_standalone_without_persistence() {
+    let policy = NativeDenyPolicy::new()
+        .hard_deny()
+        .deny_tool("terminal.run")
+        .deny_risk(RiskClass::Execute);
+    assert!(policy.denies_tool("terminal.run"));
+    assert!(policy.denies_risk(RiskClass::Execute));
+    assert!(policy.denies_all("file.read", RiskClass::Read));
+}

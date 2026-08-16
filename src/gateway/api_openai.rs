@@ -1305,6 +1305,11 @@ fn admit_error_response(error: &AdmitError, request_id: &str) -> Response {
             "parent_run_not_found",
             "parent run not found".to_string(),
         ),
+        AdmitError::ParentNotActive => (
+            StatusCode::CONFLICT,
+            "parent_run_not_active",
+            "parent run is terminal or stopping; no child can be admitted".to_string(),
+        ),
         AdmitError::SessionNotFound => (
             StatusCode::NOT_FOUND,
             "session_not_found",

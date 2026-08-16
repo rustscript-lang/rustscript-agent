@@ -185,17 +185,25 @@ pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
     if !existence::run_exists(db_id, input.parent_run_id.copy()) {
         result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
+    } else if !existence::run_active(db_id, input.parent_run_id.copy()) {
+        result = { ok: false, code: "parent_not_active", message: "parent run is terminal or stopping", result: { columns: [], rows: [] } };
+    } else if !existence::run_exists(db_id, input.child_run_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
     } else {
-        if !existence::run_exists(db_id, input.child_run_id.copy()) {
-            result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
+        // The parent-active predicate is repeated inside the write. SQLite
+        // serializes this transaction with a competing terminal transition,
+        // so a terminal parent that wins the write lock cannot receive a
+        // late link or an in-memory mirror update.
+        let executed: map = sqlite::execute(
+            db_id,
+            "INSERT INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval', 'compacting')) AND EXISTS (SELECT 1 FROM runs WHERE id = ?) ON CONFLICT (parent_run_id, child_run_id) DO UPDATE SET state = excluded.state, relation = excluded.relation WHERE child_run_links.state IN ('pending', 'active')",
+            [&input.parent_run_id, &input.child_run_id, input.ordinal.copy(), &input.relation, &input.state, input.now_ms.copy(), &input.parent_run_id, &input.child_run_id]
+        );
+        let executed_copy: map = executed.copy();
+        let executed_rows: int = executed["rows_affected"];
+        if executed_rows == 0 && !existence::run_active(db_id, input.parent_run_id.copy()) {
+            result = { ok: false, code: "parent_not_active", message: "parent run is terminal or stopping", result: { columns: [], rows: [] } };
         } else {
-            // Idempotent: re-linking an existing pair is a no-op success,
-            // never an orphan write or a duplicate error.
-            sqlite::execute(
-                db_id,
-                "INSERT OR IGNORE INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ?)",
-                [&input.parent_run_id, &input.child_run_id, input.ordinal.copy(), &input.relation, &input.state, input.now_ms.copy(), &input.parent_run_id, &input.child_run_id]
-            );
             result = {
                 ok: true,
                 code: "ok",
@@ -212,6 +220,43 @@ pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
     result
 }
 
+/// Advances ONE child link's durable state to the child's observed terminal
+/// (`completed` | `cancelled` | `failed`): a guarded UPDATE whose rows_affected
+/// reports the transition (0 = the pair does not exist, typed no-op).
+pub fn storage_run_link_state(db_id: int, payload_json: string) -> map {
+    let input: ChildLinkInput = json::decode::<ChildLinkInput>(payload_json);
+    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
+    if !existence::run_exists(db_id, input.parent_run_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
+    } else if !existence::run_active(db_id, input.parent_run_id.copy()) {
+        result = { ok: false, code: "parent_not_active", message: "parent run is terminal or stopping", result: { columns: [], rows: [] } };
+    } else if !existence::run_exists(db_id, input.child_run_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "parent or child run does not exist", result: { columns: [], rows: [] } };
+    } else {
+        // Parent activity is part of the guarded UPDATE, not merely a
+        // preflight read. A terminal parent therefore cannot receive a late
+        // link-state write after the lifecycle race.
+        let executed: map = sqlite::execute(
+            db_id,
+            "UPDATE child_run_links SET state = ? WHERE parent_run_id = ? AND child_run_id = ? AND state <> ? AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval', 'compacting'))",
+            [&input.state, &input.parent_run_id, &input.child_run_id, &input.state, &input.parent_run_id]
+        );
+        let executed_copy: map = executed.copy();
+        let executed_rows: int = executed["rows_affected"];
+        if executed_rows == 0 && !existence::run_active(db_id, input.parent_run_id.copy()) {
+            result = { ok: false, code: "parent_not_active", message: "parent run is terminal or stopping", result: { columns: [], rows: [] } };
+        } else {
+            result = {
+                ok: true,
+                code: "ok",
+                message: "",
+                result: executed_copy
+            };
+        }
+    }
+    result
+}
+
 /// One atomic terminal commit: the run transitions to a terminal status and
 /// its terminal events (and optional assistant message) are appended in the
 /// same transaction, so a terminal state is durable before anything is
@@ -221,7 +266,47 @@ pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
 pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
     let input: RunTerminalInput = json::decode::<RunTerminalInput>(payload_json);
     assert(storage_run_status_allowed(input.to_status.copy()));
-    let mut statements = [];
+    // `run.terminal` may have committed durably while the client observed an
+    // ambiguous transport error. The stable event/message IDs make a retry a
+    // read-after-write reconciliation, never a second append.
+    let existing: map = sqlite::query(
+        db_id,
+        "SELECT status, (SELECT COUNT(*) FROM run_events e WHERE e.run_id = runs.id AND e.event_id IN (?, ?)) AS matched_events, (SELECT COUNT(*) FROM messages m WHERE m.id = ?) AS matched_message FROM runs WHERE id = ? LIMIT 1",
+        [&input.event_1_id, &input.event_2_id, &input.message_id, &input.run_id],
+        { max_rows: 1, max_result_bytes: 4096 }
+    );
+    let mut replay = false;
+    let mut replay_result = { ok: false, code: "", message: "", result: {} };
+    let existing_rows: array = existing["rows"];
+    if existing_rows.length > 0 {
+        let existing_row: array = existing_rows[0];
+        let matched_events: int = existing_row[1];
+        let matched_message: int = existing_row[2];
+        let message_ok: bool = input.message_id.copy() == "" || matched_message == 1;
+        if existing_row[0] == input.to_status.copy()
+            && matched_events == input.event_count.copy()
+            && message_ok
+        {
+            let run_result: map = sqlite::query(
+                db_id,
+                "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1",
+                [&input.run_id],
+                { max_rows: 1, max_result_bytes: 65536 }
+            );
+            let event_result: map = sqlite::query(
+                db_id,
+                "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?",
+                [&input.run_id, (512)],
+                { max_rows: 512, max_result_bytes: 2097152 }
+            );
+            replay = true;
+            replay_result = { ok: true, code: "ok", message: "", result: { run: run_result, events: event_result } };
+        }
+    }
+    if replay => {
+        replay_result
+    } else => {
+        let mut statements = [];
     if input.event_count.copy() >= 1 {
         statements[statements.length] = {
             sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running')",
@@ -292,16 +377,99 @@ pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
             result = { ok: true, code: "ok", message: "", result: { run: run_result_copy, events: event_result, message: message_result } };
         }
     }
-    result
+        result
+    }
 }
 
 pub fn storage_run_list_children(db_id: int, parent_run_id: string, max_rows: int, max_bytes: int) -> map {
+    storage_run_list_children_page(db_id, parent_run_id, -1, "", max_rows, max_bytes)
+}
+
+pub fn storage_run_list_children_page(db_id: int, parent_run_id: string, after_ordinal: int, after_child_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
         db_id,
-        "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? ORDER BY ordinal ASC, child_run_id ASC LIMIT ?",
-        [&parent_run_id, (max_rows)],
+        "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? AND (ordinal > ? OR (ordinal = ? AND child_run_id > ?)) ORDER BY ordinal ASC, child_run_id ASC LIMIT ?",
+        [&parent_run_id, (after_ordinal), (after_ordinal), &after_child_id, (max_rows)],
         runs_query_limits(max_rows, max_bytes)
     )
+}
+
+struct OrdinalAllocInput {
+    parent_run_id: string,
+    namespace: string,
+    count: int,
+    now_ms: int
+}
+
+/// Durable parent-level ordinal allocation (A6 sparse-parallel fix).
+/// Atomically reserves `count` consecutive ordinals for a (parent, namespace)
+/// pair and returns their base. Refused / cancelled-before-start slots of a
+/// batch still consume ordinals (as slot / tool_call / idempotency
+/// identities), but they have NO child_run_links row — so the durable
+/// high-water here is the ONLY place a sparse batch's ordinals survive a
+/// restart. The UPDATE + SELECT run in ONE transaction on the storage
+/// connection, so concurrent allocations (a second batch of the same parent,
+/// or another gateway process) get disjoint ranges and each reads its own
+/// post-update high-water.
+pub fn storage_run_allocate_ordinal(db_id: int, payload_json: string) -> map {
+    let input: OrdinalAllocInput = json::decode::<OrdinalAllocInput>(payload_json);
+    let mut result = { ok: true, code: "ok", message: "", result: { base: 0, next_ordinal: 0 } };
+    if input.count.copy() <= 0 {
+        result = { ok: false, code: "count_invalid", message: "ordinal allocation count must be positive", result: { base: 0, next_ordinal: 0 } };
+    } else if !existence::run_exists(db_id, input.parent_run_id.copy()) {
+        result = { ok: false, code: "run_not_found", message: "ordinal allocator parent run does not exist", result: { base: 0, next_ordinal: 0 } };
+    } else {
+        // Seed the (parent, namespace) row idempotently so the UPDATE below
+        // always has a row to advance (next_ordinal starts at 0).
+        sqlite::execute(
+            db_id,
+            "INSERT OR IGNORE INTO parent_ordinals (parent_run_id, namespace, next_ordinal, updated_at_ms) VALUES (?, ?, 0, ?)",
+            [&input.parent_run_id, &input.namespace, input.now_ms.copy()]
+        );
+        // Reserve and read the resulting high-water in one transaction so a
+        // competing allocation gets a disjoint range and never overlaps.
+        let transaction_results: array = sqlite::transaction(db_id, [
+            {
+                sql: "UPDATE parent_ordinals SET next_ordinal = next_ordinal + ?, updated_at_ms = ? WHERE parent_run_id = ? AND namespace = ?",
+                params: [input.count.copy(), input.now_ms.copy(), &input.parent_run_id, &input.namespace]
+            },
+            {
+                sql: "SELECT next_ordinal FROM parent_ordinals WHERE parent_run_id = ? AND namespace = ? LIMIT 1",
+                params: [&input.parent_run_id, &input.namespace],
+                query: true
+            }
+        ]);
+        let select_result: map = transaction_results[1];
+        let rows: array = select_result["rows"];
+        let row: array = rows[0];
+        let next_ordinal: int = row[0];
+        result = {
+            ok: true,
+            code: "ok",
+            message: "",
+            result: { base: next_ordinal - input.count.copy(), next_ordinal: next_ordinal }
+        };
+    }
+    result
+}
+
+/// Read-only durable high-water (0 when no allocation has been made): the
+/// exclusive next ordinal a (parent, namespace) allocator would grant.
+pub fn storage_run_ordinal_next(db_id: int, payload_json: string) -> map {
+    let input: OrdinalAllocInput = json::decode::<OrdinalAllocInput>(payload_json);
+    let mut next_ordinal: int = 0;
+    let query_result: map = sqlite::query(
+        db_id,
+        "SELECT next_ordinal FROM parent_ordinals WHERE parent_run_id = ? AND namespace = ? LIMIT 1",
+        [&input.parent_run_id, &input.namespace],
+        { max_rows: 1, max_result_bytes: 4096 }
+    );
+    let rows: array = query_result["rows"];
+    if rows.length > 0 {
+        let row: array = rows[0];
+        next_ordinal = row[0];
+    }
+    { ok: true, code: "ok", message: "", result: { next_ordinal: next_ordinal } }
 }
 
 pub fn storage_run_record_usage(db_id: int, payload_json: string) -> map {
@@ -375,6 +543,14 @@ pub fn storage_run_recover_active(db_id: int, payload_json: string) -> array {
         {
             sql: "UPDATE runs SET status = 'failed', error_code = 'gateway_restart', error_message = 'run interrupted during gateway restart', recovery_reason = ?, finished_at_ms = ?, updated_at_ms = ? WHERE id IN (SELECT id FROM runs WHERE status IN ('queued', 'running', 'waiting_approval', 'compacting') ORDER BY updated_at_ms ASC, id ASC LIMIT CASE WHEN ? <= 0 THEN 64 WHEN ? > 512 THEN 512 ELSE ? END)",
             params: [&input.reason, input.now_ms.copy(), input.now_ms.copy(), input.max_rows.copy(), input.max_rows.copy(), input.max_rows.copy()]
+        },
+        {
+            // A child can have reached a durable terminal before a gateway
+            // crash interrupted the parent-side link update. Reconcile every
+            // pending/active link from the child run row during recovery so
+            // the link mirror never replays an obsolete active state.
+            sql: "UPDATE child_run_links SET state = (SELECT child.status FROM runs child WHERE child.id = child_run_links.child_run_id) WHERE state IN ('pending', 'active') AND EXISTS (SELECT 1 FROM runs child WHERE child.id = child_run_links.child_run_id AND child.status IN ('completed', 'failed', 'cancelled'))",
+            params: []
         },
         {
             sql: "UPDATE approvals SET state = 'expired', resolved_at_ms = ? WHERE state = 'pending' AND run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)",

@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::AtomicBool,
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
@@ -69,6 +69,8 @@ const LOAD_CAP_ROWS: i64 = 1_000_000;
 ///             updated_at_ms, last_run_at_ms
 /// idempotency: scope, key, request_hash, resource_type, resource_id, state,
 ///              response_json, created_at_ms, expires_at_ms, completed_at_ms
+/// child_links: parent_run_id, child_run_id, ordinal, relation, state,
+///              created_at_ms
 ///
 /// A typed storage command failure carrying the RSS error code.
 #[derive(Debug, Clone)]
@@ -105,6 +107,14 @@ pub struct GatewayPersistence {
     /// The state database's parent directory (SQLite root for the loop's
     /// durable commands and the approval bridge).
     db_root: Option<PathBuf>,
+    /// TEST fault injection: while `Some((event_type, remaining))`, the next
+    /// `remaining` durable `event.append` commands whose payload carries
+    /// `event_type` fail with a typed `event_append_injected` error before
+    /// reaching the storage worker; the worker then serves normally again.
+    /// Production never arms it.
+    fail_event_appends: Mutex<Option<(String, usize)>>,
+    /// TEST fault injection for the durable parent/child link state update.
+    fail_link_states: Mutex<Option<usize>>,
 }
 
 /// One serialized storage request for the dedicated worker thread.
@@ -261,6 +271,8 @@ impl GatewayPersistence {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             db_root: path.parent().map(|parent| parent.to_path_buf()),
+            fail_event_appends: Mutex::new(None),
+            fail_link_states: Mutex::new(None),
         })
     }
 
@@ -486,7 +498,46 @@ impl GatewayPersistence {
     /// Appends one run event with transactional sequence allocation and
     /// retention pruning.
     pub fn event_append(&self, payload: &Value) -> Result<Value, StorageError> {
+        // TEST fault injection gate: a matching armed injection fails the
+        // durable append BEFORE the storage worker, exactly like a storage
+        // fault, and then serves normally again. Production never arms it.
+        let injected = {
+            let mut fail = self.fail_event_appends.lock().expect("failpoint lock");
+            match fail.as_mut() {
+                Some((event_type, remaining))
+                    if payload.get("event_type").and_then(Value::as_str)
+                        == Some(event_type.as_str()) =>
+                {
+                    let fire = *remaining > 0;
+                    *remaining = remaining.saturating_sub(1);
+                    if *remaining == 0 {
+                        *fail = None;
+                    }
+                    fire
+                }
+                _ => false,
+            }
+        };
+        if injected {
+            return Err(StorageError {
+                code: "event_append_injected".to_string(),
+                message: "test fault injection: event.append failed".to_string(),
+            });
+        }
         self.command_data("event.append", payload)
+    }
+
+    /// TEST fault injection: the next `n` durable `event.append` commands
+    /// whose payload carries `event_type` fail with a typed
+    /// `event_append_injected` error; the storage worker then serves
+    /// normally again. Used by the A6 durability suites to prove the
+    /// bounded-retry / typed-failure path of the canonical lifecycle event
+    /// append (a retried append can never duplicate the event). Never armed
+    /// in production.
+    #[doc(hidden)]
+    pub fn fail_next_event_appends(&self, event_type: &str, n: usize) {
+        *self.fail_event_appends.lock().expect("failpoint lock") =
+            Some((event_type.to_string(), n));
     }
 
     /// One atomic terminal commit: run status transition plus terminal
@@ -506,6 +557,81 @@ impl GatewayPersistence {
     /// op; the maintenance-run composition and the storage fixtures use it).
     pub fn run_create(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("run.create", payload)
+    }
+
+    /// One durable parent/child link row (`run.link_child`): the storage
+    /// program inserts idempotently (UPSERT on the pair key, advancing the
+    /// admission-time `pending` state to the input state — `active` at link
+    /// time) after checking both run rows exist. This is the A2
+    /// parent-link contract the native supervisor uses after a real child
+    /// admission.
+    pub fn link_child(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("run.link_child", payload)
+    }
+
+    /// Advances ONE child link's durable state (`run.link_state`): the
+    /// guarded UPDATE from the child's observed terminal
+    /// (`completed` | `cancelled` | `failed`). The returned
+    /// `rows_affected` reports the transition (0 = the pair does not
+    /// exist or already carries the state — a typed no-op).
+    pub fn link_state(&self, payload: &Value) -> Result<Value, StorageError> {
+        let injected = {
+            let mut fail = self
+                .fail_link_states
+                .lock()
+                .expect("link-state failpoint lock");
+            let fire = fail.is_some_and(|remaining| remaining > 0);
+            if let Some(remaining) = fail.as_mut() {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 {
+                    *fail = None;
+                }
+            }
+            fire
+        };
+        if injected {
+            return Err(StorageError {
+                code: "link_state_injected".to_string(),
+                message: "test fault injection: run.link_state failed".to_string(),
+            });
+        }
+        self.command_data("run.link_state", payload)
+    }
+
+    /// TEST fault injection: fail the next `n` durable link-state writes.
+    #[doc(hidden)]
+    pub fn fail_next_link_states(&self, n: usize) {
+        *self
+            .fail_link_states
+            .lock()
+            .expect("link-state failpoint lock") = Some(n);
+    }
+
+    /// Lists the durable child links of one parent (`run.list_children`):
+    /// `{columns, rows}` with one row per child
+    /// `[parent_run_id, child_run_id, ordinal, relation, state,
+    /// created_at_ms]`, ordered by ordinal.
+    pub fn list_children(&self, parent_run_id: &str) -> Result<Value, StorageError> {
+        self.list_children_page(parent_run_id, -1, "")
+    }
+
+    /// Lists one durable child-link page after the `(ordinal, child_id)`
+    /// cursor. The replay mirror walks every page; no fixed result cap is
+    /// allowed to become an authoritative fanout truncation.
+    pub fn list_children_page(
+        &self,
+        parent_run_id: &str,
+        after_ordinal: i64,
+        after_child_id: &str,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "run.list_children_page",
+            &json!({
+                "run_id": parent_run_id,
+                "after_ordinal": after_ordinal,
+                "after_child_id": after_child_id,
+            }),
+        )
     }
 
     pub fn run_get(&self, run_id: &str) -> Result<Value, StorageError> {
@@ -530,6 +656,69 @@ impl GatewayPersistence {
                 "max_rows": max_rows,
             }),
         )
+    }
+
+    /// Durable parent-level ordinal allocation (A6 sparse-parallel fix).
+    /// Atomically reserves `count` consecutive ordinals for a
+    /// `(parent_run_id, namespace)` pair and returns the base of the
+    /// reserved range (the exclusive `next_ordinal - count`). Refused or
+    /// cancelled-before-start slots consume ordinals but create no
+    /// `child_run_links` row, so this durable high-water is the ONLY record
+    /// a sparse batch's ordinals survive across (a) later batches of the
+    /// same run and (b) a restart.
+    pub fn allocate_ordinals(
+        &self,
+        parent_run_id: &str,
+        namespace: &str,
+        count: usize,
+    ) -> Result<i64, StorageError> {
+        let count = count as i64;
+        if count <= 0 {
+            return Err(StorageError {
+                code: "count_invalid".to_string(),
+                message: "ordinal allocation count must be positive".to_string(),
+            });
+        }
+        let data = self.command_data(
+            "run.allocate_ordinal",
+            &json!({
+                "parent_run_id": parent_run_id,
+                "namespace": namespace,
+                "count": count,
+                "now_ms": timestamp(),
+            }),
+        )?;
+        data.get("base")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| StorageError {
+                code: "allocator_malformed".to_string(),
+                message: "ordinal allocation returned no base".to_string(),
+            })
+    }
+
+    /// The durable exclusive high-water (0 when nothing has been allocated
+    /// for the namespace): the next ordinal a `(parent_run_id, namespace)`
+    /// allocation would grant.
+    pub fn parent_ordinal_next(
+        &self,
+        parent_run_id: &str,
+        namespace: &str,
+    ) -> Result<i64, StorageError> {
+        let data = self.command_data(
+            "run.ordinal_next",
+            &json!({
+                "parent_run_id": parent_run_id,
+                "namespace": namespace,
+                "count": 1,
+                "now_ms": timestamp(),
+            }),
+        )?;
+        data.get("next_ordinal")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| StorageError {
+                code: "allocator_malformed".to_string(),
+                message: "ordinal-next returned no value".to_string(),
+            })
     }
 
     /// Lists durable run rows (newest first) with optional exact
@@ -622,6 +811,10 @@ impl GatewayPersistence {
         self.command_data("approval.get", &json!({ "approval_id": approval_id }))
     }
 
+    pub fn approval_list_run(&self, run_id: &str) -> Result<Value, StorageError> {
+        self.command_data("approval.list_run", &json!({ "run_id": run_id }))
+    }
+
     pub fn approval_resolve(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("approval.resolve", payload)
     }
@@ -666,7 +859,7 @@ impl GatewayPersistence {
         let migrated = self
             .command_data("migrate", &json!({}))
             .map_err(|error| format!("migrate gateway state: {error}"))?;
-        if migrated.get("schema_version") != Some(&json!(5)) {
+        if migrated.get("schema_version") != Some(&json!(6)) {
             return Err(format!(
                 "gateway schema migrated to an unexpected version: {migrated}"
             ));
@@ -703,7 +896,7 @@ impl GatewayPersistence {
                 }),
             )
             .map_err(|error| format!("load gateway state: {error}"))?;
-        GatewayStore::from_load(&data, self.broadcast_capacity)
+        GatewayStore::from_load(&data, self.broadcast_capacity, self.max_events as usize)
     }
 }
 
@@ -735,6 +928,30 @@ pub struct GatewayStore {
     pub(crate) runs: HashMap<String, RunRecord>,
     pub(crate) jobs: BTreeMap<String, JobRecord>,
     pub(crate) idempotency: HashMap<String, IdempotencyRecord>,
+    /// In-memory mirror of the durable `child_run_links` rows for the
+    /// process's own admissions (the durable rows are authoritative for
+    /// restart recovery; this mirror serves the live parent's subagent
+    /// policy context and cancellation bookkeeping).
+    pub(crate) child_links: HashMap<String, Vec<ChildLinkRecord>>,
+}
+
+/// One parent/child link in the in-memory mirror (mirrors the durable
+/// `child_run_links` row). `state` mirrors the DURABLE row's progression:
+/// the admission transaction inserts `pending`, the native link step
+/// advances it to `active`, and the native supervisor advances it to the
+/// child's terminal status (`completed`/`cancelled`/`failed`) — via the
+/// storage `run.link_state` command first, then the mirror, so the live
+/// state never claims a terminal the durable side does not carry.
+#[derive(Clone, Debug)]
+pub(crate) struct ChildLinkRecord {
+    pub(crate) child_run_id: String,
+    /// The link ordinal / relation mirror the durable row (the policy
+    /// context and cancellation bookkeeping consume them).
+    #[allow(dead_code)]
+    pub(crate) ordinal: i64,
+    #[allow(dead_code)]
+    pub(crate) relation: String,
+    pub(crate) state: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -763,6 +980,10 @@ pub(crate) struct RunRecord {
     /// The inbound platform that admitted the run (`api_server`, `telegram`,
     /// ...); the run context carries it so scripts can branch on the source.
     pub(crate) platform: String,
+    /// The structured admission input; the production loop context carries
+    /// it (`context.input`) so delegation requests (parallel batches / child
+    /// descriptors) reach the loop without a separate lookup.
+    pub(crate) input: Value,
     pub(crate) status: String,
     pub(crate) events: Vec<GatewayEvent>,
     /// Live delivery channel; `None` after a durable terminal commit or a
@@ -980,6 +1201,11 @@ fn memory_status(db_status: &str) -> &'static str {
         "completed" => "completed",
         "failed" => "failed",
         "cancelled" => "cancelled",
+        "terminal_pending" => "terminal_pending",
+        // A legacy durable `terminal_retry_expired` row unifies to the
+        // canonical `failed` terminal (the typed reason is carried by the
+        // terminal event's `error_code`), never a second canonical state.
+        "terminal_retry_expired" => "failed",
         _ => "started",
     }
 }
@@ -990,13 +1216,18 @@ impl GatewayStore {
     /// session/message references, unknown parent runs, and event sequence
     /// gaps are all rejected (agent correctness never depends on SQLite
     /// foreign-key enforcement, which the core host does not enable).
-    fn from_load(data: &Value, broadcast_capacity: usize) -> Result<Self, String> {
+    fn from_load(
+        data: &Value,
+        broadcast_capacity: usize,
+        max_events: usize,
+    ) -> Result<Self, String> {
         let session_rows = load_rows(data, "sessions")?;
         let message_rows = load_rows(data, "messages")?;
         let run_rows = load_rows(data, "runs")?;
         let event_rows = load_rows(data, "events")?;
         let job_rows = load_rows(data, "jobs")?;
         let idempotency_rows = load_rows(data, "idempotency")?;
+        let child_link_rows = load_rows(data, "child_links")?;
 
         let mut sessions = BTreeMap::new();
         for row in session_rows {
@@ -1090,6 +1321,12 @@ impl GatewayStore {
                 parent_run_id: optional_string(&row, 2),
                 request_overrides: Value::Object(Default::default()),
                 platform,
+                // Loaded runs are never driven in this process (active runs
+                // do not survive a restart); the structured input is only
+                // read for live loop contexts.
+                input: optional_string(&row, 4)
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or(Value::Null),
                 status: memory_status(&db_status).to_string(),
                 events: Vec::new(),
                 sender,
@@ -1137,9 +1374,57 @@ impl GatewayStore {
                     ));
                 }
             }
+            // Restart-bounded retention (item 6): terminal/transition appends
+            // are bounded durably too, but a run may still accumulate more than
+            // `max_events` events across a terminating run (each durable
+            // append is pruned individually, yet the mirror's relationship
+            // between the retained floor and the terminal commit can exceed the
+            // cap in edge cases). The RELOADED mirror prunes to the same bound
+            // while preserving the terminal (highest-seq) events — so after a
+            // restart the in-memory history is bounded and still retains the
+            // terminal. The DURABLE rows are left intact (the durable
+            // event.append path already bounds writes); the reloaded mirror is
+            // the authoritative runtime view.
+            if max_events > 0 && events.len() > max_events {
+                let excess = events.len() - max_events;
+                events.drain(0..excess);
+            }
             runs.get_mut(&run_id)
                 .expect("run presence was validated above")
                 .events = events;
+        }
+
+        let mut child_links: HashMap<String, Vec<ChildLinkRecord>> = HashMap::new();
+        for row in child_link_rows {
+            let parent_run_id = string_cell(&row, 0, "child link parent run id")?;
+            let child_run_id = string_cell(&row, 1, "child link child run id")?;
+            if !runs.contains_key(&parent_run_id) {
+                return Err(format!(
+                    "child link references unknown parent run: {parent_run_id}"
+                ));
+            }
+            let child = runs.get(&child_run_id).ok_or_else(|| {
+                format!("child link references unknown child run: {child_run_id}")
+            })?;
+            let durable_state = string_cell(&row, 4, "child link state")?;
+            let state = if matches!(child.status.as_str(), "completed" | "failed" | "cancelled") {
+                child.status.clone()
+            } else {
+                durable_state
+            };
+            let links = child_links.entry(parent_run_id).or_default();
+            if links.iter().any(|link| link.child_run_id == child_run_id) {
+                return Err(format!("duplicate child link: {child_run_id}"));
+            }
+            links.push(ChildLinkRecord {
+                child_run_id,
+                ordinal: int_cell(&row, 2, "child link ordinal")?,
+                relation: string_cell(&row, 3, "child link relation")?,
+                state,
+            });
+        }
+        for links in child_links.values_mut() {
+            links.sort_by_key(|link| link.ordinal);
         }
 
         let mut jobs = BTreeMap::new();
@@ -1190,6 +1475,10 @@ impl GatewayStore {
             runs,
             jobs,
             idempotency,
+            // Durable child links are restored before any replay admission;
+            // the live fanout mirror therefore cannot undercount after a
+            // restart or regress a terminal child to active.
+            child_links,
         })
     }
 }
@@ -1269,6 +1558,36 @@ pub(crate) fn append_message(
 ) -> SessionMessage {
     let message = SessionMessage {
         id: Uuid::new_v4().to_string(),
+        session_id: view.id.clone(),
+        role: role.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        content,
+        created_at: timestamp(),
+        run_id,
+        finish_reason,
+        compacted,
+    };
+    messages.push(message.clone());
+    view.message_count = messages.len();
+    view.updated_at = timestamp();
+    message
+}
+
+/// Appends one session message using a caller-provided stable id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_message_with_id(
+    view: &mut SessionView,
+    messages: &mut Vec<SessionMessage>,
+    id: String,
+    role: &str,
+    content: Value,
+    run_id: Option<String>,
+    finish_reason: Option<String>,
+    compacted: bool,
+    tool_call_id: &str,
+) -> SessionMessage {
+    let message = SessionMessage {
+        id,
         session_id: view.id.clone(),
         role: role.to_string(),
         tool_call_id: tool_call_id.to_string(),

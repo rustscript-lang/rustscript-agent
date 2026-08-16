@@ -132,6 +132,33 @@ impl ChildExecutor for Recording {
 }
 
 #[test]
+fn bridge_supervision_mode_maps_the_plans_cancel_rules() {
+    // The policy emits long-form cancel_rule descriptors; the native engine
+    // must map them to the exact supervision modes (never silently All).
+    assert_eq!(
+        SupervisionMode::from_plan(Some("cancel_losers_on_first_success")),
+        SupervisionMode::Race
+    );
+    assert_eq!(
+        SupervisionMode::from_plan(Some("cancel_siblings_on_first_failure")),
+        SupervisionMode::FailFast
+    );
+    assert_eq!(
+        SupervisionMode::from_plan(Some("none")),
+        SupervisionMode::All
+    );
+    assert_eq!(SupervisionMode::from_plan(None), SupervisionMode::All);
+    assert_eq!(
+        SupervisionMode::from_plan(Some("race")),
+        SupervisionMode::Race
+    );
+    assert_eq!(
+        SupervisionMode::from_plan(Some("fail_fast")),
+        SupervisionMode::FailFast
+    );
+}
+
+#[test]
 fn bridge_native_supervisor_bounds_concurrency_from_plan() {
     let plan = plan_for(8, "all", 2);
     assert_eq!(plan["kind"], json!("parallel.plan"));

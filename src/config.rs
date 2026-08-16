@@ -224,6 +224,18 @@ pub struct AgentGatewayConfig {
     /// Approval mode fed to the A4 approval policy: `auto` | `manual` |
     /// `never` | `all`.
     pub approval_mode: String,
+    /// Native hard deny fed to the A4 approval policy: when set, EVERY
+    /// approval decision is a deny regardless of the mode (RSS policy can
+    /// narrow but never widen a native deny).
+    pub native_hard_deny: bool,
+    /// Tool names the NATIVE deny policy denies regardless of the approval
+    /// mode (`ApprovalBridge::decide` is the authority; RSS policy cannot
+    /// relax it). Delegation tools `parallel.run` / `subagent.run` are
+    /// denied before any child admission or park.
+    pub native_deny_tools: Vec<String>,
+    /// Risk classes the NATIVE deny policy denies regardless of the approval
+    /// mode (`read` | `write` | `execute` | `privileged`).
+    pub native_deny_risks: Vec<String>,
     /// Lifetime of a pending approval before the expire sweep resumes the
     /// parked run with a typed expired tool result.
     pub approval_timeout: Duration,
@@ -236,11 +248,11 @@ pub struct AgentGatewayConfig {
     /// Stream transport flag passed to the adapters (`stream: true` uses the
     /// SSE transport).
     pub stream: bool,
-    /// Parallel orchestration requested (A6 handoff; typed non-executable
-    /// until the A7 run-admission interface wires the native supervisor).
+    /// Parallel orchestration requested (A6 handoff; the native supervisor
+    /// executes the verified RSS plan with real child runs).
     pub parallel: bool,
-    /// Task/subagent delegation requested (A6 handoff; typed
-    /// non-executable).
+    /// Task/subagent delegation requested (A6 handoff; the native supervisor
+    /// admits and awaits one real child run).
     pub task: bool,
     pub agent_name: String,
     pub bearer_token: Option<String>,
@@ -542,6 +554,9 @@ impl Default for AgentGatewayConfig {
             base_retry_delay_ms: 1000,
             max_retry_delay_ms: 30_000,
             approval_mode: "auto".to_string(),
+            native_hard_deny: false,
+            native_deny_tools: Vec::new(),
+            native_deny_risks: Vec::new(),
             approval_timeout: Duration::from_secs(600),
             max_context_messages: 64,
             retained_tail: 8,

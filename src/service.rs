@@ -22,14 +22,16 @@
 //! succeeds.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rustscript_vm::{CancellationReason, HttpConfig, InvocationError, Value as VmValue};
 use serde_json::{Value as JsonValue, json};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::config::AgentGatewayConfig;
@@ -37,8 +39,8 @@ use crate::config::ClientDisconnectPolicy;
 use crate::domain::{RunContext, timestamp, truncate_for_log, vm_value_to_json};
 use crate::events;
 use crate::gateway::store::{
-    GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
-    SessionRecord, SessionView, append_message,
+    ChildLinkRecord, GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord,
+    SessionMessage, SessionRecord, SessionView, append_message_with_id,
 };
 use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
 use crate::runtime::approval_bridge::{
@@ -46,12 +48,28 @@ use crate::runtime::approval_bridge::{
 };
 use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, DeliveryOutcome, append_event_locked,
-    restore_events_after_failed_append, run_delivery_task,
+    append_event_locked_with_id, restore_events_after_failed_append, run_delivery_task,
 };
 use crate::runtime::rss_runner::execute_rss_source;
+use crate::runtime::subagent_supervisor::{
+    ChildExecutor, ChildOutcome, ChildSpec, SupervisionMode, SupervisorCancel,
+    supervise_batch_bounded,
+};
 use crate::{AgentConfig, AgentRunner, RunCancellation, RunError};
 
 const MAX_DURABLE_ASSISTANT_BYTES: usize = 1_048_576;
+
+// One in-flight approval cancellation per durable approval id. The cell
+// deduplicates stop/deadline compensation races without issuing duplicate
+// storage writes.
+type ApprovalCancellation = Arc<OnceCell<Result<(), String>>>;
+
+/// Capacity bound for the pending child-link-terminal retry set. Each pending
+/// entry is a child link whose durable terminal advance is being retried by
+/// the lifecycle-managed janitor; a full set defers to restart recovery
+/// (which reconciles `pending`/`active` links from the child's real terminal)
+/// so the map can never grow without bound.
+const MAX_PENDING_LINK_TERMINALS: usize = 4096;
 
 /// One run whose terminal state could not be committed durably. The worker
 /// has already exited; the original terminal gets a bounded retry window,
@@ -323,6 +341,9 @@ pub enum AdmitError {
     RunLimitReached,
     IdempotencyConflict,
     ParentNotFound,
+    /// A child admission was rejected because the parent run is terminal or
+    /// stopping: no child/link/event is ever inserted under a finished parent.
+    ParentNotActive,
     SessionNotFound,
     Persistence(String),
     Invalid(String),
@@ -340,6 +361,9 @@ impl std::fmt::Display for AdmitError {
                 formatter.write_str("idempotency key was used with a different request")
             }
             Self::ParentNotFound => formatter.write_str("parent run not found"),
+            Self::ParentNotActive => {
+                formatter.write_str("parent run is terminal or stopping; no child can be admitted")
+            }
             Self::SessionNotFound => formatter.write_str("session not found"),
             Self::Persistence(message) => formatter.write_str(message),
             Self::Invalid(message) => formatter.write_str(message),
@@ -364,7 +388,12 @@ struct AgentServiceInner {
     /// present, the worker drives the RSS-owned loop instead of the legacy
     /// single-shot source.
     agent_program: Option<Arc<AgentRunner>>,
-    /// The durable approval bridge over the A2 storage program; `None` in
+    /// The A6 native-supervisor policy programs: `parallel.rss` and
+    /// `subagents.rss` are the VERIFIED-plan sources. The native supervisor
+    /// runs them with the real parent/child context and executes exactly
+    /// what they plan — it never implements agent policy itself.
+    policies: Option<Arc<AgentPolicies>>,
+    /// approval bridge over the A2 storage program; `None` in
     /// in-memory-only mode (approval.wait then fails the run typed).
     approval: Option<Arc<ApprovalBridge>>,
     /// The precompiled manual-compaction policy (`rss/agent/compact.rss`).
@@ -377,6 +406,9 @@ struct AgentServiceInner {
     /// Sessions with a manual compaction in flight (the in-process race
     /// guard; the durable pending-row contract is the cross-process guard).
     compacting_sessions: Mutex<HashSet<String>>,
+    /// Native deny policy is independent from durable approval persistence;
+    /// the same policy therefore applies in in-memory-only mode.
+    native_deny: NativeDenyPolicy,
     /// Runs parked on a durable pending approval: run_id -> the approval id
     /// and the loop state needed to resume exactly once.
     parked: Mutex<HashMap<String, ParkedRun>>,
@@ -385,7 +417,803 @@ struct AgentServiceInner {
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
+    /// The live pre-admission compensation watchers, deduplicated by their
+    /// deterministic admission idempotency key: at most ONE watcher per key,
+    /// so a re-dropped slot never spawns a second watcher. The count is
+    /// bounded by the admission/concurrency upper bound — every waiting
+    /// watcher corresponds to a dropped admission that still holds a
+    /// capacity permit, and in-flight admissions are capped by
+    /// `max_concurrent_runs`.
+    compensation_watchers: Mutex<HashSet<String>>,
+    /// Bounded set of child links whose DURABLE terminal advance could not be
+    /// persisted within the inline retry budget of
+    /// `update_child_link_state_native`. A lifecycle-managed janitor
+    /// (`link_terminal_retry_loop`, at most ONE live task) retries each entry —
+    /// deriving the terminal from the child's real observed durable state and
+    /// writing DURABLY before the mirror — until storage recovers, so a
+    /// terminal link never stays permanently non-terminal in the current
+    /// process. Keyed by `(parent_run_id, child_run_id)` (deduplicated) and
+    /// capped at [`MAX_PENDING_LINK_TERMINALS`]; an entry whose parent reaches
+    /// a real terminal is dropped (restart recovery reconciles it on the next
+    /// open, since the durable `run.link_state` write cannot succeed under a
+    /// terminal parent).
+    pending_link_terminal: Mutex<HashMap<(String, String), ()>>,
+    /// True while a link-terminal retry janitor task is running (or about to
+    /// exit). Guarded by the `swap` below so at most one janitor exists.
+    link_retry_running: AtomicBool,
+    /// One shared async cell per approval id. Every stop/deadline/park
+    /// compensation path awaits the same cell, so a single approval.request
+    /// success has exactly one approval.cancel invocation even when all race
+    /// branches fire concurrently.
+    approval_cancellations: Mutex<HashMap<String, ApprovalCancellation>>,
     metrics: Arc<Metrics>,
+}
+
+/// The A6 native-supervisor policy programs (compiled once with the
+/// gateway's capability policy, exactly like the production loop program).
+/// Both are pure DECISION policies: they never execute a child and never
+/// fabricate a lifecycle artifact; the native supervisor consumes their
+/// typed plans (`parallel.plan` / `subagent.admit` / `subagent.cancel` /
+/// `parallel.rejected` / `subagent.rejected`) and drives the real child
+/// runs.
+struct AgentPolicies {
+    parallel: AgentRunner,
+    subagent: AgentRunner,
+}
+
+/// One A6 handoff execution result: the typed outcome to backfill into the
+/// loop state, a cancellation that landed during execution (typed terminal
+/// wins), or a typed supervisor unavailability.
+enum HandoffExec {
+    Outcome(JsonValue),
+    Cancelled,
+    Unavailable(String),
+}
+
+/// The REAL child executor bound to [`AgentService`]: one supervised slot is
+/// one genuine child run admitted with `parent_run_id` (isolated session,
+/// capacity permit, tokio worker ACTUALLY spawned), durably linked, awaited
+/// to its durable terminal, and reported as a typed outcome.
+/// `subagent.started` is emitted only AFTER the admission + worker spawn;
+/// `subagent.completed` only AFTER the durable terminal. A refused
+/// admission or a failed link is a typed failure and never emits started.
+/// This is the single executor the native supervisor engine drives — no
+/// second executor exists.
+#[derive(Clone)]
+struct ServiceChildExecutor {
+    service: AgentService,
+    parent_run_id: String,
+    relation: String,
+    /// slot -> real admitted child run id (filled after a real admission).
+    admitted: Arc<Mutex<HashMap<usize, String>>>,
+    /// slot -> real admitted child session id.
+    sessions: Arc<Mutex<HashMap<usize, String>>>,
+}
+
+impl ServiceChildExecutor {
+    fn new(service: AgentService, parent_run_id: &str, relation: &str) -> Self {
+        Self {
+            service,
+            parent_run_id: parent_run_id.to_string(),
+            relation: relation.to_string(),
+            admitted: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn admitted_slot_ids(&self) -> HashMap<usize, String> {
+        self.admitted.lock().expect("admitted lock").clone()
+    }
+
+    fn admitted_sessions(&self) -> HashMap<usize, String> {
+        self.sessions.lock().expect("sessions lock").clone()
+    }
+
+    /// The parent's current session model/provider (the child inherits the
+    /// parent's model and provider).
+    fn parent_model_provider(&self) -> (String, Option<String>) {
+        let store = self.service.inner.store.read();
+        let Some(run) = store.runs.get(&self.parent_run_id) else {
+            return (String::new(), None);
+        };
+        let model = store
+            .sessions
+            .get(&run.session_id)
+            .map(|session| session.view.model.clone())
+            .unwrap_or_default();
+        let provider = store
+            .sessions
+            .get(&run.session_id)
+            .and_then(|session| session.view.provider.clone());
+        (model, provider)
+    }
+
+    /// Awaits the child's durable terminal: polls the in-memory run record
+    /// (the durable commit precedes the in-memory terminal), observes the
+    /// shared supervision cancel (propagating it to the child's
+    /// `RunCancellation`), and reports a typed outcome — never a fabricated
+    /// success.
+    async fn await_child_terminal(
+        &self,
+        service: &AgentService,
+        child_run_id: &str,
+        cancel: &SupervisorCancel,
+    ) -> ChildOutcome {
+        loop {
+            if cancel.is_requested()
+                && let Some(handle) = service.handle(child_run_id)
+            {
+                // Propagate the REAL cancellation reason (deadline vs parent
+                // stop) to the child so its terminal is typed accurately.
+                // The deadline-bounded batch requests the shared cancel with
+                // reason "deadline"; the parent-stop watcher uses
+                // "parent_cancelled"/the parent's typed reason.
+                let reason = if cancel.reason() == "deadline" {
+                    CancellationReason::Deadline
+                } else {
+                    CancellationReason::Requested
+                };
+                handle.cancel.request(reason);
+            }
+            let terminal = {
+                let store = service.inner.store.read();
+                store.runs.get(child_run_id).map(|run| run.status.clone())
+            };
+            match terminal.as_deref() {
+                Some("completed") => {
+                    return ChildOutcome::Completed(JsonValue::String(child_output_text(
+                        service,
+                        child_run_id,
+                    )));
+                }
+                Some("cancelled") => {
+                    return ChildOutcome::Cancelled(child_terminal_reason(
+                        service,
+                        child_run_id,
+                        "cancelled",
+                    ));
+                }
+                Some("failed") => {
+                    return ChildOutcome::Failed(child_terminal_reason(
+                        service,
+                        child_run_id,
+                        "failed",
+                    ));
+                }
+                Some("terminal_pending") => {
+                    // A parent stop cannot turn this intermediate state into a
+                    // cancelled child. Keep waiting for durable terminal state;
+                    // the retry janitor terminates it canonically as `failed`
+                    // (typed `error_code=terminal_retry_expired`) if the
+                    // bounded window is exhausted.
+                }
+                Some(_) | None => {}
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl ChildExecutor for ServiceChildExecutor {
+    fn execute_child(
+        &self,
+        child: &ChildSpec,
+        cancel: &SupervisorCancel,
+    ) -> Pin<Box<dyn Future<Output = ChildOutcome> + Send + '_>> {
+        let executor = self.clone();
+        let child_spec = child.clone();
+        let cancel_for_child = cancel.clone();
+        Box::pin(async move {
+            if cancel_for_child.is_requested() {
+                return ChildOutcome::Cancelled(cancel_for_child.reason());
+            }
+            let service = executor.service.clone();
+            let parent_run_id = executor.parent_run_id.clone();
+            let (parent_model, parent_provider) = executor.parent_model_provider();
+            let model = parent_model;
+            let input = child_spec.input.clone();
+            // The child admission carries a DETERMINISTIC idempotency key:
+            // the same slot always maps to the same key, so an admission
+            // whose future was dropped mid-flight (the grace-drop window)
+            // can be located and durably compensated.
+            let idempotency_key = format!(
+                "child:{parent_run_id}:{}:{}",
+                executor.relation, child_spec.slot
+            );
+            let idempotency_hash = fnv1a64(&format!(
+                "{idempotency_key}:{}:{model}",
+                serde_json::to_string(&input).unwrap_or_default()
+            ));
+            let request = AdmitRunRequest {
+                input,
+                session_id: None,
+                model: Some(model),
+                provider: parent_provider,
+                parent_run_id: Some(parent_run_id.clone()),
+                instructions: None,
+                platform: "agent:child".to_string(),
+                idempotency_key: Some(idempotency_key.clone()),
+                idempotency_hash: Some(idempotency_hash),
+                origin_actor: None,
+                request_overrides: JsonValue::Object(Default::default()),
+                session_messages: Vec::new(),
+            };
+            // The pre-admit re-check: a stop that landed while this slot
+            // was queued (or during the policy VM) prevents the admission
+            // entirely — no child work starts after a stop.
+            if cancel_for_child.is_requested() || service.run_is_stopping(&parent_run_id) {
+                return ChildOutcome::Cancelled(cancel_for_child.reason());
+            }
+            // The PRE-admission RAII guard is created BEFORE the admission
+            // await: a drop while the admission is still in flight (the
+            // grace-drop window) is compensated deterministically — the
+            // guard's bounded watcher polls the deterministic admission key
+            // and, the moment the detached admission completes, immediately
+            // cancels the child, commits its durable terminal, and releases
+            // the permit/handle/link. After the admission returns, the
+            // guard is updated with the real run id.
+            let mut guard = AdmittedChildGuard {
+                service: service.clone(),
+                parent_run_id: parent_run_id.clone(),
+                child_run_id: String::new(),
+                idempotency_key: idempotency_key.clone(),
+                resolved: false,
+                disarmed: false,
+            };
+            let admitted = match service.admit(request).await {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    // A refused admission never starts and never emits
+                    // subagent.started: typed failure in the slot. Nothing
+                    // was admitted, so no compensation is needed.
+                    guard.disarmed = true;
+                    return ChildOutcome::Failed(format!(
+                        "admission_refused:{}",
+                        describe_admit_error(&error)
+                    ));
+                }
+            };
+            guard.resolved = true;
+            guard.child_run_id = admitted.run_id.clone();
+            let child_run_id = admitted.run_id.clone();
+            let child_session_id = admitted.session_id.clone();
+            executor
+                .admitted
+                .lock()
+                .expect("admitted lock")
+                .insert(child_spec.slot, child_run_id.clone());
+            executor
+                .sessions
+                .lock()
+                .expect("sessions lock")
+                .insert(child_spec.slot, child_session_id.clone());
+            // A REPLAYED admission (the deterministic slot key already
+            // admitted — for example a re-executed handoff): the child's
+            // lifecycle was already produced by the ORIGINAL admission.
+            // NEVER spawn a second worker (a terminal child would be
+            // re-driven), never re-emit subagent.started/completed, never
+            // re-link. Await the EXISTING run's terminal — an active replay
+            // awaits the original worker, a terminal replay returns its
+            // durable terminal immediately — and advance the link state to
+            // the observed outcome (never a regression to active).
+            if admitted.replayed {
+                let outcome = executor
+                    .await_child_terminal(&service, &child_run_id, &cancel_for_child)
+                    .await;
+                service
+                    .update_child_link_state_native(
+                        &parent_run_id,
+                        &child_run_id,
+                        child_outcome_status(&outcome),
+                    )
+                    .await;
+                guard.disarmed = true;
+                return outcome;
+            }
+            // The worker receives the exact structured admission input. The
+            // canonical context parser below restores object/array shape
+            // instead of collapsing it to an empty or string-only value.
+            let worker_input =
+                serde_json::to_string(&child_spec.input).unwrap_or_else(|_| "null".to_string());
+            tokio::task::spawn(
+                Arc::new(service.clone()).run_worker(child_run_id.clone(), worker_input),
+            );
+            // Durable parent link (the A2 `run.link_child` contract) with
+            // the in-memory mirror; a failed link fails the slot typed and
+            // cancels the child (never a claim that the link exists).
+            let link_ok = {
+                let service = service.clone();
+                let parent = parent_run_id.clone();
+                let child_id = child_run_id.clone();
+                let relation = executor.relation.clone();
+                tokio::task::spawn_blocking(move || {
+                    service.link_child_native(&parent, &child_id, child_spec.slot as i64, &relation)
+                })
+                .await
+                .unwrap_or(false)
+            };
+            if !link_ok {
+                if let Some(handle) = service.handle(&child_run_id) {
+                    handle.cancel.request(CancellationReason::Requested);
+                }
+                return ChildOutcome::Failed(
+                    "link_failed: the child could not be linked durably".to_string(),
+                );
+            }
+            // The pre-started re-check: a stop that landed during the
+            // admission/link window must never produce a `subagent.started`
+            // after the stop — the child is cancelled instead.
+            if service.run_is_stopping(&parent_run_id) {
+                if let Some(handle) = service.handle(&child_run_id) {
+                    handle.cancel.request(CancellationReason::Requested);
+                }
+                return ChildOutcome::Cancelled(cancel_for_child.reason());
+            }
+            match service
+                .emit_native_event(
+                    &parent_run_id,
+                    "subagent.started",
+                    json!({
+                        "child_run_id": child_run_id,
+                        "parent_run_id": parent_run_id,
+                        "session_id": child_session_id,
+                        "ordinal": child_spec.slot,
+                        "relation": executor.relation,
+                        "turn": 0,
+                    }),
+                )
+                .await
+            {
+                NativeEventEmit::Emitted => {}
+                NativeEventEmit::ParentTerminal => {
+                    // The parent went terminal while the child was being
+                    // linked: no post-terminal side effects; the child is
+                    // cancelled.
+                    if let Some(handle) = service.handle(&child_run_id) {
+                        handle.cancel.request(CancellationReason::Requested);
+                    }
+                    return ChildOutcome::Cancelled(cancel_for_child.reason());
+                }
+                NativeEventEmit::AppendFailed => {
+                    // The durable append of `subagent.started` failed (a
+                    // storage fault): fail closed with the TYPED reason —
+                    // never a fabricated started event and never a
+                    // mislabeled parent cancellation.
+                    if let Some(handle) = service.handle(&child_run_id) {
+                        handle.cancel.request(CancellationReason::Requested);
+                    }
+                    return ChildOutcome::Cancelled("event_append_failed".to_string());
+                }
+            }
+            let outcome = executor
+                .await_child_terminal(&service, &child_run_id, &cancel_for_child)
+                .await;
+            // The link state advances to the child's observed terminal —
+            // durably (the storage `run.link_state` command) AND in the
+            // in-memory mirror.
+            service
+                .update_child_link_state_native(
+                    &parent_run_id,
+                    &child_run_id,
+                    child_outcome_status(&outcome),
+                )
+                .await;
+            // The canonical `subagent.completed` event is appended durably
+            // (bounded retry inside emit_native_event) BEFORE the child's
+            // outcome is returned: a failed append is promoted to a TYPED
+            // parent failure — the child's outcome (and its output text)
+            // must never reach the parent's history before (or without) the
+            // durable event.
+            match service
+                .emit_native_event(
+                    &parent_run_id,
+                    "subagent.completed",
+                    json!({
+                        "child_run_id": child_run_id,
+                        "parent_run_id": parent_run_id,
+                        "status": child_outcome_status(&outcome),
+                        "turn": 0,
+                    }),
+                )
+                .await
+            {
+                NativeEventEmit::Emitted => {}
+                NativeEventEmit::ParentTerminal => {
+                    // The parent went terminal while the child reached its
+                    // durable terminal: no post-terminal side effects — the
+                    // event is intentionally not appended, and nothing folds
+                    // the outcome once the parent is terminal.
+                }
+                NativeEventEmit::AppendFailed => {
+                    guard.disarmed = true;
+                    return ChildOutcome::Failed(
+                        "completed_event_append_failed: the durable \
+                         subagent.completed event could not be appended \
+                         after bounded retries"
+                            .to_string(),
+                    );
+                }
+            }
+            guard.disarmed = true;
+            outcome
+        })
+    }
+
+    /// The slot's child's REAL durable terminal (when it has reached one),
+    /// folded to a typed outcome — used by the `supervise_batch_bounded`
+    /// grace-drop fallback so a child that already durably completed (
+    /// including one whose `subagent.completed` event was appended but whose
+    /// outcome had not yet been folded into the shared buffer) is reported as
+    /// its real terminal, never as a spurious cancellation. `None` while the
+    /// child is not (yet) durably terminal.
+    fn observed_terminal_outcome(&self, slot: usize) -> Option<ChildOutcome> {
+        let child_run_id = self
+            .admitted
+            .lock()
+            .expect("admitted lock")
+            .get(&slot)
+            .cloned()?;
+        // NON-BLOCKING status read: this helper runs on the grace-drop
+        // fallback inside `supervise_batch_bounded`, on a tokio worker thread.
+        // parking_lot's `read()` parks behind a queued writer, which would
+        // stall the batch drop and delay compensation watchers. `try_read()`
+        // returns immediately on write contention; if we cannot read the
+        // child's status now, the in-flight child is compensated by its RAII
+        // guard and we fall back to the typed cancel reason.
+        let status = self
+            .service
+            .inner
+            .store
+            .try_read()?
+            .runs
+            .get(&child_run_id)?
+            .status
+            .clone();
+        match status.as_str() {
+            "completed" => Some(ChildOutcome::Completed(JsonValue::String(
+                child_output_text(&self.service, &child_run_id),
+            ))),
+            "cancelled" => Some(ChildOutcome::Cancelled(child_terminal_reason(
+                &self.service,
+                &child_run_id,
+                "cancelled",
+            ))),
+            "failed" => Some(ChildOutcome::Failed(child_terminal_reason(
+                &self.service,
+                &child_run_id,
+                "failed",
+            ))),
+            _ => None,
+        }
+    }
+}
+
+/// RAII compensation for one child slot. The guard is created BEFORE the
+/// admission await and updated after it returns. If the slot future is
+/// dropped between the guard creation and the outcome (the
+/// `supervise_batch_bounded` grace-drop window), the child run would
+/// otherwise be orphaned: a drop DURING the admission leaves a permit held
+/// and a run nobody ever drives once the detached admission completes; a
+/// drop while awaiting the terminal leaves nobody to propagate the
+/// cancellation. Drop therefore starts a compensation watcher whose
+/// lifecycle is bounded ONLY by service shutdown (it has no wall-clock
+/// give-up — see [`AdmittedChildGuard`] drop): for the in-flight-admission
+/// window it polls the deterministic admission key and, the moment the
+/// detached run appears, immediately cancels it, durably terminates it
+/// (`finish_cancelled` is idempotent against the worker's own terminal),
+/// and advances the link state — the permit and handle are always released.
+/// The watcher count is bounded by the admission/concurrency upper bound
+/// (one deduplicated watcher per deterministic key; every waiting watcher
+/// corresponds to an in-flight admission that still holds a capacity
+/// permit).
+struct AdmittedChildGuard {
+    service: AgentService,
+    parent_run_id: String,
+    /// The real admitted run id once the admission returned; empty while
+    /// the admission is still in flight (the drop-during-admission window).
+    child_run_id: String,
+    /// The deterministic admission idempotency key (locating the run if the
+    /// drop happened while the admission was still in flight).
+    idempotency_key: String,
+    /// True once the admission returned (the real run id is known).
+    resolved: bool,
+    /// True on the normal path right before the outcome is returned.
+    disarmed: bool,
+}
+
+impl Drop for AdmittedChildGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let service = self.service.clone();
+        let parent_run_id = self.parent_run_id.clone();
+        let child_run_id = self.child_run_id.clone();
+        let idempotency_key = self.idempotency_key.clone();
+        if let Some(handle) = service.handle(&child_run_id) {
+            handle.cancel.request(CancellationReason::Requested);
+        }
+        let resolved = self.resolved;
+        // At most ONE watcher per deterministic admission key (the key is
+        // `child:{parent}:{relation}:{slot}`): a re-dropped slot — a
+        // re-executed handoff of the same plan — registers the same key and
+        // is a no-op. The number of live watchers is therefore bounded by
+        // the number of in-flight admissions: every waiting watcher
+        // corresponds to a dropped admission whose `spawn_blocking` still
+        // HOLDS its capacity permit, and in-flight admissions are capped by
+        // `max_concurrent_runs` (the admission/concurrency upper bound).
+        let mut watchers = service
+            .inner
+            .compensation_watchers
+            .lock()
+            .expect("compensation watchers lock");
+        if !watchers.insert(idempotency_key.clone()) {
+            return;
+        }
+        drop(watchers);
+        // Compensation runs on the shared runtime (Drop cannot await). The
+        // watcher has NO wall-clock give-up: it polls until the detached
+        // admission's run appears (then compensates it durably) or the
+        // service shuts down (the SIGINT path) — the ONLY termination
+        // besides process death. An admission that never completed has no
+        // durable row (the admission commit is transactional), so restart
+        // recovery has nothing to repair; a row that lands in the shutdown
+        // race window is durably failed by the restart-recovery orphan
+        // sweep, exactly like any other terminal persist left for restart.
+        tokio::spawn(async move {
+            // The registration is removed on EVERY exit path of the watcher.
+            let _registration = WatcherRegistration {
+                service: service.clone(),
+                key: idempotency_key.clone(),
+            };
+            let mut found: Option<String> = if resolved {
+                Some(child_run_id.clone())
+            } else {
+                None
+            };
+            if found.is_none() {
+                // A drop DURING the admission (the grace-drop window): the
+                // spawn_blocking admission may still complete AFTER this
+                // future is gone. Poll the deterministic key until the run
+                // appears; the moment it does, immediately cancel it, commit
+                // the durable terminal, and release the permit/handle/link.
+                // The lookup is NON-BLOCKING (try_read): a stalled admission
+                // that holds (or waits for) the store write lock must never
+                // park this watcher behind it — the watcher always reaches
+                // the shutdown check between polls.
+                loop {
+                    if let Some(Some(found_id)) =
+                        service.try_find_run_by_idempotency(&idempotency_key)
+                    {
+                        found = Some(found_id);
+                        break;
+                    }
+                    if service.inner.halting.load(Ordering::Acquire) {
+                        // Service shutdown: one final lookup (the admission
+                        // may have completed while this poll was in flight)
+                        // — an admission found here is still compensated —
+                        // then the watcher ends with the process.
+                        if let Some(Some(found_id)) =
+                            service.try_find_run_by_idempotency(&idempotency_key)
+                        {
+                            found = Some(found_id);
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            let Some(found_id) = found else {
+                // The admission never completed: nothing was durably created
+                // (the transactional admission never committed), so there is
+                // nothing to compensate and restart recovery has nothing to
+                // repair. The in-flight admission dies with the process.
+                return;
+            };
+            if let Some(handle) = service.handle(&found_id) {
+                handle.cancel.request(CancellationReason::Requested);
+            }
+            // Durable terminal first: the child really reaches a terminal
+            // (the worker — when spawned — observes the cancellation; the
+            // commit is idempotent against the worker's own terminal) and
+            // the permit/handle are released by mark_terminal.
+            service
+                .finish_cancelled(&found_id, "supervisor_abandoned")
+                .await;
+            // The link advances to the child's OBSERVED terminal (never a
+            // terminal->terminal regression when the compensation races a
+            // child that really completed). NEVER write the terminal link
+            // before the child reaches a real durable terminal: if the child
+            // is still observably `terminal_pending` (its durable terminal
+            // commit is pending recovery), keep waiting/retrying instead of
+            // claiming a terminal the durable side may not carry yet.
+            loop {
+                match observed_link_state(&service, &found_id) {
+                    Some(state) => {
+                        service
+                            .update_child_link_state_native(&parent_run_id, &found_id, &state)
+                            .await;
+                        break;
+                    }
+                    None => {
+                        if service.inner.halting.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Removes one compensation-watcher registration when its watcher task
+/// exits (found-and-compensated, or service shutdown) — the registry can
+/// never leak an entry for a watcher that is no longer running.
+struct WatcherRegistration {
+    service: AgentService,
+    key: String,
+}
+
+impl Drop for WatcherRegistration {
+    fn drop(&mut self) {
+        self.service
+            .inner
+            .compensation_watchers
+            .lock()
+            .expect("compensation watchers lock")
+            .remove(&self.key);
+    }
+}
+
+/// The child's durable terminal status for a link-state advance: its real
+/// durable status when it has reached a REAL terminal
+/// (`completed`/`failed`/`cancelled`), or `None` while the child is still
+/// durable-active/pending (including `terminal_pending`, whose durable
+/// terminal commit is pending recovery — a link must NEVER advance to a
+/// terminal the durable side does not yet carry). This lets the compensation
+/// watcher wait for a real durable terminal instead of writing a premature
+/// terminal link.
+fn observed_link_state(service: &AgentService, child_run_id: &str) -> Option<String> {
+    let status = service
+        .inner
+        .store
+        .read()
+        .runs
+        .get(child_run_id)
+        .map(|run| run.status.clone())
+        .unwrap_or_default();
+    match status.as_str() {
+        "completed" | "failed" | "cancelled" => Some(status),
+        _ => None,
+    }
+}
+
+/// Deterministic FNV-1a 64-bit hash used to derive the child admission
+/// idempotency hash: the same slot/input/model always produces the same
+/// hash, so an abandoned admission can be located and compensated.
+fn fnv1a64(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn canonical_input_value(input: &str) -> JsonValue {
+    serde_json::from_str(input).unwrap_or_else(|_| JsonValue::String(input.to_string()))
+}
+
+/// Stable identifiers for result slots that were never admitted. These are
+/// intentionally derived only from the parent, relation, and ordinal so
+/// race/fail-fast continuation can still carry a non-empty correlation id.
+fn stable_slot_id(parent_run_id: &str, relation: &str, slot: usize) -> String {
+    format!("slot:{}:{}:{}", fnv1a64(parent_run_id), relation, slot)
+}
+
+fn stable_tool_call_id(parent_run_id: &str, relation: &str, slot: usize) -> String {
+    format!("toolcall:{}:{}:{}", fnv1a64(parent_run_id), relation, slot)
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "terminal_pending"
+    )
+}
+
+/// The REAL child terminal statuses that validly advance a child link's state.
+/// Unlike the run-terminal `is_terminal_status`, this excludes `terminal_pending`
+/// — a child still pending its durable terminal commit must NEVER be written
+/// as a terminal link.
+fn is_terminal_link_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
+/// The typed status string of one child outcome.
+fn child_outcome_status(outcome: &ChildOutcome) -> &'static str {
+    match outcome {
+        ChildOutcome::Completed(_) => "completed",
+        ChildOutcome::Cancelled(_) => "cancelled",
+        ChildOutcome::Failed(_) => "failed",
+    }
+}
+
+/// The child's final assistant text (its terminal output): the last
+/// assistant message's text parts in the child's own session.
+fn child_output_text(service: &AgentService, child_run_id: &str) -> String {
+    let store = service.inner.store.read();
+    let Some(run) = store.runs.get(child_run_id) else {
+        return String::new();
+    };
+    let Some(session) = store.sessions.get(&run.session_id) else {
+        return String::new();
+    };
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(|message| content_text(&message.content))
+        .unwrap_or_default()
+}
+
+/// The child's typed terminal reason from its terminal event (fallback when
+/// no terminal event is retained).
+fn child_terminal_reason(service: &AgentService, child_run_id: &str, fallback: &str) -> String {
+    let store = service.inner.store.read();
+    let Some(run) = store.runs.get(child_run_id) else {
+        return fallback.to_string();
+    };
+    run.events
+        .iter()
+        .rev()
+        .find(|event| event.event == "run.cancelled" || event.event == "run.failed")
+        .and_then(|event| {
+            event
+                .data
+                .get("reason")
+                .and_then(JsonValue::as_str)
+                .or_else(|| event.data.get("error_code").and_then(JsonValue::as_str))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// The text of one canonical content value (a plain string or text parts).
+fn content_text(content: &JsonValue) -> String {
+    match content {
+        JsonValue::String(text) => text.clone(),
+        JsonValue::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if part.get("type").and_then(JsonValue::as_str) == Some("text") {
+                    part.get("text")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The typed admission refusal code for the slot outcome.
+fn describe_admit_error(error: &AdmitError) -> &'static str {
+    match error {
+        AdmitError::RunLimitReached => "run_limit_reached",
+        AdmitError::IdempotencyConflict => "idempotency_conflict",
+        AdmitError::ParentNotFound => "parent_not_found",
+        AdmitError::ParentNotActive => "parent_not_active",
+        AdmitError::SessionNotFound => "session_not_found",
+        AdmitError::Persistence(_) => "persistence_failed",
+        AdmitError::Invalid(_) => "invalid_request",
+        AdmitError::Halting => "halting",
+    }
 }
 
 /// The production A2 storage program path. The default resolves relative to
@@ -400,6 +1228,44 @@ fn storage_program_path() -> std::path::PathBuf {
             .join("storage")
             .join("main.rss"),
     }
+}
+
+/// Compiles the A6 native-supervisor policy programs (`parallel.rss` /
+/// `subagents.rss`) with the gateway's capability policy — the same seam
+/// the production loop program uses. Fallible: a deployment without the
+/// source tree answers a typed error at construction (handoffs then fail
+/// typed), never a panic.
+fn compile_agent_policies(
+    http_config: &HttpConfig,
+    config: &AgentGatewayConfig,
+) -> Option<Result<AgentPolicies, String>> {
+    let agent_config = AgentConfig {
+        http: http_config.clone(),
+        sqlite: config.sqlite.clone(),
+        io: config.io.clone(),
+        fuel: config.fuel,
+    };
+    let agent_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("rss")
+        .join("agent");
+    let parallel =
+        match AgentRunner::from_file(agent_root.join("parallel.rss"), agent_config.clone()) {
+            Ok(runner) => runner,
+            Err(error) => {
+                return Some(Err(format!(
+                    "compile the built-in parallel policy: {error}"
+                )));
+            }
+        };
+    let subagent = match AgentRunner::from_file(agent_root.join("subagents.rss"), agent_config) {
+        Ok(runner) => runner,
+        Err(error) => {
+            return Some(Err(format!(
+                "compile the built-in subagent policy: {error}"
+            )));
+        }
+    };
+    Some(Ok(AgentPolicies { parallel, subagent }))
 }
 
 /// One run parked on a durable pending approval. The resume re-invokes the
@@ -561,6 +1427,18 @@ impl std::fmt::Display for CompactSessionError {
     }
 }
 
+/// The typed outcome of a native lifecycle event emission: the failure
+/// modes are DISTINCT — a parent terminal (no post-terminal side effects;
+/// the child is cancelled as `parent_cancelled`) vs a failed durable append
+/// (storage fault; the child is cancelled with the typed
+/// `event_append_failed` reason) vs a successful emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeEventEmit {
+    Emitted,
+    ParentTerminal,
+    AppendFailed,
+}
+
 impl AgentService {
     pub(crate) fn new(
         config: Arc<AgentGatewayConfig>,
@@ -612,6 +1490,21 @@ impl AgentService {
         metrics: Arc<Metrics>,
     ) -> Result<Self, String> {
         let capacity = Arc::new(Semaphore::new(config.max_concurrent_runs));
+        let mut deny = NativeDenyPolicy::new();
+        if config.native_hard_deny {
+            deny = deny.hard_deny();
+        }
+        for tool in &config.native_deny_tools {
+            deny = deny.deny_tool(tool.clone());
+        }
+        for risk in &config.native_deny_risks {
+            deny = deny.deny_risk(match risk.as_str() {
+                "read" => RiskClass::Read,
+                "write" => RiskClass::Write,
+                "execute" => RiskClass::Execute,
+                _ => RiskClass::Privileged,
+            });
+        }
         // The durable approval bridge composes the production A2 storage
         // program. Construction is fallible: a deployment without the source
         // tree answers a typed error instead of panicking (the gateway
@@ -631,10 +1524,12 @@ impl AgentService {
                 }
                 let storage = AgentRunner::from_file(&root, agent_config)
                     .map_err(|error| format!("compile the built-in storage program: {error}"))?;
+                // The native deny policy is configurable: tool names and risk
+                // classes denied regardless of the RSS approval mode.
                 Some(Arc::new(ApprovalBridge::new(
                     storage,
                     persistence.db_file_name().to_string(),
-                    NativeDenyPolicy::new(),
+                    deny.clone(),
                 )))
             }
             None => None,
@@ -669,21 +1564,30 @@ impl AgentService {
             }
             None => None,
         };
+        let policies = compile_agent_policies(&http_config, config.as_ref())
+            .transpose()?
+            .map(Arc::new);
         let inner = Arc::new(AgentServiceInner {
             config,
             store,
             persistence,
             agent_source,
             agent_program: agent_program.map(Arc::new),
+            policies,
             approval,
             compact,
             compacting_sessions: Mutex::new(HashSet::new()),
+            native_deny: deny,
             parked: Mutex::new(HashMap::new()),
             http_config,
             capacity,
             runs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
+            compensation_watchers: Mutex::new(HashSet::new()),
+            pending_link_terminal: Mutex::new(HashMap::new()),
+            link_retry_running: AtomicBool::new(false),
+            approval_cancellations: Mutex::new(HashMap::new()),
             metrics,
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
@@ -714,6 +1618,19 @@ impl AgentService {
     /// Number of in-memory lifecycle handles (active + retained terminal).
     pub fn handle_count(&self) -> usize {
         self.inner.runs.lock().expect("runs lock").len()
+    }
+
+    /// Number of live pre-admission compensation watchers. Deduplicated per
+    /// deterministic admission key and bounded by the admission/concurrency
+    /// upper bound (each waiting watcher corresponds to a dropped admission
+    /// that still holds a capacity permit). Observable for the durability
+    /// suites.
+    pub fn compensation_watcher_count(&self) -> usize {
+        self.inner
+            .compensation_watchers
+            .lock()
+            .expect("compensation watchers lock")
+            .len()
     }
 
     /// The persistence handle for typed repository commands; `None` when no
@@ -1372,6 +2289,7 @@ impl AgentService {
                 session_id: session_id.to_string(),
                 parent_run_id: None,
                 platform: "maintenance".to_string(),
+                input: JsonValue::Null,
                 status: status.to_string(),
                 events,
                 sender: None,
@@ -1634,6 +2552,145 @@ impl AgentService {
             })?
     }
 
+    /// Rehydrates the live replay mirror from durable rows. The durable store
+    /// is authoritative after restart or a race with another gateway process;
+    /// an in-memory idempotency hit must never return a parent with stale
+    /// fanout links.
+    fn refresh_replay_mirror(
+        &self,
+        store: &mut GatewayStore,
+        run_id: &str,
+    ) -> Result<(String, String), AdmitError> {
+        let Some(persistence) = self.inner.persistence.as_ref() else {
+            let run = store.runs.get(run_id).ok_or_else(|| {
+                AdmitError::Persistence("replayed run is missing from the mirror".to_string())
+            })?;
+            return Ok((run.session_id.clone(), run.status.clone()));
+        };
+        let run_data = persistence.run_get(run_id).map_err(|error| {
+            AdmitError::Persistence(format!("replayed run lookup failed: {error}"))
+        })?;
+        let run_row = run_data
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                AdmitError::Persistence("replayed run lookup omitted the run".to_string())
+            })?;
+        let durable_run_id = run_row
+            .first()
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        let session_id = run_row
+            .get(1)
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let durable_status = run_row
+            .get(3)
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown");
+        if durable_run_id != run_id || session_id.is_empty() {
+            return Err(AdmitError::Persistence(
+                "replayed run row is malformed".to_string(),
+            ));
+        }
+        let mapped_status = match durable_status {
+            "completed" => "completed",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            "terminal_pending" => "terminal_pending",
+            // A legacy durable `terminal_retry_expired` row unifies to the
+            // canonical `failed` terminal (the typed reason is carried by the
+            // terminal event's `error_code`), never a second canonical state.
+            "terminal_retry_expired" => "failed",
+            _ => "started",
+        };
+        if let Some(run) = store.runs.get_mut(run_id) {
+            // The durable row is authoritative, including intermediate and
+            // retry-expired terminal states.
+            run.status = mapped_status.to_string();
+        }
+
+        let mut links = Vec::new();
+        let mut after_ordinal = -1_i64;
+        let mut after_child_id = String::new();
+        loop {
+            let children_data = persistence
+                .list_children_page(run_id, after_ordinal, &after_child_id)
+                .map_err(|error| {
+                    AdmitError::Persistence(format!("replayed child-link lookup failed: {error}"))
+                })?;
+            let rows = children_data
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    AdmitError::Persistence("replayed child-link lookup omitted rows".to_string())
+                })?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let cells = row.as_array().ok_or_else(|| {
+                    AdmitError::Persistence("replayed child-link row is malformed".to_string())
+                })?;
+                if cells.len() < 5 || cells.first().and_then(JsonValue::as_str) != Some(run_id) {
+                    return Err(AdmitError::Persistence(
+                        "replayed child-link row is malformed".to_string(),
+                    ));
+                }
+                let child_run_id = cells
+                    .get(1)
+                    .and_then(JsonValue::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        AdmitError::Persistence("replayed child-link has no child id".to_string())
+                    })?;
+                let ordinal = cells.get(2).and_then(JsonValue::as_i64).ok_or_else(|| {
+                    AdmitError::Persistence("replayed child-link has no ordinal".to_string())
+                })?;
+                let relation = cells
+                    .get(3)
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let state = cells
+                    .get(4)
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                links.push(ChildLinkRecord {
+                    child_run_id: child_run_id.to_string(),
+                    ordinal,
+                    relation,
+                    state,
+                });
+            }
+            let last = rows.last().and_then(JsonValue::as_array).ok_or_else(|| {
+                AdmitError::Persistence("replayed child-link row is malformed".to_string())
+            })?;
+            after_ordinal = last.get(2).and_then(JsonValue::as_i64).ok_or_else(|| {
+                AdmitError::Persistence("replayed child-link has no ordinal".to_string())
+            })?;
+            after_child_id = last
+                .get(1)
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let truncated = children_data
+                .get("truncated")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            if !truncated && rows.len() < 512 {
+                break;
+            }
+        }
+        links.sort_by_key(|link| (link.ordinal, link.child_run_id.clone()));
+        store.child_links.insert(run_id.to_string(), links);
+        Ok((session_id, mapped_status.to_string()))
+    }
+
     fn admit_blocking(
         &self,
         request: AdmitRunRequest,
@@ -1658,13 +2715,29 @@ impl AgentService {
                     .admission_rejected(AdmitRejectReason::IdempotencyConflict);
                 return Err(AdmitError::IdempotencyConflict);
             }
-            let (session_id, status) = store
-                .runs
-                .get(&existing.run_id)
-                .map(|run| (run.session_id.clone(), run.status.clone()))
-                .unwrap_or((String::new(), "unknown".to_string()));
+            let existing_run_id = existing.run_id.clone();
+            let (session_id, status) =
+                match self.refresh_replay_mirror(&mut store, &existing_run_id) {
+                    Ok(value) => value,
+                    Err(AdmitError::Persistence(message))
+                        if message.contains("storage_unavailable") =>
+                    {
+                        // An in-memory idempotency replay is read-only. If the
+                        // durable worker is unavailable, preserve that original
+                        // response without pretending the fanout mirror was
+                        // refreshed; every successful durable read still takes
+                        // the authoritative paginated path above.
+                        let run = store.runs.get(&existing_run_id).ok_or_else(|| {
+                            AdmitError::Persistence(
+                                "replayed run is missing from the mirror".to_string(),
+                            )
+                        })?;
+                        (run.session_id.clone(), run.status.clone())
+                    }
+                    Err(error) => return Err(error),
+                };
             return Ok(AdmittedRun {
-                run_id: existing.run_id.clone(),
+                run_id: existing_run_id,
                 session_id,
                 status,
                 replayed: true,
@@ -1718,6 +2791,20 @@ impl AgentService {
                 .metrics
                 .admission_rejected(AdmitRejectReason::ParentNotFound);
             return Err(AdmitError::ParentNotFound);
+        }
+        // A child may only be admitted under an ACTIVE parent: the durable
+        // admission transaction rejects a terminal/stopping parent (RSS
+        // `run_active` predicate), and the in-memory mirror enforces the same
+        // guard so no child/link/event is ever inserted beneath a finished
+        // parent in either store.
+        if let Some(parent_run_id) = request.parent_run_id.as_deref()
+            && let Some(parent) = store.runs.get(parent_run_id)
+            && is_terminal_status(parent.status.as_str())
+        {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::ParentNotActive);
+            return Err(AdmitError::ParentNotActive);
         }
 
         // The transport's canonical pre-appended conversation (OpenAI
@@ -1785,6 +2872,12 @@ impl AgentService {
                     .admission_rejected(AdmitRejectReason::Persistence);
                 match error.code.as_str() {
                     "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
+                    "parent_not_found" => AdmitError::ParentNotFound,
+                    // The durable admission transaction rejects a child under
+                    // a terminal/stopping parent (`run_active` predicate):
+                    // no child/link/event is inserted and the rejection is
+                    // typed, never a generic persistence failure.
+                    "parent_not_active" => AdmitError::ParentNotActive,
                     _ => AdmitError::Persistence(format!(
                         "run admission could not be durably committed: {error}"
                     )),
@@ -1813,16 +2906,8 @@ impl AgentService {
                 .and_then(JsonValue::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let replayed_session = run_row
-                .get(1)
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let replayed_status = run_row
-                .get(3)
-                .and_then(JsonValue::as_str)
-                .unwrap_or("unknown")
-                .to_string();
+            let (replayed_session, replayed_status) =
+                self.refresh_replay_mirror(&mut store, &replayed_run_id)?;
             return Ok(AdmittedRun {
                 run_id: replayed_run_id,
                 session_id: replayed_session,
@@ -1887,6 +2972,7 @@ impl AgentService {
             parent_run_id: request.parent_run_id.clone(),
             request_overrides: request.request_overrides.clone(),
             platform: request.platform.clone(),
+            input: request.input.clone(),
             status: "started".to_string(),
             events: vec![started_event],
             sender: Some(sender),
@@ -1972,7 +3058,7 @@ impl AgentService {
             .get_mut(run_id)
             .map(|run| run.status.clone())
             .unwrap_or_default();
-        if status == "started" {
+        if matches!(status.as_str(), "started" | "waiting_approval") {
             if let Some(run) = store.runs.get_mut(run_id) {
                 run.status = "stopping".to_string();
             }
@@ -2004,9 +3090,22 @@ impl AgentService {
                 let run_id = run_id.to_string();
                 let approval_id = parked.approval_id;
                 tokio::spawn(async move {
-                    if let Some(bridge) = service.inner.approval.clone() {
-                        let _ = bridge.cancel(&approval_id, "gateway-stop", timestamp() as i64);
-                    }
+                    let _ = service
+                        .cancel_abandoned_approval(&run_id, &approval_id)
+                        .await;
+                    service
+                        .transition_run(&run_id, "waiting_approval", "running")
+                        .await;
+                    service.finish_cancelled(&run_id, "requested").await;
+                });
+            } else if status == "waiting_approval" {
+                // Close the micro-window after the durable status transition
+                // but before the park map insert. The worker may still return
+                // from park_for_approval, yet a direct stop must never leave
+                // a park-less waiting run stuck in `stopping`.
+                let service = self.clone();
+                let run_id = run_id.to_string();
+                tokio::spawn(async move {
                     service
                         .transition_run(&run_id, "waiting_approval", "running")
                         .await;
@@ -2142,6 +3241,13 @@ impl AgentService {
         self.inner.capacity.available_permits()
     }
 
+    #[doc(hidden)]
+    pub fn fail_next_link_states(&self, n: usize) {
+        if let Some(persistence) = &self.inner.persistence {
+            persistence.fail_next_link_states(n);
+        }
+    }
+
     /// The bounded metrics registry shared by the service, delivery, storage
     /// worker, and API handlers.
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -2173,6 +3279,15 @@ impl AgentService {
             let Some(run) = store.runs.get(&run_id) else {
                 return;
             };
+            // The authoritative active-status check (every run_worker entry
+            // runs it BEFORE any provider/message/event side effect): a run
+            // that already reached a terminal — for example a REPLAYED child
+            // admission whose lifecycle was already produced — is never
+            // re-driven, never executes a provider round, and never appends
+            // messages or events.
+            if is_terminal_status(run.status.as_str()) {
+                return;
+            }
             run.session_id.clone()
         };
         let cancellation = handle.cancel.clone();
@@ -2391,9 +3506,23 @@ impl AgentService {
             finish_reason
         };
         let attempts = 1 + self.inner.config.terminal_persist_retries;
+        // IDs belong to the logical terminal transition, not to an attempt.
+        // Reusing them makes a retry safe after an ambiguous durable response.
+        let message_id = Uuid::new_v4().to_string();
+        let delta_event_id = Uuid::new_v4().to_string();
+        let completed_event_id = Uuid::new_v4().to_string();
         for attempt in 0..attempts {
             match self
-                .commit_completed_once(run_id, session_id, output_text, usage, finish_reason)
+                .commit_completed_once(
+                    run_id,
+                    session_id,
+                    output_text,
+                    usage,
+                    finish_reason,
+                    &message_id,
+                    &delta_event_id,
+                    &completed_event_id,
+                )
                 .await
             {
                 TerminalOutcome::Committed => {
@@ -2446,6 +3575,7 @@ impl AgentService {
     /// One durable attempt of the completed terminal delta. The started/
     /// stopping race guard runs under the store lock: a stop that landed
     /// before this commit wins (the typed cancellation path commits instead).
+    #[allow(clippy::too_many_arguments)]
     async fn commit_completed_once(
         &self,
         run_id: &str,
@@ -2453,6 +3583,9 @@ impl AgentService {
         output_text: &str,
         usage: &JsonValue,
         finish_reason: &str,
+        message_id: &str,
+        delta_event_id: &str,
+        completed_event_id: &str,
     ) -> TerminalOutcome {
         let service = self.clone();
         let run_id_for_commit = run_id.to_string();
@@ -2460,6 +3593,9 @@ impl AgentService {
         let output_text_for_commit = output_text.to_string();
         let usage_for_commit = canonical_usage_json(usage);
         let finish_reason_for_commit = finish_reason.to_string();
+        let message_id_for_commit = message_id.to_string();
+        let delta_event_id_for_commit = delta_event_id.to_string();
+        let completed_event_id_for_commit = completed_event_id.to_string();
         let retry_window = self.inner.config.terminal_commit_retry_window;
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
@@ -2477,9 +3613,10 @@ impl AgentService {
                 return TerminalOutcome::SessionMissing;
             };
             let previous_session_updated = session.view.updated_at;
-            let message = append_message(
+            let message = append_message_with_id(
                 &mut session.view,
                 &mut session.messages,
+                message_id_for_commit.clone(),
                 "assistant",
                 JsonValue::String(output_text_for_commit.clone()),
                 Some(run_id_for_commit.clone()),
@@ -2493,8 +3630,9 @@ impl AgentService {
                 .expect("run was checked above");
             let previous_status = run.status.clone();
             let previous_events = run.events.clone();
-            let delta_event = append_event_locked(
+let delta_event = append_event_locked_with_id(
                 run,
+                delta_event_id_for_commit.clone(),
                 "message.delta",
                 json!({"message_id":message.id, "delta":output_text_for_commit, "role":"assistant"}),
                 max_event_bytes,
@@ -2528,8 +3666,9 @@ impl AgentService {
                     "finish_reason":finish_reason_for_commit,
                 })
             };
-            let completed_event = append_event_locked(
+            let completed_event = append_event_locked_with_id(
                 run,
+                completed_event_id_for_commit.clone(),
                 "run.completed",
                 completed_data,
                 max_event_bytes,
@@ -2598,8 +3737,9 @@ impl AgentService {
     /// which commits and publishes it exactly once when storage recovers.
     pub(crate) async fn finish_cancelled(&self, run_id: &str, reason: &str) {
         let attempts = 1 + self.inner.config.terminal_persist_retries;
+        let event_id = Uuid::new_v4().to_string();
         for attempt in 0..attempts {
-            match self.commit_cancelled_once(run_id, reason).await {
+            match self.commit_cancelled_once(run_id, reason, &event_id).await {
                 TerminalOutcome::Committed => {
                     self.inner.metrics.runs_terminal(TerminalStatus::Cancelled);
                     tracing::info!(run_id, reason, "cancelled terminal committed durably");
@@ -2631,10 +3771,16 @@ impl AgentService {
     }
 
     /// One durable attempt of the `run.cancelled` transition.
-    async fn commit_cancelled_once(&self, run_id: &str, reason: &str) -> TerminalOutcome {
+    async fn commit_cancelled_once(
+        &self,
+        run_id: &str,
+        reason: &str,
+        event_id: &str,
+    ) -> TerminalOutcome {
         let service = self.clone();
         let run_id_for_commit = run_id.to_string();
         let reason_for_commit = reason.to_string();
+        let event_id_for_commit = event_id.to_string();
         let retry_window = self.inner.config.terminal_commit_retry_window;
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
@@ -2644,16 +3790,14 @@ impl AgentService {
             let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
                 return TerminalOutcome::NotActive;
             };
-            if matches!(
-                run.status.as_str(),
-                "completed" | "failed" | "cancelled" | "terminal_pending"
-            ) {
+            if is_terminal_status(run.status.as_str()) {
                 return TerminalOutcome::NotActive;
             }
             let previous_status = run.status.clone();
             let previous_events = run.events.clone();
-            let event = append_event_locked(
+            let event = append_event_locked_with_id(
                 run,
+                event_id_for_commit.clone(),
                 "run.cancelled",
                 json!({"status":"cancelled", "reason":reason_for_commit}),
                 max_event_bytes,
@@ -2712,8 +3856,12 @@ impl AgentService {
     /// exactly once when storage recovers.
     pub(crate) async fn finish_failed(&self, run_id: &str, data: JsonValue) {
         let attempts = 1 + self.inner.config.terminal_persist_retries;
+        let event_id = Uuid::new_v4().to_string();
         for attempt in 0..attempts {
-            match self.commit_failed_once(run_id, data.clone()).await {
+            match self
+                .commit_failed_once(run_id, data.clone(), &event_id)
+                .await
+            {
                 TerminalOutcome::Committed => {
                     self.inner.metrics.runs_terminal(TerminalStatus::Failed);
                     self.mark_terminal(run_id);
@@ -2743,9 +3891,15 @@ impl AgentService {
     }
 
     /// One durable attempt of the `run.failed` transition.
-    async fn commit_failed_once(&self, run_id: &str, data: JsonValue) -> TerminalOutcome {
+    async fn commit_failed_once(
+        &self,
+        run_id: &str,
+        data: JsonValue,
+        event_id: &str,
+    ) -> TerminalOutcome {
         let service = self.clone();
         let run_id_for_commit = run_id.to_string();
+        let event_id_for_commit = event_id.to_string();
         let retry_window = self.inner.config.terminal_commit_retry_window;
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
@@ -2755,16 +3909,19 @@ impl AgentService {
             let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
                 return TerminalOutcome::NotActive;
             };
-            if matches!(
-                run.status.as_str(),
-                "completed" | "failed" | "cancelled" | "terminal_pending"
-            ) {
+            if is_terminal_status(run.status.as_str()) {
                 return TerminalOutcome::NotActive;
             }
             let previous_status = run.status.clone();
             let previous_events = run.events.clone();
-            let event =
-                append_event_locked(run, "run.failed", data, max_event_bytes, max_events_per_run);
+            let event = append_event_locked_with_id(
+                run,
+                event_id_for_commit.clone(),
+                "run.failed",
+                data,
+                max_event_bytes,
+                max_events_per_run,
+            );
             run.status = "failed".to_string();
             match terminal_commit(persistence.as_deref(), run, "", "failed", &[&event], None) {
                 Ok(durable_events) => {
@@ -2829,7 +3986,7 @@ impl AgentService {
             session_id: session_id.to_string(),
             parent_run_id,
             platform,
-            input: JsonValue::String(input.to_string()),
+            input: canonical_input_value(input),
             messages,
             system_prompt,
             model,
@@ -2927,10 +4084,21 @@ impl AgentService {
             .map(|run| run.platform.clone())
             .or_else(|| session.map(|session| session.view.source.clone()))
             .unwrap_or_default();
+        // The structured admission input: the loop carries it so delegation
+        // requests (the parallel batch / the subagent child descriptor)
+        // reach the serial loop without a separate lookup.
+        let input = run.map(|run| run.input.clone()).unwrap_or(JsonValue::Null);
+        // A CHILD run (admitted with a parent link) never re-delegates: the
+        // delegation capability flags are forced off so a supervised child
+        // reasons normally instead of recursing into another handoff.
+        let is_child = run.is_some_and(|run| run.parent_run_id.is_some());
+        let parallel = if is_child { false } else { config.parallel };
+        let task = if is_child { false } else { config.task };
         let mut context = json!({
             "run_id": run_id,
             "session_id": session_id,
             "platform": platform,
+            "input": input,
             "turn": 0,
             "retry_count": 0,
             "max_turns": config.max_turns,
@@ -2947,10 +4115,10 @@ impl AgentService {
                 "max_context_messages": config.max_context_messages,
                 "retained_tail": config.retained_tail,
                 "approval_mode": config.approval_mode.clone(),
-                "native_hard_deny": false,
+                "native_hard_deny": config.native_hard_deny,
                 "stream": config.stream,
-                "parallel": config.parallel,
-                "task": config.task,
+                "parallel": parallel,
+                "task": task,
                 "max_output_tokens": 1024,
                 "max_event_bytes": config.max_event_bytes,
                 "now_ms": timestamp(),
@@ -3096,6 +4264,33 @@ impl AgentService {
                     state = decision_state(&decision);
                 }
                 "approval.wait" => {
+                    // A natively-denied delegation NEVER parks: the typed
+                    // rejection is folded and the loop continues — no
+                    // durable approval row is created for a tool the native
+                    // policy denies (the park would otherwise wait for an
+                    // approval that can never execute).
+                    let pending_tool = decision["approval"]["tool_name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    if (pending_tool == "parallel.run" || pending_tool == "subagent.run")
+                        && let Some(rejection) = self.native_deny_rejection(&pending_tool)
+                    {
+                        let is_parallel = pending_tool == "parallel.run";
+                        phase = if is_parallel {
+                            "parallel.result"
+                        } else {
+                            "subagent.result"
+                        }
+                        .to_string();
+                        state = decision_state(&decision);
+                        if is_parallel {
+                            state["parallel_outcome"] = rejection;
+                        } else {
+                            state["subagent_outcome"] = rejection;
+                        }
+                        continue;
+                    }
                     match self
                         .park_for_approval(run_id, &base_json, &decision, deadline)
                         .await
@@ -3150,26 +4345,93 @@ impl AgentService {
                     }
                 }
                 "parallel.handoff" | "subagent.handoff" => {
-                    let code = if decision["kind"] == "parallel.handoff" {
-                        "parallel_execution_unavailable"
+                    let is_parallel = decision["kind"] == "parallel.handoff";
+                    let delegation_tool = if is_parallel {
+                        "parallel.run"
                     } else {
-                        "task_execution_unavailable"
+                        "subagent.run"
                     };
-                    let message = decision["message"]
-                        .as_str()
-                        .unwrap_or("parallel/subagent execution is not available")
+                    // The NATIVE deny policy is authoritative BEFORE any
+                    // child work: a natively-denied delegation folds the
+                    // typed rejection (approval_denied) and the loop
+                    // continues reasoning — no admission, no park, no
+                    // child, no subagent.started.
+                    if let Some(rejection) = self.native_deny_rejection(delegation_tool) {
+                        phase = if is_parallel {
+                            "parallel.result"
+                        } else {
+                            "subagent.result"
+                        }
                         .to_string();
-                    self.finish_failed(
-                        run_id,
-                        json!({
-                            "status": "failed",
-                            "error_code": code,
-                            "error_message": message,
-                            "blocked_reason": decision["blocked_reason"],
-                        }),
-                    )
-                    .await;
-                    return;
+                        state = decision_state(&decision);
+                        if is_parallel {
+                            state["parallel_outcome"] = rejection;
+                        } else {
+                            state["subagent_outcome"] = rejection;
+                        }
+                        continue;
+                    }
+                    // A6 native supervisor execution: a stop that landed
+                    // before the handoff is a typed cancellation (no child
+                    // work starts after a stop).
+                    if self.run_is_stopping(run_id) {
+                        self.finish_cancelled(run_id, handle_cancel_reason(&handle, "requested"))
+                            .await;
+                        return;
+                    }
+                    let executed = if is_parallel {
+                        self.execute_parallel_handoff(run_id, &decision, deadline)
+                            .await
+                    } else {
+                        self.execute_subagent_handoff(run_id, &decision, deadline)
+                            .await
+                    };
+                    phase = if is_parallel {
+                        "parallel.result"
+                    } else {
+                        "subagent.result"
+                    }
+                    .to_string();
+                    state = decision_state(&decision);
+                    match executed {
+                        HandoffExec::Outcome(outcome) => {
+                            // Backfill the ordered typed results / child
+                            // outcome into the loop state; the loop folds
+                            // them and continues reasoning.
+                            if is_parallel {
+                                state["parallel_outcome"] = outcome;
+                            } else {
+                                state["subagent_outcome"] = outcome;
+                            }
+                        }
+                        HandoffExec::Cancelled => {
+                            // A stop/cancel landed during the handoff
+                            // execution: the typed cancellation path wins
+                            // (children were cancelled by the propagated
+                            // supervision cancel).
+                            self.finish_cancelled(
+                                run_id,
+                                handle_cancel_reason(&handle, "requested"),
+                            )
+                            .await;
+                            return;
+                        }
+                        HandoffExec::Unavailable(message) => {
+                            // The native supervisor could not run (policy
+                            // programs unavailable): typed failure, never a
+                            // fabricated outcome.
+                            self.finish_failed(
+                                run_id,
+                                json!({
+                                    "status": "failed",
+                                    "error_code": "supervisor_unavailable",
+                                    "error_message": message,
+                                }),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
                 }
                 other => {
                     self.finish_failed(
@@ -3184,6 +4446,962 @@ impl AgentService {
                     return;
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // A6 native supervisor execution (real child runs through AgentService)
+    // -----------------------------------------------------------------------
+
+    /// Runs one RSS policy program (`parallel.rss` / `subagents.rss`) with
+    /// the real context on a blocking thread (VM execution must never occupy
+    /// a Tokio worker). Returns the typed decision map, or `None` when the
+    /// program cannot run.
+    async fn run_policy(runner: &AgentRunner, context: &JsonValue) -> Option<JsonValue> {
+        let runner = runner.clone();
+        let context = context.clone();
+        tokio::task::spawn_blocking(move || {
+            let value = runner.run_with_context(json_to_vm_value(&context)).ok()?;
+            Some(vm_value_to_json(&value))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Appends one native lifecycle event (`subagent.started` /
+    /// `subagent.completed`) to the parent run's durable event stream and
+    /// publishes it — the same durable-first critical section as script
+    /// event delivery. A failed durable append is retried with the bounded
+    /// retry (`terminal_persist_retries` immediate attempts with
+    /// `terminal_persist_retry_delay` backoff); only when storage stays
+    /// down past the bound does the typed [`NativeEventEmit::AppendFailed`]
+    /// reach the caller, which must fail the slot typed — never fold an
+    /// outcome whose canonical event is not durable. No duplicate can arise:
+    /// each failed attempt rolls the in-memory event back and the storage
+    /// worker either commits (returning Ok) or fails without committing; a
+    /// worker that dies mid-command fails every later attempt too, so the
+    /// retry path can never append the same event twice.
+    async fn emit_native_event(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        data: JsonValue,
+    ) -> NativeEventEmit {
+        let attempts = 1 + self.inner.config.terminal_persist_retries;
+        let event_id = Uuid::new_v4().to_string();
+        let mut last = NativeEventEmit::AppendFailed;
+        for attempt in 0..attempts {
+            last = self
+                .emit_native_event_once(run_id, event_id.as_str(), event_type, data.clone())
+                .await;
+            match last {
+                // A parent terminal is final (no post-terminal side
+                // effects): retrying cannot help and must not append after
+                // the terminal.
+                NativeEventEmit::Emitted | NativeEventEmit::ParentTerminal => return last,
+                NativeEventEmit::AppendFailed => {
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(self.inner.config.terminal_persist_retry_delay).await;
+                    }
+                }
+            }
+        }
+        last
+    }
+
+    /// One durable attempt of a native lifecycle event append, under the
+    /// store write lock: append in memory, commit through the typed
+    /// `event.append` transaction, publish only after the durable commit,
+    /// and roll the in-memory event back on failure.
+    async fn emit_native_event_once(
+        &self,
+        run_id: &str,
+        event_id: &str,
+        event_type: &str,
+        data: JsonValue,
+    ) -> NativeEventEmit {
+        let service = self.clone();
+        let run_id_for_block = run_id.to_string();
+        let event_id_for_block = event_id.to_string();
+        let event_type_for_block = event_type.to_string();
+        let data_for_block = data.clone();
+        let max_event_bytes = self.inner.config.max_event_bytes;
+        let max_events_per_run = self.inner.config.max_events_per_run;
+        tokio::task::spawn_blocking(move || {
+            let mut store = service.inner.store.write();
+            let Some(run) = store.runs.get_mut(&run_id_for_block) else {
+                return NativeEventEmit::ParentTerminal;
+            };
+            if is_terminal_status(run.status.as_str()) {
+                return NativeEventEmit::ParentTerminal;
+            }
+            let previous_events = run.events.clone();
+            let event = append_event_locked_with_id(
+                run,
+                event_id_for_block,
+                &event_type_for_block,
+                data_for_block,
+                max_event_bytes,
+                max_events_per_run,
+            );
+            let persistence = service.persistence_handle();
+            let durable = match persistence.as_ref() {
+                Some(persistence) => persistence
+                    .event_append(&json!({
+                        "run_id": run_id_for_block,
+                        "event_id": event.event_id,
+                        "event_type": event.event,
+                        "payload_json": serde_json::to_string(&event.data)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                        "now_ms": timestamp(),
+                        "max_events": max_events_per_run,
+                    }))
+                    .map(|_| ()),
+                None => Ok(()),
+            };
+            match durable {
+                Ok(()) => {
+                    if let Some(sender) = &run.sender {
+                        let _ = sender.send(event);
+                    }
+                    NativeEventEmit::Emitted
+                }
+                Err(_) => {
+                    run.events = previous_events;
+                    NativeEventEmit::AppendFailed
+                }
+            }
+        })
+        .await
+        .unwrap_or(NativeEventEmit::AppendFailed)
+    }
+
+    /// Durable parent/child link after a REAL child admission (the A2
+    /// `run.link_child` command through the RSS storage program) plus the
+    /// in-memory mirror for the live parent's policy context. A failed
+    /// durable link reports false — the slot fails typed (never a claim
+    /// that the link exists). The mirror is DEDUPLICATED by child id and
+    /// never regresses a terminal state back to active (matching the
+    /// durable UPSERT guard).
+    fn link_child_native(
+        &self,
+        parent_run_id: &str,
+        child_run_id: &str,
+        ordinal: i64,
+        relation: &str,
+    ) -> bool {
+        let durable_ok = match self.inner.persistence.as_ref() {
+            Some(persistence) => persistence
+                .link_child(&json!({
+                    "parent_run_id": parent_run_id,
+                    "child_run_id": child_run_id,
+                    "ordinal": ordinal,
+                    "relation": relation,
+                    "state": "active",
+                    "now_ms": timestamp(),
+                }))
+                .is_ok(),
+            None => true,
+        };
+        if durable_ok {
+            let mut store = self.inner.store.write();
+            let links = store
+                .child_links
+                .entry(parent_run_id.to_string())
+                .or_default();
+            match links
+                .iter_mut()
+                .find(|link| link.child_run_id == child_run_id)
+            {
+                // Re-linking an existing pair is idempotent in the mirror:
+                // pending/active advance to active, a terminal state is
+                // never moved back.
+                Some(existing) => {
+                    if existing.state == "pending" || existing.state == "active" {
+                        existing.state = "active".to_string();
+                    }
+                }
+                None => links.push(ChildLinkRecord {
+                    child_run_id: child_run_id.to_string(),
+                    ordinal,
+                    relation: relation.to_string(),
+                    state: "active".to_string(),
+                }),
+            }
+        }
+        durable_ok
+    }
+
+    /// The live in-memory child links of one parent (the durable rows are
+    /// authoritative for restart recovery; this mirror feeds the subagent
+    /// policy context during the parent's own execution). The mirror is the
+    /// AUTHORITATIVE live fanout count: it accumulates every child admitted
+    /// under the parent across ALL batches of the run, so cumulative
+    /// fanout can never be understated by a caller-declared count.
+    fn child_links_native(&self, parent_run_id: &str) -> Vec<ChildLinkRecord> {
+        self.inner
+            .store
+            .read()
+            .child_links
+            .get(parent_run_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Reserves `count` parent-global ordinals for a `(parent_run_id,
+    /// namespace)` pair and returns the base of the reserved range (A6
+    /// sparse-parallel fix).
+    ///
+    /// With durable storage the full range is reserved ATOMICALLY by the
+    /// storage program BEFORE any child of the batch starts, so refused or
+    /// cancelled-before-start slots — which consume an ordinal identity but
+    /// create no `child_run_links` row — still occupy durable high-water:
+    /// a later batch of the same run (or another gateway process, or a
+    /// restart) never reuses them. A durable allocation failure is a typed
+    /// error: the batch must fail rather than proceed with an ordinal space
+    /// that diverges from the durable source of truth. Without durable
+    /// storage the base is the MAX live mirror ordinal + 1 (never the sparse
+    /// link count) — the strongest invariant available offline.
+    async fn allocate_parent_ordinals(
+        &self,
+        parent_run_id: &str,
+        namespace: &str,
+        count: usize,
+    ) -> Result<i64, String> {
+        if let Some(persistence) = self.inner.persistence.clone() {
+            let parent = parent_run_id.to_string();
+            let ns = namespace.to_string();
+            let base = tokio::task::spawn_blocking(move || {
+                persistence.allocate_ordinals(&parent, &ns, count)
+            })
+            .await
+            .map_err(|error| format!("ordinal allocator task failed: {error}"))?
+            .map_err(|error| error.to_string())?;
+            return Ok(base);
+        }
+        let max_ordinal = self
+            .child_links_native(parent_run_id)
+            .iter()
+            .map(|link| link.ordinal)
+            .max()
+            .unwrap_or(-1);
+        Ok((max_ordinal + 1).max(0))
+    }
+
+    /// Non-blocking lookup of the run id recorded under an idempotency key
+    /// (the in-memory admission record), for the grace-drop compensation
+    /// watcher: returns `None` while the store lock is unavailable (a
+    /// writer — a stalled admission holding or awaiting the write lock — is
+    /// queued), so the watcher NEVER parks behind a stalled writer and can
+    /// always observe service shutdown between polls.
+    fn try_find_run_by_idempotency(&self, key: &str) -> Option<Option<String>> {
+        self.inner.store.try_read().map(|store| {
+            store
+                .idempotency
+                .get(key)
+                .map(|record| record.run_id.clone())
+        })
+    }
+
+    /// Advances one link's state to the child's observed terminal status —
+    /// DURABLY (the storage `run.link_state` command: the durable row
+    /// really progresses pending -> active -> terminal) AND in the
+    /// in-memory mirror. The mirror is updated only after the durable
+    /// command succeeded, so the live state never claims a terminal the
+    /// durable side does not carry.
+    ///
+    /// When the inline retry budget is exhausted writing a REAL child
+    /// terminal while the parent is still live, the advance is handed to the
+    /// capacity-bounded, lifecycle-managed `link_terminal_retry_loop` janitor
+    /// (deriving the terminal from the child's real observed durable state)
+    /// instead of silently leaving the durable link — and the mirror — at a
+    /// permanent non-terminal state. A child still `terminal_pending` is
+    /// NEVER written as a terminal link (the janitor reads the observed
+    /// status, which is `None` until a real durable terminal).
+    async fn update_child_link_state_native(
+        &self,
+        parent_run_id: &str,
+        child_run_id: &str,
+        state: &str,
+    ) {
+        let max_attempts = 1 + self.inner.config.terminal_persist_retries.max(2);
+        for attempt in 0..max_attempts {
+            if self
+                .write_link_state_durable(parent_run_id, child_run_id, state)
+                .await
+            {
+                self.update_link_mirror_link(parent_run_id, child_run_id, state);
+                return;
+            }
+            if attempt + 1 < max_attempts {
+                tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+            }
+        }
+        tracing::error!(
+            parent_run_id,
+            child_run_id,
+            state,
+            "child link state durable retry budget exhausted"
+        );
+        // P2 restart: an exhausted terminal advance must eventually converge
+        // in THIS process (not just at the next open). If the desired state is
+        // a real child terminal and the parent is still live, enqueue a
+        // bounded pending reconciliation retried by the janitor until storage
+        // recovers (the mirror stays non-terminal until the durable write
+        // really lands; a `terminal_pending` child is never prematurely
+        // advanced because the janitor derives the status from the child's
+        // observed durable terminal).
+        if is_terminal_link_status(state) && !self.parent_reached_real_terminal(parent_run_id) {
+            self.enqueue_pending_link_terminal(parent_run_id, child_run_id);
+        }
+    }
+
+    /// Durable `run.link_state` write. `true` when the durable row advanced
+    /// (or there is no durable store to advance); `false` on any storage
+    /// failure (including a fault-injected one and a terminal parent).
+    async fn write_link_state_durable(
+        &self,
+        parent_run_id: &str,
+        child_run_id: &str,
+        state: &str,
+    ) -> bool {
+        let Some(persistence) = self.inner.persistence.clone() else {
+            return true;
+        };
+        let parent = parent_run_id.to_string();
+        let child = child_run_id.to_string();
+        let state = state.to_string();
+        tokio::task::spawn_blocking(move || {
+            persistence
+                .link_state(&json!({
+                    "parent_run_id": parent,
+                    "child_run_id": child,
+                    "ordinal": 0,
+                    "relation": "",
+                    "state": state,
+                    "now_ms": timestamp(),
+                }))
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Advances one child link in the in-memory mirror (after the durable
+    /// write succeeded).
+    fn update_link_mirror_link(&self, parent_run_id: &str, child_run_id: &str, state: &str) {
+        let mut store = self.inner.store.write();
+        if let Some(links) = store.child_links.get_mut(parent_run_id) {
+            for link in links.iter_mut() {
+                if link.child_run_id == child_run_id {
+                    link.state = state.to_string();
+                }
+            }
+        }
+    }
+
+    /// True once the parent has reached a REAL durable terminal (mirror
+    /// status `completed`/`failed`/`cancelled`): the durable `run.link_state`
+    /// write can never succeed under a terminal parent (`parent_not_active`).
+    fn parent_reached_real_terminal(&self, parent_run_id: &str) -> bool {
+        let status = self
+            .inner
+            .store
+            .read()
+            .runs
+            .get(parent_run_id)
+            .map(|run| run.status.clone())
+            .unwrap_or_default();
+        matches!(status.as_str(), "completed" | "failed" | "cancelled")
+    }
+
+    /// The child's REAL (durable-authoritative) terminal status for the link
+    /// janitor: reads the child run's DURABLE row via `run.get` when durable
+    /// storage is present (so a child whose durable terminal committed — even
+    /// if the in-memory mirror has not caught up — advances the link), falling
+    /// back to the in-memory mirror only in in-memory-only mode. Never yields
+    /// while the child is still `pending`/`running`/`terminal_pending` (a
+    /// `terminal_pending` child stays `None`, so the janitor never writes a
+    /// premature terminal link).
+    async fn observed_link_terminal(&self, child_run_id: &str) -> Option<String> {
+        if let Some(persistence) = self.inner.persistence.clone() {
+            let child = child_run_id.to_string();
+            let durable_status = tokio::task::spawn_blocking(move || {
+                persistence
+                    .run_get(&child)
+                    .ok()
+                    .and_then(|data| data["rows"].as_array().cloned())
+                    .and_then(|rows| rows.first().cloned())
+                    .and_then(|row| row.get(3).cloned())
+                    .and_then(|status| status.as_str().map(str::to_string))
+            })
+            .await
+            .unwrap_or(None);
+            if let Some(status) = durable_status
+                && matches!(status.as_str(), "completed" | "failed" | "cancelled")
+            {
+                return Some(status);
+            }
+        }
+        observed_link_state(self, child_run_id)
+    }
+
+    /// Number of child links currently awaiting the link-terminal retry
+    /// janitor (live + bounded by [`MAX_PENDING_LINK_TERMINALS`]).
+    pub fn pending_link_terminal_count(&self) -> usize {
+        self.inner
+            .pending_link_terminal
+            .lock()
+            .expect("pending link terminal lock")
+            .len()
+    }
+
+    /// Records a child link whose durable terminal advance failed past the
+    /// inline budget for live reconciliation, and starts (at most one) janitor
+    /// task if none is running.
+    fn enqueue_pending_link_terminal(&self, parent_run_id: &str, child_run_id: &str) {
+        let mut pending = self
+            .inner
+            .pending_link_terminal
+            .lock()
+            .expect("pending link terminal lock");
+        if pending.len() >= MAX_PENDING_LINK_TERMINALS {
+            // Capacity-bound: a full set defers the remaining link to restart
+            // recovery, which reconciles `pending`/`active` links from the
+            // child's real terminal on the next open.
+            tracing::error!(
+                parent_run_id,
+                child_run_id,
+                "pending link terminal set at capacity; link terminal deferred to restart recovery"
+            );
+            return;
+        }
+        pending.insert((parent_run_id.to_string(), child_run_id.to_string()), ());
+        drop(pending);
+        if !self.inner.link_retry_running.swap(true, Ordering::AcqRel) {
+            let service = self.clone();
+            tokio::spawn(async move {
+                service.link_terminal_retry_loop().await;
+            });
+        }
+    }
+
+    /// The lifecycle-managed link-terminal retry janitor. Runs while there is
+    /// at least one pending entry and the service is not halting; it exits
+    /// (clearing the running flag) when the pending set empties so a later
+    /// enqueue starts a fresh task — at most ONE janitor ever runs. Each pass
+    /// derives the terminal from the child's REAL observed durable status and
+    /// writes DURABLY before updating the mirror. Entries whose parent reached
+    /// a real terminal are dropped (their durable write can never succeed and
+    /// restart recovery reconciles them).
+    async fn link_terminal_retry_loop(&self) {
+        loop {
+            let pending: Vec<(String, String)> = {
+                let map = self
+                    .inner
+                    .pending_link_terminal
+                    .lock()
+                    .expect("pending link terminal lock");
+                map.keys().cloned().collect()
+            };
+            if pending.is_empty() {
+                self.inner
+                    .link_retry_running
+                    .store(false, Ordering::Release);
+                return;
+            }
+            for (parent_run_id, child_run_id) in &pending {
+                if self.parent_reached_real_terminal(parent_run_id) {
+                    // The parent is terminal: this live process cannot
+                    // complete the link terminal (durable write rejects a
+                    // terminal parent); drop the entry and let restart
+                    // recovery reconcile it.
+                    self.inner
+                        .pending_link_terminal
+                        .lock()
+                        .expect("pending link terminal lock")
+                        .remove(&(parent_run_id.clone(), child_run_id.clone()));
+                    continue;
+                }
+                // Only advance once the child really carries a terminal —
+                // NEVER write a terminal the child does not yet hold (a
+                // `terminal_pending` child stays None and keeps waiting). The
+                // DURABLE child run row is authoritative; the in-memory mirror
+                // is only a fallback for in-memory-only mode.
+                let Some(observed) = self.observed_link_terminal(child_run_id).await else {
+                    continue;
+                };
+                if self
+                    .write_link_state_durable(parent_run_id, child_run_id, &observed)
+                    .await
+                {
+                    self.update_link_mirror_link(parent_run_id, child_run_id, &observed);
+                    self.inner
+                        .pending_link_terminal
+                        .lock()
+                        .expect("pending link terminal lock")
+                        .remove(&(parent_run_id.clone(), child_run_id.clone()));
+                }
+            }
+            if self.inner.halting.load(Ordering::Acquire) {
+                // Service shutdown: the remaining entries are repaired by
+                // restart recovery on the next open.
+                self.inner
+                    .link_retry_running
+                    .store(false, Ordering::Release);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn update_child_link_state_for_test(
+        &self,
+        parent_run_id: &str,
+        child_run_id: &str,
+        state: &str,
+    ) {
+        self.update_child_link_state_native(parent_run_id, child_run_id, state)
+            .await;
+    }
+
+    /// The parent status the subagent policy decides over: terminal statuses
+    /// pass through, an in-flight cancellation is "cancelling", anything
+    /// else is "active".
+    fn parent_policy_status(&self, run_id: &str) -> String {
+        let cancel_requested = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .is_some_and(|handle| handle.cancel.requested().is_some());
+        let status = self
+            .inner
+            .store
+            .read()
+            .runs
+            .get(run_id)
+            .map(|run| run.status.clone())
+            .unwrap_or_default();
+        match status.as_str() {
+            "completed" | "cancelled" | "failed" | "terminal_pending" => status,
+            _ if cancel_requested => "cancelling".to_string(),
+            _ => "active".to_string(),
+        }
+    }
+
+    /// Spawns the parent-cancellation watcher: while the parent's
+    /// `RunCancellation` is requested, the shared supervision cancel fires
+    /// and every in-flight child's executor propagates it to the child's own
+    /// cancellation. The watcher exits once `done` is set (the batch
+    /// finished) or the parent cancels, so no per-handoff task leaks.
+    fn spawn_parent_cancel_watcher(
+        &self,
+        run_id: &str,
+        supervisor_cancel: &SupervisorCancel,
+    ) -> (Arc<AtomicBool>, Option<tokio::task::JoinHandle<()>>) {
+        let done = Arc::new(AtomicBool::new(false));
+        let Some(parent_cancel) = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .map(|handle| handle.cancel.clone())
+        else {
+            return (done, None);
+        };
+        let watcher_cancel = supervisor_cancel.clone();
+        let watcher_done = Arc::clone(&done);
+        let watcher = tokio::spawn(async move {
+            loop {
+                if parent_cancel.requested().is_some() {
+                    watcher_cancel.request();
+                    return;
+                }
+                if watcher_done.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        (done, Some(watcher))
+    }
+
+    /// Executes a `parallel.handoff`: the parallel policy plans over the
+    /// REAL parent/child context (windows, ordered slots, supervision
+    /// mode), and the native supervisor drives N real child runs with
+    /// bounded concurrency, ordered result slots, race/fail-fast sibling
+    /// cancellation, parent-cancel propagation, and the remaining run
+    /// deadline as the batch bound. The ordered typed results (or the
+    /// policy's typed rejection — no child ever starts) become the
+    /// `parallel_outcome` the loop folds.
+    async fn execute_parallel_handoff(
+        &self,
+        run_id: &str,
+        decision: &JsonValue,
+        deadline: Instant,
+    ) -> HandoffExec {
+        if self.run_is_stopping(run_id) {
+            return HandoffExec::Cancelled;
+        }
+        let Some(policies) = self.inner.policies.clone() else {
+            return HandoffExec::Unavailable(
+                "the A6 parallel policy program is not available".to_string(),
+            );
+        };
+        // The parent-cancellation watcher is established BEFORE the policy
+        // VM runs: a stop that lands during the policy evaluation requests
+        // the shared supervision cancel, so no slot ever starts after it
+        // (the batch engine checks the cancel before each child admission).
+        let supervisor_cancel = SupervisorCancel::default();
+        let (watcher_done, _watcher) = self.spawn_parent_cancel_watcher(run_id, &supervisor_cancel);
+        // The cumulative fanout is the AUTHORITATIVE live child count under
+        // this parent (the mirror accumulates across ALL batches of the
+        // run), never the caller-declared `current_fanout`: multiple
+        // parallel batches in one run cannot bypass max_fanout.
+        let current_fanout = self.child_links_native(run_id).len() as i64;
+        let context = json!({
+            "parent_run_id": run_id,
+            "batch": decision["batch"].clone(),
+            "mode": decision["mode"].as_str().unwrap_or("all"),
+            "max_concurrency": decision["max_concurrency"].as_i64().unwrap_or(1),
+            "max_fanout": decision["max_fanout"].as_i64().unwrap_or(0),
+            "current_fanout": current_fanout,
+            "depth": decision["depth"].as_i64().unwrap_or(0),
+            "max_depth": decision["max_depth"].as_i64().unwrap_or(0),
+        });
+        let Some(plan) = Self::run_policy(&policies.parallel, &context).await else {
+            watcher_done.store(true, Ordering::Release);
+            return HandoffExec::Unavailable(
+                "the parallel policy could not be executed".to_string(),
+            );
+        };
+        if plan["kind"] != "parallel.plan" {
+            // The policy's typed rejection is folded back into the loop
+            // state; nothing was ever admitted or started.
+            watcher_done.store(true, Ordering::Release);
+            return HandoffExec::Outcome(json!({
+                "kind": "rejected",
+                "code": plan["code"].as_str().unwrap_or("rejected"),
+                "message": plan["message"].as_str().unwrap_or("the parallel batch was rejected"),
+            }));
+        }
+        let cancel_rule = plan["supervision"]["cancel_rule"]
+            .as_str()
+            .unwrap_or("none");
+        let mode = SupervisionMode::from_plan(Some(cancel_rule));
+        let max_concurrency = plan["supervision"]["max_concurrency"]
+            .as_i64()
+            .unwrap_or(1)
+            .max(1) as usize;
+        let batch = decision["batch"].as_array().cloned().unwrap_or_default();
+        let slots = plan["ordered_slots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if slots.is_empty() {
+            watcher_done.store(true, Ordering::Release);
+            return HandoffExec::Outcome(json!({
+                "kind": "executed",
+                "results": [],
+            }));
+        }
+        // Item 2 — parent-global batch identity: the per-batch slot index
+        // must NEVER be reused across multiple parallel batches of the same
+        // run as a child/slot/tool_call/idempotency identity.
+        //
+        // The parent-global ordinal base is NOT the live child-link COUNT
+        // (`links.len()`): consumed ordinals are SPARSE — a slot that is
+        // refused admission or cancelled before it starts still consumes its
+        // ordinal (as its slot / tool_call / idempotency identity) but
+        // creates NO `child_run_links` row, so the link count understates
+        // the ordinals actually consumed. The base therefore comes from the
+        // DURABLE parent-level ordinal allocator, which reserves this
+        // batch's full range (`slots.len()`) atomically before any child
+        // starts — the refused/cancelled slots' ordinals are durable
+        // high-water and a later batch (or another gateway process, or a
+        // restart) never reuses them. Without durable storage the base
+        // falls back to the MAX ordinals of every live mirror link + 1
+        // (never the count), the strongest invariant available offline.
+        let ordinal_base = match self
+            .allocate_parent_ordinals(run_id, "parallel", slots.len())
+            .await
+        {
+            Ok(base) => base,
+            Err(error) => {
+                watcher_done.store(true, Ordering::Release);
+                return HandoffExec::Unavailable(format!(
+                    "parallel ordinal allocation failed: {error}"
+                ));
+            }
+        };
+        let mut specs = Vec::new();
+        for slot in &slots {
+            let index = slot["index"].as_i64().unwrap_or(0).max(0) as usize;
+            let global_ordinal = (ordinal_base + index as i64).max(0) as usize;
+            let item = batch.get(index).cloned().unwrap_or(JsonValue::Null);
+            let proposed_id = item
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| stable_slot_id(run_id, "parallel", global_ordinal));
+            let input = item.get("input").cloned().unwrap_or(item);
+            specs.push(ChildSpec {
+                slot: global_ordinal,
+                child_run_id: proposed_id,
+                input,
+            });
+        }
+        let executor = ServiceChildExecutor::new(self.clone(), run_id, "parallel");
+        let (outcomes, _timed_out) = supervise_batch_bounded(
+            &executor,
+            &specs,
+            mode,
+            max_concurrency,
+            &supervisor_cancel,
+            deadline,
+            self.inner.config.cancellation_grace,
+        )
+        .await;
+        watcher_done.store(true, Ordering::Release);
+        let admitted = executor.admitted_slot_ids();
+        let results: Vec<JsonValue> = outcomes
+            .iter()
+            .enumerate()
+            .map(|(local_index, outcome)| {
+                // The result's identity uses the PARENT-GLOBAL ordinal (the
+                // ChildSpec slot), never the local batch index: a later batch
+                // never reuses a slot/tool_call/child identity.
+                let slot = specs[local_index].slot;
+                let real_id = admitted
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_else(|| specs[local_index].child_run_id.clone());
+                let slot_id = stable_slot_id(run_id, "parallel", slot);
+                let tool_call_id = stable_tool_call_id(run_id, "parallel", slot);
+                match outcome {
+                    ChildOutcome::Completed(output) => json!({
+                        "slot": slot,
+                        "slot_id": slot_id,
+                        "tool_call_id": tool_call_id,
+                        "child_run_id": real_id,
+                        "status": "completed",
+                        "output": output,
+                    }),
+                    ChildOutcome::Cancelled(reason) => json!({
+                        "slot": slot,
+                        "slot_id": slot_id,
+                        "tool_call_id": tool_call_id,
+                        "child_run_id": real_id,
+                        "status": "cancelled",
+                        "reason": reason,
+                    }),
+                    ChildOutcome::Failed(error) => json!({
+                        "slot": slot,
+                        "slot_id": slot_id,
+                        "tool_call_id": tool_call_id,
+                        "child_run_id": real_id,
+                        "status": "failed",
+                        "code": "child_run_failed",
+                        "error": error,
+                    }),
+                }
+            })
+            .collect();
+        HandoffExec::Outcome(json!({
+            "kind": "executed",
+            "results": results,
+        }))
+    }
+
+    /// Executes a `subagent.handoff`: the subagent policy decides admission
+    /// over the REAL parent state (parent link count, children, depth/fanout
+    /// budgets, parent status). An admission becomes a real child run
+    /// through AgentService (parent link, isolated session, worker actually
+    /// spawned before `subagent.started`), awaited to its durable terminal
+    /// (`subagent.completed`), and the typed child outcome is folded back.
+    /// A refused/rejected admission never starts anything; a parent
+    /// cancellation propagates to the listed children.
+    async fn execute_subagent_handoff(
+        &self,
+        run_id: &str,
+        decision: &JsonValue,
+        deadline: Instant,
+    ) -> HandoffExec {
+        if self.run_is_stopping(run_id) {
+            return HandoffExec::Cancelled;
+        }
+        let Some(policies) = self.inner.policies.clone() else {
+            return HandoffExec::Unavailable(
+                "the A6 subagent policy program is not available".to_string(),
+            );
+        };
+        // The parent-cancellation watcher is established BEFORE the policy
+        // VM runs (a stop during the policy evaluation must already be
+        // observed by the shared supervision cancel — no admission starts
+        // after a stop).
+        let supervisor_cancel = SupervisorCancel::default();
+        let (watcher_done, _watcher) = self.spawn_parent_cancel_watcher(run_id, &supervisor_cancel);
+        let links = self.child_links_native(run_id);
+        let children: Vec<JsonValue> = links
+            .iter()
+            .map(|link| json!({"child_run_id": link.child_run_id, "state": link.state}))
+            .collect();
+        let context = json!({
+            "parent_run_id": run_id,
+            "child": decision["child"].clone(),
+            "depth": decision["depth"].as_i64().unwrap_or(0),
+            "max_depth": decision["max_depth"].as_i64().unwrap_or(0),
+            "current_fanout": links.len() as i64,
+            "max_fanout": decision["max_fanout"].as_i64().unwrap_or(0),
+            "parent_status": self.parent_policy_status(run_id),
+            "children": children,
+        });
+        let Some(policy_decision) = Self::run_policy(&policies.subagent, &context).await else {
+            watcher_done.store(true, Ordering::Release);
+            return HandoffExec::Unavailable(
+                "the subagent policy could not be executed".to_string(),
+            );
+        };
+        match policy_decision["kind"].as_str() {
+            Some("subagent.rejected") => {
+                watcher_done.store(true, Ordering::Release);
+                HandoffExec::Outcome(json!({
+                    "kind": "rejected",
+                    "code": policy_decision["code"].as_str().unwrap_or("rejected"),
+                    "message": policy_decision["message"].as_str().unwrap_or("the child admission was rejected"),
+                }))
+            }
+            Some("subagent.cancel") => {
+                // Parent-cancellation propagation decided by the policy: the
+                // listed pending/active children are cancelled (terminal
+                // children are never listed).
+                if let Some(ids) = policy_decision["child_run_ids"].as_array() {
+                    for id in ids {
+                        if let Some(child_id) = id.as_str()
+                            && let Some(handle) = self.handle(child_id)
+                        {
+                            handle.cancel.request(CancellationReason::Requested);
+                        }
+                    }
+                }
+                watcher_done.store(true, Ordering::Release);
+                HandoffExec::Outcome(json!({
+                    "kind": "cancelled",
+                    "child_run_ids": policy_decision["child_run_ids"].clone(),
+                    "reason": policy_decision["reason"].as_str().unwrap_or("parent_cancelled"),
+                }))
+            }
+            Some("subagent.admit") => {
+                let ordinal = policy_decision["ordinal"]
+                    .as_i64()
+                    .unwrap_or(links.len() as i64);
+                let proposed_id = policy_decision["child_run_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| stable_slot_id(run_id, "subagent", ordinal.max(0) as usize));
+                let child = decision["child"].clone();
+                let input = child.get("input").cloned().unwrap_or(child);
+                let spec = ChildSpec {
+                    slot: ordinal.max(0) as usize,
+                    child_run_id: proposed_id,
+                    input,
+                };
+                let executor = ServiceChildExecutor::new(self.clone(), run_id, "subagent");
+                let (outcomes, _timed_out) = supervise_batch_bounded(
+                    &executor,
+                    std::slice::from_ref(&spec),
+                    SupervisionMode::All,
+                    1,
+                    &supervisor_cancel,
+                    deadline,
+                    self.inner.config.cancellation_grace,
+                )
+                .await;
+                watcher_done.store(true, Ordering::Release);
+                let admitted = executor.admitted_slot_ids();
+                let slot = ordinal.max(0) as usize;
+                let real_id = admitted
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_else(|| spec.child_run_id.clone());
+                let child_session_id = executor
+                    .admitted_sessions()
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_default();
+                let slot_id = stable_slot_id(run_id, "subagent", slot);
+                let tool_call_id = stable_tool_call_id(run_id, "subagent", slot);
+                let outcome = match outcomes
+                    .into_iter()
+                    .next()
+                    .unwrap_or(ChildOutcome::Cancelled("batch_terminated".to_string()))
+                {
+                    ChildOutcome::Completed(output) => json!({
+                        "kind": "executed",
+                        "slot_id": slot_id,
+                        "tool_call_id": tool_call_id,
+                        "child_run_id": real_id,
+                        "session_id": child_session_id,
+                        "status": "completed",
+                        "output": output,
+                    }),
+                    ChildOutcome::Cancelled(reason) => json!({
+                        "kind": "executed",
+                        "slot_id": slot_id,
+                        "tool_call_id": tool_call_id,
+                        "child_run_id": real_id,
+                        "session_id": child_session_id,
+                        "status": "cancelled",
+                        "reason": reason,
+                    }),
+                    ChildOutcome::Failed(error) => json!({
+                        "kind": "executed",
+                        "slot_id": slot_id,
+                        "tool_call_id": tool_call_id,
+                        "child_run_id": real_id,
+                        "session_id": child_session_id,
+                        "status": "failed",
+                        "code": "child_run_failed",
+                        "error": error,
+                    }),
+                };
+                HandoffExec::Outcome(outcome)
+            }
+            _ => {
+                watcher_done.store(true, Ordering::Release);
+                HandoffExec::Unavailable(
+                    "the subagent policy returned an unrecognized decision".to_string(),
+                )
+            }
+        }
+    }
+
+    /// The typed rejection outcome for a natively-denied delegation, or
+    /// `None` when the native policy allows it. `ApprovalBridge::decide` is
+    /// the native authority: a `Denied { native: true }` cannot be relaxed
+    /// by any RSS approval mode. The RSS approval policy only ever saw the
+    /// config bool; the bridge's tool/risk deny policy is consulted HERE at
+    /// the native execution boundary (delegation is risk class `execute`).
+    fn native_deny_rejection(&self, tool_name: &str) -> Option<JsonValue> {
+        if self
+            .inner
+            .native_deny
+            .denies_all(tool_name, RiskClass::Execute)
+        {
+            Some(json!({
+                "kind": "rejected",
+                "code": "approval_denied",
+                "message": format!("native policy denies {} ({})", tool_name, RiskClass::Execute.as_str()),
+            }))
+        } else {
+            None
         }
     }
 
@@ -3210,6 +5428,39 @@ impl AgentService {
             .runs
             .get(run_id)
             .is_some_and(|run| run.status == "stopping")
+    }
+
+    /// Selects the durable resolver for an abandoned approval. An explicit
+    /// gateway cancellation reason wins over the generic cancellation token:
+    /// the latter is also used for deadline cancellation and must not be
+    /// mislabeled as a gateway stop.
+    fn approval_cancel_resolver(&self, run_id: &str) -> &'static str {
+        let has_gateway_reason = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .get(run_id)
+            .is_some_and(|handle| {
+                handle
+                    .cancel_reason
+                    .lock()
+                    .expect("cancel reason lock")
+                    .is_some()
+            });
+        if has_gateway_reason
+            || self
+                .inner
+                .store
+                .read()
+                .runs
+                .get(run_id)
+                .is_some_and(|run| run.status == "stopping")
+        {
+            "gateway-stop"
+        } else {
+            "deadline-compensation"
+        }
     }
 
     /// One loop invocation with its own bounded delivery path (events are
@@ -3390,6 +5641,23 @@ impl AgentService {
     /// (or during the storage round trip) cancels the park instead: no
     /// pending approval row is created after a stop, and the run can never be
     /// wedged by a park racing a stop.
+    #[doc(hidden)]
+    pub async fn park_for_approval_for_test(
+        &self,
+        run_id: &str,
+        decision: &JsonValue,
+        deadline: Instant,
+    ) -> &'static str {
+        match self
+            .park_for_approval(run_id, &JsonValue::Null, decision, deadline)
+            .await
+        {
+            ParkOutcome::Parked => "parked",
+            ParkOutcome::Cancelled => "cancelled",
+            ParkOutcome::Failed => "failed",
+        }
+    }
+
     async fn park_for_approval(
         &self,
         run_id: &str,
@@ -3529,19 +5797,26 @@ impl AgentService {
                 return ParkOutcome::Cancelled;
             }
         };
-        // B: re-check after the blocking storage round trip — a stop that
-        // landed meanwhile must not see a new park.
-        if self.run_is_stopping(run_id) {
+        // The request succeeded, so every exit from this point owns exactly
+        // one compensation. Deadline and stop are checked together after the
+        // blocking round trip; either race must cancel the durable row before
+        // returning without a park.
+        if self.run_is_stopping(run_id)
+            || deadline.saturating_duration_since(Instant::now()).is_zero()
+        {
+            let _ = self.cancel_abandoned_approval(run_id, &approval_id).await;
             return ParkOutcome::Cancelled;
         }
         if !self
             .transition_run(run_id, "running", "waiting_approval")
             .await
         {
-            if self.run_is_stopping(run_id) {
-                return ParkOutcome::Cancelled;
-            }
-            return ParkOutcome::Failed;
+            let _ = self.cancel_abandoned_approval(run_id, &approval_id).await;
+            return if self.run_is_stopping(run_id) {
+                ParkOutcome::Cancelled
+            } else {
+                ParkOutcome::Failed
+            };
         }
         // The park is inserted BEFORE the notification event: the run is
         // observable as parked the moment the durable transition lands, so a
@@ -3577,6 +5852,7 @@ impl AgentService {
             let _ = self
                 .transition_run(run_id, "waiting_approval", "running")
                 .await;
+            let _ = self.cancel_abandoned_approval(run_id, &approval_id).await;
             return ParkOutcome::Cancelled;
         }
         // H: the approval.required event is emitted HERE with the real
@@ -3606,19 +5882,30 @@ impl AgentService {
                 .lock()
                 .expect("parked lock")
                 .remove(run_id);
-            if self.run_is_stopping(run_id) {
-                // The append was rejected because a stop landed: cancel typed
-                // (the durable status is still waiting_approval; move it back
-                // to running so the typed terminal can commit).
-                let _ = self
-                    .transition_run(run_id, "waiting_approval", "running")
-                    .await;
-                return ParkOutcome::Cancelled;
-            }
+            let stopping = self.run_is_stopping(run_id);
             let _ = self
                 .transition_run(run_id, "waiting_approval", "running")
                 .await;
-            return ParkOutcome::Failed;
+            let _ = self.cancel_abandoned_approval(run_id, &approval_id).await;
+            return if stopping {
+                ParkOutcome::Cancelled
+            } else {
+                ParkOutcome::Failed
+            };
+        }
+        if self.run_is_stopping(run_id)
+            || deadline.saturating_duration_since(Instant::now()).is_zero()
+        {
+            self.inner
+                .parked
+                .lock()
+                .expect("parked lock")
+                .remove(run_id);
+            let _ = self
+                .transition_run(run_id, "waiting_approval", "running")
+                .await;
+            let _ = self.cancel_abandoned_approval(run_id, &approval_id).await;
+            return ParkOutcome::Cancelled;
         }
         tracing::info!(run_id, "run parked on a pending approval");
         ParkOutcome::Parked
@@ -3640,27 +5927,69 @@ impl AgentService {
         let Some(bridge) = self.inner.approval.clone() else {
             return Ok(());
         };
-        let run_id_for_block = run_id.to_string();
-        let approval_id_for_block = approval_id.to_string();
-        let resolver = "deadline-compensation".to_string();
-        tokio::task::spawn_blocking(move || {
-            let now = timestamp() as i64;
-            match bridge.cancel(&approval_id_for_block, &resolver, now) {
-                Ok(affected) => {
-                    if affected > 0 {
-                        tracing::info!(
-                            run_id = %run_id_for_block,
-                            approval_id = %approval_id_for_block,
-                            "abandoned approval durably cancelled after the run deadline"
-                        );
+        let cell = {
+            let mut cancellations = self
+                .inner
+                .approval_cancellations
+                .lock()
+                .expect("approval cancellation lock");
+            cancellations
+                .entry(approval_id.to_string())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let run_id = run_id.to_string();
+        let approval_id = approval_id.to_string();
+        // The key is cloned for the completion-removal below (the closure
+        // consumes its own copy).
+        let completion_key = approval_id.clone();
+        let result = cell
+            .get_or_init(|| async move {
+                let run_id_for_block = run_id;
+                let approval_id_for_block = approval_id;
+                // A cancellation racing the park can enter this shared
+                // once-cell from either the gateway stop path or the
+                // deadline/failed-request compensation path. Resolve the
+                // reason from the live run state at the point the
+                // cancellation is committed so a stop is never recorded as
+                // deadline compensation merely because the callers raced.
+                let service_for_reason = self.clone();
+                let resolver = service_for_reason.approval_cancel_resolver(&run_id_for_block);
+                tokio::task::spawn_blocking(move || {
+                    let now = timestamp() as i64;
+                    match bridge.cancel(&approval_id_for_block, resolver, now) {
+                        Ok(affected) => {
+                            if affected > 0 {
+                                tracing::info!(
+                                    run_id = %run_id_for_block,
+                                    approval_id = %approval_id_for_block,
+                                    "abandoned approval durably cancelled"
+                                );
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(format!("approval.cancel failed: {error}")),
                     }
-                    Ok(())
-                }
-                Err(error) => Err(format!("approval.cancel failed: {error}")),
-            }
-        })
-        .await
-        .map_err(|error| format!("approval cancel worker failed: {error}"))?
+                })
+                .await
+                .map_err(|error| format!("approval cancel worker failed: {error}"))?
+            })
+            .await;
+        // The once-cell de-duplicates concurrent stop/deadline compensation
+        // races. Once the attempt completes, the entry is REMOVED so (a) a
+        // FAILED cancellation is NOT permanently cached — the next retry (the
+        // janitor sweep, a re-entered stop path) genuinely re-attempts the
+        // durable cancel instead of re-reading the stale error — and (b) the
+        // map stays bounded by in-flight cancellations, never leaking one
+        // entry per abandoned approval forever. Removing an entry while a
+        // concurrent caller still holds the cloned cell is safe: the caller
+        // observes this attempt's result, and a later caller starts fresh.
+        self.inner
+            .approval_cancellations
+            .lock()
+            .expect("approval cancellation lock")
+            .remove(&completion_key);
+        result.clone()
     }
 
     /// Durably appends the typed `run.truncated` marker (reason + drain
@@ -3682,12 +6011,10 @@ impl AgentService {
             let Some(run) = store.runs.get_mut(&run_id_for_block) else {
                 return Err("the run is gone".to_string());
             };
-            if matches!(
-                run.status.as_str(),
-                "completed" | "failed" | "cancelled" | "terminal_pending" | "stopping"
-            ) {
+            if is_terminal_status(run.status.as_str()) || run.status == "stopping" {
                 return Err("the run already reached a terminal or is stopping".to_string());
             }
+            let previous_events = run.events.clone();
             let event = append_event_locked(
                 run,
                 "run.truncated",
@@ -3716,8 +6043,7 @@ impl AgentService {
                     Ok(())
                 }
                 Err(error) => {
-                    run.events
-                        .retain(|existing| existing.event_id != event.event_id);
+                    run.events = previous_events;
                     Err(format!("run.truncated event append failed: {error}"))
                 }
             }
@@ -3751,16 +6077,14 @@ impl AgentService {
             let Some(run) = store.runs.get_mut(&run_id_for_block) else {
                 return Err("the run is gone".to_string());
             };
-            if matches!(
-                run.status.as_str(),
-                "completed" | "failed" | "cancelled" | "terminal_pending" | "stopping"
-            ) {
+            if is_terminal_status(run.status.as_str()) || run.status == "stopping" {
                 // P2-4: a stop that landed before this closure ran (the
                 // park-insert re-check is the primary guard; this status
                 // check closes the last microsecond of the race) must never
                 // see a post-stop approval.required event.
                 return Err("the run already reached a terminal or is stopping".to_string());
             }
+            let previous_events = run.events.clone();
             let event = append_event_locked(
                 run,
                 "approval.required",
@@ -3795,8 +6119,7 @@ impl AgentService {
                     Ok(())
                 }
                 Err(error) => {
-                    run.events
-                        .retain(|existing| existing.event_id != event.event_id);
+                    run.events = previous_events;
                     Err(format!("approval.required event append failed: {error}"))
                 }
             }
@@ -4197,6 +6520,26 @@ impl AgentService {
         resolver: &str,
         reason: &str,
     ) -> Result<ApprovalResolveOutcome, ApprovalResolveError> {
+        // A run that is not parked must report NoPendingApproval regardless of
+        // program availability (the 404/409 contract). Peek first.
+        let pending_absent = self
+            .inner
+            .parked
+            .lock()
+            .expect("parked lock")
+            .get(run_id)
+            .is_none();
+        if pending_absent {
+            return Err(ApprovalResolveError::NoPendingApproval);
+        }
+        // Program availability is checked BEFORE the park is consumed. A
+        // resolution must never eat the park (and leave the run durably
+        // `running` with no worker) merely because the resume program is
+        // missing; the park is restored so a later resume stays reachable.
+        let program = match self.inner.agent_program.clone() {
+            Some(program) => program,
+            None => return Err(ApprovalResolveError::ProgramUnavailable),
+        };
         let parked = self
             .inner
             .parked
@@ -4265,12 +6608,26 @@ impl AgentService {
                 }
             }
         };
-        if !self.transition_run_blocking(run_id, "waiting_approval", "running") {
-            // The run may have moved (a stop or a concurrent terminal): only
-            // restore the park while the run is still an active, un-cancelled
-            // candidate — otherwise the run is on its way to a terminal and
-            // re-parking would wedge it. The restored park CARRIES the
-            // durable outcome so a retry resumes with the same decision.
+        // The run must transition durably back to `running` before the
+        // resume. An AMBIGUOUS failure of that transition — a park that has
+        // ALREADY recorded a durable resolution (a prior attempt resolved the
+        // bridge, then lost) whose durable status is already `running` — is a
+        // resolved resume: recover from the durable current state instead of
+        // repeatedly re-trying `waiting_approval -> running` and never drop
+        // the park while the run is actually running. A fresh attempt with no
+        // recorded resolution and an externally-moved `running` status stays
+        // a typed error (legacy exact semantics): only the ambiguous-retry
+        // path recovers.
+        let transitioned = self.transition_run_blocking(run_id, "waiting_approval", "running")
+            || (parked.resolution.is_some()
+                && self.durable_run_status(run_id).as_deref() == Some("running"));
+        if !transitioned {
+            // The run may have moved to a terminal (a stop or a concurrent
+            // terminal): only restore the park while the run is still an
+            // active, un-cancelled candidate — otherwise the run is on its
+            // way to a terminal and re-parking would wedge it. The restored
+            // park CARRIES the durable outcome so a retry resumes with the
+            // same decision.
             let mut restored = parked.clone();
             restored.resolution = Some(ParkedResolution {
                 resolved,
@@ -4296,10 +6653,6 @@ impl AgentService {
             .get(&run_id)
             .map(|run| run.session_id.clone())
             .unwrap_or_default();
-        let program = match service.inner.agent_program.clone() {
-            Some(program) => program,
-            None => return Err(ApprovalResolveError::ProgramUnavailable),
-        };
         let base_context = json_to_vm_value(&parked.base_context);
         let deadline = parked.deadline;
         // The typed outcome is computed BEFORE the resume spawn (the spawn
@@ -4387,6 +6740,19 @@ impl AgentService {
             }))
             .map(|value| run_transition_matched(&value))
             .unwrap_or(false)
+    }
+
+    /// Reads the DURABLE current status of one run (`run.get`), so an
+    /// ambiguous lifecycle transition can be recovered from the authoritative
+    /// on-disk state instead of the command's ambiguous success indicator.
+    /// `None` when there is no durable store (in-memory mode) or the read
+    /// fails (the caller then conservatively treats the transition as not
+    /// having landed).
+    fn durable_run_status(&self, run_id: &str) -> Option<String> {
+        let persistence = self.inner.persistence.as_ref()?;
+        let value = persistence.run_get(run_id).ok()?;
+        let row = value.get("rows")?.as_array()?.first()?.as_array()?;
+        row.get(3).and_then(JsonValue::as_str).map(str::to_string)
     }
 
     /// Expires every parked approval whose durable row has passed its
@@ -5348,4 +7714,222 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             service.expire_parked_approvals();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::store::RunView;
+
+    #[test]
+    fn canonical_child_input_preserves_json_shapes() {
+        assert_eq!(
+            canonical_input_value(r#"{"opaque":{"n":7}}"#),
+            json!({"opaque":{"n":7}})
+        );
+        assert_eq!(canonical_input_value(r#"[1,{"n":7}]"#), json!([1,{"n":7}]));
+        assert_eq!(
+            canonical_input_value("plain user text"),
+            json!("plain user text")
+        );
+    }
+
+    #[test]
+    fn missing_child_slot_ids_are_stable_and_non_empty() {
+        let first = stable_slot_id("parent", "parallel", 3);
+        let second = stable_slot_id("parent", "parallel", 3);
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+        assert!(!stable_tool_call_id("parent", "parallel", 3).is_empty());
+    }
+
+    /// Item 2 — parallel multi-batch identity: distinct parent-global slot
+    /// ordinals (base + batch index) must never collide across batches of
+    /// the same run, so child/slot/tool_call/idempotency identities are
+    /// never reused.
+    #[test]
+    fn parallel_slot_identities_are_distinct_across_batches() {
+        let parent = "run-1";
+        // Batch 1 (base 0): slots 0..1. Batch 2 (base 2): slots 2..3.
+        let mut seen = std::collections::HashSet::new();
+        for base in [0_i64, 2_i64] {
+            for index in 0..2_usize {
+                let ordinal = (base + index as i64) as usize;
+                let slot_id = stable_slot_id(parent, "parallel", ordinal);
+                let tool_call_id = stable_tool_call_id(parent, "parallel", ordinal);
+                assert!(
+                    seen.insert(slot_id.clone()),
+                    "slot id must never be reused across batches: {slot_id}"
+                );
+                assert!(
+                    seen.insert(tool_call_id.clone()),
+                    "tool_call id must never be reused across batches: {tool_call_id}"
+                );
+            }
+        }
+        // The parent-global ordering is monotonic within and across batches.
+        assert_ne!(
+            stable_slot_id(parent, "parallel", 1),
+            stable_slot_id(parent, "parallel", 2),
+            "global ordinal must be distinct across the batch boundary"
+        );
+    }
+
+    /// Item 4 — compensation link ordering: the observed link state for a
+    /// child still `terminal_pending` (durable terminal not yet committed)
+    /// must be None, so the compensation watcher keeps waiting instead of
+    /// writing a terminal link before the child's durable terminal.
+    fn observed_link_state_for_mirror(mirror: &GatewayStore, child_run_id: &str) -> Option<String> {
+        let status = mirror
+            .runs
+            .get(child_run_id)
+            .map(|run| run.status.clone())
+            .unwrap_or_default();
+        match status.as_str() {
+            "completed" | "failed" | "cancelled" => Some(status),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn observed_link_state_is_none_until_real_durable_terminal() {
+        let mut store = GatewayStore::default();
+        store.runs.insert(
+            "child".to_string(),
+            RunRecord {
+                run_id: "child".to_string(),
+                session_id: "s".to_string(),
+                parent_run_id: None,
+                request_overrides: JsonValue::Object(Default::default()),
+                platform: "test".to_string(),
+                input: JsonValue::Null,
+                status: "terminal_pending".to_string(),
+                events: Vec::new(),
+                sender: None,
+                cancel_requested: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        assert_eq!(
+            observed_link_state_for_mirror(&store, "child"),
+            None,
+            "terminal_pending must never advance the link to a terminal"
+        );
+        store.runs.get_mut("child").expect("child").status = "completed".to_string();
+        assert_eq!(
+            observed_link_state_for_mirror(&store, "child"),
+            Some("completed".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_retry_rollback_restores_events_removed_by_retention() {
+        let mut store = GatewayStore::default();
+        store.runs.insert(
+            "run-1".to_string(),
+            RunRecord {
+                run_id: "run-1".to_string(),
+                session_id: "session-1".to_string(),
+                parent_run_id: None,
+                request_overrides: JsonValue::Object(Default::default()),
+                platform: "test".to_string(),
+                input: JsonValue::Null,
+                status: "terminal_pending".to_string(),
+                events: vec![GatewayEvent {
+                    event_id: "old-event".to_string(),
+                    seq: 1,
+                    event: "model.delta".to_string(),
+                    run_id: "run-1".to_string(),
+                    timestamp: 1,
+                    data: json!({"text":"old"}),
+                }],
+                sender: None,
+                cancel_requested: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let pending = PendingTerminal {
+            to_status: "completed".to_string(),
+            session_id: None,
+            events: vec![GatewayEvent {
+                event_id: "terminal-event".to_string(),
+                seq: 2,
+                event: "run.completed".to_string(),
+                run_id: "run-1".to_string(),
+                timestamp: 2,
+                data: json!({"status":"completed"}),
+            }],
+            assistant_message: None,
+            deadline: Instant::now() + Duration::from_secs(1),
+            expired_fallback: false,
+            kind: PendingTerminalKind::RunTerminal,
+        };
+
+        // A failed append can prune the old event before the durable command
+        // reports an error. Rollback must restore the exact retained snapshot,
+        // not merely truncate the new tail by length.
+        let previous_events = store.runs["run-1"].events.clone();
+        store.runs.get_mut("run-1").expect("run").events = pending.events.clone();
+        rollback_pending_retry(
+            &mut store,
+            "run-1",
+            &pending,
+            "terminal_pending".to_string(),
+            previous_events,
+            None,
+        );
+        let events = &store.runs["run-1"].events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "old-event");
+    }
+
+    #[test]
+    fn terminal_retry_expired_is_canonical_failed_with_typed_reason() {
+        // A terminal-retry-expired run is canonically `failed` (mirror and
+        // durable), with the typed reason carried by the terminal event's
+        // `error_code` — never a second `terminal_retry_expired` status that
+        // would fork memory from the durable `failed` row.
+        let run = RunRecord {
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            parent_run_id: None,
+            request_overrides: JsonValue::Object(Default::default()),
+            platform: "test".to_string(),
+            input: JsonValue::Null,
+            status: "failed".to_string(),
+            events: vec![GatewayEvent {
+                event_id: "terminal-expired:run-1".to_string(),
+                seq: 1,
+                event: "run.failed".to_string(),
+                run_id: "run-1".to_string(),
+                timestamp: 42,
+                data: json!({
+                    "status": "failed",
+                    "error_code": "terminal_retry_expired",
+                    "error_message": "durable terminal retry window expired",
+                }),
+            }],
+            sender: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+        };
+        let view = RunView::from_mirror(&run);
+        assert_eq!(
+            view.status, "failed",
+            "canonical mirror terminal must be failed"
+        );
+        assert_eq!(
+            view.error_code, "terminal_retry_expired",
+            "the typed retry-expired reason must survive in the terminal event"
+        );
+        assert_eq!(view.finished_at, 42);
+        assert_eq!(
+            observed_link_state_for_mirror(
+                &GatewayStore {
+                    runs: std::collections::HashMap::from([("run-1".to_string(), run.clone())]),
+                    ..GatewayStore::default()
+                },
+                "run-1",
+            ),
+            Some("failed".to_string()),
+            "the canonical failed terminal advances the child link to failed"
+        );
+    }
 }

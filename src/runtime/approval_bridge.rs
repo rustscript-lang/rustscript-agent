@@ -88,6 +88,7 @@ pub struct PendingApproval {
 pub struct NativeDenyPolicy {
     deny_tools: BTreeSet<String>,
     deny_risk: BTreeSet<RiskClass>,
+    hard_deny: bool,
 }
 
 impl NativeDenyPolicy {
@@ -105,12 +106,24 @@ impl NativeDenyPolicy {
         self
     }
 
+    /// Denies every tool/risk pair. This flag is intentionally part of the
+    /// standalone policy so hard deny remains effective when no durable
+    /// `ApprovalBridge` exists.
+    pub fn hard_deny(mut self) -> Self {
+        self.hard_deny = true;
+        self
+    }
+
     pub fn denies_tool(&self, tool: &str) -> bool {
         self.deny_tools.contains(tool)
     }
 
     pub fn denies_risk(&self, risk: RiskClass) -> bool {
         self.deny_risk.contains(&risk)
+    }
+
+    pub fn denies_all(&self, tool: &str, risk: RiskClass) -> bool {
+        self.hard_deny || self.denies_tool(tool) || self.denies_risk(risk)
     }
 }
 
@@ -217,7 +230,7 @@ impl ApprovalBridge {
     /// per-mode action. `rss_action` is the string action the approval policy
     /// produced; the native deny overrides it for any denied tool/risk.
     pub fn decide(&self, tool_name: &str, risk: RiskClass, rss_action: &str) -> ApprovalDecision {
-        let native_denied = self.deny.denies_tool(tool_name) || self.deny.denies_risk(risk);
+        let native_denied = self.deny.denies_all(tool_name, risk);
         if native_denied {
             return ApprovalDecision::Denied {
                 native: true,

@@ -79,6 +79,15 @@ pub fn storage_approval_get(db_id: int, approval_id: string, max_rows: int, max_
     )
 }
 
+pub fn storage_approval_list_run(db_id: int, run_id: string, max_rows: int, max_bytes: int) -> map {
+    sqlite::query(
+        db_id,
+        "SELECT id, run_id, session_id, state, resolver, decision_reason, resolved_at_ms FROM approvals WHERE run_id = ? ORDER BY requested_at_ms ASC, id ASC LIMIT ?",
+        [&run_id, (max_rows)],
+        approvals_query_limits(max_rows, max_bytes)
+    )
+}
+
 pub fn storage_approval_resolve(db_id: int, payload_json: string) -> map {
     let input: ApprovalResolveInput = json::decode::<ApprovalResolveInput>(payload_json);
     assert(input.state.copy() == "approved" || input.state.copy() == "denied");

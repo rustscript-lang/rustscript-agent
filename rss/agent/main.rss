@@ -33,10 +33,22 @@
 //                        continues with the provider call; on failure the
 //                        full history is retained and the run continues
 //                        (recoverable)
-//   parallel.handoff / subagent.handoff -> typed, executable:false; the
-//                        serial loop never invents parallel/subagent
-//                        outcomes (A6 native supervision needs the A7
-//                        run-admission interface)
+//   parallel.handoff / subagent.handoff -> typed, executable:false, after
+//                        the A4 delegation gate approves (approval_mode
+//                        auto/manual require a durable approval for the
+//                        execute-class delegation); the handoff carries the
+//                        verified plan request (batch / child descriptor +
+//                        supervision budgets) and the serial loop never
+//                        invents parallel/subagent outcomes — the native
+//                        supervisor executes and backfills
+//                        parallel_outcome / subagent_outcome
+//   parallel.result     -> the native supervisor executed the verified
+//                        plan; the loop folds the ordered typed slot results
+//                        (or a typed rejection) and continues reasoning
+//   subagent.result     -> the native supervisor really admitted and
+//                        awaited one child run; the loop folds the typed
+//                        child outcome (or the typed rejection) and
+//                        continues reasoning
 //   rejected          -> typed unknown-phase/state failure
 //
 // Every decision that must continue carries the full loop state (messages,
@@ -55,7 +67,8 @@
 // Context (flat, typed; missing fields fall back to documented defaults):
 //
 //   run_id, session_id: string
-//   phase: "start" | "approval.resume" | "compact.result"
+//   phase: "start" | "approval.resume" | "compact.result" |
+//          "parallel.result" | "subagent.result"
 //   turn: int            completed model rounds so far (0 initially)
 //   retry_count: int     retries consumed on the current turn
 //   max_turns: int       turns allowed before the run terminates (bounded)
@@ -260,22 +273,178 @@ fn rejected_decision(code: string, message: string, turn: int) -> map {
     { kind: "rejected", code: code, message: message, turn: turn }
 }
 
-/// A6 handoff: when parallel/task execution is requested, the serial loop
-/// does not execute it and never invents a parallel/subagent outcome — it
-/// defers with a typed, non-executable handoff decision (the A6 native
-/// supervisor needs the A7 run-admission interface to drive real child
-/// runs).
-fn handoff_decision(phase: string, capability: string, parent_run_id: string, turn: int, message: string) -> map {
+/// A6 handoff: when parallel/task delegation is approved by the A4 gate,
+/// the serial loop does not execute children itself and never invents a
+/// parallel/subagent outcome — it defers with a typed, non-executable
+/// handoff decision carrying the verified plan request (the batch / child
+/// descriptor and the supervision budgets). The native supervisor executes
+/// the plan and backfills the ordered typed results / child outcomes into
+/// the loop state (`parallel_outcome` / `subagent_outcome`), which the
+/// `parallel.result` / `subagent.result` phases fold and continue from.
+fn handoff_decision(
+    phase: string,
+    capability: string,
+    parent_run_id: string,
+    turn: int,
+    message: string,
+    batch: array,
+    mode: string,
+    max_concurrency: int,
+    max_fanout: int,
+    current_fanout: int,
+    depth: int,
+    max_depth: int,
+    child: map
+) -> map {
     {
         kind: phase,
         capability: capability,
         parent_run_id: parent_run_id,
         turn: turn,
         message: message,
+        batch: batch,
+        mode: mode,
+        max_concurrency: max_concurrency,
+        max_fanout: max_fanout,
+        current_fanout: current_fanout,
+        depth: depth,
+        max_depth: max_depth,
+        child: child,
         executable: false,
         blocked_reason: "the serial loop defers parallel/subagent execution to the dedicated native supervisor; it cannot itself advertise a parallel or subagent result",
         events: []
     }
+}
+
+/// The synthetic delegation call id for the approval gate.
+fn delegation_call_id(name: string) -> string {
+    let mut id: string = "delegation:";
+    if name == "subagent.run" {
+        id = "subagent:child";
+    } else {
+        id = "parallel:batch";
+    }
+    id
+}
+
+/// The A6 delegation gate: parallel (`parallel.run`) and task
+/// (`subagent.run`) delegation is a model-facing action with the native
+/// risk class "execute", so it passes through the A4 approval policy like
+/// any other tool: approve -> the typed handoff; deny -> a typed
+/// `approval_denied` tool result is folded and the loop continues reasoning;
+/// pending -> the durable `approval.wait` (the SERVICE parks and resumes
+/// exactly once, never a fabricated execution). An unrecognized policy
+/// action is a typed failure.
+fn delegation_gate(context: map, name: string, turn: int, messages: array, last_text: string) -> map {
+    let config: map = ctx_map(context, "config");
+    let decision_result: map = approval_run({
+        op: "decide",
+        tool_name: name,
+        risk_class: "execute",
+        approval_mode: ctx_string(config, "approval_mode", "auto"),
+        native_hard_deny: ctx_bool(config, "native_hard_deny", false)
+    });
+    let mut decision: map = run_failed_decision(
+        turn,
+        "non_retryable",
+        types::error_request("approval_policy_unavailable", name)
+    );
+    if ctx_bool(decision_result, "ok", false) == true {
+        let action: string = approval_action(decision_result);
+        let input: map = ctx_map(context, "input");
+        if action == "approve" {
+            decision = delegation_handoff(context, name, turn, input);
+        } else if action == "deny" {
+            decision = delegation_denied(context, turn, messages, name, "approval policy denied " + name, "denied", last_text);
+        } else if action == "pending" {
+            let call: map = {
+                id: delegation_call_id(name),
+                name: name,
+                arguments: { delegation: name }
+            };
+            decision = approval_wait_decision(call, "execute", [call], 0, messages, turn, last_text, config);
+        } else {
+            decision = run_failed_decision(
+                turn,
+                "non_retryable",
+                types::error_request(
+                    "invalid_approval_action",
+                    "the approval policy returned an unrecognized action: " + action
+                )
+            );
+        }
+    }
+    decision
+}
+
+/// The typed handoff for an approved delegation: the parallel handoff
+/// carries the batch (`input.tasks`) and the supervision parameters
+/// (`mode`, `max_concurrency`, `max_fanout`, `current_fanout`, `depth`,
+/// `max_depth`); the subagent handoff carries the child descriptor
+/// (`input.child`) and the depth/fanout budgets. The native supervisor
+/// plans over these exact fields.
+fn delegation_handoff(context: map, name: string, turn: int, input: map) -> map {
+    let run_id: string = ctx_string(context, "run_id", "");
+    if name == "parallel.run" => {
+        handoff_decision(
+            "parallel.handoff",
+            "parallel.plan",
+            run_id,
+            turn,
+            "parallel orchestration requested; the serial loop defers to the A6 parallel policy (parallel.rss)",
+            ctx_array(input, "tasks"),
+            ctx_string(input, "mode", "all"),
+            ctx_int(input, "max_concurrency", 1),
+            ctx_int(input, "max_fanout", 0),
+            ctx_int(input, "current_fanout", 0),
+            ctx_int(input, "depth", 0),
+            ctx_int(input, "max_depth", 0),
+            {}
+        )
+    } else => {
+        handoff_decision(
+            "subagent.handoff",
+            "subagent.admit",
+            run_id,
+            turn,
+            "task delegation requested; the serial loop defers to the A6 subagent policy (subagents.rss)",
+            [],
+            "all",
+            1,
+            ctx_int(input, "max_fanout", 0),
+            ctx_int(input, "current_fanout", 0),
+            ctx_int(input, "depth", 0),
+            ctx_int(input, "max_depth", 0),
+            ctx_map(input, "child")
+        )
+    }
+}
+
+/// A denied/expired delegation folds a typed `is_error` tool result (the
+/// same `approval_denied` / `approval_expired` codes as any denied tool) and
+/// the loop continues reasoning — no handoff, no child, no fabricated
+/// outcome. The carried config records the delegation as COMPLETED
+/// (`delegation_done`), so a later phase "start" re-entry (a provider
+/// retry) never re-runs the gate and never folds a SECOND denial pair.
+fn delegation_denied(context: map, turn: int, messages: array, name: string, reason: string, outcome: string, last_text: string) -> map {
+    let call: map = {
+        id: delegation_call_id(name),
+        name: name,
+        arguments: { delegation: name }
+    };
+    // The delegation is input-driven: the model never emitted this call, so
+    // the typed denial folds as a full matching pair (the synthesized
+    // assistant tool_call precedes the tool result). Without the pair the
+    // continuation round would carry a dangling tool result that real
+    // provider contracts reject.
+    let call_id: string = delegation_call_id(name);
+    let mut paired: array = messages;
+    paired = append_delegation_call(paired, call_id, name);
+    let mut next_context: map = context;
+    let mut next_config: map = ctx_map(context, "config");
+    next_config["delegation_done"] = true;
+    next_context["config"] = next_config;
+    tool_dispatch(next_context, turn, paired, [call], 0, call, false, reason, outcome, last_text)
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1167,9 @@ fn continue_next_turn(context: map, turn: int, messages: array, last_text: strin
 /// `is_error` tool result when denied/expired — the typed `outcome`
 /// discriminator (`approved` | `denied` | `expired`) selects the
 /// `approval_denied` / `approval_expired` code; the cycle then continues.
+/// A delegation gate call (`parallel.run` / `subagent.run`) resumes into
+/// the typed handoff when approved, or folds the typed denial/expiry when
+/// not — the gate never fabricates a delegation outcome.
 fn approval_resume_phase(context: map) -> map {
     let approval: map = ctx_map(context, "approval");
     let tool_calls: array = ctx_array(context, "tool_calls");
@@ -1019,9 +1191,18 @@ fn approval_resume_phase(context: map) -> map {
         turn: turn
     });
     let call: map = loop_array_entry(tool_calls, index);
+    let call_name: string = types::request_string(call, "name");
     let mut decision: map = rejected_decision("approval_mismatch", "resume tool call does not match the pending approval", turn);
     if types::request_string(call, "id") == call_id {
-        decision = tool_dispatch(context, turn, messages, tool_calls, index, call, resolved, reason, outcome, last_text);
+        if call_name == "parallel.run" || call_name == "subagent.run" {
+            if resolved == true {
+                decision = delegation_handoff(context, call_name, turn, ctx_map(context, "input"));
+            } else {
+                decision = delegation_denied(context, turn, messages, call_name, reason, outcome, last_text);
+            }
+        } else {
+            decision = tool_dispatch(context, turn, messages, tool_calls, index, call, resolved, reason, outcome, last_text);
+        }
     }
     decision
 }
@@ -1137,6 +1318,150 @@ fn compact_trim(messages: array, plan: map) -> array {
 }
 
 // ---------------------------------------------------------------------------
+// A6 result phases (native supervisor backfill)
+// ---------------------------------------------------------------------------
+
+/// One canonical tool message folding a typed child outcome / slot result:
+/// a completed child folds its output text, anything else folds a typed
+/// `{code, message}` error payload. The tool_call_id is the REAL child run
+/// id, so the durable message-level tool_call_id mirrors the child link.
+///
+/// Delegation is INPUT-driven: the model never emitted a tool call for the
+/// executed delegation, so the folded result is preceded by a synthesized
+/// assistant `tool_call` part with the SAME id (a full matching pair).
+/// Real provider contracts (OpenAI Chat/Responses, Anthropic Messages)
+/// reject a tool result that does not follow a matching assistant tool
+/// call, so the pair is REQUIRED for the continuation round to be legal.
+fn append_child_result(messages: array, entry: map, delegation_name: string) -> array {
+    let child_run_id: string = ctx_string(entry, "child_run_id", "");
+    let status: string = ctx_string(entry, "status", "failed");
+    let mut updated: array = messages;
+    let content: string = if status == "completed" => {
+        ctx_string(entry, "output", "")
+    } else => {
+        tool_result_content({
+            code: ctx_string(entry, "code", status),
+            message: ctx_string(entry, "error", ctx_string(entry, "reason", ""))
+        }, true)
+    };
+    updated = append_delegation_call(updated, child_run_id, delegation_name);
+    updated[updated.length] = {
+        ordinal: next_ordinal(updated),
+        role: "tool",
+        tool_call_id: child_run_id,
+        content: [{
+            type: "tool_result",
+            tool_call_id: child_run_id,
+            content: content,
+            is_error: status != "completed"
+        }]
+    };
+    updated
+}
+
+/// One canonical tool message folding a typed delegation rejection (no
+/// child ever started): the typed `{code, message}` payload as an is_error
+/// tool result, preceded by the synthesized assistant `tool_call` pair for
+/// the same id (input-driven delegation — see `append_child_result`).
+fn append_rejected_result(messages: array, prefix: string, delegation_name: string, outcome: map) -> array {
+    let call_id: string = prefix + ":rejected";
+    let content: string = tool_result_content({
+        code: ctx_string(outcome, "code", "rejected"),
+        message: ctx_string(outcome, "message", "the delegation was rejected")
+    }, true);
+    let mut updated: array = messages;
+    updated = append_delegation_call(updated, call_id, delegation_name);
+    updated[updated.length] = {
+        ordinal: next_ordinal(updated),
+        role: "tool",
+        tool_call_id: call_id,
+        content: [{
+            type: "tool_result",
+            tool_call_id: call_id,
+            content: content,
+            is_error: true
+        }]
+    };
+    updated
+}
+
+/// The synthesized assistant message carrying ONE `tool_call` part for an
+/// input-driven delegation result: the model never emitted this call, so
+/// the loop adds the matching pair itself (the tool result that follows
+/// must reference an assistant tool call on every provider wire).
+fn append_delegation_call(messages: array, call_id: string, name: string) -> array {
+    let mut updated: array = messages;
+    updated[updated.length] = {
+        ordinal: next_ordinal(updated),
+        role: "assistant",
+        content: [{
+            type: "tool_call",
+            tool_call_id: call_id,
+            name: name,
+            arguments_json: "{}"
+        }]
+    };
+    updated
+}
+
+/// Phase "parallel.result": the native supervisor executed the verified
+/// plan. The loop folds the ordered typed results (one canonical tool
+/// message per slot, in submission order) or a typed rejection, and
+/// continues reasoning with the results in history. The carried config
+/// records the delegation as COMPLETED (`delegation_done`), so a later
+/// phase "start" re-entry (a provider retry) never re-runs the gate and
+/// never re-executes children — the folded result pair stays exact-once.
+fn parallel_result_phase(context: map) -> map {
+    let outcome: map = ctx_map(context, "parallel_outcome");
+    let kind: string = ctx_string(outcome, "kind", "rejected");
+    let messages: array = ctx_array(context, "messages");
+    let turn: int = ctx_int(context, "turn", 0);
+    let last_text: string = ctx_string(context, "last_text", "");
+    let mut updated: array = messages;
+    if kind == "executed" {
+        let results: array = ctx_array(outcome, "results");
+        let mut index = 0;
+        while index < results.length {
+            updated = append_child_result(updated, loop_array_entry(results, index), "parallel.run");
+            index += 1;
+        }
+    } else {
+        updated = append_rejected_result(updated, "parallel", "parallel.run", outcome);
+    }
+    let mut next_context: map = context;
+    let mut next_config: map = ctx_map(context, "config");
+    next_config["delegation_done"] = true;
+    next_context["config"] = next_config;
+    continue_next_turn(next_context, turn, updated, last_text)
+}
+
+/// Phase "subagent.result": the native supervisor really admitted and
+/// awaited one child run. The loop folds the typed child outcome (or a
+/// typed rejection when the policy refused the admission) and continues
+/// reasoning. The carried config records the delegation as COMPLETED
+/// (`delegation_done`), so a later phase "start" re-entry (a provider
+/// retry) never re-runs the gate and never re-executes the child — the
+/// folded result pair stays exact-once.
+fn subagent_result_phase(context: map) -> map {
+    let outcome: map = ctx_map(context, "subagent_outcome");
+    let kind: string = ctx_string(outcome, "kind", "rejected");
+    let messages: array = ctx_array(context, "messages");
+    let turn: int = ctx_int(context, "turn", 0);
+    let last_text: string = ctx_string(context, "last_text", "");
+    let mut updated: array = messages;
+    if kind == "executed" {
+        updated = append_child_result(updated, outcome, "subagent.run");
+    } else {
+        updated = append_rejected_result(updated, "subagent", "subagent.run", outcome);
+    }
+    let mut next_context: map = context;
+    let mut next_config: map = ctx_map(context, "config");
+    next_config["delegation_done"] = true;
+    next_context["config"] = next_config;
+    continue_next_turn(next_context, turn, updated, last_text)
+}
+
+// ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
 //
@@ -1154,32 +1479,36 @@ pub fn agent_run(context: map) -> map {
     let phase: string = ctx_string(context, "phase", "start");
     let run_id: string = ctx_string(context, "run_id", "");
     let turn: int = ctx_int(context, "turn", 0);
-    let config: map = ctx_map(context, "config");
-    let parallel: bool = ctx_bool(config, "parallel", false);
-    let task: bool = ctx_bool(config, "task", false);
     let mut decision: map = rejected_decision("unknown_phase", "run phase is not recognized by the serial loop", turn);
-    if parallel == true {
-        decision = handoff_decision(
-            "parallel.handoff",
-            "parallel.plan",
-            run_id,
-            turn,
-            "parallel orchestration requested; the serial loop defers to the A6 parallel policy (parallel.rss)"
-        );
-    } else if task == true {
-        decision = handoff_decision(
-            "subagent.handoff",
-            "subagent.admit",
-            run_id,
-            turn,
-            "task delegation requested; the serial loop defers to the A6 subagent policy (subagents.rss)"
-        );
-    } else if phase == "start" {
-        decision = start_phase(context);
+    if phase == "start" {
+        // The delegation gates (parallel.run / subagent.run) run the A4
+        // approval policy; only an approved delegation yields the typed
+        // handoff. The gate runs ONCE per run: once the delegation was
+        // consumed (the result phases / the denial fold record
+        // `config.delegation_done`), a phase "start" re-entry — a
+        // retryable provider error — goes DIRECTLY to the provider phase
+        // and never re-enters the gate (no re-executed children, no
+        // duplicated result pair). The result phases never re-enter the
+        // gates either.
+        let config: map = ctx_map(context, "config");
+        let parallel: bool = ctx_bool(config, "parallel", false);
+        let task: bool = ctx_bool(config, "task", false);
+        let delegation_done: bool = ctx_bool(config, "delegation_done", false);
+        if delegation_done == false && parallel == true {
+            decision = delegation_gate(context, "parallel.run", turn, ctx_array(context, "messages"), ctx_string(context, "last_text", ""));
+        } else if delegation_done == false && task == true {
+            decision = delegation_gate(context, "subagent.run", turn, ctx_array(context, "messages"), ctx_string(context, "last_text", ""));
+        } else {
+            decision = start_phase(context);
+        }
     } else if phase == "approval.resume" {
         decision = approval_resume_phase(context);
     } else if phase == "compact.result" {
         decision = compact_result_phase(context);
+    } else if phase == "parallel.result" {
+        decision = parallel_result_phase(context);
+    } else if phase == "subagent.result" {
+        decision = subagent_result_phase(context);
     }
     decision
 }

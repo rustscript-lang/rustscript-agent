@@ -1297,6 +1297,13 @@ async fn create_run_handler(
                 "parent run not found",
             );
         }
+        Err(AdmitError::ParentNotActive) => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "parent_run_not_active",
+                "parent run is terminal or stopping; no child can be admitted",
+            );
+        }
         Err(AdmitError::SessionNotFound) => {
             return json_error(
                 StatusCode::NOT_FOUND,

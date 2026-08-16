@@ -584,7 +584,7 @@ fn production_storage_commands_return_sqlite_results_and_preserve_idempotency() 
 
     let migration = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
     assert_eq!(migration["ok"], json!(true));
-    assert_eq!(result_data(&migration)["schema_version"], json!(5));
+    assert_eq!(result_data(&migration)["schema_version"], json!(6));
 
     let session_create = run_storage(
         &runner,
@@ -1227,6 +1227,84 @@ fn duplicate_event_sequence_replays_exactly_once_or_conflicts_typed() {
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
 
+/// A2 lifecycle criterion: retrying one event identity with the same
+/// externally visible payload is idempotent and leaves no duplicate state.
+#[test]
+fn duplicate_event_sequence_is_rejected_and_leaves_no_partial_state() {
+    let root = temporary_root("duplicate-event");
+    let runner = storage_runner(&root);
+    let db_name = "duplicate.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-1",
+        "run.create",
+        run_payload("run-1", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-transition-1",
+        "run.transition",
+        transition_payload("run-1", "queued", "running", 4),
+        4,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "event-append-1",
+        "event.append",
+        event_payload("run-1", "event-1", "model.delta", 5, 128),
+        5,
+    );
+
+    // Same event_id again: the durable append is an idempotent success.
+    let duplicate = run_storage_result(
+        &runner,
+        db_name,
+        "event-append-dup",
+        "event.append",
+        event_payload("run-1", "event-1", "model.delta", 6, 128),
+        6,
+    );
+    assert!(
+        duplicate.is_ok(),
+        "same event_id and payload must be idempotent: {duplicate:?}"
+    );
+
+    // No partial state: exactly two events (transition + first append), and
+    // the retention high-water did not advance.
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-1",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        7,
+    );
+    let replay_rows = query_rows(&replay);
+    assert_eq!(replay_rows.len(), 2);
+    assert_eq!(replay_rows[1]["seq"], json!(2));
+    assert_eq!(replay["high_water_seq"], json!(2));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
 /// A2 exact-once ownership: the SAME event_id used against a DIFFERENT run is
 /// a typed ownership conflict, never a silent cross-run replay.
 #[test]
@@ -1279,8 +1357,107 @@ fn duplicate_event_id_across_runs_is_typed_ownership_conflict() {
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
 
-/// A2 concurrency criterion: two connections claiming the same idempotency
-/// key with the same request hash acquire exactly once.
+/// A6 terminal retry criterion: an ambiguous response after the transaction
+/// commits can be retried with the exact same event/message identities. The
+/// second attempt must return the existing durable terminal, with no duplicate
+/// events or assistant messages.
+#[test]
+fn terminal_commit_reuses_event_and_message_ids_idempotently() {
+    let root = temporary_root("terminal-idempotency");
+    let runner = storage_runner(&root);
+    let db_name = "terminal.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-1",
+        "run.create",
+        run_payload("run-1", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-running-1",
+        "run.transition",
+        transition_payload("run-1", "queued", "running", 4),
+        4,
+    );
+    let terminal_payload = json!({
+        "run_id": "run-1",
+        "to_status": "completed",
+        "error_code": "",
+        "error_message": "",
+        "event_1_id": "terminal-event-1",
+        "event_1_type": "run.completed",
+        "event_1_payload": "{\"status\":\"completed\"}",
+        "event_2_id": "",
+        "event_2_type": "",
+        "event_2_payload": "{}",
+        "event_count": 1,
+        "message_id": "terminal-message-1",
+        "message_session_id": "session-1",
+        "message_role": "assistant",
+        "message_content_json": "{\"text\":\"done\"}",
+        "message_run_id": "run-1",
+        "message_finish_reason": "stop",
+        "now_ms": 5,
+    });
+    let first = run_storage(
+        &runner,
+        db_name,
+        "terminal-first",
+        "run.terminal",
+        terminal_payload.clone(),
+        5,
+    );
+    assert_eq!(first["ok"], json!(true), "{first}");
+
+    let second = run_storage_result(
+        &runner,
+        db_name,
+        "terminal-retry",
+        "run.terminal",
+        terminal_payload,
+        6,
+    )
+    .expect("same terminal identity must be an idempotent success");
+    assert_eq!(second["ok"], json!(true), "{second}");
+
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "terminal-replay",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        7,
+    );
+    assert_eq!(query_rows(&replay).len(), 2, "status + terminal event only");
+    let messages = run_storage(
+        &runner,
+        db_name,
+        "terminal-messages",
+        "message.list",
+        json!({"session_id":"session-1", "after_ordinal":0}),
+        8,
+    );
+    assert_eq!(query_rows(&messages).len(), 1, "one assistant message only");
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
 #[test]
 fn concurrent_idempotency_claims_acquire_exactly_once() {
     let root = temporary_root("concurrent-idempotency");
@@ -1605,9 +1782,9 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     let runner = storage_runner(&root);
 
     let first = run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
-    assert_eq!(result_data(&first)["schema_version"], json!(5));
+    assert_eq!(result_data(&first)["schema_version"], json!(6));
     let second = run_storage(&runner, db_name, "migrate-2", "migrate", json!({}), 2);
-    assert_eq!(result_data(&second)["schema_version"], json!(5));
+    assert_eq!(result_data(&second)["schema_version"], json!(6));
 
     // A released v1 database upgrades to v3 without re-running v1. The
     // crafter builds a real v1 schema by executing the production schema
@@ -1629,7 +1806,7 @@ fn migrations_are_transactional_idempotent_and_upgrade_from_released_versions() 
     );
     run_raw_sql(&old_row_crafter, v1_db);
     let upgraded = run_storage(&runner, v1_db, "migrate-upgrade", "migrate", json!({}), 3);
-    assert_eq!(result_data(&upgraded)["schema_version"], json!(5));
+    assert_eq!(result_data(&upgraded)["schema_version"], json!(6));
     let run_created = run_storage(
         &runner,
         v1_db,
@@ -2227,6 +2404,271 @@ fn link_child_is_idempotent() {
         1,
         "exactly one link row survives"
     );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// A6 review contract: the `run.link_child` UPSERT must NEVER regress a
+/// terminal link back to `active`. Re-linking an existing pair advances
+/// pending/active rows (idempotent), but a terminal row (`completed` /
+/// `cancelled` / `failed`) stays terminal — a re-executed handoff can never
+/// flip a completed child's link back to active.
+#[test]
+fn link_child_never_regresses_a_terminal_link_to_active() {
+    let root = temporary_root("link-no-regress");
+    let runner = storage_runner(&root);
+    let db_name = "links-no-regress.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-parent",
+        "run.create",
+        run_payload("parent-1", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-child",
+        "run.create",
+        run_payload("child-1", "session-1", 4),
+        4,
+    );
+    // The native link step advances pending -> active (row created).
+    run_storage(
+        &runner,
+        db_name,
+        "link-1",
+        "run.link_child",
+        json!({
+            "parent_run_id": "parent-1",
+            "child_run_id": "child-1",
+            "ordinal": 0,
+            "relation": "subagent",
+            "state": "active",
+            "now_ms": 5,
+        }),
+        5,
+    );
+    // The child's observed terminal advances the link to completed.
+    run_storage(
+        &runner,
+        db_name,
+        "link-state-1",
+        "run.link_state",
+        json!({
+            "parent_run_id": "parent-1",
+            "child_run_id": "child-1",
+            "ordinal": 0,
+            "relation": "",
+            "state": "completed",
+            "now_ms": 6,
+        }),
+        6,
+    );
+    // A re-executed handoff re-links the SAME pair with state "active": the
+    // UPSERT must be a typed no-op for a terminal row — never a
+    // terminal -> active regression.
+    let relink = run_storage(
+        &runner,
+        db_name,
+        "relink-1",
+        "run.link_child",
+        json!({
+            "parent_run_id": "parent-1",
+            "child_run_id": "child-1",
+            "ordinal": 0,
+            "relation": "subagent",
+            "state": "active",
+            "now_ms": 7,
+        }),
+        7,
+    );
+    assert_eq!(
+        relink["ok"],
+        json!(true),
+        "re-linking stays a typed success"
+    );
+    let children = run_storage(
+        &runner,
+        db_name,
+        "list-children-1",
+        "run.list_children",
+        json!({"run_id": "parent-1"}),
+        8,
+    );
+    let rows = query_rows(&children);
+    assert_eq!(rows.len(), 1, "exactly one link row survives");
+    assert_eq!(
+        rows[0]["state"],
+        json!("completed"),
+        "a terminal link is never regressed to active"
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// A6 review contract: the durable link state REALLY advances. The
+/// admission transaction inserts the link as `pending`; `run.link_child`
+/// advances it to the input state (`active`); `run.link_state` advances it
+/// to the child's observed terminal (`completed`) with a typed rows_affected
+/// transition. No dead `pending` row survives a completed child.
+#[test]
+fn link_state_advances_pending_through_active_to_terminal() {
+    let root = temporary_root("link-state-advance");
+    let runner = storage_runner(&root);
+    let db_name = "links-advance.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-create-parent",
+        "run.create",
+        run_payload("parent-1", "session-1", 3),
+        3,
+    );
+    // The ADMISSION path (parent_run_id set) creates the link row as
+    // 'pending' inside the admission transaction.
+    run_storage(
+        &runner,
+        db_name,
+        "admission-create-child",
+        "admission.create",
+        json!({
+            "session_id": "session-1",
+            "session_new": 0,
+            "profile": "gateway",
+            "platform": "agent:child",
+            "account_id": "session-1",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "child-1",
+            "parent_run_id": "parent-1",
+            "input_json": "{}",
+            "message_id": "msg-1",
+            "message_run_id": "child-1",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "evt-1",
+            "now_ms": 4,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }),
+        4,
+    );
+    let admission_link = run_storage(
+        &runner,
+        db_name,
+        "list-children-pending",
+        "run.list_children",
+        json!({"run_id": "parent-1"}),
+        5,
+    );
+    let pending_rows = query_rows(&admission_link);
+    assert_eq!(pending_rows.len(), 1);
+    assert_eq!(
+        pending_rows[0]["state"],
+        json!("pending"),
+        "the admission transaction inserts the link as pending"
+    );
+    // The native link step advances pending -> active.
+    run_storage(
+        &runner,
+        db_name,
+        "link-child-active",
+        "run.link_child",
+        json!({
+            "parent_run_id": "parent-1",
+            "child_run_id": "child-1",
+            "ordinal": 0,
+            "relation": "subagent",
+            "state": "active",
+            "now_ms": 6,
+        }),
+        6,
+    );
+    let active_link = run_storage(
+        &runner,
+        db_name,
+        "list-children-active",
+        "run.list_children",
+        json!({"run_id": "parent-1"}),
+        7,
+    );
+    assert_eq!(
+        query_rows(&active_link)[0]["state"],
+        json!("active"),
+        "run.link_child advances the durable state to active"
+    );
+    // The terminal advance: run.link_state -> completed.
+    let terminal = run_storage(
+        &runner,
+        db_name,
+        "link-state-completed",
+        "run.link_state",
+        json!({
+            "parent_run_id": "parent-1",
+            "child_run_id": "child-1",
+            "ordinal": 0,
+            "relation": "",
+            "state": "completed",
+            "now_ms": 8,
+        }),
+        8,
+    );
+    assert_eq!(terminal["ok"], json!(true));
+    assert_eq!(terminal["rows_affected"], json!(1), "one typed transition");
+    let terminal_link = run_storage(
+        &runner,
+        db_name,
+        "list-children-terminal",
+        "run.list_children",
+        json!({"run_id": "parent-1"}),
+        9,
+    );
+    assert_eq!(
+        query_rows(&terminal_link)[0]["state"],
+        json!("completed"),
+        "the durable link state reaches the child's observed terminal"
+    );
+    // Re-applying the same terminal state is a typed no-op (0 rows).
+    let noop = run_storage(
+        &runner,
+        db_name,
+        "link-state-noop",
+        "run.link_state",
+        json!({
+            "parent_run_id": "parent-1",
+            "child_run_id": "child-1",
+            "ordinal": 0,
+            "relation": "",
+            "state": "completed",
+            "now_ms": 10,
+        }),
+        10,
+    );
+    assert_eq!(noop["rows_affected"], json!(0), "already terminal: no-op");
 
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
@@ -3824,5 +4266,260 @@ fn runs_prune_terminal_reclaims_only_old_terminal_runs() {
         "only the old terminal run was already reclaimed"
     );
 
+    fs::remove_dir_all(root).expect("temporary root should be removed");
+}
+
+#[test]
+fn event_append_fixed_id_is_idempotent_and_payload_checked() {
+    let root = temporary_root("event-append-idempotency");
+    let runner = storage_runner(&root);
+    let db_name = "event-append-idempotency.db";
+    run_storage(&runner, db_name, "migrate", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run",
+        "run.create",
+        run_payload("run-1", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "run-start",
+        "run.transition",
+        transition_payload("run-1", "queued", "running", 4),
+        4,
+    );
+    let event = json!({
+        "run_id": "run-1",
+        "event_id": "fixed-event-id",
+        "event_type": "subagent.started",
+        "payload_json": "{\"child_run_id\":\"child-1\"}",
+        "now_ms": 5,
+        "max_events": 128,
+    });
+    let first = run_storage(
+        &runner,
+        db_name,
+        "event-1",
+        "event.append",
+        event.clone(),
+        5,
+    );
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "first append should commit: {first}"
+    );
+    let second = run_storage(&runner, db_name, "event-2", "event.append", event, 6);
+    assert_eq!(
+        second["ok"],
+        json!(true),
+        "retrying the same event id and payload must be an idempotent success: {second}"
+    );
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay",
+        "event.replay",
+        json!({"run_id":"run-1","after_seq":0,"max_events":128,"max_bytes":65536}),
+        7,
+    );
+    let rows = replay["data"]["rows"]
+        .as_array()
+        .expect("replay rows should be returned");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.get(2) == Some(&json!("fixed-event-id")))
+            .count(),
+        1,
+        "a fixed event id must appear exactly once after an ambiguous retry"
+    );
+    let conflict = run_storage(
+        &runner,
+        db_name,
+        "event-conflict",
+        "event.append",
+        json!({
+            "run_id": "run-1",
+            "event_id": "fixed-event-id",
+            "event_type": "subagent.completed",
+            "payload_json": "{\"child_run_id\":\"child-1\"}",
+            "now_ms": 8,
+            "max_events": 128,
+        }),
+        8,
+    );
+    assert_eq!(conflict["ok"], json!(false));
+    assert_eq!(conflict["code"], json!("event_id_conflict"));
+    fs::remove_dir_all(root).expect("temporary root should be removed");
+}
+
+#[test]
+fn child_link_requires_active_parent_and_rejects_terminal_races() {
+    let root = temporary_root("child-link-parent-guard");
+    let runner = storage_runner(&root);
+    let db_name = "child-link-parent-guard.db";
+    run_storage(&runner, db_name, "migrate", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "parent",
+        "run.create",
+        run_payload("parent", "session-1", 3),
+        3,
+    );
+    let mut child = run_payload("child", "session-1", 4);
+    child["parent_run_id"] = json!("parent");
+    run_storage(&runner, db_name, "child", "run.create", child, 4);
+    run_storage(
+        &runner,
+        db_name,
+        "parent-start",
+        "run.transition",
+        transition_payload("parent", "queued", "running", 5),
+        5,
+    );
+    let link = run_storage(
+        &runner,
+        db_name,
+        "link",
+        "run.link_child",
+        json!({
+            "parent_run_id":"parent",
+            "child_run_id":"child",
+            "ordinal":0,
+            "relation":"subagent",
+            "state":"active",
+            "now_ms":6,
+        }),
+        6,
+    );
+    assert_eq!(link["ok"], json!(true), "active parent may link a child");
+    run_storage(
+        &runner,
+        db_name,
+        "parent-complete",
+        "run.transition",
+        transition_payload("parent", "running", "completed", 7),
+        7,
+    );
+    let late_state = run_storage(
+        &runner,
+        db_name,
+        "late-state",
+        "run.link_state",
+        json!({
+            "parent_run_id":"parent",
+            "child_run_id":"child",
+            "ordinal":0,
+            "relation":"subagent",
+            "state":"failed",
+            "now_ms":8,
+        }),
+        8,
+    );
+    assert_eq!(late_state["ok"], json!(false));
+    assert_eq!(late_state["code"], json!("parent_not_active"));
+    let late_link = run_storage(
+        &runner,
+        db_name,
+        "late-link",
+        "run.link_child",
+        json!({
+            "parent_run_id":"parent",
+            "child_run_id":"child",
+            "ordinal":0,
+            "relation":"subagent",
+            "state":"active",
+            "now_ms":9,
+        }),
+        9,
+    );
+    assert_eq!(late_link["ok"], json!(false));
+    assert_eq!(late_link["code"], json!("parent_not_active"));
+    fs::remove_dir_all(root).expect("temporary root should be removed");
+}
+
+#[test]
+fn load_all_includes_child_links_for_restart_mirror_rebuild() {
+    let root = temporary_root("child-links-load");
+    let runner = storage_runner(&root);
+    let db_name = "child-links-load.db";
+    run_storage(&runner, db_name, "migrate", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "parent",
+        "run.create",
+        run_payload("parent", "session-1", 3),
+        3,
+    );
+    let mut child = run_payload("child", "session-1", 4);
+    child["parent_run_id"] = json!("parent");
+    run_storage(&runner, db_name, "child", "run.create", child, 4);
+    run_storage(
+        &runner,
+        db_name,
+        "parent-start",
+        "run.transition",
+        transition_payload("parent", "queued", "running", 5),
+        5,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "link",
+        "run.link_child",
+        json!({
+            "parent_run_id":"parent",
+            "child_run_id":"child",
+            "ordinal":0,
+            "relation":"parallel",
+            "state":"active",
+            "now_ms":6,
+        }),
+        6,
+    );
+    let loaded = run_storage(
+        &runner,
+        db_name,
+        "load",
+        "load.all",
+        json!({"max_rows":128,"max_bytes":65536,"load_cap":10000}),
+        7,
+    );
+    let links = loaded["data"]["child_links"]
+        .as_array()
+        .expect("load.all must carry durable child links");
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0][0], json!("parent"));
+    assert_eq!(links[0][1], json!("child"));
+    assert_eq!(links[0][4], json!("active"));
     fs::remove_dir_all(root).expect("temporary root should be removed");
 }

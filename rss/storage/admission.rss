@@ -81,6 +81,24 @@ pub fn storage_admission_create(db_id: int, payload_json: string) -> map {
             failure_message = "parent run does not exist";
         }
     }
+    // A child may only be admitted under an ACTIVE (non-terminal) parent.
+    // A terminal parent must reject the whole admission transaction so NO
+    // child run, link, or event is ever inserted beneath it — the A6
+    // parent-active contract is enforced at the admission transaction
+    // itself, not merely at the later run.link_child step.
+    if failed == false {
+        if input.parent_run_id.copy() != "" && !existence::run_exists(db_id, input.parent_run_id.copy()) {
+            failed = true;
+            failure_code = "parent_not_found";
+            failure_message = "parent run does not exist";
+        } else {
+            if input.parent_run_id.copy() != "" && !existence::run_active(db_id, input.parent_run_id.copy()) {
+                failed = true;
+                failure_code = "parent_not_active";
+                failure_message = "parent run is terminal or stopping; a child cannot be admitted";
+            }
+        }
+    }
     let mut replay: bool = false;
     let mut conflict: bool = false;
     let mut existing_run_id: string = "";

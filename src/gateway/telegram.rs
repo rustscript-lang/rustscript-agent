@@ -3127,6 +3127,7 @@ mod tests {
                     parent_run_id: None,
                     request_overrides: serde_json::Value::Object(Default::default()),
                     platform: "telegram".to_string(),
+                    input: serde_json::Value::Null,
                     status: status.to_string(),
                     events: vec![event],
                     sender: None,

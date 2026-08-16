@@ -356,7 +356,15 @@ fn responses_build_tools(tools: array) -> array {
             let name: string = types::tool_name(tool);
             let description: string = types::tool_description(tool);
             let schema_json: string = types::tool_schema_json(tool);
-            let schema: map = json::decode(schema_json);
+            // A tool WITHOUT a schema_json carries the legal empty schema `{}`
+            // — never an empty-string decode, which would throw `json_decode
+            // failed: EOF` on the wire build and take down the whole provider
+            // round before any HTTP request is made.
+            let mut parameters: map = {};
+            if schema_json != "" {
+                let decoded: map = json::decode(schema_json);
+                parameters = decoded;
+            }
             // Official Responses tool shape: flat {type, name, description,
             // parameters} — NOT nested under a `function` key (that is the
             // Chat Completions shape). The schema is a JSON value in the map,
@@ -365,7 +373,7 @@ fn responses_build_tools(tools: array) -> array {
                 type: "function",
                 name: name,
                 description: description,
-                parameters: schema
+                parameters: parameters
             };
         }
         i += 1;
@@ -451,11 +459,22 @@ fn responses_reasoning_text(item: map) -> string {
     joined
 }
 
-/// Appends one canonical tool call from a `function_call` output item. The
-/// wire `call_id` maps to the canonical `id`; `arguments` is raw JSON text
-/// decoded into a map.
+/// The Responses API may omit `call_id` on malformed/proxy-stripped
+/// function-call items. Keep the canonical contract non-empty while making the
+/// fallback stable across retries and buffered/streamed parsing.
+fn responses_fallback_call_id(index: int) -> string {
+    "responses-call-" + json::encode(index)
+}
+
 fn responses_append_call(calls: array, item: map) -> array {
-    let call_id: string = types::request_string(item, "call_id");
+    let mut call_id: string = types::request_string(item, "call_id");
+    if call_id == "" {
+        // The fallback is the FUNCTION-CALL ordinal (the number of calls
+        // already accumulated), NOT the position in the output array: reasoning /
+        // interleaved items must not shift the fallback, and the same ordinal is
+        // used by the streaming path so buffered/stream agree exactly.
+        call_id = responses_fallback_call_id(calls.length);
+    }
     let name: string = types::request_string(item, "name");
     let args_text: string = types::request_string(item, "arguments");
     let mut args: map = {};
@@ -591,6 +610,11 @@ fn responses_send_stream(
                 let item: map = types::request_map(chunk, "item");
                 if types::request_string(item, "type") == "function_call" {
                     let output_index: int = types::request_int(chunk, "output_index", 0);
+                    // Do NOT bake a fallback id here. Leave the provider's id
+                    // empty so responses_stream_parse_tool_calls assigns the
+                    // FUNCTION-CALL ordinal (tools but position), which is the
+                    // same ordinal the buffered path uses — reasoning/interleave
+                    // items (distinct output_index) must not shift it.
                     let call_id: string = types::request_string(item, "call_id");
                     let name: string = types::request_string(item, "name");
                     tools = responses_stream_set_call(tools, output_index, call_id, name);
@@ -723,7 +747,10 @@ fn responses_stream_parse_tool_calls(tools: array) -> array {
     let mut i = 0;
     while i < tools.length {
         let entry: map = types::array_entry(tools, i);
-        let id: string = types::request_string(entry, "id");
+        let mut id: string = types::request_string(entry, "id");
+        if id == "" {
+            id = responses_fallback_call_id(i);
+        }
         let name: string = types::request_string(entry, "name");
         let args_text: string = types::request_string(entry, "args");
         let mut args: map = {};

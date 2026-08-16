@@ -482,6 +482,47 @@ fn result_kind(decision: &JsonValue) -> String {
     decision["kind"].as_str().unwrap_or("?").to_string()
 }
 
+/// Asserts every canonical `tool` message in the history is preceded by an
+/// `assistant` message whose `tool_call` part carries the SAME id — i.e. the
+/// history the loop folds into the next provider round never contains a
+/// dangling tool result (real provider contracts reject those). Assistant
+/// tool calls must be consumed by exactly one later tool result.
+fn assert_no_dangling_tool_results(messages: &[JsonValue]) {
+    let mut open_calls: Vec<String> = Vec::new();
+    for message in messages {
+        let role = message["role"].as_str().unwrap_or("");
+        if role == "assistant" {
+            if let Some(parts) = message["content"].as_array() {
+                for part in parts {
+                    if part["type"] == "tool_call"
+                        && let Some(id) = part["tool_call_id"].as_str().filter(|id| !id.is_empty())
+                    {
+                        open_calls.push(id.to_string());
+                    }
+                }
+            }
+        } else if role == "tool" {
+            if let Some(id) = message["tool_call_id"].as_str().filter(|id| !id.is_empty())
+                && let Some(position) = open_calls.iter().position(|open| open == id)
+            {
+                open_calls.remove(position);
+            } else if message["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            {
+                panic!(
+                    "dangling tool result for {}: no matching assistant tool_call",
+                    message["tool_call_id"]
+                );
+            }
+        }
+    }
+    assert!(
+        open_calls.is_empty(),
+        "unmatched assistant tool calls in the folded history: {open_calls:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Suites
 // ---------------------------------------------------------------------------
@@ -914,8 +955,20 @@ fn loop_parallel_and_task_config_yield_typed_handoffs_never_fabricated_actions()
     let server = spawn_scripted_json_server(vec![(200, wire_text("unused"))]);
     let runner = loop_runner(server.port(), &root);
 
-    let mut parallel = base_context(server.port(), loop_config("auto"));
+    // The parallel/task delegation gate runs the A4 approval policy first:
+    // under approval_mode "all" the gate approves and the loop yields the
+    // typed handoff (never a fabricated parallel/subagent outcome).
+    let mut parallel = base_context(server.port(), loop_config("all"));
     parallel["config"]["parallel"] = json!(true);
+    parallel["input"] = json!({
+        "tasks": [{"id": "t0", "input": "a"}],
+        "mode": "all",
+        "max_concurrency": 1,
+        "max_fanout": 0,
+        "current_fanout": 0,
+        "depth": 0,
+        "max_depth": 0
+    });
     let (decision, _) = run_loop(&runner, parallel);
     assert_eq!(result_kind(&decision), "parallel.handoff");
     assert_eq!(decision["executable"], json!(false));
@@ -926,12 +979,426 @@ fn loop_parallel_and_task_config_yield_typed_handoffs_never_fabricated_actions()
     );
     assert_eq!(server.request_count(), 0);
 
-    let mut task = base_context(server.port(), loop_config("auto"));
+    let mut task = base_context(server.port(), loop_config("all"));
     task["config"]["task"] = json!(true);
+    task["input"] = json!({"child": {"id": "c1", "input": "child work"}});
     let (decision, _) = run_loop(&runner, task);
     assert_eq!(result_kind(&decision), "subagent.handoff");
     assert_eq!(decision["executable"], json!(false));
     assert_eq!(server.request_count(), 0);
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+// ---------------------------------------------------------------------------
+// A6 native-supervisor wiring: the serial loop defers to the native
+// supervisor with a typed handoff carrying the verified plan request, folds
+// the ordered typed results / child outcomes back into the loop state, and
+// continues reasoning. The loop itself never executes children and never
+// fabricates an outcome.
+// ---------------------------------------------------------------------------
+
+fn tasks(tasks: JsonValue) -> JsonValue {
+    json!({
+        "tasks": tasks,
+        "mode": "all",
+        "max_concurrency": 2,
+        "max_fanout": 0,
+        "current_fanout": 0,
+        "depth": 0,
+        "max_depth": 0
+    })
+}
+
+#[test]
+fn loop_parallel_handoff_carries_the_batch_and_supervision_from_input() {
+    let root = temporary_root("parallel-handoff-input");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("unused"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["config"]["parallel"] = json!(true);
+    context["input"] = tasks(json!([
+        {"id": "t0", "input": "first"},
+        {"id": "t1", "input": "second"},
+    ]));
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "parallel.handoff");
+    // The handoff carries the batch request verbatim: the native supervisor
+    // plans over these exact items and backfills the ordered results.
+    assert_eq!(
+        decision["batch"],
+        json!([
+            {"id": "t0", "input": "first"},
+            {"id": "t1", "input": "second"},
+        ])
+    );
+    assert_eq!(decision["mode"], json!("all"));
+    assert_eq!(decision["max_concurrency"], json!(2));
+    assert_eq!(decision["max_fanout"], json!(0));
+    assert_eq!(decision["max_depth"], json!(0));
+    assert_eq!(decision["depth"], json!(0));
+    assert_eq!(decision["current_fanout"], json!(0));
+    assert_eq!(decision["executable"], json!(false));
+    assert_eq!(
+        server.request_count(),
+        0,
+        "the handoff itself never calls the provider"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_parallel_gate_in_auto_mode_yields_an_approval_wait() {
+    let root = temporary_root("parallel-gate-pending");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("unused"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    // auto mode classifies the parallel delegation (risk class execute) as
+    // pending: the loop yields the durable approval.wait, never a handoff and
+    // never a fabricated execution.
+    let mut context = base_context(server.port(), loop_config("auto"));
+    context["config"]["parallel"] = json!(true);
+    context["input"] = tasks(json!([{"id": "t0", "input": "a"}]));
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "approval.wait");
+    assert_eq!(decision["approval"]["tool_name"], json!("parallel.run"));
+    assert_eq!(decision["approval"]["risk_class"], json!("execute"));
+    assert_eq!(server.request_count(), 0);
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_approval_resume_approved_parallel_gate_yields_the_handoff() {
+    let root = temporary_root("parallel-gate-approved");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("unused"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["phase"] = json!("approval.resume");
+    context["input"] = tasks(json!([{"id": "t0", "input": "a"}]));
+    context["approval"] = json!({
+        "approval_id": "ap-1",
+        "tool_call_id": "parallel:batch",
+        "resolved": true,
+        "reason": "",
+        "outcome": "approved"
+    });
+    context["tool_calls"] = json!([
+        {"id": "parallel:batch", "name": "parallel.run", "arguments": {"task_count": 1}}
+    ]);
+    context["tool_index"] = json!(0);
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "parallel.handoff");
+    assert_eq!(decision["batch"], json!([{"id": "t0", "input": "a"}]));
+    assert_eq!(server.request_count(), 0);
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_approval_resume_denied_parallel_gate_folds_a_typed_denial_and_continues() {
+    let root = temporary_root("parallel-gate-denied");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("denied round"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["phase"] = json!("approval.resume");
+    context["input"] = tasks(json!([{"id": "t0", "input": "a"}]));
+    context["approval"] = json!({
+        "approval_id": "ap-1",
+        "tool_call_id": "parallel:batch",
+        "resolved": false,
+        "reason": "policy denied",
+        "outcome": "denied"
+    });
+    context["tool_calls"] = json!([
+        {"id": "parallel:batch", "name": "parallel.run", "arguments": {"task_count": 1}}
+    ]);
+    context["tool_index"] = json!(0);
+    let (decision, _) = run_loop(&runner, context);
+    assert_ne!(result_kind(&decision), "parallel.handoff");
+    let messages = decision["messages"].as_array().expect("messages").clone();
+    assert_no_dangling_tool_results(&messages);
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("denied delegation must fold a typed tool message");
+    assert_eq!(tool_message["tool_call_id"], json!("parallel:batch"));
+    assert_eq!(tool_message["content"][0]["is_error"], json!(true));
+    assert!(
+        tool_message["content"][0]["content"]
+            .as_str()
+            .expect("content")
+            .contains("approval_denied")
+    );
+    // The loop continues reasoning with the typed denial in history.
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the loop continues with its own provider round"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_parallel_result_phase_folds_ordered_slot_results_and_continues() {
+    let root = temporary_root("parallel-result");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("after parallel"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["phase"] = json!("parallel.result");
+    context["parallel_outcome"] = json!({
+        "kind": "executed",
+        "results": [
+            {"slot": 0, "child_run_id": "child-0", "status": "completed", "output": "out-0"},
+            {"slot": 1, "child_run_id": "child-1", "status": "failed", "code": "run_failed", "error": "boom"}
+        ]
+    });
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "run.completed");
+    let messages = decision["messages"].as_array().expect("messages").clone();
+    assert_no_dangling_tool_results(&messages);
+    // One canonical tool message per ordered slot, in submission order.
+    let tool_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(tool_messages.len(), 2);
+    assert_eq!(tool_messages[0]["tool_call_id"], json!("child-0"));
+    assert_eq!(tool_messages[0]["content"][0]["is_error"], json!(false));
+    assert_eq!(tool_messages[0]["content"][0]["content"], json!("out-0"));
+    assert_eq!(tool_messages[1]["tool_call_id"], json!("child-1"));
+    assert_eq!(tool_messages[1]["content"][0]["is_error"], json!(true));
+    assert!(
+        tool_messages[1]["content"][0]["content"]
+            .as_str()
+            .expect("content")
+            .contains("boom")
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the loop continues reasoning after the results"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_retry_after_delegation_never_re_enters_the_gate() {
+    let root = temporary_root("retry-after-delegation");
+    let server = spawn_scripted_json_server(vec![
+        wire_error(429, "rate_limit_error", "rate_limit_exceeded", "slow down"),
+        (200, wire_text("after retry")),
+    ]);
+    let runner = loop_runner(server.port(), &root);
+
+    // Turn 0: the delegation gate approves and the loop yields the handoff.
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["config"]["parallel"] = json!(true);
+    context["input"] = tasks(json!([{"id": "t0", "input": "a"}]));
+    let (handoff, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&handoff), "parallel.handoff");
+
+    // The service executes the handoff and backfills the typed outcome.
+    let mut result_context = base_context(server.port(), loop_config("all"));
+    result_context["phase"] = json!("parallel.result");
+    result_context["parallel_outcome"] = json!({
+        "kind": "executed",
+        "results": [{"slot": 0, "child_run_id": "child-0", "status": "completed", "output": "out-0"}]
+    });
+    let (after_results, _) = run_loop(&runner, result_context);
+    // The continuation provider round is a retryable 429: the loop yields a
+    // retry decision whose carried config records the delegation as
+    // completed (so a phase "start" re-entry can never re-run the gate).
+    assert_eq!(result_kind(&after_results), "retry");
+    assert_eq!(
+        after_results["config"]["delegation_done"],
+        json!(true),
+        "the carried config must record the delegation as completed"
+    );
+
+    // The service re-invokes with phase "start" and the retry state: the
+    // gate must NOT re-run — the decision is a provider round, never a
+    // second handoff, and the folded result pair is not duplicated. The
+    // carried config keeps `parallel` enabled AND records the delegation as
+    // completed, so the gate-skip is exercised, not bypassed.
+    let mut retry_context = base_context(server.port(), loop_config("all"));
+    retry_context["phase"] = json!("start");
+    retry_context["retry_count"] = after_results["retry_count"].clone();
+    retry_context["turn"] = after_results["turn"].clone();
+    retry_context["messages"] = after_results["messages"].clone();
+    retry_context["last_text"] = after_results["last_text"].clone();
+    retry_context["config"] = after_results["config"].clone();
+    retry_context["config"]["parallel"] = json!(true);
+    let (retried, _) = run_loop(&runner, retry_context);
+    assert_ne!(
+        result_kind(&retried),
+        "parallel.handoff",
+        "a retryable provider error must never re-enter the delegation gate"
+    );
+    assert_eq!(result_kind(&retried), "run.completed");
+    // The result pair appears EXACTLY ONCE in the final history.
+    let messages = retried["messages"].as_array().expect("messages").clone();
+    assert_no_dangling_tool_results(&messages);
+    let tool_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(
+        tool_messages.len(),
+        1,
+        "the delegation result pair is folded exactly once, never duplicated by a retry"
+    );
+    assert_eq!(
+        server.request_count(),
+        2,
+        "two provider attempts (the throttled 429 and the retried round), never a child round"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_parallel_result_phase_folds_a_typed_rejection_and_continues() {
+    let root = temporary_root("parallel-rejected");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("after rejection"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["phase"] = json!("parallel.result");
+    context["parallel_outcome"] = json!({
+        "kind": "rejected",
+        "code": "fanout_exceeded",
+        "message": "parallel batch exceeds the configured max_fanout"
+    });
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "run.completed");
+    let messages = decision["messages"].as_array().expect("messages").clone();
+    assert_no_dangling_tool_results(&messages);
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("rejection must fold a typed tool message");
+    assert_eq!(tool_message["tool_call_id"], json!("parallel:rejected"));
+    assert_eq!(tool_message["content"][0]["is_error"], json!(true));
+    assert!(
+        tool_message["content"][0]["content"]
+            .as_str()
+            .expect("content")
+            .contains("fanout_exceeded")
+    );
+    assert_eq!(server.request_count(), 1);
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_subagent_handoff_carries_the_child_descriptor() {
+    let root = temporary_root("subagent-handoff-child");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("unused"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["config"]["task"] = json!(true);
+    context["input"] = json!({
+        "child": {"id": "c1", "input": "child work"},
+        "depth": 0,
+        "max_depth": 2,
+        "max_fanout": 3,
+        "current_fanout": 1
+    });
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "subagent.handoff");
+    assert_eq!(
+        decision["child"],
+        json!({"id": "c1", "input": "child work"})
+    );
+    assert_eq!(decision["depth"], json!(0));
+    assert_eq!(decision["max_depth"], json!(2));
+    assert_eq!(decision["max_fanout"], json!(3));
+    assert_eq!(decision["current_fanout"], json!(1));
+    assert_eq!(server.request_count(), 0);
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_subagent_result_phase_folds_the_child_outcome_and_continues() {
+    let root = temporary_root("subagent-result");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("after child"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["phase"] = json!("subagent.result");
+    context["subagent_outcome"] = json!({
+        "kind": "executed",
+        "child_run_id": "child-real-1",
+        "session_id": "child-session-1",
+        "status": "completed",
+        "output": "child result text"
+    });
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "run.completed");
+    let messages = decision["messages"].as_array().expect("messages").clone();
+    assert_no_dangling_tool_results(&messages);
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("child outcome must fold a canonical tool message");
+    assert_eq!(tool_message["tool_call_id"], json!("child-real-1"));
+    assert_eq!(tool_message["content"][0]["is_error"], json!(false));
+    assert_eq!(
+        tool_message["content"][0]["content"],
+        json!("child result text")
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "the loop continues reasoning after the child outcome"
+    );
+
+    fs::remove_dir_all(&root).expect("temporary root should be removed");
+}
+
+#[test]
+fn loop_subagent_result_phase_folds_a_child_failure_typed() {
+    let root = temporary_root("subagent-failed");
+    let server = spawn_scripted_json_server(vec![(200, wire_text("after child failure"))]);
+    let runner = loop_runner(server.port(), &root);
+
+    let mut context = base_context(server.port(), loop_config("all"));
+    context["phase"] = json!("subagent.result");
+    context["subagent_outcome"] = json!({
+        "kind": "executed",
+        "child_run_id": "child-real-1",
+        "session_id": "child-session-1",
+        "status": "failed",
+        "code": "child_run_failed",
+        "error": "child boom"
+    });
+    let (decision, _) = run_loop(&runner, context);
+    assert_eq!(result_kind(&decision), "run.completed");
+    let messages = decision["messages"].as_array().expect("messages").clone();
+    assert_no_dangling_tool_results(&messages);
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("child failure must fold a typed tool message");
+    assert_eq!(tool_message["tool_call_id"], json!("child-real-1"));
+    assert_eq!(tool_message["content"][0]["is_error"], json!(true));
+    assert!(
+        tool_message["content"][0]["content"]
+            .as_str()
+            .expect("content")
+            .contains("child boom")
+    );
+    assert_eq!(server.request_count(), 1);
 
     fs::remove_dir_all(&root).expect("temporary root should be removed");
 }

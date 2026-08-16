@@ -117,12 +117,15 @@ above; every other field is set by embedding code.
 | `base_retry_delay_ms` | `u64` | 1000 | Exponential backoff base for provider retries. |
 | `max_retry_delay_ms` | `u64` | 30000 | Exponential backoff cap for provider retries. |
 | `approval_mode` | `String` | `"auto"` | One of `auto`/`manual`/`never`/`all`; anything else fails validation. Fed to the A4 approval policy. See `RUSTSCRIPT_AGENT_APPROVAL_MODE`. |
+| `native_hard_deny` | `bool` | `false` | Independent native deny policy: when set, every approval/delegation decision is denied regardless of mode, including without SQLite. |
+| `native_deny_tools` | `Vec<String>` | empty | Tool names the independent native deny policy rejects regardless of mode or durable-approval availability. Delegation tools `parallel.run` / `subagent.run` are denied before child admission or park. |
+| `native_deny_risks` | `Vec<String>` | empty | Risk classes the independent native deny policy rejects regardless of mode or durable-approval availability (`read` / `write` / `execute` / `privileged`). |
 | `approval_timeout` | `Duration` | 600 s | Must be positive. Lifetime of a pending approval; the janitor sweep resumes the parked run with a typed expired tool result after it. See `RUSTSCRIPT_AGENT_APPROVAL_TIMEOUT_SECS`. |
 | `max_context_messages` | `usize` | 64 | Durable-history compaction window; `0` disables the gate. See `RUSTSCRIPT_AGENT_MAX_CONTEXT_MESSAGES`. |
 | `retained_tail` | `usize` | 8 | Retained tail after a compaction. See `RUSTSCRIPT_AGENT_RETAINED_TAIL`. |
 | `stream` | `bool` | `true` | Stream transport flag passed to the provider adapters. See `RUSTSCRIPT_AGENT_STREAM`. |
-| `parallel` | `bool` | `false` | Parallel orchestration requested (A6 handoff; typed non-executable until the A7 run-admission interface wires the native supervisor). |
-| `task` | `bool` | `false` | Task/subagent delegation requested (A6 handoff; typed non-executable). |
+| `parallel` | `bool` | `false` | Parallel orchestration requested: the A6 delegation gate (A4 approval) runs, and the native supervisor executes the verified `parallel.rss` plan with real child runs (bounded concurrency, ordered slots, race/fail-fast, parent-cancel). |
+| `task` | `bool` | `false` | Task/subagent delegation requested: the A6 delegation gate (A4 approval) runs, and the native supervisor admits one REAL child run (parent link, isolated session) through `AgentService`, awaits its durable terminal, and folds the typed child outcome back into the loop. |
 | `agent_name` | `String` | `"local-rss-agent"` | Reported by `/health/detailed`. |
 | `bearer_token` | `Option<String>` | `None` | Blank tokens rejected by the binary. |
 | `max_body_bytes` | `usize` | 4 MiB | Must be positive. HTTP request body limit (`DefaultBodyLimit`). |
@@ -137,7 +140,7 @@ above; every other field is set by embedding code.
 | `cancellation_grace` | `Duration` | 5 s | Must be positive. Bounded wait after a deadline before the worker is abandoned. |
 | `janitor_interval` | `Duration` | 5 s | Must be positive. Terminal-commit retry / pending-terminal cadence. |
 | `terminal_commit_retry_window` | `Duration` | 300 s | Must be positive. Bounded window during which a failed terminal commit is retried. |
-| `terminal_persist_retries` | `usize` | 3 | —. Additional immediate retries before a terminal is parked as pending. |
+| `terminal_persist_retries` | `usize` | 3 | Additional immediate terminal-commit attempts before a terminal is parked for the bounded retry window. |
 | `terminal_persist_retry_delay` | `Duration` | 25 ms | Must be positive. Backoff between immediate terminal-persist retries. |
 | `rate_limit` | `RateLimitConfig` | disabled; `ip_burst = 60`, `account_burst = 120`, `window = 60 s`, `max_buckets = 10 000` | Validated by `RateLimitConfig::validate` (bursts ≤ 1 000 000, window ≤ 86 400 s, buckets ≤ 1 000 000). Bounded in-memory token buckets keyed by peer IP and verified bearer account; see `RUSTSCRIPT_AGENT_RATE_LIMIT_*` above. |
 | `client_disconnect_policy` | `ClientDisconnectPolicy` | `keep-running` | `keep-running` (default) or `cancel-on-disconnect`; see `RUSTSCRIPT_AGENT_CLIENT_DISCONNECT_POLICY` above. |
@@ -234,17 +237,43 @@ by the binaries), so it is not part of the canonical env table above.
   surface. Store them in an environment file or secret manager with
   restrictive permissions (see `docs/deployment.md`).
 
+## A4 approval and A6 child lifecycle
+
+The A4 approval bridge has two deliberately separate responsibilities:
+
+- `ApprovalBridge` owns durable pending approval rows and exact-once
+  resolve/deny/expire behavior. When SQLite is not configured, there is no
+  durable pending approval path; the bridge reports a typed unavailable
+  result.
+- `NativeDenyPolicy` is always constructed, including in in-memory mode.
+  `native_hard_deny`, `native_deny_tools`, and `native_deny_risks` therefore
+  remain effective without SQLite and cannot be widened by an RSS approval
+  policy.
+
+A6 delegation is executed by the native supervisor after the RSS policy
+returns a verified plan. Parallel slots use bounded concurrency, ordered
+results, race/fail-fast cancellation, parent cancellation, and the remaining
+run deadline. Task/subagent slots admit isolated child runs, persist
+`run.link_child`/`run.link_state`, and wait for the child's durable terminal.
+A child `terminal_pending` state is intermediate: the parent waits through the
+bounded terminal retry window, while parent stop/deadline can cancel the wait.
+Terminal lifecycle events reuse one event ID across retries; RSS event append
+is idempotent and rejects a matching ID with a different payload.
+
+After restart or an idempotent admission replay, `run.get` and
+`run.list_children` rebuild the live fanout mirror from durable rows. Recovery
+also synchronizes child-link state with a child's terminal run status. Child
+input is opaque JSON (objects and arrays are preserved in the canonical child
+context), and missing slot/tool-call IDs receive deterministic non-empty IDs
+so race and fail-fast continuation remains addressable. An unknown policy
+result closes its watcher before returning.
+
 ## Reserved configuration
 
 The following configuration does **not** exist in this revision. It is
 listed only to reserve the namespace and to make the roadmap explicit; no
 binary reads these names and setting them has no effect.
 
-- **A4 harness/approval machinery (排除)** and **A6 parallel tools /
-  subagents (排除)** are out of scope for this repository's current
-  milestones and define no configuration. The approval repository CRUD
-  (`approval.request`/`get`/`resolve`/`expire` storage commands) exists, but
-  there is no approval flow driving runs.
 - A job **scheduler** is not implemented: job CRUD/pause/resume/latest-output
   routes exist, but scheduled execution defines no configuration.
 

@@ -40,10 +40,12 @@ struct CursorInput {
 pub fn storage_event_append(db_id: int, payload_json: string) -> map {
     let input: EventAppendInput = json::decode::<EventAppendInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: [] };
-    if !existence::run_exists(db_id, input.run_id.copy()) {
+    if input.run_id.copy() == "" || input.event_id.copy() == "" || input.event_type.copy() == "" || input.payload_json.copy() == "" {
+        result = { ok: false, code: "invalid_event", message: "event id, type, run id, and payload are required", result: [] };
+    } else if !existence::run_exists(db_id, input.run_id.copy()) {
         result = { ok: false, code: "run_not_found", message: "event append targets an unknown run", result: [] };
     } else {
-        // Exact-once: a durable event row with this event_id may already
+// Exact-once: a durable event row with this event_id may already
         // exist because a previous request's SQLite commit landed while its
         // response was lost/timed out (the caller then retried the SAME fixed
         // event_id). Re-read the authoritative durable row by event_id and
@@ -91,8 +93,8 @@ pub fn storage_event_append(db_id: int, payload_json: string) -> map {
             let max_events: int = schema::max_events_limit(input.max_events.copy());
             let statements = [
                 {
-                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ?",
-                    params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
+sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?)",
+                    params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy(), &input.run_id]
                 },
                 {
                     sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",

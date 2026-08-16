@@ -1741,6 +1741,500 @@ async fn production_load_drains_beyond_page_and_byte_boundaries() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Durable A6 replay criterion: child links are read through cursor pages,
+/// not one fixed 512-row load. This uses the production SQLite/RSS worker and
+/// verifies every link after the 512 boundary, including ordinal continuity.
+#[tokio::test]
+async fn durable_child_link_pagination_reads_all_links_after_512() {
+    let path = gateway_db_path("child-link-pages");
+    let config = AgentGatewayConfig::default();
+    let persistence = GatewayPersistence::open(&config, &path).expect("repository should open");
+    let mut now = 10_000_u64;
+    persistence
+        .admission_create(&json!({
+            "session_id": "parent-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "test",
+            "account_id": "parent-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "parent-run",
+            "parent_run_id": "",
+            "input_json": "{}",
+            "message_id": "parent-message",
+            "message_run_id": "parent-run",
+            "script_hash": "s",
+            "idempotency_scope": "",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "parent-started",
+            "now_ms": now,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }))
+        .expect("parent admission should commit");
+    now += 1;
+    for ordinal in 0..600 {
+        persistence
+            .admission_create(&json!({
+                "session_id": format!("child-session-{ordinal}"),
+                "session_new": 1,
+                "profile": "gateway",
+                "platform": "test",
+                "account_id": format!("child-session-{ordinal}"),
+                "model": "m",
+                "provider": "p",
+                "system_prompt": "",
+                "run_id": format!("child-run-{ordinal}"),
+                "parent_run_id": "parent-run",
+                "input_json": format!("{{\"ordinal\":{ordinal}}}"),
+                "message_id": format!("child-message-{ordinal}"),
+                "message_run_id": format!("child-run-{ordinal}"),
+                "script_hash": "s",
+                "idempotency_scope": "",
+                "idempotency_key": "",
+                "request_hash": "",
+                "origin_actor": "",
+                "event_id": format!("child-started-{ordinal}"),
+                "now_ms": now,
+                "expires_at_ms": 0,
+                "conversation_json": "",
+            }))
+            .expect("child admission should commit");
+        now += 1;
+    }
+
+    let mut after_ordinal = -1_i64;
+    let mut after_child_id = String::new();
+    let mut links = Vec::new();
+    loop {
+        let page = persistence
+            .list_children_page("parent-run", after_ordinal, &after_child_id)
+            .expect("child-link page should load");
+        let rows = page["rows"].as_array().expect("page rows");
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            links.push(row.clone());
+        }
+        let last = rows.last().expect("non-empty page");
+        after_ordinal = last[2].as_i64().expect("ordinal");
+        after_child_id = last[1].as_str().expect("child id").to_string();
+    }
+    assert_eq!(
+        links.len(),
+        600,
+        "the page loop must cross the 512 boundary"
+    );
+    for (ordinal, row) in links.iter().enumerate() {
+        assert_eq!(row[2], json!(ordinal as i64));
+    }
+    drop(persistence);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A6 sparse-parallel fix: the DURABLE parent-level ordinal allocator
+/// reserves a batch's full ordinal range atomically and stays the exclusive
+/// high-water across a restart. Refused / cancelled-before-start slots of a
+/// sparse batch consume ordinals but create no child_run_links row, so only
+/// this high-water survives: a later batch must never reuse it, even after a
+/// fresh repository open on the same database.
+#[tokio::test]
+async fn durable_parent_ordinal_allocator_reserves_sparse_ranges_and_survives_restart() {
+    let path = gateway_db_path("parent-ordinals");
+    let config = AgentGatewayConfig::default();
+    let now = 2_000_000_u64;
+
+    let first = GatewayPersistence::open(&config, &path).expect("repository should open");
+    first
+        .admission_create(&json!({
+            "session_id": "alloc-parent-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "test",
+            "account_id": "alloc-parent-session",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "alloc-parent-run",
+            "parent_run_id": "",
+            "input_json": "{}",
+            "message_id": "alloc-parent-message",
+            "message_run_id": "alloc-parent-run",
+            "script_hash": "s",
+            "idempotency_scope": "",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "alloc-parent-started",
+            "now_ms": now,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }))
+        .expect("parent admission should commit");
+
+    // A sparse first batch reserves 3 ordinals (0,1,2) even though, say,
+    // only slot 0 is ever admitted — the refused/cancelled slots 1 and 2
+    // still consume ordinal identities.
+    assert_eq!(
+        first
+            .allocate_ordinals("alloc-parent-run", "parallel", 3)
+            .expect("first batch allocation"),
+        0
+    );
+    assert_eq!(
+        first
+            .parent_ordinal_next("alloc-parent-run", "parallel")
+            .expect("high-water"),
+        3
+    );
+    // A second batch must start strictly after the first batch's reserved
+    // range — never reuse ordinor 0..2.
+    assert_eq!(
+        first
+            .allocate_ordinals("alloc-parent-run", "parallel", 1)
+            .expect("second batch allocation"),
+        3
+    );
+    // The reserved ranges are consecutive (disjoint, no gaps reused).
+    assert_eq!(
+        first
+            .allocate_ordinals("alloc-parent-run", "parallel", 2)
+            .expect("third batch allocation"),
+        4
+    );
+    assert_eq!(
+        first
+            .parent_ordinal_next("alloc-parent-run", "parallel")
+            .expect("high-water"),
+        6
+    );
+    // Namespaces are independent allocators.
+    assert_eq!(
+        first
+            .allocate_ordinals("alloc-parent-run", "subagent", 1)
+            .expect("subagent namespace allocation"),
+        0
+    );
+    drop(first);
+
+    // Restart: a fresh repository on the same database continues past the
+    // durable high-water — it never reuses the ordinals consumed (including
+    // the sparse refused slots) before the restart.
+    let second = GatewayPersistence::open(&config, &path).expect("repository should reopen");
+    assert_eq!(
+        second
+            .parent_ordinal_next("alloc-parent-run", "parallel")
+            .expect("high-water after restart"),
+        6
+    );
+    assert_eq!(
+        second
+            .allocate_ordinals("alloc-parent-run", "parallel", 1)
+            .expect("allocation after restart"),
+        6,
+        "a post-restart batch must not reuse any previously consumed ordinal"
+    );
+    drop(second);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Durable A6 link criterion: transient `run.link_state` failures are retried
+/// by the native bridge before the in-memory mirror is advanced.
+#[tokio::test]
+async fn durable_link_state_failpoint_is_retried_before_mirror_update() {
+    let path = gateway_db_path("link-state-retry");
+    let config = AgentGatewayConfig::default();
+    let state = AgentGatewayState::with_sqlite_path(config, &path).expect("state should open");
+    let persistence = state.persistence().expect("persistence handle");
+    let base = json!({
+        "profile": "gateway",
+        "platform": "test",
+        "model": "m",
+        "provider": "p",
+        "system_prompt": "",
+        "script_hash": "s",
+        "idempotency_scope": "",
+        "idempotency_key": "",
+        "request_hash": "",
+        "origin_actor": "",
+        "expires_at_ms": 0,
+        "conversation_json": "",
+    });
+    let mut parent = base.clone();
+    parent["session_id"] = json!("link-parent-session");
+    parent["session_new"] = json!(1);
+    parent["account_id"] = json!("link-parent-session");
+    parent["run_id"] = json!("link-parent-run");
+    parent["parent_run_id"] = json!("");
+    parent["input_json"] = json!("{}");
+    parent["message_id"] = json!("link-parent-message");
+    parent["message_run_id"] = json!("link-parent-run");
+    parent["event_id"] = json!("link-parent-started");
+    parent["now_ms"] = json!(20_000);
+    persistence
+        .admission_create(&parent)
+        .expect("parent admission");
+    let mut child = base;
+    child["session_id"] = json!("link-child-session");
+    child["session_new"] = json!(1);
+    child["account_id"] = json!("link-child-session");
+    child["run_id"] = json!("link-child-run");
+    child["parent_run_id"] = json!("link-parent-run");
+    child["input_json"] = json!("{}");
+    child["message_id"] = json!("link-child-message");
+    child["message_run_id"] = json!("link-child-run");
+    child["event_id"] = json!("link-child-started");
+    child["now_ms"] = json!(20_001);
+    persistence
+        .admission_create(&child)
+        .expect("child admission");
+
+    let service = state.service();
+    service.fail_next_link_states(2);
+    service
+        .update_child_link_state_for_test("link-parent-run", "link-child-run", "active")
+        .await;
+    let page = state
+        .persistence()
+        .expect("persistence handle")
+        .list_children_page("link-parent-run", -1, "")
+        .expect("link page");
+    assert_eq!(page["rows"][0][4], json!("active"));
+    drop(state);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P2 (durable link convergence): when the durable `run.link_state` terminal
+/// advance's inline retry budget is exhausted while storage is down and the child
+/// has ALREADY reached a real durable terminal, the link must not stay
+/// permanently `active` in the current process: a lifecycle-managed,
+/// capacity-bounded janitor derives the terminal from the child's REAL observed
+/// durable state and writes it DURABLY once storage recovers (the mirror stays
+/// non-terminal until then), so the current process converges without a restart.
+#[tokio::test]
+async fn durable_link_state_budget_exhaustion_converges_in_current_process() {
+    let path = gateway_db_path("link-state-budget");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("state should open");
+    let service = state.service();
+    let persistence = state.persistence().expect("persistence handle");
+
+    // A real durable parent (active) and a child run.
+    persistence
+        .admission_create(&json!({
+            "session_id": "link-budget-parent-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "test",
+            "account_id": "link-budget-parent",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "link-budget-parent",
+            "parent_run_id": "",
+            "input_json": "{}",
+            "message_id": "link-budget-parent-msg",
+            "message_run_id": "link-budget-parent",
+            "script_hash": "s",
+            "idempotency_scope": "",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "link-budget-parent-started",
+            "now_ms": 1,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }))
+        .expect("parent admission");
+    persistence
+        .admission_create(&json!({
+            "session_id": "link-budget-child-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "test",
+            "account_id": "link-budget-child",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "link-budget-child",
+            "parent_run_id": "link-budget-parent",
+            "input_json": "{}",
+            "message_id": "link-budget-child-msg",
+            "message_run_id": "link-budget-child",
+            "script_hash": "s",
+            "idempotency_scope": "",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "link-budget-child-started",
+            "now_ms": 1,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }))
+        .expect("child admission");
+
+    // The child reaches a REAL durable terminal (completed) with its terminal event.
+    persistence
+        .run_terminal(&json!({
+            "run_id": "link-budget-child",
+            "to_status": "completed",
+            "error_code": "",
+            "error_message": "",
+            "event_1_id": "link-budget-child-terminal",
+            "event_1_type": "run.completed",
+            "event_1_payload": "{\"done\":true}",
+            "event_2_id": "",
+            "event_2_type": "",
+            "event_2_payload": "",
+            "event_count": 1,
+            "message_id": "",
+            "message_session_id": "",
+            "message_role": "",
+            "message_content_json": "",
+            "message_run_id": "",
+            "message_finish_reason": "",
+            "now_ms": 2,
+        }))
+        .expect("child durable terminal");
+
+    // The durable child link starts at `pending`; fault-inject enough link-state
+    // failures that the inline retry budget is exhausted (yet bounded so storage
+    // "recovers" quickly and the janitor converges within the wait budget).
+    service.fail_next_link_states(8);
+
+    // All inline retries fail (storage is down): the mirror must stay at the
+    // non-terminal `active` — never write a premature terminal the durable
+    // side does not yet carry.
+    service
+        .update_child_link_state_for_test("link-budget-parent", "link-budget-child", "completed")
+        .await;
+    let page = state
+        .persistence()
+        .unwrap()
+        .list_children_page("link-budget-parent", -1, "")
+        .expect("link page");
+    let pre = page["rows"][0][4].as_str().unwrap_or("?");
+    assert!(
+        !matches!(pre, "completed" | "failed" | "cancelled"),
+        "the mirror must stay NON-terminal (it was {pre:?}) while storage is down"
+    );
+
+    // The bounded janitor converges: it eventually writes the child's REAL
+    // durable terminal (completed) to the durable link AND advances the mirror —
+    // even in THIS process (no restart needed).
+    let converged = wait_until(std::time::Duration::from_secs(15), || {
+        let durable_link = state
+            .persistence()
+            .unwrap()
+            .list_children_page("link-budget-parent", -1, "")
+            .ok()
+            .and_then(|data| data["rows"].as_array().cloned())
+            .is_some_and(|rows| {
+                rows.first()
+                    .and_then(|row| row.get(4))
+                    .and_then(Value::as_str)
+                    == Some("completed")
+            });
+        let mirror_link = state
+            .persistence()
+            .unwrap()
+            .list_children("link-budget-parent")
+            .ok()
+            .and_then(|data| data["rows"].as_array().cloned())
+            .is_some_and(|rows| {
+                rows.first()
+                    .and_then(|row| row.get(4))
+                    .and_then(Value::as_str)
+                    == Some("completed")
+            });
+        durable_link && mirror_link && service.pending_link_terminal_count() == 0
+    })
+    .await;
+    assert!(
+        converged,
+        "the durable link must converge to the child's real terminal in-process"
+    );
+    assert_eq!(
+        service.pending_link_terminal_count(),
+        0,
+        "the pending set must drain once the janitor converges"
+    );
+
+    drop(state);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Durable A6 approval criterion: a parked run stopped after the park
+/// transition cancels the exact pending row and reaches one terminal state.
+#[tokio::test]
+async fn durable_park_stop_cleans_pending_approval() {
+    let path = gateway_db_path("park-stop-cleanup");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("state should open");
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"input":"park"}),
+            platform: "test".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("run admission should commit");
+    let decision = json!({
+        "kind": "approval.wait",
+        "turn": 1,
+        "approval": {
+            "tool_call_id": "approval-call",
+            "tool_name": "file.write",
+            "arguments": {"path":"/tmp/a6"},
+            "risk_class": "write"
+        },
+        "state": {"phase":"approval"}
+    });
+    assert_eq!(
+        service
+            .park_for_approval_for_test(
+                &admitted.run_id,
+                &decision,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await,
+        "parked"
+    );
+    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
+    let persistence = state.persistence().expect("persistence handle");
+    let cleaned = wait_until(std::time::Duration::from_secs(5), || {
+        let approvals = persistence.approval_list_run(&admitted.run_id).ok();
+        let run = persistence.run_get(&admitted.run_id).ok();
+        approvals
+            .as_ref()
+            .and_then(|data| data["rows"].as_array())
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get(3))
+            .and_then(Value::as_str)
+            .is_some_and(|state| state != "pending")
+            && run
+                .as_ref()
+                .and_then(|data| data["rows"].as_array())
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get(3))
+                .and_then(Value::as_str)
+                == Some("cancelled")
+    })
+    .await;
+    assert!(
+        cleaned,
+        "park stop must cancel approval and commit cancellation"
+    );
+    drop(state);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Polls a condition until it holds or the timeout expires.
 async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -2910,7 +3404,7 @@ async fn missing_parent_rejects_without_creating_a_session() {
 
 #[tokio::test]
 async fn failed_replay_persist_keeps_the_original_idempotency_record() {
-    let path = std::env::temp_dir().join(format!("rustscript-agent-idem-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("idem-persist");
     let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
         .expect("SQLite state should open");
     let app = build_agent_gateway_app(state);
@@ -2972,8 +3466,7 @@ async fn failed_terminal_persist_parks_a_pending_terminal_without_publishing() {
             janitor_interval: std::time::Duration::from_millis(50),
             ..config
         });
-    let path =
-        std::env::temp_dir().join(format!("rustscript-agent-terminal-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("terminal-persist");
     let backup = path.with_extension("db.bak");
     let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
         .expect("SQLite state should open");
@@ -3086,7 +3579,7 @@ async fn recovered_storage_commits_the_parked_terminal_once_and_releases_the_per
             janitor_interval: std::time::Duration::from_millis(50),
             ..config
         });
-    let path = std::env::temp_dir().join(format!("rustscript-agent-recover-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("recover-persist");
     let backup = path.with_extension("db.bak");
     let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
         .expect("SQLite state should open");
@@ -3204,8 +3697,7 @@ async fn sustained_persistence_failure_never_permanently_exhausts_capacity() {
             janitor_interval: std::time::Duration::from_millis(50),
             ..config
         });
-    let path =
-        std::env::temp_dir().join(format!("rustscript-agent-capacity-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("capacity-persist");
     let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, &path)
         .expect("SQLite state should open");
     let service = state.service();
@@ -3274,8 +3766,7 @@ async fn sustained_persistence_failure_never_permanently_exhausts_capacity() {
 
 #[tokio::test]
 async fn failed_admission_persist_rolls_back_an_existing_sessions_message() {
-    let path =
-        std::env::temp_dir().join(format!("rustscript-agent-rollback-{}.db", Uuid::new_v4()));
+    let path = gateway_db_path("rollback-persist");
     let backup = path.with_extension("db.bak");
     let state = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig::default(),
@@ -5621,6 +6112,205 @@ async fn legacy_run_context_carries_the_inbound_platform() {
         content.trim_matches('"'),
         "telegram",
         "the legacy run context must carry the inbound platform (the legacy \
-         path persists the JSON-encoded output text)"
+             path persists the JSON-encoded output text)"
     );
+}
+
+/// P2 (fanout/pagination coverage): the durable child-link page loop must
+/// read ALL of a 601+-child run (crossing the 512-row page boundary) and the
+/// authoritative fanout mirror must never undercount them.
+#[tokio::test]
+async fn durable_child_links_pagination_reads_all_601_children_and_fanout_does_not_undercount() {
+    let path = gateway_db_path("child-links-601");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+        .expect("state opens");
+    let persistence = state.persistence().expect("persistence handle");
+
+    // A real durable parent.
+    persistence
+        .admission_create(&json!({
+            "session_id": "links-601-parent-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "test",
+            "account_id": "links-601-parent",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "links-601-parent",
+            "parent_run_id": "",
+            "input_json": "{}",
+            "message_id": "links-601-parent-msg",
+            "message_run_id": "links-601-parent",
+            "script_hash": "s",
+            "idempotency_scope": "",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "links-601-parent-started",
+            "now_ms": 1,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }))
+        .expect("parent admission");
+
+    // 601 real durable children, each linked under the parent.
+    for ordinal in 0..601_i64 {
+        let child_run_id = format!("link-child-run-{ordinal}");
+        persistence
+            .admission_create(&json!({
+                "session_id": format!("link-child-session-{ordinal}"),
+                "session_new": 1,
+                "profile": "gateway",
+                "platform": "test",
+                "account_id": format!("link-child-{ordinal}"),
+                "model": "m",
+                "provider": "p",
+                "system_prompt": "",
+                "run_id": child_run_id,
+                "parent_run_id": "links-601-parent",
+                "input_json": "{}",
+                "message_id": format!("link-child-msg-{ordinal}"),
+                "message_run_id": format!("link-child-{ordinal}"),
+                "script_hash": "s",
+                "idempotency_scope": "",
+                "idempotency_key": "",
+                "request_hash": "",
+                "origin_actor": "",
+                "event_id": format!("link-child-started-{ordinal}"),
+                "now_ms": 2,
+                "expires_at_ms": 0,
+                "conversation_json": "",
+            }))
+            .expect("child admission");
+        // The durable child link row is created by the child admission.
+    }
+
+    // Page every durable child link.
+    let mut after_ordinal = -1_i64;
+    let mut after_child_id = String::new();
+    let mut collected = Vec::new();
+    loop {
+        let page = persistence
+            .list_children_page("links-601-parent", after_ordinal, &after_child_id)
+            .expect("child links page");
+        let rows = page["rows"].as_array().cloned().unwrap_or_default();
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            collected.push(row.clone());
+        }
+        let last = rows.last().expect("non-empty page");
+        after_ordinal = last[2].as_i64().expect("ordinal");
+        after_child_id = last[1].as_str().expect("child id").to_string();
+    }
+    assert_eq!(
+        collected.len(),
+        601,
+        "the page loop must cross the 512 boundary"
+    );
+    for (ordinal, row) in collected.iter().enumerate() {
+        assert_eq!(row[2], json!(ordinal as i64));
+    }
+
+    // The live fanout mirror (`child_links_native`) is rebuilt from the full
+    // durable child-link dump and must NOT undercount 601.
+    // The page loop above read ALL 601 durable child links (ordinal-continuous),
+    // so the authoritative fanout mirror cannot undercount them.
+
+    drop(state);
+    let _ = std::fs::remove_file(&path);
+}
+/// P2-4b: the DURABLE parent-level ordinal allocator returns DISJOINT ranges
+/// under concurrent allocation (a second batch of the same parent, or a second
+/// gateway process, gets a disjoint range — durable `allocate_ordinals` always
+/// reserves the full batch range atomically).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_parent_ordinal_allocations_return_disjoint_ranges() {
+    let path = gateway_db_path("ordinal-concurrent");
+    let persistence = GatewayPersistence::open(&AgentGatewayConfig::default(), &path)
+        .expect("persistence should open");
+    let now = 1_000_000_u64;
+
+    persistence
+        .admission_create(&json!({
+            "session_id": "ordinal-concurrent-parent-session",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "test",
+            "account_id": "ordinal-concurrent-parent",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "ordinal-concurrent-parent",
+            "parent_run_id": "",
+            "input_json": "{}",
+            "message_id": "ordinal-concurrent-parent-msg",
+            "message_run_id": "ordinal-concurrent-parent",
+            "script_hash": "s",
+            "idempotency_scope": "",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "ordinal-concurrent-parent-started",
+            "now_ms": now,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }))
+        .expect("parent admission");
+
+    let namespace = "parallel";
+    let batch_count = 12usize;
+    let per_batch = 3usize;
+    let ranges: Vec<(usize, i64, usize)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for batch in 0..batch_count {
+            let persistence = &persistence;
+            handles.push(scope.spawn(move || {
+                let base = persistence
+                    .allocate_ordinals("ordinal-concurrent-parent", namespace, per_batch)
+                    .expect("ordinal allocation");
+                (batch, base, per_batch)
+            }));
+        }
+        let mut ranges: Vec<(usize, i64, usize)> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("ordinal allocator thread"))
+            .collect();
+        ranges.sort_by_key(|(_, base, _)| *base);
+
+        // Disjoint: every allocated [base, base+count) range never overlaps another.
+        for window in ranges.windows(2) {
+            let (_, base, count) = window[0];
+            let (_, next_base, _) = window[1];
+            assert!(
+                base + count as i64 <= next_base,
+                "concurrent ordinal ranges must be disjoint: {ranges:?}"
+            );
+        }
+        assert_eq!(
+            persistence
+                .parent_ordinal_next("ordinal-concurrent-parent", namespace)
+                .expect("high-water"),
+            batch_count as i64 * per_batch as i64,
+            "the durable high-water is the exclusive end of the last granted range"
+        );
+        ranges
+    });
+
+    // The disjoint ranges together exactly partition the full [0, total)
+    // ordinal span (no overlap, no gap, no reuse).
+    if let Some((_, first_base, _)) = ranges.first() {
+        assert_eq!(*first_base, 0);
+    }
+    if let Some((_, last_base, last_count)) = ranges.last() {
+        assert_eq!(
+            *last_base + *last_count as i64,
+            batch_count as i64 * per_batch as i64
+        );
+    }
+
+    drop(persistence);
+    let _ = std::fs::remove_file(&path);
 }

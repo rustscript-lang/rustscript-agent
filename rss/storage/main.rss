@@ -71,6 +71,13 @@ struct RunIdInput {
 }
 
 
+struct ChildLinksPageInput {
+    run_id: string,
+    after_ordinal: int,
+    after_child_id: string
+}
+
+
 struct SessionListInput {
     profile: string,
     platform: string
@@ -334,13 +341,36 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         result = storage_unwrap(request_id, op, load::storage_load_all(db_id, command.payload_json));
     } else if command.op == "run.link_child" {
         result = storage_unwrap(request_id, op, runs::storage_run_link_child(db_id, command.payload_json));
+    } else if command.op == "run.link_state" {
+        result = storage_unwrap(request_id, op, runs::storage_run_link_state(db_id, command.payload_json));
     } else if command.op == "run.list_children" {
         let input: RunIdInput = json::decode::<RunIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, runs::storage_run_list_children(db_id, input.run_id, command.max_rows, command.max_bytes));
+    } else if command.op == "run.list_children_page" {
+        let input: ChildLinksPageInput = json::decode::<ChildLinksPageInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, runs::storage_run_list_children_page(db_id, input.run_id, input.after_ordinal, input.after_child_id, command.max_rows, command.max_bytes));
     } else if command.op == "run.usage" {
         result = storage_raw_ok(request_id, op, runs::storage_run_record_usage(db_id, command.payload_json));
-    } else if command.op == "runs.prune_terminal" {
+} else if command.op == "runs.prune_terminal" {
         result = storage_raw_ok(request_id, op, runs::storage_runs_prune_terminal(db_id, command.payload_json));
+    } else if command.op == "run.allocate_ordinal" {
+        let alloc_result: map = runs::storage_run_allocate_ordinal(db_id, command.payload_json);
+        let alloc_ok: bool = alloc_result["ok"];
+        if alloc_ok == true {
+            let alloc_data: map = alloc_result["result"];
+            result = storage_ok(request_id, op, alloc_data, 0, false, 0);
+        } else {
+            result = storage_error(request_id, op, alloc_result["code"], alloc_result["message"]);
+        }
+    } else if command.op == "run.ordinal_next" {
+        let next_result: map = runs::storage_run_ordinal_next(db_id, command.payload_json);
+        let next_ok: bool = next_result["ok"];
+        if next_ok == true {
+            let next_data: map = next_result["result"];
+            result = storage_ok(request_id, op, next_data, 0, false, 0);
+        } else {
+            result = storage_error(request_id, op, next_result["code"], next_result["message"]);
+        }
     } else if command.op == "idempotency.begin" {
         result = storage_raw_ok(request_id, op, runs::storage_run_idempotency_begin(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "idempotency.complete" {
@@ -419,6 +449,9 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
     } else if command.op == "approval.get" {
         let input: ApprovalIdInput = json::decode::<ApprovalIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, approvals::storage_approval_get(db_id, input.approval_id, command.max_rows, command.max_bytes));
+    } else if command.op == "approval.list_run" {
+        let input: RunIdInput = json::decode::<RunIdInput>(command.payload_json);
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_list_run(db_id, input.run_id, command.max_rows, command.max_bytes));
     } else if command.op == "approval.resolve" {
         result = storage_raw_ok(request_id, op, approvals::storage_approval_resolve(db_id, command.payload_json));
     } else if command.op == "approval.expire" {
