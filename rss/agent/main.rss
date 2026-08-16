@@ -189,12 +189,14 @@ fn loop_array_entry(items: array, index: int) -> map {
 // Decision builders
 // ---------------------------------------------------------------------------
 
-fn run_completed_decision(turn: int, text: string, messages: array) -> map {
+fn run_completed_decision(turn: int, text: string, messages: array, usage: map, stop_reason: string) -> map {
     {
         kind: "run.completed",
         turn: turn,
         text: text,
-        messages: messages
+        messages: messages,
+        usage: usage,
+        stop_reason: stop_reason
     }
 }
 
@@ -388,19 +390,49 @@ fn messages_with_system(messages: array, system_prompt: string) -> array {
 }
 
 /// Builds the canonical LlmRequest (rss/llm/types.rss shape) from the loop
-/// context: model, messages (with system prompt, ordinals stripped), registry
-/// tools, sampling, stream flag, and provider_options.
+/// context: model, messages (with system prompt, ordinals stripped), tools,
+/// sampling, stream flag, and provider_options.
+///
+/// Per-request overrides arrive as the typed `request` context map (the
+/// gateway's OpenAI route renders them into the canonical run context —
+/// never string markers or injected source): `tools` (canonical
+/// descriptors) replaces the registry default list when non-empty,
+/// `tool_choice` (string) overrides "auto", `sampling` carries
+/// temperature/top_p, `max_output_tokens` bounds the output, and `stream`
+/// selects the transport. Provider credentials/base_url are NEVER read from
+/// the request map: they come from the gateway-owned `provider_options`.
 fn build_request(context: map, messages: array) -> map {
     let config: map = ctx_map(context, "config");
+    let request: map = ctx_map(context, "request");
+    let client_tools: array = types::request_array(request, "tools");
+    // OpenAI's normalized route always supplies `tools_explicit`: omitted
+    // `tools` and `tools: []` both become an empty client declaration. Legacy
+    // and Telegram contexts omit this flag and retain the registry fallback.
+    let tools_explicit: bool = types::request_bool(request, "tools_explicit", false);
+    let mut tools: array = request_tool_descriptors();
+    if tools_explicit || client_tools.length > 0 {
+        tools = client_tools;
+    }
+    let client_choice: string = types::request_string(request, "tool_choice");
+    let mut choice: string = "auto";
+    if client_choice != "" {
+        choice = client_choice;
+    }
+    let mut max_output: int = types::request_int(request, "max_output_tokens", 0);
+    if max_output <= 0 {
+        max_output = ctx_int(config, "max_output_tokens", 1024);
+    }
+    let sampling: map = types::request_map(request, "sampling");
     {
         model: ctx_string(context, "model", ""),
         messages: messages_with_system(request_messages(messages), ctx_string(context, "system_prompt", "")),
-        tools: request_tool_descriptors(),
-        tool_choice: "auto",
+        tools: tools,
+        tool_choice: choice,
         reasoning: "",
-        sampling: { temperature: null, top_p: null },
-        max_output_tokens: ctx_int(config, "max_output_tokens", 1024),
-        stream: ctx_bool(config, "stream", true),
+        sampling: sampling,
+        max_output_tokens: max_output,
+        max_output_tokens_field: types::request_string(request, "max_output_tokens_field"),
+        stream: types::request_bool(request, "stream", ctx_bool(config, "stream", true)),
         provider_options: ctx_map(context, "provider_options")
     }
 }
@@ -447,6 +479,7 @@ fn build_profile(provider: string, options: map) -> map {
         api_key: types::request_string(options, "api_key"),
         model: types::request_string(options, "model"),
         adapter: types::request_string(options, "adapter"),
+        max_tokens_field: types::request_string(options, "max_tokens_field"),
         capabilities: types::request_map(options, "capabilities")
     }
 }
@@ -487,7 +520,7 @@ fn start_phase(context: map) -> map {
     let max_turns: int = ctx_int(context, "max_turns", 1);
     let retry_count: int = ctx_int(context, "retry_count", 0);
     let last_text: string = ctx_string(context, "last_text", "");
-    let mut decision: map = run_completed_decision(turn, last_text, ctx_array(context, "messages"));
+    let mut decision: map = run_completed_decision(turn, last_text, ctx_array(context, "messages"), ctx_map(context, "usage"), ctx_string(context, "stop_reason", "stop"));
     if turn < max_turns {
         if retry_count == 0 {
             decision = start_turn(context, turn, max_turns, last_text);
@@ -563,34 +596,59 @@ fn provider_result(context: map, turn: int, max_turns: int, retry_count: int, re
     decision
 }
 
-/// Success path: canonical `model.delta` + `model.completed`; text-only
-/// completes the run (the final assistant message is service-owned), tool
-/// calls enter the tool cycle with the assistant message appended. The
-/// CURRENT round's text becomes the cycle's last_text: a max-turn terminal
-/// after a tool cycle must carry this round's real text, never a stale or
-/// empty one.
+fn bounded_event_text(text: string, config: map) -> string {
+    let max_event_bytes: int = ctx_int(config, "max_event_bytes", 32768);
+    let mut text_limit: int = 0;
+    if max_event_bytes > 512 {
+        text_limit = max_event_bytes - 512;
+    }
+    let mut event_text: string = text;
+    if event_text.length > text_limit {
+        event_text = "";
+    }
+    event_text
+}
+
+/// Success path: canonical `model.delta` + `model.completed` (carrying the
+/// provider-reported usage and stop reason); text-only completes the run
+/// (the final assistant message is service-owned), tool calls enter the
+/// tool cycle with the assistant message appended. The CURRENT round's text
+/// becomes the cycle's last_text: a max-turn terminal after a tool cycle
+/// must carry this round's real text, never a stale or empty one. The
+/// round's usage/stop_reason ride the carried context so the eventual
+/// `run.completed` decision reports the FINAL round's canonical usage.
 fn provider_ok_result(context: map, turn: int, max_turns: int, retry_count: int, result: map) -> map {
     let response: map = ctx_map(result, "response");
     let text: string = types::request_string(response, "text");
     let tool_calls: array = types::request_array(response, "tool_calls");
+    let usage: map = types::request_map(response, "usage");
+    let stop_reason: string = types::request_string(response, "stop_reason");
     let config: map = ctx_map(context, "config");
+    let event_text: string = bounded_event_text(text, config);
     stream::emit({
         type: "model.delta",
         turn: turn,
-        delta: text,
+        delta: event_text,
+        truncated: event_text != text,
         stream: ctx_bool(config, "stream", true)
     });
     stream::emit({
         type: "model.completed",
         turn: turn,
-        text: text,
-        tool_calls: tool_calls.length
+        text: event_text,
+        truncated: event_text != text,
+        tool_calls: tool_calls.length,
+        usage: usage,
+        stop_reason: stop_reason
     });
-    let mut decision: map = run_completed_decision(turn + 1, text, ctx_array(context, "messages"));
+    let mut decision: map = run_completed_decision(turn + 1, text, ctx_array(context, "messages"), usage, stop_reason);
     if tool_calls.length > 0 {
         let mut messages: array = ctx_array(context, "messages");
         messages[messages.length] = assistant_message(next_ordinal(messages), text, tool_calls.copy());
-        decision = tool_cycle(context, turn, messages, tool_calls, 0, text);
+        let mut next_context: map = context;
+        next_context["usage"] = usage;
+        next_context["stop_reason"] = stop_reason;
+        decision = tool_cycle(next_context, turn, messages, tool_calls, 0, text);
     }
     decision
 }
@@ -659,7 +717,13 @@ fn tool_step(context: map, turn: int, messages: array, tool_calls: array, index:
     let call: map = loop_array_entry(tool_calls, index);
     let name: string = types::request_string(call, "name");
     let call_id: string = types::request_string(call, "id");
-    stream::emit({ type: "tool.started", tool_call_id: call_id, name: name, turn: turn });
+    stream::emit({
+        type: "tool.started",
+        tool_call_id: call_id,
+        name: name,
+        turn: turn,
+        arguments: types::request_map(call, "arguments")
+    });
     let registry_result: map = registry_run({ op: "describe", tool_name: name });
     let mut decision: map = run_failed_decision(
         turn,
@@ -910,7 +974,7 @@ fn execute_tool(name: string, arguments: map) -> map {
 fn continue_next_turn(context: map, turn: int, messages: array, last_text: string) -> map {
     let next_turn: int = turn + 1;
     let max_turns: int = ctx_int(context, "max_turns", 1);
-    let mut decision: map = run_completed_decision(next_turn, last_text, messages);
+    let mut decision: map = run_completed_decision(next_turn, last_text, messages, ctx_map(context, "usage"), ctx_string(context, "stop_reason", "stop"));
     if next_turn < max_turns {
         let mut next_context: map = context;
         next_context["turn"] = next_turn;

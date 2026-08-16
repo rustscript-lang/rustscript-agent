@@ -268,7 +268,7 @@ pub fn default_max_bytes() -> int {
 }
 
 pub fn default_max_events() -> int {
-    128
+    4096
 }
 
 pub fn default_max_messages() -> int {
@@ -281,6 +281,20 @@ pub fn max_rows_limit(requested: int) -> int {
     if value > 512 => { 512 } else => { value }
 }
 
+/// Event replay row cap: the durable retention window is configurable up to
+/// [`max_events_limit`] (16384), so replay pages must be able to serve a
+/// full window — NOT the general 512-row query cap (which stays for
+/// list-style queries such as `run.list`).
+pub fn event_replay_limits(max_events: int, max_bytes: int) -> map<int> {
+    let mut rows: int = max_events;
+    if rows <= 0 => { rows = 128; rows } else => { rows };
+    if rows > 16384 => { rows = 16384; rows } else => { rows };
+    {
+        max_rows: rows,
+        max_result_bytes: max_bytes_limit(max_bytes)
+    }
+}
+
 pub fn max_bytes_limit(requested: int) -> int {
     let mut value: int = requested;
     if value <= 0 => { value = default_max_bytes(); value } else => { value };
@@ -290,7 +304,7 @@ pub fn max_bytes_limit(requested: int) -> int {
 pub fn max_events_limit(requested: int) -> int {
     let mut value: int = requested;
     if value <= 0 => { value = default_max_events(); value } else => { value };
-    if value > 256 => { 256 } else => { value }
+    if value > 16384 => { 16384 } else => { value }
 }
 
 pub fn max_messages_limit(requested: int) -> int {
@@ -307,6 +321,6 @@ pub fn query_limits(requested_rows: int, requested_bytes: int) -> map<int> {
 }
 
 pub fn event_retention_limit(requested: int) -> int {
-    let value = if requested <= 0 => { 256 } else => { requested };
-    if value > 2048 => { 2048 } else => { value }
+    let value = if requested <= 0 => { 4096 } else => { requested };
+    if value > 16384 => { 16384 } else => { value }
 }

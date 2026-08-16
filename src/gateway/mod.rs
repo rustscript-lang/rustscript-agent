@@ -2,6 +2,10 @@
 //! RSS-backed store. Platform adapters (API Server, later Telegram) consume
 //! AgentService and cannot call providers or tools directly.
 
+/// OpenAI-compatible Chat Completions route (`POST /v1/chat/completions`):
+/// inbound normalization into the canonical AgentService/session/run
+/// contract and canonical-event -> OpenAI outbound rendering only.
+mod api_openai;
 mod api_server;
 /// Native Telegram Bot API transport, poller, and adapter. Public so
 /// integration tests can drive the client and adapter against a fixture

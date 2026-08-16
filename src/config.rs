@@ -204,7 +204,7 @@ impl Default for TelegramConfig {
 }
 
 /// Validated configuration shared by the gateway, AgentService, and runner.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentGatewayConfig {
     pub model: String,
     pub provider: Option<String>,
@@ -252,6 +252,12 @@ pub struct AgentGatewayConfig {
     pub max_events_per_run: usize,
     pub max_event_bytes: usize,
     pub terminal_run_ttl: Duration,
+    /// Durable retention of TERMINAL runs (completed/failed/cancelled): the
+    /// janitor deletes terminal runs older than this window (and their
+    /// events/retention/idempotency records) through the typed
+    /// `runs.prune_terminal` RSS command. Active and pending runs are never
+    /// touched (restart replay and the terminal retry loop depend on them).
+    pub durable_run_retention: Duration,
     pub cancellation_grace: Duration,
     pub janitor_interval: Duration,
     /// Bounded window during which a terminal commit that failed while
@@ -292,6 +298,65 @@ pub struct AgentGatewayConfig {
     pub telegram: Option<TelegramConfig>,
 }
 
+/// `provider_options` and bearer credentials are intentionally omitted from
+/// Debug output.  Provider profiles routinely carry API keys, authorization
+/// headers, and private endpoint credentials; formatting the raw JSON here
+/// would make an innocent `{:?}` log a credential exfiltration surface.
+impl std::fmt::Debug for AgentGatewayConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentGatewayConfig")
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .field("provider_options", &"REDACTED")
+            .field("max_turns", &self.max_turns)
+            .field("max_retries", &self.max_retries)
+            .field("base_retry_delay_ms", &self.base_retry_delay_ms)
+            .field("max_retry_delay_ms", &self.max_retry_delay_ms)
+            .field("approval_mode", &self.approval_mode)
+            .field("approval_timeout", &self.approval_timeout)
+            .field("max_context_messages", &self.max_context_messages)
+            .field("retained_tail", &self.retained_tail)
+            .field("stream", &self.stream)
+            .field("parallel", &self.parallel)
+            .field("task", &self.task)
+            .field("agent_name", &self.agent_name)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "REDACTED"),
+            )
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_concurrent_runs", &self.max_concurrent_runs)
+            .field("run_timeout", &self.run_timeout)
+            .field("event_channel_capacity", &self.event_channel_capacity)
+            .field("broadcast_capacity", &self.broadcast_capacity)
+            .field("max_events_per_run", &self.max_events_per_run)
+            .field("max_event_bytes", &self.max_event_bytes)
+            .field("terminal_run_ttl", &self.terminal_run_ttl)
+            .field("durable_run_retention", &self.durable_run_retention)
+            .field("cancellation_grace", &self.cancellation_grace)
+            .field("janitor_interval", &self.janitor_interval)
+            .field(
+                "terminal_commit_retry_window",
+                &self.terminal_commit_retry_window,
+            )
+            .field("terminal_persist_retries", &self.terminal_persist_retries)
+            .field(
+                "terminal_persist_retry_delay",
+                &self.terminal_persist_retry_delay,
+            )
+            .field("rate_limit", &self.rate_limit)
+            .field("client_disconnect_policy", &self.client_disconnect_policy)
+            .field("sse_keepalive_interval", &self.sse_keepalive_interval)
+            .field("http", &self.http)
+            .field("sqlite", &self.sqlite)
+            .field("io", &self.io)
+            .field("fuel", &self.fuel)
+            .field("telegram", &self.telegram)
+            .finish()
+    }
+}
+
 impl AgentGatewayConfig {
     /// Validates that every lifecycle bound is positive.
     pub fn validate(&self) -> Result<(), String> {
@@ -318,6 +383,9 @@ impl AgentGatewayConfig {
         }
         if self.terminal_run_ttl.is_zero() {
             return Err("terminal_run_ttl must be positive".to_string());
+        }
+        if self.durable_run_retention.is_zero() {
+            return Err("durable_run_retention must be positive".to_string());
         }
         if self.cancellation_grace.is_zero() {
             return Err("cancellation_grace must be positive".to_string());
@@ -487,9 +555,10 @@ impl Default for AgentGatewayConfig {
             run_timeout: Duration::from_secs(900),
             event_channel_capacity: 64,
             broadcast_capacity: 64,
-            max_events_per_run: 240,
+            max_events_per_run: 8192,
             max_event_bytes: 32 * 1024,
             terminal_run_ttl: Duration::from_secs(60),
+            durable_run_retention: Duration::from_secs(86_400),
             cancellation_grace: Duration::from_secs(5),
             janitor_interval: Duration::from_secs(5),
             terminal_commit_retry_window: Duration::from_secs(300),

@@ -1120,6 +1120,68 @@ async fn event_retention_respects_the_configured_per_run_limit() {
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
 }
 
+/// A NORMAL terminal (run.completed committed) closes the broadcast
+/// sender: a subscriber that joins AFTER the terminal with a cursor at/past
+/// the terminal must end immediately (empty replay, no live receiver), not
+/// hang until the janitor TTL releases the handle.
+#[tokio::test]
+async fn normal_terminal_closes_the_broadcast_sender() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        r#"
+        use stream;
+        pub fn run(input: map) -> string {
+            stream::emit({"type": "model.delta", "delta": "d1"});
+            "done";
+        }
+        "#,
+    )
+    .expect("RSS source should compile");
+    let service = state.service();
+    let app = build_agent_gateway_app(state);
+    let (status, run) = json_request(
+        &app,
+        axum::http::Method::POST,
+        "/v1/runs",
+        json!({"input": "sender-close"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let run_id = run["run_id"].as_str().expect("run id").to_string();
+    let finished = wait_until(std::time::Duration::from_secs(10), || {
+        service.available_capacity() == AgentGatewayConfig::default().max_concurrent_runs
+    })
+    .await;
+    assert!(finished, "the run must finish");
+    // A subscriber joining AFTER the terminal with a cursor at u64::MAX
+    // (everything after the maximum sequence) must end immediately: the
+    // terminal commit closed the broadcast sender, so there is no live
+    // receiver to wait on.
+    let uri = format!("/v1/runs/{run_id}/events?after_seq={}", u64::MAX);
+    let after_terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .expect("SSE request should build"),
+            )
+            .await
+            .expect("SSE route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("SSE body should be readable");
+        String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8")
+    })
+    .await;
+    let text = after_terminal
+        .expect("a post-terminal subscriber must end promptly, not hang until the janitor TTL");
+    assert_eq!(text.trim(), "", "no events after the terminal, got: {text}");
+}
+
 /// P1-2 (production path, fault injection): a durable admission failure
 /// (disk made read-only mid-flight) leaves no partial state that a restart
 /// could resurrect. The single-transaction `admission.create` rolls back
@@ -1157,6 +1219,7 @@ async fn failed_admission_leaves_no_resurrecting_partial_state() {
             "event_id": event_id,
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": "",
         })
     };
     // Pre-fault admission commits fully.
@@ -1442,6 +1505,7 @@ async fn approval_and_compaction_repository_round_trip_restart() {
             "event_id": "repo-event",
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }))
         .expect("admission should commit");
     let approval = first
@@ -1588,6 +1652,7 @@ async fn production_load_drains_beyond_page_and_byte_boundaries() {
             "event_id": "event-started",
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }))
         .expect("admission should commit");
     now += 1;
@@ -1686,6 +1751,32 @@ async fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() ->
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Polls the detailed-health endpoint until `terminal_pending` reaches the
+/// expected value. The pending-entry retry loop re-inserts the parked marker
+/// after each failed attempt, so a single health read can transiently overlap
+/// that take/re-put gap under load.
+async fn wait_for_health_terminal_pending(app: &axum::Router, expected: usize) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, health) = json_request(
+            app,
+            axum::http::Method::GET,
+            "/health/detailed",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if health["terminal_pending"].as_u64() == Some(expected as u64) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "health must report {expected} terminal_pending, got {health}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
@@ -1844,6 +1935,12 @@ async fn terminal_commit_window_expiry_releases_capacity_and_restart_recovery_re
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let run_id = run["run_id"].as_str().expect("run id").to_string();
+    let sse_app = app.clone();
+    let sse_run_id = run_id.clone();
+    let sse_task = tokio::spawn(async move { read_run_events(&sse_app, &sse_run_id).await });
+    // Attach before the storage fault so the live terminal-expiry event is
+    // retained for the subscriber while the handle TTL is running.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Storage goes down before the terminal commit.
     let broken = path.with_extension("db.broken");
@@ -1878,41 +1975,62 @@ async fn terminal_commit_window_expiry_releases_capacity_and_restart_recovery_re
     assert_eq!(health_status, StatusCode::OK);
     assert_eq!(health["terminal_pending"], json!(1));
 
-    // The window expires while storage is still down: the retry stops and
-    // the live stream ends without ever fabricating a terminal event.
-    let expired = wait_until(std::time::Duration::from_secs(10), || {
-        service.pending_terminal_count() == 0
+    // The window expires while storage is still down. The pending entry is
+    // converted to a recoverable terminal-expiry marker and remains parked;
+    // no live event is published before a durable row exists. The retry loop
+    // re-inserts the parked entry after each failed attempt, so poll past
+    // that transient take gap AFTER the window has elapsed.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let kept = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 1
     })
     .await;
-    assert!(expired, "the bounded retry window must expire");
-    let text = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        read_run_events(&app, &run_id),
-    )
-    .await
-    .expect("the SSE stream must end once the retry window expires");
     assert!(
-        !text.contains("event: run.cancelled")
-            && !text.contains("event: run.completed")
-            && !text.contains("event: run.failed"),
-        "no terminal event may be published after expiry, got: {text}"
+        kept,
+        "the terminal-expiry marker must remain recoverable while storage is down"
     );
+    wait_for_health_terminal_pending(&app, 1).await;
 
-    // Capacity is never exhausted and the handle is TTL-released.
+    // Capacity is released while the fallback waits for durable storage.
     assert_eq!(
         service.available_capacity(),
         AgentGatewayConfig::default().max_concurrent_runs
     );
+
+    // Storage recovers; the fallback commits exactly one typed terminal and
+    // only then closes the SSE stream.
+    std::fs::remove_dir(&path).expect("restore storage");
+    std::fs::rename(&broken, &path).expect("restore the db file");
+    let text = tokio::time::timeout(std::time::Duration::from_secs(15), sse_task)
+        .await
+        .expect("the terminal-expiry fallback must publish after recovery")
+        .expect("the live SSE task must resolve");
+    assert_eq!(
+        text.matches("event: run.failed").count(),
+        1,
+        "exactly one terminal failure must be published, got: {text}"
+    );
+    assert!(
+        text.contains("terminal_retry_expired"),
+        "expiry must be surfaced as a typed terminal outcome, got: {text}"
+    );
+    let resolved = wait_until(std::time::Duration::from_secs(10), || {
+        service.pending_terminal_count() == 0
+    })
+    .await;
+    assert!(
+        resolved,
+        "the expiry fallback must remove the pending entry"
+    );
+
     let released = wait_until(std::time::Duration::from_secs(10), || {
         service.handle_count() == 0
     })
     .await;
-    assert!(released, "the terminal-pending handle must be TTL-released");
+    assert!(released, "the terminal handle must be TTL-released");
 
-    // Storage recovers; restart recovery fails the interrupted run exactly
-    // once, so the durable side reaches a real terminal state.
-    std::fs::remove_dir(&path).expect("restore storage");
-    std::fs::rename(&broken, &path).expect("restore the db file");
+    // Restart round trip: the durable side already has the typed expiry
+    // terminal, so restart must not manufacture a second recovery event.
     drop(app);
     let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
         .expect("SQLite state should reload");
@@ -1921,8 +2039,9 @@ async fn terminal_commit_window_expiry_releases_capacity_and_restart_recovery_re
     assert_eq!(
         text.matches("event: run.failed").count(),
         1,
-        "restart recovery must fail the interrupted run exactly once, got: {text}"
+        "restart must not duplicate the expiry terminal, got: {text}"
     );
+    assert!(text.contains("terminal_retry_expired"));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1979,6 +2098,7 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
         AgentGatewayConfig {
             janitor_interval: std::time::Duration::from_millis(100),
             terminal_commit_retry_window: std::time::Duration::from_secs(10),
+            max_events_per_run: 2,
             http,
             ..AgentGatewayConfig::default()
         },
@@ -2698,6 +2818,26 @@ fn invalid_config_is_rejected_by_the_constructor() {
     );
 }
 
+#[test]
+fn agent_gateway_config_debug_redacts_all_provider_and_bearer_secrets() {
+    let config = AgentGatewayConfig {
+        bearer_token: Some("bearer-super-secret".to_string()),
+        provider_options: json!({
+            "api_key": "provider-super-secret",
+            "authorization": "Bearer provider-super-secret",
+            "nested": {"token": "nested-super-secret"}
+        }),
+        ..AgentGatewayConfig::default()
+    };
+    let rendered = format!("{config:?}");
+    assert!(
+        !rendered.contains("super-secret"),
+        "debug leaked a secret: {rendered}"
+    );
+    assert!(rendered.contains("provider_options: \"REDACTED\""));
+    assert!(rendered.contains("bearer_token: Some(\"REDACTED\")"));
+}
+
 #[tokio::test]
 async fn idempotency_conflict_creates_no_session() {
     let state = AgentGatewayState::new(AgentGatewayConfig::default())
@@ -3294,6 +3434,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "event_id": "crash-event",
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }))
         .expect("admission should commit");
     for (message_id, content) in [
@@ -3394,6 +3535,7 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "event_id": "crash-event-retry",
             "now_ms": now + 5,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }))
         .expect("retry admission should commit");
     // Admission leaves the run `running`; move it to compacting.
@@ -4635,9 +4777,10 @@ async fn sse_subscriber_lag_emits_typed_error_and_replay_recovers() {
 
 /// A9: closing the storage worker while a run is mid-flight must not hang
 /// or leak: delivery drops the unpersistable event (observable), the run
-/// parks as terminal_pending, the bounded retry fails fast and expires,
-/// the handle is released via its TTL, no terminal is fabricated, and
-/// restart recovery repairs the durable side exactly once.
+/// parks as terminal_pending, the original retry window converts to a
+/// recoverable expiry marker, the handle is released via its TTL, no live
+/// terminal is fabricated without durable storage, and restart recovery
+/// repairs the durable side exactly once.
 #[tokio::test]
 async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
     let (port, arrived, release, fixture) = spawn_holding_fixture();
@@ -4727,8 +4870,9 @@ async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
         "a terminal-pending run must not hold the admission permit"
     );
 
-    // The bounded retry fails fast against the closed worker and then
-    // expires: the entry is dropped and the handle is released via its TTL.
+    // The fallback remains recoverable while the worker is closed; the
+    // handle is released via its TTL, while its sender is not used as proof
+    // of a terminal without a durable row.
     let released = wait_until(std::time::Duration::from_secs(10), || {
         service.handle_count() == 0
     })
@@ -4736,8 +4880,8 @@ async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
     assert!(released, "the handle must be released via its TTL");
     assert_eq!(
         service.pending_terminal_count(),
-        0,
-        "the expired retry must stop"
+        1,
+        "the expired fallback must remain recoverable while storage is closed"
     );
     assert!(
         metrics
@@ -4886,6 +5030,8 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission must be open before the halt");
@@ -4906,6 +5052,8 @@ async fn halt_gates_admission_and_shutdown_makes_commands_fail_fast() {
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await;
     assert!(
@@ -4987,6 +5135,7 @@ async fn gateway_reopen_fails_orphan_pending_compaction_even_when_run_is_termina
             "event_id": "orphan-event",
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }))
         .expect("admission should commit");
     for (message_id, content) in [
@@ -5119,6 +5268,7 @@ async fn gateway_reopen_expires_orphan_pending_approval_even_when_run_is_termina
             "event_id": "orphan-approval-event",
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }))
         .expect("admission should commit");
     // The durable pending approval commits while the run is still running
@@ -5420,6 +5570,8 @@ async fn legacy_run_context_carries_the_inbound_platform() {
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");

@@ -45,18 +45,20 @@ use crate::runtime::approval_bridge::{
     ApprovalBridge, NativeDenyPolicy, PendingApproval, Resolution, RiskClass,
 };
 use crate::runtime::delivery::{
-    ChannelEventSink, DeliveryContext, DeliveryOutcome, append_event_locked, run_delivery_task,
+    ChannelEventSink, DeliveryContext, DeliveryOutcome, append_event_locked,
+    restore_events_after_failed_append, run_delivery_task,
 };
 use crate::runtime::rss_runner::execute_rss_source;
 use crate::{AgentConfig, AgentRunner, RunCancellation, RunError};
 
+const MAX_DURABLE_ASSISTANT_BYTES: usize = 1_048_576;
+
 /// One run whose terminal state could not be committed durably. The worker
-/// has already exited; a bounded retry loop (janitor cadence) commits the
-/// typed terminal exactly once when storage recovers — durable commit
-/// first, publish and permit release only after. The deadline bounds the
-/// retry so a sustained outage cannot exhaust admission capacity or
-/// accumulate retry state forever; the durable side is repaired by restart
-/// recovery once the window expires.
+/// has already exited; the original terminal gets a bounded retry window,
+/// then converts to a typed terminal-expiry marker that remains recoverable
+/// until durable storage accepts it. Live delivery waits for that commit;
+/// the admission permit is released immediately, so outages cannot exhaust
+/// capacity.
 #[derive(Clone)]
 pub struct PendingTerminal {
     pub(crate) to_status: String,
@@ -64,6 +66,7 @@ pub struct PendingTerminal {
     pub(crate) events: Vec<GatewayEvent>,
     pub(crate) assistant_message: Option<SessionMessage>,
     pub(crate) deadline: std::time::Instant,
+    pub(crate) expired_fallback: bool,
 }
 
 /// One admitted run's lifecycle state: typed cancellation, delivery permit,
@@ -162,6 +165,20 @@ fn handle_cancel_reason(handle: &RunHandle, fallback: &'static str) -> &'static 
         .unwrap_or(fallback)
 }
 
+/// One canonical pre-appended session message drafted by a transport (the
+/// OpenAI route's normalized conversation history). The admission persists
+/// these messages in the SAME transaction as the session and the run, so a
+/// failed admission leaves no partial session and a replayed idempotency
+/// key never creates a new one.
+#[derive(Clone, Debug)]
+pub struct SessionMessageDraft {
+    pub role: String,
+    /// The canonical content-part array (`text`/`tool_call`/`tool_result`).
+    pub content: JsonValue,
+    /// The message-level pair id (tool messages only).
+    pub tool_call_id: String,
+}
+
 /// Admission request built by the transport from the normalized request.
 #[derive(Clone, Debug, Default)]
 pub struct AdmitRunRequest {
@@ -176,11 +193,24 @@ pub struct AdmitRunRequest {
     pub idempotency_hash: Option<String>,
     /// The durable per-run origin actor (for example `telegram:<user_id>`
     /// for the Telegram adapter). Persisted onto the run's storage row at
-    /// admission; `None`/empty for transports that do not carry an origin
-    /// (API-server admissions). Telegram `/approve`/`/deny` resolution is
+    /// `None`/empty for transports that do not carry an origin
+    /// (API-server admissions). Telegram `/approve`/`deny` resolution is
     /// gated on this durable actor, so the binding survives restarts and is
     /// never an in-memory-only map.
     pub origin_actor: Option<String>,
+    /// The typed per-request overrides rendered into the canonical run
+    /// context `request` map (OpenAI route: `tools`, `tool_choice`,
+    /// `sampling`, `max_output_tokens`, `stream`, `metadata`). The loop
+    /// reads exactly these typed fields; provider credentials/base_url are
+    /// NEVER part of this map (they stay gateway-config-owned). In-memory
+    /// only: an interrupted run is failed by restart recovery, so the
+    /// overrides never need to survive a restart.
+    pub request_overrides: JsonValue,
+    /// The transport's canonical pre-appended conversation history
+    /// (OpenAI route). Persisted durably inside the admission transaction
+    /// and mirrored in memory after the commit; empty for transports that
+    /// append their own messages.
+    pub session_messages: Vec<SessionMessageDraft>,
 }
 
 /// Result of an accepted (or idempotently replayed) admission.
@@ -507,6 +537,31 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::Halting);
             return Err(AdmitError::Halting);
         }
+        if let (Some(key), Some(hash)) = (
+            request.idempotency_key.as_deref(),
+            request.idempotency_hash.as_deref(),
+        ) {
+            let store = self.inner.store.read();
+            if let Some(existing) = store.idempotency.get(key) {
+                if existing.request_hash != hash {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                    return Err(AdmitError::IdempotencyConflict);
+                }
+                let (session_id, status) = store
+                    .runs
+                    .get(&existing.run_id)
+                    .map(|run| (run.session_id.clone(), run.status.clone()))
+                    .unwrap_or((String::new(), "unknown".to_string()));
+                return Ok(AdmittedRun {
+                    run_id: existing.run_id.clone(),
+                    session_id,
+                    status,
+                    replayed: true,
+                });
+            }
+        }
         let capacity_permit = self
             .inner
             .capacity
@@ -615,6 +670,38 @@ impl AgentService {
             return Err(AdmitError::ParentNotFound);
         }
 
+        // The transport's canonical pre-appended conversation (OpenAI
+        // route): persisted in the SAME admission transaction as the
+        // session and the run, so a failed admission leaves no partial
+        // session and a replayed key never creates a new one. The ids are
+        // generated here so the in-memory mirror matches the durable rows
+        // exactly.
+        let mut conversation_rows = Vec::new();
+        let mut conversation_messages = Vec::new();
+        for draft in &request.session_messages {
+            let draft_message_id = Uuid::new_v4().to_string();
+            conversation_rows.push(json!({
+                "id": draft_message_id,
+                "role": draft.role,
+                "content_json": serde_json::to_string(&draft.content)
+                    .unwrap_or_else(|_| "[]".to_string()),
+                "tool_call_id": draft.tool_call_id,
+            }));
+            conversation_messages.push(SessionMessage {
+                id: draft_message_id,
+                session_id: session_id.clone(),
+                role: draft.role.clone(),
+                tool_call_id: draft.tool_call_id.clone(),
+                content: draft.content.clone(),
+                created_at: now,
+                run_id: None,
+                finish_reason: None,
+                compacted: false,
+            });
+        }
+        let conversation_json =
+            serde_json::to_string(&conversation_rows).unwrap_or_else(|_| "[]".to_string());
+
         let payload = json!({
             "session_id": session_id,
             "session_new": if session_new { 1 } else { 0 },
@@ -638,6 +725,7 @@ impl AgentService {
             "event_id": event_id,
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": conversation_json,
         });
 
         let durable = match self.inner.persistence.as_ref() {
@@ -716,6 +804,10 @@ impl AgentService {
         if request.instructions.is_some() {
             session.view.system_prompt = request.instructions.clone();
         }
+        // The transport's pre-appended conversation mirrors the durable
+        // rows exactly (same ids, same order); the run's user message
+        // follows, matching the durable ordinal order.
+        session.messages.extend(conversation_messages);
         session.messages.push(SessionMessage {
             id: message_id.clone(),
             session_id: session_id.clone(),
@@ -743,6 +835,7 @@ impl AgentService {
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             parent_run_id: request.parent_run_id.clone(),
+            request_overrides: request.request_overrides.clone(),
             platform: request.platform.clone(),
             status: "started".to_string(),
             events: vec![started_event],
@@ -1196,25 +1289,61 @@ impl AgentService {
             return;
         }
 
-        self.finish_completed(&run_id, &session_id, &output_text)
-            .await;
+        self.finish_completed(
+            &run_id,
+            &session_id,
+            &output_text,
+            &empty_usage_json(),
+            "stop",
+        )
+        .await;
     }
 
     /// Durably commits the completed terminal. The assistant message,
     /// `message.delta`, and `run.completed` form one atomic delta: the whole
     /// delta is persisted through the typed `run.terminal` transaction under
     /// the store lock and published only after the durable commit succeeds.
+    /// The canonical `usage` (the production loop carries the FINAL provider
+    /// round's usage through its `run.completed` decision; transports
+    /// without usage information pass the canonical zero shape) and the
+    /// `finish_reason` (the provider's typed stop reason, `stop` default)
+    /// are persisted into the terminal event and the assistant message row.
     /// On a persist failure the delta is rolled back, nothing is published,
     /// and the worker retries with bounded backoff
     /// (`terminal_persist_retries`/`terminal_persist_retry_delay`); if every
     /// attempt fails, the run becomes observably `terminal_pending` and the
     /// bounded retry loop commits the exact same terminal once storage
     /// recovers.
-    async fn finish_completed(&self, run_id: &str, session_id: &str, output_text: &str) {
+    async fn finish_completed(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        output_text: &str,
+        usage: &JsonValue,
+        finish_reason: &str,
+    ) {
+        if output_text.len() > MAX_DURABLE_ASSISTANT_BYTES {
+            self.finish_failed(
+                run_id,
+                json!({
+                    "code": "output_too_large",
+                    "message": format!(
+                        "assistant output exceeds the {MAX_DURABLE_ASSISTANT_BYTES} UTF-8 byte durable bound"
+                    )
+                }),
+            )
+            .await;
+            return;
+        }
+        let finish_reason = if finish_reason.is_empty() {
+            "stop"
+        } else {
+            finish_reason
+        };
         let attempts = 1 + self.inner.config.terminal_persist_retries;
         for attempt in 0..attempts {
             match self
-                .commit_completed_once(run_id, session_id, output_text)
+                .commit_completed_once(run_id, session_id, output_text, usage, finish_reason)
                 .await
             {
                 TerminalOutcome::Committed => {
@@ -1272,11 +1401,15 @@ impl AgentService {
         run_id: &str,
         session_id: &str,
         output_text: &str,
+        usage: &JsonValue,
+        finish_reason: &str,
     ) -> TerminalOutcome {
         let service = self.clone();
         let run_id_for_commit = run_id.to_string();
         let session_id_for_commit = session_id.to_string();
         let output_text_for_commit = output_text.to_string();
+        let usage_for_commit = canonical_usage_json(usage);
+        let finish_reason_for_commit = finish_reason.to_string();
         let retry_window = self.inner.config.terminal_commit_retry_window;
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
@@ -1300,7 +1433,7 @@ impl AgentService {
                 "assistant",
                 JsonValue::String(output_text_for_commit.clone()),
                 Some(run_id_for_commit.clone()),
-                Some("stop".to_string()),
+                Some(finish_reason_for_commit.clone()),
                 false,
                 "",
             );
@@ -1309,7 +1442,7 @@ impl AgentService {
                 .get_mut(&run_id_for_commit)
                 .expect("run was checked above");
             let previous_status = run.status.clone();
-            let previous_events = run.events.len();
+            let previous_events = run.events.clone();
             let delta_event = append_event_locked(
                 run,
                 "message.delta",
@@ -1317,10 +1450,38 @@ impl AgentService {
                 max_event_bytes,
                 max_events_per_run,
             );
+            // The terminal event is a bounded index into RSS-owned durable
+            // storage.  Keep the complete message inline only when it fits
+            // the configured event envelope; long output never reaches the
+            // 32 KiB event cap and is recovered by `message_id` at render
+            // time.  A message reference is present in both forms so a
+            // replay never has to infer which payload was truncated.
+            let inline_completed = json!({
+                "status":"completed",
+                "session_id":session_id_for_commit,
+                "message_id":message.id,
+                "output":{"message":message.clone()},
+                "usage":usage_for_commit,
+                "finish_reason":finish_reason_for_commit,
+            });
+            let completed_data = if serde_json::to_vec(&inline_completed)
+                .map(|bytes| bytes.len() <= max_event_bytes)
+                .unwrap_or(false)
+            {
+                inline_completed
+            } else {
+                json!({
+                    "status":"completed",
+                    "session_id":session_id_for_commit,
+                    "message_id":message.id,
+                    "usage":usage_for_commit,
+                    "finish_reason":finish_reason_for_commit,
+                })
+            };
             let completed_event = append_event_locked(
                 run,
                 "run.completed",
-                json!({"status":"completed", "output":{"message":message}, "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}),
+                completed_data,
                 max_event_bytes,
                 max_events_per_run,
             );
@@ -1334,11 +1495,17 @@ impl AgentService {
                 Some(&message),
             );
             match durable {
-                Ok(()) => {
+                Ok(durable_events) => {
                     if let Some(sender) = &run.sender {
-                        let _ = sender.send(delta_event);
-                        let _ = sender.send(completed_event);
+                        for event in durable_events {
+                            let _ = sender.send(event);
+                        }
                     }
+                    // The terminal is committed and published: close the
+                    // broadcast sender so existing subscribers observe
+                    // Closed and new subscribers replay history and end,
+                    // instead of lingering until the janitor TTL.
+                    close_run_stream(run);
                     TerminalOutcome::Committed
                 }
                 Err(error) => {
@@ -1346,7 +1513,7 @@ impl AgentService {
                     // observably terminal-pending and the retry loop owns the
                     // exact same terminal (events, message, status).
                     run.status = previous_status;
-                    run.events.truncate(previous_events);
+                    restore_events_after_failed_append(&mut run.events, previous_events);
                     let session = store
                         .sessions
                         .get_mut(&session_id_for_commit)
@@ -1362,13 +1529,14 @@ impl AgentService {
                             events: vec![delta_event, completed_event],
                             assistant_message: Some(message),
                             deadline: std::time::Instant::now() + retry_window,
+                            expired_fallback: false,
                         }),
                     }
                 }
             }
         })
         .await
-        .expect("terminal commit task must complete")
+                    .unwrap_or_else(|error| terminal_commit_task_cancelled(run_id, retry_window, error.to_string()))
     }
 
     /// Cancels a run with the typed reason through a durable-first terminal
@@ -1432,7 +1600,7 @@ impl AgentService {
                 return TerminalOutcome::NotActive;
             }
             let previous_status = run.status.clone();
-            let previous_events = run.events.len();
+            let previous_events = run.events.clone();
             let event = append_event_locked(
                 run,
                 "run.cancelled",
@@ -1449,15 +1617,21 @@ impl AgentService {
                 &[&event],
                 None,
             ) {
-                Ok(()) => {
+                Ok(durable_events) => {
                     if let Some(sender) = &run.sender {
-                        let _ = sender.send(event);
+                        for event in durable_events {
+                            let _ = sender.send(event);
+                        }
                     }
+                    // The terminal is committed and published: close the
+                    // broadcast sender so subscribers observe Closed and
+                    // new subscribers replay history and end.
+                    close_run_stream(run);
                     TerminalOutcome::Committed
                 }
                 Err(error) => {
                     run.status = previous_status;
-                    run.events.truncate(previous_events);
+                    restore_events_after_failed_append(&mut run.events, previous_events);
                     TerminalOutcome::TerminalPersistFailed {
                         error: error.to_string(),
                         pending: Box::new(PendingTerminal {
@@ -1466,13 +1640,16 @@ impl AgentService {
                             events: vec![event],
                             assistant_message: None,
                             deadline: std::time::Instant::now() + retry_window,
+                            expired_fallback: false,
                         }),
                     }
                 }
             }
         })
         .await
-        .expect("terminal commit task must complete")
+        .unwrap_or_else(|error| {
+            terminal_commit_task_cancelled(run_id, retry_window, error.to_string())
+        })
     }
 
     /// Fails a run through a durable-first terminal commit: `run.terminal`
@@ -1533,20 +1710,26 @@ impl AgentService {
                 return TerminalOutcome::NotActive;
             }
             let previous_status = run.status.clone();
-            let previous_events = run.events.len();
+            let previous_events = run.events.clone();
             let event =
                 append_event_locked(run, "run.failed", data, max_event_bytes, max_events_per_run);
             run.status = "failed".to_string();
             match terminal_commit(persistence.as_deref(), run, "", "failed", &[&event], None) {
-                Ok(()) => {
+                Ok(durable_events) => {
                     if let Some(sender) = &run.sender {
-                        let _ = sender.send(event);
+                        for event in durable_events {
+                            let _ = sender.send(event);
+                        }
                     }
+                    // The terminal is committed and published: close the
+                    // broadcast sender so subscribers observe Closed and
+                    // new subscribers replay history and end.
+                    close_run_stream(run);
                     TerminalOutcome::Committed
                 }
                 Err(error) => {
                     run.status = previous_status;
-                    run.events.truncate(previous_events);
+                    restore_events_after_failed_append(&mut run.events, previous_events);
                     TerminalOutcome::TerminalPersistFailed {
                         error: error.to_string(),
                         pending: Box::new(PendingTerminal {
@@ -1555,13 +1738,16 @@ impl AgentService {
                             events: vec![event],
                             assistant_message: None,
                             deadline: std::time::Instant::now() + retry_window,
+                            expired_fallback: false,
                         }),
                     }
                 }
             }
         })
         .await
-        .expect("terminal commit task must complete")
+        .unwrap_or_else(|error| {
+            terminal_commit_task_cancelled(run_id, retry_window, error.to_string())
+        })
     }
 
     /// Builds the canonical structured run context (gateway-api plan 4.2)
@@ -1638,6 +1824,14 @@ impl AgentService {
         let store = self.inner.store.read();
         let session = store.sessions.get(session_id);
         let run = store.runs.get(run_id);
+        // The typed per-request overrides (OpenAI route): an empty map when
+        // the transport did not carry any. The loop's `build_request` reads
+        // the `request` context map for tools/tool_choice/sampling/
+        // max_output_tokens/stream with documented fallbacks; credentials
+        // never travel through it.
+        let request_overrides = run
+            .map(|run| run.request_overrides.clone())
+            .unwrap_or_else(|| JsonValue::Object(Default::default()));
         // The provider-facing history EXCLUDES compacted rows (a committed
         // compaction covered them), even when the durable count is within the
         // window. Ordinals keep mirroring the durable rows (position + 1), so
@@ -1680,7 +1874,7 @@ impl AgentService {
             .map(|run| run.platform.clone())
             .or_else(|| session.map(|session| session.view.source.clone()))
             .unwrap_or_default();
-        let context = json!({
+        let mut context = json!({
             "run_id": run_id,
             "session_id": session_id,
             "platform": platform,
@@ -1705,12 +1899,14 @@ impl AgentService {
                 "parallel": config.parallel,
                 "task": config.task,
                 "max_output_tokens": 1024,
+                "max_event_bytes": config.max_event_bytes,
                 "now_ms": timestamp(),
                 "generation": generation,
                 "message_count": message_count,
                 "compaction_id": format!("compact:{session_id}:{}", generation + 1),
             }
         });
+        context["request"] = request_overrides;
         json_to_vm_value(&context)
     }
 
@@ -1822,7 +2018,17 @@ impl AgentService {
             match decision["kind"].as_str().unwrap_or("") {
                 "run.completed" => {
                     let text = decision["text"].as_str().unwrap_or("").to_string();
-                    self.finish_completed(run_id, session_id, &text).await;
+                    // The typed usage/stop_reason carried by the loop's
+                    // terminal decision (the FINAL provider round's canonical
+                    // usage) are persisted into the durable terminal event
+                    // and the assistant message row.
+                    let usage = decision
+                        .get("usage")
+                        .cloned()
+                        .unwrap_or_else(empty_usage_json);
+                    let stop_reason = decision["stop_reason"].as_str().unwrap_or("stop");
+                    self.finish_completed(run_id, session_id, &text, &usage, stop_reason)
+                        .await;
                     return;
                 }
                 "run.failed" => {
@@ -3186,6 +3392,96 @@ impl AgentService {
             }
         }
     }
+
+    /// Bounded durable retention sweep for TERMINAL runs: deletes terminal
+    /// runs (completed/failed/cancelled) whose durable `updated_at_ms` is
+    /// older than the configured [`AgentGatewayConfig::durable_run_retention`]
+    /// window, through the typed `runs.prune_terminal` RSS command. Active,
+    /// pending, and `terminal_pending` runs are never matched, so restart
+    /// replay and the terminal retry loop stay intact. Runs on a blocking
+    /// worker so Tokio threads are never occupied by storage stalls.
+    fn prune_durable_terminal_runs(&self) {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(persistence) = service.inner.persistence.clone() else {
+                return;
+            };
+            let now = timestamp() as i64;
+            let older_than_ms = now - service.inner.config.durable_run_retention.as_millis() as i64;
+            let pending_nonempty = !service
+                .inner
+                .pending
+                .lock()
+                .expect("pending lock")
+                .is_empty();
+            if pending_nonempty {
+                // A pending/terminal_pending run may still have a durable
+                // terminal row after a crash-window race. Defer the sweep
+                // while any such entry exists; this keeps the SQL candidate
+                // set from deleting an ambiguous run.
+                return;
+            }
+            let result = match persistence.runs_prune_terminal(older_than_ms, 64) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %truncate_for_log(&error.to_string(), 256),
+                        "durable terminal retention sweep failed; runs will be reclaimed on the next tick"
+                    );
+                    return;
+                }
+            };
+            // The storage command returns the exact ordered candidate set it
+            // deleted.  Mirror that set under the store lock so a retained
+            // terminal can never remain addressable in memory after durable
+            // GC.  Pending terminals are protected even if a future storage
+            // migration represents their state as a terminal row.
+            let ids = result
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row.as_array())
+                .filter_map(|row| row.first().and_then(JsonValue::as_str))
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if ids.is_empty() {
+                return;
+            }
+            let mut store = service.inner.store.write();
+            let mut removable = Vec::new();
+            for run_id in ids {
+                if service
+                    .inner
+                    .pending
+                    .lock()
+                    .expect("pending lock")
+                    .contains_key(&run_id)
+                {
+                    continue;
+                }
+                if let Some(mut run) = store.runs.remove(&run_id) {
+                    // Explicitly close the sender before dropping the record;
+                    // existing subscribers observe Closed instead of waiting
+                    // on an orphaned channel.
+                    run.sender = None;
+                    removable.push(run_id);
+                } else {
+                    removable.push(run_id);
+                }
+            }
+            if !removable.is_empty() {
+                store
+                    .idempotency
+                    .retain(|_, record| !removable.iter().any(|id| id == &record.run_id));
+            }
+            drop(store);
+            let mut handles = service.inner.runs.lock().expect("runs lock");
+            for run_id in removable {
+                handles.remove(&run_id);
+            }
+        });
+    }
 }
 
 /// One invocation outcome of a production loop step.
@@ -3230,6 +3526,24 @@ fn decision_state(decision: &JsonValue) -> JsonValue {
         fields.remove("kind");
     }
     state
+}
+
+/// The canonical zero usage shape: transports without provider-reported
+/// usage (the legacy single-shot path) commit exactly this shape — never a
+/// fabricated nonzero number.
+fn empty_usage_json() -> JsonValue {
+    json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+}
+
+/// Normalizes one canonical usage map (`{input_tokens, output_tokens,
+/// total_tokens}` from the loop's provider round) into the durable terminal
+/// shape; missing/unknown entries fall back to zero.
+fn canonical_usage_json(usage: &JsonValue) -> JsonValue {
+    json!({
+        "input_tokens": usage["input_tokens"].as_u64().unwrap_or(0),
+        "output_tokens": usage["output_tokens"].as_u64().unwrap_or(0),
+        "total_tokens": usage["total_tokens"].as_u64().unwrap_or(0),
+    })
 }
 
 /// Converts one JSON value into a VM value (the service-side mirror of the
@@ -3305,25 +3619,45 @@ impl AgentService {
             if run.status != "terminal_pending" {
                 return PendingRetryOutcome::Gone;
             }
-            if std::time::Instant::now() >= pending.deadline {
-                // Bounded: after the window no more events can ever be
-                // published for this run in this process. Close the live
-                // stream so SSE subscribers are not held forever; the handle
-                // is released via its TTL and the durable side is repaired by
-                // restart recovery.
-                close_run_stream(run);
+            if std::time::Instant::now() >= pending.deadline && !pending.expired_fallback {
+                // The original terminal retry budget is exhausted. Convert it
+                // into a durable failure marker and keep retrying that marker
+                // until storage recovers; closing the sender here would leave
+                // the durable run running with no typed SSE outcome.
+                let next_seq = run.events.last().map_or(1, |event| event.seq + 1);
+                let expired_event = GatewayEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    seq: next_seq,
+                    event: "run.failed".to_string(),
+                    run_id: run.run_id.clone(),
+                    timestamp: timestamp(),
+                    data: json!({
+                        "status": "failed",
+                        "error_code": "terminal_retry_expired",
+                        "error_message": "durable terminal retry window expired"
+                    }),
+                };
+                let expired_pending = PendingTerminal {
+                    to_status: "failed".to_string(),
+                    session_id: None,
+                    events: vec![expired_event],
+                    assistant_message: None,
+                    deadline: std::time::Instant::now(),
+                    expired_fallback: true,
+                };
+                service.put_pending_terminal(&run_id_for_block, expired_pending);
                 service
                     .inner
                     .metrics
                     .terminal_retry(TerminalRetryOutcome::Expired);
                 tracing::warn!(
                     run_id = %run_id_for_block,
-                    "terminal retry window expired; durable side left for restart recovery"
+                    "terminal retry window expired; durable terminal-expiry marker will be retried"
                 );
-                return PendingRetryOutcome::Expired;
+                return PendingRetryOutcome::RetryFailed;
             }
             let previous_status = run.status.clone();
-            let previous_events = run.events.len();
+            let previous_events = run.events.clone();
             // Rebuild the terminal's assistant message under the same lock
             // (durable-before-visible: it is appended in memory only after
             // the durable commit succeeds).
@@ -3366,23 +3700,23 @@ impl AgentService {
                 )
             };
             match durable {
-                Ok(()) => {
+                Ok(durable_events) => {
                     let run = store
                         .runs
                         .get_mut(&run_id_for_block)
                         .expect("run presence was checked above");
-                    // Publish the reconciled copies (sequences were updated in
-                    // place by the commit), exactly once per event.
-                    for event in &pending.events {
-                        if let Some(reconciled) = run
-                            .events
-                            .iter()
-                            .find(|candidate| candidate.event_id == event.event_id)
-                            && let Some(sender) = &run.sender
-                        {
-                            let _ = sender.send(reconciled.clone());
+                    // Publish only the rows returned by durable storage; the
+                    // prebuilt in-memory events are never used as evidence of
+                    // a successful terminal.
+                    if let Some(sender) = &run.sender {
+                        for event in durable_events {
+                            let _ = sender.send(event);
                         }
                     }
+                    // The terminal is committed and published: close the
+                    // broadcast sender so subscribers observe Closed and
+                    // new subscribers replay history and end.
+                    close_run_stream(run);
                     service
                         .inner
                         .metrics
@@ -3460,8 +3794,7 @@ impl AgentService {
                 match service.retry_pending_terminal(&run_id).await {
                     PendingRetryOutcome::Committed
                     | PendingRetryOutcome::Gone
-                    | PendingRetryOutcome::Conflict
-                    | PendingRetryOutcome::Expired => return,
+                    | PendingRetryOutcome::Conflict => return,
                     PendingRetryOutcome::RetryFailed => continue,
                 }
             }
@@ -3539,6 +3872,36 @@ enum TerminalOutcome {
     },
 }
 
+fn terminal_commit_task_cancelled(
+    run_id: &str,
+    retry_window: std::time::Duration,
+    error: String,
+) -> TerminalOutcome {
+    let event = GatewayEvent {
+        event_id: Uuid::new_v4().to_string(),
+        seq: 0,
+        event: "run.failed".to_string(),
+        run_id: run_id.to_string(),
+        timestamp: timestamp(),
+        data: json!({
+            "status": "failed",
+            "error_code": "terminal_commit_task_cancelled",
+            "error_message": error,
+        }),
+    };
+    TerminalOutcome::TerminalPersistFailed {
+        error: "terminal commit task was cancelled".to_string(),
+        pending: Box::new(PendingTerminal {
+            to_status: "failed".to_string(),
+            session_id: None,
+            events: vec![event],
+            assistant_message: None,
+            deadline: std::time::Instant::now() + retry_window,
+            expired_fallback: false,
+        }),
+    }
+}
+
 /// A typed failure of one `run.terminal` commit attempt. The `code` lets
 /// the bounded retry loop distinguish a durable terminal conflict (the run
 /// already reached a terminal state durably) from an unavailable-storage
@@ -3569,9 +3932,9 @@ fn terminal_commit(
     to_status: &str,
     events: &[&GatewayEvent],
     assistant_message: Option<&SessionMessage>,
-) -> Result<(), TerminalCommitError> {
+) -> Result<Vec<GatewayEvent>, TerminalCommitError> {
     let Some(persistence) = persistence else {
-        return Ok(());
+        return Ok(events.iter().map(|event| (*event).clone()).collect());
     };
     let event = |index: usize| -> &GatewayEvent {
         events.get(index).expect("terminal event index in range")
@@ -3614,7 +3977,7 @@ fn terminal_commit(
             message: error.message.clone(),
         })?;
     // Reconcile the in-memory terminal event sequences with the
-    // transactionally allocated durable sequences.
+    // transactionally allocated durable sequences returned by the command.
     let rows = data
         .get("events")
         .and_then(|events| events.get("rows"))
@@ -3633,7 +3996,8 @@ fn terminal_commit(
         });
     }
     let offset = rows.len() - event_count;
-    for (index, event) in events.iter().enumerate() {
+    let mut durable_events = Vec::with_capacity(event_count);
+    for (index, expected) in events.iter().enumerate() {
         let row = rows
             .get(offset + index)
             .and_then(JsonValue::as_array)
@@ -3648,15 +4012,80 @@ fn terminal_commit(
                 code: "terminal_commit_invalid".to_string(),
                 message: "run.terminal returned a malformed event sequence".to_string(),
             })?;
+        let durable_run_id = row.get(1).and_then(JsonValue::as_str).unwrap_or("");
+        let durable_event_id = row.get(2).and_then(JsonValue::as_str).unwrap_or("");
+        let durable_event_type = row.get(3).and_then(JsonValue::as_str).unwrap_or("");
+        if durable_run_id != run.run_id
+            || durable_event_id != expected.event_id
+            || durable_event_type != expected.event
+        {
+            return Err(TerminalCommitError {
+                code: "terminal_commit_invalid".to_string(),
+                message: format!(
+                    "durable event row disagreed with the pre-generated terminal id/type: run={durable_run_id} id={durable_event_id} type={durable_event_type}"
+                ),
+            });
+        }
+        let payload = row
+            .get(4)
+            .and_then(JsonValue::as_str)
+            .and_then(|payload| serde_json::from_str::<JsonValue>(payload).ok())
+            .ok_or_else(|| TerminalCommitError {
+                code: "terminal_commit_invalid".to_string(),
+                message: "run.terminal returned a malformed event payload".to_string(),
+            })?;
+        let created_at = row.get(5).and_then(JsonValue::as_u64).unwrap_or_default();
+        durable_events.push(GatewayEvent {
+            event_id: durable_event_id.to_string(),
+            seq,
+            run_id: run.run_id.clone(),
+            event: durable_event_type.to_string(),
+            data: payload,
+            timestamp: created_at,
+        });
+    }
+    if let Some(expected_message) = assistant_message {
+        let message_row = data
+            .get("message")
+            .and_then(|message| message.get("rows"))
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| TerminalCommitError {
+                code: "terminal_commit_invalid".to_string(),
+                message: "run.terminal result omitted the assistant message row".to_string(),
+            })?;
+        let durable_message_id = message_row
+            .first()
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        let durable_session_id = message_row.get(1).and_then(JsonValue::as_str).unwrap_or("");
+        let durable_message_run_id = message_row
+            .get(11)
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if durable_message_id != expected_message.id
+            || durable_session_id != session_id
+            || durable_message_run_id != run.run_id
+        {
+            return Err(TerminalCommitError {
+                code: "terminal_commit_invalid".to_string(),
+                message:
+                    "durable assistant message row disagreed with the pre-generated ownership tuple"
+                        .to_string(),
+            });
+        }
+    }
+    for durable in &durable_events {
         if let Some(in_memory) = run
             .events
             .iter_mut()
-            .find(|candidate| candidate.event_id == event.event_id)
+            .find(|candidate| candidate.event_id == durable.event_id)
         {
-            in_memory.seq = seq;
+            *in_memory = durable.clone();
         }
     }
-    Ok(())
+    Ok(durable_events)
 }
 
 /// Outcome of one bounded terminal retry attempt.
@@ -3668,9 +4097,6 @@ enum PendingRetryOutcome {
     /// The durable side already holds a different terminal (for example
     /// restart recovery); the pending terminal must not be published.
     Conflict,
-    /// The bounded retry window expired; the retry loop stops, the live
-    /// stream is closed, and the durable side is left for restart recovery.
-    Expired,
     /// Storage is still unavailable; retry again on the next tick.
     RetryFailed,
 }
@@ -3684,12 +4110,12 @@ fn rollback_pending_retry(
     run_id: &str,
     pending: &PendingTerminal,
     previous_status: String,
-    previous_events: usize,
+    previous_events: Vec<GatewayEvent>,
     previous_session_updated: Option<u64>,
 ) {
     if let Some(run) = store.runs.get_mut(run_id) {
         run.status = previous_status;
-        run.events.truncate(previous_events);
+        run.events = previous_events;
     }
     if let (Some(session_id), Some(updated_at)) =
         (pending.session_id.as_deref(), previous_session_updated)
@@ -3735,21 +4161,45 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
             let ttl = inner.config.terminal_run_ttl;
             let now = Instant::now();
+            let mut expired_pending_runs = Vec::new();
             let mut runs = inner.runs.lock().expect("runs lock");
-            runs.retain(|_run_id, handle| {
-                handle
+            runs.retain(|run_id, handle| {
+                let keep = handle
                     .terminal_at
                     .lock()
                     .expect("terminal lock")
-                    .is_none_or(|terminal_at| terminal_at + ttl > now)
+                    .is_none_or(|terminal_at| terminal_at + ttl > now);
+                if !keep && handle.subscribers.lock().expect("subscriber lock").count == 0 {
+                    expired_pending_runs.push(run_id.clone());
+                    false
+                } else {
+                    true
+                }
             });
             drop(runs);
-            // The bounded approval expiry sweep: parked runs whose durable
-            // approval passed its deadline resume with a typed expired tool
-            // result (the loop folds it and continues).
+            if !expired_pending_runs.is_empty() {
+                let mut store = inner.store.write();
+                for run_id in expired_pending_runs {
+                    if let Some(run) = store.runs.get_mut(&run_id)
+                        && run.status == "terminal_pending"
+                    {
+                        // No live subscriber remains. Close this stale
+                        // sender so a later replay request cannot hang while
+                        // the durable expiry fallback keeps retrying.
+                        run.sender = None;
+                    }
+                }
+            }
+            // The bounded durable retention sweep: terminal runs older
+            // than the configured window are deleted durably (active and
+            // pending runs are never matched).
             let service = AgentService {
                 inner: Arc::clone(&inner),
             };
+            service.prune_durable_terminal_runs();
+            // The bounded approval expiry sweep: parked runs whose durable
+            // approval passed its deadline resume with a typed expired tool
+            // result (the loop folds it and continues).
             service.expire_parked_approvals();
         }
     });

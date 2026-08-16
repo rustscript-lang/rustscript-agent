@@ -362,6 +362,25 @@ impl GatewayPersistence {
         self.command_data("message.append", payload)
     }
 
+    /// Loads one RSS-owned durable message by id, session, and run. Terminal
+    /// renderers use this ownership-checked reference path instead of putting
+    /// long assistant content in a bounded run event.
+    pub fn message_get(
+        &self,
+        message_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "message.get",
+            &json!({
+                "message_id": message_id,
+                "session_id": session_id,
+                "run_id": run_id,
+            }),
+        )
+    }
+
     /// Appends one run event with transactional sequence allocation and
     /// retention pruning.
     pub fn event_append(&self, payload: &Value) -> Result<Value, StorageError> {
@@ -383,6 +402,26 @@ impl GatewayPersistence {
 
     pub fn run_get(&self, run_id: &str) -> Result<Value, StorageError> {
         self.command_data("run.get", &json!({ "run_id": run_id }))
+    }
+
+    /// Bounded durable retention sweep for TERMINAL runs: deletes terminal
+    /// runs (completed/failed/cancelled) whose `updated_at_ms` is older than
+    /// `older_than_ms`, cascading their events/retention/idempotency/links/
+    /// approvals/compactions/usage/recovery records. Active and pending
+    /// runs are never matched. Returns the deleted run ids.
+    pub fn runs_prune_terminal(
+        &self,
+        older_than_ms: i64,
+        max_rows: i64,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "runs.prune_terminal",
+            &json!({
+                "older_than_ms": older_than_ms,
+                "now_ms": timestamp(),
+                "max_rows": max_rows,
+            }),
+        )
     }
 
     /// Lists durable run rows (newest first) with optional exact
@@ -607,14 +646,20 @@ pub(crate) struct RunRecord {
     pub(crate) run_id: String,
     pub(crate) session_id: String,
     pub(crate) parent_run_id: Option<String>,
+    /// The typed per-request overrides rendered into the canonical run
+    /// context `request` map (OpenAI route: tools/tool_choice/sampling/
+    /// max_output_tokens/stream/metadata). In-memory only: an interrupted
+    /// run is failed by restart recovery, so the overrides never need to
+    /// survive a restart.
+    pub(crate) request_overrides: Value,
     /// The inbound platform that admitted the run (`api_server`, `telegram`,
     /// ...); the run context carries it so scripts can branch on the source.
     pub(crate) platform: String,
     pub(crate) status: String,
     pub(crate) events: Vec<GatewayEvent>,
-    /// Live delivery channel; `None` once the run's stream was closed (the
-    /// bounded terminal retry expired) so SSE subscribers are never held
-    /// forever without a terminal event.
+    /// Live delivery channel; `None` after a durable terminal commit or a
+    /// durable transition conflict. A retry-window expiry keeps this sender
+    /// open while the typed terminal-expiry fallback waits for storage.
     pub(crate) sender: Option<broadcast::Sender<GatewayEvent>>,
     /// Legacy boolean stop flag kept for in-memory compatibility; the
     /// authoritative typed cancellation lives in the service RunHandle.
@@ -682,7 +727,7 @@ pub(crate) struct SessionMessage {
     pub(crate) compacted: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GatewayEvent {
     pub(crate) event_id: String,
     pub(crate) seq: u64,
@@ -917,7 +962,16 @@ impl GatewayStore {
             if !sessions.contains_key(&session_id) {
                 return Err(format!("run references unknown session: {session_id}"));
             }
+            let db_status = string_cell(&row, 3, "run status")?;
             let (sender, _) = broadcast::channel(broadcast_capacity);
+            let sender = if matches!(db_status.as_str(), "completed" | "failed" | "cancelled") {
+                // A restored terminal run has no producer.  Dropping the
+                // sender makes an after-terminal subscription observe Closed
+                // immediately instead of waiting forever on an idle channel.
+                None
+            } else {
+                Some(sender)
+            };
             let platform = sessions
                 .get(&session_id)
                 .map(|session| session.view.source.clone())
@@ -926,10 +980,11 @@ impl GatewayStore {
                 run_id: run_id.clone(),
                 session_id,
                 parent_run_id: optional_string(&row, 2),
+                request_overrides: Value::Object(Default::default()),
                 platform,
-                status: memory_status(&string_cell(&row, 3, "run status")?).to_string(),
+                status: memory_status(&db_status).to_string(),
                 events: Vec::new(),
-                sender: Some(sender),
+                sender,
                 cancel_requested: Arc::new(AtomicBool::new(false)),
             };
             if runs.insert(run_id.clone(), run).is_some() {

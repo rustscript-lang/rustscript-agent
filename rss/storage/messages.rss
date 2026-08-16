@@ -61,11 +61,11 @@ pub fn storage_message_append(db_id: int, payload_json: string, max_rows: int, m
     result
 }
 
-pub fn storage_message_get(db_id: int, message_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_message_get(db_id: int, message_id: string, session_id: string, run_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
         db_id,
-        "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? LIMIT ?",
-        [message_id, (max_rows)],
+        "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? AND run_id = ? LIMIT ?",
+        [&message_id, &session_id, &run_id, (max_rows)],
         messages_query_limits(max_rows, max_bytes)
     )
 }

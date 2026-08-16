@@ -3302,6 +3302,7 @@ async fn adapter_approval_ownerless_old_row_is_a_typed_no_op() {
             "event_id": Uuid::new_v4().to_string(),
             "now_ms": now,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }))
         .expect("old-row admission");
     persistence
@@ -3490,17 +3491,11 @@ async fn adapter_approval_owner_binding_survives_restart() {
         let gateway = AgentGatewayState::with_default_agent_program_and_sqlite(config, &db)
             .expect("phase 2 gateway");
         let adapter = spawn_adapter(gateway.clone(), telegram).await;
-        // The restart's undelivered catch-up renderer (if any) must finish
-        // and release the session gate BEFORE the new /run is admitted.
-        let sent_before_resume = state.sent_texts().len();
-        wait_until(std::time::Duration::from_secs(30), || {
-            state
-                .sent_texts()
-                .iter()
-                .skip(sent_before_resume)
-                .any(|text| text == "[done]")
-        })
-        .await;
+        // Phase-1's terminal was delivered fully durably (the delivery
+        // cursor advanced past the durable terminal event before shutdown),
+        // so on restart there is nothing undelivered to re-render. Proceed
+        // directly; the new /run admission below is what verifies the
+        // session gate is free.
         push_update(
             &state,
             update_fixture(37, 117, 555, 555, "/run write the file again"),

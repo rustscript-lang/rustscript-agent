@@ -10,6 +10,6 @@
   "provider": "local-agent",
   "provider_options": {},
   "tool_schemas": [],
-  "limits": {"max_events": 240, "timeout_ms": 900000, "max_event_bytes": 32768},
+  "limits": {"max_events": 8192, "timeout_ms": 900000, "max_event_bytes": 32768},
   "metadata": {}
 }

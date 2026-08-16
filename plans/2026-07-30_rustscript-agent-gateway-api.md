@@ -298,10 +298,88 @@ wiring is implemented on top of the A5 production serial loop
   per-IP/per-account rate-limit middleware, answer the canonical error
   envelope, and reject malformed bodies/query strings before any service
   work.
-- Not in this commit (remaining A7 work): an OpenAI Chat Completions wire
-  route (`/v1/chat/completions`, stream/non-stream, tool-call deltas) — the
-  legacy `/api/sessions/{id}/chat` path remains the only chat-completion
-  surface.
+- OpenAI Chat Completions (`POST /v1/chat/completions`, stream false/true)
+  is implemented (`src/gateway/api_openai.rs`, `tests/api_openai_tests.rs`):
+  the route ONLY normalizes OpenAI inbound into the canonical
+  AgentService/session/run contract and renders canonical durable/live
+  events as OpenAI outbound responses — no provider wire parsing, no
+  provider-adapter bypass, everything through the A5 production loop.
+  Buffered requests wait for the durable terminal and return the official
+  `chat.completion` shape (content, finish_reason, usage; `tool_calls`
+  only from the FINAL provider round's `tool.started` events — the A5
+  loop executes every tool round internally, so internal rounds never
+  leak as client tool_calls); streaming emits SSE `data: {...}\n\n`
+  chunks with per-turn BOUNDED buffering (the buffer is dropped when the
+  round advances and flushed only when the terminal confirms the final
+  response), an optional usage chunk (`stream_options.include_usage`), a
+  typed error chunk on failure/cancellation (the SAME type derivation as
+  the buffered 502/500 contract), a keep-alive heartbeat, and `[DONE]`
+  last, with each chunk carrying the durable event sequence as the SSE
+  `id` (Last-Event visibility), the bounded `x-request-id` header, and
+  the configured client-disconnect policy applied through the subscriber
+  guard. A `Lagged` live receiver recovers through the DURABLE catch-up
+  (every event was persisted before publish — no silent loss).
+  Per-request overrides (model/messages/system/user/assistant/tool/
+  tool-result, tools/tool_choice, stream, stream_options.include_usage,
+  bounded temperature [0,2]/top_p [0,1]/max_tokens/max_completion_tokens/
+  user — the official OpenAI sampling ranges) enter the loop ONLY through
+  the TYPED run context `request` map (`AdmitRunRequest::request_overrides`
+  → `context["request"]`, consumed by the loop's `build_request`); the
+  provider/profile, credentials, base_url, and allowlists stay
+  gateway-config-owned (`reserved_field` rejection for any client
+  attempt, `unknown_field`/`unsupported_field` for everything else — the
+  explicit unknown-field policy, with every client parse failure mapping
+  to the same 400 typed contract). The normalized conversation history is
+  persisted INSIDE the `admission.create` transaction (session + messages
+  + run + idempotency commit atomically), so a failed admission leaves no
+  partial/orphan session and a replayed `Idempotency-Key` never creates
+  a new one; a replayed admission NEVER spawns a second worker (provider
+  calls and tool side effects stay exact-once) — the response attaches to
+  the existing run's history/live stream instead. The route reuses the
+  bearer / rate / body / idempotency (`Idempotency-Key`, request hash
+  includes the bounded `user` metadata) guards, adds a bounded
+  `x-request-id`, and is covered by 23 real-HTTP fixtures against the real
+  router + real SQLite + real A5 loop + scripted provider (buffered text,
+  model override, streamed text with usage, buffered/streamed tool rounds
+  with real tool execution and exact-once provider call counts, typed
+  provider error, stop-cancel, disconnect policy,
+  malformed/unknown/reserved/oversize/auth/rate/idempotency incl. 409/429
+  and mid-failure session counts, in-flight + concurrent same-key replay
+  (one session, one worker), stream Lagged durable catch-up, SSE
+  x-request-id, stream error type consistency, first-chunk role, tool-role
+  array content preservation, official sampling ranges, multi-turn
+  canonical message normalization). The canonical `model.completed`
+  events now carry provider usage/stop_reason, `tool.started` carries the
+  typed arguments, and the durable `run.completed` terminal persists the
+  FINAL round's real usage and finish_reason (never fabricated zeros for
+  reported usage).
+- Follow-up (2026-08-16, branch `feat/agent-a7-openai-api`): the stream
+  contract is explicit about the first chunk and overflow. The assistant
+  role is carried by EXACTLY the first flushed delta/tool chunk and never
+  repeated (pure-renderer unit tests assert the full chunk stream). The
+  per-round TEXT buffer (4096 deltas / 256 KiB) and TOOL buffer (64 calls)
+  overflow separately: text overflow falls back to the AUTHORITATIVE
+  terminal text (lossless, buffered tool chunks preserved), while tool
+  overflow ends the stream with the typed `stream_buffer_overflow` error
+  chunk + `[DONE]` — never a silently truncated tool list. `tools: []` is
+  an EXPLICIT client disable (the captured provider wire carries no tools),
+  while OMITTING `tools` selects the registry's bounded tools.
+  `max_events_per_run` defaults to 8192 (covering the 4096-delta + 64-tool
+  stream bounds plus terminal events), the storage replay page cap is 16384
+  (`event_replay_limits`; list-style queries keep the 512-row cap), and the
+  janitor reclaims TERMINAL runs older than `durable_run_retention`
+  (default 86400 s) through the typed `runs.prune_terminal` command
+  (cascading events/retention/idempotency/links/approvals/compactions/
+  usage/recovery); active, pending, and `terminal_pending` runs are never
+  matched, so restart replay and the terminal retry loop stay intact. A
+  terminal commit closes the run's broadcast sender, so a subscriber
+  joining after the terminal replays history and ends immediately instead
+  of waiting on the janitor TTL. The durable replay pages forward
+  (`after_seq` cursor) so a terminal beyond the first page is still
+  observed within the bounded wait, and the durable catch-up pages the same
+  way. Coverage: 23 real-HTTP fixtures (was 22), 4 pure-renderer stream
+  unit tests, the sender-close integration test, and the
+  `runs.prune_terminal` storage test.
 
 ### Milestone A8: Telegram
 

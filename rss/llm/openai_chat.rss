@@ -52,6 +52,7 @@ fn openai_chat_complete_dispatch(request: map, profile: map) -> map {
     let base_url: string = types::profile_string(profile, "base_url");
     let api_key: string = types::profile_string(profile, "api_key");
     let provider: string = types::profile_string(profile, "provider");
+    let request = chat_apply_profile_token_field(request, profile);
     openai_chat_complete(request, base_url, api_key, provider)
 }
 
@@ -62,6 +63,16 @@ fn openai_chat_complete(request: map, base_url: string, api_key: string, provide
     } else => {
         chat_send_complete(request, model, base_url, api_key, provider)
     }
+}
+
+fn chat_apply_profile_token_field(request: map, profile: map) -> map {
+    let request_field: string = types::request_string(request, "max_output_tokens_field");
+    let profile_field: string = types::profile_string(profile, "max_tokens_field");
+    let mut enriched: map = request;
+    if request_field == "" && profile_field != "" {
+        enriched["max_output_tokens_field"] = profile_field;
+    }
+    enriched
 }
 
 /// The whole completion path: wire building and the buffered transport call.
@@ -125,6 +136,13 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> map {
     let top_p_present: bool = top_p_raw["present"];
     let top_p_value: float = top_p_raw["value"];
     let max_output: int = types::request_int(request, "max_output_tokens", 0);
+    let mut max_output_field: string = types::request_string(request, "max_output_tokens_field");
+    if max_output_field == "" {
+        max_output_field = "max_tokens";
+    }
+    if max_output_field != "max_completion_tokens" {
+        max_output_field = "max_tokens";
+    }
     let mut wire: map = {
         model: model,
         messages: messages,
@@ -143,7 +161,7 @@ fn chat_build_wire(request: map, model: string, stream: bool) -> map {
         wire["top_p"] = top_p_value;
     }
     if max_output > 0 {
-        wire["max_tokens"] = max_output;
+        wire[max_output_field] = max_output;
     }
     if stream {
         wire["stream_options"] = { include_usage: true };
@@ -518,10 +536,16 @@ fn chat_error_payload(body_text: string) -> map {
 // as `ok`. Cancellation never reaches this check: it fails the invocation
 // as a typed `Cancelled` error before the summary exists.
 
+fn chat_utf8_bytes(text: string) -> int {
+    let encoded: bytes = bytes::from_utf8(text);
+    encoded.length
+}
+
 fn openai_chat_stream_dispatch(request: map, profile: map) -> map {
     let base_url: string = types::profile_string(profile, "base_url");
     let api_key: string = types::profile_string(profile, "api_key");
     let provider: string = types::profile_string(profile, "provider");
+    let request = chat_apply_profile_token_field(request, profile);
     openai_chat_stream(request, base_url, api_key, provider)
 }
 
@@ -552,6 +576,8 @@ fn chat_send_stream(
     let mut input_tokens: int = 0;
     let mut output_tokens: int = 0;
     let mut total_tokens: int = 0;
+    let mut output_bytes: int = 0;
+    let mut output_overflow: bool = false;
     let mut tools: array = [];
     let mut done = false;
     let stream_result: map = http::client::sse({
@@ -574,9 +600,17 @@ fn chat_send_stream(
                 let choice: map = types::array_entry(choices, 0);
                 let delta: map = types::request_map(choice, "delta");
                 let content: string = types::request_string(delta, "content");
-                if content != "" {
+                let content_bytes: int = chat_utf8_bytes(content);
+                if output_bytes + content_bytes > 1048576 => {
+                    output_overflow = true;
+                    0
+                } else if content != "" => {
                     text = text + content;
-                }
+                    output_bytes = output_bytes + content_bytes;
+                    0
+                } else => {
+                    0
+                };
                 let reason: string = types::request_string(choice, "finish_reason");
                 if reason != "" {
                     stop_reason = reason;
@@ -601,7 +635,16 @@ fn chat_send_stream(
     });
     let outcome: string = types::request_string(stream_result, "outcome");
     let status: int = types::request_int(stream_result, "status", 0);
-    if done && outcome == "stopped" => {
+    if output_overflow => {
+        types::fail(types::error_new(
+            status,
+            "api_error",
+            "output_too_large",
+            "assistant output exceeds the 1048576 UTF-8 byte durable bound",
+            "",
+            ""
+        ))
+    } else if done && outcome == "stopped" => {
         types::ok(types::response_new(
             text,
             chat_stream_parse_tool_calls(tools),

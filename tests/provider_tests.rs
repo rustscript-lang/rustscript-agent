@@ -583,16 +583,10 @@ fn openai_chat_wire_format_is_standard() {
     );
 }
 
-/// Marker-splice collision guard (P3, user text): the wire splices user
-/// content parts and tool schemas through literal markers
-/// (`__RSS_USER_PARTS_<i>__`, `__RSS_TOOL_SCHEMA_<i>__`), and
-/// `string_replace_literal` replaces every occurrence. A collision requires
-/// user text to be EXACTLY the full quoted marker string — marker-like
+/// Runtime-map preservation guard (P3, user text): the wire encodes user
+/// content parts and tool schemas as real JSON values in one pass. Marker-like
 /// fragments in ordinary or adversarial text (prefixes, embedded occurrences,
-/// suffixed forms) must pass through byte-identical. A collision-free
-/// structured build is blocked by the core (json::encode accepts only
-/// struct-shaped values, so the splice mechanism is forced; see the plan's
-/// P3 marker note).
+/// suffixed forms) pass through byte-identical.
 #[test]
 fn openai_chat_wire_preserves_marker_like_user_text() {
     let body = read_fixture("openai_chat/error.json");
@@ -972,17 +966,174 @@ fn openai_chat_stream_eof_without_done_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// S3: OpenAI Responses adapter (blocked references)
+// A7: final provider content total UTF-8 byte cap (three adapters)
 // ---------------------------------------------------------------------------
 //
-// `openai_responses.rss` is a typed `not_implemented` stub. The buffered and
-// streaming transcripts under `tests/fixtures/providers/openai_responses/`
-// document the wire contract; these tests stay ignored until the adapter is
-// implemented. The streaming transcript mirrors the real Responses API
-// transport: every
-// payload event carries an `event:` line whose value matches the `type`
-// field of its `data:` JSON payload, and the stream ends with a bare
-// `data: [DONE]`.
+// Each streaming adapter aggregates the FINAL text output into a 1 MiB total
+// UTF-8 byte budget. When the cumulative text exceeds 1 MiB the adapter must
+// fail the invocation as the typed `output_too_large` provider error rather
+// than surface a truncated partial as `ok`. The service layer enforces an
+// identical durable bound, so a transport that bypasses the adapter (or a
+// multi-round summary that otherwise grows unbounded) is covered twice; these
+// tests pin the adapter-layer guard for all three production providers.
+
+fn overflow_events_for(kind: &str, pad: usize) -> Vec<String> {
+    // The SSE transport enforces a per-line byte limit (64 KiB), so a single
+    // 1 MiB delta would be rejected before the adapter could accumulate it.
+    // Split the oversized output into 32 KiB deltas whose cumulative UTF-8
+    // byte count crosses the 1 MiB durable bound inside the adapter.
+    const CHUNK: usize = 32 * 1024;
+    let oversized = "x".repeat(pad);
+    let text_chunks: Vec<&str> = oversized
+        .as_bytes()
+        .chunks(CHUNK)
+        .map(|bytes| std::str::from_utf8(bytes).expect("test text is ASCII"))
+        .collect();
+    match kind {
+        "openai_chat" => {
+            let mut events = Vec::new();
+            for chunk in &text_chunks {
+                events.push(format!(
+                    "data: {{\"id\":\"chatcmpl-big\",\"object\":\"chat.completion.chunk\",\"created\":1755000010,\"model\":\"gpt-4o-mini\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"{chunk}\"}},\"finish_reason\":null}}]}}\n\n"
+                ));
+            }
+            events.push("data: [DONE]\n\n".to_string());
+            events
+        }
+        "openai_responses" => {
+            let mut events = Vec::new();
+            for chunk in &text_chunks {
+                events.push(format!(
+                    "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_big\",\"output_index\":0,\"delta\":\"{chunk}\"}}\n\n"
+                ));
+            }
+            events.push(
+                "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+                    .to_string(),
+            );
+            events.push("data: [DONE]\n\n".to_string());
+            events
+        }
+        _ => {
+            let mut events = vec![
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+            ];
+            for chunk in &text_chunks {
+                events.push(format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{chunk}\"}}}}\n\n"
+                ));
+            }
+            events.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+            events
+        }
+    }
+}
+
+#[test]
+fn openai_chat_stream_output_over_one_megabyte_fails_typed() {
+    let events = overflow_events_for("openai_chat", 1_048_577);
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("api_error"));
+    assert_eq!(error["code"], json!("output_too_large"));
+    assert_eq!(error["status"], json!(200));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("UTF-8 byte durable bound"),
+        "{error:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+}
+
+#[test]
+fn openai_responses_stream_output_overflow_fails_typed() {
+    let events = overflow_events_for("openai_responses", 1_048_577);
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("api_error"));
+    assert_eq!(error["code"], json!("output_too_large"));
+    assert_eq!(error["status"], json!(200));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("1048576"),
+        "{error:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /responses HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+}
+
+#[test]
+fn anthropic_messages_stream_output_overflow_fails_typed() {
+    let events = overflow_events_for("anthropic", 1_048_577);
+    let (port, requests, fixture) = spawn_sse_fixture(events, false);
+    let runner = harness_runner(port);
+    let request = canonical_request(port, true);
+
+    let (result, _) = run_adapter(
+        "anthropic_messages",
+        request,
+        profile("anthropic", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    let error = error_of(&result);
+    assert_eq!(error["type"], json!("api_error"));
+    assert_eq!(error["code"], json!("output_too_large"));
+    assert_eq!(error["status"], json!(200));
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("1048576"),
+        "{error:?}"
+    );
+
+    let recorded = requests.recv().expect("recorded request");
+    assert_eq!(request_line(&recorded), "POST /v1/messages HTTP/1.1");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["stream"], json!(true));
+}
+
+// ---------------------------------------------------------------------------
+// S3: OpenAI Responses adapter
+// ---------------------------------------------------------------------------
+//
+// The Responses adapter uses the same typed canonical request and runtime-map
+// encoder as the Chat adapter. Buffered and streaming transcripts cover the
+// wire contract, tool choice precedence, raw schema preservation, and the
+// fail-closed EOF guards. The stream ends with a bare `data: [DONE]`.
 
 #[test]
 fn openai_responses_buffered_text_tool_usage_reasoning() {
@@ -1087,6 +1238,63 @@ fn openai_responses_buffered_text_tool_usage_reasoning() {
         !recorded.body.contains("parallel_tool_calls"),
         "wire body must not mention parallel_tool_calls at all: {}",
         recorded.body
+    );
+}
+
+/// Responses uses runtime JSON maps, so marker-looking user text and schema
+/// descriptions remain ordinary JSON values.
+#[test]
+fn openai_responses_wire_preserves_marker_like_text_and_schema() {
+    let body = read_fixture("openai_responses/response.json");
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["messages"][0]["content"][0]["text"] = json!("__RSS_TOOL_SCHEMA_0__");
+    request["tools"][0]["description"] = json!("__RSS_TOOL_SCHEMA_0__");
+    request["tools"][0]["schema_json"] =
+        json!("{\"type\":\"object\",\"description\":\"__RSS_TOOL_SCHEMA_1__\"}");
+
+    let (result, _) = run_adapter(
+        "openai_responses",
+        request,
+        profile("openai", port),
+        &runner,
+    );
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(true), "{result}");
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["input"][0]["content"], json!("__RSS_TOOL_SCHEMA_0__"));
+    assert_eq!(
+        wire["tools"][0]["description"],
+        json!("__RSS_TOOL_SCHEMA_0__")
+    );
+    assert_eq!(
+        wire["tools"][0]["parameters"]["description"],
+        json!("__RSS_TOOL_SCHEMA_1__")
+    );
+}
+
+/// The canonical request carries the client's exact token-field spelling to
+/// the Chat adapter: current OpenAI uses `max_completion_tokens`, while the
+/// legacy profile keeps `max_tokens`.
+#[test]
+fn openai_chat_wire_distinguishes_completion_token_field() {
+    let body = read_fixture("openai_chat/response.json");
+    let (port, requests, fixture) = spawn_json_fixture(200, body);
+    let runner = harness_runner(port);
+    let mut request = canonical_request(port, false);
+    request["max_output_tokens_field"] = json!("max_completion_tokens");
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(true), "{result}");
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert_eq!(wire["max_completion_tokens"], json!(128));
+    assert!(
+        wire.get("max_tokens").is_none(),
+        "legacy key must be absent"
     );
 }
 

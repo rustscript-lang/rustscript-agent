@@ -57,7 +57,7 @@ fn canonical_fixtures_deserialize_into_the_frozen_typed_contracts() {
         Value::String("hello from fixture".to_string())
     );
     assert_eq!(run_context.tool_schemas, Value::Array(vec![]));
-    assert_eq!(run_context.limits["max_events"], 240);
+    assert_eq!(run_context.limits["max_events"], 8192);
 
     let request: LlmRequest = read_fixture("llm_request.json");
     assert_eq!(request.model, "test-model");

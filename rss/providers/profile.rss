@@ -35,6 +35,7 @@ pub fn profile_merge(
         api_key: api_key,
         model: model,
         adapter: types::profile_string(metadata, "adapter"),
+        max_tokens_field: types::profile_string(metadata, "max_tokens_field"),
         capabilities: types::request_map(metadata, "capabilities")
     }
 }

@@ -277,6 +277,8 @@ async fn admit_and_wait(
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");
@@ -520,6 +522,8 @@ async fn e2e_cancel_mid_run_commits_typed_cancelled_terminal() {
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");
@@ -586,6 +590,8 @@ async fn e2e_approval_wait_resume_is_exactly_once_and_completes() {
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");
@@ -672,6 +678,8 @@ async fn e2e_approval_denied_folds_a_typed_tool_result_and_the_loop_continues() 
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");
@@ -860,6 +868,8 @@ async fn e2e_compaction_executes_durably_and_advances_generation() {
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");
@@ -949,6 +959,8 @@ async fn admit_and_spawn(
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");
@@ -2251,6 +2263,8 @@ async fn e2e_compaction_pair_boundary_preserves_the_pair_and_provider_sees_no_da
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");
@@ -3282,6 +3296,8 @@ async fn e2e_unknown_compaction_command_is_a_typed_failure_and_the_run_continues
             idempotency_key: None,
             idempotency_hash: None,
             origin_actor: None,
+            request_overrides: serde_json::Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
         .expect("admission should succeed");

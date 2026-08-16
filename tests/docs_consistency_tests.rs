@@ -432,7 +432,7 @@ fn native_config_fields_and_key_defaults_are_documented() {
         ("max_concurrent_runs", "8"),
         ("run_timeout", "900 s"),
         ("max_body_bytes", "4 MiB"),
-        ("max_events_per_run", "240"),
+        ("max_events_per_run", "8192"),
         ("max_event_bytes", "32 KiB"),
         ("fuel", "Some(10_000_000)"),
     ] {

@@ -89,9 +89,9 @@ pub fn storage_event_replay(db_id: int, payload_json: string) -> map {
     let input: EventReplayInput = json::decode::<EventReplayInput>(payload_json);
     sqlite::query(
         db_id,
-        "SELECT events.seq, events.run_id, events.event_id, events.event_type, CASE WHEN length(CAST(events.payload_json AS BLOB)) > CASE WHEN ? <= 0 THEN 16384 WHEN ? > 32768 THEN 16384 WHEN ? < 128 THEN 64 ELSE ? / 2 END THEN '{\"truncated\":true,\"original_bytes\":' || length(CAST(events.payload_json AS BLOB)) || '}' ELSE events.payload_json END AS payload_json, events.created_at_ms FROM run_events events WHERE events.run_id = ? AND events.seq >= ? ORDER BY events.seq ASC LIMIT (CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END) + 1",
+        "SELECT events.seq, events.run_id, events.event_id, events.event_type, CASE WHEN length(CAST(events.payload_json AS BLOB)) > CASE WHEN ? <= 0 THEN 16384 WHEN ? > 32768 THEN 16384 WHEN ? < 128 THEN 64 ELSE ? / 2 END THEN '{\"truncated\":true,\"original_bytes\":' || length(CAST(events.payload_json AS BLOB)) || '}' ELSE events.payload_json END AS payload_json, events.created_at_ms FROM run_events events WHERE events.run_id = ? AND events.seq >= ? ORDER BY events.seq ASC LIMIT (CASE WHEN ? <= 0 THEN 128 WHEN ? > 16384 THEN 16384 ELSE ? END) + 1",
         [input.max_bytes.copy(), input.max_bytes.copy(), input.max_bytes.copy(), input.max_bytes.copy(), &input.run_id, input.after_seq.copy(), input.max_events.copy(), input.max_events.copy(), input.max_events.copy()],
-        events_query_limits(input.max_events.copy(), input.max_bytes.copy())
+        schema::event_replay_limits(input.max_events.copy(), input.max_bytes.copy())
     )
 }
 

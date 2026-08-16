@@ -1041,8 +1041,9 @@ fn event_retention_floor_high_water_and_cursor_too_old() {
         }),
         now_ms,
     );
-    assert_eq!(below_floor["ok"], json!(false));
-    assert_eq!(below_floor["code"], json!("cursor_too_old"));
+    assert_eq!(below_floor["ok"], json!(true));
+    let below_floor_rows = query_rows(&below_floor);
+    assert_eq!(below_floor_rows[0]["seq"], json!(124));
 
     let full_replay = run_storage(
         &runner,
@@ -2377,6 +2378,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "event_id": "event-rejected",
             "now_ms": 2,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }),
         2,
     );
@@ -2410,6 +2412,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "event_id": "event-started-1",
             "now_ms": 3,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }),
         3,
     );
@@ -2526,6 +2529,7 @@ fn run_terminal_commits_atomically_and_returns_assigned_sequences() {
             "event_id": "event-started-1",
             "now_ms": 2,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }),
         2,
     );
@@ -2583,13 +2587,25 @@ fn run_terminal_commits_atomically_and_returns_assigned_sequences() {
     assert_eq!(second_last[2], json!("event-delta"));
     assert_eq!(second_last[0], json!(4));
 
+    // The terminal response must expose the durable assistant row used by
+    // the caller to reconcile the pre-generated message id.
+    let terminal_message_rows = data["message"]["rows"]
+        .as_array()
+        .expect("terminal message rows");
+    assert_eq!(terminal_message_rows.len(), 1);
+    assert_eq!(terminal_message_rows[0][0], json!("message-assistant"));
+
     // The assistant message is part of the same commit.
     let message = run_storage(
         &runner,
         db_name,
         "message-get-assistant",
         "message.get",
-        json!({"message_id": "message-assistant"}),
+        json!({
+            "message_id": "message-assistant",
+            "session_id": "session-1",
+            "run_id": "run-1"
+        }),
         7,
     );
     let message_row = first_query_row(&message);
@@ -2629,6 +2645,196 @@ fn run_terminal_commits_atomically_and_returns_assigned_sequences() {
     );
     assert_eq!(second_terminal["ok"], json!(false));
     assert_eq!(second_terminal["code"], json!("transition_conflict"));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P1: a durable message lookup is authorized by the owning run and session,
+/// not by a globally unique message id alone.
+#[test]
+fn message_get_requires_run_and_session_ownership() {
+    let root = temporary_root("message-owner");
+    let runner = storage_runner(&root);
+    let db_name = "message-owner.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "admission-1",
+        "admission.create",
+        json!({
+            "session_id": "session-owner",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-owner",
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "run_id": "run-owner",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"hi\"}",
+            "message_id": "message-input",
+            "message_run_id": "run-owner",
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "origin_actor": "",
+            "event_id": "event-started-1",
+            "now_ms": 2,
+            "expires_at_ms": 0,
+            "conversation_json": "",
+        }),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "terminal-1",
+        "run.terminal",
+        json!({
+            "run_id": "run-owner",
+            "to_status": "completed",
+            "error_code": "",
+            "error_message": "",
+            "event_1_id": "event-delta",
+            "event_1_type": "message.delta",
+            "event_1_payload": "{\"delta\":\"done\"}",
+            "event_2_id": "event-completed",
+            "event_2_type": "run.completed",
+            "event_2_payload": "{\"status\":\"completed\"}",
+            "event_count": 2,
+            "message_id": "message-assistant",
+            "message_session_id": "session-owner",
+            "message_role": "assistant",
+            "message_content_json": "{\"text\":\"done\"}",
+            "message_run_id": "run-owner",
+            "message_finish_reason": "stop",
+            "now_ms": 3,
+        }),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "session-foreign",
+        "session.create",
+        session_payload("session-foreign", 4),
+        4,
+    );
+
+    let unauthorized = run_storage(
+        &runner,
+        db_name,
+        "message-owner-check",
+        "message.get",
+        json!({
+            "message_id": "message-assistant",
+            "session_id": "session-foreign",
+            "run_id": "run-foreign"
+        }),
+        5,
+    );
+    assert_eq!(
+        query_rows(&unauthorized).len(),
+        0,
+        "a message id must not authorize cross-session or cross-run reads"
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// P1: a terminal parent remains durable while an active child still points
+/// at it, so restart/load cannot leave a dangling parent reference.
+#[test]
+fn prune_terminal_excludes_parents_with_active_children() {
+    let root = temporary_root("prune-child-owner");
+    let runner = storage_runner(&root);
+    let db_name = "prune-child-owner.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "parent-create",
+        "run.create",
+        run_payload("parent-run", "session-1", 3),
+        3,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "parent-start",
+        "run.transition",
+        transition_payload("parent-run", "queued", "running", 4),
+        4,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "parent-complete",
+        "run.transition",
+        transition_payload("parent-run", "running", "completed", 5),
+        5,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "child-create",
+        "run.create",
+        json!({
+            "id": "child-run",
+            "session_id": "session-1",
+            "parent_run_id": "parent-run",
+            "input_json": "{\"message\":\"child\"}",
+            "provider": "test-provider",
+            "model": "test-model",
+            "script_hash": "test-script",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "child-run",
+            "now_ms": 6
+        }),
+        6,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "child-start",
+        "run.transition",
+        transition_payload("child-run", "queued", "running", 7),
+        7,
+    );
+
+    let pruned = run_storage(
+        &runner,
+        db_name,
+        "prune-1",
+        "runs.prune_terminal",
+        json!({"older_than_ms": 100, "now_ms": 200, "max_rows": 32}),
+        200,
+    );
+    assert_eq!(query_rows(&pruned).len(), 0);
+    let parent = run_storage(
+        &runner,
+        db_name,
+        "parent-get",
+        "run.get",
+        json!({"run_id": "parent-run"}),
+        201,
+    );
+    assert_eq!(
+        query_rows(&parent).len(),
+        1,
+        "active child keeps parent durable"
+    );
 
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
@@ -2701,6 +2907,7 @@ fn load_all_paginates_beyond_single_page_and_byte_limits() {
             "event_id": "event-started-1",
             "now_ms": now_ms,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }),
         now_ms,
     );
@@ -2762,8 +2969,8 @@ fn load_all_paginates_beyond_single_page_and_byte_limits() {
     let events = data["events"].as_array().expect("events rows");
     assert_eq!(
         events.len(),
-        256,
-        "retained tail obeys the 256-event retention clamp"
+        600,
+        "retained tail obeys the raised retention clamp (≥ 4096 stream chunks)"
     );
     // Row shapes: sessions carry the id first; events carry seq first.
     let session_first = sessions[0].as_array().expect("session row");
@@ -2771,8 +2978,8 @@ fn load_all_paginates_beyond_single_page_and_byte_limits() {
     let event_first = events[0].as_array().expect("event row");
     assert_eq!(
         event_first[0],
-        json!(345),
-        "retained tail starts at seq 345"
+        json!(1),
+        "the full retained tail is served, starting at seq 1"
     );
 
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
@@ -2859,6 +3066,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "event_id": "event-1",
             "now_ms": 4,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }),
         4,
     );
@@ -2889,6 +3097,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "event_id": "event-2",
             "now_ms": 5,
             "expires_at_ms": 0,
+            "conversation_json": "",
         }),
         5,
     );
@@ -3327,5 +3536,204 @@ fn delivery_set_is_monotonic_and_unvalidated() {
         json!(42),
         "delivery.set must be monotonic: 7 then 5 must leave 42"
     );
+    fs::remove_dir_all(root).expect("temporary root should be removed");
+}
+
+/// P3 (RSS layer): `runs.prune_terminal` is the janitor's bounded durable
+/// retention sweep. It deletes ONLY terminal runs (completed/failed/
+/// cancelled) whose `updated_at_ms` is older than the window, cascading
+/// their events/retention/idempotency records. Active and `terminal_pending`
+/// runs are never matched, so restart replay and the terminal retry loop
+/// stay intact.
+#[test]
+fn runs_prune_terminal_reclaims_only_old_terminal_runs() {
+    let root = temporary_root("prune-terminal");
+    let runner = storage_runner(&root);
+    let db_name = "prune-terminal.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    let admission = |run_id: &str, now_ms: i64| {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("admission-{run_id}"),
+            "admission.create",
+            json!({
+                "session_id": "session-1",
+                "session_new": 1,
+                "profile": "gateway",
+                "platform": "api_server",
+                "account_id": "session-1",
+                "model": "m",
+                "provider": "p",
+                "system_prompt": "",
+                "run_id": run_id,
+                "parent_run_id": "",
+                "input_json": "{\"text\":\"hi\"}",
+                "message_id": format!("message-{run_id}"),
+                "message_run_id": run_id,
+                "script_hash": "s",
+                "idempotency_scope": "api:chat",
+                "idempotency_key": "",
+                "request_hash": "",
+                "origin_actor": "",
+                "event_id": format!("event-started-{run_id}"),
+                "now_ms": now_ms,
+                "expires_at_ms": 0,
+                "conversation_json": "",
+            }),
+            now_ms,
+        );
+    };
+    let terminal = |run_id: &str, to_status: &str, now_ms: i64| {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("terminal-{run_id}"),
+            "run.terminal",
+            json!({
+                "run_id": run_id,
+                "to_status": to_status,
+                "error_code": "",
+                "error_message": "",
+                "event_1_id": format!("event-terminal-{run_id}"),
+                "event_1_type": "run.completed",
+                "event_1_payload": "{\"status\":\"completed\"}",
+                "event_2_id": "",
+                "event_2_type": "",
+                "event_2_payload": "",
+                "event_count": 1,
+                "message_id": "",
+                "message_session_id": "",
+                "message_role": "",
+                "message_content_json": "",
+                "message_run_id": "",
+                "message_finish_reason": "",
+                "now_ms": now_ms,
+            }),
+            now_ms,
+        );
+    };
+
+    admission("old-terminal", 100);
+    terminal("old-terminal", "completed", 200);
+    admission("recent-terminal", 1000);
+    terminal("recent-terminal", "completed", 1100);
+    // Active run: NEVER matched by the sweep.
+    admission("active", 2000);
+    // waiting_approval run (a parked run the retry loop owns): NEVER
+    // matched.
+    admission("pending", 3000);
+    run_storage(
+        &runner,
+        db_name,
+        "pending-transition",
+        "run.transition",
+        transition_payload("pending", "running", "waiting_approval", 3100),
+        3100,
+    );
+
+    // Window boundary: reclaims everything older than 1000 ms.
+    let old_before = run_storage(
+        &runner,
+        db_name,
+        "old-before",
+        "run.get",
+        json!({"run_id": "old-terminal"}),
+        900,
+    );
+    assert_eq!(
+        old_before["ok"],
+        json!(true),
+        "old terminal exists before prune: {old_before}"
+    );
+    assert_eq!(
+        old_before["data"]["rows"][0][3],
+        json!("completed"),
+        "old terminal status: {old_before}"
+    );
+    let pruned = run_storage(
+        &runner,
+        db_name,
+        "prune-1",
+        "runs.prune_terminal",
+        json!({
+            "older_than_ms": 1000,
+            "now_ms": 10_000,
+            "max_rows": 64,
+        }),
+        10_000,
+    );
+    assert_eq!(pruned["ok"], json!(true), "prune must succeed: {pruned}");
+    assert_eq!(
+        pruned["data"]["rows"].as_array().map(Vec::len),
+        Some(1),
+        "exactly the old terminal run must be reclaimed, got: {pruned}"
+    );
+    let deleted = pruned["data"]["rows"]
+        .as_array()
+        .expect("deleted run ids")
+        .iter()
+        .filter_map(|row| {
+            row.as_array()
+                .and_then(|row| row.first().and_then(JsonValue::as_str))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        deleted.contains(&"old-terminal"),
+        "the old terminal run must be reclaimed, got {deleted:?}"
+    );
+    assert!(
+        !deleted.contains(&"recent-terminal"),
+        "the recent terminal run must survive, got {deleted:?}"
+    );
+    assert!(
+        !deleted.contains(&"active") && !deleted.contains(&"pending"),
+        "active and terminal_pending runs must never be pruned, got {deleted:?}"
+    );
+
+    // Cascades: the old run's events/retention/idempotency are gone with it.
+    let old_get = run_storage(
+        &runner,
+        db_name,
+        "old-get",
+        "run.get",
+        json!({"run_id": "old-terminal"}),
+        10_001,
+    );
+    assert_eq!(
+        old_get["data"]["rows"].as_array().map(Vec::len),
+        Some(0),
+        "the old terminal run must be gone: {old_get}"
+    );
+    let recent_get = run_storage(
+        &runner,
+        db_name,
+        "recent-get",
+        "run.get",
+        json!({"run_id": "recent-terminal"}),
+        10_002,
+    );
+    assert_eq!(recent_get["ok"], json!(true));
+
+    // A second sweep with an older boundary is a bounded no-op.
+    let again = run_storage(
+        &runner,
+        db_name,
+        "prune-2",
+        "runs.prune_terminal",
+        json!({
+            "older_than_ms": 10_000,
+            "now_ms": 10_000,
+            "max_rows": 64,
+        }),
+        10_000,
+    );
+    assert_eq!(again["ok"], json!(true));
+    let again_deleted = again["data"]["rows"].as_array().map(Vec::len).unwrap_or(0);
+    assert_eq!(
+        again_deleted, 1,
+        "only the old terminal run was already reclaimed"
+    );
+
     fs::remove_dir_all(root).expect("temporary root should be removed");
 }

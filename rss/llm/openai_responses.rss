@@ -16,48 +16,36 @@
 // `response.output_item.done`, and `response.completed` events, ending with a
 // bare `data: [DONE]`.
 //
-// Tool schemas arrive as `schema_json` strings and are spliced into the encoded
-// wire body through per-tool indexed literal markers
-// (`__RSS_TOOL_SCHEMA_<i>__`), because json::encode only accepts
-// struct-shaped values (see rss/llm/openai_chat.rss and the A3 plan P3 note).
+// Tool schemas are decoded to runtime JSON maps and encoded in one pass;
+// user text, descriptions, and schema literals are never searched/replaced
+// in the whole body.
 use json;
 use bytes;
 use http;
 use self::types as types;
 
-struct RespInputItem {
+// Runtime maps are used for the wire body. This keeps raw JSON schemas as
+// JSON values and prevents user text, descriptions, or schemas from being
+// interpreted as body-level markers.
+
+fn responses_input_item(
     role: string?,
     content: string?,
-    type: string?,
+    item_type: string?,
     call_id: string?,
     output: string?,
     name: string?,
     arguments: string?
-}
-
-struct RespTool {
-    type: string,
-    name: string,
-    description: string,
-    parameters: string
-}
-
-struct RespRequest {
-    model: string,
-    input: array<RespInputItem>,
-    tools: array<RespTool>?,
-    tool_choice: string?,
-    parallel_tool_calls: bool?,
-    max_output_tokens: int?,
-    temperature: float?,
-    top_p: float?,
-    stream: bool
-}
-
-/// Marker for one tool's raw schema (see rss/llm/openai_chat.rss).
-fn tool_schema_marker(index: int) -> string {
-    let encoded: string = json::encode(index);
-    "__RSS_TOOL_SCHEMA_" + encoded + "__"
+) -> map {
+    let mut item: map = {};
+    if role != null { item["role"] = role; }
+    if content != null { item["content"] = content; }
+    if item_type != null { item["type"] = item_type; }
+    if call_id != null { item["call_id"] = call_id; }
+    if output != null { item["output"] = output; }
+    if name != null { item["name"] = name; }
+    if arguments != null { item["arguments"] = arguments; }
+    item
 }
 
 // ---------------------------------------------------------------------------
@@ -92,20 +80,16 @@ fn openai_responses_complete(request: map, base_url: string, api_key: string) ->
     }
 }
 
-/// The whole buffered path: wire building, tool-schema splicing, and the
-/// transport call.
+/// The whole buffered path: runtime-map wire building and the transport
+/// call. Tool schemas stay JSON values throughout the encoding pass.
 fn responses_send_complete(
     request: map,
     model: string,
     base_url: string,
     api_key: string
 ) -> map {
-    let body_text: string = responses_encode_wire(request, model, false);
+    let body: string = responses_encode_wire(request, model, false);
     let url: string = base_url + "/responses";
-    let body: string = responses_splice_tool_schemas(
-        body_text,
-        types::request_array(request, "tools")
-    );
     let response: map = http::client::request({
         method: "POST",
         url: url,
@@ -132,15 +116,11 @@ fn responses_encode_wire(request: map, model: string, stream: bool) -> string {
     body_text
 }
 
-fn responses_build_wire(request: map, model: string, stream: bool) -> RespRequest {
-    let input: array<RespInputItem> = responses_build_input(
+fn responses_build_wire(request: map, model: string, stream: bool) -> map {
+    let input: array = responses_build_input(
         types::request_array(request, "messages")
     );
-    let tools: array<RespTool> = responses_build_tools(types::request_array(request, "tools"));
-    let mut wire_tools: array<RespTool>? = null;
-    if tools.length > 0 {
-        wire_tools = tools;
-    }
+    let tools: array = responses_build_tools(types::request_array(request, "tools"));
     let sampling: map = types::request_map(request, "sampling");
     let temperature_raw: map = types::sampling_float(sampling, "temperature");
     let top_p_raw: map = types::sampling_float(sampling, "top_p");
@@ -153,8 +133,6 @@ fn responses_build_wire(request: map, model: string, stream: bool) -> RespReques
     // request field, exactly like the chat adapter. The legacy
     // provider_options.tool_choice alias remains a fallback for older
     // callers; the top-level value always wins when both are present.
-    // parallel_tool_calls lives in provider_options as a presence-aware
-    // bool (absent -> omitted from the wire; false stays false).
     let tool_choice: string = types::request_string(request, "tool_choice");
     let options: map = types::request_map(request, "provider_options");
     let mut tool_choice_effective: string = tool_choice;
@@ -164,37 +142,14 @@ fn responses_build_wire(request: map, model: string, stream: bool) -> RespReques
     let parallel_raw: map = responses_parallel_bool(options);
     let parallel_present: bool = parallel_raw["present"];
     let parallel_value: bool = parallel_raw["value"];
-    let mut temperature: float? = null;
-    let mut top_p: float? = null;
-    let mut max_tokens: int? = null;
-    let mut wire_tool_choice: string? = null;
-    let mut wire_parallel: bool? = null;
-    if temperature_present {
-        temperature = temperature_value;
-    }
-    if top_p_present {
-        top_p = top_p_value;
-    }
-    if max_output > 0 {
-        max_tokens = max_output;
-    }
-    if tool_choice_effective != "" {
-        wire_tool_choice = tool_choice_effective;
-    }
-    if parallel_present {
-        wire_parallel = parallel_value;
-    }
-    {
-        model: model,
-        input: input,
-        tools: wire_tools,
-        tool_choice: wire_tool_choice,
-        parallel_tool_calls: wire_parallel,
-        max_output_tokens: max_tokens,
-        temperature: temperature,
-        top_p: top_p,
-        stream: stream
-    }
+    let mut body: map = { model: model, input: input, stream: stream };
+    if tools.length > 0 { body["tools"] = tools; }
+    if tool_choice_effective != "" { body["tool_choice"] = tool_choice_effective; }
+    if parallel_present { body["parallel_tool_calls"] = parallel_value; }
+    if max_output > 0 { body["max_output_tokens"] = max_output; }
+    if temperature_present { body["temperature"] = temperature_value; }
+    if top_p_present { body["top_p"] = top_p_value; }
+    body
 }
 
 /// Presence-aware bool read for one provider_options knob: absent -> present
@@ -215,8 +170,8 @@ fn responses_parallel_bool(options: map) -> map {
 }
 
 /// Converts canonical messages into the heterogeneous `input` item array.
-fn responses_build_input(messages: array) -> array<RespInputItem> {
-    let mut wire: array<RespInputItem> = [];
+fn responses_build_input(messages: array) -> array {
+    let mut wire: array = [];
     let mut i = 0;
     while i < messages.length {
         let message: map = types::array_entry(messages, i);
@@ -229,9 +184,9 @@ fn responses_build_input(messages: array) -> array<RespInputItem> {
 }
 
 fn responses_append_message_by_role(
-    wire: array<RespInputItem>,
+    wire: array,
     message: map
-) -> array<RespInputItem> {
+) -> array {
     let role: string = types::message_role(message);
     if role == "user" => {
         responses_append_user_message(wire, message)
@@ -251,11 +206,11 @@ fn responses_append_message_by_role(
 /// Appends one `user` message item (text) and one `function_call_output` item
 /// per tool_result part. Text is joined across parts into a plain string.
 fn responses_append_user_message(
-    wire: array<RespInputItem>,
+    wire: array,
     message: map
-) -> array<RespInputItem> {
+) -> array {
     let parts: array = types::message_content(message);
-    let mut result: array<RespInputItem> = wire;
+    let mut result: array = wire;
     let mut text: string = "";
     let mut i = 0;
     while i < parts.length {
@@ -264,30 +219,30 @@ fn responses_append_user_message(
             if types::part_type(part) == "tool_result" {
                 let call_id: string = types::request_string(part, "tool_call_id");
                 let output: string = types::request_string(part, "content");
-                result[result.length] = {
-                    role: null,
-                    content: null,
-                    type: "function_call_output",
-                    call_id: call_id,
-                    output: output,
-                    name: null,
-                    arguments: null
-                };
+                result[result.length] = responses_input_item(
+                    null,
+                    null,
+                    "function_call_output",
+                    call_id,
+                    output,
+                    null,
+                    null
+                );
             }
         }
         i += 1;
     }
     let text_joined: string = responses_join_text_parts(message);
     if text_joined != "" {
-        result[result.length] = {
-            role: "user",
-            content: text_joined,
-            type: null,
-            call_id: null,
-            output: null,
-            name: null,
-            arguments: null
-        };
+        result[result.length] = responses_input_item(
+            "user",
+            text_joined,
+            null,
+            null,
+            null,
+            null,
+            null
+        );
     }
     result
 }
@@ -295,11 +250,11 @@ fn responses_append_user_message(
 /// Appends one `assistant` message item (text) plus one `function_call` item
 /// per tool_call part. Text is joined into a plain string.
 fn responses_append_assistant_message(
-    wire: array<RespInputItem>,
+    wire: array,
     message: map
-) -> array<RespInputItem> {
+) -> array {
     let parts: array = types::message_content(message);
-    let mut result: array<RespInputItem> = wire;
+    let mut result: array = wire;
     let mut text: string = "";
     let mut i = 0;
     while i < parts.length {
@@ -312,7 +267,7 @@ fn responses_append_assistant_message(
         }
         i += 1;
     }
-    let mut tool_calls: array<RespInputItem> = [];
+    let mut tool_calls: array = [];
     let mut j = 0;
     while j < parts.length {
         let part: map = types::array_entry(parts, j);
@@ -321,29 +276,29 @@ fn responses_append_assistant_message(
                 let call_id: string = types::request_string(part, "tool_call_id");
                 let name: string = types::request_string(part, "name");
                 let arguments_json: string = types::request_string(part, "arguments_json");
-                tool_calls[tool_calls.length] = {
-                    role: null,
-                    content: null,
-                    type: "function_call",
-                    call_id: call_id,
-                    output: null,
-                    name: name,
-                    arguments: arguments_json
-                };
+                tool_calls[tool_calls.length] = responses_input_item(
+                    null,
+                    null,
+                    "function_call",
+                    call_id,
+                    null,
+                    name,
+                    arguments_json
+                );
             }
         }
         j += 1;
     }
     if text != "" {
-        result[result.length] = {
-            role: "assistant",
-            content: text,
-            type: null,
-            call_id: null,
-            output: null,
-            name: null,
-            arguments: null
-        };
+        result[result.length] = responses_input_item(
+            "assistant",
+            text,
+            null,
+            null,
+            null,
+            null,
+            null
+        );
     }
     let mut k = 0;
     while k < tool_calls.length {
@@ -354,22 +309,22 @@ fn responses_append_assistant_message(
 }
 
 fn responses_append_simple_message(
-    wire: array<RespInputItem>,
+    wire: array,
     role: string,
     message: map
-) -> array<RespInputItem> {
+) -> array {
     let text: string = responses_join_text_parts(message);
-    let mut result: array<RespInputItem> = wire;
+    let mut result: array = wire;
     if text != "" {
-        result[result.length] = {
-            role: role,
-            content: text,
-            type: null,
-            call_id: null,
-            output: null,
-            name: null,
-            arguments: null
-        };
+        result[result.length] = responses_input_item(
+            role,
+            text,
+            null,
+            null,
+            null,
+            null,
+            null
+        );
     }
     result
 }
@@ -392,47 +347,30 @@ fn responses_join_text_parts(message: map) -> string {
     joined
 }
 
-fn responses_build_tools(tools: array) -> array<RespTool> {
-    let mut wire: array<RespTool> = [];
+fn responses_build_tools(tools: array) -> array {
+    let mut wire: array = [];
     let mut i = 0;
     while i < tools.length {
         let tool: map = types::array_entry(tools, i);
         if tool.has("name") {
             let name: string = types::tool_name(tool);
             let description: string = types::tool_description(tool);
+            let schema_json: string = types::tool_schema_json(tool);
+            let schema: map = json::decode(schema_json);
             // Official Responses tool shape: flat {type, name, description,
             // parameters} — NOT nested under a `function` key (that is the
-            // Chat Completions shape).
+            // Chat Completions shape). The schema is a JSON value in the map,
+            // so marker-looking user text remains ordinary text.
             wire[wire.length] = {
                 type: "function",
                 name: name,
                 description: description,
-                parameters: tool_schema_marker(i)
+                parameters: schema
             };
         }
         i += 1;
     }
     wire
-}
-
-/// Replaces each tool schema marker with the tool's raw schema JSON (indexed
-/// marker, see rss/llm/openai_chat.rss).
-fn responses_splice_tool_schemas(body: string, tools: array) -> string {
-    let mut result: string = body;
-    let mut i = 0;
-    while i < tools.length {
-        let tool: map = types::array_entry(tools, i);
-        if tool.has("schema_json") {
-            let schema_json: string = types::tool_schema_json(tool);
-            result = string_replace_literal(
-                result,
-                "\"" + tool_schema_marker(i) + "\"",
-                schema_json
-            );
-        }
-        i += 1;
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -578,8 +516,13 @@ fn responses_error_payload(body_text: string) -> map {
 //
 // Aggregates Responses streaming events into canonical fields. The stream
 // summary follows the same fail-closed contract as the chat adapter (A3
-// review P2): a legal `[DONE]` stream must succeed, EOF without `[DONE]` must
-// fail as a typed provider error.
+// Fail-closed contract: a legal `[DONE]` stream must succeed, EOF without
+// `[DONE]` must fail as a typed provider error.
+
+fn responses_utf8_bytes(text: string) -> int {
+    let encoded: bytes = bytes::from_utf8(text);
+    encoded.length
+}
 
 fn openai_responses_stream_dispatch(request: map, profile: map) -> map {
     let base_url: string = types::profile_string(profile, "base_url");
@@ -602,16 +545,14 @@ fn responses_send_stream(
     base_url: string,
     api_key: string
 ) -> map {
-    let body_text: string = responses_encode_wire(request, model, true);
+    let body: string = responses_encode_wire(request, model, true);
     let url: string = base_url + "/responses";
-    let body: string = responses_splice_tool_schemas(
-        body_text,
-        types::request_array(request, "tools")
-    );
     let mut text: string = "";
     let mut input_tokens: int = 0;
     let mut output_tokens: int = 0;
     let mut total_tokens: int = 0;
+    let mut output_bytes: int = 0;
+    let mut output_overflow: bool = false;
     let mut tools: array = [];
     let mut done = false;
     let mut completed = false;
@@ -633,8 +574,12 @@ fn responses_send_stream(
             let event_type: string = types::request_string(chunk, "type");
             if event_type == "response.output_text.delta" {
                 let delta: string = types::request_string(chunk, "delta");
-                if delta != "" {
+                let delta_bytes: int = responses_utf8_bytes(delta);
+                if output_bytes + delta_bytes > 1048576 {
+                    output_overflow = true;
+                } else if delta != "" {
                     text = text + delta;
+                    output_bytes = output_bytes + delta_bytes;
                 }
             }
             if event_type == "response.function_call_arguments.delta" {
@@ -666,14 +611,16 @@ fn responses_send_stream(
     });
     let status: int = types::request_int(stream_result, "status", 0);
     let calls: array = responses_stream_parse_tool_calls(tools);
-    // Fail-closed verdict: the SSE reader stops ONLY on the explicit
-    // `data: [DONE]` branch (done=true); every other termination — EOF or
-    // transport error — leaves done=false and must fail. A `[DONE]` that
-    // arrived without the terminal response.completed event (bare [DONE])
-    // is equally malformed. `done` with a non-stopped outcome is
-    // unreachable (the only stop action is the [DONE] branch), so the
-    // verdict reduces to done && completed.
-    if !done => {
+    if output_overflow => {
+        types::fail(types::error_new(
+            status,
+            "api_error",
+            "output_too_large",
+            "assistant output exceeds the 1048576 UTF-8 byte durable bound",
+            "",
+            ""
+        ))
+    } else if !done => {
         types::fail(types::error_new(
             status,
             "api_error",

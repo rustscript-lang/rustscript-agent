@@ -125,6 +125,7 @@ pub(crate) async fn run_delivery_task(
             ) {
                 return DeliverOutcome::RunEnded;
             }
+            let previous_events = run.events.clone();
             let event = append_event_locked(
                 run,
                 &event_type_for_block,
@@ -160,8 +161,7 @@ pub(crate) async fn run_delivery_task(
                         .expect("the delivery channel exists while the run is active"),
                 ),
                 Err(error) => {
-                    run.events
-                        .retain(|existing| existing.event_id != event.event_id);
+                    restore_events_after_failed_append(&mut run.events, previous_events);
                     DeliverOutcome::PersistFailed(error.to_string())
                 }
             }
@@ -190,6 +190,29 @@ pub(crate) async fn run_delivery_task(
     outcome
 }
 
+fn compact_provider_error(error: Option<&Value>) -> Value {
+    let Some(error) = error.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let mut compact = serde_json::Map::new();
+    for key in ["type", "code", "message", "param", "request_id"] {
+        if let Some(value) = error.get(key) {
+            compact.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(compact)
+}
+
+/// Restores the complete retained event snapshot after a failed durable
+/// append. Retention may have removed older rows, so a length-based truncate
+/// cannot restore the pre-append history.
+pub(crate) fn restore_events_after_failed_append(
+    events: &mut Vec<GatewayEvent>,
+    previous_events: Vec<GatewayEvent>,
+) {
+    *events = previous_events;
+}
+
 /// Appends one event to the run's retained history and returns it with the
 /// live delivery sender. Sequence and timestamps are AgentService-owned;
 /// retention and byte bounds come from the validated configuration.
@@ -204,7 +227,24 @@ pub(crate) fn append_event_locked(
         .map(|payload| payload.len() > max_event_bytes)
         .unwrap_or(true)
     {
-        data = json!({"truncated":true,"original_bytes":"over_limit"});
+        data = match event_type {
+            "run.completed" => json!({
+                "status": "completed",
+                "message_id": data.get("message_id").cloned().unwrap_or(Value::Null),
+                "usage": data.get("usage").cloned().unwrap_or(Value::Null),
+            }),
+            "run.failed" => json!({
+                "status": "failed",
+                "error_code": data.get("error_code").cloned().unwrap_or(Value::Null),
+                "error_message": data.get("error_message").cloned().unwrap_or(Value::Null),
+                "provider_error": compact_provider_error(data.get("provider_error")),
+            }),
+            "run.cancelled" => json!({
+                "status": "cancelled",
+                "reason": data.get("reason").cloned().unwrap_or(Value::Null),
+            }),
+            _ => json!({"truncated":true,"original_bytes":"over_limit"}),
+        };
     }
     let seq = run.events.last().map(|event| event.seq + 1).unwrap_or(1);
     let event = GatewayEvent {
@@ -226,6 +266,44 @@ pub(crate) fn append_event_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_append_restores_the_full_retained_snapshot() {
+        let old = vec![
+            GatewayEvent {
+                event_id: "old-1".to_string(),
+                seq: 1,
+                event: "model.delta".to_string(),
+                run_id: "run-1".to_string(),
+                timestamp: 1,
+                data: json!({"delta": "first"}),
+            },
+            GatewayEvent {
+                event_id: "old-2".to_string(),
+                seq: 2,
+                event: "model.delta".to_string(),
+                run_id: "run-1".to_string(),
+                timestamp: 2,
+                data: json!({"delta": "second"}),
+            },
+        ];
+        let mut retained = old.clone();
+        retained.remove(0);
+        retained.push(GatewayEvent {
+            event_id: "new-3".to_string(),
+            seq: 3,
+            event: "run.completed".to_string(),
+            run_id: "run-1".to_string(),
+            timestamp: 3,
+            data: json!({"status": "completed"}),
+        });
+
+        restore_events_after_failed_append(&mut retained, old.clone());
+        assert_eq!(
+            retained, old,
+            "retention must not destroy the rollback snapshot"
+        );
+    }
 
     #[tokio::test]
     async fn full_bounded_channel_blocks_delivery_until_capacity_returns() {
@@ -259,6 +337,78 @@ mod tests {
         assert_eq!(
             receiver.recv().await.expect("second event must arrive"),
             VmValue::Int(2)
+        );
+    }
+
+    #[test]
+    fn failed_terminal_append_after_retention_drain_restores_old_events_and_drops_new_unpersisted()
+    {
+        // Finding A: after retention has drained older events, a failed
+        // durable terminal append must restore the pre-append retained
+        // snapshot. A length-based `truncate(previous_len)` regression would
+        // keep the unpersisted terminal (because retention keeps the length
+        // constant) and drop the drained old event.
+        fn run(max_events_per_run: usize) -> Vec<String> {
+            let mut run = RunRecord {
+                run_id: "run-1".to_string(),
+                session_id: "session-1".to_string(),
+                parent_run_id: None,
+                request_overrides: Value::Null,
+                platform: "api_server".to_string(),
+                status: "running".to_string(),
+                events: Vec::new(),
+                sender: None,
+                cancel_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            append_event_locked(
+                &mut run,
+                "run.started",
+                json!({"status":"running"}),
+                1024,
+                max_events_per_run,
+            );
+            append_event_locked(
+                &mut run,
+                "model.delta",
+                json!({"delta":"hello"}),
+                1024,
+                max_events_per_run,
+            );
+            // The caller snapshots the retained history before the terminal
+            // append, exactly as the terminal paths do.
+            let previous_events = run.events.clone();
+            let terminal = append_event_locked(
+                &mut run,
+                "run.completed",
+                json!({"status":"completed"}),
+                1024,
+                max_events_per_run,
+            );
+            // Retention drained run.started on the third append; the new
+            // terminal row is not yet durable.
+            assert_eq!(terminal.event, "run.completed");
+            assert_eq!(
+                run.events
+                    .iter()
+                    .map(|e| e.event.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["model.delta", "run.completed"]
+            );
+            restore_events_after_failed_append(&mut run.events, previous_events);
+            run.events.iter().map(|e| e.event.clone()).collect()
+        }
+        // With retention 3 the pre-append snapshot is the same; but with
+        // retention 2 the old run.started event was drained and must be
+        // restored, while the unpersisted terminal must be removed.
+        let restored_low = run(2);
+        assert_eq!(
+            restored_low,
+            vec!["run.started", "model.delta"],
+            "rollback must restore the drained old event and drop the unpersisted terminal"
+        );
+        assert!(
+            !restored_low.contains(&"run.completed".to_string()),
+            "the failure rollback must never keep the un-persisted terminal event"
         );
     }
 }

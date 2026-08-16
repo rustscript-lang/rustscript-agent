@@ -138,8 +138,27 @@ warning; they are scheduled for removal before v1.
   peer-IP budget like every other route, and there is no private
   exemption.
 - Run execution is bounded: `run_timeout` (default 900 s), fuel
-  (10 000 000 default), per-run event caps (`max_events_per_run` 240,
-  `max_event_bytes` 32 KiB), and a 5 s cancellation grace.
+  (10 000 000 default), per-run event caps (`max_events_per_run` 8192,
+  `max_event_bytes` 32 KiB), and a 5 s cancellation grace. Durable rows are
+  bounded too: the janitor reclaims TERMINAL runs older than
+  `durable_run_retention` (default 86400 s) through the typed
+  `runs.prune_terminal` storage command; active and pending runs are never
+  pruned, so restart replay stays intact.
+- **OpenAI stream durability (A7/P1)**: terminal events carry a bounded
+  RSS-owned assistant-message reference. The Chat renderer reloads the
+  complete bounded message, tool content, and usage from durable storage;
+  long text never travels through the 32 KiB event envelope or the 16 KiB
+  replay page. SSE chunk ids are `canonical_seq:subindex`; clients may send
+  that value as `Last-Event-ID` to resume without duplicate or missing
+  tool/text/finish/usage chunks. A loaded terminal run has no live sender,
+  so a cursor at its end closes immediately.
+- **OpenAI request semantics (A7/P1)**: omitting `tools` is equivalent to
+  an explicit empty array on `/v1/chat/completions`; the registry fallback
+  remains limited to legacy/Telegram callers. `max_completion_tokens` and
+  legacy `max_tokens` retain their spelling through the adapter. Auth,
+  rate-limit, body, and middleware failures use the OpenAI error envelope
+  with `x-request-id`, `error.type`, and `error.request_id`; Bearer scheme
+  matching is ASCII case-insensitive.
 - **Client-disconnect policy (A7)**: `keep-running` (default) survives any
   subscriber disconnect and events stay replayable through the `after_seq`
   cursor; `cancel-on-disconnect` cancels the run with the typed

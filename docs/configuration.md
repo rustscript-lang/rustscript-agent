@@ -130,9 +130,10 @@ above; every other field is set by embedding code.
 | `run_timeout` | `Duration` | 900 s | Must be positive. Per-run wall-clock deadline; expiry cancels with `Deadline` and answers `504 agent_timeout` on the legacy chat path. |
 | `event_channel_capacity` | `usize` | 64 | Must be positive. Bounded per-run event channel. |
 | `broadcast_capacity` | `usize` | 64 | Must be positive. SSE broadcast channel capacity. |
-| `max_events_per_run` | `usize` | 240 | Must be positive. Retained event history bound per run. |
+| `max_events_per_run` | `usize` | 8192 | Must be positive. Retained event history bound per run. Covers the SSE stream bounds (4096 buffered deltas + 64 tool chunks + terminal events) so a `Lagged` live receiver can always catch up through the durable replay. |
 | `max_event_bytes` | `usize` | 32 KiB | Must be positive. Per-event payload bound. |
 | `terminal_run_ttl` | `Duration` | 60 s | Must be positive. Retention of terminal run handles before release. |
+| `durable_run_retention` | `Duration` | 86400 s | Must be positive. Durable retention of TERMINAL runs (completed/failed/cancelled): the janitor deletes terminal runs older than this window (and their events/retention/idempotency records) through the typed `runs.prune_terminal` RSS command. Active, pending, and `terminal_pending` runs are never matched, so restart replay and the terminal retry loop stay intact. |
 | `cancellation_grace` | `Duration` | 5 s | Must be positive. Bounded wait after a deadline before the worker is abandoned. |
 | `janitor_interval` | `Duration` | 5 s | Must be positive. Terminal-commit retry / pending-terminal cadence. |
 | `terminal_commit_retry_window` | `Duration` | 300 s | Must be positive. Bounded window during which a failed terminal commit is retried. |
@@ -168,7 +169,7 @@ Defaults come from the pinned core revision; the policy is deny-by-default:
 | `allowed_ports` | empty (deny all) |
 | `max_redirects` | 5 |
 | `max_request_body_bytes` | 1 MiB |
-| `max_response_body_bytes` | 8 MiB |
+| `max_response_body_bytes` | 1 MiB |
 | `connect_timeout` | 10 s |
 | `request_timeout` | 30 s |
 | `allow_private_ips` | `false` |
@@ -246,3 +247,18 @@ binary reads these names and setting them has no effect.
   there is no approval flow driving runs.
 - A job **scheduler** is not implemented: job CRUD/pause/resume/latest-output
   routes exist, but scheduled execution defines no configuration.
+
+## OpenAI compatibility notes
+
+- On `/v1/chat/completions`, omitted `tools` and `tools: []` both mean no
+  tools. Only an explicitly non-empty declaration is sent to the provider;
+  the legacy and Telegram routes retain their registry policy.
+- `max_completion_tokens` and `max_tokens` are preserved as separate
+  request fields. Profiles may set `max_tokens_field` for legacy adapters.
+- Streaming uses canonical chunk ids in `seq:subindex` form. Send the last
+  received id in `Last-Event-ID` to resume at the next chunk. Terminal output
+  is loaded from the durable RSS message reference, so event/replay payload
+  bounds do not shorten the returned bounded output.
+- OpenAI middleware failures share the `{error:{message,type,code,request_id}}`
+  envelope and the `x-request-id` header. Bearer scheme matching is ASCII
+  case-insensitive.

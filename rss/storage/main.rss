@@ -54,7 +54,9 @@ struct SessionIdInput {
 
 
 struct MessageIdInput {
-    message_id: string
+    message_id: string,
+    session_id: string,
+    run_id: string
 }
 
 
@@ -296,7 +298,7 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         result = storage_unwrap(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.get" {
         let input: MessageIdInput = json::decode::<MessageIdInput>(command.payload_json);
-        result = storage_raw_ok(request_id, op, messages::storage_message_get(db_id, input.message_id, command.max_rows, command.max_bytes));
+        result = storage_raw_ok(request_id, op, messages::storage_message_get(db_id, input.message_id, input.session_id, input.run_id, command.max_rows, command.max_bytes));
     } else if command.op == "message.list" {
         let input: MessageListInput = json::decode::<MessageListInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, messages::storage_message_list(db_id, input.session_id, input.after_ordinal.copy(), command.max_messages, command.max_bytes));
@@ -337,6 +339,8 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         result = storage_raw_ok(request_id, op, runs::storage_run_list_children(db_id, input.run_id, command.max_rows, command.max_bytes));
     } else if command.op == "run.usage" {
         result = storage_raw_ok(request_id, op, runs::storage_run_record_usage(db_id, command.payload_json));
+    } else if command.op == "runs.prune_terminal" {
+        result = storage_raw_ok(request_id, op, runs::storage_runs_prune_terminal(db_id, command.payload_json));
     } else if command.op == "idempotency.begin" {
         result = storage_raw_ok(request_id, op, runs::storage_run_idempotency_begin(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "idempotency.complete" {
@@ -365,7 +369,7 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
         let floor: map = events::storage_event_retention(db_id, replay_input.run_id);
         let floor_first: int = floor["first_seq"];
         let floor_high: int = floor["high_water_seq"];
-        if floor_first > 1 && replay_input.after_seq < floor_first {
+        if floor_first > 1 && replay_input.after_seq < floor_first - 1 {
             result = {
                 request_id: request_id,
                 op: op,

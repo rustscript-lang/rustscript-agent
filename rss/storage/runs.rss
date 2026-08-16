@@ -275,11 +275,21 @@ pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
         } else {
             let event_result: map = sqlite::query(
                 db_id,
-                "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?",
-                [&input.run_id, (512)],
+                "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? AND seq >= (SELECT COALESCE(MAX(seq), 0) FROM run_events WHERE run_id = ?) - 511 ORDER BY seq ASC LIMIT ?",
+                [&input.run_id, &input.run_id, (512)],
                 { max_rows: 512, max_result_bytes: 2097152 }
             );
-            result = { ok: true, code: "ok", message: "", result: { run: run_result_copy, events: event_result } };
+            let message_result: map = if input.message_id.copy() != "" => {
+                sqlite::query(
+                    db_id,
+                    "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? AND run_id = ? LIMIT 1",
+                    [&input.message_id, &input.message_session_id, &input.message_run_id],
+                    { max_rows: 1, max_result_bytes: 1048576 }
+                )
+            } else => {
+                { columns: [], rows: [] }
+            };
+            result = { ok: true, code: "ok", message: "", result: { run: run_result_copy, events: event_result, message: message_result } };
         }
     }
     result
@@ -400,7 +410,7 @@ pub fn storage_run_recover_active(db_id: int, payload_json: string) -> array {
             params: []
         },
         {
-            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq ASC) AS rn, COUNT(*) OVER (PARTITION BY run_id) AS total FROM run_events WHERE run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)) WHERE rn <= total - CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END)",
+            sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY seq ASC) AS rn, COUNT(*) OVER (PARTITION BY run_id) AS total FROM run_events WHERE run_id IN (SELECT run_id FROM recovery_records WHERE recovered_at_ms = ? AND reason = ?)) WHERE rn <= total - CASE WHEN ? <= 0 THEN 128 WHEN ? > 16384 THEN 16384 ELSE ? END)",
             params: [input.now_ms.copy(), &input.reason, input.max_events.copy(), input.max_events.copy(), input.max_events.copy()]
         },
         {
@@ -409,4 +419,108 @@ pub fn storage_run_recover_active(db_id: int, payload_json: string) -> array {
         }
     ];
     sqlite::transaction(db_id, statements)
+}
+
+struct PruneTerminalInput {
+    older_than_ms: int,
+    now_ms: int,
+    max_rows: int
+}
+
+/// Bounded durable retention sweep for TERMINAL runs (completed/failed/
+/// cancelled): deletes runs whose `updated_at_ms` is older than the
+/// configured window, cascading their events, retention floors, run-scoped
+/// idempotency records, child links, approvals, compactions, provider
+/// usage, and recovery records — mirroring `session.delete` but run-scoped.
+/// Active/pending/`terminal_pending` runs are NEVER matched (restart replay
+/// and the terminal retry loop depend on them), so the sweep cannot break
+/// restart recovery or the API history of live runs. Returns the deleted
+/// run ids.
+pub fn storage_runs_prune_terminal(db_id: int, payload_json: string) -> map {
+    let input: PruneTerminalInput = json::decode::<PruneTerminalInput>(payload_json);
+    let limit: int = schema::max_rows_limit(input.max_rows.copy());
+    // The candidate table is populated and every dependent delete consumes
+    // that exact table inside ONE transaction.  Repeating an unordered
+    // `... LIMIT ?` subquery per table can select different rows when ties are
+    // present; the durable candidate set must be selected once, with a
+    // deterministic order, then reused verbatim.
+    let statements = [
+        {
+            sql: "CREATE TEMP TABLE IF NOT EXISTS rss_prune_candidates (run_id TEXT PRIMARY KEY)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM rss_prune_candidates",
+            params: []
+        },
+        {
+            sql: "INSERT INTO rss_prune_candidates (run_id) SELECT id FROM runs WHERE status IN ('completed', 'failed', 'cancelled') AND updated_at_ms < ? AND NOT EXISTS (SELECT 1 FROM runs child WHERE child.parent_run_id = runs.id AND child.status IN ('queued', 'running', 'waiting_approval', 'compacting')) AND NOT EXISTS (SELECT 1 FROM child_run_links links JOIN runs child_linked ON child_linked.id = links.child_run_id WHERE links.parent_run_id = runs.id AND child_linked.status IN ('queued', 'running', 'waiting_approval', 'compacting')) ORDER BY updated_at_ms ASC, id ASC LIMIT ?",
+            params: [input.older_than_ms.copy(), (limit)]
+        },
+        {
+            sql: "DELETE FROM idempotency_claim_history WHERE EXISTS (SELECT 1 FROM idempotency_records records WHERE records.scope = idempotency_claim_history.scope AND records.key = idempotency_claim_history.key AND records.resource_type = 'run' AND records.resource_id IN (SELECT run_id FROM rss_prune_candidates))",
+            params: []
+        },
+        {
+            sql: "DELETE FROM idempotency_claims WHERE EXISTS (SELECT 1 FROM idempotency_records records WHERE records.scope = idempotency_claims.scope AND records.key = idempotency_claims.key AND records.resource_type = 'run' AND records.resource_id IN (SELECT run_id FROM rss_prune_candidates))",
+            params: []
+        },
+        {
+            sql: "DELETE FROM idempotency_records WHERE resource_type = 'run' AND resource_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM run_events WHERE run_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM run_retention WHERE run_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM child_run_links WHERE parent_run_id IN (SELECT run_id FROM rss_prune_candidates) OR child_run_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM approvals WHERE run_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM compactions WHERE run_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM provider_usage WHERE run_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM recovery_records WHERE run_id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        },
+        {
+            sql: "DELETE FROM runs WHERE id IN (SELECT run_id FROM rss_prune_candidates)",
+            params: []
+        }
+    ];
+    sqlite::transaction(db_id, statements);
+    let candidates: map = sqlite::query(
+        db_id,
+        "SELECT run_id FROM rss_prune_candidates ORDER BY rowid ASC",
+        [],
+        { max_rows: limit, max_result_bytes: 65536 }
+    );
+    let candidate_rows: array = candidates["rows"];
+    let mut ids: array = [];
+    let mut index = 0;
+    while index < candidate_rows.length {
+        let row: array = candidate_rows[index].copy();
+        if row.length >= 1 {
+            ids[ids.length] = [row[0]];
+        }
+        index += 1;
+    }
+    {
+        columns: ["run_id"],
+        rows: ids
+    }
 }

@@ -23,6 +23,7 @@ pub fn call(request: map) -> map {
             api_key: "",
             model: "",
             adapter: adapter,
+            max_tokens_field: types::request_string(options, "max_tokens_field"),
             capabilities: { stream: true, tools: true, usage: true, reasoning: false }
         },
         override_base,

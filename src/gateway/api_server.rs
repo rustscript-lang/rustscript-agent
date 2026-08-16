@@ -18,8 +18,8 @@ use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{
-        HeaderMap, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
+        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, RETRY_AFTER},
     },
     middleware::{self, Next},
     response::{
@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use crate::config::{AgentGatewayConfig, RateLimitConfig};
 use crate::domain::{fnv1a64, input_text, timestamp, vm_value_to_json};
+use crate::gateway::api_openai::openai_chat_completions_handler;
 use crate::runtime::delivery::DiscardingSink;
 use crate::runtime::rss_runner::execute_rss_source;
 use crate::service::{
@@ -167,6 +168,10 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
         .route("/health/detailed", get(health_detailed_handler))
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(models_handler))
+        .route(
+            "/v1/chat/completions",
+            post(openai_chat_completions_handler),
+        )
         .route(
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
@@ -342,6 +347,20 @@ async fn gateway_guard_middleware(
     rate_limiter: Arc<RateLimiter>,
     config: Arc<AgentGatewayConfig>,
 ) -> Response {
+    let request_id = gateway_request_id(request.headers());
+    let mut request = request;
+    let has_request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|value| value == request_id);
+    if !has_request_id && let Ok(value) = HeaderValue::from_str(&request_id) {
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+    let is_openai_chat = request.uri().path() == "/v1/chat/completions";
     if config.rate_limit.enabled {
         // Peer-IP dimension: every request charges its IP bucket, including
         // auth failures (that is the anti-brute-force point). Without
@@ -355,7 +374,7 @@ async fn gateway_guard_middleware(
         if let RateLimitOutcome::Denied { retry_after } =
             rate_limiter.check(&format!("ip:{peer}"), f64::from(config.rate_limit.ip_burst))
         {
-            return rate_limited_response(retry_after);
+            return rate_limited_response(retry_after, &request_id, is_openai_chat);
         }
     }
     let Some(expected) = config.bearer_token.as_deref() else {
@@ -365,9 +384,16 @@ async fn gateway_guard_middleware(
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()));
+        .is_some_and(|value| bearer_value_matches(value, expected));
     if !authorized {
+        if is_openai_chat {
+            return openai_guard_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing or invalid bearer token",
+                &request_id,
+            );
+        }
         return json_error(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -382,15 +408,87 @@ async fn gateway_guard_middleware(
         if let RateLimitOutcome::Denied { retry_after } =
             rate_limiter.check(&account_key, f64::from(config.rate_limit.account_burst))
         {
-            return rate_limited_response(retry_after);
+            return rate_limited_response(retry_after, &request_id, is_openai_chat);
         }
     }
     next.run(request).await
 }
 
+/// RFC 7235 treats the authentication scheme as case-insensitive.  Keep the
+/// credential comparison constant-time while accepting `bearer`, `BEARER`,
+/// and mixed-case spellings with exactly one credential token.
+fn bearer_value_matches(value: &str, expected: &str) -> bool {
+    let mut parts = value.split_ascii_whitespace();
+    let Some(scheme) = parts.next() else {
+        return false;
+    };
+    let Some(token) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && scheme.eq_ignore_ascii_case("bearer")
+        && constant_time_eq(token.as_bytes(), expected.as_bytes())
+}
+
+/// Request identifiers used by middleware must follow the same bounded,
+/// header-safe contract as the OpenAI handler's identifiers.
+fn gateway_request_id(headers: &HeaderMap) -> String {
+    let inbound = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().count() <= 128
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        });
+    inbound
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("req-{}", Uuid::new_v4()))
+}
+
+fn openai_guard_error(status: StatusCode, code: &str, message: &str, request_id: &str) -> Response {
+    (
+        status,
+        [("x-request-id", request_id.to_string())],
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": code,
+                "request_id": request_id,
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// HTTP 429 with the seconds until at least one token refills.
-fn rate_limited_response(retry_after: Duration) -> Response {
+fn rate_limited_response(retry_after: Duration, request_id: &str, openai: bool) -> Response {
     let seconds = retry_after.as_secs().max(1);
+    if openai {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (RETRY_AFTER, seconds.to_string()),
+                (
+                    HeaderName::from_static("x-request-id"),
+                    request_id.to_string(),
+                ),
+            ],
+            Json(json!({
+                "error": {
+                    "message": "rate limit exceeded",
+                    "type": "rate_limit_error",
+                    "code": "rate_limited",
+                    "request_id": request_id,
+                }
+            })),
+        )
+            .into_response();
+    }
     (
         StatusCode::TOO_MANY_REQUESTS,
         [(RETRY_AFTER, seconds.to_string())],
@@ -1171,6 +1269,8 @@ async fn create_run_handler(
             idempotency_key,
             idempotency_hash: request_hash,
             origin_actor: None,
+            request_overrides: Value::Object(Default::default()),
+            session_messages: Vec::new(),
         })
         .await
     {
