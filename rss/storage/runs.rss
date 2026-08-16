@@ -151,8 +151,8 @@ pub fn storage_run_get(db_id: int, run_id: string, max_rows: int, max_bytes: int
 pub fn storage_run_list(db_id: int, session_id: string, status: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
         db_id,
-        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE session_id = ? AND (? = '' OR status = ?) ORDER BY created_at_ms DESC, id DESC LIMIT ?",
-        [session_id, status, status, (max_rows)],
+        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE (? = '' OR session_id = ?) AND (? = '' OR status = ?) ORDER BY created_at_ms DESC, id DESC LIMIT ?",
+        [session_id, session_id, status, status, (max_rows)],
         runs_query_limits(max_rows, max_bytes)
     )
 }

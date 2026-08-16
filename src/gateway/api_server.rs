@@ -40,18 +40,34 @@ use crate::config::{AgentGatewayConfig, RateLimitConfig};
 use crate::domain::{fnv1a64, input_text, timestamp, vm_value_to_json};
 use crate::runtime::delivery::DiscardingSink;
 use crate::runtime::rss_runner::execute_rss_source;
-use crate::service::{AdmitError, SubscriberGuard, failed_payload};
+use crate::service::{
+    AdmitError, ApprovalResolveError, ApprovalResolveOutcome, SubscriberGuard, failed_payload,
+};
 use crate::{
     AgentGatewayState, RunCancellation,
     gateway::store::{
-        GatewayEvent, GatewayPersistence, GatewayStore, JobRecord, JobView, RunRecord,
+        GatewayEvent, GatewayPersistence, GatewayStore, JobRecord, JobView, RunRecord, RunView,
         SessionRecord, SessionView, append_message,
     },
 };
 
+/// The durable `run.list` window cap (the storage program's bounded row
+/// page; see `LOAD_PAGE_ROWS` in `src/gateway/store.rs`). Offset + limit
+/// beyond this cannot be answered honestly from the durable store, so the
+/// list rejects the window instead of silently truncating.
+const DURABLE_RUN_LIST_CAP: usize = 512;
+
 #[derive(Debug, Default, Deserialize)]
 struct EventQuery {
     after_seq: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    session_id: Option<String>,
+    status: Option<String>,
 }
 
 /// Runs one store mutation on a blocking thread with the store write lock
@@ -169,9 +185,22 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
             "/api/sessions/{session_id}/chat",
             post(session_chat_handler),
         )
-        .route("/v1/runs", post(create_run_handler))
+        .route(
+            "/api/sessions/{session_id}/compact",
+            post(session_compact_handler),
+        )
+        .route("/v1/runs", get(list_runs_handler).post(create_run_handler))
+        .route("/v1/runs/{run_id}", get(get_run_handler))
         .route("/v1/runs/{run_id}/events", get(run_events_handler))
         .route("/v1/runs/{run_id}/stop", post(stop_run_handler))
+        .route(
+            "/v1/runs/{run_id}/approvals/{approval_id}/approve",
+            post(approve_approval_handler),
+        )
+        .route(
+            "/v1/runs/{run_id}/approvals/{approval_id}/deny",
+            post(deny_approval_handler),
+        )
         .route("/api/jobs", get(list_jobs_handler).post(create_job_handler))
         .route(
             "/api/jobs/{job_id}",
@@ -880,6 +909,214 @@ async fn session_chat_handler(
     .await
 }
 
+/// One run's mirror metadata (never the status source for the API): the
+/// platform (the session's source) and the retained event mirror.
+struct RunMirrorMeta {
+    platform: String,
+    event_count: usize,
+    last_event_seq: u64,
+}
+
+fn run_mirror_meta(store: &GatewayStore, run_id: &str) -> Option<RunMirrorMeta> {
+    let run = store.runs.get(run_id)?;
+    Some(RunMirrorMeta {
+        platform: run.platform.clone(),
+        event_count: run.events.len(),
+        last_event_seq: run.events.last().map(|event| event.seq).unwrap_or(0),
+    })
+}
+
+/// Renders the canonical `hermes.run` envelope. The `error` object appears
+/// only for the durable `failed` status (the durable error columns); a
+/// zero `started_at`/`finished_at` renders as `null` (never a fabricated
+/// timestamp).
+fn run_view_json(view: &RunView) -> Value {
+    let error = if view.status == "failed" {
+        json!({"code": view.error_code, "message": view.error_message})
+    } else {
+        Value::Null
+    };
+    json!({
+        "object": view.object,
+        "run_id": view.run_id,
+        "session_id": view.session_id,
+        "parent_run_id": view.parent_run_id,
+        "platform": view.platform,
+        "status": view.status,
+        "event_count": view.event_count,
+        "last_event_seq": view.last_event_seq,
+        "created_at": view.created_at,
+        "started_at": (view.started_at > 0).then_some(view.started_at),
+        "finished_at": (view.finished_at > 0).then_some(view.finished_at),
+        "updated_at": view.updated_at,
+        "error": error,
+    })
+}
+
+/// GET /v1/runs/{run_id}: the run's status comes from the DURABLE run row
+/// (`run.get`), never from the in-memory mirror (which keeps the legacy
+/// `started` placeholder for active runs) — a run that never started can
+/// never be reported as started. The storage read runs on a blocking
+/// thread so a storage stall never occupies a Tokio request thread.
+async fn get_run_handler(
+    State(state): State<AgentGatewayState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let meta = {
+        let store = state.store.read();
+        let Some(meta) = run_mirror_meta(&store, &run_id) else {
+            return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
+        };
+        meta
+    };
+    let view = match state.service.persistence_handle() {
+        Some(persistence) => {
+            let result = tokio::task::spawn_blocking(move || persistence.run_get(&run_id))
+                .await
+                .expect("run.get task must complete");
+            match result {
+                Ok(data) => {
+                    let row = data
+                        .get("rows")
+                        .and_then(Value::as_array)
+                        .and_then(|rows| rows.first())
+                        .and_then(Value::as_array)
+                        .cloned();
+                    let Some(mut view) = row.and_then(|row| RunView::from_durable_row(&row)) else {
+                        return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
+                    };
+                    view.platform = meta.platform;
+                    view.event_count = meta.event_count;
+                    view.last_event_seq = meta.last_event_seq;
+                    view
+                }
+                Err(error) => {
+                    return json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "persistence_unavailable",
+                        &format!("durable run lookup failed: {error}"),
+                    );
+                }
+            }
+        }
+        // In-memory-only mode has no durable store; the mirror is the only
+        // authoritative state (the status is the honest mirror status).
+        None => {
+            let store = state.store.read();
+            let Some(run) = store.runs.get(&run_id) else {
+                return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
+            };
+            RunView::from_mirror(run)
+        }
+    };
+    json_response(StatusCode::OK, run_view_json(&view))
+}
+
+/// GET /v1/runs: the durable run list (newest first) with optional exact
+/// `session_id` / `status` filters and bounded pagination. The window is
+/// bounded by the storage program's row page; an offset + limit beyond it
+/// is rejected typed instead of silently truncated.
+async fn list_runs_handler(
+    State(state): State<AgentGatewayState>,
+    Query(query): Query<RunListQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(50).min(200);
+    let offset = query.offset.unwrap_or(0);
+    if offset.saturating_add(limit) > DURABLE_RUN_LIST_CAP {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "list_window_too_large",
+            &format!(
+                "the durable run list window (offset + limit) is bounded to \
+                 {DURABLE_RUN_LIST_CAP} rows"
+            ),
+        );
+    }
+    let session_id = query.session_id.clone().unwrap_or_default();
+    let status = query.status.clone().unwrap_or_default();
+    let mirror = {
+        let store = state.store.read();
+        store
+            .runs
+            .iter()
+            .map(|(run_id, run)| {
+                (
+                    run_id.clone(),
+                    RunMirrorMeta {
+                        platform: run.platform.clone(),
+                        event_count: run.events.len(),
+                        last_event_seq: run.events.last().map(|event| event.seq).unwrap_or(0),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let views = match state.service.persistence_handle() {
+        Some(persistence) => {
+            let result =
+                tokio::task::spawn_blocking(move || persistence.run_list(&session_id, &status))
+                    .await
+                    .expect("run.list task must complete");
+            match result {
+                Ok(data) => data
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|row| {
+                        let mut view = RunView::from_durable_row(row.as_array()?)?;
+                        if let Some(meta) = mirror.get(&view.run_id) {
+                            view.platform = meta.platform.clone();
+                            view.event_count = meta.event_count;
+                            view.last_event_seq = meta.last_event_seq;
+                        }
+                        Some(view)
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    return json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "persistence_unavailable",
+                        &format!("durable run list failed: {error}"),
+                    );
+                }
+            }
+        }
+        // In-memory-only fallback: the mirror, newest first by last event.
+        None => {
+            let store = state.store.read();
+            let mut runs = store
+                .runs
+                .values()
+                .filter(|run| session_id.is_empty() || run.session_id == session_id)
+                .filter(|run| status.is_empty() || run.status == status)
+                .collect::<Vec<_>>();
+            runs.sort_by_key(|run| {
+                std::cmp::Reverse(run.events.last().map(|event| event.timestamp).unwrap_or(0))
+            });
+            runs.into_iter().map(RunView::from_mirror).collect()
+        }
+    };
+    let has_more = offset.saturating_add(limit) < views.len();
+    let data = views
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|view| run_view_json(&view))
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        json!({
+            "object": "list",
+            "data": data,
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
+        }),
+    )
+}
+
 async fn create_run_handler(
     State(state): State<AgentGatewayState>,
     headers: HeaderMap,
@@ -1091,6 +1328,164 @@ async fn stop_run_handler(
     // to persist here. A gateway crash mid-stop is repaired by restart
     // recovery exactly once.
     json_response(StatusCode::OK, json!({"run_id":run_id, "status":status}))
+}
+
+/// The approval resolution body: actor/reason are optional (defaults:
+/// `api_server` / empty). The durable bridge resolution runs on a blocking
+/// thread (storage round-trip) and returns the typed outcome; the error
+/// envelope carries the exact-once / AlreadyResolved / expired states
+/// without string matching.
+#[derive(Debug, Default, Deserialize)]
+struct ApprovalResolutionRequest {
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn approve_approval_handler(
+    State(state): State<AgentGatewayState>,
+    Path((run_id, approval_id)): Path<(String, String)>,
+    Json(request): Json<ApprovalResolutionRequest>,
+) -> Response {
+    resolve_approval(state, run_id, approval_id, true, request).await
+}
+
+async fn deny_approval_handler(
+    State(state): State<AgentGatewayState>,
+    Path((run_id, approval_id)): Path<(String, String)>,
+    Json(request): Json<ApprovalResolutionRequest>,
+) -> Response {
+    resolve_approval(state, run_id, approval_id, false, request).await
+}
+
+async fn resolve_approval(
+    state: AgentGatewayState,
+    run_id: String,
+    approval_id: String,
+    approve: bool,
+    request: ApprovalResolutionRequest,
+) -> Response {
+    // Existence fast path under the read lock; a run that never started can
+    // never be resolved (404 typed).
+    if !state.store.read().runs.contains_key(&run_id) {
+        return json_error(StatusCode::NOT_FOUND, "run_not_found", "run not found");
+    }
+    let actor = request.actor.unwrap_or_else(|| "api_server".to_string());
+    let reason = request.reason.unwrap_or_default();
+    let state_for_block = state.clone();
+    let run_id_for_block = run_id.clone();
+    let approval_id_for_block = approval_id.clone();
+    let actor_for_block = actor.clone();
+    let reason_for_block = reason.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        state_for_block.service().resolve_run_approval_for(
+            &run_id_for_block,
+            &approval_id_for_block,
+            approve,
+            &actor_for_block,
+            &reason_for_block,
+        )
+    })
+    .await
+    .expect("approval resolution task must not panic");
+    match &outcome {
+        Ok(ApprovalResolveOutcome::Resumed { approved }) => approval_envelope(
+            &run_id,
+            &approval_id,
+            &actor,
+            &reason,
+            if *approved { "approved" } else { "denied" },
+        ),
+        Ok(ApprovalResolveOutcome::Terminal { code }) => {
+            approval_envelope(&run_id, &approval_id, &actor, &reason, code)
+        }
+        Err(ApprovalResolveError::NoPendingApproval) => json_error(
+            StatusCode::CONFLICT,
+            "no_pending_approval",
+            "the run has no pending approval parked",
+        ),
+        Err(ApprovalResolveError::ApprovalIdMismatch) => json_error(
+            StatusCode::CONFLICT,
+            "approval_id_mismatch",
+            "the run is parked on a different approval id",
+        ),
+        Err(ApprovalResolveError::AlreadyResolved) => json_error(
+            StatusCode::CONFLICT,
+            "already_resolved",
+            "the approval was already resolved",
+        ),
+        Err(ApprovalResolveError::RunNotActive) => json_error(
+            StatusCode::CONFLICT,
+            "run_no_longer_waiting",
+            "the run could not transition back to running",
+        ),
+        Err(ApprovalResolveError::BridgeUnavailable) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "approval_bridge_unavailable",
+            "the durable approval bridge is not available",
+        ),
+        Err(ApprovalResolveError::ProgramUnavailable) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_program_unavailable",
+            "the production loop program is not available",
+        ),
+        Err(ApprovalResolveError::Storage(message)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_unavailable",
+            &format!("approval resolution failed: {message}"),
+        ),
+    }
+}
+
+/// The canonical `hermes.approval` resolution envelope.
+fn approval_envelope(
+    run_id: &str,
+    approval_id: &str,
+    actor: &str,
+    reason: &str,
+    status: &str,
+) -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "object": "hermes.approval",
+            "run_id": run_id,
+            "approval_id": approval_id,
+            "status": status,
+            "actor": actor,
+            "reason": reason,
+        }),
+    )
+}
+
+/// POST /api/sessions/{session_id}/compact: accurate typed unavailable.
+///
+/// Compaction is driven by the serial agent loop INSIDE a run (the A5
+/// `compact` decision: the loop plans a pair-preserving prefix with
+/// `compact.rss` and the service executes the planned commands while the
+/// run is durably `compacting`). There is no standalone session compaction
+/// service entry, and fabricating a plan or executing storage commands
+/// without the loop's plan would bypass the RSS-owned compaction policy —
+/// so the endpoint answers the typed `compaction_unavailable` for every
+/// session (terminal or active) and never fakes success.
+async fn session_compact_handler(
+    State(state): State<AgentGatewayState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    if !state.store.read().sessions.contains_key(&session_id) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session not found",
+        );
+    }
+    json_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "compaction_unavailable",
+        "session compaction is driven by the serial agent loop inside a run; \
+         no standalone session compaction entry exists",
+    )
 }
 
 async fn create_job_handler(

@@ -281,6 +281,9 @@ impl ApprovalBridge {
     ///   guards `WHERE state='pending'`, so `rows_affected` is 0 the second
     ///   time). Exactly-once dispatch is therefore guaranteed.
     /// - `approve=false` transitions pending -> denied -> `Terminal`.
+    ///
+    /// The default decision reason text is recorded; callers that carry a
+    /// caller-supplied reason use [`Self::resolve_with_reason`].
     pub fn resolve(
         &self,
         approval_id: &str,
@@ -288,12 +291,36 @@ impl ApprovalBridge {
         resolver: &str,
         now_ms: i64,
     ) -> Result<Resolution, ApprovalError> {
+        self.resolve_with_reason(approval_id, approve, resolver, "", now_ms)
+    }
+
+    /// Like [`Self::resolve`], but records the caller-supplied `reason` as
+    /// the durable `decision_reason` (an empty reason keeps the default
+    /// text, so the existing callers' payloads are byte-identical).
+    pub fn resolve_with_reason(
+        &self,
+        approval_id: &str,
+        approve: bool,
+        resolver: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<Resolution, ApprovalError> {
         let state = if approve { "approved" } else { "denied" };
+        let default_reason = if approve {
+            "approved by resolver"
+        } else {
+            "denied by resolver"
+        };
+        let decision_reason = if reason.is_empty() {
+            default_reason
+        } else {
+            reason
+        };
         let payload = json!({
             "id": approval_id,
             "state": state,
             "resolver": resolver,
-            "decision_reason": if approve { "approved by resolver" } else { "denied by resolver" },
+            "decision_reason": decision_reason,
             "resolved_at_ms": now_ms,
         });
         let result = self.command("approval.resolve", &payload)?;

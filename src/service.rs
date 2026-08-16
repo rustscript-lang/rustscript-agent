@@ -291,6 +291,63 @@ struct ParkedResolution {
     reason: String,
 }
 
+/// Typed outcome of one API approval resolution ([`AgentService::resolve_run_approval_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalResolveOutcome {
+    /// The durable row transitioned and the run resumed with the decision
+    /// (`approved` for an approve, `denied` for a fresh deny).
+    Resumed { approved: bool },
+    /// A deny (or the expiry sweep) landed on an already-terminal row: the
+    /// run resumes with the typed terminal code (`expired`).
+    Terminal { code: String },
+}
+
+/// Typed failure of one API approval resolution. The variants map directly
+/// to the HTTP error envelope codes (no string matching in the gateway).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalResolveError {
+    /// The run exists but is not parked on a pending approval.
+    NoPendingApproval,
+    /// The run is parked on a DIFFERENT approval id than the caller
+    /// addressed (the park is untouched).
+    ApprovalIdMismatch,
+    /// The durable row is already terminal (a foreign resolve/expire landed
+    /// first): strict no-op, the park is restored.
+    AlreadyResolved,
+    /// The run could not transition back to `running` (a stop or a terminal
+    /// raced the resolution).
+    RunNotActive,
+    /// No durable approval bridge (in-memory-only mode).
+    BridgeUnavailable,
+    /// No production loop program to resume with.
+    ProgramUnavailable,
+    /// A durable storage failure (the park is restored, retryable).
+    Storage(String),
+}
+
+impl ApprovalResolveError {
+    /// The legacy `String` message of the original
+    /// [`AgentService::resolve_run_approval`] surface (the expiry sweep and
+    /// the A5 fixtures depend on these exact texts).
+    fn legacy_message(&self) -> String {
+        match self {
+            Self::NoPendingApproval => "no pending approval is parked for this run".to_string(),
+            Self::ApprovalIdMismatch => "approval id mismatch".to_string(),
+            Self::AlreadyResolved => "approval already resolved".to_string(),
+            Self::RunNotActive => "the run could not transition back to running".to_string(),
+            Self::BridgeUnavailable => "the durable approval bridge is not available".to_string(),
+            Self::ProgramUnavailable => "the production loop program is not available".to_string(),
+            Self::Storage(message) => message.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.legacy_message())
+    }
+}
+
 impl AgentService {
     pub(crate) fn new(
         config: Arc<AgentGatewayConfig>,
@@ -2803,17 +2860,67 @@ impl AgentService {
     /// drops the park while the run is still active: the park is restored so
     /// a retry (or the expiry sweep, or a stop) stays reachable — a failed
     /// resolution can never wedge the run.
+    ///
+    /// Legacy service surface (the expiry sweep and the A5 fixtures): the
+    /// resolution outcome is mapped to `Ok(())` / a legacy `String` error.
+    /// The API surface uses [`Self::resolve_run_approval_for`], which carries
+    /// the run + approval id, actor/reason, and the typed outcome/error.
     pub fn resolve_run_approval(&self, run_id: &str, approve: bool) -> Result<(), String> {
+        match self.resolve_parked_approval(run_id, None, approve, "gateway", "") {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.legacy_message()),
+        }
+    }
+
+    /// The API approval surface: resolves the parked run's approval by run +
+    /// approval id (a mismatch is a typed error and never consumes the park),
+    /// records the caller's `actor`/`reason` on the durable row, and returns
+    /// the typed outcome so the HTTP layer can surface exact-once /
+    /// AlreadyResolved / expired states without string matching. See
+    /// [`Self::resolve_run_approval`] for the exact-once and park-restore
+    /// semantics (shared implementation).
+    pub fn resolve_run_approval_for(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        approve: bool,
+        actor: &str,
+        reason: &str,
+    ) -> Result<ApprovalResolveOutcome, ApprovalResolveError> {
+        self.resolve_parked_approval(run_id, Some(approval_id), approve, actor, reason)
+    }
+
+    /// The shared exact-once resolution core. `expected_approval_id` is the
+    /// API's id check (the legacy surface passes `None`); `resolver` /
+    /// `reason` are recorded on the durable row (the legacy surface passes
+    /// `"gateway"` / `""`, byte-identical to the previous payloads).
+    fn resolve_parked_approval(
+        &self,
+        run_id: &str,
+        expected_approval_id: Option<&str>,
+        approve: bool,
+        resolver: &str,
+        reason: &str,
+    ) -> Result<ApprovalResolveOutcome, ApprovalResolveError> {
         let parked = self
             .inner
             .parked
             .lock()
             .expect("parked lock")
             .remove(run_id)
-            .ok_or_else(|| "no pending approval is parked for this run".to_string())?;
+            .ok_or(ApprovalResolveError::NoPendingApproval)?;
+        if let Some(expected) = expected_approval_id
+            && parked.approval_id != expected
+        {
+            // The caller addressed a different approval than the one this run
+            // is parked on: restore the park untouched (a mismatch must never
+            // consume or resolve anything).
+            self.restore_park_if_active(run_id, &parked);
+            return Err(ApprovalResolveError::ApprovalIdMismatch);
+        }
         let Some(bridge) = self.inner.approval.clone() else {
             self.restore_park_if_active(run_id, &parked);
-            return Err("the durable approval bridge is not available".to_string());
+            return Err(ApprovalResolveError::BridgeUnavailable);
         };
         let now = timestamp() as i64;
         // The durable outcome (resolved, typed outcome, reason). A park that
@@ -2829,15 +2936,20 @@ impl AgentService {
                 recorded.reason.clone(),
             ),
             None => {
-                let resolution = match bridge.resolve(&parked.approval_id, approve, "gateway", now)
-                {
+                let resolution = match bridge.resolve_with_reason(
+                    &parked.approval_id,
+                    approve,
+                    resolver,
+                    reason,
+                    now,
+                ) {
                     Ok(resolution) => resolution,
                     Err(error) => {
                         // A storage failure must not consume the park:
                         // restore it so the caller (or the sweep) can
                         // retry.
                         self.restore_park_if_active(run_id, &parked);
-                        return Err(error.to_string());
+                        return Err(ApprovalResolveError::Storage(error.to_string()));
                     }
                 };
                 match resolution {
@@ -2853,7 +2965,7 @@ impl AgentService {
                         // never resumes the run with `resolved:false` and
                         // never re-resolves the row.
                         self.restore_park_if_active(run_id, &parked);
-                        return Err("approval already resolved".to_string());
+                        return Err(ApprovalResolveError::AlreadyResolved);
                     }
                 }
             }
@@ -2877,7 +2989,7 @@ impl AgentService {
                     "parked run could not transition back to running and is no longer active"
                 );
             }
-            return Err("the run could not transition back to running".to_string());
+            return Err(ApprovalResolveError::RunNotActive);
         }
         let service = self.clone();
         let run_id = run_id.to_string();
@@ -2891,10 +3003,27 @@ impl AgentService {
             .unwrap_or_default();
         let program = match service.inner.agent_program.clone() {
             Some(program) => program,
-            None => return Err("the production loop program is not available".to_string()),
+            None => return Err(ApprovalResolveError::ProgramUnavailable),
         };
         let base_context = json_to_vm_value(&parked.base_context);
         let deadline = parked.deadline;
+        // The typed outcome is computed BEFORE the resume spawn (the spawn
+        // consumes the loop-facing state strings).
+        let outcome_enum = if resolved {
+            ApprovalResolveOutcome::Resumed {
+                approved: outcome == "approved",
+            }
+        } else if outcome == "denied" {
+            // A fresh deny transitioned the row and the run resumes with the
+            // typed denied outcome.
+            ApprovalResolveOutcome::Resumed { approved: false }
+        } else {
+            // A deny (or the sweep) landed on an already-terminal row: the
+            // run resumes with the typed terminal code (`expired`).
+            ApprovalResolveOutcome::Terminal {
+                code: outcome.clone(),
+            }
+        };
         tokio::spawn(async move {
             let mut state = parked.state;
             let approval = state.get("approval").cloned().unwrap_or_else(|| json!({}));
@@ -2922,7 +3051,7 @@ impl AgentService {
                 )
                 .await;
         });
-        Ok(())
+        Ok(outcome_enum)
     }
 
     /// Re-inserts one taken park when the run is still an active,

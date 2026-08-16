@@ -267,6 +267,42 @@ typed `capability_unavailable` instead of fabricating bounded execution.
 
 **Criteria:** auth, body/rate/idempotency limits, native run/session/event routes, OpenAI Chat Completions stream/non-stream, tool-call deltas, usage, approval resolution, and client-disconnect policy pass contract tests.
 
+**Status (2026-08-16, branch `feat/agent-a7-api`):** the A7 REST/SSE dependency
+wiring is implemented on top of the A5 production serial loop
+(`e70db495bdf07593346f09ede250a7a4ce28bde5`):
+
+- Run status (`GET /v1/runs/{run_id}`) and run list (`GET /v1/runs`) read the
+  DURABLE store (`run.get` / `run.list`); the in-memory `started` placeholder
+  is never a status source, so a run that never started can never be reported
+  as started. The list supports `limit`/`offset`/`session_id`/`status` with
+  bounded pagination (offset + limit ≤ 512 — the storage program's row page;
+  a larger window is rejected typed, never silently truncated). The storage
+  `run.list` filter was made optional for `session_id` (mirroring the existing
+  optional `status` filter) so the unfiltered list stays a single bounded
+  query.
+- Approval resolution (`POST /v1/runs/{run_id}/approvals/{approval_id}/approve`
+  and `/deny`) is wired to `AgentService::resolve_run_approval_for` (the
+  shared exact-once core of `resolve_run_approval`): the resolution is keyed
+  by run + approval id (a mismatch is a typed 409 and never consumes the
+  park), the caller's `actor`/`reason` are recorded on the durable row, and
+  the typed outcomes surface exactly-once (`approved`/`denied` 200,
+  `already_resolved` 409, `no_pending_approval` 409, `expired` 200, storage
+  failures 503) without string matching.
+- Session compact (`POST /api/sessions/{session_id}/compact`) is an accurate
+  typed unavailable (`501 compaction_unavailable`): compaction is driven by
+  the serial agent loop INSIDE a run (the A5 `compact` decision — the loop
+  plans a pair-preserving prefix with `compact.rss` and the service executes
+  the planned commands while the run is durably `compacting`); there is no
+  standalone session compaction entry, and the route never fakes success.
+- Security boundaries: the new routes sit under the existing bearer-auth +
+  per-IP/per-account rate-limit middleware, answer the canonical error
+  envelope, and reject malformed bodies/query strings before any service
+  work.
+- Not in this commit (remaining A7 work): an OpenAI Chat Completions wire
+  route (`/v1/chat/completions`, stream/non-stream, tool-call deltas) — the
+  legacy `/api/sessions/{id}/chat` path remains the only chat-completion
+  surface.
+
 ### Milestone A8: Telegram
 
 **Files:**

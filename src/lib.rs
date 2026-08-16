@@ -33,4 +33,7 @@ pub use runtime::rss_runner::{
 pub use runtime::subagent_supervisor::{
     ChildExecutor, ChildOutcome, ChildSpec, SupervisionMode, SupervisorCancel, supervise_batch,
 };
-pub use service::{AdmitError, AdmitRunRequest, AdmittedRun, AgentService, RunHandle};
+pub use service::{
+    AdmitError, AdmitRunRequest, AdmittedRun, AgentService, ApprovalResolveError,
+    ApprovalResolveOutcome, RunHandle,
+};

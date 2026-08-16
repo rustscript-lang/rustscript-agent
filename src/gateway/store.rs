@@ -385,6 +385,17 @@ impl GatewayPersistence {
         self.command_data("run.get", &json!({ "run_id": run_id }))
     }
 
+    /// Lists durable run rows (newest first) with optional exact
+    /// `session_id` / `status` filters. Bounded by the storage program's
+    /// row cap (the most recent 512 runs); an empty filter string matches
+    /// everything.
+    pub fn run_list(&self, session_id: &str, status: &str) -> Result<Value, StorageError> {
+        self.command_data(
+            "run.list",
+            &json!({ "session_id": session_id, "status": status }),
+        )
+    }
+
     pub fn session_get(&self, session_id: &str) -> Result<Value, StorageError> {
         self.command_data("session.get", &json!({ "session_id": session_id }))
     }
@@ -708,6 +719,101 @@ impl GatewayEvent {
         axum::response::sse::Event::default()
             .event(event_name)
             .data(data)
+    }
+}
+
+/// The normalized API view of one run. The `status` and the timestamps come
+/// from the DURABLE run row (the in-memory mirror keeps the legacy
+/// `started` placeholder for active runs and is never a status source for
+/// the API); `event_count`/`last_event_seq` come from the retained
+/// in-memory event mirror (events are appended durably before they become
+/// visible, so the mirror never outruns the durable store).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RunView {
+    pub(crate) object: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) parent_run_id: Option<String>,
+    pub(crate) platform: String,
+    pub(crate) status: String,
+    pub(crate) event_count: usize,
+    pub(crate) last_event_seq: u64,
+    pub(crate) created_at: u64,
+    pub(crate) started_at: u64,
+    pub(crate) finished_at: u64,
+    pub(crate) updated_at: u64,
+    pub(crate) error_code: String,
+    pub(crate) error_message: String,
+}
+
+impl RunView {
+    /// Parses one durable run row (the 20-column `run.get`/`run.list`
+    /// shape; see `rss/storage/runs.rss`). The status cell is required; a
+    /// malformed row yields `None` (the caller answers the typed
+    /// not-found/empty list instead of fabricating a status). Missing
+    /// optional cells degrade to typed defaults.
+    pub(crate) fn from_durable_row(row: &[Value]) -> Option<RunView> {
+        let status = row.get(3)?.as_str()?.to_string();
+        Some(RunView {
+            object: "hermes.run".to_string(),
+            run_id: string_cell(row, 0, "run id").unwrap_or_default(),
+            session_id: string_cell(row, 1, "run session id").unwrap_or_default(),
+            parent_run_id: optional_string(row, 2),
+            platform: String::new(),
+            status,
+            event_count: 0,
+            last_event_seq: 0,
+            created_at: int_cell(row, 16, "run created_at").unwrap_or(0) as u64,
+            started_at: int_cell(row, 17, "run started_at").unwrap_or(0) as u64,
+            finished_at: int_cell(row, 18, "run finished_at").unwrap_or(0) as u64,
+            updated_at: int_cell(row, 19, "run updated_at").unwrap_or(0) as u64,
+            error_code: string_cell(row, 13, "run error_code").unwrap_or_default(),
+            error_message: string_cell(row, 14, "run error_message").unwrap_or_default(),
+        })
+    }
+
+    /// In-memory-only fallback view (no durable SQLite store): the mirror
+    /// status and the retained event timestamps are the only authoritative
+    /// state available. Error fields come from the last `run.failed` event.
+    pub(crate) fn from_mirror(run: &RunRecord) -> RunView {
+        let first_timestamp = run.events.first().map(|event| event.timestamp).unwrap_or(0);
+        let last = run.events.last();
+        let mut view = RunView {
+            object: "hermes.run".to_string(),
+            run_id: run.run_id.clone(),
+            session_id: run.session_id.clone(),
+            parent_run_id: run.parent_run_id.clone(),
+            platform: run.platform.clone(),
+            status: run.status.clone(),
+            event_count: run.events.len(),
+            last_event_seq: last.map(|event| event.seq).unwrap_or(0),
+            created_at: first_timestamp,
+            started_at: first_timestamp,
+            finished_at: if matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "cancelled" | "terminal_pending"
+            ) {
+                last.map(|event| event.timestamp).unwrap_or(0)
+            } else {
+                0
+            },
+            updated_at: last.map(|event| event.timestamp).unwrap_or(0),
+            error_code: String::new(),
+            error_message: String::new(),
+        };
+        if let Some(failed) = run
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.event == "run.failed")
+        {
+            view.error_code = failed.data["error_code"].as_str().unwrap_or("").to_string();
+            view.error_message = failed.data["error_message"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+        }
+        view
     }
 }
 
