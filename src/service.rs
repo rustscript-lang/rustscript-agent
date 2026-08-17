@@ -1368,6 +1368,7 @@ impl AgentService {
             maintenance_run_id.to_string(),
             RunRecord {
                 run_id: maintenance_run_id.to_string(),
+                request_overrides: JsonValue::Object(Default::default()),
                 session_id: session_id.to_string(),
                 parent_run_id: None,
                 platform: "maintenance".to_string(),
@@ -1518,6 +1519,7 @@ impl AgentService {
             events: writes.completed_event.clone().into_iter().collect(),
             assistant_message: None,
             deadline: std::time::Instant::now() + self.inner.config.terminal_commit_retry_window,
+            expired_fallback: false,
             kind: PendingTerminalKind::Maintenance {
                 from_status: writes.from_status.clone(),
                 error_code: writes.error_code.clone(),
@@ -4695,6 +4697,7 @@ impl AgentService {
                     assistant_message: None,
                     deadline: std::time::Instant::now(),
                     expired_fallback: true,
+                    kind: PendingTerminalKind::RunTerminal,
                 };
                 service.put_pending_terminal(&run_id_for_block, expired_pending);
                 service
@@ -4780,6 +4783,7 @@ impl AgentService {
                         events: writes.completed_event.into_iter().collect(),
                         assistant_message: None,
                         deadline,
+                        expired_fallback: false,
                         kind: PendingTerminalKind::Maintenance {
                             from_status: writes.from_status,
                             error_code: writes.error_code,
@@ -5038,6 +5042,7 @@ fn terminal_commit_task_cancelled(
             assistant_message: None,
             deadline: std::time::Instant::now() + retry_window,
             expired_fallback: false,
+            kind: PendingTerminalKind::RunTerminal,
         }),
     }
 }
