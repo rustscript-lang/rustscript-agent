@@ -245,13 +245,24 @@ API server; it is enabled by setting `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`.
   run) is a typed reply that never resumes the run; a `/stop` that consumes
   a parked approval cancels the durable approval row immediately
   (`approval.cancel`, resolver `gateway-stop`) instead of waiting for the
-  TTL sweep. `/compact` reports the typed compaction
-  availability: compaction is planned and executed by the active agent loop
-  when the durable history exceeds the configured window, so an active run
-  gets the loop-managed answer and a session without an active run gets the
-  typed no-run answer — the gateway never claims a manual compaction ran.
-  Approvals and compaction rows are never created or resolved outside the
-  AgentService.
+  TTL sweep. `/compact` triggers the REAL manual session compaction through
+  `AgentService::compact_session`: the RSS `compact.rss` policy decides the
+  pair-preserving prefix and the service executes the planned A2 storage
+  commands (`compaction.start → message.compact → compaction.commit`) inside
+  a bounded auditable maintenance run (`compact-run:<session>:<generation>:…`
+  — the actor `telegram:<user_id>` is persisted in its audit input), then
+  replies with the real compaction id/generation/range, or a typed skip /
+  conflict / error. An active run refuses the manual compact (compaction is
+  loop-managed while a run is active; never a concurrent double compact),
+  and the durable per-(session, generation) pending-row contract makes a
+  cross-process double compact a typed conflict. The gateway build compiles
+  the `rss/agent/compact.rss` policy alongside the storage program: a
+  missing or uncompilable policy is a TYPED build error (the gateway fails
+  to start with a clear message — never a panic, never a silent fallback),
+  and the typed `compaction_policy_unavailable` 503 answer is reserved for
+  configurations without durable storage and for runtime policy failures.
+  Approvals and compaction
+  rows are never created or resolved outside the AgentService.
 - **Retries are bounded**: 429 answers sleep `retry_after` (capped at
   `max_429_backoff`, 30 s by default) for at most 3 rounds; 5xx answers use
   capped exponential backoff for at most 3 rounds; an unauthorized failure

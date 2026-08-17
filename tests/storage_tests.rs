@@ -1112,10 +1112,12 @@ fn event_retention_floor_high_water_and_cursor_too_old() {
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
 
-/// A2 failure criterion: duplicate event identity is rejected atomically and
-/// leaves no partial state (the append transaction rolls back entirely).
+/// A2 exact-once criterion: re-appending the SAME event_id with the SAME
+/// run and content is an idempotent replay (no second row, no UNIQUE
+/// conflict); re-appending the SAME event_id with DIFFERENT content is a
+/// typed conflict — never a silent swallow, never a fabricated second event.
 #[test]
-fn duplicate_event_sequence_is_rejected_and_leaves_no_partial_state() {
+fn duplicate_event_sequence_replays_exactly_once_or_conflicts_typed() {
     let root = temporary_root("duplicate-event");
     let runner = storage_runner(&root);
     let db_name = "duplicate.db";
@@ -1153,23 +1155,55 @@ fn duplicate_event_sequence_is_rejected_and_leaves_no_partial_state() {
         5,
     );
 
-    // Same event_id again: UNIQUE(event_id) violation aborts the transaction.
-    let duplicate = run_storage_result(
+    // Retry the exact same event_id with the exact same content: this is the
+    // ambiguous-commit retry (SQLite committed, the response was lost) and
+    // must be a successful idempotent replay, NOT a UNIQUE(event_id) failure.
+    let replay = run_storage(
         &runner,
         db_name,
-        "event-append-dup",
+        "event-append-replay",
         "event.append",
         event_payload("run-1", "event-1", "model.delta", 6, 128),
         6,
     );
-    assert!(
-        duplicate.is_err(),
-        "duplicate event_id must be rejected, got {duplicate:?}"
+    assert_eq!(
+        replay["ok"],
+        json!(true),
+        "the same event_id + content must replay idempotently, got {replay:?}"
+    );
+    let replay_data = result_data(&replay);
+    assert_eq!(
+        replay_data["results"][0]["replayed"],
+        json!(true),
+        "the replay result must advertise the pre-existing durable event"
+    );
+    assert_eq!(
+        replay_data["results"][0]["existing_seq"],
+        json!(2),
+        "the replay surfaces the original seq (the transition event holds seq 1), never a new allocation"
     );
 
-    // No partial state: exactly two events (transition + first append), and
-    // the retention high-water did not advance.
-    let replay = run_storage(
+    // Now clash on the SAME event_id with DIFFERENT content: that is a typed
+    // conflict, not a silent overwrite and not a second event.
+    let conflict = run_storage_result(
+        &runner,
+        db_name,
+        "event-append-conflict",
+        "event.append",
+        event_payload("run-1", "event-1", "model.mock", 7, 128),
+        7,
+    );
+    let conflict = conflict.expect("a typed conflict is still a returned result");
+    assert_eq!(
+        conflict["ok"],
+        json!(false),
+        "same event_id + different content must be a typed conflict: {conflict:?}"
+    );
+    assert_eq!(conflict["code"], json!("event_id_conflict"));
+
+    // The durable trail is exact-once: still (transition + one append), seq 1
+    // "model.delta" untouched, retention high-water unchanged.
+    let replay_again = run_storage(
         &runner,
         db_name,
         "replay-1",
@@ -1180,12 +1214,67 @@ fn duplicate_event_sequence_is_rejected_and_leaves_no_partial_state() {
             "max_events": 128,
             "max_bytes": 65_536,
         }),
-        7,
+        8,
     );
-    let replay_rows = query_rows(&replay);
+    let replay_rows = query_rows(&replay_again);
     assert_eq!(replay_rows.len(), 2);
+    assert_eq!(replay_rows[0]["event_type"], json!("run.status_changed"));
     assert_eq!(replay_rows[1]["seq"], json!(2));
-    assert_eq!(replay["high_water_seq"], json!(2));
+    assert_eq!(replay_rows[1]["event_id"], json!("event-1"));
+    assert_eq!(replay_rows[1]["event_type"], json!("model.delta"));
+    assert_eq!(replay_again["high_water_seq"], json!(2));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// A2 exact-once ownership: the SAME event_id used against a DIFFERENT run is
+/// a typed ownership conflict, never a silent cross-run replay.
+#[test]
+fn duplicate_event_id_across_runs_is_typed_ownership_conflict() {
+    let root = temporary_root("duplicate-event-owner");
+    let runner = storage_runner(&root);
+    let db_name = "duplicate-owner.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-create-1",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    for (run_id, now) in [("run-a", 3), ("run-b", 4)] {
+        run_storage(
+            &runner,
+            db_name,
+            &format!("run-create-{run_id}"),
+            "run.create",
+            run_payload(run_id, "session-1", now),
+            now,
+        );
+    }
+    run_storage(
+        &runner,
+        db_name,
+        "event-append-a",
+        "event.append",
+        event_payload("run-a", "shared-id", "model.delta", 5, 128),
+        5,
+    );
+
+    // Same event_id but a different run with identical-looking content: the
+    // event_id is owned by run-a, so run-b's append must be a typed conflict.
+    let conflict = run_storage_result(
+        &runner,
+        db_name,
+        "event-append-b",
+        "event.append",
+        event_payload("run-b", "shared-id", "model.delta", 6, 128),
+        6,
+    )
+    .expect("a typed conflict must be a returned result");
+    assert_eq!(conflict["ok"], json!(false));
+    assert_eq!(conflict["code"], json!("event_id_conflict"));
 
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }

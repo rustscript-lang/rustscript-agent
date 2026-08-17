@@ -42,7 +42,8 @@ use crate::gateway::api_openai::openai_chat_completions_handler;
 use crate::runtime::delivery::DiscardingSink;
 use crate::runtime::rss_runner::execute_rss_source;
 use crate::service::{
-    AdmitError, ApprovalResolveError, ApprovalResolveOutcome, SubscriberGuard, failed_payload,
+    AdmitError, ApprovalResolveError, ApprovalResolveOutcome, CompactConflict, CompactSessionError,
+    CompactSessionOutcome, SubscriberGuard, failed_payload,
 };
 use crate::{
     AgentGatewayState, RunCancellation,
@@ -1560,16 +1561,15 @@ fn approval_envelope(
     )
 }
 
-/// POST /api/sessions/{session_id}/compact: accurate typed unavailable.
+/// POST /api/sessions/{session_id}/compact: real manual session compaction.
 ///
-/// Compaction is driven by the serial agent loop INSIDE a run (the A5
-/// `compact` decision: the loop plans a pair-preserving prefix with
-/// `compact.rss` and the service executes the planned commands while the
-/// run is durably `compacting`). There is no standalone session compaction
-/// service entry, and fabricating a plan or executing storage commands
-/// without the loop's plan would bypass the RSS-owned compaction policy —
-/// so the endpoint answers the typed `compaction_unavailable` for every
-/// session (terminal or active) and never fakes success.
+/// The whole composition lives in `AgentService::compact_session`: the RSS
+/// `compact.rss` policy decides the pair-preserving prefix, the service
+/// creates a bounded auditable maintenance run (only when no
+/// active/waiting/compacting run exists) and executes the planned A2 storage
+/// commands through the typed worker. This handler only renders the typed
+/// outcome — real compaction id/generation/range/status, a typed skip, a
+/// typed 409 for active runs / in-flight compactions, and typed errors.
 async fn session_compact_handler(
     State(state): State<AgentGatewayState>,
     Path(session_id): Path<String>,
@@ -1581,12 +1581,91 @@ async fn session_compact_handler(
             "session not found",
         );
     }
-    json_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "compaction_unavailable",
-        "session compaction is driven by the serial agent loop inside a run; \
-         no standalone session compaction entry exists",
-    )
+    match state
+        .service()
+        .compact_session(&session_id, "api_server")
+        .await
+    {
+        Ok(CompactSessionOutcome::Committed {
+            compaction_id,
+            run_id,
+            generation,
+            source_start_ordinal,
+            source_end_ordinal,
+            retained_tail_ordinal,
+        }) => json_response(
+            StatusCode::OK,
+            json!({
+                "object": "hermes.compaction",
+                "compaction_id": compaction_id,
+                "run_id": run_id,
+                "session_id": session_id,
+                "generation": generation,
+                "source_start_ordinal": source_start_ordinal,
+                "source_end_ordinal": source_end_ordinal,
+                "retained_tail_ordinal": retained_tail_ordinal,
+                "status": "committed",
+            }),
+        ),
+        Ok(CompactSessionOutcome::Skipped { reason }) => json_response(
+            StatusCode::OK,
+            json!({
+                "object": "hermes.compaction",
+                "session_id": session_id,
+                "status": "skipped",
+                "reason": reason,
+            }),
+        ),
+        Ok(CompactSessionOutcome::Conflict {
+            kind: CompactConflict::ActiveRun,
+            run_id: _,
+            status,
+        }) => json_error(
+            StatusCode::CONFLICT,
+            "run_active_conflict",
+            &format!(
+                "an agent run{} is active for this session; manual compaction is refused \
+                 while a run is active",
+                status
+                    .as_deref()
+                    .map(|status| format!(" ({status})"))
+                    .unwrap_or_default()
+            ),
+        ),
+        Ok(CompactSessionOutcome::Conflict {
+            kind: CompactConflict::CompactionInProgress,
+            ..
+        }) => json_error(
+            StatusCode::CONFLICT,
+            "compaction_in_progress",
+            "a compaction is already in progress for this session",
+        ),
+        Err(CompactSessionError::SessionNotFound) => json_error(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session not found",
+        ),
+        Err(CompactSessionError::NoDurableStorage) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_unavailable",
+            "no durable storage is configured; compaction is unavailable",
+        ),
+        Err(CompactSessionError::Halting) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway_halting",
+            "the gateway is halting; no new compaction may start",
+        ),
+        Err(CompactSessionError::Plan(message)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "compaction_policy_unavailable",
+            &message,
+        ),
+        Err(CompactSessionError::Storage(message)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_unavailable",
+            &format!("session compaction failed: {message}"),
+        ),
+    }
 }
 
 async fn create_job_handler(

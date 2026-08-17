@@ -90,6 +90,15 @@ pub struct GatewayPersistence {
     max_events: i64,
     broadcast_capacity: usize,
     metrics: Arc<crate::metrics::Metrics>,
+    /// Test-only fault injection: the next N commands with a given op fail
+    /// fast with a typed storage error before reaching the worker. Only
+    /// integration tests populate this; production paths never touch it.
+    failures: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// Test-only fault injection: after a successful durable round-trip for
+    /// `op` (optionally after `skip` commits), drop the response. Keyed by op
+    /// -> (remaining_skip, remaining_lost). Only integration tests populate
+    /// this; production paths never touch it.
+    commit_lost: std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>>,
     /// The state database file name (as the RSS storage program addresses
     /// it); the production serial loop's compaction plan needs it.
     db_file: String,
@@ -245,6 +254,8 @@ impl GatewayPersistence {
             max_events: config.max_events_per_run as i64,
             broadcast_capacity: config.broadcast_capacity,
             metrics,
+            failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            commit_lost: std::sync::Mutex::new(std::collections::HashMap::new()),
             db_file: path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -274,10 +285,67 @@ impl GatewayPersistence {
         self.worker.shutdown();
     }
 
+    /// Test-only fault injection: the next `count` commands with `op` fail
+    /// fast with a typed storage error before reaching the worker (a
+    /// bounded `count` = N, a continuous outage = `usize::MAX` until
+    /// cleared with `count` 0). Lets integration tests exercise typed
+    /// failure paths a live worker cannot reach (e.g. a storage outage
+    /// between two commands of one composition). Production code never
+    /// calls this.
+    #[doc(hidden)]
+    pub fn inject_storage_failure(&self, op: &str, count: usize) {
+        let mut failures = self.failures.lock().expect("failure injection lock");
+        if count == 0 {
+            failures.remove(op);
+        } else {
+            failures.insert(op.to_string(), count);
+        }
+    }
+
+    /// Test-only fault injection after a committed durable round-trip: for
+    /// the next `count` commands with `op` (after `skip` successful commits
+    /// of that op have passed), drop the response exactly like a store
+    /// response that timed out or was lost after the SQLite write landed.
+    /// This is what makes a caller retry the same fixed `event_id`; an
+    /// exact-once storage layer must turn that retry into an idempotent
+    /// replay instead of a fatal UNIQUE conflict. `skip` lets a test target
+    /// a later `op` occurrence (e.g. the started event vs the terminal
+    /// `compact.completed`) deterministically. Only integration tests
+    /// populate this; production paths never touch it.
+    ///
+    /// Consecutive lost responses for the same op consume from `count`
+    /// (bounded); a `count` of 0 clears the injection.
+    #[doc(hidden)]
+    pub fn inject_commit_lost_response(&self, op: &str, skip: usize, count: usize) {
+        let mut lost = self.commit_lost.lock().expect("commit-lost injection lock");
+        if count == 0 {
+            lost.remove(op);
+        } else {
+            lost.insert(op.to_string(), (skip, count));
+        }
+    }
+
     /// Runs one command on the dedicated storage worker and blocks (bounded)
     /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+        // Test-only fault injection: consume one failure before any worker
+        // round-trip so a composition's later commands can fail while its
+        // earlier ones succeed.
+        {
+            let mut failures = self.failures.lock().expect("failure injection lock");
+            if let Some(count) = failures.get_mut(op) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    failures.remove(op);
+                }
+                drop(failures);
+                self.metrics
+                    .storage_op(crate::metrics::StorageOp::from_command(op), false);
+                return Err(format!("injected storage failure for {op}"));
+            }
+        }
         let result = if self
             .worker
             .closed
@@ -303,6 +371,40 @@ impl GatewayPersistence {
                 Err(_) => Err("gateway storage worker is not running".to_string()),
             }
         };
+        // Test-only fault injection: after a successful durable round-trip,
+        // lose the response exactly like a timeout/ dropped store response.
+        // The SQLite commit has already landed, so a retry of the same fixed
+        // event_id must be reconciled by the exact-once storage layer, not
+        // returned as a fatal UNIQUE conflict. A `skip` prefix lets a test
+        // target a later occurrence of the op (e.g. the started event vs the
+        // terminal compact.completed) deterministically.
+        if result.is_ok() {
+            let mut lose_response = false;
+            {
+                let mut lost = self.commit_lost.lock().expect("commit-lost injection lock");
+                if let Some((skip, count)) = lost.get_mut(op) {
+                    if *skip > 0 {
+                        // Let this commit's response through; the next
+                        // occurrence is the one still being targeted.
+                        *skip -= 1;
+                    } else {
+                        // Lose the current response; count tracks how many
+                        // consecutive responses to drop in total.
+                        lose_response = true;
+                        if *count > 1 {
+                            *count -= 1;
+                        } else {
+                            lost.remove(op);
+                        }
+                    }
+                }
+            }
+            if lose_response {
+                self.metrics
+                    .storage_op(crate::metrics::StorageOp::from_command(op), false);
+                return Err(format!("injected commit-lost response for {op}"));
+            }
+        }
         self.metrics
             .storage_op(crate::metrics::StorageOp::from_command(op), result.is_ok());
         result
@@ -398,6 +500,12 @@ impl GatewayPersistence {
     /// `transition_conflict`).
     pub fn run_transition(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("run.transition", payload)
+    }
+
+    /// Creates a durable run row in `queued` status (the typed `run.create`
+    /// op; the maintenance-run composition and the storage fixtures use it).
+    pub fn run_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("run.create", payload)
     }
 
     pub fn run_get(&self, run_id: &str) -> Result<Value, StorageError> {

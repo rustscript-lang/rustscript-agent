@@ -21,7 +21,7 @@
 //! streams forever. Nothing is ever published before the durable commit
 //! succeeds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
@@ -67,6 +67,102 @@ pub struct PendingTerminal {
     pub(crate) assistant_message: Option<SessionMessage>,
     pub(crate) deadline: std::time::Instant,
     pub(crate) expired_fallback: bool,
+    pub(crate) kind: PendingTerminalKind,
+}
+
+/// What one pending terminal commits durably. The A5 admitted-run terminal
+/// commits through the `run.terminal` transaction (from `running`); a
+/// maintenance run's terminal commits through `run.transition` +
+/// `event.append` + best-effort `compaction.fail`, because the A2
+/// maintenance lifecycle is `queued -> running -> compacting -> terminal`
+/// and `run.terminal` only accepts `running` runs.
+#[derive(Clone)]
+pub(crate) enum PendingTerminalKind {
+    /// An admitted run's terminal: `run.terminal` with the prebuilt events
+    /// and optional assistant message.
+    RunTerminal,
+    /// A maintenance run's terminal (manual session compaction): the
+    /// durable-first compensation writes that had not landed when the run
+    /// was parked.
+    Maintenance {
+        /// The durable status at park time (the `run.transition`
+        /// from-status; no other actor mutates the maintenance run, so it
+        /// cannot drift between attempts).
+        from_status: String,
+        error_code: String,
+        error_message: String,
+        /// The pending `compaction.fail` payload, cleared once it landed
+        /// (best-effort by the A2 contract).
+        fail_payload: Option<JsonValue>,
+        /// The terminal transition already landed (a previous attempt
+        /// committed it before the event append failed).
+        transition_landed: bool,
+        /// The `compact.completed` event already landed (exact-once).
+        event_landed: bool,
+    },
+}
+
+/// One maintenance run's durable terminal writes (the A2 maintenance
+/// lifecycle: `run.transition` to the terminal status, the exact-once
+/// `compact.completed` event, and the best-effort `compaction.fail`).
+#[derive(Clone)]
+pub(crate) struct MaintenanceTerminalWrites {
+    pub(crate) run_id: String,
+    /// The durable status the terminal transition starts from (no other
+    /// actor mutates the maintenance run, so it cannot drift).
+    pub(crate) from_status: String,
+    /// `failed` or `completed`.
+    pub(crate) to_status: String,
+    pub(crate) error_code: String,
+    pub(crate) error_message: String,
+    /// The `compact.completed` event to append durably (exact-once).
+    pub(crate) completed_event: Option<GatewayEvent>,
+    /// The best-effort `compaction.fail` payload (pending row only).
+    pub(crate) fail_payload: Option<JsonValue>,
+    /// The terminal transition already landed durably.
+    pub(crate) transition_landed: bool,
+    /// The `compact.completed` event already landed durably.
+    pub(crate) event_landed: bool,
+}
+
+impl MaintenanceTerminalWrites {
+    /// One terminal write set; nothing has landed yet.
+    fn new(
+        run_id: String,
+        from_status: String,
+        to_status: String,
+        error_code: String,
+        error_message: String,
+        completed_event: Option<GatewayEvent>,
+        fail_payload: Option<JsonValue>,
+    ) -> Self {
+        Self {
+            run_id,
+            from_status,
+            to_status,
+            error_code,
+            error_message,
+            completed_event,
+            fail_payload,
+            transition_landed: false,
+            event_landed: false,
+        }
+    }
+
+    /// True when every required write has landed.
+    fn done(&self) -> bool {
+        self.transition_landed && (self.event_landed || self.completed_event.is_none())
+    }
+}
+
+/// Outcome of one bounded durable terminal attempt for a maintenance run.
+pub(crate) enum MaintenanceTerminalOutcome {
+    /// Every terminal write landed durably.
+    Committed,
+    /// Storage is still down after the bounded retries: the caller mirrors
+    /// the run observably `terminal_pending` and parks this pending
+    /// terminal for the bounded retry loop.
+    Parked(Box<PendingTerminal>),
 }
 
 /// One admitted run's lifecycle state: typed cancellation, delivery permit,
@@ -271,6 +367,16 @@ struct AgentServiceInner {
     /// The durable approval bridge over the A2 storage program; `None` in
     /// in-memory-only mode (approval.wait then fails the run typed).
     approval: Option<Arc<ApprovalBridge>>,
+    /// The precompiled manual-compaction policy (`rss/agent/compact.rss`).
+    /// The service never re-implements the pair-preserving prefix in Rust:
+    /// it renders the canonical history, invokes this exported `run`
+    /// callable, and executes the returned typed A2 command sequence
+    /// through the storage worker. `None` when no durable storage is
+    /// configured (manual compaction then answers a typed error).
+    compact: Option<Arc<AgentRunner>>,
+    /// Sessions with a manual compaction in flight (the in-process race
+    /// guard; the durable pending-row contract is the cross-process guard).
+    compacting_sessions: Mutex<HashSet<String>>,
     /// Runs parked on a durable pending approval: run_id -> the approval id
     /// and the loop state needed to resume exactly once.
     parked: Mutex<HashMap<String, ParkedRun>>,
@@ -385,6 +491,76 @@ impl std::fmt::Display for ApprovalResolveError {
     }
 }
 
+/// Typed outcome of one manual session compaction
+/// ([`AgentService::compact_session`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactSessionOutcome {
+    /// The RSS-planned compaction committed durably: the real compaction id,
+    /// the maintenance run that executed it, the advanced generation, and
+    /// the covered range.
+    Committed {
+        compaction_id: String,
+        run_id: String,
+        generation: u64,
+        source_start_ordinal: i64,
+        source_end_ordinal: i64,
+        retained_tail_ordinal: i64,
+    },
+    /// The RSS policy decided nothing to do (`compact.skip`); no durable
+    /// state was created.
+    Skipped { reason: String },
+    /// The manual compact was refused: an active/waiting/compacting run
+    /// owns the session, or another compaction is already in flight.
+    Conflict {
+        kind: CompactConflict,
+        run_id: Option<String>,
+        status: Option<String>,
+    },
+}
+
+/// Why a manual compaction was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactConflict {
+    /// A run for the session is durably queued/running/waiting_approval/
+    /// compacting: compaction is loop-managed while a run is active.
+    ActiveRun,
+    /// Another manual compaction is in flight (in-process race guard or the
+    /// durable pending-row contract of a concurrent process).
+    CompactionInProgress,
+}
+
+/// Typed failure of one manual session compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactSessionError {
+    SessionNotFound,
+    /// No durable SQLite state is configured (in-memory-only mode).
+    NoDurableStorage,
+    /// The gateway is halting; no new durable work may start.
+    Halting,
+    /// The RSS policy could not be compiled or produced an invalid decision.
+    Plan(String),
+    /// A durable storage failure (the maintenance run was durably failed and
+    /// any pending row failed; retry is safe).
+    Storage(String),
+}
+
+/// Maps a storage worker error onto the typed compaction error.
+fn storage_error(error: crate::gateway::store::StorageError) -> CompactSessionError {
+    CompactSessionError::Storage(error.to_string())
+}
+
+impl std::fmt::Display for CompactSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => formatter.write_str("session not found"),
+            Self::NoDurableStorage => formatter.write_str("no durable storage is configured"),
+            Self::Halting => formatter.write_str("the gateway is halting"),
+            Self::Plan(message) => formatter.write_str(message),
+            Self::Storage(message) => formatter.write_str(message),
+        }
+    }
+}
+
 impl AgentService {
     pub(crate) fn new(
         config: Arc<AgentGatewayConfig>,
@@ -463,6 +639,36 @@ impl AgentService {
             }
             None => None,
         };
+        // The manual-compaction policy is compiled with the same capability
+        // policy as the storage program (it is a pure decision policy and
+        // never touches SQLite, but it must exist wherever durable storage
+        // does). A missing or uncompilable policy is a TYPED construction
+        // error — the gateway fails to start with a clear message, never a
+        // panic and never a silent fallback. The typed
+        // `compaction_policy_unavailable` answer is reserved for
+        // configurations without durable storage and for runtime policy
+        // failures.
+        let compact = match persistence.as_ref() {
+            Some(persistence) => {
+                let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("rss")
+                    .join("agent")
+                    .join("compact.rss");
+                let mut agent_config = AgentConfig {
+                    http: http_config.clone(),
+                    sqlite: config.sqlite.clone(),
+                    io: config.io.clone(),
+                    fuel: config.fuel,
+                };
+                if let Some(parent) = persistence.db_root() {
+                    agent_config = agent_config.with_sqlite_root(parent);
+                }
+                let compact = AgentRunner::from_file(&root, agent_config)
+                    .map_err(|error| format!("compile the built-in compact policy: {error}"))?;
+                Some(Arc::new(compact))
+            }
+            None => None,
+        };
         let inner = Arc::new(AgentServiceInner {
             config,
             store,
@@ -470,6 +676,8 @@ impl AgentService {
             agent_source,
             agent_program: agent_program.map(Arc::new),
             approval,
+            compact,
+            compacting_sessions: Mutex::new(HashSet::new()),
             parked: Mutex::new(HashMap::new()),
             http_config,
             capacity,
@@ -512,6 +720,846 @@ impl AgentService {
     /// SQLite path is configured (in-memory only mode).
     pub(crate) fn persistence_handle(&self) -> Option<Arc<GatewayPersistence>> {
         self.inner.persistence.clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual session compaction (single composition; RSS-owned policy)
+    // -----------------------------------------------------------------------
+
+    /// Compacts one session on demand. The pair-preserving prefix comes from
+    /// the RSS policy (`rss/agent/compact.rss`); native code only orchestrates
+    /// generic storage commands. With no active run the service creates a
+    /// bounded auditable maintenance run and executes
+    /// `compaction.start → message.compact → compaction.commit` (or the typed
+    /// failure path) with generation advance and exact-once events/terminal;
+    /// with an active/waiting/compacting run it answers a typed conflict
+    /// (never a concurrent double compact). Idempotent retry and restart
+    /// recovery are safe by the unchanged A2 storage contract.
+    pub async fn compact_session(
+        &self,
+        session_id: &str,
+        actor: &str,
+    ) -> Result<CompactSessionOutcome, CompactSessionError> {
+        if self.inner.halting.load(Ordering::Acquire) {
+            return Err(CompactSessionError::Halting);
+        }
+        {
+            let store = self.inner.store.read();
+            if !store.sessions.contains_key(session_id) {
+                return Err(CompactSessionError::SessionNotFound);
+            }
+        }
+        // In-process race guard: one manual compaction per session at a
+        // time. The durable pending-row contract is the cross-process guard.
+        {
+            let mut compacting = self
+                .inner
+                .compacting_sessions
+                .lock()
+                .expect("compacting sessions lock");
+            if !compacting.insert(session_id.to_string()) {
+                return Ok(CompactSessionOutcome::Conflict {
+                    kind: CompactConflict::CompactionInProgress,
+                    run_id: None,
+                    status: None,
+                });
+            }
+        }
+        let service = self.clone();
+        let session_id = session_id.to_string();
+        let actor = actor.to_string();
+        let guard_key = session_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            service.compact_session_blocking(&session_id, &actor)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(CompactSessionError::Storage(format!(
+                "compaction worker failed: {error}"
+            )))
+        });
+        self.inner
+            .compacting_sessions
+            .lock()
+            .expect("compacting sessions lock")
+            .remove(&guard_key);
+        outcome
+    }
+
+    /// The blocking composition (storage worker round-trips never occupy
+    /// Tokio threads). See [`Self::compact_session`] for the contract.
+    fn compact_session_blocking(
+        &self,
+        session_id: &str,
+        actor: &str,
+    ) -> Result<CompactSessionOutcome, CompactSessionError> {
+        let Some(persistence) = self.inner.persistence.clone() else {
+            return Err(CompactSessionError::NoDurableStorage);
+        };
+        let Some(compact) = self.inner.compact.clone() else {
+            return Err(CompactSessionError::Plan(
+                "the compact.rss policy is not available".to_string(),
+            ));
+        };
+        // Authoritative durable active-run gate (restart-safe): any
+        // non-terminal run for the session refuses the manual compact.
+        {
+            let data = persistence
+                .run_list(session_id, "")
+                .map_err(storage_error)?;
+            if let Some((run_id, status)) = data
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(JsonValue::as_array)
+                .find(|row| {
+                    row.get(3)
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|status| {
+                            matches!(
+                                status,
+                                "queued" | "running" | "waiting_approval" | "compacting"
+                            )
+                        })
+                })
+                .map(|row| {
+                    (
+                        row.first()
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        row.get(3)
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+            {
+                return Ok(CompactSessionOutcome::Conflict {
+                    kind: CompactConflict::ActiveRun,
+                    run_id: Some(run_id),
+                    status: Some(status),
+                });
+            }
+        }
+
+        // Canonical history from the mirror (the same shape the production
+        // loop plans over: ordinals mirror durable rows, message-level pair
+        // ids, canonical content parts).
+        let (messages, generation, model) = {
+            let store = self.inner.store.read();
+            let session = store.sessions.get(session_id);
+            let messages = session
+                .map(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, message)| !message.compacted)
+                        .map(|(index, message)| {
+                            json!({
+                                "ordinal": index + 1,
+                                "role": message.role,
+                                // The message-level pair id mirrors the
+                                // durable messages.tool_call_id column, and
+                                // content is canonicalized to the parts
+                                // array exactly like the production loop
+                                // context (string content -> one text part),
+                                // so the policy contract holds for any
+                                // persisted shape.
+                                "tool_call_id": message.tool_call_id,
+                                "content": canonical_message_content(&message.content),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let generation = session.map(|session| session.view.generation).unwrap_or(1);
+            let model = session
+                .map(|session| session.view.model.clone())
+                .unwrap_or_else(|| self.inner.config.model.clone());
+            (messages, generation, model)
+        };
+
+        // The RSS policy decides: skip (typed no-op, no durable writes) or
+        // plan (the exact A2 command sequence to execute).
+        let maintenance_run_id = format!(
+            "compact-run:{session_id}:{}:{}",
+            generation + 1,
+            &Uuid::new_v4().to_string()[..8]
+        );
+        let config = &self.inner.config;
+        let context = json!({
+            "session_id": session_id,
+            "run_id": maintenance_run_id,
+            "compaction_id": format!("compact:{session_id}:{}", generation + 1),
+            "generation": generation,
+            "messages": messages,
+            "config": {
+                "max_context_messages": config.max_context_messages,
+                "retained_tail": config.retained_tail,
+                "now_ms": timestamp(),
+                "model": model,
+                "token_estimate": 0,
+            },
+        });
+        let decision = compact
+            .run_with_context(json_to_vm_value(&context))
+            .map_err(|error| CompactSessionError::Plan(format!("compact.rss failed: {error}")))
+            .map(|decision| vm_value_to_json(&decision))?;
+        let kind = decision["kind"].as_str().unwrap_or("").to_string();
+        if kind == "compact.skip" {
+            let reason = decision["reason"]
+                .as_str()
+                .unwrap_or("history_within_window")
+                .to_string();
+            return Ok(CompactSessionOutcome::Skipped { reason });
+        }
+        if kind != "compact.plan" {
+            return Err(CompactSessionError::Plan(format!(
+                "compact.rss produced an unknown decision kind: {kind}"
+            )));
+        }
+        // The policy's decision is FLAT (the loop wraps it under `plan`
+        // only when it yields the `compact` decision; the policy itself
+        // returns kind/generation/range/commands at the top level).
+        let plan = decision.clone();
+        let plan_generation = plan["generation"].as_i64().unwrap_or(0);
+        let start_ordinal = plan["source_start_ordinal"].as_i64().unwrap_or(0);
+        let end_ordinal = plan["source_end_ordinal"].as_i64().unwrap_or(0);
+        let tail_ordinal = plan["retained_tail_ordinal"].as_i64().unwrap_or(0);
+        let compaction_id = format!("compact:{session_id}:{plan_generation}");
+        let now = timestamp() as i64;
+        let max_events = config.max_events_per_run as i64;
+
+        // The bounded auditable maintenance run: created durably, stepped
+        // queued -> running -> compacting (the A2 start/commit guards require
+        // `compacting`). Any failure durably fails the run — no orphan
+        // non-terminal run is ever left behind.
+        let audit_input = json!({
+            "kind": "session_compaction",
+            "actor": actor,
+            "session_id": session_id,
+            "target_generation": plan_generation,
+        });
+        persistence
+            .run_create(&json!({
+                "id": maintenance_run_id,
+                "session_id": session_id,
+                "parent_run_id": "",
+                "input_json": audit_input.to_string(),
+                "provider": "",
+                "model": model,
+                "script_hash": "compact",
+                "idempotency_scope": "",
+                "idempotency_key": "",
+                "now_ms": now,
+            }))
+            .map_err(storage_error)?;
+        for (from, to) in [("queued", "running"), ("running", "compacting")] {
+            let matched = persistence
+                .run_transition(&json!({
+                    "run_id": maintenance_run_id,
+                    "from_status": from,
+                    "to_status": to,
+                    "error_code": "",
+                    "error_message": "",
+                    "recovery_reason": "",
+                    "now_ms": now,
+                }))
+                .map(|value| run_transition_matched(&value))
+                .unwrap_or(false);
+            if !matched {
+                // Durable-first compensation: the maintenance run can never
+                // reach compacting — fail it durably with bounded retries,
+                // and if storage is still down park it observably
+                // `terminal_pending` for the bounded retry loop (never a
+                // silent `let _ =` that strands the run durably
+                // queued/running without an owned retry).
+                let message = format!("the maintenance run could not transition {from} -> {to}");
+                let writes = MaintenanceTerminalWrites::new(
+                    maintenance_run_id.clone(),
+                    from.to_string(),
+                    "failed".to_string(),
+                    "maintenance_run_failed".to_string(),
+                    message.clone(),
+                    None,
+                    None,
+                );
+                let outcome = self.commit_maintenance_terminal(&persistence, writes.clone());
+                self.mirror_maintenance_terminal(session_id, &writes, outcome, None);
+                return Err(CompactSessionError::Storage(message));
+            }
+        }
+
+        // Exact-once durable event trail: compact.started before the first
+        // command, compact.completed after (ok or error). The started event
+        // must be durable before any command runs: a persistent failure
+        // aborts the compaction and fails the maintenance run durably.
+        let started_event = GatewayEvent {
+            event_id: Uuid::new_v4().to_string(),
+            seq: 1,
+            event: "compact.started".to_string(),
+            run_id: maintenance_run_id.clone(),
+            timestamp: now as u64,
+            data: json!({
+                "compaction_id": compaction_id,
+                "generation": plan_generation,
+                "source_start_ordinal": start_ordinal,
+                "source_end_ordinal": end_ordinal,
+                "retained_tail_ordinal": tail_ordinal,
+            }),
+        };
+        if !self.append_maintenance_event_bounded(&persistence, &started_event, now, max_events) {
+            let message =
+                "compact.started could not be persisted durably; the compaction was aborted"
+                    .to_string();
+            let writes = MaintenanceTerminalWrites::new(
+                maintenance_run_id.clone(),
+                "compacting".to_string(),
+                "failed".to_string(),
+                "compaction_failed".to_string(),
+                message.clone(),
+                None,
+                None,
+            );
+            let outcome = self.commit_maintenance_terminal(&persistence, writes.clone());
+            self.mirror_maintenance_terminal(session_id, &writes, outcome, None);
+            return Err(CompactSessionError::Storage(message));
+        }
+
+        // The plan's command sequence, with the canonical service-owned
+        // compaction id (the storage layer's per-(session, generation)
+        // identity and the idempotent-resume path key on this exact id).
+        let mut commands: Vec<(String, JsonValue)> = plan["commands"]
+            .as_array()
+            .map(|commands| {
+                commands
+                    .iter()
+                    .filter_map(|command| {
+                        let op = command["op"].as_str()?.to_string();
+                        Some((op, command["payload"].clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (_, payload) in &mut commands {
+            if payload.get("id").is_some() {
+                payload["id"] = json!(compaction_id);
+            }
+        }
+
+        let mut error: Option<String> = None;
+        let mut start_ok = false;
+        let mut conflict: Option<CompactConflict> = None;
+        let mut already_committed: Option<JsonValue> = None;
+        for (op, payload) in &commands {
+            let step = match op.as_str() {
+                "compaction.start" => persistence.compaction_start(payload),
+                "message.compact" => persistence.message_compact(payload),
+                "compaction.commit" => persistence.compaction_commit(payload),
+                other => {
+                    error = Some(format!("{other}: unknown compaction command in the plan"));
+                    break;
+                }
+            };
+            match step {
+                Ok(value) if compaction_command_ok(op, &value) => {
+                    if op == "compaction.start" {
+                        start_ok = true;
+                    }
+                }
+                Ok(value) => {
+                    // An ok:true envelope whose data reports no match (a
+                    // guarded step that matched no row) is a typed step
+                    // failure; the storage layer reports every typed
+                    // conflict as an ERR (see the Err arm below).
+                    let code = value
+                        .get("code")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("storage_error")
+                        .to_string();
+                    let message = value
+                        .get("message")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    error = Some(format!("{op} failed: {code} {message}"));
+                    break;
+                }
+                Err(storage_error) => {
+                    // The typed storage layer reports guard conflicts as
+                    // `Err(StorageError { code })`, never as an ok envelope.
+                    match storage_error.code.as_str() {
+                        // Cross-process double compact: the other process's
+                        // pending/failed row owns the target generation.
+                        "compaction_pending_conflict" | "compaction_failed_conflict" => {
+                            conflict = Some(CompactConflict::CompactionInProgress);
+                            break;
+                        }
+                        // The other process already committed this exact
+                        // (session, generation): the idempotent answer comes
+                        // from the committed durable row. A failed or empty
+                        // read is a TYPED storage failure — never a
+                        // fall-through to the success path, which would
+                        // fabricate a completed attribution and run
+                        // ownership the durable side never recorded.
+                        "compaction_already_committed" => {
+                            let row = persistence
+                                .compaction_get(&compaction_id)
+                                .map_err(|error| {
+                                    format!(
+                                        "{op} reported {}, but the committed row could \
+                                         not be read: {error}",
+                                        storage_error.code
+                                    )
+                                })
+                                .and_then(|data| {
+                                    data.get("rows")
+                                        .and_then(JsonValue::as_array)
+                                        .and_then(|rows| rows.first())
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "{op} reported {}, but the committed \
+                                                 row is missing",
+                                                storage_error.code
+                                            )
+                                        })
+                                })
+                                .and_then(|row| {
+                                    if row.get(10).and_then(JsonValue::as_str) == Some("committed")
+                                    {
+                                        Ok(row)
+                                    } else {
+                                        Err(format!(
+                                            "{op} reported {}, but the committed row \
+                                             is not in the committed state",
+                                            storage_error.code
+                                        ))
+                                    }
+                                });
+                            match row {
+                                Ok(row) => already_committed = Some(row),
+                                Err(message) => error = Some(message),
+                            }
+                            break;
+                        }
+                        _ => {
+                            error = Some(format!("{op} failed: {storage_error}"));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let completed_event_id = Uuid::new_v4().to_string();
+        if let Some(conflict) = conflict {
+            // The maintenance run is durably failed (exact-once terminal for
+            // the losing request) and the event trail closes — durable-first
+            // with bounded retries; a persistent outage parks the terminal
+            // observably `terminal_pending` for the bounded retry loop.
+            let completed_event = GatewayEvent {
+                event_id: completed_event_id,
+                seq: 2,
+                event: "compact.completed".to_string(),
+                run_id: maintenance_run_id.clone(),
+                timestamp: now as u64,
+                data: json!({
+                    "ok": false,
+                    "error": "compaction_conflict",
+                    "compaction_id": compaction_id,
+                    "generation": plan_generation,
+                }),
+            };
+            let message =
+                "a compaction for this session+generation is already in flight".to_string();
+            let writes = MaintenanceTerminalWrites::new(
+                maintenance_run_id.clone(),
+                "compacting".to_string(),
+                "failed".to_string(),
+                "compaction_conflict".to_string(),
+                message,
+                Some(completed_event),
+                None,
+            );
+            let outcome = self.commit_maintenance_terminal(&persistence, writes.clone());
+            self.mirror_maintenance_terminal(session_id, &writes, outcome, Some(&started_event));
+            return Ok(CompactSessionOutcome::Conflict {
+                kind: conflict,
+                run_id: None,
+                status: None,
+            });
+        }
+        if let Some(row) = already_committed {
+            // Idempotent answer from the committed durable row: the other
+            // process owns the committed truth, so the response carries its
+            // real values and the mirror is REFRESHED from the same row
+            // (later plans and message views never see stale state).
+            let committed_compaction_id = row
+                .get(0)
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&compaction_id)
+                .to_string();
+            let committed_run_id = row
+                .get(2)
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string();
+            let committed_generation = row.get(3).and_then(JsonValue::as_u64).unwrap_or(0);
+            let committed_start = row.get(4).and_then(JsonValue::as_i64).unwrap_or(0);
+            let committed_end = row.get(5).and_then(JsonValue::as_i64).unwrap_or(0);
+            let committed_tail = row.get(6).and_then(JsonValue::as_i64).unwrap_or(0);
+            let completed_event = GatewayEvent {
+                event_id: completed_event_id,
+                seq: 2,
+                event: "compact.completed".to_string(),
+                run_id: maintenance_run_id.clone(),
+                timestamp: now as u64,
+                data: json!({
+                    "ok": false,
+                    "error": "compaction_already_committed",
+                    "compaction_id": compaction_id,
+                    "generation": plan_generation,
+                }),
+            };
+            let writes = MaintenanceTerminalWrites::new(
+                maintenance_run_id.clone(),
+                "compacting".to_string(),
+                "failed".to_string(),
+                "compaction_already_committed".to_string(),
+                "a compaction for this session+generation was already committed".to_string(),
+                Some(completed_event),
+                None,
+            );
+            let outcome = self.commit_maintenance_terminal(&persistence, writes.clone());
+            // Refresh the mirror session state from the committed durable
+            // row (durable truth) regardless of the terminal outcome.
+            {
+                let mut store = self.inner.store.write();
+                if let Some(session) = store.sessions.get_mut(session_id) {
+                    for (index, message) in session.messages.iter_mut().enumerate() {
+                        let ordinal = (index + 1) as i64;
+                        if ordinal >= committed_start && ordinal <= committed_end {
+                            message.compacted = true;
+                        }
+                    }
+                    session.view.generation = session.view.generation.max(committed_generation);
+                    session.view.updated_at = timestamp();
+                }
+            }
+            self.mirror_maintenance_terminal(session_id, &writes, outcome, Some(&started_event));
+            return Ok(CompactSessionOutcome::Committed {
+                compaction_id: committed_compaction_id,
+                run_id: committed_run_id,
+                generation: committed_generation,
+                source_start_ordinal: committed_start,
+                source_end_ordinal: committed_end,
+                retained_tail_ordinal: committed_tail,
+            });
+        }
+        if let Some(error) = error {
+            // A pending row that never committed is durably failed; the
+            // maintenance run is terminal-failed; the history stays fully
+            // recoverable (A2 contract). All terminal writes are
+            // durable-first (bounded retries + parked terminal), never
+            // silent `let _ =`.
+            let completed_event = GatewayEvent {
+                event_id: completed_event_id,
+                seq: 2,
+                event: "compact.completed".to_string(),
+                run_id: maintenance_run_id.clone(),
+                timestamp: now as u64,
+                data: json!({
+                    "ok": false,
+                    "error": error,
+                    "compaction_id": compaction_id,
+                    "generation": plan_generation,
+                }),
+            };
+            let writes = MaintenanceTerminalWrites::new(
+                maintenance_run_id.clone(),
+                "compacting".to_string(),
+                "failed".to_string(),
+                "compaction_failed".to_string(),
+                error.clone(),
+                Some(completed_event),
+                if start_ok {
+                    Some(json!({
+                        "id": compaction_id,
+                        "error_message": error,
+                        "completed_at_ms": now,
+                    }))
+                } else {
+                    None
+                },
+            );
+            let outcome = self.commit_maintenance_terminal(&persistence, writes.clone());
+            self.mirror_maintenance_terminal(session_id, &writes, outcome, Some(&started_event));
+            return Err(CompactSessionError::Storage(error));
+        }
+
+        // Success: the compaction is durably committed (generation
+        // advanced). Mirror the committed session state (durable truth),
+        // then close the event trail and the maintenance run's terminal
+        // exactly once — durable-first, parked observably if storage is
+        // still down (the run terminal lands via the bounded retry loop,
+        // never left durably compacting).
+        {
+            let mut store = self.inner.store.write();
+            if let Some(session) = store.sessions.get_mut(session_id) {
+                for (index, message) in session.messages.iter_mut().enumerate() {
+                    let ordinal = (index + 1) as i64;
+                    if ordinal >= start_ordinal && ordinal <= end_ordinal {
+                        message.compacted = true;
+                    }
+                }
+                session.view.generation = plan_generation as u64;
+                session.view.updated_at = timestamp();
+            }
+        }
+        let completed_event = GatewayEvent {
+            event_id: completed_event_id,
+            seq: 2,
+            event: "compact.completed".to_string(),
+            run_id: maintenance_run_id.clone(),
+            timestamp: now as u64,
+            data: json!({
+                "ok": true,
+                "error": "",
+                "compaction_id": compaction_id,
+                "generation": plan_generation,
+            }),
+        };
+        let writes = MaintenanceTerminalWrites::new(
+            maintenance_run_id.clone(),
+            "compacting".to_string(),
+            "completed".to_string(),
+            String::new(),
+            String::new(),
+            Some(completed_event),
+            None,
+        );
+        let outcome = self.commit_maintenance_terminal(&persistence, writes.clone());
+        self.mirror_maintenance_terminal(session_id, &writes, outcome, Some(&started_event));
+        Ok(CompactSessionOutcome::Committed {
+            compaction_id,
+            run_id: maintenance_run_id,
+            generation: plan_generation as u64,
+            source_start_ordinal: start_ordinal,
+            source_end_ordinal: end_ordinal,
+            retained_tail_ordinal: tail_ordinal,
+        })
+    }
+
+    /// Mirrors a failed/terminal maintenance run into the store so run views
+    /// and session-active checks never see a fabricated or stale state.
+    fn mirror_maintenance_run(
+        &self,
+        session_id: &str,
+        maintenance_run_id: &str,
+        status: &str,
+        events: Vec<GatewayEvent>,
+    ) {
+        let mut store = self.inner.store.write();
+        store.runs.insert(
+            maintenance_run_id.to_string(),
+            RunRecord {
+                run_id: maintenance_run_id.to_string(),
+                session_id: session_id.to_string(),
+                parent_run_id: None,
+                platform: "maintenance".to_string(),
+                status: status.to_string(),
+                events,
+                sender: None,
+                cancel_requested: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    /// Appends one maintenance-run event with bounded in-process retries
+    /// (the A5 `terminal_persist_retries` / `terminal_persist_retry_delay`
+    /// knobs; the blocking compaction worker owns its thread, so sleeping
+    /// there never stalls Tokio). Returns false when the bounded retries
+    /// are exhausted.
+    fn append_maintenance_event_bounded(
+        &self,
+        persistence: &GatewayPersistence,
+        event: &GatewayEvent,
+        now_ms: i64,
+        max_events: i64,
+    ) -> bool {
+        let attempts = 1 + self.inner.config.terminal_persist_retries;
+        for attempt in 0..attempts {
+            let appended = persistence
+                .event_append(&json!({
+                    "run_id": event.run_id,
+                    "event_id": event.event_id,
+                    "event_type": event.event,
+                    "payload_json": serde_json::to_string(&event.data)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    "now_ms": now_ms,
+                    "max_events": max_events,
+                }))
+                .is_ok();
+            if appended {
+                return true;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(self.inner.config.terminal_persist_retry_delay);
+            }
+        }
+        false
+    }
+
+    /// One attempt of the maintenance-run terminal writes; `Ok` when every
+    /// write landed, `Err` while any remains. The best-effort
+    /// `compaction.fail` never blocks the terminal (the A2 contract; a
+    /// leftover pending row is swept by restart recovery).
+    fn maintenance_terminal_once(
+        &self,
+        persistence: &GatewayPersistence,
+        writes: &mut MaintenanceTerminalWrites,
+    ) -> Result<(), ()> {
+        if let Some(payload) = writes.fail_payload.as_ref()
+            && persistence.compaction_fail(payload).is_ok()
+        {
+            writes.fail_payload = None;
+        }
+        if !writes.transition_landed {
+            match persistence.run_transition(&json!({
+                "run_id": writes.run_id,
+                "from_status": writes.from_status,
+                "to_status": writes.to_status,
+                "error_code": writes.error_code,
+                "error_message": writes.error_message,
+                "recovery_reason": "",
+                "now_ms": timestamp(),
+            })) {
+                Ok(data) if run_transition_matched(&data) => {
+                    writes.transition_landed = true;
+                }
+                Ok(_) => {
+                    // Not matched: the run may already be terminal durably
+                    // (an earlier attempt landed, or restart recovery ran).
+                    // A terminal status settles the transition either way —
+                    // the event trail still closes exactly once.
+                    let durable_status = persistence
+                        .run_get(&writes.run_id)
+                        .ok()
+                        .and_then(|data| {
+                            data.get("rows")
+                                .and_then(JsonValue::as_array)
+                                .and_then(|rows| rows.first())
+                                .and_then(|row| row.get(3))
+                                .and_then(JsonValue::as_str)
+                                .map(|status| status.to_string())
+                        })
+                        .unwrap_or_default();
+                    if matches!(
+                        durable_status.as_str(),
+                        "completed" | "failed" | "cancelled"
+                    ) {
+                        writes.transition_landed = true;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if !writes.event_landed
+            && let Some(event) = writes.completed_event.as_ref()
+            && persistence
+                .event_append(&json!({
+                    "run_id": event.run_id,
+                    "event_id": event.event_id,
+                    "event_type": event.event,
+                    "payload_json": serde_json::to_string(&event.data)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    "now_ms": timestamp(),
+                    "max_events": self.inner.config.max_events_per_run,
+                }))
+                .is_ok()
+        {
+            writes.event_landed = true;
+        }
+        if writes.done() { Ok(()) } else { Err(()) }
+    }
+
+    /// Durably commits one maintenance run's terminal with bounded
+    /// in-process retries (the A5 terminal retry knobs). On final failure
+    /// the terminal is parked observably `terminal_pending` and handed to
+    /// the bounded retry loop, so a maintenance run is never left durably
+    /// `compacting` (or queued/running) without an owned retry: the same
+    /// process commits the exact terminal once storage recovers. The
+    /// caller mirrors the run (`mirror_maintenance_terminal`) and returns
+    /// its typed outcome.
+    fn commit_maintenance_terminal(
+        &self,
+        persistence: &GatewayPersistence,
+        mut writes: MaintenanceTerminalWrites,
+    ) -> MaintenanceTerminalOutcome {
+        let attempts = 1 + self.inner.config.terminal_persist_retries;
+        for attempt in 0..attempts {
+            if self
+                .maintenance_terminal_once(persistence, &mut writes)
+                .is_ok()
+            {
+                return MaintenanceTerminalOutcome::Committed;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(self.inner.config.terminal_persist_retry_delay);
+            }
+        }
+        let pending = PendingTerminal {
+            to_status: writes.to_status.clone(),
+            session_id: None,
+            events: writes.completed_event.clone().into_iter().collect(),
+            assistant_message: None,
+            deadline: std::time::Instant::now() + self.inner.config.terminal_commit_retry_window,
+            kind: PendingTerminalKind::Maintenance {
+                from_status: writes.from_status.clone(),
+                error_code: writes.error_code.clone(),
+                error_message: writes.error_message.clone(),
+                fail_payload: writes.fail_payload.clone(),
+                transition_landed: writes.transition_landed,
+                event_landed: writes.event_landed,
+            },
+        };
+        MaintenanceTerminalOutcome::Parked(Box::new(pending))
+    }
+
+    /// Mirrors one maintenance run's terminal after the durable-first
+    /// attempt and hands a parked terminal to the bounded retry loop:
+    /// `Committed` -> the terminal status with the full event trail;
+    /// `Parked` -> observably `terminal_pending` with only the durably
+    /// appended events, and the bounded retry loop commits the terminal and
+    /// completes the mirror exactly once when storage recovers.
+    fn mirror_maintenance_terminal(
+        &self,
+        session_id: &str,
+        writes: &MaintenanceTerminalWrites,
+        outcome: MaintenanceTerminalOutcome,
+        started_event: Option<&GatewayEvent>,
+    ) {
+        let mut events = Vec::new();
+        if let Some(started) = started_event {
+            events.push(started.clone());
+        }
+        match outcome {
+            MaintenanceTerminalOutcome::Committed => {
+                if let Some(completed) = &writes.completed_event {
+                    events.push(completed.clone());
+                }
+                self.mirror_maintenance_run(session_id, &writes.run_id, &writes.to_status, events);
+            }
+            MaintenanceTerminalOutcome::Parked(pending) => {
+                self.mirror_maintenance_run(session_id, &writes.run_id, "terminal_pending", events);
+                self.register_pending_terminal(&writes.run_id, *pending);
+                self.spawn_terminal_retry(writes.run_id.clone());
+            }
+        }
     }
 
     /// Atomically admits one run: capacity permit, idempotency, parent check,
@@ -1530,6 +2578,7 @@ impl AgentService {
                             assistant_message: Some(message),
                             deadline: std::time::Instant::now() + retry_window,
                             expired_fallback: false,
+                            kind: PendingTerminalKind::RunTerminal,
                         }),
                     }
                 }
@@ -1641,6 +2690,7 @@ impl AgentService {
                             assistant_message: None,
                             deadline: std::time::Instant::now() + retry_window,
                             expired_fallback: false,
+                            kind: PendingTerminalKind::RunTerminal,
                         }),
                     }
                 }
@@ -1739,6 +2789,7 @@ impl AgentService {
                             assistant_message: None,
                             deadline: std::time::Instant::now() + retry_window,
                             expired_fallback: false,
+                            kind: PendingTerminalKind::RunTerminal,
                         }),
                     }
                 }
@@ -3654,6 +4705,95 @@ impl AgentService {
                     run_id = %run_id_for_block,
                     "terminal retry window expired; durable terminal-expiry marker will be retried"
                 );
+                return PendingRetryOutcome::RetryFailed;
+            }
+            // Maintenance-run terminals commit through the durable-first
+            // compensation (run.transition + event.append + best-effort
+            // compaction.fail), not the `run.terminal` transaction: the A2
+            // maintenance lifecycle is queued/running/compacting and
+            // `run.terminal` only accepts `running` runs.
+            if matches!(pending.kind, PendingTerminalKind::Maintenance { .. }) {
+                let deadline = pending.deadline;
+                let PendingTerminalKind::Maintenance {
+                    from_status,
+                    error_code,
+                    error_message,
+                    fail_payload,
+                    transition_landed,
+                    event_landed,
+                } = pending.kind
+                else {
+                    unreachable!("kind was checked above");
+                };
+                let mut writes = MaintenanceTerminalWrites {
+                    run_id: run_id_for_block.clone(),
+                    from_status,
+                    error_code,
+                    error_message,
+                    completed_event: pending.events.first().cloned(),
+                    fail_payload,
+                    transition_landed,
+                    event_landed,
+                    to_status: pending.to_status.clone(),
+                };
+                let landed = persistence.as_deref().is_some_and(|persistence| {
+                    service
+                        .maintenance_terminal_once(persistence, &mut writes)
+                        .is_ok()
+                });
+                if landed {
+                    // Mirror the terminal: the status plus the completed
+                    // event exactly once (durable-before-visible).
+                    if let Some(run) = store.runs.get_mut(&run_id_for_block) {
+                        run.status = writes.to_status.clone();
+                        if let Some(event) = &writes.completed_event
+                            && !run
+                                .events
+                                .iter()
+                                .any(|candidate| candidate.event_id == event.event_id)
+                        {
+                            run.events.push(GatewayEvent {
+                                seq: (run.events.len() + 1) as u64,
+                                ..event.clone()
+                            });
+                        }
+                    }
+                    service
+                        .inner
+                        .metrics
+                        .terminal_retry(TerminalRetryOutcome::Committed);
+                    tracing::info!(
+                        run_id = %run_id_for_block,
+                        status = %writes.to_status,
+                        "maintenance run terminal committed durably by the bounded retry"
+                    );
+                    return PendingRetryOutcome::Committed;
+                }
+                // Storage is still down: reflect the writes that landed and
+                // retry on the next janitor tick (the original deadline
+                // bounds the window).
+                service.put_pending_terminal(
+                    &run_id_for_block,
+                    PendingTerminal {
+                        to_status: writes.to_status,
+                        session_id: None,
+                        events: writes.completed_event.into_iter().collect(),
+                        assistant_message: None,
+                        deadline,
+                        kind: PendingTerminalKind::Maintenance {
+                            from_status: writes.from_status,
+                            error_code: writes.error_code,
+                            error_message: writes.error_message,
+                            fail_payload: writes.fail_payload,
+                            transition_landed: writes.transition_landed,
+                            event_landed: writes.event_landed,
+                        },
+                    },
+                );
+                service
+                    .inner
+                    .metrics
+                    .terminal_retry(TerminalRetryOutcome::RetryFailed);
                 return PendingRetryOutcome::RetryFailed;
             }
             let previous_status = run.status.clone();

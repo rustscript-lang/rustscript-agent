@@ -598,7 +598,10 @@ use crate::AgentGatewayState;
 use crate::domain::{InboundEnvelope, fnv1a64, timestamp};
 use crate::gateway::store::{GatewayEvent, SessionRecord, SessionView};
 use crate::gateway::telegram_render::{EventRenderer, RenderAction};
-use crate::service::{AdmitError, AdmitRunRequest, AdmittedRun, failed_payload};
+use crate::service::{
+    AdmitError, AdmitRunRequest, AdmittedRun, CompactConflict, CompactSessionOutcome,
+    failed_payload,
+};
 
 /// Delivery cursor consumer for the global getUpdates offset (hangs on the
 /// control session).
@@ -1382,6 +1385,7 @@ async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: 
                 chat_id,
                 message.message_thread_id,
                 &session_id,
+                from.id,
             )
             .await
         }
@@ -2241,18 +2245,20 @@ async fn cmd_approval(
     let _ = reply(api, chat_id, thread_id, &message).await;
 }
 
-/// `/compact`: answers with the typed availability of the REAL A5
-/// compaction. Compaction is planned and executed by the active agent loop
-/// (the service executes the loop-planned storage commands while the run is
-/// durably `compacting`); there is NO manual trigger on the service, so an
-/// active run gets the loop-managed answer and a session without an active
-/// run gets the typed no-run answer. Never claims a compaction happened.
+/// `/compact`: triggers the REAL manual session compaction through
+/// `AgentService::compact_session` (RSS `compact.rss` decides the
+/// pair-preserving prefix; the service executes the planned A2 storage
+/// commands inside a bounded auditable maintenance run). The reply echoes
+/// the real result — compaction id/generation/range — or the typed skip /
+/// conflict / error. An active run is refused (compaction is loop-managed
+/// while a run is active; never a concurrent double compact).
 async fn cmd_compact(
     runtime: &AdapterRuntime,
     api: &TelegramApi,
     chat_id: i64,
     thread_id: Option<i64>,
     session_id: &str,
+    user_id: i64,
 ) {
     let (has_session, active_run) = {
         let store = runtime.state.store.read();
@@ -2275,19 +2281,52 @@ async fn cmd_compact(
             api,
             chat_id,
             thread_id,
-            "Compaction is managed by the active agent loop; it runs automatically when the \
-             conversation exceeds the configured window. There is no manual compaction trigger.",
+            "An agent run is active in this chat; compaction is managed by the run's loop. \
+             Stop the run first to compact manually.",
         )
         .await;
         return;
     }
-    let _ = reply(
-        api,
-        chat_id,
-        thread_id,
-        "No active run in this chat; there is nothing to compact.",
-    )
-    .await;
+    let service = runtime.state.service();
+    let actor = format!("telegram:{user_id}");
+    let message = match service.compact_session(session_id, &actor).await {
+        Ok(CompactSessionOutcome::Committed {
+            compaction_id,
+            generation,
+            source_start_ordinal,
+            source_end_ordinal,
+            retained_tail_ordinal,
+            ..
+        }) => format!(
+            "Compaction committed: {compaction_id} (generation {generation}), range \
+             [{source_start_ordinal}, {source_end_ordinal}], retained tail \
+             {retained_tail_ordinal}."
+        ),
+        Ok(CompactSessionOutcome::Skipped { reason }) => {
+            format!("No compaction needed: {}.", compact_skip_text(&reason))
+        }
+        Ok(CompactSessionOutcome::Conflict {
+            kind: CompactConflict::ActiveRun,
+            ..
+        }) => "An agent run is active in this chat; compaction is managed by the run's loop. \
+                Stop the run first to compact manually."
+            .to_string(),
+        Ok(CompactSessionOutcome::Conflict {
+            kind: CompactConflict::CompactionInProgress,
+            ..
+        }) => "A compaction is already running for this chat; try again shortly.".to_string(),
+        Err(error) => format!("Could not compact this conversation: {error}."),
+    };
+    let _ = reply(api, chat_id, thread_id, &message).await;
+}
+
+/// Human text for one RSS `compact.skip` reason.
+fn compact_skip_text(reason: &str) -> &'static str {
+    match reason {
+        "history_within_window" => "the conversation is within the configured window",
+        "history_within_retained_tail" => "the conversation fits within the retained tail",
+        _ => "compaction is not configured for this gateway",
+    }
 }
 
 /// Spawns the run worker with the same panic guard as the API server: a

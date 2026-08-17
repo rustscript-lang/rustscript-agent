@@ -937,15 +937,15 @@ async fn adapter_commands_new_status_compact_respond_explicitly() {
     );
     let compact = sends
         .iter()
-        .find(|text| text.contains("nothing to compact"))
+        .find(|text| text.contains("No compaction needed"))
         .expect("/compact must reply");
     assert!(
-        compact.contains("nothing to compact"),
-        "/compact must answer with the typed no-run state, got: {compact}"
+        compact.contains("No compaction needed"),
+        "/compact must answer with the typed skip state, got: {compact}"
     );
     assert!(
-        !compact.contains("completed"),
-        "/compact must not advertise itself as done: {compact}"
+        !compact.contains("Compaction committed"),
+        "/compact must not advertise a compaction that never ran: {compact}"
     );
     adapter.shutdown().await;
     std::fs::remove_file(&db).expect("temporary db should be removed");
@@ -3788,7 +3788,7 @@ async fn adapter_approval_after_stop_is_a_typed_no_op() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adapter_compact_reports_typed_availability_for_active_and_terminal_runs() {
+async fn adapter_compact_refuses_active_runs_and_skips_terminal_sessions() {
     let (base, state) = spawn_fixture().await;
     // A real ACTIVE run without the A5 provider chain: the legacy source
     // parks in a holding HTTP call, so the run stays durably non-terminal
@@ -3817,23 +3817,24 @@ async fn adapter_compact_reports_typed_availability_for_active_and_terminal_runs
         "the run must be durably active while /compact is tested"
     );
 
-    // Active run: /compact answers the typed loop-managed state; there is
-    // no manual compaction trigger on the service.
+    // Active run: /compact refuses with the typed loop-managed answer —
+    // compaction is managed by the active run's loop, never a concurrent
+    // manual compact.
     push_update(&state, update_fixture(71, 151, 555, 555, "/compact"));
     wait_until(std::time::Duration::from_secs(30), || {
         state
             .sent_texts()
             .iter()
-            .any(|text| text.contains("no manual compaction trigger"))
+            .any(|text| text.contains("An agent run is active"))
     })
     .await;
     let sends = state.sent_texts();
     let active_compact = sends
         .iter()
-        .find(|text| text.contains("no manual compaction trigger"))
+        .find(|text| text.contains("An agent run is active"))
         .expect("active /compact reply");
     assert!(
-        !active_compact.contains("completed"),
+        !active_compact.contains("Compaction committed"),
         "an active-run /compact must never claim a compaction happened"
     );
 
@@ -3847,13 +3848,140 @@ async fn adapter_compact_reports_typed_availability_for_active_and_terminal_runs
     .await;
     wait_for_durable_status(&gateway, &run_id, "completed").await;
 
-    // Terminal run: /compact answers the typed no-active-run state.
+    // Terminal run: /compact runs the REAL RSS-owned compaction; the
+    // two-message history is within the default window, so the honest
+    // answer is a typed skip that never fabricates a commit.
     push_update(&state, update_fixture(73, 153, 555, 555, "/compact"));
     wait_until(std::time::Duration::from_secs(30), || {
         state
             .sent_texts()
             .iter()
-            .any(|text| text.contains("nothing to compact"))
+            .any(|text| text.contains("No compaction needed"))
+    })
+    .await;
+
+    adapter.shutdown().await;
+    std::fs::remove_file(&db).expect("temporary db should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_compact_triggers_real_compaction_and_echoes_the_result() {
+    let (base, state) = spawn_fixture().await;
+    let db = telegram_db_path("a9-compact");
+    let session_id = "telegram:fixture_bot:555:";
+
+    // Phase 1: seed an over-window history durably for the telegram session
+    // (6 canonical messages; window 4 / retained tail 1), then drop the
+    // gateway so the adapter's gateway hydrates the mirror from the rows.
+    {
+        let gateway = test_state(ECHO_SOURCE, &db, |mut config| {
+            config.max_context_messages = 4;
+            config.retained_tail = 1;
+            config
+        });
+        let persistence = gateway.persistence().expect("durable persistence");
+        persistence
+            .session_create(&json!({
+                "id": session_id,
+                "profile": "telegram",
+                "platform": "telegram",
+                "account_id": "fixture_bot",
+                "chat_id": "555",
+                "thread_id": "",
+                "user_id": "555",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "test-model",
+                "provider": "",
+                "toolset_hash": "",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": 1_700_000_000_000_i64,
+            }))
+            .expect("seed session create must succeed");
+        for index in 0..6 {
+            let payload = json!({
+                "id": format!("seed-{}", Uuid::new_v4()),
+                "session_id": session_id,
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content_json": json!([{"type": "text", "text": format!("m{index}")}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 0,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": 1_700_000_000_000_i64 + index as i64,
+            });
+            persistence
+                .message_append(&payload)
+                .expect("seed message append must succeed");
+        }
+        drop(gateway);
+    }
+
+    let gateway = test_state(ECHO_SOURCE, &db, |mut config| {
+        config.max_context_messages = 4;
+        config.retained_tail = 1;
+        config
+    });
+    let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
+
+    // /compact triggers the REAL RSS-owned compaction and echoes the real
+    // result: canonical compaction id, generation, and the committed range.
+    push_update(&state, update_fixture(80, 160, 555, 555, "/compact"));
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("Compaction committed"))
+    })
+    .await;
+    let sends = state.sent_texts();
+    let committed = sends
+        .iter()
+        .find(|text| text.contains("Compaction committed"))
+        .expect("/compact committed reply");
+    assert!(
+        committed.contains("compact:telegram:fixture_bot:555::2"),
+        "the reply must carry the real canonical compaction id: {committed}"
+    );
+    assert!(
+        committed.contains("generation 2") && committed.contains("[1, 5]"),
+        "the reply must carry the real generation and range: {committed}"
+    );
+
+    // Durable truth: one committed row, generation advanced, maintenance
+    // run terminal.
+    let persistence = gateway.persistence().expect("durable persistence");
+    let data = persistence
+        .compaction_latest(session_id)
+        .expect("compaction.latest must succeed");
+    let row = data["rows"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_array)
+        .expect("committed compaction row");
+    assert_eq!(row[0], json!("compact:telegram:fixture_bot:555::2"));
+    assert_eq!(row[3], json!(2));
+    assert_eq!(row[5], json!(5));
+    assert_eq!(row[10], json!("committed"));
+    let maintenance_run = row[2].as_str().expect("maintenance run id").to_string();
+    assert_eq!(
+        durable_run_status(&gateway, &maintenance_run),
+        "completed",
+        "the maintenance run must be durably terminal"
+    );
+
+    // A second /compact over the compacted mirror is a typed skip.
+    push_update(&state, update_fixture(81, 161, 555, 555, "/compact"));
+    wait_until(std::time::Duration::from_secs(30), || {
+        state
+            .sent_texts()
+            .iter()
+            .any(|text| text.contains("No compaction needed"))
     })
     .await;
 

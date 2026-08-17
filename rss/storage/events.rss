@@ -43,26 +43,72 @@ pub fn storage_event_append(db_id: int, payload_json: string) -> map {
     if !existence::run_exists(db_id, input.run_id.copy()) {
         result = { ok: false, code: "run_not_found", message: "event append targets an unknown run", result: [] };
     } else {
-        let max_events: int = schema::max_events_limit(input.max_events.copy());
-        let statements = [
-            {
-                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ?",
-                params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
-            },
-            {
-                sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
-                params: [&input.run_id, &input.run_id, max_events.copy(), &input.run_id, max_events.copy()]
-            },
-            {
-                sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-                params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
-            },
-            {
-                sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
-                params: [input.now_ms.copy(), &input.run_id]
+        // Exact-once: a durable event row with this event_id may already
+        // exist because a previous request's SQLite commit landed while its
+        // response was lost/timed out (the caller then retried the SAME fixed
+        // event_id). Re-read the authoritative durable row by event_id and
+        // reconcile BEFORE inserting:
+        //   - same run_id + event_type + payload_json -> idempotent replay:
+        //     return the EXISTING durable event as success (no second row,
+        //     no extra publish, seq untouched).
+        //   - same event_id but a different run/content -> typed conflict,
+        //     never a silent swallow and never a fabricated second event.
+        // On a truly new event_id we fall through to the unchanged atomic
+        // insert (retention + prune + high-water in one transaction). The
+        // UNIQUE(event_id) constraint backstops a cross-process race where
+        // two callers both pass the pre-check before either row exists; the
+        // loser surfaces a typed storage error and its retry hits this
+        // pre-check's replay path.
+        let existing: map = sqlite::query(
+            db_id,
+            "SELECT seq, run_id, event_type, payload_json FROM run_events WHERE event_id = ? LIMIT 1",
+            [&input.event_id],
+            { max_rows: 1, max_result_bytes: 4096 }
+        );
+        let existing_rows: array = existing["rows"];
+        if existing_rows.length > 0 {
+            let existing_row: array = existing_rows[0];
+            let existing_seq: int = existing_row[0];
+            let existing_run: string = existing_row[1];
+            let existing_type: string = existing_row[2];
+            let existing_payload: string = existing_row[3];
+            if existing_run == input.run_id && existing_type == input.event_type && existing_payload == input.payload_json {
+                // Same identity + same content: an idempotent replay of an
+                // event that already committed durably. Expose the original
+                // seq (never a new allocation).
+                let replay_result: array = [
+                    {
+                        rows_affected: 0,
+                        replayed: true,
+                        existing_seq: existing_seq
+                    }
+                ];
+                result = { ok: true, code: "ok", message: "event already durable (idempotent replay)", result: replay_result };
+            } else {
+                result = { ok: false, code: "event_id_conflict", message: "event_id already exists with a different run or content", result: [] };
             }
-        ];
-        result = { ok: true, code: "ok", message: "", result: sqlite::transaction(db_id, statements) };
+        } else {
+            let max_events: int = schema::max_events_limit(input.max_events.copy());
+            let statements = [
+                {
+                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ?",
+                    params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
+                },
+                {
+                    sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
+                    params: [&input.run_id, &input.run_id, max_events.copy(), &input.run_id, max_events.copy()]
+                },
+                {
+                    sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+                    params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
+                },
+                {
+                    sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
+                    params: [input.now_ms.copy(), &input.run_id]
+                }
+            ];
+            result = { ok: true, code: "ok", message: "", result: sqlite::transaction(db_id, statements) };
+        }
     }
     result
 }

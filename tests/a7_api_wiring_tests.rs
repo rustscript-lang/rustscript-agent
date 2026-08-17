@@ -7,7 +7,8 @@
 //! `started`), approval approve/deny wired to
 //! `AgentService::resolve_run_approval` (run + approval id, actor/reason,
 //! exact-once / AlreadyResolved / expired typed states), session compact as
-//! an accurate typed-unavailable (never a fake success), and the auth /
+//! the REAL RSS-owned compaction (typed skip within the window, typed 409
+//! while a run is active — never a fabricated commit), and the auth /
 //! rate-limit / pagination / error-envelope / SSE replay boundaries.
 
 use std::io::{Read, Write};
@@ -755,7 +756,7 @@ async fn a7_stop_racing_the_approval_park_cancels_and_resolution_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a7_session_compact_answers_typed_unavailable_never_fake_success() {
+async fn a7_session_compact_is_real_and_refuses_active_runs() {
     let root = temporary_root("a7-compact");
     let server = spawn_scripted_server(
         vec![
@@ -779,12 +780,10 @@ async fn a7_session_compact_answers_typed_unavailable_never_fake_success() {
     });
     let app = build_agent_gateway_app(state.clone());
 
-    // A session whose run is TERMINAL (completed) and a session whose run is
-    // ACTIVE (parked waiting_approval): neither may be compacted by a
-    // standalone endpoint — compaction is driven by the serial agent loop
-    // inside a run (the A5 `compact` decision), and no standalone entry
-    // exists. The endpoint must answer the accurate typed unavailable and
-    // never fabricate success.
+    // A session whose run is TERMINAL (completed): the endpoint runs the
+    // REAL RSS-owned compaction — the two-message history is within the
+    // default window, so the honest answer is a typed skip (never a
+    // fabricated compaction, never a fake commit).
     let terminal_run = create_run(&app, None).await;
     wait_for_status(&app, &terminal_run, "completed", Duration::from_secs(30)).await;
     wait_for_terminal_handle(&state, &terminal_run, Duration::from_secs(10)).await;
@@ -793,7 +792,21 @@ async fn a7_session_compact_answers_typed_unavailable_never_fake_success() {
         .as_str()
         .expect("session id")
         .to_string();
+    let (status, body) = post_request(
+        &app,
+        &format!("/api/sessions/{terminal_session}/compact"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the real compact entry: {body}");
+    assert_eq!(body["status"], json!("skipped"));
+    assert_eq!(body["reason"], json!("history_within_window"));
+    assert_eq!(durable_compaction_count(&state, &terminal_session), 0);
 
+    // A session whose run is ACTIVE (parked waiting_approval): the manual
+    // compact is refused with the typed 409 — compaction is loop-managed
+    // while a run is active, never a concurrent double compaction.
     let active_run = create_run(&app, None).await;
     wait_for_status(
         &app,
@@ -808,26 +821,17 @@ async fn a7_session_compact_answers_typed_unavailable_never_fake_success() {
         .expect("session id")
         .to_string();
 
-    for session_id in [&terminal_session, &active_session] {
-        let (status, body) = post_request(
-            &app,
-            &format!("/api/sessions/{session_id}/compact"),
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["error"]["code"], json!("compaction_unavailable"));
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .expect("message")
-                .contains("serial agent loop"),
-            "the message must name the real A5 compaction entry"
-        );
-        // No fake success: no durable compaction row was created.
-        assert_eq!(durable_compaction_count(&state, session_id), 0);
-    }
+    let (status, body) = post_request(
+        &app,
+        &format!("/api/sessions/{active_session}/compact"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], json!("run_active_conflict"));
+    // No fake success: no durable compaction row was created.
+    assert_eq!(durable_compaction_count(&state, &active_session), 0);
 
     // The active run is untouched (still parked and resolvable).
     let (_, active_after) = get_request(&app, &format!("/v1/runs/{active_run}"), None).await;
