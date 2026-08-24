@@ -148,34 +148,65 @@ fn control_failed(control: map, turn: int, retry_count: int, tool_calls_used: in
 // ---------------------------------------------------------------------------
 
 fn error_is_retryable(error: map) -> bool {
-    let status: int = ctx_int(error, "status", 0);
-    let error_type: string = ctx_string(error, "type", "");
+    let code: string = ctx_string(error, "code", "");
     let mut retryable = false;
-    if status == 429 {
-        retryable = true;
+    let mut decided = false;
+    if code == "setup" {
+        decided = true;
     }
-    if status == 408 {
-        retryable = true;
+    if code == "config" {
+        decided = true;
     }
-    if status >= 500 {
-        if status <= 599 {
-            retryable = true;
+    if code == "adapter_unavailable" {
+        decided = true;
+    }
+    if code == "malformed_payload" {
+        decided = true;
+    }
+    if code == "scripted_exhausted" {
+        decided = true;
+    }
+    if code == "cancelled" {
+        decided = true;
+    }
+    if code == "deadline_elapsed" {
+        decided = true;
+    }
+    if decided == false {
+        if error.has("retryable") {
+            if type(error["retryable"]) == "bool" {
+                let flagged: bool = error["retryable"];
+                retryable = flagged;
+                decided = true;
+            }
         }
     }
-    if error_type == "rate_limit_error" {
-        retryable = true;
-    }
-    if error_type == "overloaded_error" {
-        retryable = true;
-    }
-    if error_type == "server_error" {
-        retryable = true;
-    }
-    if error_type == "api_error" {
-        retryable = true;
-    }
-    if error_type == "timeout_error" {
-        retryable = true;
+    if decided == false {
+        let status: int = ctx_int(error, "status", 0);
+        let error_type: string = ctx_string(error, "type", "");
+        if status == 429 {
+            retryable = true;
+        }
+        if status == 408 {
+            retryable = true;
+        }
+        if status >= 500 {
+            if status <= 599 {
+                retryable = true;
+            }
+        }
+        if error_type == "rate_limit_error" {
+            retryable = true;
+        }
+        if error_type == "overloaded_error" {
+            retryable = true;
+        }
+        if error_type == "server_error" {
+            retryable = true;
+        }
+        if error_type == "timeout_error" {
+            retryable = true;
+        }
     }
     retryable
 }
@@ -443,7 +474,13 @@ fn run_serial_loop(context: map) -> map {
                     } else {
                         let delay: int = backoff_delay_ms(base_delay, retry_count, cap_delay);
                         agent::sleep_ms(delay);
-                        retry_count += 1;
+                        let after_sleep: map = agent::control_check();
+                        if ctx_bool(after_sleep, "ok", false) == false {
+                            decision = control_failed(after_sleep, turn, retry_count, tool_calls_used);
+                            running = false;
+                        } else {
+                            retry_count += 1;
+                        }
                     }
                 } else {
                     let code: string = ctx_string(error, "code", "provider_error");

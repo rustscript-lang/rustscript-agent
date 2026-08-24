@@ -48,7 +48,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,7 +61,7 @@ use rustscript_agent::{
     AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
     ScriptedProvider, ToolRegistry,
 };
-use rustscript_vm::{CancellationToken, Value};
+use rustscript_vm::{CancellationReason, CancellationToken, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 // ---------------------------------------------------------------------------
@@ -1252,4 +1252,171 @@ fn anthropic_messages_stream_transcript_is_referenced() {
 
     assert!(result["ok"] == json!(false), "{result}");
     assert_eq!(result["error"]["code"], json!("not_implemented"));
+}
+
+fn production_loop_runner() -> AgentRunner {
+    AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
+        AgentConfig::default(),
+    )
+    .expect("production loop policy should compile")
+}
+
+fn production_loop_context(base_url: &str) -> JsonValue {
+    let mut context = loop_context();
+    context["provider_options"] = json!({
+        "base_url": base_url,
+        "api_key": "test-key",
+    });
+    context
+}
+
+fn spawn_slow_http_fixture() -> (
+    u16,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind slow fixture");
+    let port = listener.local_addr().expect("slow fixture address").port();
+    let accepted = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let accepted_flag = Arc::clone(&accepted);
+    let finished_flag = Arc::clone(&finished);
+    let handle = thread::spawn(move || {
+        let Some(mut stream) = accept_bounded(&listener) else {
+            finished_flag.store(true, Ordering::SeqCst);
+            return;
+        };
+        accepted_flag.store(true, Ordering::SeqCst);
+        let _ = read_http_request(&mut stream);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("slow fixture read timeout");
+        let mut buffer = [0_u8; 256];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+        finished_flag.store(true, Ordering::SeqCst);
+    });
+    (port, accepted, finished, handle)
+}
+
+#[test]
+fn production_adapter_allows_https_default_port_without_explicit_port() {
+    let runner = production_loop_runner();
+    let decision = vm_value_to_json(
+        &runner
+            .run_with_context(json_to_vm_value(&production_loop_context(
+                "https://127.0.0.1/v1",
+            )))
+            .expect("https default-port loop should return a decision"),
+    );
+    let message = decision["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(
+        !message.contains("port 443 is not allowed"),
+        "ordinary https URLs must use port_or_known_default(443): {decision}"
+    );
+    assert!(
+        !message.contains("has no known default port"),
+        "https has a known default port: {decision}"
+    );
+}
+
+#[test]
+fn production_adapter_rejects_unknown_defaultless_scheme() {
+    let runner = production_loop_runner();
+    let decision = vm_value_to_json(
+        &runner
+            .run_with_context(json_to_vm_value(&production_loop_context(
+                "foo://127.0.0.1/v1",
+            )))
+            .expect("unknown-scheme loop should return a decision"),
+    );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("config"));
+    assert_eq!(decision["error"]["retryable"], json!(false));
+}
+
+#[test]
+fn production_adapter_allows_explicit_nondefault_http_port() {
+    let body = read_fixture("openai_chat/response.json");
+    let (port, _requests, fixture) = spawn_json_fixture(200, body);
+    let runner = production_loop_runner();
+    let decision = vm_value_to_json(
+        &runner
+            .run_with_context(json_to_vm_value(&production_loop_context(&format!(
+                "http://127.0.0.1:{port}"
+            ))))
+            .expect("explicit nondefault port should reach the adapter"),
+    );
+    fixture.join().expect("fixture thread");
+    assert_eq!(decision["kind"], json!("run.completed"), "{decision}");
+}
+
+#[test]
+fn nested_adapter_http_is_interrupted_by_parent_cancel() {
+    let (port, accepted, finished, fixture) = spawn_slow_http_fixture();
+    let runner = production_loop_runner();
+    let cancellation = RunCancellation::new();
+    let worker_cancel = cancellation.clone();
+    let context = json_to_vm_value(&production_loop_context(&format!(
+        "http://127.0.0.1:{port}"
+    )));
+    let worker = thread::spawn(move || {
+        let mut sink = RecordingSink::default();
+        runner.run_with_context_and_events(context, &mut sink, &worker_cancel)
+    });
+    let wait_start = Instant::now();
+    while !accepted.load(Ordering::SeqCst) {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(8),
+            "nested adapter never opened the HTTP connection"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let start = Instant::now();
+    cancellation.request(CancellationReason::Requested);
+    let result = worker.join().expect("nested adapter worker");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "parent cancel must interrupt nested HTTP promptly, took {elapsed:?}"
+    );
+    match result {
+        Ok(value) => {
+            let decision = vm_value_to_json(&value);
+            assert_eq!(decision["kind"], json!("run.failed"), "{decision}");
+            assert_eq!(decision["error"]["code"], json!("cancelled"), "{decision}");
+        }
+        Err(error) => {
+            let text = format!("{error:?}");
+            assert!(
+                text.contains("Cancelled") || text.contains("Deadline"),
+                "parent stop must return typed cancelled/deadline, got {error:?}"
+            );
+        }
+    }
+    let join_start = Instant::now();
+    fixture
+        .join()
+        .expect("slow fixture must join after client drop");
+    assert!(
+        join_start.elapsed() < Duration::from_secs(2),
+        "HTTP fixture worker must not remain after cancel"
+    );
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "slow HTTP worker must finish with no residue"
+    );
 }

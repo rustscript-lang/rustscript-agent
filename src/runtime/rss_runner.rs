@@ -295,11 +295,26 @@ impl RunCancellation {
     }
 
     pub(crate) fn deadline_passed(&self) -> bool {
-        self.inner
-            .deadline
-            .lock()
-            .expect("deadline lock")
+        self.deadline_instant()
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub(crate) fn deadline_instant(&self) -> Option<Instant> {
+        *self.inner.deadline.lock().expect("deadline lock")
+    }
+
+    /// Nested adapter runs share request/deadline flags but own their epoch
+    /// watcher so the parent run is not disarmed when the nested invocation ends.
+    pub(crate) fn child(&self) -> Self {
+        Self {
+            inner: Arc::new(RunCancellationInner {
+                requested: Arc::clone(&self.inner.requested),
+                deadline: Arc::clone(&self.inner.deadline),
+                epoch: Arc::new(Mutex::new(None)),
+                watcher: Arc::new(Mutex::new(None)),
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+        }
     }
 
     /// Spawns the epoch watcher once the VM (and its epoch handle) exists.
@@ -420,7 +435,12 @@ impl AgentRunner {
 
     /// Backoff delays requested by the RSS loop, in milliseconds.
     pub fn recorded_sleeps(&self) -> Vec<i64> {
-        self.host.sleeps.lock().expect("sleep log lock").clone()
+        self.host.sleeps.lock().expect("sleep log lock").requested()
+    }
+
+    /// Number of backoff records dropped after the bounded sleep ring filled.
+    pub fn recorded_sleep_dropped(&self) -> u64 {
+        self.host.sleeps.lock().expect("sleep log lock").dropped()
     }
 
     /// Runs the exported `run(context)` entry with no event sink and no
@@ -581,9 +601,6 @@ impl AgentRunner {
                 drop(guard);
                 match poll? {
                     InvocationPoll::Pending => {
-                        // The VM is paused on an outstanding host operation.
-                        // Polling drives the operation; the cancellation
-                        // checks above cancel it with the typed reason.
                         thread::sleep(Duration::from_millis(1));
                     }
                     InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) => {
@@ -652,12 +669,19 @@ fn compile_options() -> CompileSourceFileOptions {
 struct RssAdapterProvider;
 
 impl AgentProviderHost for RssAdapterProvider {
-    fn call(&self, request: &serde_json::Value) -> serde_json::Value {
-        invoke_existing_adapter(request)
+    fn call(
+        &self,
+        request: &serde_json::Value,
+        cancellation: &RunCancellation,
+    ) -> serde_json::Value {
+        invoke_existing_adapter(request, cancellation)
     }
 }
 
-fn invoke_existing_adapter(request: &serde_json::Value) -> serde_json::Value {
+fn invoke_existing_adapter(
+    request: &serde_json::Value,
+    cancellation: &RunCancellation,
+) -> serde_json::Value {
     let provider = request
         .get("provider")
         .and_then(serde_json::Value::as_str)
@@ -667,16 +691,10 @@ fn invoke_existing_adapter(request: &serde_json::Value) -> serde_json::Value {
     if let Some(base_url) = request
         .pointer("/provider_options/base_url")
         .and_then(serde_json::Value::as_str)
-        && let Ok(url) = url::Url::parse(base_url)
-        && let Some(host) = url.host_str()
     {
-        config = AgentConfig::for_hosts([host]);
-        config.http.allowed_schemes = vec![url.scheme().to_string()];
-        if let Some(port) = url.port() {
-            config.http.allowed_ports = vec![port];
-        }
-        if host == "127.0.0.1" || host == "localhost" {
-            config.http.allow_private_ips = true;
+        match adapter_http_config(base_url) {
+            Ok(parsed) => config = parsed,
+            Err(error) => return error,
         }
     }
     let harness_path =
@@ -702,9 +720,52 @@ fn invoke_existing_adapter(request: &serde_json::Value) -> serde_json::Value {
         "request": forwarded,
         "profile": profile,
     }));
-    match runner.run_with_context(context) {
+    let child = cancellation.child();
+    match runner.run_with_context_and_events(context, &mut DiscardSink, &child) {
         Ok(value) => vm_value_to_json(&value),
+        Err(RunError::Invocation(InvocationError::Cancelled(reason))) => {
+            if matches!(reason, CancellationReason::Deadline) {
+                adapter_fail("deadline_elapsed", "run deadline elapsed")
+            } else {
+                adapter_fail("cancelled", "run was cancelled")
+            }
+        }
+        Err(RunError::Invocation(InvocationError::DeadlineReached { .. })) => {
+            adapter_fail("deadline_elapsed", "run deadline elapsed")
+        }
         Err(error) => adapter_fail("adapter_failed", &error.to_string()),
+    }
+}
+
+fn adapter_http_config(base_url: &str) -> std::result::Result<AgentConfig, serde_json::Value> {
+    let url = url::Url::parse(base_url)
+        .map_err(|error| adapter_fail("config", &format!("invalid provider base_url: {error}")))?;
+    let Some(host) = url.host_str() else {
+        return Err(adapter_fail("config", "provider base_url has no host"));
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return Err(adapter_fail(
+            "config",
+            &format!(
+                "provider base_url scheme '{}' has no known default port",
+                url.scheme()
+            ),
+        ));
+    };
+    let mut config = AgentConfig::for_hosts([host]);
+    config.http.allowed_schemes = vec![url.scheme().to_string()];
+    config.http.allowed_ports = vec![port];
+    if host == "127.0.0.1" || host == "localhost" {
+        config.http.allow_private_ips = true;
+    }
+    Ok(config)
+}
+
+struct DiscardSink;
+
+impl RunEventSink for DiscardSink {
+    fn deliver(&mut self, _value: Value) -> std::result::Result<(), RunDeliveryError> {
+        Ok(())
     }
 }
 
@@ -731,7 +792,8 @@ fn adapter_fail(code: &str, message: &str) -> serde_json::Value {
             "code": code,
             "message": message,
             "param": "",
-            "request_id": ""
+            "request_id": "",
+            "retryable": false
         }
     })
 }

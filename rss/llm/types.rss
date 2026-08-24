@@ -72,13 +72,59 @@ pub fn error_new(
     param: string,
     request_id: string
 ) -> map {
+    let mut retryable = false;
+    if status == 429 {
+        retryable = true;
+    }
+    if status == 408 {
+        retryable = true;
+    }
+    if status >= 500 {
+        if status <= 599 {
+            retryable = true;
+        }
+    }
+    if error_type == "rate_limit_error" {
+        retryable = true;
+    }
+    if error_type == "overloaded_error" {
+        retryable = true;
+    }
+    if error_type == "server_error" {
+        retryable = true;
+    }
+    if error_type == "timeout_error" {
+        retryable = true;
+    }
+    if error_type == "malformed_payload" {
+        retryable = false;
+    }
+    if error_type == "invalid_request_error" {
+        retryable = false;
+    }
+    if code == "setup" {
+        retryable = false;
+    }
+    if code == "config" {
+        retryable = false;
+    }
+    if code == "adapter_unavailable" {
+        retryable = false;
+    }
+    if code == "malformed_payload" {
+        retryable = false;
+    }
+    if code == "scripted_exhausted" {
+        retryable = false;
+    }
     {
         status: status,
         type: error_type,
         code: code,
         message: message,
         param: param,
-        request_id: request_id
+        request_id: request_id,
+        retryable: retryable
     }
 }
 

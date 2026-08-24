@@ -5,10 +5,9 @@
 //! does not add an OpenAI-compatible inference path.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustscript_vm::{
     CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostFunctionRegistry,
@@ -63,9 +62,38 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
     }))
 }
 
+const SLEEP_CHUNK_MS: u64 = 10;
+const SLEEP_CAP_MS: u64 = 60_000;
+const SLEEP_LOG_CAP: usize = 32;
+
+/// Bounded ring of requested backoff delays plus a dropped-entry count.
+#[derive(Clone, Debug, Default)]
+pub struct SleepLog {
+    entries: VecDeque<i64>,
+    dropped: u64,
+}
+
+impl SleepLog {
+    fn push(&mut self, requested_ms: i64) {
+        if self.entries.len() == SLEEP_LOG_CAP {
+            self.entries.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.entries.push_back(requested_ms);
+    }
+
+    pub(crate) fn requested(&self) -> Vec<i64> {
+        self.entries.iter().copied().collect()
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
 /// Native provider invocation used by `agent::provider_call`.
 pub trait AgentProviderHost: Send + Sync {
-    fn call(&self, request: &JsonValue) -> JsonValue;
+    fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue;
 }
 
 /// Injectable host bridges for one compiled runner.
@@ -73,7 +101,7 @@ pub trait AgentProviderHost: Send + Sync {
 pub struct AgentHostBridges {
     pub provider: Option<Arc<dyn AgentProviderHost>>,
     pub dispatcher: Option<Arc<DispatchContext>>,
-    pub sleeps: Arc<Mutex<Vec<i64>>>,
+    pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
 }
 
@@ -83,7 +111,7 @@ pub struct AgentHostState {
     pub provider: Arc<dyn AgentProviderHost>,
     pub dispatcher: Option<Arc<DispatchContext>>,
     pub cancellation: RunCancellation,
-    pub sleeps: Arc<Mutex<Vec<i64>>>,
+    pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
 }
 
@@ -102,11 +130,7 @@ impl AgentHostState {
         if let Some(error) = self.control_error() {
             return error;
         }
-        let result = self.provider.call(request);
-        if let Some(error) = self.control_error() {
-            return error;
-        }
-        normalize_provider_envelope(result)
+        normalize_provider_envelope(self.provider.call(request, &self.cancellation))
     }
 
     fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
@@ -130,20 +154,49 @@ impl AgentHostState {
             );
         };
         let result = dispatcher.dispatch_one(&parsed);
+        let mut envelope = tool_result_envelope(&parsed, result);
         if let Some(error) = self.control_error() {
-            return error_with_block(error, call, Some(&parsed));
+            envelope["terminal"] = json!(true);
+            envelope["control"] = error.get("error").cloned().unwrap_or(error);
         }
-        tool_result_envelope(&parsed, result)
+        envelope
     }
 
     fn sleep_ms(&self, delay_ms: i64) -> i64 {
-        let delay = delay_ms.max(0);
-        self.sleeps.lock().expect("sleep log lock").push(delay);
-        if !self.skip_sleep && delay > 0 {
-            let capped = u64::try_from(delay).unwrap_or(u64::MAX).min(60_000);
-            thread::sleep(Duration::from_millis(capped));
+        let requested = delay_ms.max(0);
+        let capped = u64::try_from(requested)
+            .unwrap_or(u64::MAX)
+            .min(SLEEP_CAP_MS);
+        let requested_capped = i64::try_from(capped).unwrap_or(i64::MAX);
+        let mut slept = 0_u64;
+        if !self.skip_sleep && capped > 0 {
+            while slept < capped {
+                if self.control_error().is_some() {
+                    break;
+                }
+                let remaining = capped - slept;
+                let mut chunk = remaining.min(SLEEP_CHUNK_MS);
+                if let Some(deadline) = self.cancellation.deadline_instant() {
+                    let until = deadline.saturating_duration_since(Instant::now());
+                    let until_ms = u64::try_from(until.as_millis()).unwrap_or(u64::MAX);
+                    if until_ms == 0 {
+                        break;
+                    }
+                    chunk = chunk.min(until_ms);
+                }
+                thread::sleep(Duration::from_millis(chunk));
+                slept += chunk;
+            }
         }
-        delay
+        self.sleeps
+            .lock()
+            .expect("sleep log lock")
+            .push(requested_capped);
+        if self.skip_sleep {
+            requested_capped
+        } else {
+            i64::try_from(slept).unwrap_or(i64::MAX)
+        }
     }
 }
 
@@ -155,9 +208,14 @@ pub struct ScriptedProvider {
 
 #[derive(Default)]
 struct ScriptedProviderInner {
-    outcomes: Mutex<VecDeque<JsonValue>>,
-    requests: Mutex<Vec<JsonValue>>,
-    calls: AtomicU64,
+    state: Mutex<ScriptedProviderState>,
+}
+
+#[derive(Default)]
+struct ScriptedProviderState {
+    outcomes: VecDeque<JsonValue>,
+    requests: Vec<JsonValue>,
+    calls: u64,
 }
 
 impl ScriptedProvider {
@@ -167,9 +225,10 @@ impl ScriptedProvider {
 
     pub fn push_ok(&self, response: JsonValue) {
         self.inner
-            .outcomes
+            .state
             .lock()
-            .expect("scripted outcomes")
+            .expect("scripted provider")
+            .outcomes
             .push_back(json!({
                 "ok": true,
                 "response": response,
@@ -179,9 +238,10 @@ impl ScriptedProvider {
 
     pub fn push_error(&self, error: JsonValue) {
         self.inner
-            .outcomes
+            .state
             .lock()
-            .expect("scripted outcomes")
+            .expect("scripted provider")
+            .outcomes
             .push_back(json!({
                 "ok": false,
                 "response": {},
@@ -191,44 +251,38 @@ impl ScriptedProvider {
 
     pub fn push_envelope(&self, envelope: JsonValue) {
         self.inner
-            .outcomes
+            .state
             .lock()
-            .expect("scripted outcomes")
+            .expect("scripted provider")
+            .outcomes
             .push_back(envelope);
     }
 
     pub fn requests(&self) -> Vec<JsonValue> {
         self.inner
-            .requests
+            .state
             .lock()
-            .expect("scripted requests")
+            .expect("scripted provider")
+            .requests
             .clone()
     }
 
     pub fn call_count(&self) -> u64 {
-        self.inner.calls.load(Ordering::SeqCst)
+        self.inner.state.lock().expect("scripted provider").calls
     }
 }
 
 impl AgentProviderHost for ScriptedProvider {
-    fn call(&self, request: &JsonValue) -> JsonValue {
-        self.inner.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner
-            .requests
-            .lock()
-            .expect("scripted requests")
-            .push(request.clone());
-        self.inner
-            .outcomes
-            .lock()
-            .expect("scripted outcomes")
-            .pop_front()
-            .unwrap_or_else(|| {
-                typed_fail(
-                    "scripted_exhausted",
-                    "scripted provider has no remaining outcomes",
-                )
-            })
+    fn call(&self, request: &JsonValue, _cancellation: &RunCancellation) -> JsonValue {
+        let mut state = self.inner.state.lock().expect("scripted provider");
+        state.calls = state.calls.saturating_add(1);
+        state.requests.push(request.clone());
+        state.outcomes.pop_front().unwrap_or_else(|| {
+            typed_fail(
+                "scripted_exhausted",
+                "scripted provider has no remaining outcomes",
+            )
+        })
     }
 }
 
@@ -313,9 +367,27 @@ fn typed_fail(code: &str, message: &str) -> JsonValue {
             "code": code,
             "message": message,
             "param": "",
-            "request_id": ""
+            "request_id": "",
+            "retryable": error_is_retryable_code(code)
         }
     })
+}
+
+fn error_is_retryable_code(code: &str) -> bool {
+    !matches!(
+        code,
+        "setup"
+            | "config"
+            | "adapter_unavailable"
+            | "malformed_payload"
+            | "scripted_exhausted"
+            | "cancelled"
+            | "deadline_elapsed"
+            | "dispatcher_missing"
+            | "adapter_failed"
+            | "unsupported_parallel"
+            | "unsupported_task"
+    )
 }
 
 fn error_type_for(code: &str) -> &'static str {
@@ -370,9 +442,20 @@ fn parse_tool_call(value: &JsonValue) -> Result<ToolCall, String> {
         return Err("tool call is missing id or name".to_string());
     }
     let arguments = if let Some(arguments) = value.get("arguments") {
+        if !arguments.is_object() {
+            return Err("tool call arguments must be an object".to_string());
+        }
         arguments.clone()
-    } else if let Some(text) = value.get("arguments_json").and_then(JsonValue::as_str) {
-        serde_json::from_str(text).unwrap_or_else(|_| json!({}))
+    } else if let Some(raw) = value.get("arguments_json") {
+        let text = raw
+            .as_str()
+            .ok_or_else(|| "arguments_json must be a string".to_string())?;
+        let parsed: JsonValue = serde_json::from_str(text)
+            .map_err(|error| format!("malformed arguments_json: {error}"))?;
+        if !parsed.is_object() {
+            return Err("arguments_json must decode to an object".to_string());
+        }
+        parsed
     } else {
         json!({})
     };

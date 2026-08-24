@@ -8,6 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -16,10 +17,11 @@ use rustscript_agent::tools::{
     ToolExecutorBoundary, ToolOwner, ToolResult,
 };
 use rustscript_agent::{
-    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner,
-    ScriptedProvider, ToolRegistry, builtin_entries,
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentProviderHost,
+    AgentRunner, RunCancellation, RunError, ScriptedProvider, ToolDescriptor, ToolRegistry,
+    ToolRegistryEntry, builtin_entries,
 };
-use rustscript_vm::{CancellationToken, Value};
+use rustscript_vm::{CancellationReason, CancellationToken, InvocationError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 fn agent_root() -> PathBuf {
@@ -314,6 +316,153 @@ fn echo_tool() -> JsonValue {
         "description": "Read bounded text from a workspace file",
         "schema_json": "{\"type\":\"object\"}"
     }])
+}
+
+fn optional_tool() -> JsonValue {
+    json!([{
+        "name": "optional_tool",
+        "description": "all arguments optional",
+        "schema_json": "{\"type\":\"object\"}"
+    }])
+}
+
+fn optional_tool_dispatcher() -> (Arc<DispatchContext>, Arc<CountingExecutor>, PathBuf) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
+        "optional-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("optional tool workspace");
+    let executor = CountingExecutor::new();
+    let registry = ToolRegistry::new([ToolRegistryEntry::new(
+        ToolDescriptor::new(
+            "optional_tool",
+            "all arguments optional",
+            "coding",
+            "read",
+            json!({
+                "type": "object",
+                "properties": { "hint": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        ),
+        NativeToolExecutor::placeholder("optional_tool"),
+    )])
+    .expect("optional tool registry");
+    let snapshot = registry.snapshot();
+    let identity = snapshot.identity().to_string();
+    let dispatcher = DispatchContext::new(
+        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
+        root.clone(),
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(30),
+        snapshot,
+        identity.clone(),
+        identity,
+        DispatchLimits {
+            max_tool_calls: 8,
+            max_tool_output_bytes: 64 * 1024,
+            max_event_bytes: 32 * 1024,
+        },
+        MemoryEvents::new(),
+        executor.clone(),
+    )
+    .expect("optional dispatch context");
+    (Arc::new(dispatcher), executor, root)
+}
+
+struct CancelAfterEffect {
+    cancellation: RunCancellation,
+    count: AtomicU64,
+}
+
+impl ToolExecutorBoundary for CancelAfterEffect {
+    fn execute(
+        &self,
+        executor: &NativeToolExecutor,
+        arguments: &JsonValue,
+        _cancellation: &CancellationToken,
+        _deadline: Instant,
+    ) -> ToolResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.cancellation.request(CancellationReason::Requested);
+        ToolResult::success(
+            format!("ran {}", executor.tool_name()),
+            json!({"ok": true, "arguments": arguments}),
+        )
+    }
+}
+
+fn cancel_after_effect_dispatcher(
+    cancellation: RunCancellation,
+) -> (Arc<DispatchContext>, Arc<CancelAfterEffect>, PathBuf) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
+        "cancel-after-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("cancel-after workspace");
+    let executor = Arc::new(CancelAfterEffect {
+        cancellation,
+        count: AtomicU64::new(0),
+    });
+    let snapshot = ToolRegistry::builtin()
+        .expect("builtin registry")
+        .snapshot();
+    let identity = snapshot.identity().to_string();
+    let dispatcher = DispatchContext::new(
+        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
+        root.clone(),
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(30),
+        snapshot,
+        identity.clone(),
+        identity,
+        DispatchLimits {
+            max_tool_calls: 8,
+            max_tool_output_bytes: 64 * 1024,
+            max_event_bytes: 32 * 1024,
+        },
+        MemoryEvents::new(),
+        executor.clone(),
+    )
+    .expect("cancel-after dispatch context");
+    (Arc::new(dispatcher), executor, root)
+}
+
+fn assert_typed_cancelled(result: std::result::Result<Value, RunError>) -> Option<JsonValue> {
+    match result {
+        Ok(value) => {
+            let decision = vm_value_to_json(&value);
+            assert_eq!(decision["kind"], json!("run.failed"), "{decision}");
+            assert_eq!(decision["error"]["code"], json!("cancelled"), "{decision}");
+            Some(decision)
+        }
+        Err(RunError::Invocation(InvocationError::Cancelled(CancellationReason::Requested))) => {
+            None
+        }
+        Err(error) => panic!("expected typed cancelled, got {error:?}"),
+    }
+}
+
+fn provider_error_with_retryable(
+    status: i64,
+    error_type: &str,
+    code: &str,
+    message: &str,
+    retryable: bool,
+) -> JsonValue {
+    json!({
+        "status": status,
+        "type": error_type,
+        "code": code,
+        "message": message,
+        "param": "",
+        "request_id": "req-1",
+        "retryable": retryable
+    })
 }
 
 fn canonical_arguments_json(arguments: &JsonValue) -> JsonValue {
@@ -1660,7 +1809,7 @@ fn loop_backoff_saturates_without_overflow_for_huge_inputs() {
         ),
     );
     assert_eq!(decision["kind"], json!("run.completed"));
-    assert_eq!(runner.recorded_sleeps(), vec![near_max]);
+    assert_eq!(runner.recorded_sleeps(), vec![60_000]);
 }
 
 #[test]
@@ -1755,6 +1904,307 @@ fn loop_multi_call_response_pins_tool_call_count() {
     assert_eq!(decision["kind"], json!("run.completed"));
     assert_eq!(executor.count.load(Ordering::SeqCst), 2);
     assert_eq!(provider.call_count(), 2);
+}
+
+#[test]
+fn loop_malformed_arguments_json_is_typed_before_optional_tool_effect() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{
+            "id": "c1",
+            "name": "optional_tool",
+            "arguments_json": "{not-json"
+        }]),
+    ));
+    provider.push_ok(text_response("should not run"));
+    let (dispatcher, executor, root) = optional_tool_dispatcher();
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let decision = decide(
+        &runner,
+        run_context(4, 8, loop_config(false, false), optional_tool()),
+    );
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("malformed_payload"));
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.call_count(), 1);
+    assert!(runner.recorded_sleeps().is_empty());
+}
+
+#[test]
+fn loop_non_object_arguments_json_is_typed_before_optional_tool_effect() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{
+            "id": "c1",
+            "name": "optional_tool",
+            "arguments_json": "[1,2]"
+        }]),
+    ));
+    let (dispatcher, executor, root) = optional_tool_dispatcher();
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let decision = decide(
+        &runner,
+        run_context(4, 8, loop_config(false, false), optional_tool()),
+    );
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("malformed_payload"));
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.call_count(), 1);
+}
+
+#[test]
+fn loop_config_error_does_not_consume_retry_budget() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error_with_retryable(
+        0,
+        "api_error",
+        "config",
+        "bad provider config",
+        false,
+    ));
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, false), json!([])),
+    );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("config"));
+    assert_eq!(provider.call_count(), 1);
+    assert!(runner.recorded_sleeps().is_empty());
+}
+
+#[test]
+fn loop_generic_api_error_is_not_retryable_without_flag() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(
+        0,
+        "api_error",
+        "adapter_unavailable",
+        "down",
+    ));
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, false), json!([])),
+    );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("adapter_unavailable"));
+    assert_eq!(provider.call_count(), 1);
+    assert!(runner.recorded_sleeps().is_empty());
+}
+
+#[test]
+fn loop_scripted_exhausted_does_not_retry() {
+    let provider = ScriptedProvider::new();
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, false), json!([])),
+    );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("scripted_exhausted"));
+    assert_eq!(provider.call_count(), 1);
+    assert!(runner.recorded_sleeps().is_empty());
+}
+
+#[test]
+fn loop_explicit_retryable_flag_retries_transient_transport() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error_with_retryable(
+        0,
+        "api_error",
+        "transport",
+        "connection reset",
+        true,
+    ));
+    provider.push_ok(text_response("recovered"));
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, false), json!([])),
+    );
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(decision["answer"], json!("recovered"));
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(runner.recorded_sleeps(), vec![100]);
+}
+
+#[test]
+fn loop_post_effect_cancel_keeps_tool_result_and_skips_next_effect() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([
+            {"id": "c1", "name": "read_file", "arguments": {"path": "a.txt"}},
+            {"id": "c2", "name": "read_file", "arguments": {"path": "b.txt"}}
+        ]),
+    ));
+    provider.push_ok(text_response("should not run"));
+    let cancellation = RunCancellation::new();
+    let (dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
+    let runner = loop_runner()
+        .with_provider(Arc::new(provider.clone()))
+        .with_dispatcher(dispatcher)
+        .with_skip_sleep(true);
+    let mut sink = VecSink::default();
+    let result = runner.run_with_context_and_events(
+        json_to_vm(&run_context(4, 8, loop_config(false, false), echo_tool())),
+        &mut sink,
+        &cancellation,
+    );
+    let _ = fs::remove_dir_all(root);
+    assert_typed_cancelled(result);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.call_count(), 1);
+}
+
+#[test]
+fn loop_post_effect_cancel_probe_returns_real_tool_result() {
+    let cancellation = RunCancellation::new();
+    let (dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
+    let runner = AgentRunner::from_source(
+        r#"
+use agent;
+pub fn run(context: map) -> map {
+    agent::tool_dispatch(context)
+}
+"#,
+        AgentConfig::default(),
+    )
+    .expect("dispatch probe should compile")
+    .with_dispatcher(dispatcher);
+    let mut sink = VecSink::default();
+    let result = runner.run_with_context_and_events(
+        json_to_vm(&json!({
+            "id": "c1",
+            "name": "read_file",
+            "arguments": {"path": "a.txt"}
+        })),
+        &mut sink,
+        &cancellation,
+    );
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 1);
+    match result {
+        Ok(value) => {
+            let envelope = vm_value_to_json(&value);
+            assert_eq!(envelope["ok"], json!(true));
+            assert_eq!(envelope["content_block"]["type"], json!("tool_result"));
+            assert_eq!(envelope["content_block"]["tool_call_id"], json!("c1"));
+            assert_eq!(envelope["content_block"]["content"], json!("ran read_file"));
+            assert_eq!(envelope["content_block"]["is_error"], json!(false));
+        }
+        Err(RunError::Invocation(InvocationError::Cancelled(CancellationReason::Requested))) => {}
+        Err(error) => {
+            panic!("probe should keep the tool result or return typed cancelled, got {error:?}")
+        }
+    }
+}
+
+#[test]
+fn loop_cancel_interrupts_backoff_sleep() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
+    provider.push_ok(text_response("should not run"));
+    let runner = loop_runner()
+        .with_provider(Arc::new(provider.clone()))
+        .with_skip_sleep(false);
+    let cancellation = RunCancellation::new();
+    let cancel = cancellation.clone();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&started);
+    thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(25));
+        cancel.request(CancellationReason::Requested);
+    });
+    let mut sink = VecSink::default();
+    let context = json_to_vm(&run_context(
+        3,
+        8,
+        json!({
+            "base_retry_delay_ms": 5000,
+            "max_retry_delay_ms": 5000,
+            "max_retries": 2,
+            "parallel": false,
+            "task": false
+        }),
+        json!([]),
+    ));
+    started.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    let result = runner.run_with_context_and_events(context, &mut sink, &cancellation);
+    let elapsed = start.elapsed();
+    assert_typed_cancelled(result);
+    assert!(
+        elapsed < Duration::from_millis(750),
+        "backoff sleep should abort promptly, took {elapsed:?}"
+    );
+    assert_eq!(provider.call_count(), 1);
+}
+
+#[test]
+fn loop_sleep_log_is_a_bounded_ring() {
+    let provider = ScriptedProvider::new();
+    for _ in 0..41 {
+        provider.push_error(provider_error(429, "rate_limit_error", "rl", "slow"));
+    }
+    let runner = loop_runner_with(provider, None);
+    let decision = decide(
+        &runner,
+        run_context(
+            3,
+            8,
+            json!({
+                "base_retry_delay_ms": 100,
+                "max_retry_delay_ms": 100,
+                "max_retries": 40,
+                "parallel": false,
+                "task": false
+            }),
+            json!([]),
+        ),
+    );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("retry_exhausted"));
+    assert_eq!(runner.recorded_sleeps().len(), 32);
+    assert_eq!(runner.recorded_sleep_dropped(), 8);
+}
+
+#[test]
+fn scripted_provider_pairs_request_and_outcome_under_one_lock() {
+    let provider = ScriptedProvider::new();
+    const N: usize = 32;
+    for i in 0..N {
+        provider.push_ok(json!({
+            "text": format!("{i}"),
+            "tool_calls": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": "",
+            "stop_reason": "stop"
+        }));
+    }
+    thread::scope(|scope| {
+        for i in 0..N {
+            let provider = provider.clone();
+            scope.spawn(move || {
+                let envelope = AgentProviderHost::call(
+                    &provider,
+                    &json!({"i": i as i64}),
+                    &RunCancellation::new(),
+                );
+                assert_eq!(envelope["ok"], json!(true));
+            });
+        }
+    });
+    assert_eq!(provider.call_count(), N as u64);
+    assert_eq!(provider.requests().len(), N);
 }
 
 // Post-review edge suites: compaction prefix boundaries
