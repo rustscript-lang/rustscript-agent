@@ -766,16 +766,10 @@ fn open_root_dirfd(path: &Path) -> Result<File, ArtifactError> {
 fn lock_exclusive(dir: &File) -> Result<(), ArtifactError> {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
-        let result =
-            unsafe { unix_dir::flock(dir.as_raw_fd(), unix_dir::LOCK_EX | unix_dir::LOCK_NB) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(ArtifactError::new(
-                "artifact_store_busy",
-                "artifact store is already open",
-            ))
+        match try_lock_exclusive(dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == "artifact_store_busy" => retry_lock_exclusive(dir, error),
+            Err(error) => Err(error),
         }
     }
     #[cfg(not(unix))]
@@ -786,6 +780,39 @@ fn lock_exclusive(dir: &File) -> Result<(), ArtifactError> {
             "artifact store requires a Unix directory capability",
         ))
     }
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(dir: &File) -> Result<(), ArtifactError> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe { unix_dir::flock(dir.as_raw_fd(), unix_dir::LOCK_EX | unix_dir::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ArtifactError::new(
+            "artifact_store_busy",
+            "artifact store is already open",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn retry_lock_exclusive(dir: &File, busy: ArtifactError) -> Result<(), ArtifactError> {
+    // Teardown can drop the previous exclusive holder on another thread.
+    // Wait briefly so a dead store can release the flock before fail-closed.
+    for attempt in 0..48 {
+        if attempt < 16 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        match try_lock_exclusive(dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code() == "artifact_store_busy" => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(busy)
 }
 
 fn verify_dirfd_matches_root(root: &ConfinedFsRoot, dir: &File) -> Result<(), ArtifactError> {
