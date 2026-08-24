@@ -11,6 +11,7 @@ pub mod domain;
 pub mod events;
 pub mod gateway;
 pub mod metrics;
+pub mod prompt;
 pub mod runtime;
 pub mod service;
 pub mod tools;

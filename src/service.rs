@@ -54,6 +54,7 @@ use crate::gateway::store::{
     SessionRecord, SessionView, append_message,
 };
 use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
+use crate::prompt::{CodingPromptBudgets, DateSource, SystemDateSource, build_coding_prompt};
 use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, append_event_locked, run_delivery_task,
 };
@@ -108,6 +109,8 @@ pub struct RunHandle {
     /// Run-scoped native dispatch state shared by every `dispatch_tools` call.
     native_dispatch: Mutex<NativeDispatchPhase>,
     native_dispatch_cv: Condvar,
+    /// Frozen coding system prompt captured at admission.
+    coding_system_prompt: Arc<str>,
 }
 
 /// Shared native dispatch machinery for one admitted run.
@@ -165,6 +168,11 @@ impl RunHandle {
     /// True while the run has not committed a terminal state.
     pub fn is_terminal(&self) -> bool {
         self.terminal_at.lock().expect("terminal lock").is_some()
+    }
+
+    /// Frozen coding system prompt captured at admission for this run.
+    pub fn coding_system_prompt(&self) -> &str {
+        &self.coding_system_prompt
     }
 
     fn cancel_native_tools(&self) {
@@ -427,7 +435,9 @@ struct AgentServiceInner {
     file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     native_dispatch_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     native_dispatch_init_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    prompt_read_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     artifact_stores: ArtifactStorePool,
+    date_source: RwLock<Arc<dyn DateSource>>,
 }
 
 impl Drop for AgentServiceInner {
@@ -487,7 +497,9 @@ impl AgentService {
             file_search_entered: Mutex::new(None),
             native_dispatch_shutdown: Mutex::new(None),
             native_dispatch_init_entered: Mutex::new(None),
+            prompt_read_entered: Mutex::new(None),
             artifact_stores: ArtifactStorePool::default(),
+            date_source: RwLock::new(Arc::new(SystemDateSource)),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
         Self { inner }
@@ -539,6 +551,12 @@ impl AgentService {
         let limits = limits.normalized()?;
         *self.inner.run_limits.write() = limits;
         Ok(())
+    }
+
+    /// Replaces the date source used by future admissions. Existing runs keep
+    /// the date captured into their frozen coding prompt.
+    pub fn set_date_source(&self, source: Arc<dyn DateSource>) {
+        *self.inner.date_source.write() = source;
     }
 
     /// Returns the immutable context captured at admission time.
@@ -868,6 +886,17 @@ impl AgentService {
             .native_dispatch_shutdown
             .lock()
             .expect("native dispatch shutdown observer lock") = Some(observer);
+    }
+
+    /// Test seam: later coding-prompt guidance reads invoke `observer` after
+    /// admission has cloned prompt inputs and released the store lock, and
+    /// before any `ConfinedFsRoot` filesystem IO.
+    pub fn inject_prompt_read_entered_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .prompt_read_entered
+            .lock()
+            .expect("prompt read observer lock") = Some(observer);
     }
 
     /// Drops native dispatch state and cleans processes/artifacts for every
@@ -1236,7 +1265,41 @@ impl AgentService {
             provider: effective_provider.clone(),
             system_prompt: effective_system_prompt.clone(),
         };
-        let context = self.make_admitted_context(&context_input, &snapshot);
+        let date = self.inner.date_source.read().current_date();
+        let platform = std::env::consts::OS.to_string();
+        let arch = std::env::consts::ARCH.to_string();
+        let workspace_root = snapshot.limits.workspace_root.clone();
+        let tool_descriptors = snapshot.registry.descriptors().to_vec();
+        let run_limits = snapshot.limits.clone();
+        drop(store);
+
+        let prompt_read_observer = self
+            .inner
+            .prompt_read_entered
+            .lock()
+            .expect("prompt read observer lock")
+            .clone();
+        if let Some(observer) = prompt_read_observer {
+            observer();
+        }
+
+        let coding_system_prompt = build_coding_prompt(
+            &workspace_root,
+            &tool_descriptors,
+            &run_limits,
+            &date,
+            &platform,
+            &arch,
+            CodingPromptBudgets::default(),
+        )
+        .map_err(|error| {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            AdmitError::Invalid(error.to_string())
+        })?;
+        let context =
+            self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
         let persisted_input = persisted_run_context_json(&context)?;
         let provider = effective_provider.clone().unwrap_or_default();
         let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
@@ -1293,7 +1356,6 @@ impl AgentService {
             "expires_at_ms": 0,
         });
 
-        drop(store);
         let durable = match self.inner.persistence.as_ref() {
             Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
                 self.inner
@@ -1327,6 +1389,20 @@ impl AgentService {
             &run_id,
         )? {
             return Ok(replayed);
+        }
+        if !session_new && !store.sessions.contains_key(&session_id) {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::SessionNotFound);
+            return Err(AdmitError::SessionNotFound);
+        }
+        if let Some(parent_run_id) = request.parent_run_id.as_deref()
+            && !store.runs.contains_key(parent_run_id)
+        {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::ParentNotFound);
+            return Err(AdmitError::ParentNotFound);
         }
         self.inner.store_generation.fetch_add(1, Ordering::Release);
         if session_new {
@@ -1402,6 +1478,7 @@ impl AgentService {
             tool_cancel: CancellationToken::new(),
             native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
             native_dispatch_cv: Condvar::new(),
+            coding_system_prompt: Arc::from(coding_system_prompt),
         });
         self.inner
             .runs
@@ -2320,6 +2397,7 @@ impl AgentService {
         &self,
         admission: &ContextAdmissionInput,
         snapshot: &RunAdmissionSnapshot,
+        coding_system_prompt: String,
     ) -> RunContext {
         let provider_options = snapshot.provider_profile.options().clone();
         let tool_schemas = snapshot.registry.schemas();
@@ -2368,6 +2446,7 @@ impl AgentService {
             tool_schemas,
             limits,
             metadata: JsonValue::Object(metadata),
+            coding_system_prompt: Some(coding_system_prompt),
         }
     }
 

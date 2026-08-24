@@ -76,6 +76,9 @@ pub struct RunContext {
     pub tool_schemas: Value,
     pub limits: Value,
     pub metadata: Value,
+    /// Frozen coding system prompt captured once at run admission.
+    #[serde(default)]
+    pub coding_system_prompt: Option<String>,
 }
 
 impl RunContext {
