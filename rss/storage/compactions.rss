@@ -40,9 +40,9 @@ struct CompactionFailInput {
 /// True when the input id is already used by a compaction row for a
 /// DIFFERENT session or generation: reusing an id across sessions or
 /// generations is a typed conflict, never a SQLite constraint error.
-fn compaction_id_conflict(db_id: int, input_id: string, input_session_id: string, input_generation: int) -> bool {
+fn compaction_id_conflict(db_id: resource<sqlite.connection>, input_id: string, input_session_id: string, input_generation: int) -> bool {
     let by_id: map = sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, generation FROM compactions WHERE id = ? LIMIT 1",
         [input_id],
         { max_rows: 1, max_result_bytes: 4096 }
@@ -63,9 +63,9 @@ fn compaction_id_conflict(db_id: int, input_id: string, input_session_id: string
 
 /// The existing compaction row for the target (session_id, generation), if
 /// any (the unique key of the compactions table).
-fn compaction_existing_row(db_id: int, session_id: string, generation: int, max_rows: int, max_bytes: int) -> map {
+fn compaction_existing_row(db_id: resource<sqlite.connection>, session_id: string, generation: int, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE session_id = ? AND generation = ? LIMIT 1",
         [session_id, generation],
         compactions_query_limits(max_rows, max_bytes)
@@ -142,15 +142,15 @@ fn compaction_row_matches(
 /// conflict must never silently replace the failed row's identity. When no
 /// row exists after the insert, the guards rejected the start: that is a
 /// typed `compaction_start_rejected`, never a silent success.
-fn compaction_start_insert(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+fn compaction_start_insert(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: CompactionStartInput = json::decode::<CompactionStartInput>(payload_json);
     sqlite::execute(
-        db_id,
+        &db_id,
         "INSERT INTO compactions (id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? FROM sessions JOIN runs ON runs.session_id = sessions.id WHERE sessions.id = ? AND sessions.generation + 1 = ? AND runs.id = ? AND runs.session_id = ? AND runs.status = 'compacting' AND ? >= 0 AND ? >= ? AND ? >= ? AND ? <= ? AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id AND messages.ordinal = ?) AND NOT EXISTS (SELECT 1 FROM compactions existing WHERE existing.id = ? AND existing.session_id <> ?) ON CONFLICT (session_id, generation) DO UPDATE SET id = excluded.id, run_id = excluded.run_id, source_start_ordinal = excluded.source_start_ordinal, source_end_ordinal = excluded.source_end_ordinal, retained_tail_ordinal = excluded.retained_tail_ordinal, summary_json = excluded.summary_json, token_estimate = excluded.token_estimate, model = excluded.model, state = 'pending', error_message = '', created_at_ms = excluded.created_at_ms, completed_at_ms = 0 WHERE compactions.state = 'failed' AND compactions.id = excluded.id",
         [&input.id, &input.session_id, &input.run_id, input.generation.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.retained_tail_ordinal.copy(), &input.summary_json, input.token_estimate.copy(), &input.model, input.now_ms.copy(), &input.session_id, input.generation.copy(), &input.run_id, &input.session_id, input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_start_ordinal.copy(), input.retained_tail_ordinal.copy(), input.source_end_ordinal.copy(), input.source_start_ordinal.copy(), input.source_end_ordinal.copy(), &input.id, &input.session_id]
     );
     let inserted: map = sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE id = ? AND session_id = ? LIMIT ?",
         [&input.id, &input.session_id, (max_rows)],
         compactions_query_limits(max_rows, max_bytes)
@@ -166,7 +166,7 @@ fn compaction_start_insert(db_id: int, payload_json: string, max_rows: int, max_
     result
 }
 
-pub fn storage_compaction_start(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_compaction_start(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: CompactionStartInput = json::decode::<CompactionStartInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
     if !existence::session_exists(db_id, input.session_id.copy()) {
@@ -256,25 +256,25 @@ pub fn storage_compaction_start(db_id: int, payload_json: string, max_rows: int,
     result
 }
 
-pub fn storage_compaction_get(db_id: int, compaction_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_compaction_get(db_id: resource<sqlite.connection>, compaction_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE id = ? LIMIT ?",
         [compaction_id, (max_rows)],
         compactions_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_compaction_latest(db_id: int, session_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_compaction_latest(db_id: resource<sqlite.connection>, session_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, run_id, generation, source_start_ordinal, source_end_ordinal, retained_tail_ordinal, summary_json, token_estimate, model, state, error_message, created_at_ms, completed_at_ms FROM compactions WHERE session_id = ? ORDER BY generation DESC, created_at_ms DESC LIMIT ?",
         [session_id, (max_rows)],
         compactions_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_compaction_commit(db_id: int, payload_json: string) -> array {
+pub fn storage_compaction_commit(db_id: resource<sqlite.connection>, payload_json: string) -> array {
     let input: CompactionCommitInput = json::decode::<CompactionCommitInput>(payload_json);
     // The three statements run IN ORDER on one connection inside the
     // transaction, and statement 2's `changes() = 1` guard reads the
@@ -299,10 +299,10 @@ pub fn storage_compaction_commit(db_id: int, payload_json: string) -> array {
             params: [input.generation.copy(), input.completed_at_ms.copy(), &input.session_id, input.generation.copy(), &input.id, &input.session_id, input.generation.copy()]
         }
     ];
-    sqlite::transaction(db_id, statements)
+    sqlite::transaction(&db_id, statements)
 }
 
-pub fn storage_compaction_fail(db_id: int, payload_json: string) -> map {
+pub fn storage_compaction_fail(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: CompactionFailInput = json::decode::<CompactionFailInput>(payload_json);
     // Deliberately a silent no-op when no pending row matches (P3
     // evaluation: every caller treats fail as best-effort — the compact
@@ -312,7 +312,7 @@ pub fn storage_compaction_fail(db_id: int, payload_json: string) -> map {
     // created; surfacing a typed error would break those callers without
     // adding safety).
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE compactions SET state = 'failed', error_message = ?, completed_at_ms = ? WHERE id = ? AND state = 'pending'",
         [&input.error_message, input.completed_at_ms.copy(), &input.id]
     )

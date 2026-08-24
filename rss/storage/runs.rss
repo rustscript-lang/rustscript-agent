@@ -109,7 +109,7 @@ struct RecoveryBatchResult {
     truncated: bool
 }
 
-pub fn storage_run_create(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_run_create(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: RunCreateInput = json::decode::<RunCreateInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
     if !existence::session_exists(db_id, input.session_id.copy()) {
@@ -119,7 +119,7 @@ pub fn storage_run_create(db_id: int, payload_json: string, max_rows: int, max_b
             result = { ok: false, code: "parent_not_found", message: "parent run does not exist", result: { columns: [], rows: [] } };
         } else {
             sqlite::execute(
-                db_id,
+                &db_id,
                 "INSERT OR IGNORE INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, updated_at_ms) SELECT ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))",
                 [&input.id, &input.session_id, &input.parent_run_id, &input.input_json, &input.provider, &input.model, &input.script_hash, &input.idempotency_scope, &input.idempotency_key, input.now_ms.copy(), input.now_ms.copy(), &input.id, &input.session_id, &input.session_id, &input.parent_run_id, &input.parent_run_id]
             );
@@ -128,7 +128,7 @@ pub fn storage_run_create(db_id: int, payload_json: string, max_rows: int, max_b
                 code: "ok",
                 message: "",
                 result: sqlite::query(
-                    db_id,
+                    &db_id,
                     "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? AND session_id = ? LIMIT ?",
                     [&input.id, &input.session_id, (max_rows)],
                     runs_query_limits(max_rows, max_bytes)
@@ -139,18 +139,18 @@ pub fn storage_run_create(db_id: int, payload_json: string, max_rows: int, max_b
     result
 }
 
-pub fn storage_run_get(db_id: int, run_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_run_get(db_id: resource<sqlite.connection>, run_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT ?",
         [run_id, (max_rows)],
         runs_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_run_list(db_id: int, session_id: string, status: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_run_list(db_id: resource<sqlite.connection>, session_id: string, status: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE session_id = ? AND (? = '' OR status = ?) ORDER BY created_at_ms DESC, id DESC LIMIT ?",
         [session_id, status, status, (max_rows)],
         runs_query_limits(max_rows, max_bytes)
@@ -161,10 +161,10 @@ pub fn storage_run_status_allowed(status: string) -> bool {
     status == "queued" || status == "running" || status == "waiting_approval" || status == "compacting" || status == "completed" || status == "failed" || status == "cancelled"
 }
 
-pub fn storage_run_transition(db_id: int, payload_json: string) -> array {
+pub fn storage_run_transition(db_id: resource<sqlite.connection>, payload_json: string) -> array {
     let input: RunTransitionInput = json::decode::<RunTransitionInput>(payload_json);
     assert(storage_run_status_allowed(input.to_status.copy()));
-    sqlite::transaction(db_id, [
+    sqlite::transaction(&db_id, [
         {
             sql: "UPDATE runs SET status = ?, error_code = ?, error_message = ?, recovery_reason = ?, started_at_ms = CASE WHEN ? = 'running' AND started_at_ms = 0 THEN ? ELSE started_at_ms END, finished_at_ms = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE finished_at_ms END, updated_at_ms = ? WHERE id = ? AND status = ? AND ((status = 'queued' AND ? IN ('running', 'cancelled', 'failed')) OR (status = 'running' AND ? IN ('waiting_approval', 'compacting', 'completed', 'failed', 'cancelled')) OR (status = 'waiting_approval' AND ? IN ('running', 'compacting', 'completed', 'failed', 'cancelled')) OR (status = 'compacting' AND ? IN ('running', 'completed', 'failed', 'cancelled')))",
             params: [&input.to_status, &input.error_code, &input.error_message, &input.recovery_reason, &input.to_status, input.now_ms.copy(), &input.to_status, input.now_ms.copy(), input.now_ms.copy(), &input.run_id, &input.from_status, &input.to_status, &input.to_status, &input.to_status, &input.to_status]
@@ -180,7 +180,7 @@ pub fn storage_run_transition(db_id: int, payload_json: string) -> array {
     ])
 }
 
-pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
+pub fn storage_run_link_child(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: ChildLinkInput = json::decode::<ChildLinkInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
     if !existence::run_exists(db_id, input.parent_run_id.copy()) {
@@ -192,7 +192,7 @@ pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
             // Idempotent: re-linking an existing pair is a no-op success,
             // never an orphan write or a duplicate error.
             sqlite::execute(
-                db_id,
+                &db_id,
                 "INSERT OR IGNORE INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ?)",
                 [&input.parent_run_id, &input.child_run_id, input.ordinal.copy(), &input.relation, &input.state, input.now_ms.copy(), &input.parent_run_id, &input.child_run_id]
             );
@@ -201,7 +201,7 @@ pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
                 code: "ok",
                 message: "",
                 result: sqlite::query(
-                    db_id,
+                    &db_id,
                     "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? AND child_run_id = ? LIMIT 1",
                     [&input.parent_run_id, &input.child_run_id],
                     { max_rows: 1, max_result_bytes: 4096 }
@@ -218,7 +218,7 @@ pub fn storage_run_link_child(db_id: int, payload_json: string) -> map {
 /// published and a failed commit leaves no partial terminal state.
 /// Sequence numbers are allocated transactionally as `max(seq) + 1` per run;
 /// the returned rows let the caller reconcile in-memory sequences.
-pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
+pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: RunTerminalInput = json::decode::<RunTerminalInput>(payload_json);
     assert(storage_run_status_allowed(input.to_status.copy()));
     let mut statements = [];
@@ -252,9 +252,9 @@ pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
         sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
         params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy(), &input.run_id, &input.to_status]
     };
-    sqlite::transaction(db_id, statements);
+    sqlite::transaction(&db_id, statements);
     let run_result: map = sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1",
         [&input.run_id],
         { max_rows: 1, max_result_bytes: 65536 }
@@ -274,7 +274,7 @@ pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
             result = { ok: false, code: "transition_conflict", message: "run terminal transition matched no row", result: { run: run_result_copy, events: { columns: [], rows: [] } } };
         } else {
             let event_result: map = sqlite::query(
-                db_id,
+                &db_id,
                 "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT ?",
                 [&input.run_id, (512)],
                 { max_rows: 512, max_result_bytes: 2097152 }
@@ -285,38 +285,38 @@ pub fn storage_run_terminal(db_id: int, payload_json: string) -> map {
     result
 }
 
-pub fn storage_run_list_children(db_id: int, parent_run_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_run_list_children(db_id: resource<sqlite.connection>, parent_run_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT parent_run_id, child_run_id, ordinal, relation, state, created_at_ms FROM child_run_links WHERE parent_run_id = ? ORDER BY ordinal ASC, child_run_id ASC LIMIT ?",
         [&parent_run_id, (max_rows)],
         runs_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_run_record_usage(db_id: int, payload_json: string) -> map {
+pub fn storage_run_record_usage(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: UsageInput = json::decode::<UsageInput>(payload_json);
     sqlite::execute(
-        db_id,
+        &db_id,
         "INSERT INTO provider_usage (id, run_id, provider, model, request_count, input_tokens, output_tokens, reasoning_tokens, cached_tokens, created_at_ms, usage_ids) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '|' || ? || '|' WHERE ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND ? >= 0 AND instr(?, '|') = 0 ON CONFLICT (run_id, provider, model) DO UPDATE SET request_count = provider_usage.request_count + excluded.request_count, input_tokens = provider_usage.input_tokens + excluded.input_tokens, output_tokens = provider_usage.output_tokens + excluded.output_tokens, reasoning_tokens = provider_usage.reasoning_tokens + excluded.reasoning_tokens, cached_tokens = provider_usage.cached_tokens + excluded.cached_tokens, usage_ids = provider_usage.usage_ids || excluded.id || '|' WHERE instr(provider_usage.usage_ids, '|' || excluded.id || '|') = 0",
         [&input.id, &input.run_id, &input.provider, &input.model, input.request_count.copy(), input.input_tokens.copy(), input.output_tokens.copy(), input.reasoning_tokens.copy(), input.cached_tokens.copy(), input.now_ms.copy(), &input.id, input.request_count.copy(), input.input_tokens.copy(), input.output_tokens.copy(), input.reasoning_tokens.copy(), input.cached_tokens.copy(), &input.id]
     );
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE runs SET input_tokens = COALESCE((SELECT SUM(input_tokens) FROM provider_usage WHERE run_id = ?), 0), output_tokens = COALESCE((SELECT SUM(output_tokens) FROM provider_usage WHERE run_id = ?), 0), updated_at_ms = ? WHERE id = ?",
         [&input.run_id, &input.run_id, input.now_ms.copy(), &input.run_id]
     );
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, input_tokens, output_tokens FROM runs WHERE id = ? LIMIT 1",
         [&input.run_id],
         { max_rows: 1, max_result_bytes: 4096 }
     )
 }
 
-pub fn storage_run_idempotency_begin(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_run_idempotency_begin(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: IdempotencyBeginInput = json::decode::<IdempotencyBeginInput>(payload_json);
-    sqlite::transaction(db_id, [
+    sqlite::transaction(&db_id, [
         {
             sql: "DELETE FROM idempotency_records WHERE scope = ? AND key = ? AND ((state = 'claimed' AND expires_at_ms <= ?) OR state = 'expired')",
             params: [&input.scope, &input.key, input.now_ms.copy()]
@@ -335,23 +335,23 @@ pub fn storage_run_idempotency_begin(db_id: int, payload_json: string, max_rows:
         }
     ]);
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT scope, key, request_hash, resource_type, resource_id, CASE WHEN request_hash = ? THEN state ELSE 'failed' END AS state, CASE WHEN request_hash = ? THEN response_json ELSE '{\"error_code\":\"idempotency_key_conflict\"}' END AS response_json, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN 1 ELSE 0 END AS acquired, CASE WHEN changes() = 1 AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND claim_token = ?) THEN ? ELSE '' END AS claim_token, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT ?",
         [&input.request_hash, &input.request_hash, &input.scope, &input.key, &input.claim_token, &input.scope, &input.key, &input.claim_token, &input.claim_token, &input.scope, &input.key, (max_rows)],
         runs_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_run_idempotency_complete(db_id: int, payload_json: string) -> map {
+pub fn storage_run_idempotency_complete(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: IdempotencyCompleteInput = json::decode::<IdempotencyCompleteInput>(payload_json);
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE idempotency_records SET state = ?, response_json = ?, completed_at_ms = ? WHERE scope = ? AND key = ? AND request_hash = ? AND state = 'claimed' AND ? IN ('completed', 'failed') AND expires_at_ms > ? AND ? <> '' AND EXISTS (SELECT 1 FROM idempotency_claims WHERE scope = ? AND key = ? AND request_hash = ? AND claim_token = ?)",
         [&input.state, &input.response_json, input.now_ms.copy(), &input.scope, &input.key, &input.request_hash, &input.state, input.now_ms.copy(), &input.claim_token, &input.scope, &input.key, &input.request_hash, &input.claim_token]
     )
 }
 
-pub fn storage_run_recover_active(db_id: int, payload_json: string) -> array {
+pub fn storage_run_recover_active(db_id: resource<sqlite.connection>, payload_json: string) -> array {
     let input: RecoveryInput = json::decode::<RecoveryInput>(payload_json);
     let statements = [
         {
@@ -396,5 +396,5 @@ pub fn storage_run_recover_active(db_id: int, payload_json: string) -> array {
             params: [input.now_ms.copy(), input.now_ms.copy(), &input.reason]
         }
     ];
-    sqlite::transaction(db_id, statements)
+    sqlite::transaction(&db_id, statements)
 }

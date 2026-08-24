@@ -30,7 +30,7 @@ use rustscript_vm::{
     CallReturn, CancellationReason, EpochHandle, HostAsyncBridge, HostFunctionRegistry, HostFuture,
     HostFutureOutput, HttpConfig, HttpHostExt, InvocationError, InvocationItem, InvocationPoll,
     SqliteHostExt, SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source,
+    compile_source, register_http_builtin_module, register_sqlite_builtin_module,
 };
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
@@ -340,10 +340,11 @@ impl Default for RunCancellation {
 }
 
 /// Compiles and drives one exported `run(context)` callable per run.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentRunner {
     program: rustscript_vm::Program,
     config: AgentConfig,
+    registry: Arc<HostFunctionRegistry>,
 }
 
 impl AgentRunner {
@@ -357,7 +358,13 @@ impl AgentRunner {
         let program = compile_source(source)
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
-        Ok(Self { program, config })
+        let registry = build_restricted_registry()
+            .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
+        Ok(Self {
+            program,
+            config,
+            registry: Arc::new(registry),
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
@@ -372,7 +379,13 @@ impl AgentRunner {
         let program = rustscript_vm::compile_source_file(&path)
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
-        Ok(Self { program, config })
+        let registry = build_restricted_registry()
+            .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
+        Ok(Self {
+            program,
+            config,
+            registry: Arc::new(registry),
+        })
     }
 
     /// Runs the exported `run(context)` entry with no event sink and no
@@ -399,12 +412,14 @@ impl AgentRunner {
         &self,
         cancellation: Option<&RunCancellation>,
     ) -> std::result::Result<(Vm, Value), RunError> {
-        let mut vm = Vm::new(self.program.clone());
+        let mut vm = Vm::try_new(self.program.clone()).map_err(RunError::Vm)?;
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()));
         vm.configure_http(self.config.http.clone())
             .map_err(RunError::Setup)?;
         vm.configure_sqlite(self.config.sqlite.clone());
-        bind_restricted_registry(&mut vm).map_err(RunError::Setup)?;
+        self.registry
+            .bind_vm_cached(&mut vm)
+            .map_err(RunError::Setup)?;
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
                 .map_err(RunError::Setup)?;
@@ -557,8 +572,10 @@ impl AgentRunner {
 /// `openai_chat` streaming adapter since core revision fd4b570; see
 /// plans/2026-08-14_a3-rustscript-core-unblock.md). Ambient runtime
 /// input/emit builtins are intentionally absent from agent execution.
-pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), VmError> {
+fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmError> {
     let mut registry = HostFunctionRegistry::restricted();
+    register_sqlite_builtin_module(&mut registry)?;
+    register_http_builtin_module(&mut registry)?;
     for name in [
         "json::encode",
         "json::decode",
@@ -577,7 +594,7 @@ pub(crate) fn bind_restricted_registry(vm: &mut Vm) -> std::result::Result<(), V
     ] {
         registry.allow_builtin(name)?;
     }
-    registry.bind_vm_cached(vm)
+    Ok(registry)
 }
 
 /// Drives futures submitted by async host builtins (for example the HTTP

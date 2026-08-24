@@ -29,7 +29,7 @@ struct MessageCompactInput {
     end_ordinal: int
 }
 
-pub fn storage_message_append(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_message_append(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: MessageAppendInput = json::decode::<MessageAppendInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
     if !existence::session_exists(db_id, input.session_id.copy()) {
@@ -45,13 +45,13 @@ pub fn storage_message_append(db_id: int, payload_json: string, max_rows: int, m
                 params: [&input.session_id, input.now_ms.copy(), &input.session_id]
             }
         ];
-        sqlite::transaction(db_id, statements);
+        sqlite::transaction(&db_id, statements);
         result = {
             ok: true,
             code: "ok",
             message: "",
             result: sqlite::query(
-                db_id,
+                &db_id,
                 "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? LIMIT ?",
                 [&input.id, &input.session_id, (max_rows)],
                 messages_query_limits(max_rows, max_bytes)
@@ -61,28 +61,28 @@ pub fn storage_message_append(db_id: int, payload_json: string, max_rows: int, m
     result
 }
 
-pub fn storage_message_get(db_id: int, message_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_message_get(db_id: resource<sqlite.connection>, message_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? LIMIT ?",
         [message_id, (max_rows)],
         messages_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_message_list(db_id: int, session_id: string, after_ordinal: int, max_rows: int, max_bytes: int) -> map {
+pub fn storage_message_list(db_id: resource<sqlite.connection>, session_id: string, after_ordinal: int, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?",
         [session_id, after_ordinal, max_rows],
         messages_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_message_mark_compacted(db_id: int, payload_json: string) -> map {
+pub fn storage_message_mark_compacted(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: MessageCompactInput = json::decode::<MessageCompactInput>(payload_json);
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE messages SET compacted = 1 WHERE session_id = ? AND ordinal >= ? AND ordinal <= ? AND EXISTS (SELECT 1 FROM compactions WHERE session_id = ? AND source_start_ordinal = ? AND source_end_ordinal = ? AND state = 'committed')",
         [&input.session_id, input.start_ordinal.copy(), input.end_ordinal.copy(), &input.session_id, input.start_ordinal.copy(), input.end_ordinal.copy()]
     )

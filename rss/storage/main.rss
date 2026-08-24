@@ -119,8 +119,8 @@ fn storage_open_options(db_path: string, db_mode: string, busy_timeout_ms: int, 
     }
 }
 
-fn storage_apply_migrations(db_id: int, now_ms: int) {
-    sqlite::execute(db_id, schema::schema_migrations_table_sql(), []);
+fn storage_apply_migrations(db_id: resource<sqlite.connection>, now_ms: int) {
+    sqlite::execute(&db_id, schema::schema_migrations_table_sql(), []);
     let mut applied_version: int = storage_applied_version(db_id);
     let mut migration_index = 0;
     while migration_index < schema::schema_migration_count() {
@@ -144,7 +144,7 @@ fn storage_apply_migrations(db_id: int, now_ms: int) {
                     now_ms
                 ]
             };
-            sqlite::transaction(db_id, statements);
+            sqlite::transaction(&db_id, statements);
             applied_version = migration_version;
         }
         migration_index += 1;
@@ -155,9 +155,9 @@ fn storage_apply_migrations(db_id: int, now_ms: int) {
 /// Reads the highest migration version already applied to this database.
 /// The query always yields exactly one row (COALESCE), so extraction is
 /// unconditional.
-fn storage_applied_version(db_id: int) -> int {
+fn storage_applied_version(db_id: resource<sqlite.connection>) -> int {
     let result: map = sqlite::query(
-        db_id,
+        &db_id,
         "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations",
         [],
         { max_rows: 1, max_result_bytes: 4096 }
@@ -274,7 +274,7 @@ fn storage_nth_rows_affected(results: array, index: int) -> int {
     affected
 }
 
-fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
+fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand) -> StorageResult {
     let request_id = command.request_id.copy();
     let op = command.op.copy();
     let mut result = storage_error(request_id.copy(), op.copy(), "unknown_operation", "storage operation is not registered");
@@ -446,7 +446,7 @@ fn storage_dispatch(db_id: int, command: StorageCommand) -> StorageResult {
 }
 
 pub fn run(command: StorageCommand) -> StorageResult {
-let db_id: int = sqlite::open(storage_open_options(command.db_path.copy(), command.db_mode.copy(), command.busy_timeout_ms.copy(), command.max_rows.copy(), command.max_bytes.copy()));
+let db_id: resource<sqlite.connection> = sqlite::open(storage_open_options(command.db_path.copy(), command.db_mode.copy(), command.busy_timeout_ms.copy(), command.max_rows.copy(), command.max_bytes.copy()));
 let _migration_result = if command.db_mode.copy() == "read_only" => { true } else => { storage_apply_migrations(db_id, command.now_ms.copy()) };
 let result = storage_dispatch(db_id, command);
 sqlite::close(db_id);

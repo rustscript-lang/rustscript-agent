@@ -17,7 +17,7 @@ struct LoadAllInput {
     load_cap: int
 }
 
-pub fn storage_load_all(db_id: int, payload_json: string) -> map {
+pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: LoadAllInput = json::decode::<LoadAllInput>(payload_json);
     let page_size: int = 512;
     let load_cap: int = input.load_cap.copy();
@@ -89,7 +89,7 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
             let mut page_done = false;
             while page_done == false {
                 let page: map = sqlite::query(
-                    db_id,
+                    &db_id,
                     "SELECT ordinal, id, session_id, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?",
                     [&session_id, ordinal_cursor, page_size + 1],
                     { max_rows: page_size, max_result_bytes: 2097152 }
@@ -134,7 +134,7 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
             let mut event_page_done = false;
             while event_page_done == false {
                 let page: map = sqlite::query(
-                    db_id,
+                    &db_id,
                     "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
                     [&run_id, seq_cursor, page_size + 1],
                     { max_rows: page_size, max_result_bytes: 2097152 }
@@ -198,7 +198,7 @@ pub fn storage_load_all(db_id: int, payload_json: string) -> map {
     result
 }
 
-fn load_page(db_id: int, sql: string, page_size: int, load_cap: int) -> map {
+fn load_page(db_id: resource<sqlite.connection>, sql: string, page_size: int, load_cap: int) -> map {
     let mut rows = [];
     let mut columns = [];
     let mut last_rowid: int = 0;
@@ -210,7 +210,7 @@ fn load_page(db_id: int, sql: string, page_size: int, load_cap: int) -> map {
         // exactly at the host's max_rows cap without setting `truncated`,
         // silently losing the rest of the table.
         let result: map = sqlite::query(
-            db_id,
+            &db_id,
             sql,
             [last_rowid, page_size + 1],
             { max_rows: page_size, max_result_bytes: 2097152 }

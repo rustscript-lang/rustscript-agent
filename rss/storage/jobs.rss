@@ -36,46 +36,46 @@ struct JobIdInput {
     job_id: string
 }
 
-pub fn storage_job_create(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_job_create(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: JobCreateInput = json::decode::<JobCreateInput>(payload_json);
     sqlite::execute(
-        db_id,
+        &db_id,
         "INSERT INTO jobs (id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, schedule_json = excluded.schedule_json, prompt = excluded.prompt, deliver_json = excluded.deliver_json, skills_json = excluded.skills_json, repeat_count = excluded.repeat_count, enabled = excluded.enabled, updated_at_ms = excluded.updated_at_ms",
         [&input.id, &input.name, &input.schedule_json, &input.prompt, &input.deliver_json, &input.skills_json, input.repeat_count.copy(), input.enabled.copy(), input.now_ms.copy(), input.now_ms.copy()]
     );
     { ok: true, result: storage_job_query(db_id, input.id, max_rows, max_bytes) }
 }
 
-pub fn storage_job_update(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_job_update(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: JobUpdateInput = json::decode::<JobUpdateInput>(payload_json);
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE jobs SET name = ?, schedule_json = ?, prompt = ?, deliver_json = ?, skills_json = ?, repeat_count = ?, enabled = ?, updated_at_ms = ? WHERE id = ?",
         [&input.name, &input.schedule_json, &input.prompt, &input.deliver_json, &input.skills_json, input.repeat_count.copy(), input.enabled.copy(), input.now_ms.copy(), &input.id]
     );
     { ok: true, result: storage_job_query(db_id, input.id, max_rows, max_bytes) }
 }
 
-pub fn storage_job_delete(db_id: int, payload_json: string) -> map {
+pub fn storage_job_delete(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: JobIdInput = json::decode::<JobIdInput>(payload_json);
     // Report the REAL rows affected: deleting a missing job is a typed
     // zero-row result, never a hardcoded success.
     let result: map = sqlite::execute(
-        db_id,
+        &db_id,
         "DELETE FROM jobs WHERE id = ?",
         [&input.job_id]
     );
     { ok: true, result: result }
 }
 
-pub fn storage_job_get(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_job_get(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: JobIdInput = json::decode::<JobIdInput>(payload_json);
     { ok: true, result: storage_job_query(db_id, input.job_id, max_rows, max_bytes) }
 }
 
-pub fn storage_job_list(db_id: int, max_rows: int, max_bytes: int) -> map {
+pub fn storage_job_list(db_id: resource<sqlite.connection>, max_rows: int, max_bytes: int) -> map {
     let result: map = sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs ORDER BY created_at_ms ASC, id ASC LIMIT ?",
         [(max_rows)],
         jobs_query_limits(max_rows, max_bytes)
@@ -83,9 +83,9 @@ pub fn storage_job_list(db_id: int, max_rows: int, max_bytes: int) -> map {
     { ok: true, result: result }
 }
 
-fn storage_job_query(db_id: int, job_id: string, max_rows: int, max_bytes: int) -> map {
+fn storage_job_query(db_id: resource<sqlite.connection>, job_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs WHERE id = ? LIMIT ?",
         [&job_id, (max_rows)],
         jobs_query_limits(max_rows, max_bytes)

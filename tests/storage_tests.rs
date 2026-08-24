@@ -268,14 +268,14 @@ fn query_sql_runner(
 ) -> AgentRunner {
     let body = statements
         .iter()
-        .map(|sql| format!("    sqlite::execute(db, \"{sql}\", []);"))
+        .map(|sql| format!("    sqlite::execute(&db, \"{sql}\", []);"))
         .collect::<Vec<_>>()
         .join("\n");
     let source = format!(
         r#"
 use sqlite;
 pub fn run(input: map) -> map {{
-    let db: int = sqlite::open({{
+    let db = sqlite::open({{
         path: input["db_name"],
         mode: "read_write_create",
         limits: {{
@@ -288,7 +288,7 @@ pub fn run(input: map) -> map {{
         }}
     }});
 {body}
-    let result: map = sqlite::query(db, "{final_sql}", [], {{ max_rows: 64, max_result_bytes: 65536 }});
+    let result: map = sqlite::query(&db, "{final_sql}", [], {{ max_rows: 64, max_result_bytes: 65536 }});
     sqlite::close(db);
     result
 }}
@@ -366,14 +366,14 @@ fn event_payload(
 fn raw_sql_runner(root: &std::path::Path, label: &str, statements: &[&str]) -> AgentRunner {
     let body = statements
         .iter()
-        .map(|sql| format!("    sqlite::execute(db, \"{sql}\", []);"))
+        .map(|sql| format!("    sqlite::execute(&db, \"{sql}\", []);"))
         .collect::<Vec<_>>()
         .join("\n");
     let source = format!(
         r#"
 use sqlite;
 pub fn run(input: map) -> bool {{
-    let db: int = sqlite::open({{
+    let db = sqlite::open({{
         path: input["db_name"],
         mode: "read_write_create",
         limits: {{
@@ -416,7 +416,7 @@ fn released_v1_runner(root: &std::path::Path) -> AgentRunner {
 use sqlite;
 use self::schema as schema;
 pub fn run(input: map) -> bool {
-    let db: int = sqlite::open({
+    let db = sqlite::open({
         path: input["db_name"],
         mode: "read_write_create",
         limits: {
@@ -428,7 +428,7 @@ pub fn run(input: map) -> bool {
             max_transaction_ms: 5000
         }
     });
-    sqlite::execute(db, schema::schema_migrations_table_sql(), []);
+    sqlite::execute(&db, schema::schema_migrations_table_sql(), []);
     let mut statements = [];
     let mut statement_index = 0;
     while statement_index < 11 {
@@ -439,7 +439,7 @@ pub fn run(input: map) -> bool {
         sql: schema::schema_migration_record_sql(),
         params: [1, schema::schema_migration_name(0), schema::schema_migration_checksum(0), 1]
     };
-    sqlite::transaction(db, statements);
+    sqlite::transaction(&db, statements);
     sqlite::close(db);
     true
 }

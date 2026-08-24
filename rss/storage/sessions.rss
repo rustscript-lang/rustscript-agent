@@ -44,7 +44,7 @@ struct SessionIdInput {
     session_id: string
 }
 
-pub fn storage_session_create(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_session_create(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: SessionCreateInput = json::decode::<SessionCreateInput>(payload_json);
     let statements = [
         {
@@ -56,34 +56,34 @@ pub fn storage_session_create(db_id: int, payload_json: string, max_rows: int, m
             params: [input.now_ms.copy(), &input.id, &input.profile, &input.platform, &input.account_id, &input.chat_id, &input.thread_id]
         }
     ];
-    sqlite::transaction(db_id, statements);
+    sqlite::transaction(&db_id, statements);
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms, title, end_reason FROM sessions WHERE id = ? AND profile = ? AND platform = ? AND account_id = ? AND chat_id = ? AND thread_id = ? LIMIT ?",
         [&input.id, &input.profile, &input.platform, &input.account_id, &input.chat_id, &input.thread_id, (max_rows)],
         sessions_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_session_get(db_id: int, session_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_session_get(db_id: resource<sqlite.connection>, session_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms, title, end_reason FROM sessions WHERE id = ? LIMIT ?",
         [session_id, (max_rows)],
         sessions_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_session_list(db_id: int, profile: string, platform: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_session_list(db_id: resource<sqlite.connection>, profile: string, platform: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms, title, end_reason FROM sessions WHERE profile = ? AND platform = ? ORDER BY updated_at_ms DESC, id ASC LIMIT ?",
         [profile, platform, (max_rows)],
         sessions_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_session_touch(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_session_touch(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: SessionTouchInput = json::decode::<SessionTouchInput>(payload_json);
     // The touch is keyed by session id only: a caller that carries a stale
     // `generation` (for example after a compaction bumped the durable
@@ -91,7 +91,7 @@ pub fn storage_session_touch(db_id: int, payload_json: string, max_rows: int, ma
     // input contract for payload compatibility but does not gate the
     // update; compaction owns generation bumps.
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE sessions SET status = ?, system_prompt = ?, model = ?, provider = ?, toolset_hash = ?, metadata_json = ?, title = ?, end_reason = ?, updated_at_ms = ? WHERE id = ?",
         [&input.status, &input.system_prompt, &input.model, &input.provider, &input.toolset_hash, &input.metadata_json, &input.title, &input.end_reason, input.now_ms.copy(), &input.session_id]
     );
@@ -106,7 +106,7 @@ pub fn storage_session_touch(db_id: int, payload_json: string, max_rows: int, ma
 /// cascade predicate needs the runs to still exist. The session row delete
 /// is statement 1, so `rows_affected` of that result tells the caller
 /// whether the session existed (0 -> session_not_found).
-pub fn storage_session_delete(db_id: int, payload_json: string) -> array {
+pub fn storage_session_delete(db_id: resource<sqlite.connection>, payload_json: string) -> array {
     let input: SessionIdInput = json::decode::<SessionIdInput>(payload_json);
     let statements = [
         {
@@ -150,5 +150,5 @@ pub fn storage_session_delete(db_id: int, payload_json: string) -> array {
             params: [&input.session_id]
         }
     ];
-    sqlite::transaction(db_id, statements)
+    sqlite::transaction(&db_id, statements)
 }

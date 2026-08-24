@@ -34,7 +34,7 @@ struct ApprovalExpireInput {
     now_ms: int
 }
 
-pub fn storage_approval_request(db_id: int, payload_json: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_approval_request(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: ApprovalRequestInput = json::decode::<ApprovalRequestInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
     if !existence::run_exists(db_id, input.run_id.copy()) {
@@ -44,7 +44,7 @@ pub fn storage_approval_request(db_id: int, payload_json: string, max_rows: int,
             result = { ok: false, code: "run_not_found", message: "approval request references an unknown run or session", result: { columns: [], rows: [] } };
         } else {
             sqlite::execute(
-                db_id,
+                &db_id,
                 "INSERT OR IGNORE INTO approvals (id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE runs.id = ? AND runs.session_id = ? AND runs.status IN ('running', 'waiting_approval')) AND NOT EXISTS (SELECT 1 FROM approvals existing JOIN runs owner ON owner.id = existing.run_id WHERE existing.id = ? AND owner.session_id <> ?)",
                 [&input.id, &input.run_id, &input.session_id, &input.tool_call_id, &input.tool_name, &input.arguments_json, &input.risk_class, &input.decision_scope, input.one_time.copy(), input.requested_at_ms.copy(), input.expires_at_ms.copy(), &input.run_id, &input.session_id, &input.id, &input.session_id]
             );
@@ -53,7 +53,7 @@ pub fn storage_approval_request(db_id: int, payload_json: string, max_rows: int,
                 code: "ok",
                 message: "",
                 result: sqlite::query(
-                    db_id,
+                    &db_id,
                     "SELECT id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms, resolved_at_ms, resolver, decision_reason FROM approvals WHERE id = ? AND session_id = ? LIMIT ?",
                     [&input.id, &input.session_id, (max_rows)],
                     approvals_query_limits(max_rows, max_bytes)
@@ -64,29 +64,29 @@ pub fn storage_approval_request(db_id: int, payload_json: string, max_rows: int,
     result
 }
 
-pub fn storage_approval_get(db_id: int, approval_id: string, max_rows: int, max_bytes: int) -> map {
+pub fn storage_approval_get(db_id: resource<sqlite.connection>, approval_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
-        db_id,
+        &db_id,
         "SELECT id, run_id, session_id, tool_call_id, tool_name, arguments_json, risk_class, state, decision_scope, one_time, requested_at_ms, expires_at_ms, resolved_at_ms, resolver, decision_reason FROM approvals WHERE id = ? LIMIT ?",
         [approval_id, (max_rows)],
         approvals_query_limits(max_rows, max_bytes)
     )
 }
 
-pub fn storage_approval_resolve(db_id: int, payload_json: string) -> map {
+pub fn storage_approval_resolve(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: ApprovalResolveInput = json::decode::<ApprovalResolveInput>(payload_json);
     assert(input.state.copy() == "approved" || input.state.copy() == "denied");
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE approvals SET state = ?, resolver = ?, decision_reason = ?, resolved_at_ms = ? WHERE id = ? AND state = 'pending' AND (expires_at_ms <= 0 OR expires_at_ms > ?) AND EXISTS (SELECT 1 FROM runs WHERE runs.id = approvals.run_id AND runs.status IN ('running', 'waiting_approval'))",
         [&input.state, &input.resolver, &input.decision_reason, input.resolved_at_ms.copy(), &input.id, input.resolved_at_ms.copy()]
     )
 }
 
-pub fn storage_approval_expire(db_id: int, payload_json: string) -> map {
+pub fn storage_approval_expire(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: ApprovalExpireInput = json::decode::<ApprovalExpireInput>(payload_json);
     sqlite::execute(
-        db_id,
+        &db_id,
         "UPDATE approvals SET state = 'expired', resolved_at_ms = ?, resolver = 'storage-expiry' WHERE state = 'pending' AND expires_at_ms > 0 AND expires_at_ms <= ?",
         [input.now_ms.copy(), input.now_ms.copy()]
     )
