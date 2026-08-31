@@ -224,17 +224,8 @@ pub struct ProviderError {
     pub raw: Value,
 }
 
-/// Tool descriptor contract (gateway-api plan section 4.5): name,
-/// description, JSON schema, toolset, and risk class. Native capability
-/// policy remains the hard upper bound for any mapped generic capability.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ToolDescriptor {
-    pub name: String,
-    pub description: String,
-    pub toolset: String,
-    pub risk_class: String,
-    pub schema: Value,
-}
+/// Compatibility re-export of the single public tool descriptor contract.
+pub use crate::tools::types::ToolDescriptor;
 
 /// Canonical event envelope attached to one run (gateway-api plan section
 /// 4.3): AgentService assigns the durable event identity, the monotonic
