@@ -21,18 +21,28 @@
 //! streams forever. Nothing is ever published before the durable commit
 //! succeeds.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::Instant;
 
 use parking_lot::RwLock;
 use rustscript_vm::{CancellationReason, HttpConfig, InvocationError, Value as VmValue};
-use serde_json::{Value as JsonValue, json};
+use serde_json::{Map, Value as JsonValue, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-use crate::config::AgentGatewayConfig;
-use crate::config::ClientDisconnectPolicy;
+use crate::config::{
+    ADMISSION_IDEMPOTENCY_SCOPE, ADMISSION_RUN_COL_ID, ADMISSION_RUN_COL_INPUT_JSON,
+    ADMISSION_RUN_COL_MODEL, ADMISSION_RUN_COL_PARENT_RUN_ID, ADMISSION_RUN_COL_PROVIDER,
+    ADMISSION_RUN_COL_SCRIPT_HASH, ADMISSION_RUN_COL_SESSION_ID, ADMISSION_RUN_COL_STATUS,
+    ADMISSION_SESSION_PROFILE, AdmissionSqliteCellLens, AgentGatewayConfig, ClientDisconnectPolicy,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_MODEL_NAME_BYTES, MAX_PROVIDER_NAME_BYTES,
+    MAX_RUN_CONTEXT_STORAGE_BYTES, ProviderProfile, ProviderProfileError, RunLimits,
+    RunLimitsError, estimate_admission_query_bytes, validate_request_hash, validate_visible_name,
+};
 use crate::domain::{RunContext, timestamp, truncate_for_log, vm_value_to_json};
 use crate::events;
 use crate::gateway::store::{
@@ -44,6 +54,7 @@ use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, append_event_locked, run_delivery_task,
 };
 use crate::runtime::rss_runner::execute_rss_source;
+use crate::tools::{ToolRegistry, ToolRegistrySnapshot};
 use crate::{RunCancellation, RunError};
 
 /// One run whose terminal state could not be committed durably. The worker
@@ -181,6 +192,52 @@ pub struct AdmittedRun {
     pub replayed: bool,
 }
 
+/// Typed errors raised when an admitted run cannot safely resume with its
+/// captured context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunContextError {
+    Missing {
+        run_id: String,
+    },
+    RegistryMismatch {
+        run_id: String,
+        expected: String,
+        actual: String,
+    },
+    InvalidMetadata {
+        run_id: String,
+        reason: String,
+    },
+    Persistence(String),
+}
+
+impl std::fmt::Display for RunContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { run_id } => {
+                write!(formatter, "run context is missing for run {run_id}")
+            }
+            Self::RegistryMismatch {
+                run_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "run {run_id} registry snapshot mismatch: expected {expected}, current {actual}"
+            ),
+            Self::InvalidMetadata { run_id, reason } => {
+                write!(
+                    formatter,
+                    "run {run_id} context metadata is invalid: {reason}"
+                )
+            }
+            Self::Persistence(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RunContextError {}
+
 #[derive(Debug)]
 pub enum AdmitError {
     RunLimitReached,
@@ -213,6 +270,29 @@ impl std::fmt::Display for AdmitError {
 
 impl std::error::Error for AdmitError {}
 
+const RUN_CONTEXT_METADATA_VERSION: u64 = 1;
+const RUN_CONTEXT_STORAGE_KEY: &str = "run_context";
+
+#[derive(Clone)]
+struct RunAdmissionSnapshot {
+    registry: ToolRegistrySnapshot,
+    provider_profile: ProviderProfile,
+    limits: RunLimits,
+}
+
+struct ContextAdmissionInput {
+    run_id: String,
+    session_id: String,
+    message_id: String,
+    parent_run_id: Option<String>,
+    platform: String,
+    input: JsonValue,
+    messages: Vec<SessionMessage>,
+    model: String,
+    provider: Option<String>,
+    system_prompt: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AgentService {
     inner: Arc<AgentServiceInner>,
@@ -224,10 +304,17 @@ struct AgentServiceInner {
     persistence: Option<Arc<GatewayPersistence>>,
     agent_source: Option<Arc<String>>,
     http_config: HttpConfig,
+    tool_registry: RwLock<ToolRegistry>,
+    provider_profiles: RwLock<HashMap<String, ProviderProfile>>,
+    run_limits: RwLock<RunLimits>,
+    contexts: Mutex<HashMap<String, RunContext>>,
+    context_registries: Mutex<HashMap<String, ToolRegistrySnapshot>>,
+    context_cache_capacity: usize,
     capacity: Arc<Semaphore>,
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
+    store_generation: AtomicU64,
     metrics: Arc<Metrics>,
 }
 
@@ -241,16 +328,34 @@ impl AgentService {
         metrics: Arc<Metrics>,
     ) -> Self {
         let capacity = Arc::new(Semaphore::new(config.max_concurrent_runs));
+        let context_cache_capacity = config.max_concurrent_runs.saturating_mul(4).max(16);
+        normalize_loaded_session_messages(&store);
+        let default_registry = ToolRegistry::builtin().expect("built-in tool registry validates");
+        let default_provider = config
+            .provider
+            .clone()
+            .unwrap_or_else(|| "local-agent".to_string());
+        let default_profile = ProviderProfile::builtin(default_provider.clone())
+            .expect("built-in provider profile validates");
+        let mut provider_profiles = HashMap::new();
+        provider_profiles.insert(default_provider, default_profile);
         let inner = Arc::new(AgentServiceInner {
             config,
             store,
             persistence,
             agent_source,
             http_config,
+            tool_registry: RwLock::new(default_registry),
+            provider_profiles: RwLock::new(provider_profiles),
+            run_limits: RwLock::new(RunLimits::default()),
+            contexts: Mutex::new(HashMap::new()),
+            context_registries: Mutex::new(HashMap::new()),
+            context_cache_capacity,
             capacity,
             runs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
+            store_generation: AtomicU64::new(0),
             metrics,
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
@@ -267,6 +372,154 @@ impl AgentService {
 
     pub fn http_config(&self) -> &HttpConfig {
         &self.inner.http_config
+    }
+
+    /// Returns the registry snapshot currently used for future admissions.
+    pub fn tool_registry_snapshot(&self) -> ToolRegistrySnapshot {
+        self.inner.tool_registry.read().snapshot()
+    }
+
+    /// Replaces the registry used by future admissions. Existing run contexts
+    /// retain their own cloned snapshot and are unaffected. Empty registries
+    /// are rejected and leave the active registry unchanged.
+    pub fn set_tool_registry(&self, registry: ToolRegistry) -> Result<(), String> {
+        if registry.snapshot().is_empty() {
+            return Err("tool registry must not be empty".to_string());
+        }
+        *self.inner.tool_registry.write() = registry;
+        Ok(())
+    }
+
+    /// Installs a validated provider profile for future admissions.
+    pub fn set_provider_profile(
+        &self,
+        profile: ProviderProfile,
+    ) -> Result<(), ProviderProfileError> {
+        let profile = ProviderProfile::new(profile.name.clone(), profile.options().clone())?;
+        self.inner
+            .provider_profiles
+            .write()
+            .insert(profile.name.clone(), profile);
+        Ok(())
+    }
+
+    /// Replaces the validated limits used by future admissions.
+    pub fn set_run_limits(&self, limits: RunLimits) -> Result<(), RunLimitsError> {
+        let limits = limits.normalized()?;
+        *self.inner.run_limits.write() = limits;
+        Ok(())
+    }
+
+    /// Returns the immutable context captured at admission time.
+    pub fn run_context(&self, run_id: &str) -> Option<RunContext> {
+        if let Some(context) = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+        {
+            return Some(context);
+        }
+        self.resume_context(run_id).ok()
+    }
+
+    pub fn run_registry_snapshot(&self, run_id: &str) -> Option<ToolRegistrySnapshot> {
+        self.inner
+            .context_registries
+            .lock()
+            .expect("context registries lock")
+            .get(run_id)
+            .cloned()
+    }
+
+    /// Returns a JSON view of the in-memory run events for integration tests
+    /// and gateway diagnostics without exposing the storage-owned event type.
+    pub fn run_events(&self, run_id: &str) -> Vec<JsonValue> {
+        self.inner
+            .store
+            .try_read()
+            .and_then(|store| {
+                store.runs.get(run_id).map(|run| {
+                    run.events
+                        .iter()
+                        .map(|event| {
+                            json!({
+                                "event_id": event.event_id,
+                                "seq": event.seq,
+                                "event": event.event,
+                                "run_id": event.run_id,
+                                "timestamp": event.timestamp,
+                                "data": event.data,
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Verifies that an admitted or persisted run can execute with the
+    /// currently loaded registry. A mismatch is returned before any RSS
+    /// invocation is started.
+    pub fn verify_run_context(&self, run_id: &str) -> Result<(), RunContextError> {
+        let context = self
+            .run_context(run_id)
+            .map(Ok)
+            .unwrap_or_else(|| self.resume_context(run_id))?;
+        let current_identity = self.inner.tool_registry.read().identity().to_string();
+        verify_context_registry(&context, &current_identity)?;
+        if let Some(snapshot) = self
+            .inner
+            .context_registries
+            .lock()
+            .expect("context registries lock")
+            .get(run_id)
+        {
+            let expected = context
+                .metadata
+                .get("registry_identity")
+                .and_then(JsonValue::as_str)
+                .expect("metadata validation checked registry identity");
+            if snapshot.identity() != expected {
+                return Err(invalid_context_metadata(
+                    run_id,
+                    "in-memory registry snapshot does not match metadata",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Restores a context from the run's durable admission snapshot. The
+    /// snapshot is authoritative for recovery; checking the currently loaded
+    /// registry is deliberately left to [`Self::verify_run_context`].
+    pub fn resume_context(&self, run_id: &str) -> Result<RunContext, RunContextError> {
+        let context = self.load_persisted_context(run_id)?;
+        let current_registry = self.inner.tool_registry.read().snapshot();
+        let registry_matches = context
+            .metadata
+            .get("registry_identity")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|identity| identity == current_registry.identity());
+        self.cache_context(
+            context.clone(),
+            registry_matches.then_some(current_registry),
+        );
+        Ok(context)
+    }
+
+    /// Number of cached context and registry snapshots, respectively.
+    pub fn context_cache_counts(&self) -> (usize, usize) {
+        (
+            self.inner.contexts.lock().expect("contexts lock").len(),
+            self.inner
+                .context_registries
+                .lock()
+                .expect("context registries lock")
+                .len(),
+        )
     }
 
     pub fn handle(&self, run_id: &str) -> Option<Arc<RunHandle>> {
@@ -312,6 +565,35 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::Halting);
             return Err(AdmitError::Halting);
         }
+        if let Err(message) = validate_idempotency_pair(
+            request.idempotency_key.as_deref(),
+            request.idempotency_hash.as_deref(),
+        ) {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            return Err(AdmitError::Invalid(message));
+        }
+        if let Some(model) = request.model.as_deref()
+            && let Err(message) = validate_visible_name(model, "model", MAX_MODEL_NAME_BYTES)
+        {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            return Err(AdmitError::Invalid(message));
+        }
+        if let Some(provider) = request
+            .provider
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            && let Err(message) =
+                validate_visible_name(provider, "provider", MAX_PROVIDER_NAME_BYTES)
+        {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            return Err(AdmitError::Invalid(message));
+        }
         let capacity_permit = self
             .inner
             .capacity
@@ -343,33 +625,28 @@ impl AgentService {
         let now = timestamp();
         let message_id = Uuid::new_v4().to_string();
         let event_id = Uuid::new_v4().to_string();
-        let mut store = self.inner.store.write();
-
-        // Idempotent replay fast path (authoritative under the write lock):
-        // an admitted key returns the existing run without creating anything.
-        if let (Some(key), Some(hash)) = (
+        let registry = self.inner.tool_registry.read().snapshot();
+        if registry.is_empty() {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            return Err(AdmitError::Invalid(
+                "tool registry must not be empty".to_string(),
+            ));
+        }
+        let run_limits = self.inner.run_limits.read().clone();
+        run_limits
+            .validate()
+            .map_err(|error| AdmitError::Invalid(format!("invalid run limits: {error}")))?;
+        if let Some(replayed) = self.replay_existing_admission(
             request.idempotency_key.as_deref(),
             request.idempotency_hash.as_deref(),
-        ) && let Some(existing) = store.idempotency.get(key)
-        {
-            if existing.request_hash != hash {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::IdempotencyConflict);
-                return Err(AdmitError::IdempotencyConflict);
-            }
-            let (session_id, status) = store
-                .runs
-                .get(&existing.run_id)
-                .map(|run| (run.session_id.clone(), run.status.clone()))
-                .unwrap_or((String::new(), "unknown".to_string()));
-            return Ok(AdmittedRun {
-                run_id: existing.run_id.clone(),
-                session_id,
-                status,
-                replayed: true,
-            });
+        )? {
+            return Ok(replayed);
         }
+
+        let generation = self.inner.store_generation.load(Ordering::Acquire);
+        let store = self.inner.store.read();
 
         // Session resolution: reuse an existing session or prepare a new one
         // (applied in memory only after the durable commit).
@@ -386,21 +663,65 @@ impl AgentService {
             None => Uuid::new_v4().to_string(),
         };
         let session_new = !store.sessions.contains_key(&session_id);
+        let (effective_model, effective_provider, effective_system_prompt) = if session_new {
+            (
+                request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.inner.config.model.clone()),
+                request
+                    .provider
+                    .clone()
+                    .or_else(|| self.inner.config.provider.clone()),
+                request.instructions.clone(),
+            )
+        } else {
+            let session = store
+                .sessions
+                .get(&session_id)
+                .expect("existing admission session should be present");
+            (
+                request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| session.view.model.clone()),
+                request
+                    .provider
+                    .clone()
+                    .or_else(|| session.view.provider.clone()),
+                request
+                    .instructions
+                    .clone()
+                    .or_else(|| session.view.system_prompt.clone()),
+            )
+        };
+        if let Err(message) = validate_visible_name(&effective_model, "model", MAX_MODEL_NAME_BYTES)
+        {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            return Err(AdmitError::Invalid(message));
+        }
+        if let Some(provider) = effective_provider
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            && let Err(message) =
+                validate_visible_name(provider, "provider", MAX_PROVIDER_NAME_BYTES)
+        {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            return Err(AdmitError::Invalid(message));
+        }
         let new_session_view = if session_new {
             let view = SessionView {
                 id: session_id.clone(),
                 object: "hermes.session".to_string(),
                 title: None,
-                model: request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.inner.config.model.clone()),
-                provider: request
-                    .provider
-                    .clone()
-                    .or_else(|| self.inner.config.provider.clone()),
+                model: effective_model.clone(),
+                provider: effective_provider.clone(),
                 source: request.platform.clone(),
-                system_prompt: request.instructions.clone(),
+                system_prompt: effective_system_prompt.clone(),
                 created_at: now,
                 updated_at: now,
                 message_count: 0,
@@ -418,24 +739,91 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::ParentNotFound);
             return Err(AdmitError::ParentNotFound);
         }
+        let provider_profile = self
+            .resolve_provider_profile(effective_provider.as_deref())
+            .map_err(|error| AdmitError::Invalid(format!("invalid provider profile: {error}")))?;
+        let snapshot = RunAdmissionSnapshot {
+            registry,
+            provider_profile,
+            limits: run_limits,
+        };
+        let context_message = SessionMessage {
+            id: message_id.clone(),
+            session_id: session_id.clone(),
+            role: "user".to_string(),
+            content: request.input.clone(),
+            created_at: now,
+            run_id: Some(run_id.clone()),
+            finish_reason: None,
+        };
+        let mut context_messages = store
+            .sessions
+            .get(&session_id)
+            .map(|session| session.messages.clone())
+            .unwrap_or_default();
+        context_messages.push(context_message.clone());
+        let context_input = ContextAdmissionInput {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            message_id: message_id.clone(),
+            parent_run_id: request.parent_run_id.clone(),
+            platform: request.platform.clone(),
+            input: request.input.clone(),
+            messages: context_messages,
+            model: effective_model.clone(),
+            provider: effective_provider.clone(),
+            system_prompt: effective_system_prompt.clone(),
+        };
+        let context = self.make_admitted_context(&context_input, &snapshot);
+        let persisted_input = persisted_run_context_json(&context)?;
+        let provider = effective_provider.clone().unwrap_or_default();
+        let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
+        let estimate = estimate_admission_query_bytes(AdmissionSqliteCellLens {
+            run_id: run_id.len(),
+            session_id: session_id.len(),
+            parent_run_id: request.parent_run_id.as_deref().unwrap_or("").len(),
+            input_json: persisted_input.len(),
+            provider: provider.len(),
+            model: effective_model.len(),
+            script_hash: snapshot.registry.identity().len(),
+            idempotency_scope: ADMISSION_IDEMPOTENCY_SCOPE.len(),
+            idempotency_key: idempotency_key.len(),
+            platform: request.platform.len(),
+            profile: ADMISSION_SESSION_PROFILE.len(),
+            system_prompt: effective_system_prompt.as_deref().unwrap_or("").len(),
+            message_id: message_id.len(),
+            request_hash: request.idempotency_hash.as_deref().unwrap_or("").len(),
+            has_idempotency: !idempotency_key.is_empty(),
+        })
+        .map_err(|error| {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            AdmitError::Invalid(error.to_string())
+        })?;
+        estimate.ensure_fits().map_err(|error| {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            AdmitError::Invalid(error.to_string())
+        })?;
 
         let payload = json!({
             "session_id": session_id,
             "session_new": if session_new { 1 } else { 0 },
-            "profile": "gateway",
-            "platform": request.platform,
+            "profile": ADMISSION_SESSION_PROFILE,
+            "platform": request.platform.clone(),
             "account_id": session_id,
-            "model": request.model.clone().unwrap_or_default(),
-            "provider": request.provider.clone().unwrap_or_default(),
-            "system_prompt": request.instructions.clone().unwrap_or_default(),
+            "model": effective_model.clone(),
+            "provider": effective_provider.clone().unwrap_or_default(),
+            "system_prompt": effective_system_prompt.clone().unwrap_or_default(),
             "run_id": run_id,
             "parent_run_id": request.parent_run_id.clone().unwrap_or_default(),
-            "input_json": serde_json::to_string(&request.input)
-                .unwrap_or_else(|_| "null".to_string()),
+            "input_json": persisted_input,
             "message_id": message_id,
             "message_run_id": run_id,
-            "script_hash": "",
-            "idempotency_scope": "api:chat",
+            "script_hash": snapshot.registry.identity(),
+            "idempotency_scope": ADMISSION_IDEMPOTENCY_SCOPE,
             "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
             "request_hash": request.idempotency_hash.clone().unwrap_or_default(),
             "event_id": event_id,
@@ -443,6 +831,7 @@ impl AgentService {
             "expires_at_ms": 0,
         });
 
+        drop(store);
         let durable = match self.inner.persistence.as_ref() {
             Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
                 self.inner
@@ -461,42 +850,23 @@ impl AgentService {
         // The transactional admission may have replayed an existing key (a
         // restart race the in-memory fast path cannot see).
         if data.get("replayed") == Some(&JsonValue::Bool(true)) {
-            let run_row = data
-                .get("run")
-                .and_then(|run| run.get("rows"))
-                .and_then(JsonValue::as_array)
-                .and_then(|rows| rows.first())
-                .and_then(JsonValue::as_array)
-                .cloned()
-                .ok_or_else(|| {
-                    AdmitError::Persistence(
-                        "replayed admission omitted the existing run".to_string(),
-                    )
-                })?;
-            let replayed_run_id = run_row
-                .first()
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let replayed_session = run_row
-                .get(1)
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let replayed_status = run_row
-                .get(3)
-                .and_then(JsonValue::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-            return Ok(AdmittedRun {
-                run_id: replayed_run_id,
-                session_id: replayed_session,
-                status: replayed_status,
-                replayed: true,
-            });
+            return self.finish_durable_replay(&data);
         }
 
-        // Durable commit succeeded: apply the matching in-memory state.
+        // Durable commit succeeded: apply the matching in-memory state under
+        // the write lock with a generation recheck so concurrent admits cannot
+        // duplicate runs after the storage roundtrip.
+        let mut store = self.inner.store.write();
+        if let Some(replayed) = self.recheck_admission_after_commit(
+            &store,
+            generation,
+            request.idempotency_key.as_deref(),
+            request.idempotency_hash.as_deref(),
+            &run_id,
+        )? {
+            return Ok(replayed);
+        }
+        self.inner.store_generation.fetch_add(1, Ordering::Release);
         if session_new {
             store.sessions.insert(
                 session_id.clone(),
@@ -519,15 +889,7 @@ impl AgentService {
         if request.instructions.is_some() {
             session.view.system_prompt = request.instructions.clone();
         }
-        session.messages.push(SessionMessage {
-            id: message_id.clone(),
-            session_id: session_id.clone(),
-            role: "user".to_string(),
-            content: request.input.clone(),
-            created_at: now,
-            run_id: Some(run_id.clone()),
-            finish_reason: None,
-        });
+        session.messages.push(context_message);
         session.view.message_count = session.messages.len();
         session.view.updated_at = now;
 
@@ -581,6 +943,7 @@ impl AgentService {
             .lock()
             .expect("runs lock")
             .insert(run_id.clone(), handle);
+        self.cache_context(context, Some(snapshot.registry));
         self.inner.metrics.admission_accepted();
         self.inner.metrics.active_runs_inc();
         Ok(AdmittedRun {
@@ -588,6 +951,171 @@ impl AgentService {
             session_id,
             status: "started".to_string(),
             replayed: false,
+        })
+    }
+
+    fn replay_existing_admission(
+        &self,
+        key: Option<&str>,
+        hash: Option<&str>,
+    ) -> Result<Option<AdmittedRun>, AdmitError> {
+        let (Some(key), Some(hash)) = (key, hash) else {
+            return Ok(None);
+        };
+        let peeked = {
+            let store = self.inner.store.read();
+            store.idempotency.get(key).cloned().map(|existing| {
+                let run = store.runs.get(&existing.run_id);
+                (
+                    existing,
+                    run.map(|run| (run.session_id.clone(), run.status.clone())),
+                )
+            })
+        };
+        let Some((existing, run_info)) = peeked else {
+            return Ok(None);
+        };
+        if existing.request_hash != hash {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+            return Err(AdmitError::IdempotencyConflict);
+        }
+        let store = self.inner.store.write();
+        let Some(current) = store.idempotency.get(key) else {
+            return Ok(None);
+        };
+        if current.request_hash != hash {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+            return Err(AdmitError::IdempotencyConflict);
+        }
+        let (session_id, status) = store
+            .runs
+            .get(&current.run_id)
+            .map(|run| (run.session_id.clone(), run.status.clone()))
+            .or(run_info)
+            .unwrap_or_else(|| (String::new(), "unknown".to_string()));
+        Ok(Some(AdmittedRun {
+            run_id: current.run_id.clone(),
+            session_id,
+            status,
+            replayed: true,
+        }))
+    }
+
+    fn finish_durable_replay(&self, data: &JsonValue) -> Result<AdmittedRun, AdmitError> {
+        let run_row = data
+            .get("run")
+            .and_then(|run| run.get("rows"))
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                AdmitError::Persistence("replayed admission omitted the existing run".to_string())
+            })?;
+        let replayed_run_id = admission_run_str(&run_row, ADMISSION_RUN_COL_ID)
+            .unwrap_or_default()
+            .to_string();
+        let replayed_session = admission_run_str(&run_row, ADMISSION_RUN_COL_SESSION_ID)
+            .unwrap_or_default()
+            .to_string();
+        let replayed_status = admission_run_str(&run_row, ADMISSION_RUN_COL_STATUS)
+            .unwrap_or("unknown")
+            .to_string();
+        let store = self.inner.store.write();
+        if let Some(run) = store.runs.get(&replayed_run_id) {
+            return Ok(AdmittedRun {
+                run_id: replayed_run_id,
+                session_id: run.session_id.clone(),
+                status: run.status.clone(),
+                replayed: true,
+            });
+        }
+        Ok(AdmittedRun {
+            run_id: replayed_run_id,
+            session_id: replayed_session,
+            status: replayed_status,
+            replayed: true,
+        })
+    }
+
+    fn recheck_admission_after_commit(
+        &self,
+        store: &GatewayStore,
+        generation: u64,
+        key: Option<&str>,
+        hash: Option<&str>,
+        run_id: &str,
+    ) -> Result<Option<AdmittedRun>, AdmitError> {
+        let current_generation = self.inner.store_generation.load(Ordering::Acquire);
+        if current_generation != generation {
+            tracing::debug!(
+                current_generation,
+                generation,
+                "admission store generation changed during durable commit"
+            );
+        }
+        if let Some(existing) = store.runs.get(run_id) {
+            return Ok(Some(AdmittedRun {
+                run_id: run_id.to_string(),
+                session_id: existing.session_id.clone(),
+                status: existing.status.clone(),
+                replayed: true,
+            }));
+        }
+        if let (Some(key), Some(hash)) = (key, hash)
+            && let Some(existing) = store.idempotency.get(key)
+        {
+            if existing.request_hash != hash {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                return Err(AdmitError::IdempotencyConflict);
+            }
+            let (session_id, status) = store
+                .runs
+                .get(&existing.run_id)
+                .map(|run| (run.session_id.clone(), run.status.clone()))
+                .unwrap_or_else(|| (String::new(), "unknown".to_string()));
+            return Ok(Some(AdmittedRun {
+                run_id: existing.run_id.clone(),
+                session_id,
+                status,
+                replayed: true,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn reconstruct_admitted_messages(
+        &self,
+        context: &RunContext,
+    ) -> Result<JsonValue, RunContextError> {
+        let message_id = context
+            .metadata
+            .get("message_id")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid_context_metadata(&context.run_id, "message id is missing"))?;
+        let store = self.inner.store.read();
+        let session = store.sessions.get(&context.session_id).ok_or_else(|| {
+            invalid_context_metadata(&context.run_id, "session messages are missing")
+        })?;
+        let cutoff = session
+            .messages
+            .iter()
+            .position(|message| message.id == message_id)
+            .ok_or_else(|| {
+                invalid_context_metadata(&context.run_id, "admitted message is missing")
+            })?;
+        serde_json::to_value(&session.messages[..=cutoff]).map_err(|error| {
+            invalid_context_metadata(
+                &context.run_id,
+                &format!("session messages could not be reconstructed: {error}"),
+            )
         })
     }
 
@@ -785,7 +1313,7 @@ impl AgentService {
     /// from the `Complete` value, `run.cancelled` from a typed cancellation,
     /// or `run.failed` from any other typed error. Nothing is published after
     /// the terminal commit.
-    pub async fn run_worker(self: Arc<Self>, run_id: String, input: String) {
+    pub async fn run_worker(self: Arc<Self>, run_id: String, _input: String) {
         tokio::task::yield_now().await;
         let Some(handle) = self
             .inner
@@ -804,6 +1332,23 @@ impl AgentService {
             };
             run.session_id.clone()
         };
+        if let Err(error) = self.verify_run_context(&run_id) {
+            tracing::error!(
+                run_id = %run_id,
+                error = %error,
+                "run context verification failed before RSS execution"
+            );
+            self.finish_failed(
+                &run_id,
+                json!({
+                    "status": "failed",
+                    "error_code": "run_context_mismatch",
+                    "error_message": "the admitted run context no longer matches the loaded registry",
+                }),
+            )
+            .await;
+            return;
+        }
         let cancellation = handle.cancel.clone();
 
         if cancellation.requested().is_some() {
@@ -816,7 +1361,7 @@ impl AgentService {
             let http_config = self.inner.http_config.clone();
             let sqlite_policy = self.inner.config.sqlite.clone();
             let run_timeout = self.inner.config.run_timeout;
-            let context = self.build_run_context(&run_id, &session_id, &input);
+            let context = self.build_run_context(&run_id);
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling
             // (backpressure). The delivery task validates, sequences, appends
@@ -910,7 +1455,13 @@ impl AgentService {
                 }
             }
         } else {
-            input.clone()
+            self.inner
+                .contexts
+                .lock()
+                .expect("contexts lock")
+                .get(&run_id)
+                .map(|context| context.input.to_string())
+                .expect("run context was verified before completion")
         };
 
         if cancellation.requested().is_some() {
@@ -1285,47 +1836,468 @@ impl AgentService {
         .expect("terminal commit task must complete")
     }
 
+    fn resolve_provider_profile(
+        &self,
+        provider: Option<&str>,
+    ) -> Result<ProviderProfile, ProviderProfileError> {
+        let provider = provider.unwrap_or("local-agent");
+        if let Some(profile) = self.inner.provider_profiles.read().get(provider).cloned() {
+            return Ok(profile);
+        }
+        ProviderProfile::builtin(provider.to_string())
+    }
+
+    fn make_admitted_context(
+        &self,
+        admission: &ContextAdmissionInput,
+        snapshot: &RunAdmissionSnapshot,
+    ) -> RunContext {
+        let provider_options = snapshot.provider_profile.options().clone();
+        let tool_schemas = snapshot.registry.schemas();
+        let limits = effective_limits_json(&snapshot.limits, &self.inner.config);
+        let mut metadata = Map::new();
+        metadata.insert(
+            "schema_version".to_string(),
+            JsonValue::from(RUN_CONTEXT_METADATA_VERSION),
+        );
+        metadata.insert(
+            "run_id".to_string(),
+            JsonValue::String(admission.run_id.clone()),
+        );
+        metadata.insert(
+            "session_id".to_string(),
+            JsonValue::String(admission.session_id.clone()),
+        );
+        metadata.insert(
+            "registry_identity".to_string(),
+            JsonValue::String(snapshot.registry.identity().to_string()),
+        );
+        metadata.insert(
+            "toolset_hash".to_string(),
+            JsonValue::String(snapshot.registry.identity().to_string()),
+        );
+        metadata.insert(
+            "provider_profile".to_string(),
+            JsonValue::String(snapshot.provider_profile.name.clone()),
+        );
+        metadata.insert(
+            "message_id".to_string(),
+            JsonValue::String(admission.message_id.clone()),
+        );
+        RunContext {
+            run_id: admission.run_id.clone(),
+            session_id: admission.session_id.clone(),
+            parent_run_id: admission.parent_run_id.clone(),
+            platform: admission.platform.clone(),
+            input: admission.input.clone(),
+            messages: serde_json::to_value(&admission.messages)
+                .expect("admitted session messages must be serializable"),
+            system_prompt: admission.system_prompt.clone(),
+            model: admission.model.clone(),
+            provider: admission.provider.clone(),
+            provider_options,
+            tool_schemas,
+            limits,
+            metadata: JsonValue::Object(metadata),
+        }
+    }
+
+    fn cache_context(&self, context: RunContext, registry: Option<ToolRegistrySnapshot>) {
+        let active_ids: HashSet<String> = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .iter()
+            .filter_map(|(run_id, handle)| (!handle.is_terminal()).then_some(run_id.clone()))
+            .collect();
+        let cache_capacity = self.inner.context_cache_capacity;
+        let mut evicted = None;
+        {
+            let mut contexts = self.inner.contexts.lock().expect("contexts lock");
+            if !contexts.contains_key(&context.run_id) && contexts.len() >= cache_capacity {
+                evicted = contexts
+                    .keys()
+                    .find(|run_id| !active_ids.contains(*run_id))
+                    .cloned();
+                if let Some(run_id) = &evicted {
+                    contexts.remove(run_id);
+                }
+            }
+            contexts.insert(context.run_id.clone(), context.clone());
+        }
+        let mut registries = self
+            .inner
+            .context_registries
+            .lock()
+            .expect("context registries lock");
+        if let Some(run_id) = evicted {
+            registries.remove(&run_id);
+        }
+        if let Some(registry) = registry {
+            if !registries.contains_key(&context.run_id)
+                && registries.len() >= cache_capacity
+                && let Some(run_id) = registries
+                    .keys()
+                    .find(|run_id| !active_ids.contains(*run_id))
+                    .cloned()
+            {
+                registries.remove(&run_id);
+            }
+            registries.insert(context.run_id, registry);
+        } else {
+            registries.remove(&context.run_id);
+        }
+    }
+
+    fn load_persisted_context(&self, run_id: &str) -> Result<RunContext, RunContextError> {
+        let Some(persistence) = &self.inner.persistence else {
+            return Err(RunContextError::Missing {
+                run_id: run_id.to_string(),
+            });
+        };
+        let run_data = persistence
+            .run_get(run_id)
+            .map_err(|error| RunContextError::Persistence(format!("read run context: {error}")))?;
+        let run_row = run_data
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| RunContextError::Missing {
+                run_id: run_id.to_string(),
+            })?;
+        if admission_run_str(run_row, ADMISSION_RUN_COL_ID) != Some(run_id) {
+            return Err(invalid_context_metadata(
+                run_id,
+                "run record id does not match the requested run",
+            ));
+        }
+        let persisted_input = admission_run_str(run_row, ADMISSION_RUN_COL_INPUT_JSON)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid_context_metadata(run_id, "run context snapshot is missing"))?;
+        let envelope: JsonValue = serde_json::from_str(persisted_input).map_err(|error| {
+            invalid_context_metadata(run_id, &format!("run context snapshot is invalid: {error}"))
+        })?;
+        if envelope.get("schema_version").and_then(JsonValue::as_u64)
+            != Some(RUN_CONTEXT_METADATA_VERSION)
+        {
+            return Err(invalid_context_metadata(
+                run_id,
+                "unsupported run context snapshot schema version",
+            ));
+        }
+        let context_value = envelope
+            .get(RUN_CONTEXT_STORAGE_KEY)
+            .cloned()
+            .ok_or_else(|| invalid_context_metadata(run_id, "run context snapshot is missing"))?;
+        let mut context: RunContext = serde_json::from_value(context_value).map_err(|error| {
+            invalid_context_metadata(
+                run_id,
+                &format!("run context snapshot is incomplete: {error}"),
+            )
+        })?;
+        context.messages = self.reconstruct_admitted_messages(&context)?;
+        verify_context_metadata(&context)?;
+        if context.run_id != run_id {
+            return Err(invalid_context_metadata(
+                run_id,
+                "run id does not match the persisted context",
+            ));
+        }
+        let row_session_id = admission_run_str(run_row, ADMISSION_RUN_COL_SESSION_ID)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid_context_metadata(run_id, "run session id is missing"))?;
+        if context.session_id != row_session_id {
+            return Err(invalid_context_metadata(
+                run_id,
+                "session id does not match the run record",
+            ));
+        }
+        if context.parent_run_id != optional_string(run_row.get(ADMISSION_RUN_COL_PARENT_RUN_ID)) {
+            return Err(invalid_context_metadata(
+                run_id,
+                "parent run id does not match the run record",
+            ));
+        }
+        if context.provider != optional_string(run_row.get(ADMISSION_RUN_COL_PROVIDER)) {
+            return Err(invalid_context_metadata(
+                run_id,
+                "provider does not match the run record",
+            ));
+        }
+        if admission_run_str(run_row, ADMISSION_RUN_COL_MODEL) != Some(context.model.as_str()) {
+            return Err(invalid_context_metadata(
+                run_id,
+                "model does not match the run record",
+            ));
+        }
+        let registry_identity = context
+            .metadata
+            .get("registry_identity")
+            .and_then(JsonValue::as_str)
+            .expect("context metadata validation checked registry identity");
+        if admission_run_str(run_row, ADMISSION_RUN_COL_SCRIPT_HASH) != Some(registry_identity) {
+            return Err(invalid_context_metadata(
+                run_id,
+                "registry identity does not match the run record",
+            ));
+        }
+        Ok(context)
+    }
+
     /// Builds the canonical structured run context (gateway-api plan 4.2)
     /// that is passed as the sole argument to the exported `run(context)`
     /// callable.
-    fn build_run_context(&self, run_id: &str, session_id: &str, input: &str) -> VmValue {
-        let store = self.inner.store.read();
-        let session = store.sessions.get(session_id);
-        let run = store.runs.get(run_id);
-        let messages = session
-            .map(|session| serde_json::to_value(&session.messages).unwrap_or(JsonValue::Null))
-            .unwrap_or(JsonValue::Null);
-        let system_prompt = session.and_then(|session| session.view.system_prompt.clone());
-        let model = session
-            .map(|session| session.view.model.clone())
-            .unwrap_or_else(|| self.inner.config.model.clone());
-        let provider = session
-            .and_then(|session| session.view.provider.clone())
-            .or_else(|| self.inner.config.provider.clone());
-        let parent_run_id = run.and_then(|run| run.parent_run_id.clone());
-        let context = RunContext {
-            run_id: run_id.to_string(),
-            session_id: session_id.to_string(),
-            parent_run_id,
-            platform: "api_server".to_string(),
-            input: JsonValue::String(input.to_string()),
-            messages,
-            system_prompt,
-            model,
-            provider,
-            // Provider options and tool schemas arrive with the provider and
-            // tool milestones; the canonical shape is present from the start.
-            provider_options: JsonValue::Object(Default::default()),
-            tool_schemas: JsonValue::Array(Vec::new()),
-            limits: json!({
-                "max_events": self.inner.config.max_events_per_run,
-                "max_event_bytes": self.inner.config.max_event_bytes,
-                "timeout_ms": self.inner.config.run_timeout.as_millis(),
-            }),
-            metadata: JsonValue::Object(Default::default()),
-        };
+    fn build_run_context(&self, run_id: &str) -> VmValue {
+        let context = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+            .expect("run context was verified before execution");
         context.to_vm_value()
     }
+}
+
+/// Validates the service-owned idempotency-key grammar before any admission
+/// storage command runs. A Rust `&str` is already valid UTF-8; its byte length
+/// is used deliberately so multibyte keys consume their actual serialized
+/// budget. The accepted grammar is one or more visible Unicode scalar values:
+/// whitespace and control characters are rejected.
+fn validate_idempotency_key(key: Option<&str>) -> Result<(), String> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    validate_visible_name(key, "idempotency key", MAX_IDEMPOTENCY_KEY_BYTES)
+}
+
+fn validate_idempotency_pair(key: Option<&str>, hash: Option<&str>) -> Result<(), String> {
+    validate_idempotency_key(key)?;
+    match (key, hash) {
+        (None, None | Some("")) => Ok(()),
+        (None, Some(_)) => Err("idempotency hash requires an idempotency key".to_string()),
+        (Some(_), None | Some("")) => {
+            Err("idempotency hash is required when an idempotency key is present".to_string())
+        }
+        (Some(_), Some(hash)) => validate_request_hash(hash),
+    }
+}
+
+fn admission_run_str(row: &[JsonValue], index: usize) -> Option<&str> {
+    row.get(index).and_then(JsonValue::as_str)
+}
+
+fn persisted_run_context_json(context: &RunContext) -> Result<String, AdmitError> {
+    verify_context_metadata(context).map_err(admit_context_error)?;
+    let mut snapshot = context.clone();
+    snapshot.messages = JsonValue::Array(Vec::new());
+    let envelope = canonicalize_json_value(&json!({
+        "schema_version": RUN_CONTEXT_METADATA_VERSION,
+        RUN_CONTEXT_STORAGE_KEY: snapshot,
+    }));
+    let serialized = serde_json::to_string(&envelope).map_err(|error| {
+        AdmitError::Invalid(format!("run context serialization failed: {error}"))
+    })?;
+    if serialized.len() > MAX_RUN_CONTEXT_STORAGE_BYTES {
+        return Err(AdmitError::Invalid(
+            "run context snapshot exceeds the size limit".to_string(),
+        ));
+    }
+    Ok(serialized)
+}
+
+fn normalize_loaded_session_messages(store: &Arc<RwLock<GatewayStore>>) {
+    let mut store = store.write();
+    for session in store.sessions.values_mut() {
+        for message in &mut session.messages {
+            let Some(envelope) = message.content.as_object() else {
+                continue;
+            };
+            if envelope.get("schema_version").and_then(JsonValue::as_u64)
+                != Some(RUN_CONTEXT_METADATA_VERSION)
+            {
+                continue;
+            }
+            let Some(input) = envelope
+                .get(RUN_CONTEXT_STORAGE_KEY)
+                .and_then(JsonValue::as_object)
+                .and_then(|context| context.get("input"))
+            else {
+                continue;
+            };
+            message.content = input.clone();
+        }
+    }
+}
+
+fn admit_context_error(error: RunContextError) -> AdmitError {
+    match error {
+        RunContextError::Persistence(message) => AdmitError::Persistence(message),
+        other => AdmitError::Invalid(other.to_string()),
+    }
+}
+
+fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {
+    RunContextError::InvalidMetadata {
+        run_id: run_id.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn optional_string(value: Option<&JsonValue>) -> Option<String> {
+    value
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn effective_limits_json(limits: &RunLimits, config: &AgentGatewayConfig) -> JsonValue {
+    let mut object = match limits.to_json() {
+        JsonValue::Object(object) => object,
+        _ => Map::new(),
+    };
+    object.insert(
+        "max_events".to_string(),
+        JsonValue::from(config.max_events_per_run),
+    );
+    object.insert(
+        "max_event_bytes".to_string(),
+        JsonValue::from(config.max_event_bytes),
+    );
+    object.insert(
+        "timeout_ms".to_string(),
+        JsonValue::from(u64::try_from(config.run_timeout.as_millis()).unwrap_or(u64::MAX)),
+    );
+    JsonValue::Object(object)
+}
+
+fn canonicalize_json_value(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Array(values) => JsonValue::Array(
+            values
+                .iter()
+                .map(canonicalize_json_value)
+                .collect::<Vec<_>>(),
+        ),
+        JsonValue::Object(entries) => {
+            let mut keys = entries.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut object = Map::new();
+            for key in keys {
+                object.insert(
+                    key.clone(),
+                    canonicalize_json_value(entries.get(key).expect("key came from object")),
+                );
+            }
+            JsonValue::Object(object)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn verify_context_metadata(context: &RunContext) -> Result<(), RunContextError> {
+    let run_id = &context.run_id;
+    let metadata = context
+        .metadata
+        .as_object()
+        .ok_or_else(|| invalid_context_metadata(run_id, "context metadata is not an object"))?;
+    if metadata.get("schema_version").and_then(JsonValue::as_u64)
+        != Some(RUN_CONTEXT_METADATA_VERSION)
+    {
+        return Err(invalid_context_metadata(
+            run_id,
+            "unsupported metadata schema version",
+        ));
+    }
+    if metadata.get("run_id").and_then(JsonValue::as_str) != Some(run_id) {
+        return Err(invalid_context_metadata(
+            run_id,
+            "run id does not match metadata",
+        ));
+    }
+    if metadata.get("session_id").and_then(JsonValue::as_str) != Some(context.session_id.as_str()) {
+        return Err(invalid_context_metadata(
+            run_id,
+            "session id does not match metadata",
+        ));
+    }
+    let registry_identity = metadata
+        .get("registry_identity")
+        .and_then(JsonValue::as_str)
+        .filter(|identity| identity.starts_with("sha256:") && identity.len() == 71)
+        .ok_or_else(|| invalid_context_metadata(run_id, "registry identity is invalid"))?;
+    if metadata.get("toolset_hash").and_then(JsonValue::as_str) != Some(registry_identity) {
+        return Err(invalid_context_metadata(
+            run_id,
+            "toolset hash does not match registry identity",
+        ));
+    }
+    let message_id = metadata
+        .get("message_id")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_context_metadata(run_id, "message id is missing"))?;
+    let _ = message_id;
+    for bulky in ["provider_options", "tool_schemas", "limits", "input"] {
+        if metadata.contains_key(bulky) {
+            return Err(invalid_context_metadata(
+                run_id,
+                "context metadata must not duplicate run payload fields",
+            ));
+        }
+    }
+    let tool_schemas = context
+        .tool_schemas
+        .as_array()
+        .filter(|schemas| !schemas.is_empty())
+        .ok_or_else(|| {
+            invalid_context_metadata(run_id, "tool schema snapshot must be non-empty")
+        })?;
+    let _ = tool_schemas;
+    let messages = context
+        .messages
+        .as_array()
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| invalid_context_metadata(run_id, "message baseline must be non-empty"))?;
+    if messages.iter().any(JsonValue::is_null) {
+        return Err(invalid_context_metadata(
+            run_id,
+            "message baseline contains a null entry",
+        ));
+    }
+    let provider_profile_name = metadata
+        .get("provider_profile")
+        .and_then(JsonValue::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid_context_metadata(run_id, "provider profile is missing"))?;
+    ProviderProfile::new(provider_profile_name, context.provider_options.clone())
+        .map_err(|error| invalid_context_metadata(run_id, &error.to_string()))?;
+    RunLimits::from_json(&context.limits)
+        .map_err(|error| invalid_context_metadata(run_id, &error.to_string()))?;
+    Ok(())
+}
+
+fn verify_context_registry(
+    context: &RunContext,
+    current_identity: &str,
+) -> Result<(), RunContextError> {
+    verify_context_metadata(context)?;
+    let expected = context
+        .metadata
+        .get("registry_identity")
+        .and_then(JsonValue::as_str)
+        .expect("metadata validation checked registry identity");
+    if expected != current_identity {
+        return Err(RunContextError::RegistryMismatch {
+            run_id: context.run_id.clone(),
+            expected: expected.to_string(),
+            actual: current_identity.to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl AgentService {
@@ -1782,14 +2754,34 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
             let ttl = inner.config.terminal_run_ttl;
             let now = Instant::now();
-            let mut runs = inner.runs.lock().expect("runs lock");
-            runs.retain(|_run_id, handle| {
-                handle
-                    .terminal_at
+            let expired_run_ids: HashSet<String> = {
+                let mut runs = inner.runs.lock().expect("runs lock");
+                let mut expired = HashSet::new();
+                runs.retain(|run_id, handle| {
+                    let keep = handle
+                        .terminal_at
+                        .lock()
+                        .expect("terminal lock")
+                        .is_none_or(|terminal_at| terminal_at + ttl > now);
+                    if !keep {
+                        expired.insert(run_id.clone());
+                    }
+                    keep
+                });
+                expired
+            };
+            if !expired_run_ids.is_empty() {
+                inner
+                    .contexts
                     .lock()
-                    .expect("terminal lock")
-                    .is_none_or(|terminal_at| terminal_at + ttl > now)
-            });
+                    .expect("contexts lock")
+                    .retain(|run_id, _| !expired_run_ids.contains(run_id));
+                inner
+                    .context_registries
+                    .lock()
+                    .expect("context registries lock")
+                    .retain(|run_id, _| !expired_run_ids.contains(run_id));
+            }
         }
     });
 }
