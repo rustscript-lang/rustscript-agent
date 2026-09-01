@@ -8,6 +8,7 @@ use rustscript_agent::config::ProcessToolConfig;
 use rustscript_agent::tools::{
     NativeToolExecutor, ProcessOwner, ProcessTable, TerminalExecutor, TerminalRequest, ToolResult,
 };
+use rustscript_vm::CancellationToken;
 use serde_json::json;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -421,4 +422,99 @@ fn config_rejects_zero_and_over_large_process_budgets() {
     let mut invalid = base;
     invalid.max_timeout = Duration::from_secs(60 * 60 + 1);
     assert!(invalid.validate().is_err());
+}
+
+fn tight_timeout_config(fixture: &Fixture) -> ProcessToolConfig {
+    let mut config = fixture.config();
+    config.default_timeout = Duration::from_millis(40);
+    config.max_timeout = Duration::from_millis(400);
+    config
+}
+
+#[test]
+fn no_controls_wrappers_accept_timeout_above_default_up_to_max() {
+    let fixture = Fixture::new();
+    let executor = fixture.executor_with_config(tight_timeout_config(&fixture));
+
+    let run = executor.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "0.12".to_string()],
+        timeout_ms: Some(300),
+        ..TerminalRequest::default()
+    });
+    assert!(run.ok, "{run:?}");
+    assert_eq!(run.data["exit_code"], 0);
+
+    let execute = executor.execute(&json!({
+        "argv": ["/bin/sleep", "0.12"],
+        "timeout_ms": 300
+    }));
+    assert!(execute.ok, "{execute:?}");
+    assert_eq!(execute.data["exit_code"], 0);
+
+    let over_max = executor.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "0.12".to_string()],
+        timeout_ms: Some(401),
+        ..TerminalRequest::default()
+    });
+    assert!(!over_max.ok, "{over_max:?}");
+    assert_eq!(error_code(&over_max), "invalid_timeout");
+}
+
+#[test]
+fn omitted_timeout_still_uses_default_internally() {
+    let fixture = Fixture::new();
+    let executor = fixture.executor_with_config(tight_timeout_config(&fixture));
+    let started = Instant::now();
+    let result = executor.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+        ..TerminalRequest::default()
+    });
+    assert!(!result.ok, "{result:?}");
+    assert_eq!(error_code(&result), "deadline_elapsed");
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "omitted timeout used {:?} instead of default_timeout",
+        started.elapsed()
+    );
+
+    let started = Instant::now();
+    let execute = executor.execute(&json!({
+        "argv": ["/bin/sleep", "1"]
+    }));
+    assert!(!execute.ok, "{execute:?}");
+    assert_eq!(error_code(&execute), "deadline_elapsed");
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "omitted execute timeout used {:?} instead of default_timeout",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn explicit_external_deadline_still_clamps_timeout_above_default() {
+    let fixture = Fixture::new();
+    let executor = fixture.executor_with_config(tight_timeout_config(&fixture));
+    let started = Instant::now();
+    let result = executor.execute_with_controls(
+        &json!({
+            "argv": ["/bin/sleep", "1"],
+            "timeout_ms": 300
+        }),
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_millis(20),
+    );
+    assert!(!result.ok, "{result:?}");
+    assert_eq!(error_code(&result), "deadline_elapsed");
+    assert!(started.elapsed() < Duration::from_millis(200));
+
+    let started = Instant::now();
+    let run = executor.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+        timeout_ms: Some(300),
+        deadline: Some(Instant::now() + Duration::from_millis(20)),
+        ..TerminalRequest::default()
+    });
+    assert!(!run.ok, "{run:?}");
+    assert_eq!(error_code(&run), "deadline_elapsed");
+    assert!(started.elapsed() < Duration::from_millis(200));
 }

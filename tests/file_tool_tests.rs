@@ -66,7 +66,7 @@ fn error_code(result: &ToolResult) -> &str {
 }
 
 fn owner() -> ArtifactOwner {
-    ArtifactOwner::new("profile-test", "session-test", "run-test")
+    ArtifactOwner::new("profile-test", "session-test", "run-test").expect("owner")
 }
 
 fn synthetic_artifact_id(index: usize) -> String {
@@ -245,10 +245,15 @@ fn oversized_result_without_owner_is_bounded_output_too_large() {
 
     let result = tools.read_file(ReadFileRequest::new("large.txt"));
     assert!(!result.ok);
-    assert_eq!(error_code(&result), "output_too_large");
-    assert!(result.content.len() <= 32);
+    assert_eq!(error_code(&result), "output_truncated");
     assert!(result.artifacts.is_empty());
-    assert!(!result.truncated);
+    assert!(result.truncated);
+    let encoded = serde_json::to_vec(&result).expect("serialize");
+    assert!(
+        encoded.len() < 512,
+        "fail-closed envelope should stay compact: {}",
+        encoded.len()
+    );
 }
 
 #[test]
@@ -326,14 +331,14 @@ fn patch_reports_binary_and_invalid_utf8_as_distinct_typed_errors() {
 #[test]
 fn oversized_read_output_is_stored_as_bounded_owned_artifact() {
     let fixture = Fixture::new();
-    let payload = "0123456789abcdef\n".repeat(16);
+    let payload = "0123456789abcdef\n".repeat(256);
     fs::write(fixture.root.join("large.txt"), &payload).expect("write large fixture");
     let mut config = FileToolConfig::for_workspace(&fixture.root);
-    config.max_output_bytes = 32;
-    config.max_read_bytes = 1024;
+    config.max_output_bytes = 2048;
+    config.max_read_bytes = 8192;
     config.max_search_output_bytes = 32;
-    config.artifact_store.max_object_bytes = 1024;
-    config.artifact_store.max_total_bytes = 2048;
+    config.artifact_store.max_object_bytes = 8192;
+    config.artifact_store.max_total_bytes = 16_384;
     let tools = fixture.tools_with_config(config);
     let tools = tools.with_owner(owner());
 
@@ -341,7 +346,7 @@ fn oversized_read_output_is_stored_as_bounded_owned_artifact() {
     assert!(result.ok);
     assert!(result.truncated);
     assert_eq!(result.artifacts.len(), 1);
-    assert!(result.content.len() <= 32);
+    assert!(serde_json::to_vec(&result).expect("serialize").len() <= 2048);
     assert!(result.content.contains("artifact"));
     assert!(!result.content.contains("0123456789abcdef"));
 
@@ -604,7 +609,8 @@ fn artifact_store_enforces_opaque_ids_ownership_and_exhaustion() {
     };
     let store = ArtifactStore::with_config(config).expect("create artifact store");
     let first_owner = owner();
-    let other_owner = ArtifactOwner::new("other-profile", "other-session", "other-run");
+    let other_owner =
+        ArtifactOwner::new("other-profile", "other-session", "other-run").expect("other owner");
 
     let first = store
         .put(&first_owner, b"artifact-data")
@@ -812,7 +818,8 @@ fn artifact_ttl_cleanup_unlinks_files_and_reclaims_count_bytes_per_owner() {
     };
     let store = ArtifactStore::with_config(config).expect("create reclaim artifact store");
     let first_owner = owner();
-    let other_owner = ArtifactOwner::new("other-profile", "other-session", "other-run");
+    let other_owner =
+        ArtifactOwner::new("other-profile", "other-session", "other-run").expect("other owner");
     let start = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
     store.set_now(start);
 
@@ -887,10 +894,10 @@ fn concurrent_put_and_cleanup_keep_count_bytes_aligned_with_disk() {
     };
     let store = std::sync::Arc::new(ArtifactStore::with_config(config).expect("create race store"));
     let owners = [
-        ArtifactOwner::new("p0", "s0", "r0"),
-        ArtifactOwner::new("p1", "s1", "r1"),
-        ArtifactOwner::new("p2", "s2", "r2"),
-        ArtifactOwner::new("p3", "s3", "r3"),
+        ArtifactOwner::new("p0", "s0", "r0").expect("owner 0"),
+        ArtifactOwner::new("p1", "s1", "r1").expect("owner 1"),
+        ArtifactOwner::new("p2", "s2", "r2").expect("owner 2"),
+        ArtifactOwner::new("p3", "s3", "r3").expect("owner 3"),
     ];
 
     std::thread::scope(|scope| {
@@ -1137,7 +1144,7 @@ fn search_huge_fanout_enumerates_with_config_budget_and_hard_elapsed_bound() {
 #[test]
 fn artifact_root_is_outside_workspace_and_invisible_to_read_and_search() {
     let fixture = Fixture::new();
-    let payload = "secret-artifact-payload-xyz\n".repeat(8);
+    let payload = "secret-artifact-payload-xyz\n".repeat(200);
     fs::write(fixture.root.join("large.txt"), &payload).expect("write large fixture");
     let config = FileToolConfig::for_workspace(&fixture.root);
     assert!(
@@ -1160,11 +1167,11 @@ fn artifact_root_is_outside_workspace_and_invisible_to_read_and_search() {
     );
 
     let mut config = FileToolConfig::for_workspace(&fixture.root);
-    config.max_output_bytes = 32;
-    config.max_read_bytes = 1024;
+    config.max_output_bytes = 2048;
+    config.max_read_bytes = 8192;
     config.max_search_output_bytes = 32;
-    config.artifact_store.max_object_bytes = 1024;
-    config.artifact_store.max_total_bytes = 2048;
+    config.artifact_store.max_object_bytes = 8192;
+    config.artifact_store.max_total_bytes = 16_384;
     let tools = fixture.tools_with_config(config).with_owner(owner());
     let stored = tools.read_file(ReadFileRequest::new("large.txt"));
     assert!(stored.ok);

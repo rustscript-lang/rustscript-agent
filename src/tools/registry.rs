@@ -2,6 +2,8 @@ use std::{collections::BTreeSet, io};
 
 use serde_json::{Map, Value, json};
 
+use crate::config::MAX_PROCESS_TOOL_TIMEOUT;
+
 use super::types::{NativeToolExecutor, RiskClass, ToolDescriptor, Toolset};
 
 /// Computes a SHA-256 digest for the deterministic registry fingerprint.
@@ -1111,6 +1113,15 @@ pub fn default_tool_registry() -> Result<ToolRegistry, ToolRegistryError> {
     ToolRegistry::builtin()
 }
 
+/// Schema for `timeout_ms` using the compile-time millisecond ceiling when it
+/// fits in `u64`. Runtime still enforces `ProcessToolConfig.max_timeout`.
+fn timeout_ms_schema() -> Value {
+    match u64::try_from(MAX_PROCESS_TOOL_TIMEOUT.as_millis()) {
+        Ok(maximum) => json!({"type": "integer", "minimum": 1, "maximum": maximum}),
+        Err(_) => json!({"type": "integer", "minimum": 1}),
+    }
+}
+
 /// Returns the six initial inert registrations in their canonical declaration
 /// order. The registry constructor freezes that order for the initial names.
 pub fn builtin_entries() -> Vec<ToolRegistryEntry> {
@@ -1227,7 +1238,7 @@ pub fn builtin_entries() -> Vec<ToolRegistryEntry> {
                         "action": {"type": "string", "enum": ["poll", "wait", "log", "write", "close", "kill"]},
                         "process_id": {"type": "string"},
                         "data": {"type": "string"},
-                        "timeout_ms": {"type": "integer", "minimum": 1},
+                        "timeout_ms": timeout_ms_schema(),
                         "offset": {"type": "integer", "minimum": 0},
                         "limit": {"type": "integer", "minimum": 1}
                     },

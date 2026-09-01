@@ -214,7 +214,7 @@ fn builtin_registry_descriptors_freeze_toolsets_risks_schemas_and_executors() {
                         "action": {"type": "string", "enum": ["poll", "wait", "log", "write", "close", "kill"]},
                         "process_id": {"type": "string"},
                         "data": {"type": "string"},
-                        "timeout_ms": {"type": "integer", "minimum": 1},
+                        "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
                         "offset": {"type": "integer", "minimum": 0},
                         "limit": {"type": "integer", "minimum": 1}
                     },

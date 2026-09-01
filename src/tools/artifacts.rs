@@ -19,6 +19,7 @@ use rustscript_vm::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::{ProcessArtifactSink, ProcessOwner, ToolOwner};
 use crate::config::{ARTIFACT_RECONCILE_OVERHEAD_ENTRIES, ArtifactStoreConfig};
 
 const TEMP_PREFIX: &str = ".rustscript-agent-tmp-";
@@ -28,22 +29,67 @@ const MANIFEST_VERSION: u32 = 1;
 /// Owner identity used to scope artifact retrieval.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ArtifactOwner {
-    profile: String,
-    session: String,
-    run: String,
+    owner: ToolOwner,
 }
 
 impl ArtifactOwner {
-    /// Creates an owner triple. Empty labels are accepted and compared exactly.
+    /// Creates a validated owner triple. Invalid labels fail closed.
     pub fn new(
         profile: impl Into<String>,
         session: impl Into<String>,
         run: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        Ok(Self {
+            owner: ToolOwner::new(profile, session, run)?,
+        })
+    }
+
+    /// Profile label.
+    pub fn profile(&self) -> &str {
+        self.owner.profile()
+    }
+
+    /// Session label.
+    pub fn session(&self) -> &str {
+        self.owner.session()
+    }
+
+    /// Run label.
+    pub fn run(&self) -> &str {
+        self.owner.run()
+    }
+}
+
+impl From<ToolOwner> for ArtifactOwner {
+    fn from(owner: ToolOwner) -> Self {
+        Self { owner }
+    }
+}
+
+impl From<ArtifactOwner> for ToolOwner {
+    fn from(owner: ArtifactOwner) -> Self {
+        owner.owner
+    }
+}
+
+impl From<&ArtifactOwner> for ToolOwner {
+    fn from(owner: &ArtifactOwner) -> Self {
+        owner.owner.clone()
+    }
+}
+
+impl From<ProcessOwner> for ArtifactOwner {
+    fn from(owner: ProcessOwner) -> Self {
         Self {
-            profile: profile.into(),
-            session: session.into(),
-            run: run.into(),
+            owner: ToolOwner::from(owner),
+        }
+    }
+}
+
+impl From<&ProcessOwner> for ArtifactOwner {
+    fn from(owner: &ProcessOwner) -> Self {
+        Self {
+            owner: ToolOwner::from(owner),
         }
     }
 }
@@ -307,6 +353,64 @@ impl ArtifactStore {
         Ok(removed)
     }
 
+    /// Removes every object owned by `owner`. TTL cleanup remains additional.
+    pub fn cleanup_owner(&self, owner: &ArtifactOwner) -> Result<usize, ArtifactError> {
+        self.cleanup_matching(|candidate| candidate == owner)
+    }
+
+    /// Removes every object owned by `profile`/`session`/`run`.
+    pub fn cleanup_run(
+        &self,
+        profile: &str,
+        session: &str,
+        run: &str,
+    ) -> Result<usize, ArtifactError> {
+        self.cleanup_matching(|candidate| {
+            candidate.profile() == profile
+                && candidate.session() == session
+                && candidate.run() == run
+        })
+    }
+
+    /// Removes every object owned by `profile`/`session`.
+    pub fn cleanup_session(&self, profile: &str, session: &str) -> Result<usize, ArtifactError> {
+        self.cleanup_matching(|candidate| {
+            candidate.profile() == profile && candidate.session() == session
+        })
+    }
+
+    /// Removes every object owned by `profile`.
+    pub fn cleanup_profile(&self, profile: &str) -> Result<usize, ArtifactError> {
+        self.cleanup_matching(|candidate| candidate.profile() == profile)
+    }
+
+    fn cleanup_matching(
+        &self,
+        predicate: impl Fn(&ArtifactOwner) -> bool,
+    ) -> Result<usize, ArtifactError> {
+        let mut state = self.state.lock();
+        let ids: Vec<String> = state
+            .objects
+            .iter()
+            .filter(|(_, record)| predicate(&record.owner))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut removed = 0usize;
+        for id in ids {
+            if !unlink_confined_leaf(&self.dir, &id) {
+                continue;
+            }
+            if let Some(record) = state.objects.remove(&id) {
+                state.committed_bytes = state.committed_bytes.saturating_sub(record.size);
+                removed = removed.saturating_add(1);
+            }
+        }
+        if removed > 0 {
+            persist_index(&self.root, &state)?;
+        }
+        Ok(removed)
+    }
+
     fn expire_locked(&self) -> Result<usize, ArtifactError> {
         let mut state = self.state.lock();
         self.expire_into(&mut state)
@@ -452,9 +556,9 @@ fn persist_index(root: &ConfinedFsRoot, state: &StoreState) -> Result<(), Artifa
             .iter()
             .map(|(id, record)| ManifestObject {
                 id: id.clone(),
-                profile: record.owner.profile.clone(),
-                session: record.owner.session.clone(),
-                run: record.owner.run.clone(),
+                profile: record.owner.profile().to_string(),
+                session: record.owner.session().to_string(),
+                run: record.owner.run().to_string(),
                 size: record.size as u64,
                 created_unix_ms: unix_ms(record.created_at),
                 expires_unix_ms: unix_ms(record.expires_at),
@@ -566,12 +670,19 @@ fn load_and_reconcile(
             let _ = unlink_confined_leaf(dir, &item.id);
             continue;
         }
+        let owner = match ArtifactOwner::new(item.profile, item.session, item.run) {
+            Ok(owner) => owner,
+            Err(_) => {
+                let _ = unlink_confined_leaf(dir, &item.id);
+                continue;
+            }
+        };
         let size = usize::try_from(disk_len).unwrap_or(usize::MAX);
         committed_bytes = committed_bytes.saturating_add(size);
         objects.insert(
             item.id,
             ObjectRecord {
-                owner: ArtifactOwner::new(item.profile, item.session, item.run),
+                owner,
                 size,
                 created_at: from_unix_ms(item.created_unix_ms),
                 expires_at,
@@ -752,6 +863,14 @@ fn valid_artifact_id(id: &str) -> bool {
 
 fn not_found() -> ArtifactError {
     ArtifactError::new("artifact_not_found", "artifact not found")
+}
+
+impl ProcessArtifactSink for ArtifactStore {
+    fn store(&self, owner: &ProcessOwner, bytes: &[u8]) -> Result<String, String> {
+        self.put(&ArtifactOwner::from(owner), bytes)
+            .map(|stored| stored.id)
+            .map_err(|error| error.message().to_string())
+    }
 }
 
 fn map_store_error(error: rustscript_vm::ConfinedFsError) -> ArtifactError {

@@ -13,10 +13,13 @@ use serde_json::{Map, Value, json};
 
 use crate::config::ProcessToolConfig;
 
-use super::{NativeToolExecutor, ToolDescriptor, ToolResult, builtin_descriptor};
+use super::{
+    NativeToolExecutor, ToolDescriptor, ToolOwner, ToolResult, builtin_descriptor,
+    enforce_serialized_tool_result_cap, serialized_tool_result_len,
+};
 
-const OWNER_FIELD_LIMIT: usize = 128;
 const PROCESS_NOT_FOUND_MESSAGE: &str = "process not found";
+const WRITE_POLL_SLICE: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ToolFailure {
@@ -40,9 +43,7 @@ impl ToolFailure {
 /// Owner scope that binds an opaque process id to profile/session/run.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ProcessOwner {
-    profile_id: String,
-    session_id: String,
-    run_id: String,
+    owner: ToolOwner,
 }
 
 impl ProcessOwner {
@@ -52,39 +53,42 @@ impl ProcessOwner {
         run_id: impl Into<String>,
     ) -> Result<Self, String> {
         Ok(Self {
-            profile_id: validate_owner_field(profile_id.into(), "profile_id")?,
-            session_id: validate_owner_field(session_id.into(), "session_id")?,
-            run_id: validate_owner_field(run_id.into(), "run_id")?,
+            owner: ToolOwner::new(profile_id, session_id, run_id)?,
         })
     }
 
     pub fn profile_id(&self) -> &str {
-        &self.profile_id
+        self.owner.profile()
     }
 
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        self.owner.session()
     }
 
     pub fn run_id(&self) -> &str {
-        &self.run_id
+        self.owner.run()
     }
 }
 
-fn validate_owner_field(value: String, name: &str) -> Result<String, String> {
-    if value.is_empty() {
-        return Err(format!("{name} must not be empty"));
+impl From<ToolOwner> for ProcessOwner {
+    fn from(owner: ToolOwner) -> Self {
+        Self { owner }
     }
-    if value.contains('\0') {
-        return Err(format!("{name} is invalid"));
-    }
-    if value.len() > OWNER_FIELD_LIMIT {
-        return Err(format!("{name} exceeds the configured bound"));
-    }
-    Ok(value)
 }
 
-/// Optional overflow sink. Task 3 artifacts are not implemented here.
+impl From<ProcessOwner> for ToolOwner {
+    fn from(owner: ProcessOwner) -> Self {
+        owner.owner
+    }
+}
+
+impl From<&ProcessOwner> for ToolOwner {
+    fn from(owner: &ProcessOwner) -> Self {
+        owner.owner.clone()
+    }
+}
+
+/// Optional overflow sink for owner-scoped artifact publication.
 pub trait ProcessArtifactSink: Send + Sync {
     fn store(&self, owner: &ProcessOwner, bytes: &[u8]) -> Result<String, String>;
 }
@@ -118,19 +122,19 @@ impl CleanupMask {
     fn matches(&self, owner: &ProcessOwner) -> bool {
         match self {
             Self::All => true,
-            Self::Profile(profile_id) => owner.profile_id == *profile_id,
+            Self::Profile(profile_id) => owner.profile_id() == *profile_id,
             Self::Session {
                 profile_id,
                 session_id,
-            } => owner.profile_id == *profile_id && owner.session_id == *session_id,
+            } => owner.profile_id() == *profile_id && owner.session_id() == *session_id,
             Self::Run {
                 profile_id,
                 session_id,
                 run_id,
             } => {
-                owner.profile_id == *profile_id
-                    && owner.session_id == *session_id
-                    && owner.run_id == *run_id
+                owner.profile_id() == *profile_id
+                    && owner.session_id() == *session_id
+                    && owner.run_id() == *run_id
             }
         }
     }
@@ -194,9 +198,9 @@ impl ProcessTable {
 
     pub fn cleanup_owner(&self, owner: &ProcessOwner) -> Result<usize, String> {
         Ok(self.cleanup_scope(CleanupMask::Run {
-            profile_id: owner.profile_id.clone(),
-            session_id: owner.session_id.clone(),
-            run_id: owner.run_id.clone(),
+            profile_id: owner.profile_id().to_string(),
+            session_id: owner.session_id().to_string(),
+            run_id: owner.run_id().to_string(),
         }))
     }
 
@@ -243,8 +247,8 @@ impl ProcessTable {
     pub(crate) fn register_foreground(
         table: &Arc<Self>,
         owner: &ProcessOwner,
+        token: CancellationToken,
     ) -> Result<(CancellationToken, ForegroundGuard), ToolFailure> {
-        let token = CancellationToken::new();
         let mut state = table.inner.lock();
         if owner_blocked(&state, owner) {
             token.cancel();
@@ -477,6 +481,45 @@ pub(crate) struct ProcessExecutorState {
     pub artifact_sink: Option<Arc<dyn ProcessArtifactSink>>,
 }
 
+/// Outer deadline for wrappers that do not receive caller run controls.
+///
+/// `default_timeout` is only the omitted-`timeout_ms` request/spawn/action default.
+/// The wrapper deadline must not be tighter than any validated request timeout, so
+/// this uses `max_timeout` with checked Instant arithmetic that saturates on overflow.
+pub(crate) fn no_controls_deadline(config: &ProcessToolConfig) -> Instant {
+    saturating_instant_add(Instant::now(), config.max_timeout)
+}
+
+pub(crate) fn saturating_instant_add(now: Instant, duration: Duration) -> Instant {
+    now.checked_add(duration).unwrap_or(now)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn resolve_action_timeout(
+    config: &ProcessToolConfig,
+    timeout_ms: Option<u64>,
+) -> Result<Option<Duration>, ToolFailure> {
+    match timeout_ms {
+        None => Ok(None),
+        Some(0) => Err(ToolFailure::new(
+            "invalid_timeout",
+            "timeout_ms must be positive",
+        )),
+        Some(ms) => {
+            if ms > duration_millis(config.max_timeout) {
+                return Err(ToolFailure::new(
+                    "invalid_timeout",
+                    "timeout exceeds the configured bound",
+                ));
+            }
+            Ok(Some(Duration::from_millis(ms)))
+        }
+    }
+}
+
 /// Owner-scoped executor for the `process` native slot.
 #[derive(Clone)]
 pub struct ProcessExecutor {
@@ -521,13 +564,45 @@ impl ProcessExecutor {
     }
 
     pub fn execute(&self, arguments: &Value) -> ToolResult {
+        self.execute_with_controls(
+            arguments,
+            &CancellationToken::new(),
+            no_controls_deadline(&self.inner.config),
+        )
+    }
+
+    pub fn execute_with_controls(
+        &self,
+        arguments: &Value,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
         match parse_process_request(arguments) {
-            Ok(request) => self.run(request),
+            Ok(request) => self.run_with_controls(request, cancellation, deadline),
             Err(failure) => failure.into_result(),
         }
     }
 
     pub fn run(&self, request: ProcessRequest) -> ToolResult {
+        self.run_with_controls(
+            request,
+            &CancellationToken::new(),
+            no_controls_deadline(&self.inner.config),
+        )
+    }
+
+    pub fn run_with_controls(
+        &self,
+        request: ProcessRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        if cancellation.is_cancelled() {
+            return ToolResult::failure("cancelled", "process was cancelled");
+        }
+        if Instant::now() >= deadline {
+            return ToolResult::failure("deadline_elapsed", "process deadline elapsed");
+        }
         if request.process_id.is_empty() {
             return process_not_found().into_result();
         }
@@ -541,12 +616,14 @@ impl ProcessExecutor {
         };
         match request.action {
             ProcessAction::Poll => self.poll(&handle),
-            ProcessAction::Wait => self.wait(&handle, request.timeout_ms),
+            ProcessAction::Wait => self.wait(&handle, request.timeout_ms, cancellation, deadline),
             ProcessAction::Log => self.log(&handle, request.offset, request.limit),
             ProcessAction::Write => self.write(
                 &handle,
                 request.data.as_deref().unwrap_or(""),
                 request.timeout_ms,
+                cancellation,
+                deadline,
             ),
             ProcessAction::Close => self.close(&handle),
             ProcessAction::Kill => self.kill(&handle),
@@ -560,33 +637,49 @@ impl ProcessExecutor {
         }
     }
 
-    fn wait(&self, handle: &BoundedProcessHandle, timeout_ms: Option<u64>) -> ToolResult {
-        if let Some(timeout_ms) = timeout_ms
-            && timeout_ms == 0
-        {
-            return ToolResult::failure("invalid_timeout", "timeout_ms must be positive");
+    fn wait(
+        &self,
+        handle: &BoundedProcessHandle,
+        timeout_ms: Option<u64>,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        let timeout = match resolve_action_timeout(&self.inner.config, timeout_ms) {
+            Ok(timeout) => timeout,
+            Err(failure) => return failure.into_result(),
+        };
+        if cancellation.is_cancelled() {
+            return ToolResult::failure("cancelled", "process was cancelled");
+        }
+        if Instant::now() >= deadline {
+            return ToolResult::failure("deadline_elapsed", "process deadline elapsed");
         }
         let process_deadline = handle.deadline();
-        let action_deadline = timeout_ms
-            .map(|ms| Instant::now() + Duration::from_millis(ms))
-            .unwrap_or(process_deadline);
-        if action_deadline >= process_deadline {
-            match handle.wait(None) {
-                Ok(status) => self.view(handle, Some(status), true),
-                Err(error) => map_handle_error(handle, error, &self.inner),
+        let wait_timeout_deadline =
+            timeout.map(|timeout| saturating_instant_add(Instant::now(), timeout));
+        loop {
+            if cancellation.is_cancelled() {
+                return ToolResult::failure("cancelled", "process was cancelled");
             }
-        } else {
-            loop {
-                match handle.poll() {
-                    Ok(Some(status)) => return self.view(handle, Some(status), true),
-                    Ok(None) => {
-                        if Instant::now() >= action_deadline {
-                            return self.view(handle, None, true);
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
+            if Instant::now() >= deadline {
+                return ToolResult::failure("deadline_elapsed", "process deadline elapsed");
+            }
+            match handle.poll() {
+                Ok(Some(status)) => return self.view(handle, Some(status), true),
+                Ok(None) => {
+                    if wait_timeout_deadline.is_some_and(|bound| Instant::now() >= bound) {
+                        return self.view(handle, None, true);
                     }
-                    Err(error) => return map_handle_error(handle, error, &self.inner),
+                    if Instant::now() >= process_deadline {
+                        return map_handle_error(
+                            handle,
+                            BoundedProcessError::DeadlineElapsed,
+                            &self.inner,
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
+                Err(error) => return map_handle_error(handle, error, &self.inner),
             }
         }
     }
@@ -616,11 +709,27 @@ impl ProcessExecutor {
         handle: &BoundedProcessHandle,
         data: &str,
         timeout_ms: Option<u64>,
+        cancellation: &CancellationToken,
+        deadline: Instant,
     ) -> ToolResult {
-        if let Some(0) = timeout_ms {
-            return ToolResult::failure("invalid_timeout", "timeout_ms must be positive");
+        if cancellation.is_cancelled() {
+            return ToolResult::failure("cancelled", "process was cancelled");
         }
-        match write_stdin_with_deadline(handle, data.as_bytes(), timeout_ms) {
+        if Instant::now() >= deadline {
+            return ToolResult::failure("deadline_elapsed", "process deadline elapsed");
+        }
+        let timeout = match resolve_action_timeout(&self.inner.config, timeout_ms) {
+            Ok(timeout) => timeout,
+            Err(failure) => return failure.into_result(),
+        };
+        match write_stdin_with_deadline(
+            handle,
+            data.as_bytes(),
+            timeout,
+            cancellation,
+            deadline,
+            self.inner.config.cleanup_timeout,
+        ) {
             Ok(wrote) => ToolResult::success(String::new(), json!({ "wrote_bytes": wrote as u64 })),
             Err(BoundedProcessError::StdinClosed) => {
                 ToolResult::failure("stdin_closed", "process stdin is closed")
@@ -743,18 +852,22 @@ fn truncate_snapshot(mut snapshot: LogSnapshot, limit: u64) -> LogSnapshot {
 fn write_stdin_with_deadline(
     handle: &BoundedProcessHandle,
     data: &[u8],
-    timeout_ms: Option<u64>,
+    timeout: Option<Duration>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    cleanup_timeout: Duration,
 ) -> Result<usize, BoundedProcessError> {
+    if cancellation.is_cancelled() {
+        return Err(BoundedProcessError::Cancelled);
+    }
     let process_deadline = handle.deadline();
-    let action_deadline = timeout_ms
-        .map(|ms| Instant::now() + Duration::from_millis(ms))
+    let action_deadline = timeout
+        .map(|timeout| saturating_instant_add(Instant::now(), timeout))
         .unwrap_or(process_deadline)
-        .min(process_deadline);
+        .min(process_deadline)
+        .min(deadline);
     if Instant::now() >= action_deadline {
         return Err(BoundedProcessError::DeadlineElapsed);
-    }
-    if action_deadline >= process_deadline {
-        return handle.write_stdin(data);
     }
     let (tx, rx) = mpsc::sync_channel(1);
     let writer = handle.clone();
@@ -766,18 +879,57 @@ fn write_stdin_with_deadline(
             let _ = tx.send(result);
         })
         .map_err(|_| BoundedProcessError::StdinWriteFailed { os_code: None })?;
-    let remaining = action_deadline.saturating_duration_since(Instant::now());
-    match rx.recv_timeout(remaining) {
-        Ok(result) => {
-            let _ = worker.join();
-            result
+    loop {
+        if cancellation.is_cancelled() {
+            return interrupt_write_worker(
+                handle,
+                worker,
+                &rx,
+                cleanup_timeout,
+                BoundedProcessError::Cancelled,
+            );
         }
-        Err(_) => {
-            let _ = handle.close_stdin();
-            let _ = worker.join();
-            Err(BoundedProcessError::DeadlineElapsed)
+        let now = Instant::now();
+        if now >= action_deadline {
+            return interrupt_write_worker(
+                handle,
+                worker,
+                &rx,
+                cleanup_timeout,
+                BoundedProcessError::DeadlineElapsed,
+            );
+        }
+        let slice = action_deadline
+            .saturating_duration_since(now)
+            .min(WRITE_POLL_SLICE);
+        match rx.recv_timeout(slice) {
+            Ok(result) => {
+                let _ = worker.join();
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                return Err(BoundedProcessError::StdinWriteFailed { os_code: None });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+}
+
+fn interrupt_write_worker(
+    handle: &BoundedProcessHandle,
+    worker: thread::JoinHandle<()>,
+    rx: &mpsc::Receiver<Result<usize, BoundedProcessError>>,
+    cleanup_timeout: Duration,
+    interrupt: BoundedProcessError,
+) -> Result<usize, BoundedProcessError> {
+    let _ = handle.close_stdin();
+    let outcome = match rx.recv_timeout(cleanup_timeout) {
+        Ok(Ok(wrote)) => Ok(wrote),
+        Ok(Err(_)) | Err(_) => Err(interrupt),
+    };
+    let _ = worker.join();
+    outcome
 }
 
 fn map_handle_error(
@@ -950,7 +1102,7 @@ pub(crate) fn apply_output_bounds(
             .and_then(Value::as_bool)
             .unwrap_or(false);
     result.truncated = ring_truncated;
-    if envelope_len(result) <= config.max_output_bytes {
+    if serialized_tool_result_len(result) <= config.max_output_bytes {
         return;
     }
 
@@ -967,7 +1119,7 @@ pub(crate) fn apply_output_bounds(
         }
         Some(Err(_)) | None => false,
     };
-    if envelope_len(result) <= config.max_output_bytes {
+    if serialized_tool_result_len(result) <= config.max_output_bytes {
         return;
     }
     if !stored_artifact && let Value::Object(data) = &mut result.data {
@@ -975,153 +1127,5 @@ pub(crate) fn apply_output_bounds(
         data.insert("overflow_reason".into(), json!("artifact_unavailable"));
         data.insert("retained_bytes".into(), json!(payload.len() as u64));
     }
-    if envelope_len(result) <= config.max_output_bytes {
-        return;
-    }
-    shrink_envelope_to_cap(result, config.max_output_bytes);
-}
-
-fn envelope_len(result: &ToolResult) -> usize {
-    serde_json::to_vec(result)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
-}
-
-fn stream_string(result: &ToolResult, key: &str) -> String {
-    result
-        .data
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
-}
-
-fn set_stream_string(result: &mut ToolResult, key: &str, value: String) {
-    if let Value::Object(data) = &mut result.data
-        && data.get(key).and_then(Value::as_str).is_some()
-    {
-        data.insert(key.to_string(), json!(value));
-    }
-}
-
-fn clear_stream_strings(result: &mut ToolResult) {
-    set_stream_string(result, "stdout", String::new());
-    set_stream_string(result, "stderr", String::new());
-}
-
-fn allocate_payload_budget(
-    budget: usize,
-    content: &str,
-    stdout: &str,
-    stderr: &str,
-) -> (usize, usize, usize) {
-    let mut shares = 0usize;
-    if !content.is_empty() {
-        shares += 1;
-    }
-    if !stdout.is_empty() {
-        shares += 1;
-    }
-    if !stderr.is_empty() {
-        shares += 1;
-    }
-    let shares = shares.max(1);
-    let each = budget / shares;
-    let mut content_budget = if content.is_empty() {
-        0
-    } else {
-        each.min(content.len())
-    };
-    let mut stdout_budget = if stdout.is_empty() {
-        0
-    } else {
-        each.min(stdout.len())
-    };
-    let mut stderr_budget = if stderr.is_empty() {
-        0
-    } else {
-        each.min(stderr.len())
-    };
-    let mut leftover = budget.saturating_sub(content_budget + stdout_budget + stderr_budget);
-    for (slot, source) in [
-        (&mut content_budget, content),
-        (&mut stdout_budget, stdout),
-        (&mut stderr_budget, stderr),
-    ] {
-        let extra = source.len().saturating_sub(*slot).min(leftover);
-        *slot += extra;
-        leftover -= extra;
-    }
-    (content_budget, stdout_budget, stderr_budget)
-}
-
-fn shrink_envelope_to_cap(result: &mut ToolResult, cap: usize) {
-    let original_content = result.content.clone();
-    let original_stdout = stream_string(result, "stdout");
-    let original_stderr = stream_string(result, "stderr");
-
-    let mut skeleton = result.clone();
-    skeleton.content.clear();
-    clear_stream_strings(&mut skeleton);
-    let skeleton_len = envelope_len(&skeleton);
-    if skeleton_len > cap {
-        *result = minimal_bounded_error(cap);
-        return;
-    }
-
-    let mut budget = cap.saturating_sub(skeleton_len);
-    loop {
-        let (content_budget, stdout_budget, stderr_budget) = allocate_payload_budget(
-            budget,
-            &original_content,
-            &original_stdout,
-            &original_stderr,
-        );
-        result.content = truncate_to_bytes(&original_content, content_budget);
-        let stdout = truncate_to_bytes(&original_stdout, stdout_budget);
-        let stderr = truncate_to_bytes(&original_stderr, stderr_budget);
-        if stdout.len() < original_stdout.len()
-            && let Value::Object(data) = &mut result.data
-        {
-            data.insert("stdout_truncated".into(), json!(true));
-        }
-        if stderr.len() < original_stderr.len()
-            && let Value::Object(data) = &mut result.data
-        {
-            data.insert("stderr_truncated".into(), json!(true));
-        }
-        set_stream_string(result, "stdout", stdout);
-        set_stream_string(result, "stderr", stderr);
-        result.truncated = true;
-        if envelope_len(result) <= cap {
-            return;
-        }
-        if budget == 0 {
-            *result = minimal_bounded_error(cap);
-            return;
-        }
-        budget /= 2;
-    }
-}
-
-fn minimal_bounded_error(cap: usize) -> ToolResult {
-    for message in ["tool result exceeds the configured bound", "bounded", ""] {
-        let candidate =
-            ToolResult::failure_with("output_truncated", message, String::new(), json!({}), true);
-        if envelope_len(&candidate) <= cap {
-            return candidate;
-        }
-    }
-    ToolResult::failure_with("output_truncated", "", String::new(), json!({}), true)
-}
-
-fn truncate_to_bytes(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let mut end = limit;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
+    enforce_serialized_tool_result_cap(result, config.max_output_bytes);
 }

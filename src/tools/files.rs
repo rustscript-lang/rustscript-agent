@@ -9,16 +9,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rustscript_vm::{
-    ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind, ConfinedFsLimits, ConfinedFsRoot,
-    ConfinedPublicationState, EnumerationBudget, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES,
-    MAX_READ_BYTES, MAX_TEMP_ATTEMPTS, MAX_WRITE_BYTES,
+    CancellationToken, ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind, ConfinedFsLimits,
+    ConfinedFsRoot, ConfinedPublicationState, EnumerationBudget, MAX_COMPONENT_BYTES,
+    MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_TEMP_ATTEMPTS, MAX_WRITE_BYTES,
 };
 use serde_json::{Value, json};
 
 use super::artifacts::{ArtifactOwner, ArtifactStore};
 use super::types::NativeToolExecutor;
-use super::{ToolError, ToolResult};
-use crate::config::FileToolConfig;
+use super::{
+    ToolError, ToolResult, enforce_serialized_tool_result_cap, serialized_tool_result_len,
+};
+use crate::config::{FileToolConfig, MAX_FILE_TOOL_WALL_TIME};
 
 const TEMP_PREFIX: &str = ".rustscript-agent-tmp-";
 
@@ -111,15 +113,39 @@ impl FileTools {
         &self.artifacts
     }
 
+    /// Returns a shared handle so process/terminal overflow can publish into the same store.
+    pub fn artifact_store_arc(&self) -> Arc<ArtifactStore> {
+        Arc::clone(&self.artifacts)
+    }
+
     /// Executes a Task 1 native coding executor. Process tools are rejected.
     pub fn execute(&self, executor: &NativeToolExecutor, arguments: &Value) -> ToolResult {
+        self.execute_with_controls(
+            executor,
+            arguments,
+            &CancellationToken::new(),
+            Instant::now() + MAX_FILE_TOOL_WALL_TIME,
+        )
+    }
+
+    /// Executes a coding executor under the caller's cancellation token and deadline.
+    pub fn execute_with_controls(
+        &self,
+        executor: &NativeToolExecutor,
+        arguments: &Value,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        if let Some(result) = control_failure(cancellation, deadline, json!({})) {
+            return result;
+        }
         match executor {
             NativeToolExecutor::ReadFile => match parse_read_request(arguments) {
-                Ok(request) => self.read_file(request),
+                Ok(request) => self.read_file_with_controls(request, cancellation, deadline),
                 Err(message) => fail("invalid_arguments", message, json!({})),
             },
             NativeToolExecutor::SearchFiles => match parse_search_request(arguments) {
-                Ok(request) => self.search_files(request),
+                Ok(request) => self.search_files_with_controls(request, cancellation, deadline),
                 Err(message) => fail("invalid_arguments", message, json!({})),
             },
             NativeToolExecutor::WriteFile => {
@@ -133,7 +159,7 @@ impl FileTools {
                         json!({}),
                     );
                 };
-                self.write_file(path, content)
+                self.write_file_with_controls(path, content, cancellation, deadline)
             }
             NativeToolExecutor::Patch => {
                 let Some(path) = arguments.get("path").and_then(Value::as_str) else {
@@ -149,7 +175,14 @@ impl FileTools {
                     .get("replace_all")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                self.patch(path, old_string, new_string, replace_all)
+                self.patch_with_controls(
+                    path,
+                    old_string,
+                    new_string,
+                    replace_all,
+                    cancellation,
+                    deadline,
+                )
             }
             NativeToolExecutor::Terminal
             | NativeToolExecutor::Process
@@ -163,6 +196,23 @@ impl FileTools {
 
     /// Reads a UTF-8 workspace file with optional 1-based line windowing.
     pub fn read_file(&self, request: ReadFileRequest) -> ToolResult {
+        self.read_file_with_controls(
+            request,
+            &CancellationToken::new(),
+            Instant::now() + MAX_FILE_TOOL_WALL_TIME,
+        )
+    }
+
+    /// Reads a workspace file under the caller's cancellation token and deadline.
+    pub fn read_file_with_controls(
+        &self,
+        request: ReadFileRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        if let Some(result) = control_failure(cancellation, deadline, json!({})) {
+            return result;
+        }
         if request.offset == Some(0) {
             return fail(
                 "invalid_offset",
@@ -205,6 +255,23 @@ impl FileTools {
 
     /// Traverses the workspace with hard caps and a wall-clock deadline.
     pub fn search_files(&self, request: SearchFilesRequest) -> ToolResult {
+        self.search_files_with_controls(
+            request,
+            &CancellationToken::new(),
+            Instant::now() + MAX_FILE_TOOL_WALL_TIME,
+        )
+    }
+
+    /// Searches the workspace under the caller's cancellation token and deadline.
+    pub fn search_files_with_controls(
+        &self,
+        request: SearchFilesRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        if let Some(result) = control_failure(cancellation, deadline, json!({})) {
+            return result;
+        }
         if request.pattern.is_empty() {
             return fail(
                 "invalid_arguments",
@@ -214,15 +281,22 @@ impl FileTools {
         }
         let target_files = matches!(request.target.as_deref(), Some("files"));
         let start = request.path.as_deref().unwrap_or("");
-        let deadline = Instant::now() + self.config.max_search_wall_time;
+        let search_budget = Instant::now() + self.config.max_search_wall_time;
         let mut state = SearchState::new();
-        if Instant::now() >= deadline {
-            state.truncated = true;
-            state.stop = true;
+        let controls = SearchWalkControls {
+            cancel: cancellation,
+            caller_deadline: deadline,
+            search_budget,
+        };
+        if observe_search_controls(&controls, &mut state) {
+            // Caller cancel/deadline or search wall-time already recorded.
         } else if let Err(error) =
-            self.walk_search(start, 0, &request, target_files, deadline, &mut state)
+            self.walk_search(start, 0, &request, target_files, &controls, &mut state)
         {
             return map_fs_error(error, json!({}));
+        }
+        if let Some((code, message)) = state.control {
+            return fail(code, message, json!({}));
         }
         state.lines.sort();
         let offset = request.offset.unwrap_or(0);
@@ -249,6 +323,29 @@ impl FileTools {
 
     /// Atomically publishes UTF-8 content to a workspace path.
     pub fn write_file(&self, path: &str, content: &str) -> ToolResult {
+        self.write_file_with_controls(
+            path,
+            content,
+            &CancellationToken::new(),
+            Instant::now() + MAX_FILE_TOOL_WALL_TIME,
+        )
+    }
+
+    /// Writes a workspace file under the caller's cancellation token and deadline.
+    pub fn write_file_with_controls(
+        &self,
+        path: &str,
+        content: &str,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        if let Some(result) = control_failure(
+            cancellation,
+            deadline,
+            json!({ "publication": "not_published" }),
+        ) {
+            return result;
+        }
         if content.len() > self.config.max_write_bytes {
             return fail(
                 "write_too_large",
@@ -269,6 +366,33 @@ impl FileTools {
 
     /// Replaces a unique match, or every match when `replace_all` is set.
     pub fn patch(&self, path: &str, old: &str, new: &str, replace_all: bool) -> ToolResult {
+        self.patch_with_controls(
+            path,
+            old,
+            new,
+            replace_all,
+            &CancellationToken::new(),
+            Instant::now() + MAX_FILE_TOOL_WALL_TIME,
+        )
+    }
+
+    /// Patches a workspace file under the caller's cancellation token and deadline.
+    pub fn patch_with_controls(
+        &self,
+        path: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        if let Some(result) = control_failure(
+            cancellation,
+            deadline,
+            json!({ "publication": "not_published" }),
+        ) {
+            return result;
+        }
         if old.is_empty() {
             return fail(
                 "invalid_arguments",
@@ -332,6 +456,13 @@ impl FileTools {
                 json!({ "publication": "not_published" }),
             );
         }
+        if let Some(result) = control_failure(
+            cancellation,
+            deadline,
+            json!({ "publication": "not_published" }),
+        ) {
+            return result;
+        }
         match self.publish(path, updated.as_bytes()) {
             Ok((durable, staging_cleaned)) => {
                 let preview =
@@ -370,13 +501,11 @@ impl FileTools {
         depth: usize,
         request: &SearchFilesRequest,
         target_files: bool,
-        deadline: Instant,
+        controls: &SearchWalkControls<'_>,
         state: &mut SearchState,
     ) -> Result<(), ConfinedFsError> {
         state.dirs_visited = state.dirs_visited.saturating_add(1);
-        if Instant::now() >= deadline {
-            state.truncated = true;
-            state.stop = true;
+        if observe_search_controls(controls, state) {
             return Ok(());
         }
         if state.stop {
@@ -413,9 +542,7 @@ impl FileTools {
         };
         entries.sort_by(|left, right| left.name().cmp(right.name()));
         for entry in entries {
-            if Instant::now() >= deadline {
-                state.truncated = true;
-                state.stop = true;
+            if observe_search_controls(controls, state) {
                 return Ok(());
             }
             if state.stop {
@@ -434,7 +561,7 @@ impl FileTools {
                         state.truncated = true;
                         continue;
                     }
-                    self.walk_search(&child, depth + 1, request, target_files, deadline, state)?;
+                    self.walk_search(&child, depth + 1, request, target_files, controls, state)?;
                     if state.stop {
                         return Ok(());
                     }
@@ -472,6 +599,9 @@ impl FileTools {
                         state.stop = true;
                         return Ok(());
                     }
+                    if observe_search_controls(controls, state) {
+                        return Ok(());
+                    }
                     let bytes = match self.root.read_file(&child) {
                         Ok(bytes) => bytes,
                         Err(error) if is_skip_search_error(&error) => continue,
@@ -483,6 +613,9 @@ impl FileTools {
                     }
                     let text = String::from_utf8(bytes).unwrap_or_default();
                     for (index, line) in text.split_inclusive('\n').enumerate() {
+                        if observe_search_controls(controls, state) {
+                            return Ok(());
+                        }
                         if line.contains(&request.pattern) {
                             let trimmed = line.trim_end_matches(['\n', '\r']);
                             self.push_match(state, format!("{}:{}:{trimmed}", child, index + 1));
@@ -490,8 +623,10 @@ impl FileTools {
                                 || state.truncated
                                 || state.lines.len() >= self.config.max_search_matches
                             {
-                                state.truncated = true;
-                                state.stop = true;
+                                if state.control.is_none() {
+                                    state.truncated = true;
+                                    state.stop = true;
+                                }
                                 return Ok(());
                             }
                         }
@@ -519,27 +654,32 @@ impl FileTools {
     }
 
     fn finalize(&self, mut result: ToolResult) -> ToolResult {
-        if !result.ok || result.content.len() <= self.config.max_output_bytes {
+        let cap = self.config.max_output_bytes;
+        if serialized_tool_result_len(&result) <= cap {
             return result;
         }
-        let Some(owner) = self.owner.as_ref() else {
-            return fail(
-                "output_too_large",
-                "result exceeds the model-visible budget",
-                result.data,
-            );
-        };
-        match self.artifacts.put(owner, result.content.as_bytes()) {
-            Ok(handle) => {
-                let bytes = result.content.len();
-                result.content = artifact_summary(&handle.id, bytes, self.config.max_output_bytes);
-                result.truncated = true;
-                result.artifacts = vec![handle.id];
-                result
+        if let Some(owner) = self.owner.as_ref() {
+            match self.artifacts.put(owner, result.content.as_bytes()) {
+                Ok(handle) => {
+                    let bytes = result.content.len();
+                    result.content = artifact_summary(&handle.id, bytes, cap);
+                    result.truncated = true;
+                    result.artifacts = vec![handle.id];
+                }
+                Err(error) => {
+                    result = fail(error.code(), error.message(), result.data);
+                }
             }
-            Err(error) => fail(error.code(), error.message(), result.data),
         }
+        enforce_serialized_tool_result_cap(&mut result, cap);
+        result
     }
+}
+
+struct SearchWalkControls<'a> {
+    cancel: &'a CancellationToken,
+    caller_deadline: Instant,
+    search_budget: Instant,
 }
 
 struct SearchState {
@@ -550,6 +690,7 @@ struct SearchState {
     lines: Vec<String>,
     truncated: bool,
     stop: bool,
+    control: Option<(&'static str, &'static str)>,
 }
 
 impl SearchState {
@@ -562,8 +703,46 @@ impl SearchState {
             lines: Vec::new(),
             truncated: false,
             stop: false,
+            control: None,
         }
     }
+}
+
+fn control_failure(
+    cancel: &CancellationToken,
+    deadline: Instant,
+    data: Value,
+) -> Option<ToolResult> {
+    if cancel.is_cancelled() {
+        return Some(fail("cancelled", "tool execution was cancelled", data));
+    }
+    if Instant::now() >= deadline {
+        return Some(fail("deadline_elapsed", "tool deadline elapsed", data));
+    }
+    None
+}
+
+fn observe_search_controls(controls: &SearchWalkControls<'_>, state: &mut SearchState) -> bool {
+    if state.control.is_some() {
+        state.stop = true;
+        return true;
+    }
+    if controls.cancel.is_cancelled() {
+        state.control = Some(("cancelled", "tool execution was cancelled"));
+        state.stop = true;
+        return true;
+    }
+    if Instant::now() >= controls.caller_deadline {
+        state.control = Some(("deadline_elapsed", "tool deadline elapsed"));
+        state.stop = true;
+        return true;
+    }
+    if Instant::now() >= controls.search_budget {
+        state.truncated = true;
+        state.stop = true;
+        return true;
+    }
+    false
 }
 
 fn split_publication_target(path: &str) -> (&str, &str) {

@@ -13,7 +13,8 @@ use crate::config::ProcessToolConfig;
 
 use super::process::{
     ProcessArtifactSink, ProcessExecutorState, ProcessOwner, ProcessTable, ToolFailure,
-    apply_output_bounds, model_content, optional_positive_u64, process_error_code, snapshot_data,
+    apply_output_bounds, model_content, no_controls_deadline, optional_positive_u64,
+    process_error_code, snapshot_data,
 };
 use super::{NativeToolExecutor, ToolDescriptor, ToolResult, builtin_descriptor};
 
@@ -74,25 +75,61 @@ impl TerminalExecutor {
     }
 
     pub fn execute(&self, arguments: &Value) -> ToolResult {
+        self.execute_with_controls(
+            arguments,
+            &CancellationToken::new(),
+            no_controls_deadline(&self.inner.config),
+        )
+    }
+
+    pub fn execute_with_controls(
+        &self,
+        arguments: &Value,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
         match parse_terminal_request(arguments) {
-            Ok(request) => self.run(request),
+            Ok(request) => self.run_with_controls(request, cancellation, deadline),
             Err(failure) => failure.into_result(),
         }
     }
 
     pub fn run(&self, request: TerminalRequest) -> ToolResult {
-        let prepared = match self.prepare(request) {
+        let deadline = request
+            .deadline
+            .unwrap_or_else(|| no_controls_deadline(&self.inner.config));
+        self.run_with_controls(request, &CancellationToken::new(), deadline)
+    }
+
+    pub fn run_with_controls(
+        &self,
+        request: TerminalRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> ToolResult {
+        if cancellation.is_cancelled() {
+            return ToolResult::failure("cancelled", "process was cancelled");
+        }
+        if Instant::now() >= deadline {
+            return ToolResult::failure("deadline_elapsed", "process deadline elapsed");
+        }
+        let prepared = match self.prepare(request, cancellation.clone(), deadline) {
             Ok(prepared) => prepared,
             Err(failure) => return failure.into_result(),
         };
         if prepared.background {
             self.spawn_background(prepared)
         } else {
-            self.run_foreground(prepared)
+            self.run_foreground(prepared, cancellation.clone())
         }
     }
 
-    fn prepare(&self, request: TerminalRequest) -> Result<PreparedRequest, ToolFailure> {
+    fn prepare(
+        &self,
+        request: TerminalRequest,
+        token: CancellationToken,
+        deadline: Instant,
+    ) -> Result<PreparedRequest, ToolFailure> {
         if request.argv.is_empty() {
             return Err(ToolFailure::new(
                 "invalid_argv",
@@ -116,12 +153,10 @@ impl TerminalExecutor {
             .with_env_map(request.env)
             .with_timeout(timeout)
             .with_output_limits(stream_limit, stream_limit, stream_limit)
-            .with_cancellation_token(CancellationToken::new());
+            .with_cancellation_token(token)
+            .with_deadline(deadline);
         if let Some(stdin) = request.stdin {
             core = core.with_stdin(stdin);
-        }
-        if let Some(deadline) = request.deadline {
-            core = core.with_deadline(deadline);
         }
         Ok(PreparedRequest {
             core,
@@ -129,9 +164,13 @@ impl TerminalExecutor {
         })
     }
 
-    fn run_foreground(&self, mut prepared: PreparedRequest) -> ToolResult {
+    fn run_foreground(
+        &self,
+        mut prepared: PreparedRequest,
+        token: CancellationToken,
+    ) -> ToolResult {
         let (token, _guard) =
-            match ProcessTable::register_foreground(&self.inner.table, &self.inner.owner) {
+            match ProcessTable::register_foreground(&self.inner.table, &self.inner.owner, token) {
                 Ok(registered) => registered,
                 Err(failure) => return failure.into_result(),
             };
@@ -273,13 +312,13 @@ fn parse_terminal_request(arguments: &Value) -> Result<TerminalRequest, ToolFail
         env: BTreeMap::new(),
         stdin,
         timeout_ms: optional_positive_u64(arguments, "timeout_ms", "invalid_timeout")?,
-        deadline: None,
         max_output_bytes: optional_positive_u64(
             arguments,
             "max_output_bytes",
             "invalid_output_limit",
         )?,
         background: false,
+        ..TerminalRequest::default()
     })
 }
 

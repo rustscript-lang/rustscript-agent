@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
-use rustscript_agent::config::ProcessToolConfig;
+use rustscript_agent::config::{MAX_PROCESS_TOOL_TIMEOUT, ProcessToolConfig};
 use rustscript_agent::tools::{
     NativeToolExecutor, ProcessAction, ProcessArtifactSink, ProcessExecutor, ProcessOwner,
     ProcessRequest, ProcessTable, TerminalExecutor, TerminalRequest, ToolResult,
 };
+use rustscript_vm::CancellationToken;
 use serde_json::json;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -43,7 +44,22 @@ impl Fixture {
         &self,
         owner: ProcessOwner,
     ) -> (TerminalExecutor, ProcessExecutor, Arc<ProcessTable>) {
-        let config = self.config();
+        self.pair_with_config_for(self.config(), owner)
+    }
+
+    fn pair_with_config(
+        &self,
+        config: ProcessToolConfig,
+    ) -> (TerminalExecutor, ProcessExecutor, Arc<ProcessTable>) {
+        self.pair_with_config_for(config, owner())
+    }
+
+    fn pair_with_config_for(
+        &self,
+        mut config: ProcessToolConfig,
+        owner: ProcessOwner,
+    ) -> (TerminalExecutor, ProcessExecutor, Arc<ProcessTable>) {
+        config.workspace_root = self.root.clone();
         let table = Arc::new(ProcessTable::new(config.clone()).expect("process table"));
         let terminal = TerminalExecutor::new(config.clone(), Arc::clone(&table), owner.clone())
             .expect("terminal");
@@ -134,6 +150,17 @@ fn process_executor_matches_the_frozen_registry_contract() {
     assert_eq!(process.descriptor().name, "process");
     assert_eq!(process.descriptor().toolset, "process");
     assert_eq!(process.slot().contract().tool_name, "process");
+}
+
+#[test]
+fn process_timeout_ms_schema_advertises_stable_millisecond_maximum() {
+    let fixture = Fixture::new();
+    let (_, process, _) = fixture.pair();
+    let timeout = &process.descriptor().schema["properties"]["timeout_ms"];
+    assert_eq!(timeout["type"], "integer");
+    assert_eq!(timeout["minimum"], 1);
+    let maximum = u64::try_from(MAX_PROCESS_TOOL_TIMEOUT.as_millis()).expect("max timeout fits ms");
+    assert_eq!(timeout["maximum"], maximum);
 }
 
 #[test]
@@ -313,6 +340,96 @@ fn wait_timeout_cannot_extend_the_spawn_deadline() {
     assert!(!waited.ok);
     assert_eq!(error_code(&waited), "deadline_elapsed");
     assert!(started.elapsed() < Duration::from_secs(2));
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+fn tight_timeout_config(fixture: &Fixture) -> ProcessToolConfig {
+    let mut config = fixture.config();
+    config.default_timeout = Duration::from_millis(40);
+    config.max_timeout = Duration::from_millis(400);
+    config
+}
+
+#[test]
+fn no_controls_wait_accepts_timeout_above_default_up_to_max() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair_with_config(tight_timeout_config(&fixture));
+    let process_id = spawn_sleep(&terminal, "0.12", 300);
+    let waited = process.run(ProcessRequest {
+        action: ProcessAction::Wait,
+        process_id,
+        timeout_ms: Some(300),
+        ..ProcessRequest::default()
+    });
+    assert!(waited.ok, "{waited:?}");
+    assert_eq!(waited.data["status"], "exited");
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn no_controls_execute_wait_is_not_prematurely_deadline_elapsed() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair_with_config(tight_timeout_config(&fixture));
+    let process_id = spawn_sleep(&terminal, "0.12", 300);
+    let waited = process.execute(&json!({
+        "action": "wait",
+        "process_id": process_id,
+        "timeout_ms": 300
+    }));
+    assert!(waited.ok, "{waited:?}");
+    assert_eq!(waited.data["status"], "exited");
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn omitted_wait_timeout_is_not_clamped_to_default() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair_with_config(tight_timeout_config(&fixture));
+    let process_id = spawn_sleep(&terminal, "0.12", 300);
+    let waited = process.run(ProcessRequest {
+        action: ProcessAction::Wait,
+        process_id,
+        timeout_ms: None,
+        ..ProcessRequest::default()
+    });
+    assert!(waited.ok, "{waited:?}");
+    assert_eq!(waited.data["status"], "exited");
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn explicit_external_deadline_still_clamps_wait_above_default() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair_with_config(tight_timeout_config(&fixture));
+    let process_id = spawn_sleep(&terminal, "1", 300);
+    let started = Instant::now();
+    let waited = process.run_with_controls(
+        ProcessRequest {
+            action: ProcessAction::Wait,
+            process_id: process_id.clone(),
+            timeout_ms: Some(300),
+            ..ProcessRequest::default()
+        },
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_millis(20),
+    );
+    assert!(!waited.ok, "{waited:?}");
+    assert_eq!(error_code(&waited), "deadline_elapsed");
+    assert!(started.elapsed() < Duration::from_millis(200));
+
+    let started = Instant::now();
+    let execute = process.execute_with_controls(
+        &json!({
+            "action": "wait",
+            "process_id": process_id,
+            "timeout_ms": 300
+        }),
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_millis(20),
+    );
+    assert!(!execute.ok, "{execute:?}");
+    assert_eq!(error_code(&execute), "deadline_elapsed");
+    assert!(started.elapsed() < Duration::from_millis(200));
     table.cleanup_owner(&owner()).expect("cleanup");
 }
 
@@ -608,6 +725,209 @@ fn write_timeout_ms_caps_a_full_pipe_and_returns_typed_timeout() {
     assert!(
         elapsed < Duration::from_millis(800),
         "write timeout blocked for {elapsed:?}"
+    );
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn wait_timeout_ms_rejects_u64_max_without_panic() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair();
+    let process_id = spawn_sleep(&terminal, "30", 5_000);
+    let waited = process.run(ProcessRequest {
+        action: ProcessAction::Wait,
+        process_id: process_id.clone(),
+        timeout_ms: Some(u64::MAX),
+        ..ProcessRequest::default()
+    });
+    assert!(!waited.ok, "{waited:?}");
+    assert_eq!(error_code(&waited), "invalid_timeout");
+
+    let execute = process.execute(&json!({
+        "action": "wait",
+        "process_id": process_id,
+        "timeout_ms": u64::MAX
+    }));
+    assert!(!execute.ok, "{execute:?}");
+    assert_eq!(error_code(&execute), "invalid_timeout");
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn wait_timeout_ms_above_max_is_invalid() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair_with_config(tight_timeout_config(&fixture));
+    let process_id = spawn_sleep(&terminal, "1", 300);
+    let waited = process.run(ProcessRequest {
+        action: ProcessAction::Wait,
+        process_id,
+        timeout_ms: Some(401),
+        ..ProcessRequest::default()
+    });
+    assert!(!waited.ok, "{waited:?}");
+    assert_eq!(error_code(&waited), "invalid_timeout");
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn write_timeout_ms_rejects_u64_max_without_panic() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair();
+    let spawned = terminal.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "30".to_string()],
+        background: true,
+        timeout_ms: Some(5_000),
+        ..TerminalRequest::default()
+    });
+    assert!(spawned.ok, "{spawned:?}");
+    let process_id = spawned.data["process_id"].as_str().unwrap().to_string();
+    let written = process.run(ProcessRequest {
+        action: ProcessAction::Write,
+        process_id: process_id.clone(),
+        data: Some("x".to_string()),
+        timeout_ms: Some(u64::MAX),
+        ..ProcessRequest::default()
+    });
+    assert!(!written.ok, "{written:?}");
+    assert_eq!(error_code(&written), "invalid_timeout");
+
+    let execute = process.execute(&json!({
+        "action": "write",
+        "process_id": process_id,
+        "data": "x",
+        "timeout_ms": u64::MAX
+    }));
+    assert!(!execute.ok, "{execute:?}");
+    assert_eq!(error_code(&execute), "invalid_timeout");
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn write_timeout_ms_above_max_is_invalid() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair_with_config(tight_timeout_config(&fixture));
+    let spawned = terminal.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "1".to_string()],
+        background: true,
+        timeout_ms: Some(300),
+        ..TerminalRequest::default()
+    });
+    assert!(spawned.ok, "{spawned:?}");
+    let process_id = spawned.data["process_id"].as_str().unwrap().to_string();
+    let written = process.run(ProcessRequest {
+        action: ProcessAction::Write,
+        process_id,
+        data: Some("x".to_string()),
+        timeout_ms: Some(401),
+        ..ProcessRequest::default()
+    });
+    assert!(!written.ok, "{written:?}");
+    assert_eq!(error_code(&written), "invalid_timeout");
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+fn spawn_blocking_write(
+    process: &ProcessExecutor,
+    process_id: String,
+    cancellation: CancellationToken,
+    deadline: Instant,
+    timeout_ms: Option<u64>,
+) -> std::thread::JoinHandle<ToolResult> {
+    let process = process.clone();
+    std::thread::spawn(move || {
+        process.run_with_controls(
+            ProcessRequest {
+                action: ProcessAction::Write,
+                process_id,
+                data: Some("x".repeat(1024 * 1024)),
+                timeout_ms,
+                ..ProcessRequest::default()
+            },
+            &cancellation,
+            deadline,
+        )
+    })
+}
+
+fn wait_until_write_blocks(join: &std::thread::JoinHandle<ToolResult>) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(40) {
+        assert!(
+            !join.is_finished(),
+            "write completed before the pipe could fill"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !join.is_finished(),
+        "write completed before cancellation/deadline"
+    );
+}
+
+#[test]
+fn write_cancellation_interrupts_a_full_pipe() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair();
+    let spawned = terminal.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "30".to_string()],
+        background: true,
+        timeout_ms: Some(5_000),
+        ..TerminalRequest::default()
+    });
+    assert!(spawned.ok, "{spawned:?}");
+    let process_id = spawned.data["process_id"].as_str().unwrap().to_string();
+    let cancellation = CancellationToken::new();
+    let started = Instant::now();
+    let join = spawn_blocking_write(
+        &process,
+        process_id,
+        cancellation.clone(),
+        Instant::now() + Duration::from_secs(5),
+        Some(5_000),
+    );
+    wait_until_write_blocks(&join);
+    cancellation.cancel();
+    let written = join.join().expect("write thread");
+    let elapsed = started.elapsed();
+    assert!(!written.ok, "{written:?}");
+    assert_eq!(error_code(&written), "cancelled");
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "cancelled write blocked for {elapsed:?}"
+    );
+    table.cleanup_owner(&owner()).expect("cleanup");
+}
+
+#[test]
+fn write_caller_deadline_interrupts_a_full_pipe() {
+    let fixture = Fixture::new();
+    let (terminal, process, table) = fixture.pair();
+    let spawned = terminal.run(TerminalRequest {
+        argv: vec!["/bin/sleep".to_string(), "30".to_string()],
+        background: true,
+        timeout_ms: Some(5_000),
+        ..TerminalRequest::default()
+    });
+    assert!(spawned.ok, "{spawned:?}");
+    let process_id = spawned.data["process_id"].as_str().unwrap().to_string();
+    let started = Instant::now();
+    let written = process.run_with_controls(
+        ProcessRequest {
+            action: ProcessAction::Write,
+            process_id,
+            data: Some("x".repeat(1024 * 1024)),
+            timeout_ms: Some(5_000),
+            ..ProcessRequest::default()
+        },
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_millis(50),
+    );
+    let elapsed = started.elapsed();
+    assert!(!written.ok, "{written:?}");
+    assert_eq!(error_code(&written), "deadline_elapsed");
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "deadline write blocked for {elapsed:?}"
     );
     table.cleanup_owner(&owner()).expect("cleanup");
 }

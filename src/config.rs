@@ -26,7 +26,11 @@ pub const MAX_FILE_TOOL_SEARCH_MATCHES: usize = 1_000_000;
 pub const MAX_FILE_TOOL_SEARCH_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FILE_TOOL_PATCH_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FILE_TOOL_PATCH_PREVIEW_BYTES: usize = 64 * 1024;
-pub const MAX_FILE_TOOL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+/// Canonical model-visible tool-result envelope ceiling, aligned with
+/// [`RunLimits::MAX_TOOL_OUTPUT_BYTES`].
+const TOOL_OUTPUT_HARD_CEILING_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = TOOL_OUTPUT_HARD_CEILING_BYTES as usize;
+pub const DEFAULT_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_FILE_TOOL_WALL_TIME: Duration = Duration::from_secs(600);
 pub const MAX_ARTIFACT_OBJECT_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_ARTIFACT_TOTAL_BYTES: usize = 512 * 1024 * 1024;
@@ -160,14 +164,14 @@ impl FileToolConfig {
             max_search_wall_time: Duration::from_secs(2),
             max_patch_bytes: 8 * 1024 * 1024,
             max_patch_preview_bytes: 16 * 1024,
-            max_output_bytes: 64 * 1024,
+            max_output_bytes: DEFAULT_TOOL_OUTPUT_BYTES,
             artifact_store,
         }
     }
 
     /// Validates the workspace path and every file-tool/artifact budget.
     pub fn validate(&self) -> Result<(), String> {
-        validate_absolute_directory(&self.workspace_root, "workspace_root")?;
+        canonical_workspace_root(&self.workspace_root).map_err(|error| error.to_string())?;
         validate_positive_bounded(
             self.max_read_bytes,
             MAX_FILE_TOOL_READ_BYTES,
@@ -227,7 +231,7 @@ impl FileToolConfig {
         )?;
         validate_positive_bounded(
             self.max_output_bytes,
-            MAX_FILE_TOOL_OUTPUT_BYTES,
+            MAX_TOOL_OUTPUT_BYTES,
             "max_output_bytes",
         )?;
         self.artifact_store.validate()?;
@@ -1366,7 +1370,7 @@ pub struct RunLimits {
 impl RunLimits {
     pub const MAX_TURNS: u64 = 1_000_000;
     pub const MAX_TOOL_CALLS: u64 = 1_000_000;
-    pub const MAX_TOOL_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+    pub const MAX_TOOL_OUTPUT_BYTES: u64 = TOOL_OUTPUT_HARD_CEILING_BYTES;
 
     pub fn new(
         max_turns: u64,
@@ -1507,7 +1511,7 @@ fn canonical_workspace_root(path: &Path) -> Result<PathBuf, RunLimitsError> {
 }
 
 /// Hard upper bounds for native terminal/process tool budgets.
-pub const MAX_PROCESS_TOOL_OUTPUT_BYTES: usize = MAX_OUTPUT_BYTES;
+pub const MAX_PROCESS_TOOL_OUTPUT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
 pub const MAX_PROCESS_TOOL_STREAM_BYTES: usize = MAX_OUTPUT_BYTES;
 pub const MAX_PROCESS_TOOL_STDIN_BYTES: usize = MAX_STDIN_BYTES;
 pub const MAX_PROCESS_TOOL_PROCESSES: usize = 1_024;
@@ -1545,7 +1549,7 @@ impl ProcessToolConfig {
             workspace_root: root.into(),
             default_timeout: Duration::from_secs(30),
             max_timeout: MAX_PROCESS_TOOL_TIMEOUT,
-            max_output_bytes: 64 * 1024,
+            max_output_bytes: DEFAULT_TOOL_OUTPUT_BYTES,
             max_stream_bytes: 1024 * 1024,
             max_stdin_bytes: 1024 * 1024,
             max_processes: 32,
@@ -1556,7 +1560,7 @@ impl ProcessToolConfig {
 
     /// Validates every process-tool budget. Invalid values fail closed.
     pub fn validate(&self) -> Result<(), String> {
-        validate_process_workspace(&self.workspace_root)?;
+        canonical_workspace_root(&self.workspace_root).map_err(|error| error.to_string())?;
         if self.default_timeout.is_zero() || self.default_timeout > self.max_timeout {
             return Err("default_timeout must be positive and at most max_timeout".to_string());
         }
@@ -1602,29 +1606,11 @@ impl ProcessToolConfig {
     pub fn validated(&self) -> Result<Self, String> {
         self.validate()?;
         Ok(Self {
-            workspace_root: std::fs::canonicalize(&self.workspace_root)
-                .map_err(|error| format!("workspace_root is invalid: {error}"))?,
+            workspace_root: canonical_workspace_root(&self.workspace_root)
+                .map_err(|error| error.to_string())?,
             ..self.clone()
         })
     }
-}
-
-fn validate_process_workspace(path: &Path) -> Result<(), String> {
-    if path.as_os_str().is_empty() {
-        return Err("workspace_root is empty".to_string());
-    }
-    if path.to_string_lossy().contains('\0') {
-        return Err("workspace_root is invalid: path contains NUL".to_string());
-    }
-    if !path.is_absolute() {
-        return Err("workspace_root must be absolute".to_string());
-    }
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|error| format!("workspace_root is invalid: {error}"))?;
-    if !canonical.is_dir() {
-        return Err("workspace_root is invalid: path is not a directory".to_string());
-    }
-    Ok(())
 }
 
 fn validate_positive_bounded(value: usize, max: usize, name: &str) -> Result<(), String> {
