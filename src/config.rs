@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rustscript_vm::{HttpConfig, SqlitePolicy};
+use rustscript_vm::{HttpConfig, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, MAX_TIMEOUT, SqlitePolicy};
 use serde_json::{Map, Value, json};
 
 /// Telegram Bot API adapter configuration.
@@ -1194,6 +1194,137 @@ fn canonical_workspace_root(path: &Path) -> Result<PathBuf, RunLimitsError> {
     Ok(canonical)
 }
 
+/// Hard upper bounds for native terminal/process tool budgets.
+pub const MAX_PROCESS_TOOL_OUTPUT_BYTES: usize = MAX_OUTPUT_BYTES;
+pub const MAX_PROCESS_TOOL_STREAM_BYTES: usize = MAX_OUTPUT_BYTES;
+pub const MAX_PROCESS_TOOL_STDIN_BYTES: usize = MAX_STDIN_BYTES;
+pub const MAX_PROCESS_TOOL_PROCESSES: usize = 1_024;
+pub const MAX_PROCESS_TOOL_PROCESSES_PER_OWNER: usize = 256;
+pub const MAX_PROCESS_TOOL_TIMEOUT: Duration = MAX_TIMEOUT;
+pub const MAX_PROCESS_TOOL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validated native configuration for bounded terminal and process tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessToolConfig {
+    /// Canonical absolute workspace used as the default child cwd.
+    pub workspace_root: PathBuf,
+    /// Default spawn timeout when a request omits `timeout_ms`.
+    pub default_timeout: Duration,
+    /// Maximum spawn/lifecycle timeout accepted from configuration or a request.
+    pub max_timeout: Duration,
+    /// Maximum model-visible content bytes in one tool result.
+    pub max_output_bytes: usize,
+    /// Maximum retained stdout/stderr ring bytes passed to the core process API.
+    pub max_stream_bytes: usize,
+    /// Maximum initial stdin bytes accepted by `terminal`.
+    pub max_stdin_bytes: usize,
+    /// Maximum retained process records in one table.
+    pub max_processes: usize,
+    /// Maximum retained process records for one profile/session/run owner.
+    pub max_processes_per_owner: usize,
+    /// Upper bound for owner cleanup and table drop.
+    pub cleanup_timeout: Duration,
+}
+
+impl ProcessToolConfig {
+    /// Returns fail-closed defaults rooted at `workspace`.
+    pub fn for_workspace(root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: root.into(),
+            default_timeout: Duration::from_secs(30),
+            max_timeout: MAX_PROCESS_TOOL_TIMEOUT,
+            max_output_bytes: 64 * 1024,
+            max_stream_bytes: 1024 * 1024,
+            max_stdin_bytes: 1024 * 1024,
+            max_processes: 32,
+            max_processes_per_owner: 8,
+            cleanup_timeout: Duration::from_secs(2),
+        }
+    }
+
+    /// Validates every process-tool budget. Invalid values fail closed.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_process_workspace(&self.workspace_root)?;
+        if self.default_timeout.is_zero() || self.default_timeout > self.max_timeout {
+            return Err("default_timeout must be positive and at most max_timeout".to_string());
+        }
+        if self.max_timeout.is_zero() || self.max_timeout > MAX_PROCESS_TOOL_TIMEOUT {
+            return Err("max_timeout must be positive and at most 3600 seconds".to_string());
+        }
+        validate_positive_bounded(
+            self.max_output_bytes,
+            MAX_PROCESS_TOOL_OUTPUT_BYTES,
+            "max_output_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_stream_bytes,
+            MAX_PROCESS_TOOL_STREAM_BYTES,
+            "max_stream_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_stdin_bytes,
+            MAX_PROCESS_TOOL_STDIN_BYTES,
+            "max_stdin_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_processes,
+            MAX_PROCESS_TOOL_PROCESSES,
+            "max_processes",
+        )?;
+        validate_positive_bounded(
+            self.max_processes_per_owner,
+            MAX_PROCESS_TOOL_PROCESSES_PER_OWNER,
+            "max_processes_per_owner",
+        )?;
+        if self.max_processes_per_owner > self.max_processes {
+            return Err("max_processes_per_owner must be at most max_processes".to_string());
+        }
+        if self.cleanup_timeout.is_zero() || self.cleanup_timeout > MAX_PROCESS_TOOL_CLEANUP_TIMEOUT
+        {
+            return Err("cleanup_timeout must be positive and at most 30 seconds".to_string());
+        }
+        Ok(())
+    }
+
+    /// Returns a copy with a canonical workspace after validation.
+    pub fn validated(&self) -> Result<Self, String> {
+        self.validate()?;
+        Ok(Self {
+            workspace_root: std::fs::canonicalize(&self.workspace_root)
+                .map_err(|error| format!("workspace_root is invalid: {error}"))?,
+            ..self.clone()
+        })
+    }
+}
+
+fn validate_process_workspace(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("workspace_root is empty".to_string());
+    }
+    if path.to_string_lossy().contains('\0') {
+        return Err("workspace_root is invalid: path contains NUL".to_string());
+    }
+    if !path.is_absolute() {
+        return Err("workspace_root must be absolute".to_string());
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("workspace_root is invalid: {error}"))?;
+    if !canonical.is_dir() {
+        return Err("workspace_root is invalid: path is not a directory".to_string());
+    }
+    Ok(())
+}
+
+fn validate_positive_bounded(value: usize, max: usize, name: &str) -> Result<(), String> {
+    if value == 0 {
+        return Err(format!("{name} must be positive"));
+    }
+    if value > max {
+        return Err(format!("{name} is too large: {value}"));
+    }
+    Ok(())
+}
+
 /// Validated configuration shared by the gateway, AgentService, and runner.
 #[derive(Clone, Debug)]
 pub struct AgentGatewayConfig {
@@ -1449,6 +1580,30 @@ mod tests {
         AgentGatewayConfig::default()
             .validate()
             .expect("default configuration must validate");
+    }
+
+    #[test]
+    fn process_tool_config_fail_closes_on_zero_and_oversize_budgets() {
+        let root = std::env::current_dir().expect("current dir");
+        let base = ProcessToolConfig::for_workspace(&root);
+        base.validate()
+            .expect("default process tool config must validate");
+
+        let mut invalid = base.clone();
+        invalid.max_timeout = Duration::ZERO;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = base.clone();
+        invalid.max_output_bytes = 0;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = base.clone();
+        invalid.max_processes = 0;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = base;
+        invalid.max_timeout = MAX_PROCESS_TOOL_TIMEOUT + Duration::from_secs(1);
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

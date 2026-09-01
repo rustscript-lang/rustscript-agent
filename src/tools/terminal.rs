@@ -1,0 +1,382 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use rustscript_vm::{
+    BoundedExecError, BoundedExecOutput, BoundedProcess, BoundedProcessRequest, CancellationToken,
+    LogSnapshot, ProcessStatus, exec_bounded,
+};
+use serde_json::{Map, Value, json};
+
+use crate::config::ProcessToolConfig;
+
+use super::process::{
+    ProcessArtifactSink, ProcessExecutorState, ProcessOwner, ProcessTable, ToolFailure,
+    apply_output_bounds, model_content, optional_positive_u64, process_error_code, snapshot_data,
+};
+use super::{NativeToolExecutor, ToolDescriptor, ToolResult, builtin_descriptor};
+
+/// Typed terminal request. `argv` is executed directly; no shell string exists.
+#[derive(Clone, Debug, Default)]
+pub struct TerminalRequest {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub stdin: Option<Vec<u8>>,
+    pub timeout_ms: Option<u64>,
+    pub deadline: Option<Instant>,
+    pub max_output_bytes: Option<u64>,
+    pub background: bool,
+}
+
+/// Native executor for the `terminal` slot.
+#[derive(Clone)]
+pub struct TerminalExecutor {
+    inner: Arc<ProcessExecutorState>,
+}
+
+impl TerminalExecutor {
+    pub fn new(
+        config: ProcessToolConfig,
+        table: Arc<ProcessTable>,
+        owner: ProcessOwner,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            inner: Arc::new(ProcessExecutorState {
+                config: config.validated()?,
+                table,
+                owner,
+                artifact_sink: None,
+            }),
+        })
+    }
+
+    pub fn with_artifact_sink(&self, sink: Arc<dyn ProcessArtifactSink>) -> Self {
+        Self {
+            inner: Arc::new(ProcessExecutorState {
+                artifact_sink: Some(sink),
+                ..(*self.inner).clone()
+            }),
+        }
+    }
+
+    pub fn slot(&self) -> NativeToolExecutor {
+        NativeToolExecutor::Terminal
+    }
+
+    pub fn descriptor(&self) -> ToolDescriptor {
+        builtin_descriptor("terminal")
+    }
+
+    pub fn table(&self) -> &ProcessTable {
+        &self.inner.table
+    }
+
+    pub fn execute(&self, arguments: &Value) -> ToolResult {
+        match parse_terminal_request(arguments) {
+            Ok(request) => self.run(request),
+            Err(failure) => failure.into_result(),
+        }
+    }
+
+    pub fn run(&self, request: TerminalRequest) -> ToolResult {
+        let prepared = match self.prepare(request) {
+            Ok(prepared) => prepared,
+            Err(failure) => return failure.into_result(),
+        };
+        if prepared.background {
+            self.spawn_background(prepared)
+        } else {
+            self.run_foreground(prepared)
+        }
+    }
+
+    fn prepare(&self, request: TerminalRequest) -> Result<PreparedRequest, ToolFailure> {
+        if request.argv.is_empty() {
+            return Err(ToolFailure::new(
+                "invalid_argv",
+                "argv must be a non-empty string array",
+            ));
+        }
+        let timeout = resolve_timeout(&self.inner.config, request.timeout_ms)?;
+        let stream_limit = resolve_stream_limit(&self.inner.config, request.max_output_bytes)?;
+        if let Some(stdin) = request.stdin.as_ref()
+            && stdin.len() > self.inner.config.max_stdin_bytes
+        {
+            return Err(ToolFailure::new(
+                "invalid_stdin",
+                "stdin exceeds the configured bound",
+            ));
+        }
+        let cwd = resolve_cwd(&self.inner.config.workspace_root, request.cwd.as_deref())?;
+        let mut core = BoundedProcessRequest::new(request.argv)
+            .with_cwd(cwd)
+            .with_workspace_root(self.inner.config.workspace_root.clone())
+            .with_env_map(request.env)
+            .with_timeout(timeout)
+            .with_output_limits(stream_limit, stream_limit, stream_limit)
+            .with_cancellation_token(CancellationToken::new());
+        if let Some(stdin) = request.stdin {
+            core = core.with_stdin(stdin);
+        }
+        if let Some(deadline) = request.deadline {
+            core = core.with_deadline(deadline);
+        }
+        Ok(PreparedRequest {
+            core,
+            background: request.background,
+        })
+    }
+
+    fn run_foreground(&self, mut prepared: PreparedRequest) -> ToolResult {
+        let (token, _guard) =
+            match ProcessTable::register_foreground(&self.inner.table, &self.inner.owner) {
+                Ok(registered) => registered,
+                Err(failure) => return failure.into_result(),
+            };
+        prepared.core = prepared.core.with_cancellation_token(token);
+        match exec_bounded(prepared.core) {
+            Ok(output) => self.foreground_result(output, true, None),
+            Err(BoundedExecError::TimedOut(output)) => self.foreground_result(
+                output,
+                false,
+                Some(("deadline_elapsed", "process deadline elapsed".to_string())),
+            ),
+            Err(BoundedExecError::Cancelled(output)) => self.foreground_result(
+                output,
+                false,
+                Some(("cancelled", "process was cancelled".to_string())),
+            ),
+            Err(BoundedExecError::Spawn(error) | BoundedExecError::Failed(error)) => {
+                let (code, message) = process_error_code(&error);
+                ToolResult::failure(code, message)
+            }
+        }
+    }
+
+    fn spawn_background(&self, prepared: PreparedRequest) -> ToolResult {
+        let process = match BoundedProcess::spawn(prepared.core) {
+            Ok(process) => process,
+            Err(error) => {
+                let (code, message) = process_error_code(&error);
+                return ToolResult::failure(code, message);
+            }
+        };
+        match self.inner.table.insert(self.inner.owner.clone(), process) {
+            Ok(process_id) => ToolResult::success(
+                String::new(),
+                json!({
+                    "background": true,
+                    "process_id": process_id,
+                    "status": "running",
+                }),
+            ),
+            Err(failure) => failure.into_result(),
+        }
+    }
+
+    fn foreground_result(
+        &self,
+        output: BoundedExecOutput,
+        ok: bool,
+        error: Option<(&str, String)>,
+    ) -> ToolResult {
+        let stdout = LogSnapshot {
+            bytes: output.stdout,
+            offset: output.stdout_offset,
+            next_offset: output.stdout_next_offset,
+            truncated: output.stdout_truncated,
+            gap: output.stdout_gap,
+            eof: true,
+        };
+        let stderr = LogSnapshot {
+            bytes: output.stderr,
+            offset: output.stderr_offset,
+            next_offset: output.stderr_next_offset,
+            truncated: output.stderr_truncated,
+            gap: output.stderr_gap,
+            eof: true,
+        };
+        let mut data = snapshot_data(&stdout, &stderr);
+        insert_exit_status(&mut data, output.status);
+        data.insert("background".into(), json!(false));
+        let content = model_content(&stdout.bytes, &stderr.bytes);
+        let truncated = stdout.truncated || stderr.truncated;
+        let mut result = if let Some((code, message)) = error {
+            ToolResult::failure_with(code, message, content, Value::Object(data), truncated)
+        } else if ok {
+            let mut result = ToolResult::success(content, Value::Object(data));
+            result.truncated = truncated;
+            result
+        } else {
+            ToolResult::failure_with(
+                "spawn_failed",
+                "process operation failed",
+                content,
+                Value::Object(data),
+                truncated,
+            )
+        };
+        apply_output_bounds(
+            &mut result,
+            &self.inner.config,
+            &self.inner.owner,
+            self.inner.artifact_sink.as_deref(),
+            &stdout.bytes,
+        );
+        result
+    }
+}
+
+struct PreparedRequest {
+    core: BoundedProcessRequest,
+    background: bool,
+}
+
+fn parse_terminal_request(arguments: &Value) -> Result<TerminalRequest, ToolFailure> {
+    let Some(items) = arguments.get("argv").and_then(Value::as_array) else {
+        return Err(ToolFailure::new(
+            "invalid_argv",
+            "argv must be a non-empty string array",
+        ));
+    };
+    let mut argv = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(ToolFailure::new(
+                "invalid_argv",
+                "argv must be a non-empty string array",
+            ));
+        };
+        argv.push(text.to_string());
+    }
+    if argv.is_empty() {
+        return Err(ToolFailure::new(
+            "invalid_argv",
+            "argv must be a non-empty string array",
+        ));
+    }
+    let stdin = match arguments.get("stdin") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.as_bytes().to_vec()),
+        Some(_) => {
+            return Err(ToolFailure::new("invalid_stdin", "stdin must be a string"));
+        }
+    };
+    Ok(TerminalRequest {
+        argv,
+        cwd: arguments
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        env: BTreeMap::new(),
+        stdin,
+        timeout_ms: optional_positive_u64(arguments, "timeout_ms", "invalid_timeout")?,
+        deadline: None,
+        max_output_bytes: optional_positive_u64(
+            arguments,
+            "max_output_bytes",
+            "invalid_output_limit",
+        )?,
+        background: false,
+    })
+}
+
+fn resolve_timeout(
+    config: &ProcessToolConfig,
+    timeout_ms: Option<u64>,
+) -> Result<Duration, ToolFailure> {
+    let timeout = match timeout_ms {
+        Some(0) => {
+            return Err(ToolFailure::new(
+                "invalid_timeout",
+                "timeout_ms must be positive",
+            ));
+        }
+        Some(ms) => Duration::from_millis(ms),
+        None => config.default_timeout,
+    };
+    if timeout.is_zero() || timeout > config.max_timeout {
+        return Err(ToolFailure::new(
+            "invalid_timeout",
+            "timeout exceeds the configured bound",
+        ));
+    }
+    Ok(timeout)
+}
+
+fn resolve_stream_limit(
+    config: &ProcessToolConfig,
+    max_output_bytes: Option<u64>,
+) -> Result<usize, ToolFailure> {
+    match max_output_bytes {
+        None => Ok(config.max_stream_bytes),
+        Some(0) => Err(ToolFailure::new(
+            "invalid_output_limit",
+            "max_output_bytes must be positive",
+        )),
+        Some(value) => {
+            let value = usize::try_from(value).unwrap_or(usize::MAX);
+            if value > config.max_stream_bytes {
+                Err(ToolFailure::new(
+                    "invalid_output_limit",
+                    "max_output_bytes exceeds the configured bound",
+                ))
+            } else {
+                Ok(value)
+            }
+        }
+    }
+}
+
+pub(crate) fn resolve_cwd(
+    workspace_root: &Path,
+    cwd: Option<&str>,
+) -> Result<PathBuf, ToolFailure> {
+    let candidate = match cwd {
+        None => workspace_root.to_path_buf(),
+        Some(value) if value.is_empty() || value.contains('\0') => {
+            return Err(invalid_cwd());
+        }
+        Some(value) => {
+            let path = Path::new(value);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                workspace_root.join(path)
+            }
+        }
+    };
+    let canonical = std::fs::canonicalize(&candidate).map_err(|_| invalid_cwd())?;
+    let workspace = std::fs::canonicalize(workspace_root).map_err(|_| invalid_cwd())?;
+    if canonical != workspace && canonical.strip_prefix(&workspace).is_err() {
+        return Err(invalid_cwd());
+    }
+    if !canonical.is_dir() {
+        return Err(invalid_cwd());
+    }
+    Ok(canonical)
+}
+
+fn invalid_cwd() -> ToolFailure {
+    ToolFailure::new("invalid_cwd", "cwd is outside the workspace")
+}
+
+fn insert_exit_status(data: &mut Map<String, Value>, status: ProcessStatus) {
+    match status {
+        ProcessStatus::Exited { code } => {
+            data.insert("status".into(), json!("exited"));
+            if let Some(code) = code {
+                data.insert("exit_code".into(), json!(code));
+            }
+        }
+        ProcessStatus::Signaled { signal } => {
+            data.insert("status".into(), json!("signaled"));
+            data.insert("signal".into(), json!(signal));
+        }
+        ProcessStatus::Unknown => {
+            data.insert("status".into(), json!("unknown"));
+        }
+    }
+}
