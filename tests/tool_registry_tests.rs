@@ -197,7 +197,8 @@ fn builtin_registry_descriptors_freeze_toolsets_risks_schemas_and_executors() {
                         "cwd": {"type": "string"},
                         "timeout_ms": {"type": "integer", "minimum": 1},
                         "max_output_bytes": {"type": "integer", "minimum": 1},
-                        "stdin": {"type": "string"}
+                        "stdin": {"type": "string"},
+                        "background": {"type": "boolean"}
                     },
                     "required": ["argv"],
                     "additionalProperties": false

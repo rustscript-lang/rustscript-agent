@@ -22,14 +22,17 @@
 //! succeeds.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use rustscript_vm::{CancellationReason, HttpConfig, InvocationError, Value as VmValue};
+use rustscript_vm::{
+    CancellationReason, CancellationToken, HttpConfig, InvocationError, Value as VmValue,
+};
 use serde_json::{Map, Value as JsonValue, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -39,11 +42,12 @@ use crate::config::{
     ADMISSION_RUN_COL_MODEL, ADMISSION_RUN_COL_PARENT_RUN_ID, ADMISSION_RUN_COL_PROVIDER,
     ADMISSION_RUN_COL_SCRIPT_HASH, ADMISSION_RUN_COL_SESSION_ID, ADMISSION_RUN_COL_STATUS,
     ADMISSION_SESSION_PROFILE, AdmissionSqliteCellLens, AgentGatewayConfig, ClientDisconnectPolicy,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_MODEL_NAME_BYTES, MAX_PROVIDER_NAME_BYTES,
-    MAX_RUN_CONTEXT_STORAGE_BYTES, ProviderProfile, ProviderProfileError, RunLimits,
-    RunLimitsError, estimate_admission_query_bytes, validate_request_hash, validate_visible_name,
+    FileToolConfig, MAX_IDEMPOTENCY_KEY_BYTES, MAX_MODEL_NAME_BYTES, MAX_PROVIDER_NAME_BYTES,
+    MAX_RUN_CONTEXT_STORAGE_BYTES, ProcessToolConfig, ProviderProfile, ProviderProfileError,
+    RunLimits, RunLimitsError, estimate_admission_query_bytes, validate_request_hash,
+    validate_visible_name,
 };
-use crate::domain::{RunContext, timestamp, truncate_for_log, vm_value_to_json};
+use crate::domain::{RunContext, ToolCall, timestamp, truncate_for_log, vm_value_to_json};
 use crate::events;
 use crate::gateway::store::{
     GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
@@ -54,7 +58,11 @@ use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, append_event_locked, run_delivery_task,
 };
 use crate::runtime::rss_runner::execute_rss_source;
-use crate::tools::{ToolRegistry, ToolRegistrySnapshot};
+use crate::tools::{
+    ArtifactOwner, DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError,
+    FileTools, NativeExecutionDeps, ProcessArtifactSink, ProcessExecutor, ProcessOwner,
+    ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry, ToolRegistrySnapshot, ToolResult,
+};
 use crate::{RunCancellation, RunError};
 
 /// One run whose terminal state could not be committed durably. The worker
@@ -93,6 +101,50 @@ pub struct RunHandle {
     /// critical section so attach/drop races are atomic.
     subscribers: Mutex<SubscriberState>,
     disconnect_policy: ClientDisconnectPolicy,
+    /// Created at admission and cancelled by every stop/deadline/terminal path.
+    tool_cancel: CancellationToken,
+    /// Run-scoped native dispatch state shared by every `dispatch_tools` call.
+    native_dispatch: Mutex<NativeDispatchSlot>,
+}
+
+/// Shared native dispatch machinery for one admitted run.
+struct NativeDispatchState {
+    dispatcher: DispatchContext,
+    files: FileTools,
+    table: Arc<ProcessTable>,
+    cleaned: AtomicBool,
+    shutdown_entered: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Monotonic native-dispatch slot: once `closed`, lazy init must never refill.
+struct NativeDispatchSlot {
+    closed: bool,
+    state: Option<Arc<NativeDispatchState>>,
+}
+
+impl NativeDispatchState {
+    fn shutdown(&self) {
+        if self.cleaned.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(observer) = &self.shutdown_entered {
+            observer();
+        }
+        self.dispatcher.cancellation().cancel();
+        let owner = self.dispatcher.owner();
+        let _ = self.table.cleanup_owner(&ProcessOwner::from(owner.clone()));
+        let _ = self
+            .files
+            .artifact_store_arc()
+            .cleanup_owner(&ArtifactOwner::from(owner.clone()));
+        self.table.shutdown();
+    }
+}
+
+impl Drop for NativeDispatchState {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// Live SSE subscriber accounting for one run handle.
@@ -106,6 +158,37 @@ impl RunHandle {
     /// True while the run has not committed a terminal state.
     pub fn is_terminal(&self) -> bool {
         self.terminal_at.lock().expect("terminal lock").is_some()
+    }
+
+    fn cancel_native_tools(&self) {
+        self.tool_cancel.cancel();
+    }
+
+    fn native_dispatch_closed(&self) -> bool {
+        self.native_dispatch
+            .lock()
+            .expect("native dispatch lock")
+            .closed
+    }
+
+    fn release_native_dispatch(&self) {
+        self.tool_cancel.cancel();
+        let state = {
+            let mut slot = self.native_dispatch.lock().expect("native dispatch lock");
+            slot.closed = true;
+            slot.state.take()
+        };
+        if let Some(state) = state {
+            state.shutdown();
+        }
+    }
+
+    fn native_dispatch_retained(&self) -> bool {
+        self.native_dispatch
+            .lock()
+            .expect("native dispatch lock")
+            .state
+            .is_some()
     }
 }
 
@@ -155,6 +238,7 @@ impl Drop for SubscriberGuard {
             .lock()
             .expect("cancel reason lock") = Some("client_disconnect");
         self.handle.cancel.request(CancellationReason::Requested);
+        self.handle.cancel_native_tools();
     }
 }
 
@@ -167,6 +251,18 @@ fn handle_cancel_reason(handle: &RunHandle, fallback: &'static str) -> &'static 
         .lock()
         .expect("cancel reason lock")
         .unwrap_or(fallback)
+}
+
+fn cancelled_dispatch_results(calls: &[ToolCall], terminal: bool) -> Vec<ToolResult> {
+    let message = if terminal {
+        "run already committed a terminal state"
+    } else {
+        "native dispatch is closed"
+    };
+    calls
+        .iter()
+        .map(|_| ToolResult::failure("cancelled", message))
+        .collect()
 }
 
 /// Admission request built by the transport from the normalized request.
@@ -316,6 +412,23 @@ struct AgentServiceInner {
     halting: AtomicBool,
     store_generation: AtomicU64,
     metrics: Arc<Metrics>,
+    file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    native_dispatch_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Drop for AgentServiceInner {
+    fn drop(&mut self) {
+        let handles: Vec<Arc<RunHandle>> = self
+            .runs
+            .lock()
+            .expect("runs lock")
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        for handle in handles {
+            handle.release_native_dispatch();
+        }
+    }
 }
 
 impl AgentService {
@@ -357,6 +470,8 @@ impl AgentService {
             halting: AtomicBool::new(false),
             store_generation: AtomicU64::new(0),
             metrics,
+            file_search_entered: Mutex::new(None),
+            native_dispatch_shutdown: Mutex::new(None),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
         Self { inner }
@@ -458,6 +573,259 @@ impl AgentService {
                 })
             })
             .unwrap_or_default()
+    }
+
+    /// Serial, validated native dispatch against the admitted registry snapshot.
+    ///
+    /// The live registry is not consulted. Durable event append uses the same
+    /// store/persist/publish path as script delivery.
+    pub fn dispatch_tools(
+        &self,
+        run_id: &str,
+        calls: &[ToolCall],
+    ) -> Result<Vec<ToolResult>, RunContextError> {
+        let handle = self
+            .handle(run_id)
+            .ok_or_else(|| RunContextError::Missing {
+                run_id: run_id.to_string(),
+            })?;
+        if handle.is_terminal() || handle.native_dispatch_closed() {
+            return Ok(cancelled_dispatch_results(calls, handle.is_terminal()));
+        }
+        match self.native_dispatch_state(run_id, &handle)? {
+            Some(state) => Ok(state.dispatcher.dispatch(calls)),
+            None => Ok(cancelled_dispatch_results(calls, handle.is_terminal())),
+        }
+    }
+
+    fn native_dispatch_state(
+        &self,
+        run_id: &str,
+        handle: &Arc<RunHandle>,
+    ) -> Result<Option<Arc<NativeDispatchState>>, RunContextError> {
+        let mut slot = handle.native_dispatch.lock().expect("native dispatch lock");
+        if slot.closed {
+            return Ok(None);
+        }
+        if let Some(existing) = slot.state.as_ref() {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        let created = Arc::new(self.build_native_dispatch_state(run_id, handle)?);
+        if slot.closed {
+            drop(slot);
+            return Ok(None);
+        }
+        slot.state = Some(Arc::clone(&created));
+        Ok(Some(created))
+    }
+
+    fn build_native_dispatch_state(
+        &self,
+        run_id: &str,
+        handle: &Arc<RunHandle>,
+    ) -> Result<NativeDispatchState, RunContextError> {
+        let context = self
+            .run_context(run_id)
+            .ok_or_else(|| RunContextError::Missing {
+                run_id: run_id.to_string(),
+            })?;
+        let registry = self.run_registry_snapshot(run_id).ok_or_else(|| {
+            invalid_context_metadata(run_id, "admitted registry snapshot is missing")
+        })?;
+        let expected = context
+            .metadata
+            .get("registry_identity")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| invalid_context_metadata(run_id, "registry identity is missing"))?;
+        if registry.identity() != expected {
+            return Err(RunContextError::RegistryMismatch {
+                run_id: run_id.to_string(),
+                expected: expected.to_string(),
+                actual: registry.identity().to_string(),
+            });
+        }
+        let toolset_hash = context
+            .metadata
+            .get("toolset_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(expected)
+            .to_string();
+        let owner = ToolOwner::new(
+            ADMISSION_SESSION_PROFILE,
+            &context.session_id,
+            &context.run_id,
+        )
+        .map_err(|error| invalid_context_metadata(run_id, &error))?;
+        let workspace = context
+            .limits
+            .get("workspace_root")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| invalid_context_metadata(run_id, "workspace_root is missing"))?;
+        let workspace = PathBuf::from(workspace);
+        let max_tool_calls = context
+            .limits
+            .get("max_tool_calls")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| invalid_context_metadata(run_id, "max_tool_calls is missing"))?;
+        let max_tool_output_bytes = context
+            .limits
+            .get("max_tool_output_bytes")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| invalid_context_metadata(run_id, "max_tool_output_bytes is missing"))?
+            as usize;
+        let file_config = FileToolConfig::for_workspace(&workspace);
+        let process_config = ProcessToolConfig::for_workspace(&workspace);
+        let mut files = FileTools::new(file_config)
+            .map_err(|error| invalid_context_metadata(run_id, &error))?
+            .with_owner(ArtifactOwner::from(owner.clone()));
+        if let Some(observer) = self
+            .inner
+            .file_search_entered
+            .lock()
+            .expect("file search observer lock")
+            .clone()
+        {
+            files = files.with_search_entered_observer(observer);
+        }
+        let table = Arc::new(
+            ProcessTable::new(process_config.clone())
+                .map_err(|error| invalid_context_metadata(run_id, &error))?,
+        );
+        let sink: Arc<dyn ProcessArtifactSink> = files.artifact_store_arc();
+        let terminal = TerminalExecutor::new(
+            process_config.clone(),
+            Arc::clone(&table),
+            ProcessOwner::from(owner.clone()),
+        )
+        .map_err(|error| invalid_context_metadata(run_id, &error))?
+        .with_artifact_sink(Arc::clone(&sink));
+        let process = ProcessExecutor::new(
+            process_config,
+            Arc::clone(&table),
+            ProcessOwner::from(owner.clone()),
+        )
+        .map_err(|error| invalid_context_metadata(run_id, &error))?
+        .with_artifact_sink(sink);
+        let events = Arc::new(ServiceEventCommitter {
+            store: Arc::clone(&self.inner.store),
+            persistence: self.inner.persistence.clone(),
+            run_id: run_id.to_string(),
+            handle: Arc::downgrade(handle),
+            max_event_bytes: self.inner.config.max_event_bytes,
+            max_events_per_run: self.inner.config.max_events_per_run,
+        });
+        let dispatcher = DispatchContext::new(
+            owner,
+            workspace,
+            handle.tool_cancel.clone(),
+            handle.started_at + self.inner.config.run_timeout,
+            registry,
+            expected.to_string(),
+            toolset_hash,
+            DispatchLimits {
+                max_tool_calls,
+                max_tool_output_bytes,
+                max_event_bytes: self.inner.config.max_event_bytes,
+            },
+            events,
+            Arc::new(NativeExecutionDeps {
+                files: files.clone(),
+                terminal,
+                process,
+            }),
+        )
+        .map_err(|error| invalid_context_metadata(run_id, &error))?;
+        Ok(NativeDispatchState {
+            dispatcher,
+            files,
+            table,
+            cleaned: AtomicBool::new(false),
+            shutdown_entered: self
+                .inner
+                .native_dispatch_shutdown
+                .lock()
+                .expect("native dispatch shutdown observer lock")
+                .clone(),
+        })
+    }
+
+    /// True when run-scoped native dispatch state is still retained.
+    pub fn native_dispatch_retained(&self, run_id: &str) -> bool {
+        self.handle(run_id)
+            .is_some_and(|handle| handle.native_dispatch_retained())
+    }
+
+    /// Test seam: later native `search_files` walks invoke `observer` when they
+    /// begin, so service tests can prove stop overlaps an in-flight search.
+    pub fn inject_file_search_entered_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .file_search_entered
+            .lock()
+            .expect("file search observer lock") = Some(observer);
+    }
+
+    /// Test seam: later native-dispatch shutdown invokes `observer` before
+    /// process/artifact teardown, so service tests can overlap handle/stop/admit
+    /// with an in-flight close.
+    pub fn inject_native_dispatch_shutdown_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .native_dispatch_shutdown
+            .lock()
+            .expect("native dispatch shutdown observer lock") = Some(observer);
+    }
+
+    /// Drops native dispatch state and cleans processes/artifacts for every
+    /// run belonging to `session_id`.
+    pub fn cleanup_session_native_dispatch(&self, session_id: &str) {
+        let run_ids: Vec<String> = {
+            let store = self.inner.store.read();
+            let mut ids: Vec<String> = store
+                .runs
+                .iter()
+                .filter(|(_, run)| run.session_id == session_id)
+                .map(|(run_id, _)| run_id.clone())
+                .collect();
+            drop(store);
+            if ids.is_empty() {
+                ids = self
+                    .inner
+                    .contexts
+                    .lock()
+                    .expect("contexts lock")
+                    .iter()
+                    .filter(|(_, context)| context.session_id == session_id)
+                    .map(|(run_id, _)| run_id.clone())
+                    .collect();
+            }
+            ids
+        };
+        let handles: Vec<Arc<RunHandle>> = {
+            let runs = self.inner.runs.lock().expect("runs lock");
+            run_ids
+                .into_iter()
+                .filter_map(|run_id| runs.get(&run_id).cloned())
+                .collect()
+        };
+        for handle in handles {
+            handle.release_native_dispatch();
+        }
+    }
+
+    /// Cancels and drops every retained native dispatch state.
+    pub fn shutdown_native_dispatch(&self) {
+        let handles: Vec<Arc<RunHandle>> = self
+            .inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .values()
+            .cloned()
+            .collect();
+        for handle in handles {
+            handle.release_native_dispatch();
+        }
     }
 
     /// Verifies that an admitted or persisted run can execute with the
@@ -937,6 +1305,11 @@ impl AgentService {
             }),
             disconnect_policy: self.inner.config.client_disconnect_policy,
             started_at: Instant::now(),
+            tool_cancel: CancellationToken::new(),
+            native_dispatch: Mutex::new(NativeDispatchSlot {
+                closed: false,
+                state: None,
+            }),
         });
         self.inner
             .runs
@@ -1165,6 +1538,7 @@ impl AgentService {
             // observing the cancellation commits exactly this reason.
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
             handle.cancel.request(CancellationReason::Requested);
+            handle.cancel_native_tools();
             tracing::debug!(
                 run_id,
                 reason = "requested",
@@ -1197,6 +1571,7 @@ impl AgentService {
         for handle in handles {
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("resource_closed");
             handle.cancel.request(CancellationReason::ResourceClosed);
+            handle.cancel_native_tools();
         }
     }
 
@@ -1219,29 +1594,31 @@ impl AgentService {
     /// worker (or the bounded terminal retry loop) after the one terminal
     /// commit.
     pub fn mark_terminal(&self, run_id: &str) {
-        if let Some(handle) = self
+        let Some(handle) = self
             .inner
             .runs
             .lock()
             .expect("runs lock")
             .get(run_id)
             .cloned()
-        {
-            handle.terminal.store(true, Ordering::Release);
-            let now = Instant::now();
-            let mut terminal_at = handle.terminal_at.lock().expect("terminal lock");
-            if terminal_at.is_none() {
-                self.inner
-                    .metrics
-                    .record_run_duration(handle.started_at.elapsed().as_secs_f64());
-                // The gauge release belongs to the same first-call guard:
-                // the run transitions out of the active gauge exactly once.
-                self.inner.metrics.active_runs_dec();
-            }
-            *terminal_at = Some(now);
-            drop(terminal_at);
-            handle.permit.lock().expect("permit lock").take();
+        else {
+            return;
+        };
+        handle.terminal.store(true, Ordering::Release);
+        let now = Instant::now();
+        let mut terminal_at = handle.terminal_at.lock().expect("terminal lock");
+        if terminal_at.is_none() {
+            self.inner
+                .metrics
+                .record_run_duration(handle.started_at.elapsed().as_secs_f64());
+            // The gauge release belongs to the same first-call guard:
+            // the run transitions out of the active gauge exactly once.
+            self.inner.metrics.active_runs_dec();
         }
+        *terminal_at = Some(now);
+        drop(terminal_at);
+        handle.permit.lock().expect("permit lock").take();
+        handle.release_native_dispatch();
     }
 
     /// Records one run's terminal state for the bounded durable-first retry
@@ -2140,6 +2517,84 @@ fn admit_context_error(error: RunContextError) -> AdmitError {
     }
 }
 
+struct ServiceEventCommitter {
+    store: Arc<RwLock<GatewayStore>>,
+    persistence: Option<Arc<GatewayPersistence>>,
+    run_id: String,
+    handle: Weak<RunHandle>,
+    max_event_bytes: usize,
+    max_events_per_run: usize,
+}
+
+impl DurableEventCommitter for ServiceEventCommitter {
+    fn is_terminal(&self) -> bool {
+        self.handle
+            .upgrade()
+            .map(|handle| handle.is_terminal())
+            .unwrap_or(true)
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.handle
+            .upgrade()
+            .map(|handle| handle.cancel.requested().is_some())
+            .unwrap_or(true)
+    }
+
+    fn commit(&self, event_type: &str, data: JsonValue) -> Result<(), EventCommitError> {
+        if self.is_terminal() {
+            return Err(EventCommitError::Terminal);
+        }
+        let mut store = self.store.write();
+        let Some(run) = store.runs.get_mut(&self.run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
+        if matches!(
+            run.status.as_str(),
+            "completed" | "failed" | "cancelled" | "terminal_pending"
+        ) {
+            return Err(EventCommitError::Terminal);
+        }
+        let event = append_event_locked(
+            run,
+            event_type,
+            data,
+            self.max_event_bytes,
+            self.max_events_per_run,
+        );
+        let durable = match self.persistence.as_ref() {
+            Some(persistence) => {
+                let payload = json!({
+                    "run_id": self.run_id,
+                    "event_id": event.event_id,
+                    "event_type": event.event,
+                    "payload_json": serde_json::to_string(&event.data)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    "now_ms": timestamp(),
+                    "max_events": self.max_events_per_run,
+                });
+                persistence.event_append(&payload).map(|_| ())
+            }
+            None => Ok(()),
+        };
+        match durable {
+            Ok(()) => {
+                let sender = run.sender.clone();
+                drop(store);
+                if let Some(sender) = sender {
+                    let _ = sender.send(event);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                run.events
+                    .retain(|existing| existing.event_id != event.event_id);
+                Err(EventCommitError::PersistFailed(error.to_string()))
+            }
+        }
+    }
+}
+
 fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {
     RunContextError::InvalidMetadata {
         run_id: run_id.to_string(),
@@ -2754,6 +3209,7 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
             let ttl = inner.config.terminal_run_ttl;
             let now = Instant::now();
+            let mut expired_handles = Vec::new();
             let expired_run_ids: HashSet<String> = {
                 let mut runs = inner.runs.lock().expect("runs lock");
                 let mut expired = HashSet::new();
@@ -2764,12 +3220,16 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
                         .expect("terminal lock")
                         .is_none_or(|terminal_at| terminal_at + ttl > now);
                     if !keep {
+                        expired_handles.push(Arc::clone(handle));
                         expired.insert(run_id.clone());
                     }
                     keep
                 });
                 expired
             };
+            for handle in expired_handles {
+                handle.release_native_dispatch();
+            }
             if !expired_run_ids.is_empty() {
                 inner
                     .contexts

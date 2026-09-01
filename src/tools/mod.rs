@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod dispatch;
 pub mod files;
 pub mod process;
 pub mod registry;
@@ -9,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub use artifacts::{ArtifactError, ArtifactOwner, ArtifactStore, StoredArtifact};
+pub use dispatch::{
+    DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError, NativeExecutionDeps,
+    ToolExecutorBoundary,
+};
 pub use files::{FileTools, ReadFileRequest, SearchFilesRequest};
 pub use process::{
     ProcessAction, ProcessArtifactSink, ProcessExecutor, ProcessOwner, ProcessRequest, ProcessTable,

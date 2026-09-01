@@ -330,7 +330,10 @@ fn parse_terminal_request(arguments: &Value) -> Result<TerminalRequest, ToolFail
             "max_output_bytes",
             "invalid_output_limit",
         )?,
-        background: false,
+        background: arguments
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         ..TerminalRequest::default()
     })
 }

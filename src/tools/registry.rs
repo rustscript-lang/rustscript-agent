@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io};
+use std::{collections::BTreeSet, io, sync::Arc};
 
 use serde_json::{Map, Value, json};
 
@@ -835,6 +835,43 @@ pub fn validate_json_schema(schema: &Value) -> Result<(), SchemaValidationError>
     }
 }
 
+/// Validates a tool-call instance against a frozen registry JSON Schema.
+///
+/// The schema document itself was accepted at registration time. This checks
+/// the model's arguments, returning a bounded diagnostic on the first error.
+pub fn validate_tool_arguments(schema: &Value, arguments: &Value) -> Result<(), String> {
+    let validator = compile_instance_validator(schema)?;
+    validator.validate(arguments).map_err(|error| {
+        let path = bounded_pointer(&error.instance_path().to_string());
+        let keyword = bounded_token(error.kind().keyword(), MAX_ERROR_FIELD_BYTES);
+        bounded_message(
+            &format!("keyword={keyword} path={path}"),
+            MAX_DIAGNOSTIC_BYTES,
+        )
+    })?;
+    Ok(())
+}
+
+fn compile_instance_validator(schema: &Value) -> Result<jsonschema::Validator, String> {
+    let compiled = match declared_schema_draft(schema) {
+        Some(jsonschema::Draft::Draft4) => jsonschema::draft4::new(schema),
+        Some(jsonschema::Draft::Draft6) => jsonschema::draft6::new(schema),
+        Some(jsonschema::Draft::Draft7) => jsonschema::draft7::new(schema),
+        Some(jsonschema::Draft::Draft201909) => jsonschema::draft201909::new(schema),
+        Some(jsonschema::Draft::Draft202012) => jsonschema::draft202012::new(schema),
+        _ => jsonschema::draft7::new(schema),
+    };
+    compiled.map_err(|error| bounded_message(&error.to_string(), MAX_DIAGNOSTIC_BYTES))
+}
+
+fn declared_schema_draft(schema: &Value) -> Option<jsonschema::Draft> {
+    schema
+        .as_object()
+        .and_then(|object| object.get("$schema"))
+        .and_then(Value::as_str)
+        .and_then(supported_schema_draft)
+}
+
 fn validate_modern_schema_with_legacy_compatibility(
     schema: &Value,
 ) -> Result<(), SchemaValidationError> {
@@ -944,12 +981,22 @@ fn schema_keyword_from_pointer(pointer: &str, fallback: &str) -> String {
 }
 
 /// An immutable, deterministic registry view suitable for attaching to a run.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ToolRegistrySnapshot {
     entries: Box<[ToolRegistryEntry]>,
     descriptors: Box<[ToolDescriptor]>,
     names: Box<[String]>,
     identity: String,
+    validators: Box<[Arc<jsonschema::Validator>]>,
+}
+
+impl PartialEq for ToolRegistrySnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+            && self.descriptors == other.descriptors
+            && self.names == other.names
+            && self.identity == other.identity
+    }
 }
 
 impl ToolRegistrySnapshot {
@@ -974,10 +1021,14 @@ impl ToolRegistrySnapshot {
     }
 
     pub fn descriptor(&self, name: &str) -> Option<&ToolDescriptor> {
+        self.entry(name).map(ToolRegistryEntry::descriptor)
+    }
+
+    /// Frozen registry entry for `name`, including its native executor slot.
+    pub fn entry(&self, name: &str) -> Option<&ToolRegistryEntry> {
         self.entries
             .iter()
             .find(|entry| entry.descriptor.name == name)
-            .map(ToolRegistryEntry::descriptor)
     }
 
     /// Returns the provider-facing descriptor array without exposing registry
@@ -1000,6 +1051,35 @@ impl ToolRegistrySnapshot {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Validates `arguments` against the frozen compiled schema for `name`.
+    pub fn validate_arguments(&self, name: &str, arguments: &Value) -> Result<(), String> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.descriptor.name == name)
+            .ok_or_else(|| bounded_message("unknown tool", MAX_DIAGNOSTIC_BYTES))?;
+        self.validators[index]
+            .validate(arguments)
+            .map_err(|error| {
+                let path = bounded_pointer(&error.instance_path().to_string());
+                let keyword = bounded_token(error.kind().keyword(), MAX_ERROR_FIELD_BYTES);
+                bounded_message(
+                    &format!("keyword={keyword} path={path}"),
+                    MAX_DIAGNOSTIC_BYTES,
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Frozen compiled instance validator for `name`, if the snapshot contains it.
+    pub fn frozen_argument_validator(&self, name: &str) -> Option<&jsonschema::Validator> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.descriptor.name == name)?;
+        Some(self.validators[index].as_ref())
     }
 }
 
@@ -1055,6 +1135,17 @@ impl ToolRegistry {
             .map(|descriptor| descriptor.name.clone())
             .collect();
         let identity = registry_identity(&collected);
+        let mut validators = Vec::with_capacity(collected.len());
+        for entry in &collected {
+            let validator =
+                compile_instance_validator(&entry.descriptor.schema).map_err(|reason| {
+                    ToolRegistryError::InvalidSchema {
+                        name: entry.descriptor.name.clone(),
+                        reason,
+                    }
+                })?;
+            validators.push(Arc::new(validator));
+        }
 
         Ok(Self {
             snapshot: ToolRegistrySnapshot {
@@ -1062,6 +1153,7 @@ impl ToolRegistry {
                 descriptors: descriptors.into_boxed_slice(),
                 names: names.into_boxed_slice(),
                 identity,
+                validators: validators.into_boxed_slice(),
             },
         })
     }
@@ -1218,7 +1310,8 @@ pub fn builtin_entries() -> Vec<ToolRegistryEntry> {
                         "cwd": {"type": "string"},
                         "timeout_ms": {"type": "integer", "minimum": 1},
                         "max_output_bytes": {"type": "integer", "minimum": 1},
-                        "stdin": {"type": "string"}
+                        "stdin": {"type": "string"},
+                        "background": {"type": "boolean"}
                     },
                     "required": ["argv"],
                     "additionalProperties": false

@@ -75,6 +75,7 @@ pub struct FileTools {
     root: Arc<ConfinedFsRoot>,
     artifacts: Arc<ArtifactStore>,
     owner: Option<ArtifactOwner>,
+    search_entered: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl FileTools {
@@ -97,6 +98,7 @@ impl FileTools {
             root: Arc::new(root),
             artifacts: Arc::new(artifacts),
             owner: None,
+            search_entered: None,
         })
     }
 
@@ -105,6 +107,17 @@ impl FileTools {
         Self {
             owner: Some(owner),
             ..self.clone()
+        }
+    }
+
+    /// Test seam: `observer` runs when a later `search_files` walk begins.
+    pub(crate) fn with_search_entered_observer(
+        self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            search_entered: Some(observer),
+            ..self
         }
     }
 
@@ -224,6 +237,9 @@ impl FileTools {
             Ok(bytes) => bytes,
             Err(error) => return map_fs_error(error, json!({})),
         };
+        if let Some(result) = control_failure(cancellation, deadline, json!({})) {
+            return result;
+        }
         if bytes.contains(&0) {
             return fail("binary_file", "file contains binary content", json!({}));
         }
@@ -278,6 +294,9 @@ impl FileTools {
                 "search_files requires a pattern",
                 json!({}),
             );
+        }
+        if let Some(observer) = &self.search_entered {
+            observer();
         }
         let target_files = matches!(request.target.as_deref(), Some("files"));
         let start = request.path.as_deref().unwrap_or("");
