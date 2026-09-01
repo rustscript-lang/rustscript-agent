@@ -1,3 +1,5 @@
+pub mod artifacts;
+pub mod files;
 pub mod process;
 pub mod registry;
 pub mod terminal;
@@ -6,6 +8,8 @@ pub mod types;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use artifacts::{ArtifactError, ArtifactOwner, ArtifactStore, StoredArtifact};
+pub use files::{FileTools, ReadFileRequest, SearchFilesRequest};
 pub use process::{
     ProcessAction, ProcessArtifactSink, ProcessExecutor, ProcessOwner, ProcessRequest, ProcessTable,
 };
