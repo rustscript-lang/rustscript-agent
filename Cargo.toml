@@ -25,7 +25,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "5c328b8d5c374b365a2560925204e588b575a30a", default-features = false, features = ["runtime", "http-client", "sqlite"] }
+rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "31e4003869c1bbca01c547f443446a6cb63dec59", default-features = false, features = ["runtime", "http-client", "sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Meta-schema validation only; resolver features stay disabled.
