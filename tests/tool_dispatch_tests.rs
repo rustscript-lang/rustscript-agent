@@ -7,12 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use rustscript_agent::config::{FileToolConfig, ProcessToolConfig, RunLimits};
+use rustscript_agent::config::{ArtifactStoreConfig, FileToolConfig, ProcessToolConfig, RunLimits};
+use rustscript_agent::service::RunContextError;
 use rustscript_agent::tools::{
-    ArtifactOwner, DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError,
-    FileTools, NativeExecutionDeps, NativeToolExecutor, ProcessArtifactSink, ProcessExecutor,
-    ProcessOwner, ProcessTable, TerminalExecutor, TerminalRequest, ToolExecutorBoundary, ToolOwner,
-    ToolRegistry, ToolRegistryEntry, ToolRegistrySnapshot, ToolResult,
+    ArtifactOwner, ArtifactStore, DispatchContext, DispatchLimits, DurableEventCommitter,
+    EventCommitError, FileTools, NativeExecutionDeps, NativeToolExecutor, ProcessArtifactSink,
+    ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, TerminalRequest,
+    ToolExecutorBoundary, ToolOwner, ToolRegistry, ToolRegistryEntry, ToolRegistrySnapshot,
+    ToolResult,
 };
 use rustscript_agent::{
     AdmitRunRequest, AdmittedRun, AgentGatewayConfig, AgentGatewayState, AgentService, ToolCall,
@@ -2174,4 +2176,362 @@ async fn session_cleanup_does_not_block_handle_stop_or_admission_during_hostile_
     cleanup.join().expect("cleanup join");
     wait_until_dead(pid);
     assert!(!service.native_dispatch_retained(&admitted_hostile.run_id));
+}
+
+fn derived_artifact_root(workspace: &Path) -> PathBuf {
+    let name = workspace
+        .file_name()
+        .map(|component| component.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".to_string());
+    workspace
+        .parent()
+        .expect("workspace parent")
+        .join(format!(".rustscript-agent-state-{name}"))
+}
+
+#[tokio::test]
+async fn same_workspace_two_runs_share_one_artifact_store() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let first = admit_run(&service).await;
+    let second = admit_run(&service).await;
+    let first_result = service
+        .dispatch_tools(
+            &first.run_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect("first dispatch");
+    let second_result = service
+        .dispatch_tools(
+            &second.run_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect("second dispatch");
+    assert!(first_result[0].ok, "{:?}", first_result[0]);
+    assert!(second_result[0].ok, "{:?}", second_result[0]);
+    let store_a = service
+        .native_artifact_store(&first.run_id)
+        .expect("first store");
+    let store_b = service
+        .native_artifact_store(&second.run_id)
+        .expect("second store");
+    assert!(
+        Arc::ptr_eq(&store_a, &store_b),
+        "concurrent runs in one workspace must share one ArtifactStore"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_workspace_first_inits_share_one_store() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let first = admit_run(&service).await;
+    let second = admit_run(&service).await;
+    let left = service.clone();
+    let right = service.clone();
+    let left_id = first.run_id.clone();
+    let right_id = second.run_id.clone();
+    let left_thread = thread::spawn(move || {
+        left.dispatch_tools(
+            &left_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+    });
+    let right_thread = thread::spawn(move || {
+        right.dispatch_tools(
+            &right_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+    });
+    let left_result = left_thread
+        .join()
+        .expect("left join")
+        .expect("left dispatch");
+    let right_result = right_thread
+        .join()
+        .expect("right join")
+        .expect("right dispatch");
+    assert!(left_result[0].ok, "{:?}", left_result[0]);
+    assert!(right_result[0].ok, "{:?}", right_result[0]);
+    let store_a = service
+        .native_artifact_store(&first.run_id)
+        .expect("first store");
+    let store_b = service
+        .native_artifact_store(&second.run_id)
+        .expect("second store");
+    assert!(Arc::ptr_eq(&store_a, &store_b));
+}
+
+#[tokio::test]
+async fn different_workspace_artifact_stores_stay_isolated() {
+    let left_fixture = Fixture::new();
+    let right_fixture = Fixture::new();
+    fs::write(left_fixture.root.join("ok.txt"), "left\n").expect("write left");
+    fs::write(right_fixture.root.join("ok.txt"), "right\n").expect("write right");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 64 * 1024, &left_fixture.root).expect("left limits"))
+        .expect("set left");
+    let left_run = admit_run(&service).await;
+    service
+        .set_run_limits(RunLimits::new(8, 8, 64 * 1024, &right_fixture.root).expect("right limits"))
+        .expect("set right");
+    let right_run = admit_run(&service).await;
+    let left_result = service
+        .dispatch_tools(
+            &left_run.run_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect("left dispatch");
+    let right_result = service
+        .dispatch_tools(
+            &right_run.run_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect("right dispatch");
+    assert!(left_result[0].ok, "{:?}", left_result[0]);
+    assert!(right_result[0].ok, "{:?}", right_result[0]);
+    let store_a = service
+        .native_artifact_store(&left_run.run_id)
+        .expect("left store");
+    let store_b = service
+        .native_artifact_store(&right_run.run_id)
+        .expect("right store");
+    assert!(!Arc::ptr_eq(&store_a, &store_b));
+}
+
+#[tokio::test]
+async fn artifact_store_pool_drops_dead_stores_so_root_can_reopen() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    service
+        .dispatch_tools(
+            &admitted.run_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect("dispatch");
+    service.mark_terminal(&admitted.run_id);
+    assert!(!service.native_dispatch_retained(&admitted.run_id));
+    let config = ArtifactStoreConfig::for_root(derived_artifact_root(&fixture.root));
+    ArtifactStore::with_config(config).expect("dead pool entry must release the exclusive flock");
+}
+
+#[tokio::test]
+async fn native_dispatch_init_preserves_artifact_store_error_code() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let artifact_root = derived_artifact_root(&fixture.root);
+    fs::write(&artifact_root, b"not-a-directory").expect("block artifact root with a file");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    let error = service
+        .dispatch_tools(
+            &admitted.run_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect_err("blocked artifact root must fail native init");
+    match error {
+        RunContextError::InvalidMetadata { reason, .. } => {
+            assert!(
+                reason.contains("invalid_config"),
+                "typed ArtifactStoreError code must survive native init: {reason}"
+            );
+        }
+        other => panic!("expected InvalidMetadata, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn admitted_32kib_cap_artifacts_at_executor_layer() {
+    let fixture = Fixture::new();
+    let payload = "0123456789abcdef".repeat(40 * 1024 / 16);
+    fs::write(fixture.root.join("mid.txt"), &payload).expect("write mid file");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 32 * 1024, &fixture.root).expect("32KiB limits"))
+        .expect("set limits");
+    let admitted = admit_run(&service).await;
+    let result = service
+        .dispatch_tools(
+            &admitted.run_id,
+            &[call("c1", "read_file", json!({"path": "mid.txt"}))],
+        )
+        .expect("dispatch");
+    assert!(
+        result[0].truncated || !result[0].artifacts.is_empty(),
+        "32KiB admitted cap must artifact at the executor: {:?}",
+        result[0]
+    );
+    let encoded = serde_json::to_vec(&result[0]).expect("encode");
+    assert!(
+        encoded.len() <= 32 * 1024,
+        "serialized cap is defense-in-depth: {}",
+        encoded.len()
+    );
+}
+
+#[tokio::test]
+async fn admitted_1mib_cap_keeps_over_64kib_inline() {
+    let fixture = Fixture::new();
+    let payload = "0123456789abcdef".repeat(80 * 1024 / 16);
+    fs::write(fixture.root.join("large.txt"), &payload).expect("write large file");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 1024 * 1024, &fixture.root).expect("1MiB limits"))
+        .expect("set limits");
+    let admitted = admit_run(&service).await;
+    let result = service
+        .dispatch_tools(
+            &admitted.run_id,
+            &[call("c1", "read_file", json!({"path": "large.txt"}))],
+        )
+        .expect("dispatch");
+    assert!(result[0].ok, "{:?}", result[0]);
+    assert!(
+        result[0].artifacts.is_empty(),
+        "80KiB payload must stay inline under the 1MiB admitted cap: {:?}",
+        result[0]
+    );
+    assert!(result[0].content.contains("0123456789abcdef"));
+    let encoded = serde_json::to_vec(&result[0]).expect("encode");
+    assert!(encoded.len() <= 1024 * 1024, "{}", encoded.len());
+    assert!(
+        encoded.len() > 64 * 1024,
+        "payload should exceed the old 64KiB executor default"
+    );
+}
+
+#[tokio::test]
+async fn first_init_close_does_not_wait_for_init_io() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let entered = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(2));
+    let observer_entered = Arc::clone(&entered);
+    let observer_barrier = Arc::clone(&barrier);
+    service.inject_native_dispatch_init_entered_observer(Arc::new(move || {
+        observer_entered.store(true, Ordering::SeqCst);
+        observer_barrier.wait();
+    }));
+    let admitted = admit_run(&service).await;
+    let run_id = admitted.run_id.clone();
+    let dispatcher = service.clone();
+    let dispatch_id = run_id.clone();
+    let dispatch = thread::spawn(move || {
+        dispatcher.dispatch_tools(
+            &dispatch_id,
+            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
+        )
+    });
+    let wait_start = Instant::now();
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(2),
+            "native dispatch init did not start"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let closer = service.clone();
+    let close_id = run_id.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        closer.mark_terminal(&close_id);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_millis(500))
+        .expect("mark_terminal must not wait for init IO");
+    barrier.wait();
+    let results = dispatch.join().expect("dispatch join").expect("dispatch");
+    assert!(!service.native_dispatch_retained(&run_id));
+    if !results[0].ok {
+        assert_eq!(error_code(&results[0]), "cancelled");
+    }
+}
+
+#[tokio::test]
+async fn blocked_put_then_cleanup_leaves_no_object_reservation_or_bytes() {
+    let fixture = Fixture::new();
+    let payload = "0123456789abcdef".repeat(8 * 1024);
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write small");
+    fs::write(fixture.root.join("large.txt"), &payload).expect("write large");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 32 * 1024, &fixture.root).expect("32KiB limits"))
+        .expect("set limits");
+    let admitted = admit_run(&service).await;
+    service
+        .dispatch_tools(
+            &admitted.run_id,
+            &[call("c0", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect("prime dispatch");
+    let store = service
+        .native_artifact_store(&admitted.run_id)
+        .expect("store after init");
+    let entered = Arc::new(AtomicBool::new(false));
+    let hold = Arc::new(Barrier::new(2));
+    let observer_entered = Arc::clone(&entered);
+    let observer_hold = Arc::clone(&hold);
+    store.inject_put_entered_observer(Arc::new(move || {
+        observer_entered.store(true, Ordering::SeqCst);
+        observer_hold.wait();
+    }));
+    let dispatcher = service.clone();
+    let dispatch_id = admitted.run_id.clone();
+    let dispatch = thread::spawn(move || {
+        dispatcher.dispatch_tools(
+            &dispatch_id,
+            &[call("c1", "read_file", json!({"path": "large.txt"}))],
+        )
+    });
+    let wait_start = Instant::now();
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(2),
+            "overflow put did not start"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let cleanup_service = service.clone();
+    let session_id = admitted.session_id.clone();
+    let cleanup = thread::spawn(move || {
+        cleanup_service.cleanup_session_native_dispatch(&session_id);
+    });
+    let closed_start = Instant::now();
+    while !service.native_dispatch_closed(&admitted.run_id) {
+        assert!(
+            closed_start.elapsed() < Duration::from_secs(2),
+            "cleanup did not close native dispatch"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    hold.wait();
+    dispatch.join().expect("dispatch join").expect("dispatch");
+    cleanup.join().expect("cleanup join");
+    assert_eq!(store.object_count(), 0);
+    assert_eq!(store.total_bytes(), 0);
+    assert_eq!(store.reserved_count(), 0);
+    assert_eq!(store.reserved_bytes(), 0);
+    assert!(
+        store
+            .confined_object_names()
+            .expect("confined names")
+            .is_empty()
+    );
+    let after = service
+        .dispatch_tools(
+            &admitted.run_id,
+            &[call("c2", "read_file", json!({"path": "ok.txt"}))],
+        )
+        .expect("sticky closed dispatch");
+    assert_cancelled_bounded(&after[0]);
 }

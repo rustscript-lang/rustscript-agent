@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex, Weak,
+    Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
@@ -43,9 +43,9 @@ use crate::config::{
     ADMISSION_RUN_COL_SCRIPT_HASH, ADMISSION_RUN_COL_SESSION_ID, ADMISSION_RUN_COL_STATUS,
     ADMISSION_SESSION_PROFILE, AdmissionSqliteCellLens, AgentGatewayConfig, ClientDisconnectPolicy,
     FileToolConfig, MAX_IDEMPOTENCY_KEY_BYTES, MAX_MODEL_NAME_BYTES, MAX_PROVIDER_NAME_BYTES,
-    MAX_RUN_CONTEXT_STORAGE_BYTES, ProcessToolConfig, ProviderProfile, ProviderProfileError,
-    RunLimits, RunLimitsError, estimate_admission_query_bytes, validate_request_hash,
-    validate_visible_name,
+    MAX_RUN_CONTEXT_STORAGE_BYTES, MAX_TOOL_OUTPUT_BYTES, ProcessToolConfig, ProviderProfile,
+    ProviderProfileError, RunLimits, RunLimitsError, estimate_admission_query_bytes,
+    validate_request_hash, validate_visible_name,
 };
 use crate::domain::{RunContext, ToolCall, timestamp, truncate_for_log, vm_value_to_json};
 use crate::events;
@@ -58,10 +58,12 @@ use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, append_event_locked, run_delivery_task,
 };
 use crate::runtime::rss_runner::execute_rss_source;
+use crate::tools::artifacts::ArtifactStorePool;
 use crate::tools::{
-    ArtifactOwner, DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError,
-    FileTools, NativeExecutionDeps, ProcessArtifactSink, ProcessExecutor, ProcessOwner,
-    ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry, ToolRegistrySnapshot, ToolResult,
+    ArtifactError, ArtifactOwner, ArtifactStore, DispatchContext, DispatchLimits,
+    DurableEventCommitter, EventCommitError, FileTools, NativeExecutionDeps, ProcessArtifactSink,
+    ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry,
+    ToolRegistrySnapshot, ToolResult,
 };
 use crate::{RunCancellation, RunError};
 
@@ -104,7 +106,8 @@ pub struct RunHandle {
     /// Created at admission and cancelled by every stop/deadline/terminal path.
     tool_cancel: CancellationToken,
     /// Run-scoped native dispatch state shared by every `dispatch_tools` call.
-    native_dispatch: Mutex<NativeDispatchSlot>,
+    native_dispatch: Mutex<NativeDispatchPhase>,
+    native_dispatch_cv: Condvar,
 }
 
 /// Shared native dispatch machinery for one admitted run.
@@ -116,10 +119,13 @@ struct NativeDispatchState {
     shutdown_entered: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-/// Monotonic native-dispatch slot: once `closed`, lazy init must never refill.
-struct NativeDispatchSlot {
-    closed: bool,
-    state: Option<Arc<NativeDispatchState>>,
+/// Two-phase native dispatch slot. The handle lock is never held across
+/// FileTools/ArtifactStore filesystem IO.
+enum NativeDispatchPhase {
+    Empty,
+    Initializing,
+    Ready(Arc<NativeDispatchState>),
+    Closed,
 }
 
 impl NativeDispatchState {
@@ -130,7 +136,8 @@ impl NativeDispatchState {
         if let Some(observer) = &self.shutdown_entered {
             observer();
         }
-        self.dispatcher.cancellation().cancel();
+        self.dispatcher.close();
+        self.dispatcher.quiesce();
         let owner = self.dispatcher.owner();
         let _ = self.table.cleanup_owner(&ProcessOwner::from(owner.clone()));
         let _ = self
@@ -165,18 +172,24 @@ impl RunHandle {
     }
 
     fn native_dispatch_closed(&self) -> bool {
-        self.native_dispatch
-            .lock()
-            .expect("native dispatch lock")
-            .closed
+        matches!(
+            *self.native_dispatch.lock().expect("native dispatch lock"),
+            NativeDispatchPhase::Closed
+        )
     }
 
     fn release_native_dispatch(&self) {
         self.tool_cancel.cancel();
         let state = {
-            let mut slot = self.native_dispatch.lock().expect("native dispatch lock");
-            slot.closed = true;
-            slot.state.take()
+            let mut phase = self.native_dispatch.lock().expect("native dispatch lock");
+            let previous = std::mem::replace(&mut *phase, NativeDispatchPhase::Closed);
+            self.native_dispatch_cv.notify_all();
+            match previous {
+                NativeDispatchPhase::Ready(state) => Some(state),
+                NativeDispatchPhase::Empty
+                | NativeDispatchPhase::Initializing
+                | NativeDispatchPhase::Closed => None,
+            }
         };
         if let Some(state) = state {
             state.shutdown();
@@ -184,11 +197,10 @@ impl RunHandle {
     }
 
     fn native_dispatch_retained(&self) -> bool {
-        self.native_dispatch
-            .lock()
-            .expect("native dispatch lock")
-            .state
-            .is_some()
+        matches!(
+            *self.native_dispatch.lock().expect("native dispatch lock"),
+            NativeDispatchPhase::Ready(_)
+        )
     }
 }
 
@@ -414,6 +426,8 @@ struct AgentServiceInner {
     metrics: Arc<Metrics>,
     file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     native_dispatch_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    native_dispatch_init_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    artifact_stores: ArtifactStorePool,
 }
 
 impl Drop for AgentServiceInner {
@@ -472,6 +486,8 @@ impl AgentService {
             metrics,
             file_search_entered: Mutex::new(None),
             native_dispatch_shutdown: Mutex::new(None),
+            native_dispatch_init_entered: Mutex::new(None),
+            artifact_stores: ArtifactStorePool::default(),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
         Self { inner }
@@ -603,20 +619,59 @@ impl AgentService {
         run_id: &str,
         handle: &Arc<RunHandle>,
     ) -> Result<Option<Arc<NativeDispatchState>>, RunContextError> {
-        let mut slot = handle.native_dispatch.lock().expect("native dispatch lock");
-        if slot.closed {
-            return Ok(None);
+        loop {
+            let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
+            if matches!(*phase, NativeDispatchPhase::Closed) {
+                return Ok(None);
+            }
+            if let NativeDispatchPhase::Ready(state) = &*phase {
+                return Ok(Some(Arc::clone(state)));
+            }
+            if matches!(*phase, NativeDispatchPhase::Initializing) {
+                drop(
+                    handle
+                        .native_dispatch_cv
+                        .wait(phase)
+                        .expect("native dispatch condvar"),
+                );
+                continue;
+            }
+            *phase = NativeDispatchPhase::Initializing;
+            break;
         }
-        if let Some(existing) = slot.state.as_ref() {
-            return Ok(Some(Arc::clone(existing)));
+        if let Some(observer) = self
+            .inner
+            .native_dispatch_init_entered
+            .lock()
+            .expect("native dispatch init observer lock")
+            .clone()
+        {
+            observer();
         }
-        let created = Arc::new(self.build_native_dispatch_state(run_id, handle)?);
-        if slot.closed {
-            drop(slot);
-            return Ok(None);
+        let built = self.build_native_dispatch_state(run_id, handle);
+        let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
+        match built {
+            Ok(state) => {
+                let state = Arc::new(state);
+                if matches!(*phase, NativeDispatchPhase::Initializing) {
+                    *phase = NativeDispatchPhase::Ready(Arc::clone(&state));
+                    handle.native_dispatch_cv.notify_all();
+                    Ok(Some(state))
+                } else {
+                    handle.native_dispatch_cv.notify_all();
+                    drop(phase);
+                    drop(state);
+                    Ok(None)
+                }
+            }
+            Err(error) => {
+                if !matches!(*phase, NativeDispatchPhase::Closed) {
+                    *phase = NativeDispatchPhase::Empty;
+                }
+                handle.native_dispatch_cv.notify_all();
+                Err(error)
+            }
         }
-        slot.state = Some(Arc::clone(&created));
-        Ok(Some(created))
     }
 
     fn build_native_dispatch_state(
@@ -673,9 +728,17 @@ impl AgentService {
             .and_then(JsonValue::as_u64)
             .ok_or_else(|| invalid_context_metadata(run_id, "max_tool_output_bytes is missing"))?
             as usize;
-        let file_config = FileToolConfig::for_workspace(&workspace);
-        let process_config = ProcessToolConfig::for_workspace(&workspace);
-        let mut files = FileTools::new(file_config)
+        let output_cap = max_tool_output_bytes.clamp(1, MAX_TOOL_OUTPUT_BYTES);
+        let mut file_config = FileToolConfig::for_workspace(&workspace);
+        file_config.apply_admitted_output_cap(output_cap);
+        let mut process_config = ProcessToolConfig::for_workspace(&workspace);
+        process_config.apply_admitted_output_cap(output_cap);
+        let artifacts = self
+            .inner
+            .artifact_stores
+            .get_or_open(file_config.artifact_store.clone())
+            .map_err(|error| artifact_init_error(run_id, &error))?;
+        let mut files = FileTools::with_artifact_store(file_config, artifacts)
             .map_err(|error| invalid_context_metadata(run_id, &error))?
             .with_owner(ArtifactOwner::from(owner.clone()));
         if let Some(observer) = self
@@ -724,7 +787,7 @@ impl AgentService {
             toolset_hash,
             DispatchLimits {
                 max_tool_calls,
-                max_tool_output_bytes,
+                max_tool_output_bytes: output_cap,
                 max_event_bytes: self.inner.config.max_event_bytes,
             },
             events,
@@ -753,6 +816,37 @@ impl AgentService {
     pub fn native_dispatch_retained(&self, run_id: &str) -> bool {
         self.handle(run_id)
             .is_some_and(|handle| handle.native_dispatch_retained())
+    }
+
+    /// True when native dispatch for `run_id` is sticky-closed.
+    pub fn native_dispatch_closed(&self, run_id: &str) -> bool {
+        self.handle(run_id)
+            .is_some_and(|handle| handle.native_dispatch_closed())
+    }
+
+    /// Shared owner-scoped artifact store for an initialized run, if any.
+    pub fn native_artifact_store(&self, run_id: &str) -> Option<Arc<ArtifactStore>> {
+        let handle = self.handle(run_id)?;
+        let phase = handle.native_dispatch.lock().ok()?;
+        match &*phase {
+            NativeDispatchPhase::Ready(state) => Some(state.files.artifact_store_arc()),
+            NativeDispatchPhase::Empty
+            | NativeDispatchPhase::Initializing
+            | NativeDispatchPhase::Closed => None,
+        }
+    }
+
+    /// Test seam: later native dispatch construction invokes `observer` after
+    /// releasing the slot lock and before FileTools/ArtifactStore IO.
+    pub fn inject_native_dispatch_init_entered_observer(
+        &self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .inner
+            .native_dispatch_init_entered
+            .lock()
+            .expect("native dispatch init observer lock") = Some(observer);
     }
 
     /// Test seam: later native `search_files` walks invoke `observer` when they
@@ -1306,10 +1400,8 @@ impl AgentService {
             disconnect_policy: self.inner.config.client_disconnect_policy,
             started_at: Instant::now(),
             tool_cancel: CancellationToken::new(),
-            native_dispatch: Mutex::new(NativeDispatchSlot {
-                closed: false,
-                state: None,
-            }),
+            native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
+            native_dispatch_cv: Condvar::new(),
         });
         self.inner
             .runs
@@ -2600,6 +2692,10 @@ fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {
         run_id: run_id.to_string(),
         reason: reason.to_string(),
     }
+}
+
+fn artifact_init_error(run_id: &str, error: &ArtifactError) -> RunContextError {
+    invalid_context_metadata(run_id, &format!("{}: {}", error.code(), error.message()))
 }
 
 fn optional_string(value: Option<&JsonValue>) -> Option<String> {

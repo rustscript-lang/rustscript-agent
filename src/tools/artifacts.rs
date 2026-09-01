@@ -8,10 +8,11 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rustscript_vm::{
     ConfinedFsLimits, ConfinedFsRoot, ConfinedPublicationState, EnumerationBudget,
     MAX_COMPONENT_BYTES, MAX_READ_BYTES, MAX_TEMP_ATTEMPTS, MAX_WRITE_BYTES,
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{ProcessArtifactSink, ProcessOwner, ToolOwner};
-use crate::config::{ARTIFACT_RECONCILE_OVERHEAD_ENTRIES, ArtifactStoreConfig};
+use crate::config::{ARTIFACT_RECONCILE_OVERHEAD_ENTRIES, ArtifactStoreConfig, identity_path};
 
 const TEMP_PREFIX: &str = ".rustscript-agent-tmp-";
 const MANIFEST_NAME: &str = "manifest.json";
@@ -173,6 +174,7 @@ pub struct ArtifactStore {
     root: ConfinedFsRoot,
     dir: File,
     state: Mutex<StoreState>,
+    put_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl ArtifactStore {
@@ -205,6 +207,7 @@ impl ArtifactStore {
             root,
             dir,
             state: Mutex::new(state),
+            put_entered: Mutex::new(None),
         })
     }
 
@@ -221,6 +224,21 @@ impl ArtifactStore {
     /// Returns committed payload bytes currently retained.
     pub fn total_bytes(&self) -> usize {
         self.state.lock().committed_bytes
+    }
+
+    /// Returns how many in-flight put reservations are retained.
+    pub fn reserved_count(&self) -> usize {
+        self.state.lock().reserved.len()
+    }
+
+    /// Returns reserved payload bytes for in-flight puts.
+    pub fn reserved_bytes(&self) -> usize {
+        self.state.lock().reserved_bytes
+    }
+
+    /// Test seam: `observer` runs after a put reservation is taken and before publish.
+    pub fn inject_put_entered_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self.put_entered.lock() = Some(observer);
     }
 
     /// Overrides the clock used for TTL decisions. Intended for tests.
@@ -291,6 +309,9 @@ impl ArtifactStore {
             size: data.len(),
             committed: false,
         };
+        if let Some(observer) = self.put_entered.lock().clone() {
+            observer();
+        }
 
         let published = self.publish_object(&id, data);
         match published {
@@ -880,6 +901,90 @@ fn map_store_error(error: rustscript_vm::ConfinedFsError) -> ArtifactError {
             "artifact publication could not be classified",
         ),
         _ => ArtifactError::new("invalid_config", error.message()),
+    }
+}
+
+struct PendingArtifactInit {
+    result: Mutex<Option<Result<Arc<ArtifactStore>, ArtifactError>>>,
+    cv: Condvar,
+}
+
+enum ArtifactStorePoolSlot {
+    Pending(Arc<PendingArtifactInit>),
+    Ready(Weak<ArtifactStore>),
+}
+
+/// AgentService-level pool: one owner-scoped store per identity-safe artifact root.
+#[derive(Default)]
+pub(crate) struct ArtifactStorePool {
+    entries: Mutex<HashMap<PathBuf, ArtifactStorePoolSlot>>,
+}
+
+impl ArtifactStorePool {
+    pub(crate) fn get_or_open(
+        &self,
+        config: ArtifactStoreConfig,
+    ) -> Result<Arc<ArtifactStore>, ArtifactError> {
+        let key = identity_path(&config.root, "artifact_store.root")
+            .map_err(|message| ArtifactError::new("invalid_config", message))?;
+        let pending = {
+            let mut entries = self.entries.lock();
+            match entries.get(&key) {
+                Some(ArtifactStorePoolSlot::Ready(weak)) => {
+                    if let Some(store) = weak.upgrade() {
+                        return Ok(store);
+                    }
+                    entries.remove(&key);
+                }
+                Some(ArtifactStorePoolSlot::Pending(pending)) => {
+                    let pending = Arc::clone(pending);
+                    drop(entries);
+                    let mut result = pending.result.lock();
+                    while result.is_none() {
+                        pending.cv.wait(&mut result);
+                    }
+                    return clone_pool_result(result.as_ref().expect("pending init result"));
+                }
+                None => {}
+            }
+            let pending = Arc::new(PendingArtifactInit {
+                result: Mutex::new(None),
+                cv: Condvar::new(),
+            });
+            entries.insert(
+                key.clone(),
+                ArtifactStorePoolSlot::Pending(Arc::clone(&pending)),
+            );
+            pending
+        };
+
+        let opened = ArtifactStore::with_config(config.clone()).map(Arc::new);
+        {
+            let mut entries = self.entries.lock();
+            match &opened {
+                Ok(store) => {
+                    entries.insert(
+                        key.clone(),
+                        ArtifactStorePoolSlot::Ready(Arc::downgrade(store)),
+                    );
+                }
+                Err(_) => {
+                    entries.remove(&key);
+                }
+            }
+        }
+        *pending.result.lock() = Some(clone_pool_result(&opened));
+        pending.cv.notify_all();
+        opened
+    }
+}
+
+fn clone_pool_result(
+    result: &Result<Arc<ArtifactStore>, ArtifactError>,
+) -> Result<Arc<ArtifactStore>, ArtifactError> {
+    match result {
+        Ok(store) => Ok(Arc::clone(store)),
+        Err(error) => Err(error.clone()),
     }
 }
 

@@ -209,6 +209,7 @@ struct DispatchInner {
     call_count: AtomicU64,
     serial: Mutex<()>,
     fail_linked_spawn: AtomicBool,
+    closed: AtomicBool,
 }
 
 /// Serial dispatcher bound to one admitted run snapshot.
@@ -257,6 +258,7 @@ impl DispatchContext {
                 call_count: AtomicU64::new(0),
                 serial: Mutex::new(()),
                 fail_linked_spawn: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
             }),
         })
     }
@@ -274,6 +276,17 @@ impl DispatchContext {
     /// Owner bound to this dispatcher.
     pub fn owner(&self) -> &ToolOwner {
         &self.inner.owner
+    }
+
+    /// Sticky-closes this dispatcher so later calls cannot commit effects.
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.cancellation.cancel();
+    }
+
+    /// Waits for any in-flight serial dispatch to finish, then releases the gate.
+    pub fn quiesce(&self) {
+        drop(self.inner.serial.lock());
     }
 
     /// Canonical workspace retained at construction.
@@ -450,6 +463,12 @@ impl DispatchContext {
     }
 
     fn control_failure(&self) -> Option<ToolResult> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Some(ToolResult::failure(
+                "cancelled",
+                "native dispatch is closed",
+            ));
+        }
         if self.inner.events.is_terminal() {
             return Some(ToolResult::failure(
                 "cancelled",

@@ -82,6 +82,24 @@ impl FileTools {
     /// Validates `config`, retains the workspace root, and opens artifact storage.
     pub fn new(config: FileToolConfig) -> Result<Self, String> {
         config.validate()?;
+        let artifacts = ArtifactStore::with_config(config.artifact_store.clone())
+            .map_err(|error| error.message().to_string())?;
+        Self::from_validated(config, Arc::new(artifacts))
+    }
+
+    /// Validates `config` and reuses a shared, already-opened artifact store.
+    pub fn with_artifact_store(
+        config: FileToolConfig,
+        artifacts: Arc<ArtifactStore>,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        Self::from_validated(config, artifacts)
+    }
+
+    fn from_validated(
+        config: FileToolConfig,
+        artifacts: Arc<ArtifactStore>,
+    ) -> Result<Self, String> {
         let limits = ConfinedFsLimits {
             max_read_bytes: config.max_read_bytes.min(MAX_READ_BYTES),
             max_write_bytes: config.max_write_bytes.min(MAX_WRITE_BYTES),
@@ -91,12 +109,10 @@ impl FileTools {
         };
         let root = ConfinedFsRoot::with_limits(&config.workspace_root, limits)
             .map_err(|error| error.message().to_string())?;
-        let artifacts = ArtifactStore::with_config(config.artifact_store.clone())
-            .map_err(|error| error.message().to_string())?;
         Ok(Self {
             config,
             root: Arc::new(root),
-            artifacts: Arc::new(artifacts),
+            artifacts,
             owner: None,
             search_entered: None,
         })

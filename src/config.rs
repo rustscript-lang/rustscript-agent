@@ -261,6 +261,17 @@ impl FileToolConfig {
         }
         Ok(())
     }
+
+    /// Aligns file-tool envelope and search caps with an admitted run output budget.
+    pub fn apply_admitted_output_cap(&mut self, max_tool_output_bytes: usize) {
+        let cap = max_tool_output_bytes
+            .clamp(1, MAX_TOOL_OUTPUT_BYTES)
+            .min(self.artifact_store.max_object_bytes.max(1));
+        self.max_output_bytes = cap;
+        if self.max_search_output_bytes > cap {
+            self.max_search_output_bytes = cap;
+        }
+    }
 }
 
 impl Default for FileToolConfig {
@@ -301,7 +312,7 @@ fn derived_artifact_root(workspace_root: &Path) -> PathBuf {
     }
 }
 
-fn identity_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+pub(crate) fn identity_path(path: &Path, label: &str) -> Result<PathBuf, String> {
     if path.exists() {
         return std::fs::canonicalize(path).map_err(|_| format!("{label} cannot be resolved"));
     }
@@ -1600,6 +1611,11 @@ impl ProcessToolConfig {
             return Err("cleanup_timeout must be positive and at most 30 seconds".to_string());
         }
         Ok(())
+    }
+
+    /// Aligns the model-visible process/terminal envelope with an admitted run output budget.
+    pub fn apply_admitted_output_cap(&mut self, max_tool_output_bytes: usize) {
+        self.max_output_bytes = max_tool_output_bytes.clamp(1, MAX_PROCESS_TOOL_OUTPUT_BYTES);
     }
 
     /// Returns a copy with a canonical workspace after validation.

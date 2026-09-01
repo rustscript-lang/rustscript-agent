@@ -1034,6 +1034,7 @@ fn assemble_process_result(
         &state.owner,
         state.artifact_sink.as_deref(),
         &stdout.bytes,
+        &stderr.bytes,
     );
     result
 }
@@ -1090,7 +1091,8 @@ pub(crate) fn apply_output_bounds(
     config: &ProcessToolConfig,
     owner: &ProcessOwner,
     sink: Option<&dyn ProcessArtifactSink>,
-    retained: &[u8],
+    stdout: &[u8],
+    stderr: &[u8],
 ) {
     let ring_truncated = result.truncated
         || result
@@ -1109,14 +1111,16 @@ pub(crate) fn apply_output_bounds(
     }
 
     result.truncated = true;
-    let payload = if retained.is_empty() {
-        result.content.as_bytes().to_vec()
-    } else {
-        retained.to_vec()
-    };
+    let payload = overflow_artifact_payload(stdout, stderr, overflow_artifact_cap(config));
+    if let Value::Object(data) = &mut result.data {
+        data.insert("overflow_encoding".into(), json!("labeled-utf8"));
+        data.insert("overflow_stdout_bytes".into(), json!(stdout.len() as u64));
+        data.insert("overflow_stderr_bytes".into(), json!(stderr.len() as u64));
+    }
     let stored_artifact = match sink.map(|sink| sink.store(owner, &payload)) {
         Some(Ok(id)) => {
             result.artifacts.push(id);
+            compact_overflow_envelope(result);
             true
         }
         Some(Err(_)) | None => false,
@@ -1130,4 +1134,68 @@ pub(crate) fn apply_output_bounds(
         data.insert("retained_bytes".into(), json!(payload.len() as u64));
     }
     enforce_serialized_tool_result_cap(result, config.max_output_bytes);
+}
+
+const STDOUT_OVERFLOW_LABEL: &str = "stdout:\n";
+const STDERR_OVERFLOW_LABEL: &str = "stderr:\n";
+
+fn compact_overflow_envelope(result: &mut ToolResult) {
+    result.content.clear();
+    if let Value::Object(data) = &mut result.data {
+        data.insert("stdout".into(), json!(""));
+        data.insert("stderr".into(), json!(""));
+    }
+}
+
+fn overflow_artifact_cap(config: &ProcessToolConfig) -> usize {
+    config
+        .max_stream_bytes
+        .saturating_mul(2)
+        .saturating_add(STDOUT_OVERFLOW_LABEL.len() + STDERR_OVERFLOW_LABEL.len() + 2)
+        .max(STDOUT_OVERFLOW_LABEL.len() + STDERR_OVERFLOW_LABEL.len() + 1)
+}
+
+pub(crate) fn overflow_artifact_payload(stdout: &[u8], stderr: &[u8], cap: usize) -> Vec<u8> {
+    let cap = cap.max(STDOUT_OVERFLOW_LABEL.len() + STDERR_OVERFLOW_LABEL.len() + 1);
+    let mut out = Vec::new();
+    append_label_and_bytes(&mut out, STDOUT_OVERFLOW_LABEL, stdout, cap);
+    if out.len() < cap {
+        if !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        append_label_and_bytes(&mut out, STDERR_OVERFLOW_LABEL, stderr, cap);
+    }
+    if out.len() > cap {
+        out.truncate(cap);
+        while !out.is_empty() && std::str::from_utf8(&out).is_err() {
+            out.pop();
+        }
+    }
+    out
+}
+
+fn append_label_and_bytes(out: &mut Vec<u8>, label: &str, bytes: &[u8], cap: usize) {
+    if out.len() >= cap {
+        return;
+    }
+    let room = cap - out.len();
+    let take = label.len().min(room);
+    out.extend_from_slice(&label.as_bytes()[..take]);
+    if take < label.len() {
+        return;
+    }
+    append_lossy_bounded(out, bytes, cap);
+}
+
+fn append_lossy_bounded(out: &mut Vec<u8>, bytes: &[u8], cap: usize) {
+    if out.len() >= cap {
+        return;
+    }
+    let room = cap - out.len();
+    let lossy = String::from_utf8_lossy(bytes);
+    let mut end = lossy.len().min(room);
+    while end > 0 && !lossy.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.extend_from_slice(&lossy.as_bytes()[..end]);
 }
