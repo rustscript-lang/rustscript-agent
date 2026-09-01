@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
     BoundedExecError, BoundedExecOutput, BoundedProcess, BoundedProcessRequest, CancellationToken,
-    LogSnapshot, ProcessStatus, exec_bounded,
+    ConfinedFsRoot, LogSnapshot, ProcessStatus, exec_bounded,
 };
 use serde_json::{Map, Value, json};
 
@@ -35,6 +34,7 @@ pub struct TerminalRequest {
 #[derive(Clone)]
 pub struct TerminalExecutor {
     inner: Arc<ProcessExecutorState>,
+    root: Arc<ConfinedFsRoot>,
 }
 
 impl TerminalExecutor {
@@ -43,13 +43,17 @@ impl TerminalExecutor {
         table: Arc<ProcessTable>,
         owner: ProcessOwner,
     ) -> Result<Self, String> {
+        let config = config.validated()?;
+        let root = ConfinedFsRoot::new(&config.workspace_root)
+            .map_err(|error| error.message().to_string())?;
         Ok(Self {
             inner: Arc::new(ProcessExecutorState {
-                config: config.validated()?,
+                config,
                 table,
                 owner,
                 artifact_sink: None,
             }),
+            root: Arc::new(root),
         })
     }
 
@@ -59,6 +63,7 @@ impl TerminalExecutor {
                 artifact_sink: Some(sink),
                 ..(*self.inner).clone()
             }),
+            root: Arc::clone(&self.root),
         }
     }
 
@@ -146,10 +151,18 @@ impl TerminalExecutor {
                 "stdin exceeds the configured bound",
             ));
         }
-        let cwd = resolve_cwd(&self.inner.config.workspace_root, request.cwd.as_deref())?;
+        let directory = self
+            .root
+            .open_directory(request.cwd.as_deref().unwrap_or(""))
+            .map_err(|_| invalid_cwd())?;
+        if Instant::now() >= deadline {
+            return Err(ToolFailure::new(
+                "deadline_elapsed",
+                "process deadline elapsed",
+            ));
+        }
         let mut core = BoundedProcessRequest::new(request.argv)
-            .with_cwd(cwd)
-            .with_workspace_root(self.inner.config.workspace_root.clone())
+            .with_confined_cwd(directory)
             .with_env_map(request.env)
             .with_timeout(timeout)
             .with_output_limits(stream_limit, stream_limit, stream_limit)
@@ -367,35 +380,6 @@ fn resolve_stream_limit(
             }
         }
     }
-}
-
-pub(crate) fn resolve_cwd(
-    workspace_root: &Path,
-    cwd: Option<&str>,
-) -> Result<PathBuf, ToolFailure> {
-    let candidate = match cwd {
-        None => workspace_root.to_path_buf(),
-        Some(value) if value.is_empty() || value.contains('\0') => {
-            return Err(invalid_cwd());
-        }
-        Some(value) => {
-            let path = Path::new(value);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                workspace_root.join(path)
-            }
-        }
-    };
-    let canonical = std::fs::canonicalize(&candidate).map_err(|_| invalid_cwd())?;
-    let workspace = std::fs::canonicalize(workspace_root).map_err(|_| invalid_cwd())?;
-    if canonical != workspace && canonical.strip_prefix(&workspace).is_err() {
-        return Err(invalid_cwd());
-    }
-    if !canonical.is_dir() {
-        return Err(invalid_cwd());
-    }
-    Ok(canonical)
 }
 
 fn invalid_cwd() -> ToolFailure {

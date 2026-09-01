@@ -979,7 +979,9 @@ pub(crate) fn validation_error_code(error: &ProcessValidationError) -> (&'static
         | ProcessValidationError::CwdRequired
         | ProcessValidationError::CwdNotAbsolute
         | ProcessValidationError::CwdTooLong
-        | ProcessValidationError::CwdContainsNul => "invalid_cwd",
+        | ProcessValidationError::CwdContainsNul
+        | ProcessValidationError::ConflictingCwd
+        | ProcessValidationError::ConfinedCwdUnsupported => "invalid_cwd",
         ProcessValidationError::EnvCountExceeded
         | ProcessValidationError::InvalidEnvKey
         | ProcessValidationError::EnvKeyTooLong

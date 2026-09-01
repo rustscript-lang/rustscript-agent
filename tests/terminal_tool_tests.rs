@@ -12,7 +12,8 @@ use rustscript_vm::CancellationToken;
 use serde_json::json;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-const TEMP_ROOT: &str = "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t4-process2-905efdd1";
+const TEMP_ROOT: &str =
+    "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-tools-agent-integration-c77be280";
 
 struct Fixture {
     root: PathBuf,
@@ -65,6 +66,27 @@ fn error_code(result: &ToolResult) -> &str {
         .expect("tool result should contain an error")
         .code
         .as_str()
+}
+
+fn assert_invalid_cwd_without_raw_path(result: &ToolResult, leaked: &[&str]) {
+    assert!(!result.ok, "{result:?}");
+    assert_eq!(error_code(result), "invalid_cwd");
+    let message = &result
+        .error
+        .as_ref()
+        .expect("invalid_cwd should include a message")
+        .message;
+    let encoded = serde_json::to_string(result).expect("serialize invalid_cwd");
+    for token in leaked {
+        assert!(
+            !message.contains(token),
+            "invalid_cwd message leaked {token:?}: {message}"
+        );
+        assert!(
+            !encoded.contains(token),
+            "invalid_cwd envelope leaked {token:?}: {encoded}"
+        );
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -186,15 +208,224 @@ fn relative_cwd_is_resolved_inside_the_workspace_and_escape_is_denied() {
         cwd: Some("..".to_string()),
         ..TerminalRequest::default()
     });
-    assert!(!escape.ok);
-    assert_eq!(error_code(&escape), "invalid_cwd");
+    assert_invalid_cwd_without_raw_path(&escape, &[fixture.root.to_string_lossy().as_ref(), ".."]);
+}
+
+#[test]
+fn nested_cwd_runs_in_the_retained_leaf_directory() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.root.join("nested/leaf")).expect("nested leaf");
+    fs::write(fixture.root.join("root-marker"), b"root").expect("root marker");
+    fs::write(fixture.root.join("nested/leaf/marker"), b"nested").expect("nested marker");
+    let executor = fixture.executor();
+
+    let nested = executor.run(TerminalRequest {
+        argv: vec!["/bin/cat".to_string(), "marker".to_string()],
+        cwd: Some("nested/leaf".to_string()),
+        ..TerminalRequest::default()
+    });
+    assert!(nested.ok, "{nested:?}");
+    assert_eq!(nested.content, "nested");
+
+    let default_root = executor.run(TerminalRequest {
+        argv: vec!["/bin/cat".to_string(), "root-marker".to_string()],
+        cwd: None,
+        ..TerminalRequest::default()
+    });
+    assert!(default_root.ok, "{default_root:?}");
+    assert_eq!(default_root.content, "root");
+
+    let empty_root = executor.run(TerminalRequest {
+        argv: vec!["/bin/cat".to_string(), "root-marker".to_string()],
+        cwd: Some(String::new()),
+        ..TerminalRequest::default()
+    });
+    assert!(empty_root.ok, "{empty_root:?}");
+    assert_eq!(empty_root.content, "root");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_cwd_is_denied_without_following_or_leaking_paths() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.root.join("sub")).expect("subdir");
+    fs::write(fixture.root.join("sub/marker"), b"inside").expect("inside marker");
+    symlink("sub", fixture.root.join("link")).expect("cwd symlink");
+    let executor = fixture.executor();
+
+    let result = executor.run(TerminalRequest {
+        argv: vec!["/bin/cat".to_string(), "marker".to_string()],
+        cwd: Some("link".to_string()),
+        ..TerminalRequest::default()
+    });
+    assert_invalid_cwd_without_raw_path(
+        &result,
+        &[fixture.root.to_string_lossy().as_ref(), "inside"],
+    );
+}
+
+#[test]
+fn absolute_cwd_is_denied_even_when_it_points_inside_the_workspace() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.root.join("sub")).expect("subdir");
+    let executor = fixture.executor();
+    let absolute = fixture.root.join("sub");
+    let result = executor.run(TerminalRequest {
+        argv: vec!["/bin/pwd".to_string()],
+        cwd: Some(absolute.to_string_lossy().into_owned()),
+        ..TerminalRequest::default()
+    });
+    assert_invalid_cwd_without_raw_path(
+        &result,
+        &[
+            fixture.root.to_string_lossy().as_ref(),
+            absolute.to_string_lossy().as_ref(),
+        ],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn root_binding_swap_fail_closes_without_redirecting_outside() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let workspace = fixture.root.join("workspace");
+    let aside = fixture.root.join("workspace-aside");
+    let outside = fixture.root.join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("marker"), b"inside").expect("inside marker");
+    fs::write(outside.join("marker"), b"outside").expect("outside marker");
+
+    let mut config = ProcessToolConfig::for_workspace(&workspace);
+    config.workspace_root = workspace.clone();
+    let table = Arc::new(ProcessTable::new(config.clone()).expect("process table"));
+    let executor = TerminalExecutor::new(config, table, owner()).expect("terminal executor");
+
+    fs::rename(&workspace, &aside).expect("move workspace aside");
+    symlink(&outside, &workspace).expect("replace workspace with outside symlink");
+
+    let result = executor.run(TerminalRequest {
+        argv: vec!["/bin/cat".to_string(), "marker".to_string()],
+        ..TerminalRequest::default()
+    });
+    let outside_path = outside.to_string_lossy().into_owned();
+    assert_invalid_cwd_without_raw_path(
+        &result,
+        &[workspace.to_string_lossy().as_ref(), outside_path.as_str()],
+    );
+    assert_eq!(
+        fs::read(outside.join("marker")).expect("outside marker intact"),
+        b"outside"
+    );
+    assert_eq!(
+        fs::read(aside.join("marker")).expect("original workspace intact"),
+        b"inside"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn synchronized_parent_and_leaf_swap_between_open_and_spawn_cannot_redirect_outside() {
+    use std::os::unix::fs::symlink;
+
+    use rustscript_vm::{BoundedProcessRequest, ConfinedFsRoot, exec_bounded};
+
+    let fixture = Fixture::new();
+    let outside = fixture.root.join("outside");
+    fs::create_dir_all(fixture.root.join("parent/leaf")).expect("leaf");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(fixture.root.join("parent/leaf/marker"), b"inside").expect("inside marker");
+    fs::write(outside.join("marker"), b"outside").expect("outside marker");
+
+    let root = ConfinedFsRoot::new(&fixture.root).expect("workspace root capability");
+    let directory = root
+        .open_directory("parent/leaf")
+        .expect("retained leaf directory");
+
+    fs::rename(
+        fixture.root.join("parent/leaf"),
+        fixture.root.join("leaf-moved"),
+    )
+    .expect("rename leaf");
+    symlink(&outside, fixture.root.join("parent/leaf")).expect("leaf symlink");
+    fs::rename(
+        fixture.root.join("parent"),
+        fixture.root.join("parent-moved"),
+    )
+    .expect("rename parent");
+    symlink(&outside, fixture.root.join("parent")).expect("parent symlink");
+
+    match exec_bounded(
+        BoundedProcessRequest::new(vec!["/bin/cat".to_string(), "marker".to_string()])
+            .with_confined_cwd(directory)
+            .with_timeout(Duration::from_secs(5)),
+    ) {
+        Ok(output) => {
+            assert_ne!(
+                output.stdout.as_slice(),
+                b"outside",
+                "retained cwd must not follow a swapped path"
+            );
+            assert_eq!(output.stdout, b"inside");
+            assert!(output.status.is_success());
+        }
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                !text.contains("outside") && !text.contains(outside.to_string_lossy().as_ref()),
+                "fail-closed spawn must stay path-free: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn path_based_cwd_is_absent_from_agent_production() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let production = [
+        "src/tools/terminal.rs",
+        "src/tools/process.rs",
+        "src/tools/mod.rs",
+    ];
+    for relative in production {
+        let source = fs::read_to_string(manifest.join(relative)).expect("read production source");
+        assert!(
+            !source.contains(".with_cwd("),
+            "{relative} must not pass a path cwd"
+        );
+        assert!(
+            !source.contains("with_workspace_root("),
+            "{relative} must not pass a workspace path cwd"
+        );
+        assert!(
+            !source.contains("current_dir("),
+            "{relative} must not set a user-derived current_dir"
+        );
+    }
+    let terminal = fs::read_to_string(manifest.join("src/tools/terminal.rs")).expect("terminal");
     assert!(
-        !escape
-            .error
-            .as_ref()
-            .unwrap()
-            .message
-            .contains(fixture.root.to_string_lossy().as_ref())
+        terminal.contains("with_confined_cwd"),
+        "terminal must retain a confined cwd capability"
+    );
+    assert!(
+        terminal.contains("open_directory"),
+        "terminal must open cwd through ConfinedFsRoot"
+    );
+    assert!(
+        !terminal.contains("canonicalize"),
+        "terminal must not canonicalize cwd paths"
+    );
+    assert!(
+        !terminal.contains("strip_prefix"),
+        "terminal must not check cwd with strip_prefix"
+    );
+    assert!(
+        !terminal.contains("fn resolve_cwd"),
+        "terminal must not keep a path-based resolve_cwd helper"
     );
 }
 

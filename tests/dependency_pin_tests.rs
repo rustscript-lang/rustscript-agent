@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 const RUSTSCRIPT_GIT: &str = "https://github.com/rustscript-lang/rustscript.git";
-const RUSTSCRIPT_REV: &str = "31e4003869c1bbca01c547f443446a6cb63dec59";
+const RUSTSCRIPT_REV: &str = "f9ca4143f8ba2f486e270347504c49f5ea846097";
 
 fn manifest() -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
