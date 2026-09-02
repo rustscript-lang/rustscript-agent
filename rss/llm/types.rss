@@ -257,3 +257,39 @@ pub fn provider_options(request: map) -> map {
 pub fn profile_string(profile: map, key: string) -> string {
     request_string(profile, key)
 }
+
+pub fn content_text(text: string) -> map {
+    { type: "text", text: text }
+}
+
+pub fn content_tool_call(tool_call_id: string, name: string, arguments_json: string) -> map {
+    {
+        type: "tool_call",
+        tool_call_id: tool_call_id,
+        name: name,
+        arguments_json: arguments_json
+    }
+}
+
+pub fn content_tool_result(
+    tool_call_id: string,
+    name: string,
+    content: string,
+    is_error: bool,
+    result: map,
+    error: map,
+    artifact: array,
+    truncated: bool
+) -> map {
+    {
+        type: "tool_result",
+        tool_call_id: tool_call_id,
+        name: name,
+        content: content,
+        is_error: is_error,
+        result: result,
+        error: error,
+        artifact: artifact,
+        truncated: truncated
+    }
+}

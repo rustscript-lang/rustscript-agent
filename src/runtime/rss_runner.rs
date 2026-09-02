@@ -27,11 +27,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallReturn, CancellationReason, EpochHandle, HostAsyncBridge, HostFunctionRegistry, HostFuture,
-    HostFutureOutput, HttpConfig, HttpHostExt, InvocationError, InvocationItem, InvocationPoll,
-    SqliteHostExt, SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source, register_http_builtin_module, register_sqlite_builtin_module,
+    CallReturn, CancellationReason, CompileSourceFileOptions, EpochHandle, HostAsyncBridge,
+    HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt, InvocationError,
+    InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy, Value, Vm, VmError,
+    VmResult, VmStatus, VmYieldReason, compile_source_file_with_options,
+    compile_source_with_flavor_and_options, register_http_builtin_module_from_catalog,
+    register_sqlite_builtin_module_from_catalog,
 };
+
+use super::agent_host::{
+    AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog,
+    register_agent_host_functions,
+};
+use crate::domain::{json_to_vm_value, vm_value_to_json};
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -345,6 +353,7 @@ pub struct AgentRunner {
     program: rustscript_vm::Program,
     config: AgentConfig,
     registry: Arc<HostFunctionRegistry>,
+    host: AgentHostBridges,
 }
 
 impl AgentRunner {
@@ -355,16 +364,14 @@ impl AgentRunner {
                 MAX_AGENT_SOURCE_BYTES
             )));
         }
-        let program = compile_source(source)
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
-        let registry = build_restricted_registry()
-            .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
-        Ok(Self {
-            program,
-            config,
-            registry: Arc::new(registry),
-        })
+        let program = compile_source_with_flavor_and_options(
+            source,
+            SourceFlavor::RustScript,
+            compile_options(),
+        )
+        .map_err(|error| AgentError::Compile(error.to_string()))?
+        .program;
+        Self::from_program(program, config)
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
@@ -376,16 +383,44 @@ impl AgentRunner {
                 MAX_AGENT_SOURCE_BYTES
             )));
         }
-        let program = rustscript_vm::compile_source_file(&path)
+        let program = compile_source_file_with_options(&path, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
+        Self::from_program(program, config)
+    }
+
+    fn from_program(program: rustscript_vm::Program, config: AgentConfig) -> Result<Self> {
         let registry = build_restricted_registry()
             .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
         Ok(Self {
             program,
             config,
             registry: Arc::new(registry),
+            host: AgentHostBridges::default(),
         })
+    }
+
+    /// Installs a scripted or custom provider for the serial loop host bridge.
+    pub fn with_provider(mut self, provider: Arc<dyn AgentProviderHost>) -> Self {
+        self.host.provider = Some(provider);
+        self
+    }
+
+    /// Installs the Task 5 dispatcher used by `agent::tool_dispatch`.
+    pub fn with_dispatcher(mut self, dispatcher: Arc<crate::tools::DispatchContext>) -> Self {
+        self.host.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Records backoff delays without sleeping (loop tests).
+    pub fn with_skip_sleep(mut self, skip: bool) -> Self {
+        self.host.skip_sleep = skip;
+        self
+    }
+
+    /// Backoff delays requested by the RSS loop, in milliseconds.
+    pub fn recorded_sleeps(&self) -> Vec<i64> {
+        self.host.sleeps.lock().expect("sleep log lock").clone()
     }
 
     /// Runs the exported `run(context)` entry with no event sink and no
@@ -420,6 +455,18 @@ impl AgentRunner {
         self.registry
             .bind_vm_cached(&mut vm)
             .map_err(RunError::Setup)?;
+        let provider: Arc<dyn AgentProviderHost> = self
+            .host
+            .provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(RssAdapterProvider));
+        vm.host_context().set_module_state(AgentHostState {
+            provider,
+            dispatcher: self.host.dispatcher.clone(),
+            cancellation: cancellation.cloned().unwrap_or_default(),
+            sleeps: Arc::clone(&self.host.sleeps),
+            skip_sleep: self.host.skip_sleep,
+        });
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
                 .map_err(RunError::Setup)?;
@@ -567,15 +614,15 @@ impl AgentRunner {
 }
 
 /// Binds the restricted capability registry: JSON, bytes conversion, the
-/// invocation stream emit builtin, generic SQLite, and the HTTP client
-/// (buffered request plus the callable SSE stream, consumed by the
-/// `openai_chat` streaming adapter since core revision fd4b570; see
-/// plans/2026-08-14_a3-rustscript-core-unblock.md). Ambient runtime
-/// input/emit builtins are intentionally absent from agent execution.
+/// invocation stream emit builtin, generic SQLite, the HTTP client, and the
+/// bounded agent provider/tool host bridges. Ambient runtime input/emit
+/// builtins are intentionally absent from agent execution.
 fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmError> {
+    let catalog = agent_host_catalog();
     let mut registry = HostFunctionRegistry::restricted();
-    register_sqlite_builtin_module(&mut registry)?;
-    register_http_builtin_module(&mut registry)?;
+    register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    register_agent_host_functions(&mut registry, catalog.as_ref())?;
     for name in [
         "json::encode",
         "json::decode",
@@ -595,6 +642,98 @@ fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmEr
         registry.allow_builtin(name)?;
     }
     Ok(registry)
+}
+
+fn compile_options() -> CompileSourceFileOptions {
+    CompileSourceFileOptions::default().with_host_api_catalog(agent_host_catalog())
+}
+
+/// Default production provider: invoke the existing RSS adapter harness.
+struct RssAdapterProvider;
+
+impl AgentProviderHost for RssAdapterProvider {
+    fn call(&self, request: &serde_json::Value) -> serde_json::Value {
+        invoke_existing_adapter(request)
+    }
+}
+
+fn invoke_existing_adapter(request: &serde_json::Value) -> serde_json::Value {
+    let provider = request
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("openai");
+    let kind = adapter_kind(provider);
+    let mut config = AgentConfig::default();
+    if let Some(base_url) = request
+        .pointer("/provider_options/base_url")
+        .and_then(serde_json::Value::as_str)
+        && let Ok(url) = url::Url::parse(base_url)
+        && let Some(host) = url.host_str()
+    {
+        config = AgentConfig::for_hosts([host]);
+        config.http.allowed_schemes = vec![url.scheme().to_string()];
+        if let Some(port) = url.port() {
+            config.http.allowed_ports = vec![port];
+        }
+        if host == "127.0.0.1" || host == "localhost" {
+            config.http.allow_private_ips = true;
+        }
+    }
+    let harness_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss");
+    let runner = match AgentRunner::from_file(harness_path, config) {
+        Ok(runner) => runner,
+        Err(error) => {
+            return adapter_fail("adapter_unavailable", &error.to_string());
+        }
+    };
+    let mut forwarded = request.clone();
+    if let Some(object) = forwarded.as_object_mut() {
+        object.remove("provider");
+    }
+    let profile = serde_json::json!({
+        "provider": provider,
+        "base_url": request.pointer("/provider_options/base_url").cloned().unwrap_or(serde_json::Value::Null),
+        "api_key": request.pointer("/provider_options/api_key").cloned().unwrap_or(serde_json::Value::Null),
+        "model": request.get("model").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    let context = json_to_vm_value(&serde_json::json!({
+        "kind": kind,
+        "request": forwarded,
+        "profile": profile,
+    }));
+    match runner.run_with_context(context) {
+        Ok(value) => vm_value_to_json(&value),
+        Err(error) => adapter_fail("adapter_failed", &error.to_string()),
+    }
+}
+
+fn adapter_kind(provider: &str) -> &'static str {
+    match provider {
+        "openai_responses" | "responses" => "openai_responses",
+        "anthropic" | "anthropic_messages" => "anthropic_messages",
+        "profile:openrouter" => "profile:openrouter",
+        "profile:deepseek" => "profile:deepseek",
+        "profile:opencode_zen" => "profile:opencode_zen",
+        "profile:opencode_go" => "profile:opencode_go",
+        "profile:custom" => "profile:custom",
+        _ => "openai_chat",
+    }
+}
+
+fn adapter_fail(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "response": {},
+        "error": {
+            "status": 0,
+            "type": "api_error",
+            "code": code,
+            "message": message,
+            "param": "",
+            "request_id": ""
+        }
+    })
 }
 
 /// Drives futures submitted by async host builtins (for example the HTTP

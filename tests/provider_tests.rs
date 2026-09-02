@@ -47,14 +47,21 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use rustscript_agent::tools::{
+    DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError, NativeToolExecutor,
+    ToolExecutorBoundary, ToolOwner, ToolResult,
+};
 use rustscript_agent::{
     AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
+    ScriptedProvider, ToolRegistry,
 };
-use rustscript_vm::Value;
+use rustscript_vm::{CancellationToken, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 // ---------------------------------------------------------------------------
@@ -447,6 +454,28 @@ fn openai_chat_non_stream_text_usage_and_reasoning() {
 }
 
 #[test]
+fn openai_chat_unknown_finish_reason_is_preserved_as_text_response() {
+    let mut body: JsonValue =
+        serde_json::from_str(&read_fixture("openai_chat/response.json")).expect("fixture json");
+    body["choices"][0]["finish_reason"] = json!("mystery_stop");
+    let (port, _requests, fixture) = spawn_json_fixture(200, body.to_string());
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let response = response_of(&result);
+    assert_eq!(response["stop_reason"], json!("mystery_stop"));
+    assert_eq!(response["tool_calls"], json!([]));
+    assert!(
+        !response["text"].as_str().expect("text").is_empty(),
+        "{response:?}"
+    );
+}
+
+#[test]
 fn openai_chat_non_stream_tool_calls() {
     let body = read_fixture("openai_chat/response_tools.json");
     let (port, requests, fixture) = spawn_json_fixture(200, body);
@@ -565,6 +594,197 @@ fn openai_chat_wire_format_is_standard() {
         "wire body must not mention tool_choice at all: {}",
         recorded.body
     );
+}
+
+/// Loop follow-up messages must convert through the real OpenAI Chat request
+/// builder: assistant `function.arguments` is the canonical JSON string, and
+/// tool results keep wire role/tool_call_id/content instead of being dropped.
+#[test]
+fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
+    let first_arguments = json!({"path": "文档.txt"});
+    let second_arguments = json!({"path": "a\"b\\c.md"});
+    let provider = ScriptedProvider::new();
+    provider.push_ok(json!({
+        "text": "Let me read.",
+        "tool_calls": [
+            {"id": "call-1", "name": "read_file", "arguments": first_arguments},
+            {"id": "call-2", "name": "read_file", "arguments": second_arguments}
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider.push_ok(json!({
+        "text": "done",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "stop"
+    }));
+    let (dispatcher, _root) = loop_dispatcher(8);
+    let loop_runner = AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
+        AgentConfig::default(),
+    )
+    .expect("production loop policy should compile")
+    .with_provider(Arc::new(provider.clone()))
+    .with_dispatcher(dispatcher)
+    .with_skip_sleep(true);
+    let decision = vm_value_to_json(
+        &loop_runner
+            .run_with_context(json_to_vm_value(&loop_context()))
+            .expect("loop should run"),
+    );
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(provider.call_count(), 2);
+
+    let mut follow = provider.requests()[1].clone();
+    assert_eq!(
+        follow["messages"][2]["content"][0]["content"],
+        json!("ran read_file"),
+        "canonical tool_result content before adapter conversion: {}",
+        follow["messages"][2]
+    );
+    let body = read_fixture("openai_chat/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    follow["provider_options"] = json!({
+        "base_url": format!("http://127.0.0.1:{port}"),
+        "api_key": "test-key",
+    });
+    let runner = harness_runner(port);
+    let (result, _) = run_adapter("openai_chat", follow, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let messages = wire["messages"].as_array().expect("wire messages");
+    assert_eq!(messages[0]["role"], json!("user"));
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    assert_eq!(messages[1]["content"], json!("Let me read."));
+    let first_arguments_json =
+        serde_json::to_string(&first_arguments).expect("first arguments json");
+    let second_arguments_json =
+        serde_json::to_string(&second_arguments).expect("second arguments json");
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["arguments"],
+        json!(first_arguments_json)
+    );
+    assert!(
+        messages[1]["tool_calls"][0]["function"]["arguments"].is_string(),
+        "function.arguments must be an exact JSON string: {}",
+        messages[1]["tool_calls"][0]["function"]["arguments"]
+    );
+    assert_eq!(
+        messages[1]["tool_calls"][1]["function"]["arguments"],
+        json!(second_arguments_json)
+    );
+    assert_eq!(messages[2]["role"], json!("tool"));
+    assert_eq!(messages[2]["tool_call_id"], json!("call-1"));
+    assert_eq!(messages[2]["content"], json!("ran read_file"));
+    assert_eq!(messages[3]["role"], json!("tool"));
+    assert_eq!(messages[3]["tool_call_id"], json!("call-2"));
+    assert_eq!(messages[3]["content"], json!("ran read_file"));
+    assert_eq!(
+        messages.len(),
+        4,
+        "tool results must not be dropped: {wire}"
+    );
+}
+
+const LOOP_TEMP_ROOT: &str =
+    "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t6-agent-loop-9d82a388";
+
+struct LoopEvents;
+
+impl DurableEventCommitter for LoopEvents {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
+    fn stop_requested(&self) -> bool {
+        false
+    }
+
+    fn commit(&self, _event_type: &str, _data: JsonValue) -> Result<(), EventCommitError> {
+        Ok(())
+    }
+}
+
+struct LoopExecutor;
+
+impl ToolExecutorBoundary for LoopExecutor {
+    fn execute(
+        &self,
+        executor: &NativeToolExecutor,
+        _arguments: &JsonValue,
+        _cancellation: &CancellationToken,
+        _deadline: Instant,
+    ) -> ToolResult {
+        ToolResult::success(format!("ran {}", executor.tool_name()), json!({"ok": true}))
+    }
+}
+
+fn loop_dispatcher(max_tool_calls: u64) -> (Arc<DispatchContext>, PathBuf) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
+        "adapter-loop-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("loop dispatcher workspace");
+    let snapshot = ToolRegistry::builtin()
+        .expect("builtin registry")
+        .snapshot();
+    let identity = snapshot.identity().to_string();
+    let dispatcher = DispatchContext::new(
+        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
+        root.clone(),
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(30),
+        snapshot,
+        identity.clone(),
+        identity,
+        DispatchLimits {
+            max_tool_calls,
+            max_tool_output_bytes: 64 * 1024,
+            max_event_bytes: 32 * 1024,
+        },
+        Arc::new(LoopEvents),
+        Arc::new(LoopExecutor),
+    )
+    .expect("dispatch context");
+    (Arc::new(dispatcher), root)
+}
+
+fn loop_context() -> JsonValue {
+    json!({
+        "run_id": "run-loop",
+        "session_id": "session-loop",
+        "model": "test-model",
+        "provider": "openai",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        }],
+        "tools": [{
+            "name": "read_file",
+            "description": "Read bounded text from a workspace file",
+            "schema_json": "{\"type\":\"object\"}"
+        }],
+        "provider_options": {},
+        "limits": {
+            "max_turns": 4,
+            "max_tool_calls": 8
+        },
+        "config": {
+            "base_retry_delay_ms": 100,
+            "max_retry_delay_ms": 400,
+            "max_retries": 2,
+            "parallel": false,
+            "task": false
+        }
+    })
 }
 
 /// Marker-splice collision guard (P3, user text): the wire splices user

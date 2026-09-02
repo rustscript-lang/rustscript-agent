@@ -1,77 +1,15 @@
-// A5 serial loop policy skeleton (pure decision policy; no provider
-// transport, no storage, no tool runner).
+// Serial provider/tool agent loop.
 //
-// The exported `run(context)` is a state-machine step function: ONE typed
-// context map in, ONE discriminated decision map out. The future
-// script-owned runner (A7/A8) will drive this policy around real provider
-// calls; in this skeleton the policy NEVER calls a provider or dispatches a
-// tool. A provider call that would succeed and a tool dispatch that would
-// run are both returned as typed BLOCKED capability states, so no success is
-// ever fabricated and no private builtin is added. Parallel/subagent/task
-// execution is rejected outright (A6 excluded).
-//
-// Context (all fields typed; missing fields fall back to documented
-// defaults):
-//
-//   turn: int            completed turns so far (0 initially)
-//   max_turns: int       turns allowed before the run terminates
-//   retry_count: int     retries already consumed on the current turn
-//   max_retries: int     retries allowed per turn
-//   phase: string        "start" | "provider_result"
-//   model: string        model name carried by model.* event descriptors
-//   provider: map        canonical call result {ok, response, error}
-//                        (rss/llm/types.rss shape); ignored in phase "start"
-//   config: map          {base_retry_delay_ms, max_retry_delay_ms,
-//                         parallel, task}
-//
-// Decisions (kind discriminator):
-//
-//   blocked      -> capability "provider.call" | "tool.dispatch" with a
-//                   typed reason; events carry the canonical descriptors to
-//                   emit before the (blocked) action. A blocked
-//                   "tool.dispatch" decision carries turn + 1: a tool-call
-//                   cycle CONSUMES the turn budget, so a runaway tool loop
-//                   terminates once the next start phase is refused at
-//                   max_turns (the completed model call's event still
-//                   carries the turn it started in).
-//   retry        -> delay_ms (exponential backoff, capped), retry_count
-//                   (incremented), turn unchanged
-//   next.turn    -> turn + 1 (a turn without tool calls completed)
-//   run.completed-> terminal decision after the last allowed turn (the
-//                   service commits the service-owned run.completed event)
-//   run.failed   -> terminal decision carrying the typed ProviderError
-//                   {status, type, code, message, param, request_id} and a
-//                   reason ("non_retryable" | "max_retries_exceeded"); the
-//                   service commits the service-owned run.failed event
-//   rejected     -> typed rejection (parallel_not_supported,
-//                   task_not_supported, unknown_phase)
-//
-// Every decision carries an `events` array of canonical event descriptors:
-//
-//   model.started:    {type: "model.started", turn, model}
-//   model.completed:  {type: "model.completed", turn, text, tool_calls}
-//
-// `tool_calls` on model.completed is pinned to the exact number of
-// `tool_call` entries in the canonical `response.tool_calls` array: 0 for a
-// text-only completion, N for N calls in one response.
-//
-// Backoff is `min(max(base, 0) * 2^retry_count, max(cap, 0))` with defined
-// edge semantics: negative or zero inputs clamp to 0 (a zero delay is a
-// valid immediate retry), a base above the cap clamps to the cap on entry,
-// and doubling SATURATES at the cap so no i64 input can overflow.
-//
-// run.failed / run.completed are SERVICE-OWNED event types (src/events.rs);
-// the policy only describes the terminal decision, it never emits them.
-//
-// Compiler-contract notes: all helpers are same-module, and arrays passed
-// onward are built in this module (no cross-module accessor array values).
-// Every helper takes at most ONE map parameter EXCEPT `provider_result`,
-// which takes the canonical `provider` + `config` pair. The two-map trigger
-// documented in the A3 core blocker plan fires only when a function with
-// two map parameters reads the FIRST map's fields and passes the SECOND map
-// onward to another script function; `provider_result` reads fields of both
-// maps but never passes a map onward — only scalars and the in-module
-// events array cross call boundaries.
+// `run(context)` drives canonical LlmRequest construction, the bounded native
+// host provider bridge, serial tool dispatch, and retry/backoff until a typed
+// terminal decision. Follow-up assistant `tool_call` parts use `arguments_json`
+// strings; tool results stay user-role `tool_result` parts so adapters see one
+// contract. Parallel/task execution is rejected. Provider/network errors
+// consume the retry budget; completed tool effects are never retried.
+// Durability of messages/events is left to Task 7.
+
+use agent;
+use json;
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -132,48 +70,83 @@ fn ctx_array(value: map, key: string) -> array {
     result
 }
 
+fn array_map(items: array, index: int) -> map {
+    let mut result: map = {};
+    if items.has(index) {
+        if type(items[index].copy()) == "map" {
+            let coerced: map = items[index].copy();
+            result = coerced;
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Decision builders
 // ---------------------------------------------------------------------------
 
-fn blocked_decision(capability: string, reason: string, turn: int, events: array) -> map {
+fn run_completed_decision(answer: string, turn: int, retry_count: int, tool_calls_used: int, events: array) -> map {
     {
-        kind: "blocked",
-        capability: capability,
-        reason: reason,
+        kind: "run.completed",
+        answer: answer,
         turn: turn,
+        retry_count: retry_count,
+        tool_calls_used: tool_calls_used,
         events: events
     }
 }
 
-fn retry_decision(delay_ms: int, retry_count: int, turn: int) -> map {
-    { kind: "retry", delay_ms: delay_ms, retry_count: retry_count, turn: turn, events: [] }
+fn run_failed_decision(code: string, message: string, turn: int, retry_count: int, tool_calls_used: int, error: map) -> map {
+    let mut payload: map = error;
+    if !payload.has("code") {
+        payload = {
+            status: ctx_int(error, "status", 0),
+            type: ctx_string(error, "type", "api_error"),
+            code: code,
+            message: message,
+            param: ctx_string(error, "param", ""),
+            request_id: ctx_string(error, "request_id", "")
+        };
+    }
+    {
+        kind: "run.failed",
+        error: payload,
+        reason: code,
+        turn: turn,
+        retry_count: retry_count,
+        tool_calls_used: tool_calls_used,
+        events: []
+    }
 }
 
-fn next_turn_decision(turn: int, events: array) -> map {
-    { kind: "next.turn", turn: turn, events: events }
+fn failed_code(code: string, message: string, turn: int, retry_count: int, tool_calls_used: int) -> map {
+    run_failed_decision(
+        code,
+        message,
+        turn,
+        retry_count,
+        tool_calls_used,
+        {
+            status: 0,
+            type: "invalid_request_error",
+            code: code,
+            message: message,
+            param: "",
+            request_id: ""
+        }
+    )
 }
 
-fn run_completed_decision(turn: int, events: array) -> map {
-    { kind: "run.completed", turn: turn, events: events }
-}
-
-fn run_failed_decision(turn: int, reason: string, error: map) -> map {
-    { kind: "run.failed", turn: turn, reason: reason, error: error, events: [] }
-}
-
-fn rejected_decision(code: string, message: string, turn: int) -> map {
-    { kind: "rejected", code: code, message: message, turn: turn, events: [] }
+fn control_failed(control: map, turn: int, retry_count: int, tool_calls_used: int) -> map {
+    let error: map = ctx_map(control, "error");
+    let code: string = ctx_string(error, "code", "cancelled");
+    run_failed_decision(code, ctx_string(error, "message", code), turn, retry_count, tool_calls_used, error)
 }
 
 // ---------------------------------------------------------------------------
 // Retry classification and backoff
 // ---------------------------------------------------------------------------
 
-/// Typed ProviderError classification: rate limits (429), request timeouts
-/// (408), server errors (5xx), and the canonical `rate_limit_error` /
-/// `server_error` error types are retryable; everything else (including the
-/// typed `invalid_request_error` family) is not.
 fn error_is_retryable(error: map) -> bool {
     let status: int = ctx_int(error, "status", 0);
     let error_type: string = ctx_string(error, "type", "");
@@ -192,19 +165,21 @@ fn error_is_retryable(error: map) -> bool {
     if error_type == "rate_limit_error" {
         retryable = true;
     }
+    if error_type == "overloaded_error" {
+        retryable = true;
+    }
     if error_type == "server_error" {
+        retryable = true;
+    }
+    if error_type == "api_error" {
+        retryable = true;
+    }
+    if error_type == "timeout_error" {
         retryable = true;
     }
     retryable
 }
 
-/// Exponential backoff for the attempt AFTER `retry_count` failures:
-/// `min(max(base, 0) * 2^retry_count, max(cap, 0))` with defined edge
-/// semantics. Negative or zero inputs clamp to 0 (a zero delay is a valid
-/// immediate retry), a base above the cap clamps to the cap on entry, and
-/// doubling SATURATES at the cap: the loop breaks once the delay reaches
-/// the cap or the zero fixed point, so the delay never overflows and the
-/// function terminates for ANY i64 inputs (including a huge retry_count).
 fn backoff_delay_ms(base: int, retry_count: int, cap: int) -> int {
     let mut delay: int = base;
     let mut ceiling: int = cap;
@@ -233,77 +208,167 @@ fn backoff_delay_ms(base: int, retry_count: int, cap: int) -> int {
 }
 
 // ---------------------------------------------------------------------------
-// Phase handlers
+// Canonical request / message helpers
 // ---------------------------------------------------------------------------
 
-/// Phase "start": emit `model.started` for the upcoming turn and attempt the
-/// provider call. The call itself is a typed blocked capability in this
-/// skeleton (the A3 core blocker holds the adapters); the harness injects
-/// synthetic results instead of the policy fabricating success.
-fn start_phase(turn: int, max_turns: int, model: string) -> map {
-    let mut decision: map = run_completed_decision(turn, []);
-    if turn < max_turns {
-        let mut events: array = [];
-        events[events.length] = { type: "model.started", turn: turn, model: model };
-        decision = blocked_decision(
-            "provider.call",
-            "serial loop skeleton: provider call is a typed blocked capability while the A3 core blocker stands",
-            turn,
-            events
-        );
-    }
-    decision
+fn text_part(text: string) -> map {
+    { type: "text", text: text }
 }
 
-/// Phase "provider_result": decide from the canonical typed call result.
-fn provider_result(turn: int, max_turns: int, retry_count: int, max_retries: int, provider: map, config: map) -> map {
-    let ok_flag: bool = ctx_bool(provider, "ok", false);
-    let mut decision: map = rejected_decision("unknown_phase", "provider result is not decidable", turn);
-    if ok_flag == true {
-        let response: map = ctx_map(provider, "response");
-        let text: string = ctx_string(response, "text", "");
-        let tool_calls: array = ctx_array(response, "tool_calls");
-        let mut events: array = [];
-        events[events.length] = {
-            type: "model.completed",
-            turn: turn,
-            text: text,
-            tool_calls: tool_calls.length
-        };
-        if tool_calls.length > 0 {
-            // A tool-call cycle consumes the turn budget: the dispatch
-            // decision carries the turn the run continues at after the
-            // tools finish (turn + 1), so a runaway tool loop terminates
-            // once the next start phase is refused at max_turns.
-            let next_turn: int = turn + 1;
-            decision = blocked_decision(
-                "tool.dispatch",
-                "serial loop skeleton: tool dispatch is a typed blocked capability; no tool runner is wired; the tool cycle consumes the turn budget",
-                next_turn,
-                events
-            );
-        } else {
-            let next_turn: int = turn + 1;
-            if next_turn >= max_turns {
-                decision = run_completed_decision(next_turn, events);
-            } else {
-                decision = next_turn_decision(next_turn, events);
+fn encode_arguments_json(arguments: map) -> string {
+    let encoded: string = json::encode(arguments);
+    encoded
+}
+
+fn tool_call_part(call: map) -> map {
+    {
+        type: "tool_call",
+        tool_call_id: ctx_string(call, "id", ""),
+        name: ctx_string(call, "name", ""),
+        arguments_json: encode_arguments_json(ctx_map(call, "arguments"))
+    }
+}
+
+fn user_text_message(text: string) -> map {
+    let mut content: array = [];
+    content[content.length] = text_part(text);
+    { role: "user", content: content }
+}
+
+fn assistant_message(text: string, calls: array) -> map {
+    let mut content: array = [];
+    if text != "" {
+        content[content.length] = text_part(text);
+    }
+    let mut i = 0;
+    while i < calls.length {
+        content[content.length] = tool_call_part(array_map(calls, i));
+        i += 1;
+    }
+    { role: "assistant", content: content }
+}
+
+fn tool_result_message(block: map) -> map {
+    let mut content: array = [];
+    content[content.length] = block;
+    { role: "user", content: content }
+}
+
+fn seed_messages(context: map, messages: array) -> array {
+    let mut seeded: array = messages;
+    if seeded.length == 0 {
+        let mut text: string = "";
+        if context.has("input") {
+            if type(context["input"]) == "map" {
+                let input: map = ctx_map(context, "input");
+                text = ctx_string(input, "message", ctx_string(input, "text", ""));
+            } else if type(context["input"]) == "string" {
+                text = ctx_string(context, "input", "");
             }
         }
-    } else {
-        let error: map = ctx_map(provider, "error");
-        if !error_is_retryable(error) {
-            decision = run_failed_decision(turn, "non_retryable", error);
-        } else if retry_count >= max_retries {
-            decision = run_failed_decision(turn, "max_retries_exceeded", error);
-        } else {
-            let base: int = ctx_int(config, "base_retry_delay_ms", 1000);
-            let cap: int = ctx_int(config, "max_retry_delay_ms", 30000);
-            let delay: int = backoff_delay_ms(base, retry_count, cap);
-            decision = retry_decision(delay, retry_count + 1, turn);
+        if text != "" {
+            seeded[seeded.length] = user_text_message(text);
         }
     }
-    decision
+    seeded
+}
+
+fn tools_from_context(context: map) -> array {
+    let mut tools: array = ctx_array(context, "tools");
+    if tools.length == 0 {
+        tools = ctx_array(context, "tool_schemas");
+    }
+    tools
+}
+
+fn build_llm_request(context: map, messages: array) -> map {
+    let limits: map = ctx_map(context, "limits");
+    let sampling: map = ctx_map(context, "sampling");
+    {
+        provider: ctx_string(context, "provider", "openai"),
+        model: ctx_string(context, "model", ""),
+        messages: messages,
+        tools: tools_from_context(context),
+        tool_choice: ctx_string(context, "tool_choice", ""),
+        reasoning: ctx_string(context, "reasoning", ""),
+        sampling: sampling,
+        max_output_tokens: ctx_int(context, "max_output_tokens", ctx_int(limits, "max_output_tokens", 0)),
+        stream: false,
+        provider_options: ctx_map(context, "provider_options")
+    }
+}
+
+fn response_is_malformed(response: map) -> bool {
+    let mut malformed = false;
+    if !response.has("text") {
+        if !response.has("tool_calls") {
+            malformed = true;
+        }
+    }
+    if response.has("tool_calls") {
+        if type(response["tool_calls"]) != "array" {
+            malformed = true;
+        }
+    }
+    malformed
+}
+
+fn dispatch_serial(calls: array, max_tool_calls: int, tool_calls_used: int) -> map {
+    let mut messages: array = [];
+    let mut used: int = tool_calls_used;
+    let mut i = 0;
+    let mut failed: map = {};
+    let mut stopped = false;
+    while i < calls.length {
+        if stopped == false {
+            if used >= max_tool_calls {
+                failed = failed_code(
+                    "max_tool_calls",
+                    "max_tool_calls exceeded",
+                    0,
+                    0,
+                    used
+                );
+                stopped = true;
+            } else {
+                let control: map = agent::control_check();
+                if ctx_bool(control, "ok", false) == false {
+                    failed = control_failed(control, 0, 0, used);
+                    stopped = true;
+                } else {
+                    let call: map = array_map(calls, i);
+                    let dispatched: map = agent::tool_dispatch(call);
+                    let after: map = agent::control_check();
+                    messages[messages.length] = tool_result_message(ctx_map(dispatched, "content_block"));
+                    used += 1;
+                    if ctx_bool(dispatched, "ok", false) == false {
+                        if ctx_bool(dispatched, "terminal", false) == true {
+                            failed = run_failed_decision(
+                                ctx_string(ctx_map(dispatched, "error"), "code", "tool_failed"),
+                                ctx_string(ctx_map(dispatched, "error"), "message", "tool dispatch failed"),
+                                0,
+                                0,
+                                used,
+                                ctx_map(dispatched, "error")
+                            );
+                            stopped = true;
+                        }
+                    }
+                    if ctx_bool(after, "ok", false) == false {
+                        failed = control_failed(after, 0, 0, used);
+                        stopped = true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    {
+        messages: messages,
+        tool_calls_used: used,
+        stopped: stopped,
+        failure: failed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,25 +376,119 @@ fn provider_result(turn: int, max_turns: int, retry_count: int, max_retries: int
 // ---------------------------------------------------------------------------
 
 pub fn run(context: map) -> map {
-    let turn: int = ctx_int(context, "turn", 0);
-    let max_turns: int = ctx_int(context, "max_turns", 1);
-    let retry_count: int = ctx_int(context, "retry_count", 0);
-    let max_retries: int = ctx_int(context, "max_retries", 0);
-    let phase: string = ctx_string(context, "phase", "");
-    let model: string = ctx_string(context, "model", "");
-    let provider: map = ctx_map(context, "provider");
     let config: map = ctx_map(context, "config");
-    let parallel: bool = ctx_bool(config, "parallel", false);
-    let task: bool = ctx_bool(config, "task", false);
-    let mut decision: map = rejected_decision("unknown_phase", "run phase is not recognized by the serial loop policy", turn);
-    if parallel == true {
-        decision = rejected_decision("parallel_not_supported", "parallel/subagent execution is excluded from the serial loop policy", turn);
-    } else if task == true {
-        decision = rejected_decision("task_not_supported", "task delegation is excluded from the serial loop policy", turn);
-    } else if phase == "start" {
-        decision = start_phase(turn, max_turns, model);
-    } else if phase == "provider_result" {
-        decision = provider_result(turn, max_turns, retry_count, max_retries, provider, config);
+    let mut decision: map = {};
+    if ctx_bool(config, "parallel", false) == true {
+        decision = failed_code("unsupported_parallel", "parallel tool dispatch is not supported", 0, 0, 0);
+    } else if ctx_bool(config, "task", false) == true {
+        decision = failed_code("unsupported_task", "task/sub-agent dispatch is not supported", 0, 0, 0);
+    } else {
+        decision = run_serial_loop(context);
+    }
+    decision
+}
+
+fn run_serial_loop(context: map) -> map {
+    let limits: map = ctx_map(context, "limits");
+    let config: map = ctx_map(context, "config");
+    let model: string = ctx_string(context, "model", "");
+    let max_turns: int = ctx_int(limits, "max_turns", ctx_int(context, "max_turns", 8));
+    let max_tool_calls: int = ctx_int(limits, "max_tool_calls", ctx_int(context, "max_tool_calls", 32));
+    let max_retries: int = ctx_int(config, "max_retries", ctx_int(context, "max_retries", 2));
+    let base_delay: int = ctx_int(config, "base_retry_delay_ms", 100);
+    let cap_delay: int = ctx_int(config, "max_retry_delay_ms", 400);
+    let mut messages: array = seed_messages(context, ctx_array(context, "messages"));
+    let mut turn: int = 0;
+    let mut retry_count: int = 0;
+    let mut tool_calls_used: int = 0;
+    let mut running = true;
+    let mut decision: map = failed_code("internal", "loop did not produce a decision", 0, 0, 0);
+    while running {
+        let control: map = agent::control_check();
+        if ctx_bool(control, "ok", false) == false {
+            decision = control_failed(control, turn, retry_count, tool_calls_used);
+            running = false;
+        } else if turn >= max_turns {
+            decision = failed_code("max_turns", "max_turns exceeded", turn, retry_count, tool_calls_used);
+            running = false;
+        } else {
+            let mut events: array = [];
+            events[events.length] = { type: "model.started", turn: turn, model: model };
+            let request: map = build_llm_request(context, messages);
+            let provider_result: map = agent::provider_call(request);
+            let after: map = agent::control_check();
+            if ctx_bool(after, "ok", false) == false {
+                decision = control_failed(after, turn, retry_count, tool_calls_used);
+                running = false;
+            } else if ctx_bool(provider_result, "ok", false) == false {
+                let error: map = ctx_map(provider_result, "error");
+                if error_is_retryable(error) {
+                    if retry_count >= max_retries {
+                        decision = run_failed_decision(
+                            "retry_exhausted",
+                            "provider retry budget exhausted",
+                            turn,
+                            retry_count,
+                            tool_calls_used,
+                            {
+                                status: ctx_int(error, "status", 0),
+                                type: ctx_string(error, "type", "api_error"),
+                                code: "retry_exhausted",
+                                message: "provider retry budget exhausted",
+                                param: ctx_string(error, "param", ""),
+                                request_id: ctx_string(error, "request_id", "")
+                            }
+                        );
+                        running = false;
+                    } else {
+                        let delay: int = backoff_delay_ms(base_delay, retry_count, cap_delay);
+                        agent::sleep_ms(delay);
+                        retry_count += 1;
+                    }
+                } else {
+                    let code: string = ctx_string(error, "code", "provider_error");
+                    decision = run_failed_decision(code, ctx_string(error, "message", code), turn, retry_count, tool_calls_used, error);
+                    running = false;
+                }
+            } else {
+                let response: map = ctx_map(provider_result, "response");
+                if response_is_malformed(response) {
+                    decision = failed_code("malformed_payload", "provider response is malformed", turn, retry_count, tool_calls_used);
+                    running = false;
+                } else {
+                    let text: string = ctx_string(response, "text", "");
+                    let calls: array = ctx_array(response, "tool_calls");
+                    let mut completed_events: array = [];
+                    completed_events[completed_events.length] = {
+                        type: "model.completed",
+                        turn: turn,
+                        text: text,
+                        tool_calls: calls.length
+                    };
+                    retry_count = 0;
+                    if calls.length == 0 {
+                        decision = run_completed_decision(text, turn + 1, retry_count, tool_calls_used, completed_events);
+                        running = false;
+                    } else {
+                        messages[messages.length] = assistant_message(text, calls);
+                        let dispatched: map = dispatch_serial(calls, max_tool_calls, tool_calls_used);
+                        let produced: array = ctx_array(dispatched, "messages");
+                        let mut j = 0;
+                        while j < produced.length {
+                            messages[messages.length] = array_map(produced, j);
+                            j += 1;
+                        }
+                        tool_calls_used = ctx_int(dispatched, "tool_calls_used", tool_calls_used);
+                        if ctx_bool(dispatched, "stopped", false) == true {
+                            decision = ctx_map(dispatched, "failure");
+                            running = false;
+                        } else {
+                            turn += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
     decision
 }

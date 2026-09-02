@@ -1,34 +1,25 @@
-//! A5 serial agent policy suites.
+//! Serial provider/tool loop and compaction policy suites.
 //!
-//! Two pure-RSS policy modules under `rss/agent/` are driven here exactly as
-//! the future script-owned runner would drive them: one typed context map
-//! into the exported entry, one typed decision map out, executed on
-//! synthetic typed inputs (no provider transport, no SQLite in the policy).
-//!
-//! - `main.rss` — serial loop policy skeleton: turn/max_turns accounting,
-//!   typed ProviderError retry/backoff decisions, canonical
-//!   `model.started` / `model.completed` event descriptors and the
-//!   service-owned `run.failed` terminal descriptor. Provider calls and tool
-//!   dispatch are typed BLOCKED capabilities (never fabricated success), and
-//!   parallel/task execution is rejected (A6 excluded).
-//! - `compact.rss` — durable compaction policy: prefix selection over the
-//!   message history that never splits an assistant tool-call message from
-//!   its tool-result messages and always keeps a retained tail window, plus
-//!   the typed A2 storage command sequence
-//!   `compaction.start -> message.compact -> compaction.commit` and the
-//!   `compaction.fail` command builder. The execution tests drive the plan
-//!   commands through the production A2 storage service
-//!   (`rss/storage/main.rss`) and assert the durable outcome.
+//! `main.rss` drives a real serial provider/tool loop through the bounded
+//! native RSS host bridge. Tests inject a scripted provider and the Task 5
+//! dispatcher. Compaction tests remain pure policy plus durable storage.
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rustscript_agent::{
-    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner, ToolRegistry,
-    builtin_entries,
+use parking_lot::Mutex;
+use rustscript_agent::tools::{
+    DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError, NativeToolExecutor,
+    ToolExecutorBoundary, ToolOwner, ToolResult,
 };
-use rustscript_vm::Value;
+use rustscript_agent::{
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner,
+    ScriptedProvider, ToolRegistry, builtin_entries,
+};
+use rustscript_vm::{CancellationToken, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 fn agent_root() -> PathBuf {
@@ -46,9 +37,25 @@ fn fixtures_root() -> PathBuf {
         .join("agent")
 }
 
+const LOOP_TEMP_ROOT: &str =
+    "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t6-agent-loop-9d82a388";
+
 fn loop_runner() -> AgentRunner {
     AgentRunner::from_file(agent_root().join("main.rss"), AgentConfig::default())
         .expect("production loop policy should compile")
+}
+
+fn loop_runner_with(
+    provider: ScriptedProvider,
+    dispatcher: Option<Arc<DispatchContext>>,
+) -> AgentRunner {
+    let mut runner = loop_runner()
+        .with_provider(Arc::new(provider))
+        .with_skip_sleep(true);
+    if let Some(dispatcher) = dispatcher {
+        runner = runner.with_dispatcher(dispatcher);
+    }
+    runner
 }
 
 fn compact_runner() -> AgentRunner {
@@ -144,81 +151,179 @@ fn loop_config(parallel: bool, task: bool) -> JsonValue {
     json!({
         "base_retry_delay_ms": 100,
         "max_retry_delay_ms": 400,
+        "max_retries": 2,
         "parallel": parallel,
         "task": task
     })
 }
 
-fn provider_ok(text: &str, tool_calls: JsonValue) -> JsonValue {
+fn text_response(text: &str) -> JsonValue {
     json!({
-        "ok": true,
-        "response": {
-            "text": text,
-            "tool_calls": tool_calls,
-            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            "reasoning": "",
-            "stop_reason": "end_turn"
-        },
-        "error": {}
+        "text": text,
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "stop"
+    })
+}
+
+fn tool_response(text: &str, tool_calls: JsonValue) -> JsonValue {
+    json!({
+        "text": text,
+        "tool_calls": tool_calls,
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
     })
 }
 
 fn provider_error(status: i64, error_type: &str, code: &str, message: &str) -> JsonValue {
     json!({
-        "ok": false,
-        "response": {},
-        "error": {
-            "status": status,
-            "type": error_type,
-            "code": code,
-            "message": message,
-            "param": "",
-            "request_id": "req-1"
-        }
+        "status": status,
+        "type": error_type,
+        "code": code,
+        "message": message,
+        "param": "",
+        "request_id": "req-1"
     })
 }
 
-fn loop_context(
-    phase: &str,
-    turn: i64,
+fn run_context(
     max_turns: i64,
-    retry_count: i64,
-    max_retries: i64,
-    provider: JsonValue,
+    max_tool_calls: i64,
     config: JsonValue,
+    tools: JsonValue,
 ) -> JsonValue {
     json!({
-        "turn": turn,
-        "max_turns": max_turns,
-        "retry_count": retry_count,
-        "max_retries": max_retries,
-        "phase": phase,
+        "run_id": "run-loop",
+        "session_id": "session-loop",
         "model": "test-model",
-        "provider": provider,
+        "provider": "openai",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        }],
+        "tools": tools,
+        "provider_options": {},
+        "limits": {
+            "max_turns": max_turns,
+            "max_tool_calls": max_tool_calls
+        },
         "config": config
     })
 }
 
-fn start_context(turn: i64, max_turns: i64, config: JsonValue) -> JsonValue {
-    loop_context("start", turn, max_turns, 0, 2, json!({}), config)
+struct MemoryEvents {
+    events: Mutex<Vec<(String, JsonValue)>>,
+    terminal: AtomicU64,
 }
 
-fn provider_context(
-    turn: i64,
-    max_turns: i64,
-    retry_count: i64,
-    max_retries: i64,
-    provider: JsonValue,
-) -> JsonValue {
-    loop_context(
-        "provider_result",
-        turn,
-        max_turns,
-        retry_count,
-        max_retries,
-        provider,
-        loop_config(false, false),
+impl MemoryEvents {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            events: Mutex::new(Vec::new()),
+            terminal: AtomicU64::new(0),
+        })
+    }
+}
+
+impl DurableEventCommitter for MemoryEvents {
+    fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::SeqCst) != 0
+    }
+
+    fn stop_requested(&self) -> bool {
+        false
+    }
+
+    fn commit(&self, event_type: &str, data: JsonValue) -> Result<(), EventCommitError> {
+        self.events.lock().push((event_type.to_string(), data));
+        Ok(())
+    }
+}
+
+struct CountingExecutor {
+    count: AtomicU64,
+    names: Mutex<Vec<String>>,
+}
+
+impl CountingExecutor {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            count: AtomicU64::new(0),
+            names: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl ToolExecutorBoundary for CountingExecutor {
+    fn execute(
+        &self,
+        executor: &NativeToolExecutor,
+        arguments: &JsonValue,
+        _cancellation: &CancellationToken,
+        _deadline: Instant,
+    ) -> ToolResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.names.lock().push(executor.tool_name().to_string());
+        ToolResult::success(
+            format!("ran {}", executor.tool_name()),
+            json!({"ok": true, "arguments": arguments}),
+        )
+    }
+}
+
+fn native_dispatcher(
+    max_tool_calls: u64,
+) -> (Arc<DispatchContext>, Arc<CountingExecutor>, PathBuf) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
+        "loop-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("loop dispatcher workspace");
+    let executor = CountingExecutor::new();
+    let snapshot = ToolRegistry::builtin()
+        .expect("builtin registry")
+        .snapshot();
+    let identity = snapshot.identity().to_string();
+    let dispatcher = DispatchContext::new(
+        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
+        root.clone(),
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(30),
+        snapshot,
+        identity.clone(),
+        identity,
+        DispatchLimits {
+            max_tool_calls,
+            max_tool_output_bytes: 64 * 1024,
+            max_event_bytes: 32 * 1024,
+        },
+        MemoryEvents::new(),
+        executor.clone(),
     )
+    .expect("dispatch context");
+    (Arc::new(dispatcher), executor, root)
+}
+
+fn echo_tool() -> JsonValue {
+    json!([{
+        "name": "read_file",
+        "description": "Read bounded text from a workspace file",
+        "schema_json": "{\"type\":\"object\"}"
+    }])
+}
+
+fn canonical_arguments_json(arguments: &JsonValue) -> JsonValue {
+    json!(serde_json::to_string(arguments).expect("arguments should serialize"))
+}
+
+fn assert_no_blocked(decision: &JsonValue) {
+    assert_ne!(decision["kind"], json!("blocked"));
+    assert_ne!(decision["capability"], json!("provider.call"));
+    assert_ne!(decision["capability"], json!("tool.dispatch"));
 }
 
 // ---------------------------------------------------------------------------
@@ -226,427 +331,394 @@ fn provider_context(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn loop_start_phase_emits_model_started_and_blocks_provider_call() {
-    let runner = loop_runner();
-    let decision = decide(&runner, start_context(0, 3, loop_config(false, false)));
-    assert_eq!(decision["kind"], json!("blocked"));
-    assert_eq!(decision["capability"], json!("provider.call"));
-    assert_eq!(decision["turn"], json!(0));
-    assert!(
-        decision["reason"]
-            .as_str()
-            .is_some_and(|reason| !reason.is_empty()),
-        "blocked provider.call must carry a typed reason"
+fn loop_text_only_response_produces_final_answer() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("done"));
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, false), json!([])),
     );
-    let events = decision["events"]
-        .as_array()
-        .expect("decision should carry event descriptors");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["type"], json!("model.started"));
-    assert_eq!(events[0]["turn"], json!(0));
-    assert_eq!(events[0]["model"], json!("test-model"));
+    assert_no_blocked(&decision);
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(decision["answer"], json!("done"));
+    assert_eq!(provider.call_count(), 1);
+    let request = &provider.requests()[0];
+    assert_eq!(request["model"], json!("test-model"));
+    assert_eq!(request["provider"], json!("openai"));
+    assert_eq!(request["messages"][0]["role"], json!("user"));
 }
 
 #[test]
-fn loop_success_without_tools_advances_turn() {
-    let runner = loop_runner();
+fn loop_one_serial_tool_call_then_final() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": "call-1", "name": "read_file", "arguments": {"path": "note.txt"}}]),
+    ));
+    provider.push_ok(text_response("after tool"));
+    let (dispatcher, executor, root) = native_dispatcher(8);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_ok("hello", json!([]))),
+        run_context(4, 8, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(decision["kind"], json!("next.turn"));
-    assert_eq!(decision["turn"], json!(1));
-    let events = decision["events"]
-        .as_array()
-        .expect("decision should carry event descriptors");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["type"], json!("model.completed"));
-    assert_eq!(events[0]["turn"], json!(0));
-    assert_eq!(events[0]["text"], json!("hello"));
-    assert_eq!(events[0]["tool_calls"], json!(0));
-}
-
-#[test]
-fn loop_success_with_tool_calls_blocks_tool_dispatch() {
-    let runner = loop_runner();
-    let decision = decide(
-        &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_ok(
-                "need a tool",
-                json!([{"id": "call-1", "name": "read_file", "arguments": {}}]),
-            ),
-        ),
-    );
-    assert_eq!(decision["kind"], json!("blocked"));
-    assert_eq!(decision["capability"], json!("tool.dispatch"));
+    let _ = fs::remove_dir_all(root);
+    assert_no_blocked(&decision);
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(decision["answer"], json!("after tool"));
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 1);
+    let second = &provider.requests()[1];
+    assert_eq!(second["messages"][1]["role"], json!("assistant"));
     assert_eq!(
-        decision["turn"],
-        json!(1),
-        "the tool cycle consumes the turn budget: the run continues at turn + 1"
+        second["messages"][1]["content"][0]["type"],
+        json!("tool_call")
     );
     assert_eq!(
-        decision["events"][0]["turn"],
-        json!(0),
-        "the completed model call still belongs to the turn it started in"
+        second["messages"][1]["content"][0]["tool_call_id"],
+        json!("call-1")
+    );
+    assert_eq!(
+        second["messages"][1]["content"][0]["name"],
+        json!("read_file")
+    );
+    assert_eq!(
+        second["messages"][1]["content"][0]["arguments_json"],
+        canonical_arguments_json(&json!({"path": "note.txt"}))
     );
     assert!(
-        decision["reason"]
-            .as_str()
-            .is_some_and(|reason| !reason.is_empty()),
-        "blocked tool.dispatch must carry a typed reason"
+        second["messages"][1]["content"][0]
+            .get("arguments")
+            .is_none_or(JsonValue::is_null),
+        "assistant tool_call parts must not carry an arguments map: {}",
+        second["messages"][1]["content"][0]
     );
-    let events = decision["events"]
-        .as_array()
-        .expect("decision should carry event descriptors");
-    assert_eq!(events[0]["type"], json!("model.completed"));
-    assert_eq!(events[0]["tool_calls"], json!(1));
-}
-
-#[test]
-fn loop_max_turns_terminates_run_completed() {
-    let runner = loop_runner();
-    // A fresh turn is refused once the budget is exhausted.
-    let refused = decide(&runner, start_context(3, 3, loop_config(false, false)));
-    assert_eq!(refused["kind"], json!("run.completed"));
-    assert_eq!(refused["turn"], json!(3));
+    assert_eq!(second["messages"][2]["role"], json!("user"));
     assert_eq!(
-        refused["events"].as_array().expect("events").len(),
-        0,
-        "refusing a new turn emits no events"
+        second["messages"][2]["content"][0]["type"],
+        json!("tool_result")
     );
-    // Completing the last allowed turn also terminates.
-    let completed = decide(
-        &runner,
-        provider_context(2, 3, 0, 2, provider_ok("done", json!([]))),
+    assert_eq!(
+        second["messages"][2]["content"][0]["tool_call_id"],
+        json!("call-1")
     );
-    assert_eq!(completed["kind"], json!("run.completed"));
-    assert_eq!(completed["turn"], json!(3));
-    let events = completed["events"]
-        .as_array()
-        .expect("decision should carry event descriptors");
-    assert_eq!(events[0]["type"], json!("model.completed"));
+    assert_eq!(
+        second["messages"][2]["content"][0]["name"],
+        json!("read_file")
+    );
+    assert_eq!(
+        second["messages"][2]["content"][0]["truncated"],
+        json!(false)
+    );
+    assert_eq!(
+        second["messages"][2]["content"][0]["is_error"],
+        json!(false)
+    );
 }
 
 #[test]
-fn loop_retryable_error_retries_with_backoff() {
-    let runner = loop_runner();
+fn loop_multiple_serial_calls_in_order_exactly_once() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "calling",
+        json!([
+            {"id": "c1", "name": "read_file", "arguments": {"path": "a.txt"}},
+            {"id": "c2", "name": "read_file", "arguments": {"path": "b.txt"}}
+        ]),
+    ));
+    provider.push_ok(text_response("both done"));
+    let (dispatcher, executor, root) = native_dispatcher(8);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_error(429, "rate_limit_error", "rate_limited", "slow down"),
-        ),
+        run_context(4, 8, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(decision["kind"], json!("retry"));
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 2);
     assert_eq!(
-        decision["retry_count"],
-        json!(1),
-        "retry count must increment"
+        *executor.names.lock(),
+        vec!["read_file".to_string(), "read_file".to_string()]
     );
+    let follow = &provider.requests()[1];
+    let messages = follow["messages"].as_array().expect("messages");
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    assert_eq!(messages[1]["content"][0]["type"], json!("text"));
+    assert_eq!(messages[1]["content"][1]["type"], json!("tool_call"));
     assert_eq!(
-        decision["delay_ms"],
-        json!(100),
-        "first retry uses the base delay"
+        messages[1]["content"][1]["arguments_json"],
+        canonical_arguments_json(&json!({"path": "a.txt"}))
     );
+    assert_eq!(messages[1]["content"][2]["type"], json!("tool_call"));
     assert_eq!(
-        decision["turn"],
-        json!(0),
-        "a retry does not consume a turn"
+        messages[1]["content"][2]["arguments_json"],
+        canonical_arguments_json(&json!({"path": "b.txt"}))
     );
-    assert_eq!(
-        decision["events"].as_array().expect("events").len(),
-        0,
-        "a retry emits no event descriptors"
-    );
+    assert_eq!(messages[2]["role"], json!("user"));
+    assert_eq!(messages[2]["content"][0]["type"], json!("tool_result"));
+    assert_eq!(messages[2]["content"][0]["tool_call_id"], json!("c1"));
+    assert_eq!(messages[2]["content"][0]["name"], json!("read_file"));
+    assert_eq!(messages[3]["role"], json!("user"));
+    assert_eq!(messages[3]["content"][0]["type"], json!("tool_result"));
+    assert_eq!(messages[3]["content"][0]["tool_call_id"], json!("c2"));
+    assert_eq!(messages[3]["content"][0]["name"], json!("read_file"));
 }
 
 #[test]
-fn loop_backoff_doubles_then_caps() {
-    let runner = loop_runner();
-    let second = decide(
-        &runner,
-        provider_context(
-            0,
-            3,
-            1,
-            4,
-            provider_error(503, "server_error", "unavailable", "busy"),
-        ),
-    );
-    assert_eq!(second["kind"], json!("retry"));
-    assert_eq!(
-        second["delay_ms"],
-        json!(200),
-        "second retry doubles the delay"
-    );
-    assert_eq!(second["retry_count"], json!(2));
-    let third = decide(
-        &runner,
-        provider_context(
-            0,
-            3,
-            2,
-            4,
-            provider_error(503, "server_error", "unavailable", "busy"),
-        ),
-    );
-    assert_eq!(third["delay_ms"], json!(400), "third retry doubles again");
-    assert_eq!(third["retry_count"], json!(3));
-    let capped = decide(
-        &runner,
-        provider_context(
-            0,
-            3,
-            3,
-            4,
-            provider_error(503, "server_error", "unavailable", "busy"),
-        ),
-    );
-    assert_eq!(
-        capped["delay_ms"],
-        json!(400),
-        "backoff is capped at max_retry_delay_ms"
-    );
-    assert_eq!(capped["retry_count"], json!(4));
-}
-
-#[test]
-fn loop_nonretryable_error_fails_run() {
-    let runner = loop_runner();
+fn loop_provider_retry_backoff_then_success() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
+    provider.push_error(provider_error(429, "rate_limit_error", "rate", "slow"));
+    provider.push_ok(text_response("recovered"));
+    let runner = loop_runner_with(provider.clone(), None);
     let decision = decide(
         &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_error(400, "invalid_request_error", "bad_request", "no"),
-        ),
+        run_context(3, 8, loop_config(false, false), json!([])),
+    );
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(decision["answer"], json!("recovered"));
+    assert_eq!(provider.call_count(), 3);
+    assert_eq!(runner.recorded_sleeps(), vec![100, 200]);
+}
+
+#[test]
+fn loop_provider_retry_exhaustion() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(500, "server_error", "boom", "fail"));
+    provider.push_error(provider_error(500, "server_error", "boom", "fail"));
+    provider.push_error(provider_error(500, "server_error", "boom", "fail"));
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, false), json!([])),
     );
     assert_eq!(decision["kind"], json!("run.failed"));
-    assert_eq!(decision["reason"], json!("non_retryable"));
-    assert_eq!(decision["turn"], json!(0));
-    let error = decision["error"]
-        .as_object()
-        .expect("run.failed must carry the typed provider error");
-    assert_eq!(error["status"], json!(400));
-    assert_eq!(error["type"], json!("invalid_request_error"));
-    assert_eq!(error["code"], json!("bad_request"));
-    assert_eq!(error["message"], json!("no"));
-    assert_eq!(error["param"], json!(""));
-    assert_eq!(error["request_id"], json!("req-1"));
+    assert_eq!(decision["error"]["code"], json!("retry_exhausted"));
+    assert_eq!(provider.call_count(), 3);
+    assert_eq!(runner.recorded_sleeps(), vec![100, 200]);
 }
 
 #[test]
-fn loop_max_retries_exceeded_fails_run() {
-    let runner = loop_runner();
-    // 503 is retryable, but the budget is already exhausted.
+fn loop_non_retryable_provider_error_fails_without_retry() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(
+        400,
+        "invalid_request_error",
+        "bad_request",
+        "nope",
+    ));
+    let runner = loop_runner_with(provider.clone(), None);
     let decision = decide(
         &runner,
-        provider_context(
-            0,
-            3,
-            2,
-            2,
-            provider_error(503, "server_error", "unavailable", "busy"),
-        ),
+        run_context(3, 8, loop_config(false, false), json!([])),
     );
     assert_eq!(decision["kind"], json!("run.failed"));
-    assert_eq!(decision["reason"], json!("max_retries_exceeded"));
-    assert_eq!(decision["error"]["status"], json!(503));
+    assert_eq!(decision["error"]["code"], json!("bad_request"));
+    assert_eq!(provider.call_count(), 1);
+    assert!(runner.recorded_sleeps().is_empty());
 }
 
 #[test]
-fn loop_parallel_config_is_rejected() {
-    let runner = loop_runner();
-    let decision = decide(&runner, start_context(0, 3, loop_config(true, false)));
-    assert_eq!(decision["kind"], json!("rejected"));
-    assert_eq!(decision["code"], json!("parallel_not_supported"));
-    assert!(
-        decision["message"]
-            .as_str()
-            .is_some_and(|message| !message.is_empty()),
-        "rejection must carry a typed message"
-    );
-}
-
-#[test]
-fn loop_task_config_is_rejected() {
-    let runner = loop_runner();
-    let decision = decide(&runner, start_context(0, 3, loop_config(false, true)));
-    assert_eq!(decision["kind"], json!("rejected"));
-    assert_eq!(decision["code"], json!("task_not_supported"));
-}
-
-#[test]
-fn loop_unknown_phase_is_rejected() {
-    let runner = loop_runner();
+fn loop_max_turns_is_enforced() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": "c1", "name": "read_file", "arguments": {"path": "note.txt"}}]),
+    ));
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": "c2", "name": "read_file", "arguments": {"path": "note.txt"}}]),
+    ));
+    let (dispatcher, executor, root) = native_dispatcher(8);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
-        loop_context("mystery", 0, 3, 0, 2, json!({}), loop_config(false, false)),
+        run_context(1, 8, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(decision["kind"], json!("rejected"));
-    assert_eq!(decision["code"], json!("unknown_phase"));
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("max_turns"));
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn loop_full_serial_run_advances_turns_and_completes() {
-    let runner = loop_runner();
-    // The harness injects synthetic provider results between policy steps,
-    // exactly as the future script-owned runner would after the A3 blocker
-    // clears; the policy itself never fabricates a provider success.
-    let start = decide(&runner, start_context(0, 3, loop_config(false, false)));
-    assert_eq!(start["kind"], json!("blocked"));
-    assert_eq!(start["capability"], json!("provider.call"));
-    assert_eq!(start["events"][0]["type"], json!("model.started"));
-
-    let step = decide(
+fn loop_max_tool_calls_composes_with_task5_budget() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([
+            {"id": "c1", "name": "read_file", "arguments": {"path": "a.txt"}},
+            {"id": "c2", "name": "read_file", "arguments": {"path": "b.txt"}}
+        ]),
+    ));
+    let (dispatcher, executor, root) = native_dispatcher(1);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let decision = decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_ok("hello", json!([]))),
+        run_context(4, 1, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(step["kind"], json!("next.turn"));
-    assert_eq!(step["turn"], json!(1));
-
-    let start = decide(&runner, start_context(1, 3, loop_config(false, false)));
-    assert_eq!(start["kind"], json!("blocked"));
-    assert_eq!(
-        start["events"][0]["turn"],
-        json!(1),
-        "turn must increment across steps"
-    );
-
-    let step = decide(
-        &runner,
-        provider_context(1, 3, 0, 2, provider_ok("again", json!([]))),
-    );
-    assert_eq!(step["kind"], json!("next.turn"));
-    assert_eq!(step["turn"], json!(2));
-
-    let start = decide(&runner, start_context(2, 3, loop_config(false, false)));
-    assert_eq!(start["events"][0]["turn"], json!(2));
-
-    let step = decide(
-        &runner,
-        provider_context(2, 3, 0, 2, provider_ok("done", json!([]))),
-    );
-    assert_eq!(step["kind"], json!("run.completed"));
-    assert_eq!(step["turn"], json!(3));
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("max_tool_calls"));
+    assert_eq!(executor.count.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.call_count(), 1);
 }
 
 #[test]
-fn loop_decisions_never_invent_parallel_or_subagent_actions() {
-    let runner = loop_runner();
-    let mut decisions = Vec::new();
-    decisions.push(decide(
-        &runner,
-        start_context(0, 3, loop_config(false, false)),
-    ));
-    decisions.push(decide(
-        &runner,
-        provider_context(0, 3, 0, 2, provider_ok("hello", json!([]))),
-    ));
-    decisions.push(decide(
-        &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_ok("t", json!([{"id": "c", "name": "n", "arguments": {}}])),
-        ),
-    ));
-    decisions.push(decide(
-        &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_error(429, "rate_limit_error", "rl", "slow"),
-        ),
-    ));
-    decisions.push(decide(
-        &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_error(400, "invalid_request_error", "br", "no"),
-        ),
-    ));
-    for decision in &decisions {
-        let text = decision.to_string();
-        assert!(
-            !text.contains("subagent") && !text.contains("parallel") && !text.contains("\"task\""),
-            "the serial loop policy must never invent parallel/task actions: {text}"
-        );
+fn loop_cancel_stops_before_provider() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("should not run"));
+    let runner = loop_runner_with(provider.clone(), None);
+    let cancellation = rustscript_agent::RunCancellation::new();
+    cancellation.request(rustscript_vm::CancellationReason::Requested);
+    let mut sink = VecSink::default();
+    let result = runner.run_with_context_and_events(
+        json_to_vm(&run_context(3, 8, loop_config(false, false), json!([]))),
+        &mut sink,
+        &cancellation,
+    );
+    if let Ok(value) = result {
+        let decision = vm_value_to_json(&value);
+        assert_eq!(decision["kind"], json!("run.failed"));
+        assert_eq!(decision["error"]["code"], json!("cancelled"));
     }
+    assert_eq!(provider.call_count(), 0);
 }
 
 #[test]
-fn loop_canonical_event_shapes() {
-    let runner = loop_runner();
-    let started = decide(&runner, start_context(0, 3, loop_config(false, false)));
-    let started_event = started["events"][0]
-        .as_object()
-        .expect("model.started event descriptor");
-    let mut started_keys: Vec<&String> = started_event.keys().collect();
-    started_keys.sort();
-    assert_eq!(started_keys, vec!["model", "turn", "type"]);
+fn loop_deadline_stops_before_provider() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("should not run"));
+    let runner = loop_runner_with(provider.clone(), None);
+    let cancellation = rustscript_agent::RunCancellation::with_timeout(Duration::from_millis(0));
+    let mut sink = VecSink::default();
+    let result = runner.run_with_context_and_events(
+        json_to_vm(&run_context(3, 8, loop_config(false, false), json!([]))),
+        &mut sink,
+        &cancellation,
+    );
+    if let Ok(value) = result {
+        let decision = vm_value_to_json(&value);
+        assert_eq!(decision["kind"], json!("run.failed"));
+        assert_eq!(decision["error"]["code"], json!("deadline_elapsed"));
+    }
+    assert_eq!(provider.call_count(), 0);
+}
 
-    let completed = decide(
+#[test]
+fn loop_malformed_provider_response_is_typed() {
+    let provider = ScriptedProvider::new();
+    provider.push_envelope(json!("not-an-object"));
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
         &runner,
-        provider_context(0, 3, 0, 2, provider_ok("hi", json!([]))),
+        run_context(3, 8, loop_config(false, false), json!([])),
     );
-    let completed_event = completed["events"][0]
-        .as_object()
-        .expect("model.completed event descriptor");
-    let mut completed_keys: Vec<&String> = completed_event.keys().collect();
-    completed_keys.sort();
-    assert_eq!(completed_keys, vec!["text", "tool_calls", "turn", "type"]);
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("malformed_payload"));
+    assert_eq!(provider.call_count(), 1);
+}
 
-    let failed = decide(
+#[test]
+fn loop_unknown_finish_reason_with_text_is_final() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(json!({
+        "text": "ok anyway",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "mystery"
+    }));
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
         &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_error(400, "invalid_request_error", "br", "no"),
-        ),
+        run_context(3, 8, loop_config(false, false), json!([])),
     );
-    let failed_error = failed["error"]
-        .as_object()
-        .expect("run.failed must carry the typed provider error");
-    let mut error_keys: Vec<&String> = failed_error.keys().collect();
-    error_keys.sort();
-    assert_eq!(
-        error_keys,
-        vec!["code", "message", "param", "request_id", "status", "type"]
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(decision["answer"], json!("ok anyway"));
+}
+
+#[test]
+fn loop_parallel_is_typed_unsupported() {
+    let provider = ScriptedProvider::new();
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(true, false), json!([])),
     );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("unsupported_parallel"));
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[test]
+fn loop_task_is_typed_unsupported() {
+    let provider = ScriptedProvider::new();
+    let runner = loop_runner_with(provider.clone(), None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, true), json!([])),
+    );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("unsupported_task"));
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[test]
+fn loop_has_no_blocked_terminal_path() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("plain"));
+    let runner = loop_runner_with(provider, None);
+    let decision = decide(
+        &runner,
+        run_context(3, 8, loop_config(false, false), json!([])),
+    );
+    assert_no_blocked(&decision);
+    assert_eq!(decision["kind"], json!("run.completed"));
+}
+
+#[test]
+fn loop_completed_tool_effects_are_not_retried() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": "c1", "name": "read_file", "arguments": {"path": "a.txt"}}]),
+    ));
+    provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
+    provider.push_ok(text_response("after retry"));
+    let (dispatcher, executor, root) = native_dispatcher(8);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let decision = decide(
+        &runner,
+        run_context(4, 8, loop_config(false, false), echo_tool()),
+    );
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(executor.count.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.call_count(), 3);
 }
 
 #[test]
 fn loop_fixture_context_deserializes() {
     let context = read_fixture("loop_context.json");
-    assert_eq!(context["phase"], json!("start"));
-    assert_eq!(context["turn"], json!(0));
-    assert_eq!(context["max_turns"], json!(3));
+    assert_eq!(context["model"], json!("test-model"));
+    assert_eq!(context["limits"]["max_turns"], json!(3));
     assert_eq!(context["config"]["parallel"], json!(false));
-    // The fixture is a valid decision input: the policy accepts it.
-    let runner = loop_runner();
-    let decision = decide(&runner, context);
-    assert_eq!(decision["kind"], json!("blocked"));
-    assert_eq!(decision["capability"], json!("provider.call"));
+}
+
+#[derive(Default)]
+struct VecSink {
+    events: Vec<Value>,
+}
+
+impl rustscript_agent::RunEventSink for VecSink {
+    fn deliver(&mut self, event: Value) -> Result<(), rustscript_agent::RunDeliveryError> {
+        self.events.push(event);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,243 +1621,142 @@ fn compaction_failure_marks_failed_and_preserves_history() {
 
 #[test]
 fn loop_backoff_base_above_cap_clamps_to_cap() {
-    let runner = loop_runner();
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(503, "server_error", "unavailable", "busy"));
+    provider.push_ok(text_response("ok"));
+    let runner = loop_runner_with(provider.clone(), None);
     let config = json!({
         "base_retry_delay_ms": 1000,
         "max_retry_delay_ms": 400,
+        "max_retries": 2,
         "parallel": false,
         "task": false
     });
-    let first = decide(
-        &runner,
-        loop_context(
-            "provider_result",
-            0,
-            3,
-            0,
-            2,
-            provider_error(503, "server_error", "unavailable", "busy"),
-            config.clone(),
-        ),
-    );
-    assert_eq!(first["kind"], json!("retry"));
-    assert_eq!(
-        first["delay_ms"],
-        json!(400),
-        "a base above the cap must clamp to the cap on entry"
-    );
-    let second = decide(
-        &runner,
-        loop_context(
-            "provider_result",
-            0,
-            3,
-            1,
-            2,
-            provider_error(503, "server_error", "unavailable", "busy"),
-            config,
-        ),
-    );
-    assert_eq!(second["delay_ms"], json!(400), "doubling stays capped");
+    let decision = decide(&runner, run_context(3, 8, config, json!([])));
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(runner.recorded_sleeps(), vec![400]);
 }
 
 #[test]
 fn loop_backoff_saturates_without_overflow_for_huge_inputs() {
-    let runner = loop_runner();
-    // A base just above half of i64::MAX must saturate at the cap on the
-    // first doubling instead of overflowing the signed range.
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(429, "rate_limit_error", "rl", "slow"));
+    provider.push_ok(text_response("ok"));
+    let runner = loop_runner_with(provider, None);
     let near_max = i64::MAX / 2 + 1;
     let decision = decide(
         &runner,
-        loop_context(
-            "provider_result",
-            0,
+        run_context(
             3,
-            1,
-            2,
-            provider_error(429, "rate_limit_error", "rl", "slow"),
+            8,
             json!({
                 "base_retry_delay_ms": near_max,
                 "max_retry_delay_ms": i64::MAX,
+                "max_retries": 2,
                 "parallel": false,
                 "task": false
             }),
+            json!([]),
         ),
     );
-    assert_eq!(decision["kind"], json!("retry"));
-    assert_eq!(
-        decision["delay_ms"],
-        json!(i64::MAX),
-        "doubling must saturate at the cap, never overflow"
-    );
-    // A very large retry count must terminate with the capped delay.
-    let many = decide(
-        &runner,
-        loop_context(
-            "provider_result",
-            0,
-            3,
-            100_000,
-            100_001,
-            provider_error(503, "server_error", "unavailable", "busy"),
-            json!({
-                "base_retry_delay_ms": 100,
-                "max_retry_delay_ms": 400,
-                "parallel": false,
-                "task": false
-            }),
-        ),
-    );
-    assert_eq!(many["kind"], json!("retry"));
-    assert_eq!(many["delay_ms"], json!(400), "delay saturates at the cap");
-    assert_eq!(many["retry_count"], json!(100_001));
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(runner.recorded_sleeps(), vec![near_max]);
 }
 
 #[test]
 fn loop_backoff_zero_and_negative_inputs_are_clamped() {
-    let runner = loop_runner();
-    // Zero base: an immediate retry (delay 0), defined and bounded.
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(429, "rate_limit_error", "rl", "slow"));
+    provider.push_ok(text_response("ok"));
+    let runner = loop_runner_with(provider.clone(), None);
     let zero = decide(
         &runner,
-        loop_context(
-            "provider_result",
-            0,
+        run_context(
             3,
-            0,
-            2,
-            provider_error(429, "rate_limit_error", "rl", "slow"),
+            8,
             json!({
                 "base_retry_delay_ms": 0,
                 "max_retry_delay_ms": 400,
+                "max_retries": 2,
                 "parallel": false,
                 "task": false
             }),
+            json!([]),
         ),
     );
-    assert_eq!(zero["kind"], json!("retry"));
-    assert_eq!(zero["delay_ms"], json!(0));
-    // Negative base and negative cap clamp to zero.
+    assert_eq!(zero["kind"], json!("run.completed"));
+    assert_eq!(runner.recorded_sleeps(), vec![0]);
+
+    let provider = ScriptedProvider::new();
+    provider.push_error(provider_error(429, "rate_limit_error", "rl", "slow"));
+    provider.push_ok(text_response("ok"));
+    let runner = loop_runner_with(provider, None);
     let negative = decide(
         &runner,
-        loop_context(
-            "provider_result",
-            0,
+        run_context(
             3,
-            0,
-            2,
-            provider_error(429, "rate_limit_error", "rl", "slow"),
+            8,
             json!({
                 "base_retry_delay_ms": -500,
                 "max_retry_delay_ms": -1,
+                "max_retries": 2,
                 "parallel": false,
                 "task": false
             }),
+            json!([]),
         ),
     );
-    assert_eq!(negative["delay_ms"], json!(0));
-    // A zero cap clamps any base to zero.
-    let zero_cap = decide(
-        &runner,
-        loop_context(
-            "provider_result",
-            0,
-            3,
-            0,
-            2,
-            provider_error(429, "rate_limit_error", "rl", "slow"),
-            json!({
-                "base_retry_delay_ms": 100,
-                "max_retry_delay_ms": 0,
-                "parallel": false,
-                "task": false
-            }),
-        ),
-    );
-    assert_eq!(zero_cap["delay_ms"], json!(0));
+    assert_eq!(negative["kind"], json!("run.completed"));
+    assert_eq!(runner.recorded_sleeps(), vec![0]);
 }
 
 #[test]
 fn loop_tool_cycles_consume_turn_budget_and_terminate() {
-    let runner = loop_runner();
-    // max_turns = 2: every provider result asks for tools; each tool-call
-    // cycle consumes the turn budget, so the run must terminate once the
-    // budget is exhausted instead of looping forever inside turn 0.
-    let first = decide(
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "t",
+        json!([{"id": "c1", "name": "read_file", "arguments": {"path": "note.txt"}}]),
+    ));
+    provider.push_ok(tool_response(
+        "t",
+        json!([{"id": "c2", "name": "read_file", "arguments": {"path": "note.txt"}}]),
+    ));
+    let (dispatcher, executor, root) = native_dispatcher(8);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let decision = decide(
         &runner,
-        provider_context(
-            0,
-            2,
-            0,
-            2,
-            provider_ok("t", json!([{"id": "c1", "name": "n", "arguments": {}}])),
-        ),
+        run_context(2, 8, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(first["kind"], json!("blocked"));
-    assert_eq!(first["capability"], json!("tool.dispatch"));
-    assert_eq!(
-        first["turn"],
-        json!(1),
-        "the tool cycle consumes the turn budget"
-    );
-    assert_eq!(
-        first["events"][0]["turn"],
-        json!(0),
-        "the completed model call belongs to the turn it started in"
-    );
-    assert_eq!(first["events"][0]["tool_calls"], json!(1));
-
-    let second = decide(
-        &runner,
-        provider_context(
-            1,
-            2,
-            0,
-            2,
-            provider_ok("t", json!([{"id": "c2", "name": "n", "arguments": {}}])),
-        ),
-    );
-    assert_eq!(second["kind"], json!("blocked"));
-    assert_eq!(second["turn"], json!(2));
-
-    // The budget is exhausted: the next start phase terminates the run.
-    let completed = decide(&runner, start_context(2, 2, loop_config(false, false)));
-    assert_eq!(completed["kind"], json!("run.completed"));
-    assert_eq!(completed["turn"], json!(2));
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("max_turns"));
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 2);
 }
 
 #[test]
 fn loop_multi_call_response_pins_tool_call_count() {
-    let runner = loop_runner();
-    // tool_calls on model.completed is the exact number of tool_call
-    // entries in the response array (pinned semantics: 0 for text-only,
-    // N for N calls in one response).
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "two tools",
+        json!([
+            {"id": "call-1", "name": "read_file", "arguments": {"path": "note.txt"}},
+            {"id": "call-2", "name": "read_file", "arguments": {"path": "note.txt"}}
+        ]),
+    ));
+    provider.push_ok(text_response("done"));
+    let (dispatcher, executor, root) = native_dispatcher(8);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
-        provider_context(
-            0,
-            3,
-            0,
-            2,
-            provider_ok(
-                "two tools",
-                json!([
-                    {"id": "call-1", "name": "read_file", "arguments": {}},
-                    {"id": "call-2", "name": "search_files", "arguments": {}}
-                ]),
-            ),
-        ),
+        run_context(4, 8, loop_config(false, false), echo_tool()),
     );
-    assert_eq!(decision["kind"], json!("blocked"));
-    assert_eq!(decision["capability"], json!("tool.dispatch"));
-    assert_eq!(decision["events"][0]["tool_calls"], json!(2));
-    assert_eq!(
-        decision["turn"],
-        json!(1),
-        "the tool cycle consumes the turn budget"
-    );
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(executor.count.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.call_count(), 2);
 }
 
-// ---------------------------------------------------------------------------
 // Post-review edge suites: compaction prefix boundaries
 // ---------------------------------------------------------------------------
 

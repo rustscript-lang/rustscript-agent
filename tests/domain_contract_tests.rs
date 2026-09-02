@@ -30,6 +30,7 @@ fn provider_request_serialization_keeps_the_existing_descriptor_wire_shape() {
             content: vec![LlmContentBlock {
                 block_type: "text".to_string(),
                 text: Some("hello".to_string()),
+                ..Default::default()
             }],
         }],
         tools: vec![ToolDescriptor::new(
