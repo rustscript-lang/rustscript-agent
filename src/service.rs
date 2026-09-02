@@ -47,7 +47,12 @@ use crate::config::{
     ProviderProfileError, RunLimits, RunLimitsError, estimate_admission_query_bytes,
     validate_request_hash, validate_visible_name,
 };
-use crate::domain::{RunContext, ToolCall, timestamp, truncate_for_log, vm_value_to_json};
+use crate::domain::{
+    LlmContentBlock, MAX_DURABLE_TEXT_CHARS, RunContext, ToolCall, decode_message_blocks,
+    decode_message_content, durable_message_id, durable_provider_event_id, durable_tool_event_id,
+    encode_message_content, provider_pending_may_retry, timestamp, truncate_for_log,
+    truncate_utf8_chars, vm_value_to_json,
+};
 use crate::events;
 use crate::gateway::store::{
     GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
@@ -66,7 +71,15 @@ use crate::tools::{
     ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry,
     ToolRegistrySnapshot, ToolResult,
 };
-use crate::{RunCancellation, RunError};
+use crate::{AgentProviderHost, RunCancellation, RunError};
+
+/// Recovery action for a pending provider request after restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderPendingDecision {
+    Retry,
+    Replay,
+    Interrupted,
+}
 
 /// One run whose terminal state could not be committed durably. The worker
 /// has already exited; a bounded retry loop (janitor cadence) commits the
@@ -627,8 +640,473 @@ impl AgentService {
             return Ok(cancelled_dispatch_results(calls, handle.is_terminal()));
         }
         match self.native_dispatch_state(run_id, &handle)? {
-            Some(state) => Ok(state.dispatcher.dispatch(calls)),
+            Some(state) => {
+                let mut results = Vec::with_capacity(calls.len());
+                let mut pending = Vec::new();
+                let mut pending_idx = Vec::new();
+                for (index, call) in calls.iter().enumerate() {
+                    if let Some(replayed) = self.replay_durable_tool_result(run_id, &call.id) {
+                        results.push(Some(replayed));
+                    } else {
+                        results.push(None);
+                        pending.push(call.clone());
+                        pending_idx.push(index);
+                    }
+                }
+                if !pending.is_empty() {
+                    let dispatched = state.dispatcher.dispatch(&pending);
+                    for (slot, result) in pending_idx.into_iter().zip(dispatched) {
+                        results[slot] = Some(result);
+                    }
+                }
+                Ok(results
+                    .into_iter()
+                    .map(|result| result.expect("dispatch slot filled"))
+                    .collect())
+            }
             None => Ok(cancelled_dispatch_results(calls, handle.is_terminal())),
+        }
+    }
+
+    /// Replay a completed/failed tool result from durable messages/events.
+    /// Completed effects are never dispatched again. Interrupted effects
+    /// surface as typed `interrupted_effect` failures without re-execution.
+    fn replay_durable_tool_result(&self, run_id: &str, tool_call_id: &str) -> Option<ToolResult> {
+        let store = self.inner.store.read();
+        let run = store.runs.get(run_id)?;
+        let has_output = run.events.iter().any(|event| {
+            matches!(
+                event.event.as_str(),
+                "tool.output" | "tool.completed" | "tool.failed"
+            ) && event.data.get("tool_call_id").and_then(JsonValue::as_str) == Some(tool_call_id)
+        });
+        if !has_output {
+            return None;
+        }
+        if let Some(session) = store.sessions.get(&run.session_id) {
+            for message in session.messages.iter().rev() {
+                if message.tool_call_id.as_deref() != Some(tool_call_id) {
+                    continue;
+                }
+                for block in decode_message_blocks(&message.content) {
+                    if block.block_type != "tool_result"
+                        || block.tool_call_id.as_deref() != Some(tool_call_id)
+                    {
+                        continue;
+                    }
+                    if block.is_error == Some(true) {
+                        let (code, message_text) = block
+                            .error
+                            .as_ref()
+                            .map(|error| {
+                                (
+                                    error
+                                        .get("code")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("tool_failed")
+                                        .to_string(),
+                                    error
+                                        .get("message")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("tool failed")
+                                        .to_string(),
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                ("tool_failed".to_string(), "tool failed".to_string())
+                            });
+                        return Some(ToolResult::failure(code, message_text));
+                    }
+                    let mut result = ToolResult::success(
+                        block.content.clone().unwrap_or_default(),
+                        block.result.clone().unwrap_or(JsonValue::Null),
+                    );
+                    result.truncated = block.truncated.unwrap_or(false);
+                    if let Some(JsonValue::Object(artifact)) = block.artifact {
+                        if let Some(id) = artifact.get("id").and_then(JsonValue::as_str) {
+                            result.artifacts = vec![id.to_string()];
+                        }
+                    } else if let Some(JsonValue::String(id)) = block.artifact {
+                        result.artifacts = vec![id];
+                    } else if let Some(JsonValue::Array(artifacts)) = block.artifact {
+                        result.artifacts = artifacts
+                            .iter()
+                            .filter_map(JsonValue::as_str)
+                            .map(str::to_string)
+                            .collect();
+                    }
+                    return Some(result);
+                }
+            }
+        }
+        let interrupted = run.events.iter().any(|event| {
+            event.event == "tool.failed"
+                && event.data.get("error_code").and_then(JsonValue::as_str)
+                    == Some("interrupted_effect")
+                && event.data.get("tool_call_id").and_then(JsonValue::as_str) == Some(tool_call_id)
+        });
+        if interrupted {
+            return Some(ToolResult::failure(
+                "interrupted_effect",
+                "effect interrupted by restart",
+            ));
+        }
+        Some(ToolResult::success("", JsonValue::Null))
+    }
+
+    /// Persist one provider step (assistant message + model.completed) before
+    /// live publish. Completed provider responses are replayed when a durable
+    /// response already exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_provider_step(
+        &self,
+        run_id: &str,
+        turn: u64,
+        blocks: &[LlmContentBlock],
+        usage: Option<&crate::domain::Usage>,
+        finish_reason: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+        parent_message_id: Option<&str>,
+    ) -> Result<String, EventCommitError> {
+        let event_id = durable_provider_event_id(run_id, turn, "model.completed");
+        let message_id = durable_message_id(run_id, "turn", &turn.to_string());
+        let content = encode_message_content(blocks);
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("turn".to_string(), json!(turn));
+        if let Some(usage) = usage {
+            metadata.insert(
+                "usage".to_string(),
+                json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                }),
+            );
+        }
+        if let Some(provider) = provider {
+            metadata.insert("provider".to_string(), json!(provider));
+        }
+        if let Some(model) = model {
+            metadata.insert("model".to_string(), json!(model));
+        }
+        let metadata = JsonValue::Object(metadata);
+        let mut store = self.inner.store.write();
+        let Some(run) = store.runs.get_mut(run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
+        if run.events.iter().any(|event| event.event_id == event_id) {
+            return Ok(message_id);
+        }
+        if matches!(
+            run.status.as_str(),
+            "completed" | "failed" | "cancelled" | "terminal_pending"
+        ) {
+            let requested_id = durable_provider_event_id(run_id, turn, "model.requested");
+            let recovering = run
+                .events
+                .iter()
+                .any(|event| event.event_id == requested_id);
+            if !recovering {
+                return Err(EventCommitError::Terminal);
+            }
+        }
+        let session_id = run.session_id.clone();
+        let event = append_event_locked(
+            run,
+            "model.completed",
+            json!({
+                "turn": turn,
+                "finish_reason": finish_reason.unwrap_or(""),
+                "provider": provider.unwrap_or(""),
+                "model": model.unwrap_or(""),
+            }),
+            self.inner.config.max_event_bytes,
+            self.inner.config.max_events_per_run,
+        );
+        if let Some(last) = run.events.last_mut() {
+            last.event_id = event_id.clone();
+        }
+        let mut event = event;
+        event.event_id = event_id.clone();
+        let message = SessionMessage {
+            id: message_id.clone(),
+            session_id: session_id.clone(),
+            role: "assistant".to_string(),
+            content: content.clone(),
+            created_at: timestamp(),
+            run_id: Some(run_id.to_string()),
+            finish_reason: finish_reason.map(str::to_string),
+            name: None,
+            tool_call_id: None,
+            parent_message_id: parent_message_id.map(str::to_string),
+            token_estimate: usage.map(|usage| usage.total_tokens as i64),
+            metadata: metadata.clone(),
+            ordinal: None,
+        };
+        let mut inserted_message = false;
+        if let Some(session) = store.sessions.get_mut(&session_id)
+            && !session
+                .messages
+                .iter()
+                .any(|existing| existing.id == message_id)
+        {
+            session.messages.push(message.clone());
+            session.view.message_count = session.messages.len();
+            inserted_message = true;
+        }
+        let persistence = self.inner.persistence.clone();
+        let payload = json!({
+            "run_id": run_id,
+            "session_id": session_id,
+            "event_id": event_id,
+            "event_type": "model.completed",
+            "payload_json": serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()),
+            "now_ms": timestamp(),
+            "max_events": self.inner.config.max_events_per_run,
+            "message_id": message_id,
+            "role": "assistant",
+            "content_json": serde_json::to_string(&content).unwrap_or_else(|_| "[]".to_string()),
+            "name": "",
+            "tool_call_id": "",
+            "parent_message_id": parent_message_id.unwrap_or(""),
+            "token_estimate": usage.map(|usage| usage.total_tokens as i64).unwrap_or(0),
+            "metadata_json": serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string()),
+            "finish_reason": finish_reason.unwrap_or(""),
+        });
+        let sender = store.runs.get(run_id).and_then(|run| run.sender.clone());
+        drop(store);
+        let durable = match persistence.as_ref() {
+            Some(persistence) => persistence.step_commit(&payload).map(|_| ()),
+            None => Ok(()),
+        };
+        match durable {
+            Ok(()) => {
+                if let Some(sender) = sender {
+                    let _ = sender.send(event);
+                }
+                Ok(message_id)
+            }
+            Err(error) => {
+                let mut store = self.inner.store.write();
+                if let Some(run) = store.runs.get_mut(run_id) {
+                    run.events.retain(|existing| existing.event_id != event_id);
+                }
+                if inserted_message && let Some(session) = store.sessions.get_mut(&session_id) {
+                    session
+                        .messages
+                        .retain(|existing| existing.id != message_id);
+                    session.view.message_count = session.messages.len();
+                }
+                Err(EventCommitError::PersistFailed(error.to_string()))
+            }
+        }
+    }
+
+    /// Persist a provider request boundary (`model.requested`) with enough
+    /// metadata to decide restart retry vs typed interrupt.
+    pub fn commit_provider_request(
+        &self,
+        run_id: &str,
+        turn: u64,
+        request_is_idempotent: bool,
+        request: &JsonValue,
+    ) -> Result<(), EventCommitError> {
+        let event_id = durable_provider_event_id(run_id, turn, "model.requested");
+        let payload = json!({
+            "turn": turn,
+            "idempotent": request_is_idempotent,
+            "request": request,
+            "effect_boundary": false,
+        });
+        self.persist_provider_event(run_id, &event_id, "model.requested", payload)
+    }
+
+    /// Inspect durable provider-request state and apply
+    /// [`provider_pending_may_retry`]. Retry calls the provider once and
+    /// commits the response; otherwise reconcile `interrupted_provider`.
+    pub fn recover_pending_provider(
+        &self,
+        run_id: &str,
+        turn: u64,
+        provider: &dyn AgentProviderHost,
+    ) -> Result<ProviderPendingDecision, EventCommitError> {
+        let decision = self.provider_pending_decision(run_id, turn);
+        match decision {
+            ProviderPendingDecision::Replay => Ok(decision),
+            ProviderPendingDecision::Retry => {
+                let request = self
+                    .pending_provider_request(run_id, turn)
+                    .unwrap_or_else(|| json!({}));
+                let cancellation = self
+                    .handle(run_id)
+                    .map(|handle| handle.cancel.clone())
+                    .unwrap_or_default();
+                let envelope = provider.call(&request, &cancellation);
+                if envelope.get("ok") == Some(&JsonValue::Bool(true)) {
+                    let response = envelope
+                        .get("response")
+                        .cloned()
+                        .unwrap_or(JsonValue::Object(Map::new()));
+                    let blocks = provider_response_blocks(&response);
+                    self.commit_provider_step(
+                        run_id,
+                        turn,
+                        &blocks,
+                        None,
+                        Some("stop"),
+                        None,
+                        None,
+                        None,
+                    )?;
+                } else {
+                    self.persist_interrupted_provider(run_id, turn)?;
+                    return Ok(ProviderPendingDecision::Interrupted);
+                }
+                Ok(ProviderPendingDecision::Retry)
+            }
+            ProviderPendingDecision::Interrupted => {
+                self.persist_interrupted_provider(run_id, turn)?;
+                Ok(ProviderPendingDecision::Interrupted)
+            }
+        }
+    }
+
+    pub fn provider_pending_decision(&self, run_id: &str, turn: u64) -> ProviderPendingDecision {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return ProviderPendingDecision::Interrupted;
+        };
+        let requested_id = durable_provider_event_id(run_id, turn, "model.requested");
+        let completed_id = durable_provider_event_id(run_id, turn, "model.completed");
+        let interrupted_id = durable_provider_event_id(run_id, turn, "interrupted_provider");
+        let requested = run
+            .events
+            .iter()
+            .find(|event| event.event_id == requested_id);
+        let has_durable_response = run.events.iter().any(|event| {
+            event.event_id == completed_id
+                || event.event_id == interrupted_id
+                || (event.event == "model.failed"
+                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn))
+        });
+        if has_durable_response {
+            return if run
+                .events
+                .iter()
+                .any(|event| event.event_id == completed_id)
+            {
+                ProviderPendingDecision::Replay
+            } else {
+                ProviderPendingDecision::Interrupted
+            };
+        }
+        let Some(requested) = requested else {
+            return ProviderPendingDecision::Interrupted;
+        };
+        let request_is_idempotent = requested
+            .data
+            .get("idempotent")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let request_seq = requested.seq;
+        let has_effect = run
+            .events
+            .iter()
+            .any(|event| event.seq > request_seq && event.event.starts_with("tool."));
+        if provider_pending_may_retry(has_durable_response, request_is_idempotent, has_effect) {
+            ProviderPendingDecision::Retry
+        } else {
+            ProviderPendingDecision::Interrupted
+        }
+    }
+
+    fn pending_provider_request(&self, run_id: &str, turn: u64) -> Option<JsonValue> {
+        let store = self.inner.store.read();
+        let run = store.runs.get(run_id)?;
+        let event_id = durable_provider_event_id(run_id, turn, "model.requested");
+        run.events
+            .iter()
+            .find(|event| event.event_id == event_id)
+            .and_then(|event| event.data.get("request").cloned())
+    }
+
+    fn persist_interrupted_provider(
+        &self,
+        run_id: &str,
+        turn: u64,
+    ) -> Result<(), EventCommitError> {
+        let event_id = durable_provider_event_id(run_id, turn, "interrupted_provider");
+        let payload = json!({
+            "turn": turn,
+            "error_code": "interrupted_provider",
+            "error_message": "pending provider request is not retryable",
+        });
+        self.persist_provider_event(run_id, &event_id, "model.failed", payload)
+    }
+
+    fn persist_provider_event(
+        &self,
+        run_id: &str,
+        event_id: &str,
+        event_type: &str,
+        payload: JsonValue,
+    ) -> Result<(), EventCommitError> {
+        let mut store = self.inner.store.write();
+        let Some(run) = store.runs.get_mut(run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
+        if run.events.iter().any(|event| event.event_id == event_id) {
+            return Ok(());
+        }
+        let session_id = run.session_id.clone();
+        let max_event_bytes = self.inner.config.max_event_bytes;
+        let max_events = self.inner.config.max_events_per_run;
+        let mut event = append_event_locked(run, event_type, payload, max_event_bytes, max_events);
+        event.event_id = event_id.to_string();
+        if let Some(last) = run.events.last_mut() {
+            last.event_id = event_id.to_string();
+        }
+        let persistence = self.inner.persistence.clone();
+        let payload = json!({
+            "run_id": run_id,
+            "session_id": session_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "payload_json": serde_json::to_string(&event.data)
+                .unwrap_or_else(|_| "{}".to_string()),
+            "now_ms": timestamp(),
+            "max_events": max_events,
+            "message_id": "",
+            "role": "assistant",
+            "content_json": "",
+            "name": "",
+            "tool_call_id": "",
+            "parent_message_id": "",
+            "token_estimate": 0,
+            "metadata_json": "{}",
+            "finish_reason": "",
+        });
+        let sender = store.runs.get(run_id).and_then(|run| run.sender.clone());
+        drop(store);
+        let durable = match persistence.as_ref() {
+            Some(persistence) => persistence.step_commit(&payload).map(|_| ()),
+            None => Ok(()),
+        };
+        match durable {
+            Ok(()) => {
+                if let Some(sender) = sender {
+                    let _ = sender.send(event);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let mut store = self.inner.store.write();
+                if let Some(run) = store.runs.get_mut(run_id) {
+                    run.events.retain(|existing| existing.event_id != event_id);
+                }
+                Err(EventCommitError::PersistFailed(error.to_string()))
+            }
         }
     }
 
@@ -1242,10 +1720,16 @@ impl AgentService {
             id: message_id.clone(),
             session_id: session_id.clone(),
             role: "user".to_string(),
-            content: request.input.clone(),
+            content: decode_message_content(&request.input),
             created_at: now,
             run_id: Some(run_id.clone()),
             finish_reason: None,
+            name: None,
+            tool_call_id: None,
+            parent_message_id: None,
+            token_estimate: None,
+            metadata: JsonValue::Null,
+            ordinal: None,
         };
         let mut context_messages = store
             .sessions
@@ -1653,12 +2137,20 @@ impl AgentService {
             .ok_or_else(|| {
                 invalid_context_metadata(&context.run_id, "admitted message is missing")
             })?;
-        serde_json::to_value(&session.messages[..=cutoff]).map_err(|error| {
+        let mut messages = serde_json::to_value(&session.messages[..=cutoff]).map_err(|error| {
             invalid_context_metadata(
                 &context.run_id,
                 &format!("session messages could not be reconstructed: {error}"),
             )
-        })
+        })?;
+        if let Some(items) = messages.as_array_mut() {
+            for item in items {
+                if let Some(object) = item.as_object_mut() {
+                    object.remove("ordinal");
+                }
+            }
+        }
+        Ok(messages)
     }
 
     /// Registers one live SSE subscriber against an active run's handle and
@@ -2661,24 +3153,38 @@ fn normalize_loaded_session_messages(store: &Arc<RwLock<GatewayStore>>) {
     let mut store = store.write();
     for session in store.sessions.values_mut() {
         for message in &mut session.messages {
-            let Some(envelope) = message.content.as_object() else {
-                continue;
-            };
-            if envelope.get("schema_version").and_then(JsonValue::as_u64)
-                != Some(RUN_CONTEXT_METADATA_VERSION)
-            {
-                continue;
+            if let Some(input) = admission_input_from_message_content(&message.content) {
+                message.content = decode_message_content(&input);
             }
-            let Some(input) = envelope
-                .get(RUN_CONTEXT_STORAGE_KEY)
-                .and_then(JsonValue::as_object)
-                .and_then(|context| context.get("input"))
-            else {
-                continue;
-            };
-            message.content = input.clone();
         }
     }
+}
+
+fn admission_input_from_message_content(content: &JsonValue) -> Option<JsonValue> {
+    if let Some(input) = envelope_run_input(content) {
+        return Some(input);
+    }
+    let text = content
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block.get("text"))
+        .and_then(JsonValue::as_str)?;
+    let parsed: JsonValue = serde_json::from_str(text).ok()?;
+    envelope_run_input(&parsed)
+}
+
+fn envelope_run_input(value: &JsonValue) -> Option<JsonValue> {
+    let envelope = value.as_object()?;
+    if envelope.get("schema_version").and_then(JsonValue::as_u64)
+        != Some(RUN_CONTEXT_METADATA_VERSION)
+    {
+        return None;
+    }
+    envelope
+        .get(RUN_CONTEXT_STORAGE_KEY)
+        .and_then(JsonValue::as_object)
+        .and_then(|context| context.get("input"))
+        .cloned()
 }
 
 fn admit_context_error(error: RunContextError) -> AdmitError {
@@ -2713,57 +3219,260 @@ impl DurableEventCommitter for ServiceEventCommitter {
     }
 
     fn commit(&self, event_type: &str, data: JsonValue) -> Result<(), EventCommitError> {
+        self.commit_step(event_type, data, None)
+    }
+
+    fn commit_step(
+        &self,
+        event_type: &str,
+        data: JsonValue,
+        result: Option<&ToolResult>,
+    ) -> Result<(), EventCommitError> {
         if self.is_terminal() {
             return Err(EventCommitError::Terminal);
         }
+        let tool_call_id = data
+            .get("tool_call_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let event_id = if tool_call_id.is_empty() {
+            String::new()
+        } else {
+            durable_tool_event_id(&self.run_id, &tool_call_id, event_type)
+        };
+        let attach_message = result.is_some()
+            && !tool_call_id.is_empty()
+            && matches!(event_type, "tool.output" | "tool.completed" | "tool.failed");
+        let message_id = if attach_message {
+            durable_message_id(&self.run_id, "result", &tool_call_id)
+        } else {
+            String::new()
+        };
+        let content = result
+            .filter(|_| attach_message)
+            .map(|result| tool_result_content_json(&tool_call_id, result));
         let mut store = self.store.write();
+        {
+            let Some(run) = store.runs.get(&self.run_id) else {
+                return Err(EventCommitError::Terminal);
+            };
+            if matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "cancelled" | "terminal_pending"
+            ) {
+                return Err(EventCommitError::Terminal);
+            }
+            if !event_id.is_empty() && run.events.iter().any(|event| event.event_id == event_id) {
+                return Ok(());
+            }
+        }
+        let session_id = store
+            .runs
+            .get(&self.run_id)
+            .map(|run| run.session_id.clone())
+            .ok_or(EventCommitError::Terminal)?;
+        let (parent_message_id, tool_name) = if attach_message {
+            match lookup_tool_call_parent(&store, &session_id, &tool_call_id) {
+                Some(pair) => pair,
+                None => return Err(EventCommitError::MissingParent),
+            }
+        } else {
+            (String::new(), String::new())
+        };
         let Some(run) = store.runs.get_mut(&self.run_id) else {
             return Err(EventCommitError::Terminal);
         };
-        if matches!(
-            run.status.as_str(),
-            "completed" | "failed" | "cancelled" | "terminal_pending"
-        ) {
-            return Err(EventCommitError::Terminal);
-        }
-        let event = append_event_locked(
+        let mut event = append_event_locked(
             run,
             event_type,
             data,
             self.max_event_bytes,
             self.max_events_per_run,
         );
-        let durable = match self.persistence.as_ref() {
+        if !event_id.is_empty() {
+            event.event_id = event_id.clone();
+            if let Some(last) = run.events.last_mut() {
+                last.event_id = event_id.clone();
+            }
+        }
+        let mut inserted_message = false;
+        if attach_message
+            && let Some(session) = store.sessions.get_mut(&session_id)
+            && !session
+                .messages
+                .iter()
+                .any(|existing| existing.id == message_id)
+        {
+            session.messages.push(SessionMessage {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                role: "user".to_string(),
+                content: content.clone().unwrap_or(JsonValue::Array(Vec::new())),
+                created_at: timestamp(),
+                run_id: Some(self.run_id.clone()),
+                finish_reason: None,
+                name: if tool_name.is_empty() {
+                    None
+                } else {
+                    Some(tool_name.clone())
+                },
+                tool_call_id: Some(tool_call_id.clone()),
+                parent_message_id: if parent_message_id.is_empty() {
+                    None
+                } else {
+                    Some(parent_message_id.clone())
+                },
+                token_estimate: None,
+                metadata: JsonValue::Null,
+                ordinal: None,
+            });
+            session.view.message_count = session.messages.len();
+            inserted_message = true;
+        }
+        let persistence = self.persistence.clone();
+        let persist_event_id = event.event_id.clone();
+        let persist_event_type = event.event.clone();
+        let payload_json = serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string());
+        let sender = store
+            .runs
+            .get(&self.run_id)
+            .and_then(|run| run.sender.clone());
+        drop(store);
+        let durable = match persistence.as_ref() {
             Some(persistence) => {
-                let payload = json!({
-                    "run_id": self.run_id,
-                    "event_id": event.event_id,
-                    "event_type": event.event,
-                    "payload_json": serde_json::to_string(&event.data)
-                        .unwrap_or_else(|_| "{}".to_string()),
-                    "now_ms": timestamp(),
-                    "max_events": self.max_events_per_run,
-                });
-                persistence.event_append(&payload).map(|_| ())
+                if attach_message {
+                    persistence
+                        .step_commit(&json!({
+                            "run_id": self.run_id,
+                            "session_id": session_id,
+                            "event_id": persist_event_id.as_str(),
+                            "event_type": persist_event_type.as_str(),
+                            "payload_json": payload_json.as_str(),
+                            "now_ms": timestamp(),
+                            "max_events": self.max_events_per_run,
+                            "message_id": message_id,
+                            "role": "user",
+                            "content_json": serde_json::to_string(
+                                content.as_ref().unwrap_or(&JsonValue::Array(Vec::new()))
+                            )
+                            .unwrap_or_else(|_| "[]".to_string()),
+                            "name": tool_name,
+                            "tool_call_id": tool_call_id,
+                            "parent_message_id": parent_message_id,
+                            "token_estimate": 0,
+                            "metadata_json": "{}",
+                            "finish_reason": "",
+                        }))
+                        .map(|_| ())
+                } else {
+                    persistence
+                        .event_append(&json!({
+                            "run_id": self.run_id,
+                            "event_id": persist_event_id.as_str(),
+                            "event_type": persist_event_type.as_str(),
+                            "payload_json": payload_json.as_str(),
+                            "now_ms": timestamp(),
+                            "max_events": self.max_events_per_run,
+                        }))
+                        .map(|_| ())
+                }
             }
             None => Ok(()),
         };
         match durable {
             Ok(()) => {
-                let sender = run.sender.clone();
-                drop(store);
                 if let Some(sender) = sender {
                     let _ = sender.send(event);
                 }
                 Ok(())
             }
             Err(error) => {
-                run.events
-                    .retain(|existing| existing.event_id != event.event_id);
+                let mut store = self.store.write();
+                if let Some(run) = store.runs.get_mut(&self.run_id) {
+                    run.events
+                        .retain(|existing| existing.event_id != event.event_id);
+                }
+                if inserted_message && let Some(session) = store.sessions.get_mut(&session_id) {
+                    session
+                        .messages
+                        .retain(|existing| existing.id != message_id);
+                    session.view.message_count = session.messages.len();
+                }
                 Err(EventCommitError::PersistFailed(error.to_string()))
             }
         }
     }
+}
+
+fn lookup_tool_call_parent(
+    store: &GatewayStore,
+    session_id: &str,
+    tool_call_id: &str,
+) -> Option<(String, String)> {
+    let session = store.sessions.get(session_id)?;
+    for message in &session.messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        for block in decode_message_blocks(&message.content) {
+            if block.block_type == "tool_call"
+                && block.tool_call_id.as_deref() == Some(tool_call_id)
+            {
+                return Some((message.id.clone(), block.name.unwrap_or_default()));
+            }
+        }
+    }
+    None
+}
+
+fn provider_response_blocks(response: &JsonValue) -> Vec<LlmContentBlock> {
+    if let Some(content) = response.get("content") {
+        let blocks = decode_message_blocks(content);
+        if !blocks.is_empty() {
+            return blocks;
+        }
+    }
+    let text = response
+        .get("text")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    vec![LlmContentBlock {
+        block_type: "text".to_string(),
+        text: Some(text.to_string()),
+        ..Default::default()
+    }]
+}
+
+fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValue {
+    let (content, cut) = truncate_utf8_chars(&result.content, MAX_DURABLE_TEXT_CHARS);
+    let truncated = result.truncated || cut;
+    let error = result.error.as_ref().map(|error| {
+        json!({
+            "code": error.code,
+            "message": error.message,
+        })
+    });
+    let artifact = result
+        .artifacts
+        .first()
+        .cloned()
+        .map(|id| json!({"id": id}));
+    encode_message_content(&[LlmContentBlock {
+        block_type: "tool_result".to_string(),
+        tool_call_id: Some(tool_call_id.to_string()),
+        content: Some(content),
+        is_error: Some(!result.ok),
+        result: if result.ok {
+            Some(result.data.clone())
+        } else {
+            None
+        },
+        error,
+        artifact,
+        truncated: truncated.then_some(true),
+        ..LlmContentBlock::default()
+    }])
 }
 
 fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {

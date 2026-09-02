@@ -2,6 +2,7 @@ use json;
 use sqlite;
 use self::schema as schema;
 use self::existence as existence;
+use self::messages as messages;
 
 fn events_query_limits(max_rows: int, max_bytes: int) -> map<int> {
     { max_rows: max_rows, max_result_bytes: if max_bytes < 4096 => { 4096 } else => { max_bytes } }
@@ -46,8 +47,8 @@ pub fn storage_event_append(db_id: resource<sqlite.connection>, payload_json: st
         let max_events: int = schema::max_events_limit(input.max_events.copy());
         let statements = [
             {
-                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ?",
-                params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy()]
+                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
+                params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy(), input.event_id.copy()]
             },
             {
                 sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
@@ -143,4 +144,118 @@ pub fn storage_delivery_cursor_advance(db_id: resource<sqlite.connection>, paylo
         "INSERT INTO delivery_cursors (session_id, consumer, last_event_seq, updated_at_ms) SELECT ?, ?, ?, ? WHERE ? >= 0 AND ? <= COALESCE((SELECT MAX(events.seq) FROM run_events events JOIN runs event_runs ON event_runs.id = events.run_id WHERE event_runs.session_id = ?), 0) ON CONFLICT (session_id, consumer) DO UPDATE SET last_event_seq = MAX(delivery_cursors.last_event_seq, excluded.last_event_seq), updated_at_ms = excluded.updated_at_ms",
         [&input.session_id, &input.consumer, input.event_seq.copy(), input.now_ms.copy(), input.event_seq.copy(), input.event_seq.copy(), &input.session_id]
     )
+}
+
+struct StepCommitInput {
+    run_id: string,
+    session_id: string,
+    event_id: string,
+    event_type: string,
+    payload_json: string,
+    now_ms: int,
+    max_events: int,
+    message_id: string,
+    role: string,
+    content_json: string,
+    name: string,
+    tool_call_id: string,
+    parent_message_id: string,
+    token_estimate: int,
+    metadata_json: string,
+    finish_reason: string
+}
+
+struct ReconcileEffectsInput {
+    now_ms: int,
+    max_rows: int
+}
+
+/// Atomically persist one provider/tool step: the event and optional canonical
+/// message in a single SQLite transaction. Stable event_id/message id retries
+/// append once. The store lock/transaction is held only for this command;
+/// callers publish after it returns.
+pub fn storage_step_commit(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let raw_payload: map = json::decode(payload_json);
+    let mut failpoint: string = "";
+    if raw_payload.has("failpoint") {
+        failpoint = raw_payload["failpoint"].copy();
+    }
+    let input: StepCommitInput = json::decode::<StepCommitInput>(payload_json);
+    let mut result = { ok: true, code: "ok", message: "", result: [] };
+    if input.payload_json.copy().length > 65536 {
+        result = { ok: false, code: "payload_too_large", message: "step event payload exceeds 65536 bytes", result: [] };
+    } else {
+        if !existence::run_exists(db_id, input.run_id.copy()) {
+            result = { ok: false, code: "run_not_found", message: "step commit targets an unknown run", result: [] };
+        } else {
+            if input.message_id.copy() != "" && !existence::session_exists(db_id, input.session_id.copy()) {
+                result = { ok: false, code: "session_not_found", message: "step commit targets an unknown session", result: [] };
+            } else {
+                let encoded: string = messages::storage_message_encode_content(db_id, input.content_json.copy());
+                let max_events: int = schema::max_events_limit(input.max_events.copy());
+                let mut statements = [
+                    {
+                        sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
+                        params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy(), input.event_id.copy()]
+                    },
+                    {
+                        sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
+                        params: [&input.run_id, &input.run_id, max_events.copy(), &input.run_id, max_events.copy()]
+                    },
+                    {
+                        sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+                        params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
+                    },
+                    {
+                        sql: "INSERT OR IGNORE INTO messages (id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ? != ''",
+                        params: [&input.message_id, &input.session_id, &input.session_id, &input.role, &encoded, &input.name, &input.tool_call_id, &input.parent_message_id, input.token_estimate.copy(), &input.metadata_json, &input.run_id, &input.finish_reason, input.now_ms.copy(), &input.message_id]
+                    },
+                    {
+                        sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ? AND ? != ''",
+                        params: [&input.session_id, input.now_ms.copy(), &input.session_id, &input.message_id]
+                    },
+                    {
+                        sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
+                        params: [input.now_ms.copy(), &input.run_id]
+                    },
+                    {
+                        sql: "UPDATE messages SET compacted = 2 WHERE ? = 'after_partial_write' AND id = ?",
+                        params: [&failpoint, &input.message_id]
+                    }
+                ];
+                result = { ok: true, code: "ok", message: "", result: sqlite::transaction(&db_id, statements) };
+                if failpoint == "after_commit_before_publish" {
+                    result = { ok: false, code: "failpoint_after_commit_before_publish", message: "durable commit succeeded; live publish skipped", result: [] };
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Reconcile requested/started tool effects that have no durable output,
+/// completed, or failed event. Each incomplete call becomes exactly one
+/// `tool.failed` with typed `interrupted_effect` plus one user-role
+/// tool_result message. Completed effects are left untouched. Idempotent.
+pub fn storage_effect_reconcile(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: ReconcileEffectsInput = json::decode::<ReconcileEffectsInput>(payload_json);
+    let limit: int = if input.max_rows.copy() <= 0 => { 64 } else => {
+        if input.max_rows.copy() > 256 => { 256 } else => { input.max_rows.copy() }
+    };
+    let statements = [
+        {
+            sql: "INSERT OR IGNORE INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT pending.run_id, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = pending.run_id), 0) + pending.rn, substr('recovery-effect:' || pending.run_id || ':' || pending.tool_call_id, 1, 128), 'tool.failed', CAST(json_object('status', 'failed', 'error_code', 'interrupted_effect', 'tool_call_id', pending.tool_call_id, 'reason', 'interrupted_effect') AS TEXT), ? FROM (SELECT grouped.run_id AS run_id, grouped.tool_call_id AS tool_call_id, ROW_NUMBER() OVER (PARTITION BY grouped.run_id ORDER BY grouped.min_seq) AS rn FROM (SELECT events.run_id AS run_id, json_extract(events.payload_json, '$.tool_call_id') AS tool_call_id, MIN(events.seq) AS min_seq FROM run_events events WHERE events.event_type IN ('tool.requested', 'tool.started') AND json_extract(events.payload_json, '$.tool_call_id') IS NOT NULL AND json_extract(events.payload_json, '$.tool_call_id') != '' AND NOT EXISTS (SELECT 1 FROM run_events done WHERE done.run_id = events.run_id AND done.event_type IN ('tool.output', 'tool.completed', 'tool.failed') AND json_extract(done.payload_json, '$.tool_call_id') = json_extract(events.payload_json, '$.tool_call_id')) GROUP BY events.run_id, json_extract(events.payload_json, '$.tool_call_id') LIMIT ?) grouped) pending",
+            params: [input.now_ms.copy(), limit.copy()]
+        },
+        {
+            sql: "INSERT OR IGNORE INTO messages (id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, metadata_json, run_id, finish_reason, created_at_ms) SELECT substr('recovery-msg:' || pending.run_id || ':' || pending.tool_call_id, 1, 128), pending.session_id, COALESCE((SELECT MAX(ordinal) FROM messages existing WHERE existing.session_id = pending.session_id), 0) + pending.rn, 'user', CAST(json_array(json_object('type', 'tool_result', 'tool_call_id', pending.tool_call_id, 'content', '', 'is_error', json('true'), 'error', json_object('code', 'interrupted_effect', 'message', 'effect interrupted by restart'), 'truncated', json('false'))) AS TEXT), '', pending.tool_call_id, '', 0, CAST(json_object('interrupted_effect', json('true')) AS TEXT), pending.run_id, '', ? FROM (SELECT grouped.run_id AS run_id, grouped.session_id AS session_id, grouped.tool_call_id AS tool_call_id, ROW_NUMBER() OVER (PARTITION BY grouped.session_id ORDER BY grouped.min_seq) AS rn FROM (SELECT events.run_id AS run_id, runs.session_id AS session_id, json_extract(events.payload_json, '$.tool_call_id') AS tool_call_id, MIN(events.seq) AS min_seq FROM run_events events JOIN runs ON runs.id = events.run_id WHERE events.event_type = 'tool.failed' AND json_extract(events.payload_json, '$.error_code') = 'interrupted_effect' GROUP BY events.run_id, json_extract(events.payload_json, '$.tool_call_id') LIMIT ?) grouped) pending",
+            params: [input.now_ms.copy(), limit.copy()]
+        },
+        {
+            sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = sessions.id), last_message_seq), updated_at_ms = ? WHERE id IN (SELECT runs.session_id FROM runs JOIN run_events events ON events.run_id = runs.id WHERE events.event_type = 'tool.failed' AND json_extract(events.payload_json, '$.error_code') = 'interrupted_effect')",
+            params: [input.now_ms.copy()]
+        }
+    ];
+    let results: array = sqlite::transaction(&db_id, statements);
+    { ok: true, code: "ok", message: "", result: results }
 }

@@ -19,7 +19,9 @@ pub mod tools;
 pub use config::{AgentGatewayConfig, TelegramConfig};
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
-    LlmResponse, ProviderError, RunContext, Sampling, ToolCall, Usage,
+    LlmResponse, ProviderError, RunContext, Sampling, ToolCall, Usage, decode_message_blocks,
+    decode_message_content, encode_message_content, provider_pending_may_retry,
+    truncate_utf8_chars,
 };
 pub use gateway::store::GatewayPersistence;
 pub use gateway::{AgentGatewayState, build_agent_gateway_app};
@@ -28,7 +30,9 @@ pub use runtime::rss_runner::{
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
 };
 pub use runtime::{AgentHostBridges, AgentProviderHost, ScriptedProvider};
-pub use service::{AdmitError, AdmitRunRequest, AdmittedRun, AgentService, RunHandle};
+pub use service::{
+    AdmitError, AdmitRunRequest, AdmittedRun, AgentService, ProviderPendingDecision, RunHandle,
+};
 pub use tools::{
     NativeExecutorContract, NativeToolExecutor, RiskClass, SchemaValidationError,
     SchemaValidationErrorKind, ToolDescriptor, ToolRegistry, ToolRegistryEntry, ToolRegistryError,

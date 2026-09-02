@@ -179,7 +179,7 @@ pub struct LlmContentBlock {
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "artifacts")]
     pub artifact: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
@@ -336,4 +336,169 @@ pub(crate) fn truncate_for_log(message: &str, max_chars: usize) -> &str {
         Some((index, _)) => &message[..index],
         None => message,
     }
+}
+
+/// Per-field bound for durable message text/arguments/results. Keeps the
+/// 1 MiB `content_json` CHECK from splitting a multi-byte UTF-8 scalar.
+pub const MAX_DURABLE_TEXT_CHARS: usize = 65_536;
+const MAX_DURABLE_ID_BYTES: usize = 128;
+
+/// Provider pending calls may be retried only when no durable response
+/// exists, the request is idempotent, and the request has no effect.
+/// Completed provider responses are replayed, never reissued.
+pub fn provider_pending_may_retry(
+    has_durable_response: bool,
+    request_is_idempotent: bool,
+    has_effect: bool,
+) -> bool {
+    !has_durable_response && request_is_idempotent && !has_effect
+}
+
+/// Stable event id for a tool lifecycle step: `run + call + event_type`.
+pub fn durable_tool_event_id(run_id: &str, tool_call_id: &str, event_type: &str) -> String {
+    bound_durable_id(&format!("{run_id}:tool:{tool_call_id}:{event_type}"))
+}
+
+/// Stable event id for a provider step: `run + turn + event_type`.
+pub fn durable_provider_event_id(run_id: &str, turn: u64, event_type: &str) -> String {
+    bound_durable_id(&format!("{run_id}:turn:{turn}:{event_type}"))
+}
+
+/// Stable message id: `run + kind + key` (turn ordinal or tool_call_id).
+pub fn durable_message_id(run_id: &str, kind: &str, key: &str) -> String {
+    bound_durable_id(&format!("{run_id}:{kind}:{key}"))
+}
+
+fn bound_durable_id(id: &str) -> String {
+    if id.len() <= MAX_DURABLE_ID_BYTES {
+        return id.to_string();
+    }
+    id.chars()
+        .scan(0usize, |bytes, ch| {
+            let width = ch.len_utf8();
+            if *bytes + width > MAX_DURABLE_ID_BYTES {
+                None
+            } else {
+                *bytes += width;
+                Some(ch)
+            }
+        })
+        .collect()
+}
+
+/// UTF-8-safe character truncation used by durable message fields.
+pub fn truncate_utf8_chars(text: &str, max_chars: usize) -> (String, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((index, _)) => (text[..index].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+/// Decode stored `content_json` into the canonical LlmContentBlock array.
+/// Legacy shapes (raw text, `{"text":...}`, a single block object) become
+/// the same array schema; already-canonical arrays pass through.
+pub fn decode_message_content(value: &Value) -> Value {
+    Value::Array(
+        decode_message_blocks(value)
+            .into_iter()
+            .map(|block| serde_json::to_value(block).unwrap_or(Value::Object(Default::default())))
+            .collect(),
+    )
+}
+
+/// Decode stored `content_json` into canonical blocks.
+pub fn decode_message_blocks(value: &Value) -> Vec<LlmContentBlock> {
+    match value {
+        Value::Array(items) => items.iter().map(decode_one_block).collect(),
+        Value::String(text) => vec![text_block(text)],
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str).is_some() {
+                vec![decode_one_block(value)]
+            } else if let Some(text) = map.get("text") {
+                let rendered = match text {
+                    Value::String(value) => value.clone(),
+                    other => other.to_string(),
+                };
+                vec![text_block(&rendered)]
+            } else {
+                vec![text_block(&value.to_string())]
+            }
+        }
+        Value::Null => Vec::new(),
+        other => vec![text_block(&other.to_string())],
+    }
+}
+
+fn decode_one_block(value: &Value) -> LlmContentBlock {
+    let mut block =
+        serde_json::from_value(value.clone()).unwrap_or_else(|_| text_block(&value.to_string()));
+    if block.truncated == Some(false) {
+        block.truncated = None;
+    }
+    if block.arguments_json.is_none() {
+        if let Some(arguments) = block.arguments.take() {
+            block.arguments_json =
+                Some(serde_json::to_string(&arguments).unwrap_or_else(|_| arguments.to_string()));
+        }
+    } else {
+        block.arguments = None;
+    }
+    if let Some(Value::Array(items)) = &block.artifact {
+        block.artifact = items.first().cloned();
+    }
+    block
+}
+
+fn text_block(text: &str) -> LlmContentBlock {
+    let (text, truncated) = truncate_utf8_chars(text, MAX_DURABLE_TEXT_CHARS);
+    LlmContentBlock {
+        block_type: "text".to_string(),
+        text: Some(text),
+        truncated: truncated.then_some(true),
+        ..LlmContentBlock::default()
+    }
+}
+
+/// Encode canonical blocks, bounding text/arguments/result fields.
+pub fn encode_message_content(blocks: &[LlmContentBlock]) -> Value {
+    Value::Array(
+        blocks
+            .iter()
+            .map(bound_content_block)
+            .map(|block| serde_json::to_value(block).unwrap_or(Value::Object(Default::default())))
+            .collect(),
+    )
+}
+
+fn bound_content_block(block: &LlmContentBlock) -> LlmContentBlock {
+    let mut bounded = block.clone();
+    let mut truncated = block.truncated.unwrap_or(false);
+    if let Some(text) = bounded.text.take() {
+        let (text, cut) = truncate_utf8_chars(&text, MAX_DURABLE_TEXT_CHARS);
+        truncated |= cut;
+        bounded.text = Some(text);
+    }
+    if let Some(content) = bounded.content.take() {
+        let (content, cut) = truncate_utf8_chars(&content, MAX_DURABLE_TEXT_CHARS);
+        truncated |= cut;
+        bounded.content = Some(content);
+    }
+    if bounded.arguments_json.is_none() {
+        if let Some(arguments) = bounded.arguments.take() {
+            bounded.arguments_json =
+                Some(serde_json::to_string(&arguments).unwrap_or_else(|_| arguments.to_string()));
+        }
+    } else {
+        bounded.arguments = None;
+    }
+    if let Some(arguments_json) = bounded.arguments_json.take() {
+        let (arguments_json, cut) = truncate_utf8_chars(&arguments_json, MAX_DURABLE_TEXT_CHARS);
+        truncated |= cut;
+        bounded.arguments_json = Some(arguments_json);
+    }
+    if let Some(Value::Array(items)) = &bounded.artifact {
+        bounded.artifact = items.first().cloned();
+    }
+    bounded.truncated = truncated.then_some(true);
+    bounded
 }

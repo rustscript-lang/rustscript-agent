@@ -49,6 +49,7 @@ pub struct DispatchLimits {
 pub enum EventCommitError {
     Terminal,
     PersistFailed(String),
+    MissingParent,
 }
 
 /// Durable-first event sink used by dispatch. Implementations must not publish
@@ -59,6 +60,17 @@ pub trait DurableEventCommitter: Send + Sync {
         false
     }
     fn commit(&self, event_type: &str, data: Value) -> Result<(), EventCommitError>;
+    /// Persist a tool step. Default forwards to [`Self::commit`]; production
+    /// committers attach a durable tool_result message for output/completed/failed.
+    fn commit_step(
+        &self,
+        event_type: &str,
+        data: Value,
+        result: Option<&ToolResult>,
+    ) -> Result<(), EventCommitError> {
+        let _ = result;
+        self.commit(event_type, data)
+    }
 }
 
 /// Injectable native executor boundary. Production code uses
@@ -318,15 +330,19 @@ impl DispatchContext {
             let ordinal = used + 1;
             let result = ToolResult::failure("max_tool_calls", "max_tool_calls exceeded");
             if let Some(entry) = self.inner.registry.entry(&call.name) {
-                self.publish_validation_failure(
+                if let Err(error) = self.publish_validation_failure(
                     call,
                     ordinal,
                     entry.executor().tool_name(),
                     Some(entry.descriptor().risk_class.as_str()),
                     &result,
-                );
-            } else {
-                self.publish_validation_failure(call, ordinal, "unknown", None, &result);
+                ) {
+                    return pre_effect_commit_failure(error);
+                }
+            } else if let Err(error) =
+                self.publish_validation_failure(call, ordinal, "unknown", None, &result)
+            {
+                return pre_effect_commit_failure(error);
             }
             return result;
         }
@@ -334,7 +350,11 @@ impl DispatchContext {
 
         let Some(entry) = self.inner.registry.entry(&call.name) else {
             let result = unknown_tool_result(&call.name);
-            self.publish_validation_failure(call, ordinal, "unknown", None, &result);
+            if let Err(error) =
+                self.publish_validation_failure(call, ordinal, "unknown", None, &result)
+            {
+                return pre_effect_commit_failure(error);
+            }
             return result;
         };
         let executor_name = entry.executor().tool_name();
@@ -345,7 +365,11 @@ impl DispatchContext {
             .validate_arguments(&call.name, &call.arguments)
         {
             let result = ToolResult::failure("invalid_arguments", reason);
-            self.publish_validation_failure(call, ordinal, executor_name, Some(risk), &result);
+            if let Err(error) =
+                self.publish_validation_failure(call, ordinal, executor_name, Some(risk), &result)
+            {
+                return pre_effect_commit_failure(error);
+            }
             return result;
         }
 
@@ -357,7 +381,7 @@ impl DispatchContext {
         }
         if let Some(result) = self.gate_before_effect() {
             if !self.inner.events.is_terminal() {
-                let _ = self.commit(
+                let _ = self.commit_with_result(
                     "tool.failed",
                     self.lifecycle_payload(
                         call,
@@ -367,6 +391,7 @@ impl DispatchContext {
                         "failed",
                         Some(&result),
                     ),
+                    Some(&result),
                 );
             }
             return result;
@@ -390,7 +415,7 @@ impl DispatchContext {
         if self.inner.events.is_terminal() {
             return result;
         }
-        match self.commit(
+        match self.commit_with_result(
             "tool.output",
             self.lifecycle_payload(
                 call,
@@ -400,10 +425,12 @@ impl DispatchContext {
                 "output",
                 Some(&result),
             ),
+            Some(&result),
         ) {
             Ok(()) => {}
             Err(EventCommitError::Terminal) => return result,
             Err(EventCommitError::PersistFailed(_)) => return persist_failed_result(),
+            Err(EventCommitError::MissingParent) => return missing_parent_result(),
         }
         if self.inner.events.is_terminal() {
             return result;
@@ -413,7 +440,7 @@ impl DispatchContext {
         } else {
             ("tool.failed", "failed")
         };
-        match self.commit(
+        match self.commit_with_result(
             event_type,
             self.lifecycle_payload(
                 call,
@@ -423,10 +450,12 @@ impl DispatchContext {
                 status,
                 Some(&result),
             ),
+            Some(&result),
         ) {
             Ok(()) => result,
             Err(EventCommitError::Terminal) => result,
             Err(EventCommitError::PersistFailed(_)) => persist_failed_result(),
+            Err(EventCommitError::MissingParent) => missing_parent_result(),
         }
     }
 
@@ -506,26 +535,22 @@ impl DispatchContext {
         executor: &str,
         risk: Option<&str>,
         result: &ToolResult,
-    ) {
+    ) -> Result<(), EventCommitError> {
         if self.inner.events.is_terminal() {
-            return;
+            return Err(EventCommitError::Terminal);
         }
-        if self
-            .commit(
-                "tool.requested",
-                self.lifecycle_payload(call, ordinal, executor, risk, "requested", None),
-            )
-            .is_err()
-        {
-            return;
-        }
+        self.commit(
+            "tool.requested",
+            self.lifecycle_payload(call, ordinal, executor, risk, "requested", None),
+        )?;
         if self.inner.events.is_terminal() {
-            return;
+            return Err(EventCommitError::Terminal);
         }
-        let _ = self.commit(
+        self.commit_with_result(
             "tool.failed",
             self.lifecycle_payload(call, ordinal, executor, risk, "failed", Some(result)),
-        );
+            Some(result),
+        )
     }
 
     fn lifecycle_payload(
@@ -549,10 +574,19 @@ impl DispatchContext {
     }
 
     fn commit(&self, event_type: &str, data: Value) -> Result<(), EventCommitError> {
+        self.commit_with_result(event_type, data, None)
+    }
+
+    fn commit_with_result(
+        &self,
+        event_type: &str,
+        data: Value,
+        result: Option<&ToolResult>,
+    ) -> Result<(), EventCommitError> {
         if self.inner.events.is_terminal() {
             return Err(EventCommitError::Terminal);
         }
-        self.inner.events.commit(event_type, data)
+        self.inner.events.commit_step(event_type, data, result)
     }
 }
 
@@ -575,10 +609,18 @@ fn cancellation_unavailable_result() -> ToolResult {
 fn pre_effect_commit_failure(error: EventCommitError) -> ToolResult {
     match error {
         EventCommitError::PersistFailed(_) => persist_failed_result(),
+        EventCommitError::MissingParent => missing_parent_result(),
         EventCommitError::Terminal => {
             ToolResult::failure("cancelled", "run already committed a terminal state")
         }
     }
+}
+
+fn missing_parent_result() -> ToolResult {
+    ToolResult::failure(
+        "missing_tool_parent",
+        "tool result parent tool_call is missing",
+    )
 }
 
 fn lifecycle_data(

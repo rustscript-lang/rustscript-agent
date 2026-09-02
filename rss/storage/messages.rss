@@ -4,9 +4,55 @@ use self::schema as schema;
 use self::existence as existence;
 
 fn messages_query_limits(max_rows: int, max_bytes: int) -> map<int> {
-    { max_rows: max_rows, max_result_bytes: max_bytes }
+    { max_rows: max_rows, max_result_bytes: if max_bytes < 4096 => { 4096 } else => { max_bytes } }
 }
 
+/// Canonical content_json is always a JSON array of LlmContentBlock objects.
+/// Legacy shapes (raw text, `{"text":...}`, a single block object) are
+/// rewritten with the same block schema; already-canonical arrays pass
+/// through losslessly. Text fields are UTF-8-safe truncated to 65536
+/// characters so the 1 MiB CHECK cannot split a multi-byte scalar.
+pub fn storage_message_encode_content(db_id: resource<sqlite.connection>, content_json: string) -> string {
+    let source: string = content_json.copy();
+    let classified: map = sqlite::query(
+        &db_id,
+        "SELECT CASE WHEN json_valid(payload) AND json_type(payload) = 'array' THEN 1 ELSE 0 END, CASE WHEN json_valid(payload) AND json_type(payload) = 'object' AND json_extract(payload, '$.type') IS NOT NULL THEN 1 ELSE 0 END FROM (SELECT ? AS payload)",
+        [&source],
+        { max_rows: 1, max_result_bytes: 4096 }
+    );
+    let class_rows: array = classified["rows"];
+    let class_row: array = class_rows[0];
+    let is_array: int = class_row[0];
+    let is_block: int = class_row[1];
+    let mut encoded: string = source.copy();
+    if is_array.copy() == 1 {
+        encoded = source.copy();
+    } else {
+        if is_block.copy() == 1 {
+            encoded = "[" + source.copy() + "]";
+        } else {
+            let cut: map = sqlite::query(
+                &db_id,
+                "SELECT CASE WHEN length(extracted) > 65536 THEN CAST(json_array(json_object('type', 'text', 'text', substr(extracted, 1, 65536), 'truncated', json('true'))) AS TEXT) ELSE CAST(json_array(json_object('type', 'text', 'text', extracted)) AS TEXT) END AS encoded FROM (SELECT CASE WHEN json_valid(payload) AND json_type(payload) = 'object' AND json_extract(payload, '$.text') IS NOT NULL THEN json_extract(payload, '$.text') WHEN json_valid(payload) AND json_type(payload) = 'text' THEN json_extract(payload, '$') ELSE payload END AS extracted FROM (SELECT ? AS payload))",
+                [&source],
+                { max_rows: 1, max_result_bytes: 1048576 }
+            );
+            let cut_rows: array = cut["rows"];
+            let cut_row: array = cut_rows[0];
+            encoded = cut_row[0];
+        }
+    }
+    encoded
+}
+
+/// Read-side decoder using the same canonical array schema as encode.
+pub fn storage_message_content_expr() -> string {
+    "CASE WHEN json_valid(content_json) AND json_type(content_json) = 'array' THEN content_json WHEN json_valid(content_json) AND json_type(content_json) = 'object' AND json_extract(content_json, '$.type') IS NOT NULL THEN json_array(json(content_json)) WHEN json_valid(content_json) AND json_type(content_json) = 'object' AND json_extract(content_json, '$.text') IS NOT NULL THEN json_array(json_object('type', 'text', 'text', json_extract(content_json, '$.text'))) WHEN json_valid(content_json) AND json_type(content_json) = 'text' THEN json_array(json_object('type', 'text', 'text', json_extract(content_json, '$'))) ELSE json_array(json_object('type', 'text', 'text', content_json)) END"
+}
+
+fn storage_message_select_sql(predicate: string) -> string {
+    "SELECT id, session_id, ordinal, role, " + storage_message_content_expr() + " AS content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages " + predicate
+}
 
 struct MessageAppendInput {
     id: string,
@@ -31,14 +77,15 @@ struct MessageCompactInput {
 
 pub fn storage_message_append(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: MessageAppendInput = json::decode::<MessageAppendInput>(payload_json);
-    let mut result = { ok: true, code: "ok", message: "", result: { columns: [], rows: [] } };
+    let mut result = { ok: true, code: "ok", message: "", result: {} };
     if !existence::session_exists(db_id, input.session_id.copy()) {
-        result = { ok: false, code: "session_not_found", message: "message append targets an unknown session", result: { columns: [], rows: [] } };
+        result = { ok: false, code: "session_not_found", message: "message append targets an unknown session", result: {} };
     } else {
+        let encoded: string = storage_message_encode_content(db_id, input.content_json.copy());
         let statements = [
             {
                 sql: "INSERT OR IGNORE INTO messages (id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                params: [&input.id, &input.session_id, &input.role, &input.content_json, &input.name, &input.tool_call_id, &input.parent_message_id, input.token_estimate.copy(), &input.metadata_json, &input.run_id, &input.finish_reason, input.now_ms.copy(), &input.session_id, &input.id, &input.session_id]
+                params: [&input.id, &input.session_id, &input.role, &encoded, &input.name, &input.tool_call_id, &input.parent_message_id, input.token_estimate.copy(), &input.metadata_json, &input.run_id, &input.finish_reason, input.now_ms.copy(), &input.session_id, &input.id, &input.session_id]
             },
             {
                 sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ?",
@@ -52,7 +99,7 @@ pub fn storage_message_append(db_id: resource<sqlite.connection>, payload_json: 
             message: "",
             result: sqlite::query(
                 &db_id,
-                "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? LIMIT ?",
+                storage_message_select_sql("WHERE id = ? AND session_id = ? LIMIT ?"),
                 [&input.id, &input.session_id, (max_rows)],
                 messages_query_limits(max_rows, max_bytes)
             )
@@ -64,7 +111,7 @@ pub fn storage_message_append(db_id: resource<sqlite.connection>, payload_json: 
 pub fn storage_message_get(db_id: resource<sqlite.connection>, message_id: string, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
         &db_id,
-        "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? LIMIT ?",
+        storage_message_select_sql("WHERE id = ? LIMIT ?"),
         [message_id, (max_rows)],
         messages_query_limits(max_rows, max_bytes)
     )
@@ -73,7 +120,7 @@ pub fn storage_message_get(db_id: resource<sqlite.connection>, message_id: strin
 pub fn storage_message_list(db_id: resource<sqlite.connection>, session_id: string, after_ordinal: int, max_rows: int, max_bytes: int) -> map {
     sqlite::query(
         &db_id,
-        "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?",
+        storage_message_select_sql("WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?"),
         [session_id, after_ordinal, max_rows],
         messages_query_limits(max_rows, max_bytes)
     )

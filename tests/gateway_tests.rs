@@ -8,7 +8,7 @@ use axum::{
 use rustscript_agent::metrics::{StorageOp, TerminalRetryOutcome, TerminalStatus};
 use rustscript_agent::{
     AdmitError, AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentService,
-    GatewayPersistence, build_agent_gateway_app,
+    GatewayPersistence, LlmContentBlock, Usage, build_agent_gateway_app,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -5286,4 +5286,151 @@ async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
         "the registry must count the dropped broadcasts"
     );
     fixture.join().expect("fixture thread");
+}
+
+#[tokio::test]
+async fn session_messages_api_serializes_canonical_tool_call_blocks() {
+    let path = gateway_db_path("durable-messages");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(context: map) -> map { context; }",
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "use a tool"}),
+            platform: "gateway_tests".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit should succeed");
+    let persistence = state.persistence().expect("sqlite persistence");
+    let usage = Usage {
+        input_tokens: 1,
+        output_tokens: 2,
+        total_tokens: 3,
+    };
+    let parent_id = service
+        .commit_provider_step(
+            &admitted.run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "tool_call".to_string(),
+                tool_call_id: Some("call-api".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_json: Some(r#"{"path":"lib.rs"}"#.to_string()),
+                ..LlmContentBlock::default()
+            }],
+            Some(&usage),
+            Some("tool_calls"),
+            Some("test-provider"),
+            Some("test-model"),
+            Some("parent-1"),
+        )
+        .expect("provider step should persist");
+    persistence
+        .step_commit(&json!({
+            "run_id": admitted.run_id,
+            "session_id": admitted.session_id,
+            "event_id": format!("{}:turn:1:tool.output", admitted.run_id),
+            "event_type": "tool.output",
+            "payload_json": "{\"tool_call_id\":\"call-api\",\"truncated\":true}",
+            "now_ms": 40,
+            "max_events": 128,
+            "message_id": format!("{}:turn:1:tool:call-api:output", admitted.run_id),
+            "role": "user",
+            "content_json": json!([{
+                "type": "tool_result",
+                "tool_call_id": "call-api",
+                "name": "read_file",
+                "content": "notes",
+                "is_error": true,
+                "result": "notes",
+                "error": {"code": "too_large", "message": "truncated output"},
+                "artifact": {"id": "art-1"},
+                "truncated": true
+            }]).to_string(),
+            "name": "read_file",
+            "tool_call_id": "call-api",
+            "parent_message_id": parent_id,
+            "token_estimate": 4,
+            "metadata_json": "{}",
+            "finish_reason": "",
+        }))
+        .expect("canonical tool_result payload");
+    drop(persistence);
+    drop(state);
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(context: map) -> map { context; }",
+        &path,
+    )
+    .expect("reopen gateway");
+    let app = build_agent_gateway_app(state.clone());
+    let (status, body) = json_request(
+        &app,
+        axum::http::Method::GET,
+        &format!("/api/sessions/{}/messages", admitted.session_id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = body["data"].as_array().expect("messages list");
+    let assistant = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant tool-call message");
+    assert_eq!(assistant["id"], parent_id);
+    assert_eq!(assistant["finish_reason"], "tool_calls");
+    assert_eq!(assistant["parent_message_id"], "parent-1");
+    assert_eq!(assistant["metadata"]["provider"], "test-provider");
+    assert_eq!(assistant["metadata"]["model"], "test-model");
+    assert_eq!(assistant["metadata"]["usage"]["total_tokens"], 3);
+    assert!(
+        assistant["ordinal"]
+            .as_i64()
+            .is_some_and(|ordinal| ordinal > 0)
+    );
+    let content = assistant["content"].as_array().expect("canonical blocks");
+    assert_eq!(content[0]["type"], "tool_call");
+    assert_eq!(content[0]["tool_call_id"], "call-api");
+    assert_eq!(content[0]["name"], "read_file");
+    assert_eq!(content[0]["arguments_json"], r#"{"path":"lib.rs"}"#);
+    assert!(content[0].get("arguments").is_none());
+    let tool_result = messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message["role"] == "user"
+                && message["tool_call_id"] == "call-api"
+                && message["content"][0]["truncated"] == true
+        })
+        .expect("user tool_result");
+    assert_eq!(tool_result["name"], "read_file");
+    assert_eq!(tool_result["parent_message_id"], parent_id);
+    assert!(
+        tool_result["ordinal"]
+            .as_i64()
+            .is_some_and(|ordinal| ordinal > 0)
+    );
+    assert_eq!(tool_result["content"][0]["type"], "tool_result");
+    assert_eq!(tool_result["content"][0]["result"], "notes");
+    assert_eq!(tool_result["content"][0]["error"]["code"], "too_large");
+    assert_eq!(
+        tool_result["content"][0]["artifact"],
+        json!({"id": "art-1"})
+    );
+    assert!(tool_result["content"][0].get("artifacts").is_none());
+    assert_eq!(tool_result["content"][0]["truncated"], true);
+    let serialized = serde_json::to_string(tool_result).expect("serialize");
+    assert!(
+        serialized.contains("\"ordinal\""),
+        "ordinal must be serialized: {serialized}"
+    );
+    drop(app);
+    drop(state);
+    let _ = std::fs::remove_file(&path);
 }

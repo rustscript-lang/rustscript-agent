@@ -90,6 +90,9 @@ pub struct GatewayPersistence {
     max_events: i64,
     broadcast_capacity: usize,
     metrics: Arc<crate::metrics::Metrics>,
+    fail_next: std::sync::atomic::AtomicBool,
+    fail_after_partial_write: std::sync::atomic::AtomicBool,
+    fail_after_commit_before_publish: std::sync::atomic::AtomicBool,
 }
 
 /// One serialized storage request for the dedicated worker thread.
@@ -238,6 +241,9 @@ impl GatewayPersistence {
             max_events: config.max_events_per_run as i64,
             broadcast_capacity: config.broadcast_capacity,
             metrics,
+            fail_next: std::sync::atomic::AtomicBool::new(false),
+            fail_after_partial_write: std::sync::atomic::AtomicBool::new(false),
+            fail_after_commit_before_publish: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -254,6 +260,14 @@ impl GatewayPersistence {
     /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+        if self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.metrics
+                .storage_op(crate::metrics::StorageOp::from_command(op), false);
+            return Err("injected persist failure".to_string());
+        }
         let result = if self
             .worker
             .closed
@@ -342,6 +356,50 @@ impl GatewayPersistence {
     /// retention pruning.
     pub fn event_append(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("event.append", payload)
+    }
+
+    /// Atomic message + event commit for one provider or tool step.
+    /// The store lock / SQLite transaction is released by the worker before
+    /// the caller publishes live.
+    pub fn step_commit(&self, payload: &Value) -> Result<Value, StorageError> {
+        let mut payload = payload.clone();
+        if self
+            .fail_after_partial_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            payload["failpoint"] = json!("after_partial_write");
+        } else if self
+            .fail_after_commit_before_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            payload["failpoint"] = json!("after_commit_before_publish");
+        }
+        self.command_data("step.commit", &payload)
+    }
+
+    /// Reconcile requested/started tool effects that lack durable output.
+    pub fn reconcile_effects(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("recovery.reconcile_effects", payload)
+    }
+
+    /// Test failpoint: the next storage command fails before the worker runs.
+    pub fn inject_persist_failure(&self) {
+        self.fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test failpoint: the next `step.commit` aborts inside the SQLite
+    /// transaction after partial writes so the whole step rolls back.
+    pub fn inject_fail_after_partial_write(&self) {
+        self.fail_after_partial_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test failpoint: the next `step.commit` succeeds durably then returns
+    /// a typed error before the caller can live-publish.
+    pub fn inject_fail_after_commit_before_publish(&self) {
+        self.fail_after_commit_before_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// One atomic terminal commit: run status transition plus terminal
@@ -504,6 +562,24 @@ impl GatewayPersistence {
                 return Err("restart recovery did not converge".to_string());
             }
         }
+        let mut remaining = 1i64;
+        let mut effect_rounds = 0u32;
+        while remaining > 0 {
+            let result = self
+                .command_data(
+                    "recovery.reconcile_effects",
+                    &json!({
+                        "now_ms": timestamp(),
+                        "max_rows": RECOVERY_BATCH,
+                    }),
+                )
+                .map_err(|error| format!("reconcile interrupted effects: {error}"))?;
+            remaining = first_rows_affected(&result);
+            effect_rounds += 1;
+            if effect_rounds > 10_000 {
+                return Err("effect reconciliation did not converge".to_string());
+            }
+        }
         let data = self
             .command_data(
                 "load.all",
@@ -620,8 +696,26 @@ pub(crate) struct SessionMessage {
     pub(crate) role: String,
     pub(crate) content: Value,
     pub(crate) created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token_estimate: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_null_or_empty")]
+    pub(crate) metadata: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ordinal: Option<i64>,
+}
+
+fn is_null_or_empty(value: &Value) -> bool {
+    value.is_null() || value.as_object().is_some_and(|object| object.is_empty())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -731,10 +825,23 @@ impl GatewayStore {
                 id: string_cell(&row, 1, "message id")?,
                 session_id: session_id.clone(),
                 role: string_cell(&row, 3, "message role")?,
-                content: json_cell(&row, 4, "message content")?,
+                content: crate::domain::decode_message_content(&json_cell(
+                    &row,
+                    4,
+                    "message content",
+                )?),
                 created_at: int_cell(&row, 13, "message created_at")? as u64,
                 run_id: optional_string(&row, 11),
                 finish_reason: optional_string(&row, 12),
+                name: optional_string(&row, 5),
+                tool_call_id: optional_string(&row, 6),
+                parent_message_id: optional_string(&row, 7),
+                token_estimate: row
+                    .get(8)
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value != 0),
+                metadata: json_optional_cell(&row, 10, "message metadata")?.unwrap_or(Value::Null),
+                ordinal: row.first().and_then(Value::as_i64),
             };
             messages_by_session
                 .entry(session_id)
@@ -742,7 +849,7 @@ impl GatewayStore {
                 .push(message);
         }
         for (session_id, mut messages) in messages_by_session {
-            messages.sort_by_key(|message| message.created_at);
+            messages.sort_by_key(|message| (message.ordinal.unwrap_or(0), message.created_at));
             let session = sessions
                 .get_mut(&session_id)
                 .expect("session presence was validated above");
@@ -900,16 +1007,39 @@ fn int_cell(row: &[Value], index: usize, label: &str) -> Result<i64, String> {
 }
 
 fn json_cell(row: &[Value], index: usize, label: &str) -> Result<Value, String> {
-    let text = string_cell(row, index, label)?;
-    serde_json::from_str(&text).map_err(|error| format!("decode {label}: {error}"))
+    match row.get(index) {
+        Some(Value::String(text)) => {
+            serde_json::from_str(text).map_err(|error| format!("decode {label}: {error}"))
+        }
+        Some(other) => Ok(other.clone()),
+        None => Err(format!("load.all row missing {label}")),
+    }
+}
+
+fn first_rows_affected(data: &Value) -> i64 {
+    data.get("results")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("rows_affected"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            data.as_array()
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get("rows_affected"))
+                .and_then(Value::as_i64)
+        })
+        .or_else(|| data.get("rows_affected").and_then(Value::as_i64))
+        .unwrap_or(0)
 }
 
 fn json_optional_cell(row: &[Value], index: usize, label: &str) -> Result<Option<Value>, String> {
-    match row.get(index).and_then(Value::as_str) {
-        Some("") | None => Ok(None),
-        Some(text) => serde_json::from_str(text)
+    match row.get(index) {
+        Some(Value::String(text)) if text.is_empty() => Ok(None),
+        Some(Value::String(text)) => serde_json::from_str(text)
             .map(Some)
             .map_err(|error| format!("decode {label}: {error}")),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => Ok(Some(other.clone())),
     }
 }
 
@@ -940,10 +1070,16 @@ pub(crate) fn append_message(
         id: Uuid::new_v4().to_string(),
         session_id: view.id.clone(),
         role: role.to_string(),
-        content,
+        content: crate::domain::decode_message_content(&content),
         created_at: timestamp(),
         run_id,
         finish_reason,
+        name: None,
+        tool_call_id: None,
+        parent_message_id: None,
+        token_estimate: None,
+        metadata: Value::Null,
+        ordinal: None,
     };
     messages.push(message.clone());
     view.message_count = messages.len();
