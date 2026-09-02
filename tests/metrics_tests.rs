@@ -12,7 +12,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use rustscript_agent::metrics::{
-    AdmitRejectReason, Metrics, StorageOp, TerminalRetryOutcome, TerminalStatus,
+    AdmitRejectReason, Metrics, MetricsSnapshot, StorageOp, TerminalRetryOutcome, TerminalStatus,
 };
 use rustscript_agent::{
     AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, build_agent_gateway_app,
@@ -369,6 +369,300 @@ fn histogram_records_edge_durations_into_the_fixed_buckets() {
             .contains("agent_run_duration_seconds_bucket{le=\"+Inf\"} 3"),
         "rendered buckets accumulate to the total count"
     );
+}
+
+const CODING_ACTIVITY_COUNTERS: [&str; 5] = [
+    "agent_model_calls_total",
+    "agent_tool_calls_total",
+    "agent_tool_failures_total",
+    "agent_turns_total",
+    "agent_truncations_total",
+];
+
+/// Strings that must never appear in snapshots or Prometheus text: tool args,
+/// paths, stdin/env, output, prompt, provider responses/error text, and
+/// model/provider/run/session identifiers.
+const SENSITIVE_SENTINELS: [&str; 11] = [
+    "/secret/workspace/src/main.rs",
+    "{\"path\":\"/etc/passwd\",\"offset\":12}",
+    "STDIN_PAYLOAD_DO_NOT_RECORD",
+    "ENV_SECRET_TOKEN=abc123",
+    "tool stdout: leaked file contents",
+    "system prompt: never reveal this",
+    "provider response: you are gpt-secret",
+    "provider-error-text: connection refused to 10.0.0.1",
+    "model-id-claude-opus-secret",
+    "run-id-550e8400-e29b-41d4-a716-446655440000",
+    "session-id-sess_secret_999",
+];
+
+fn coding_activity_values(snapshot: &MetricsSnapshot) -> [u64; 5] {
+    [
+        snapshot.model_calls,
+        snapshot.tool_calls,
+        snapshot.tool_failures,
+        snapshot.turns,
+        snapshot.truncations,
+    ]
+}
+
+#[test]
+fn coding_activity_counters_default_to_zero_and_render_unlabelled() {
+    let metrics = Metrics::default();
+    let snapshot = metrics.snapshot();
+    assert_eq!(coding_activity_values(&snapshot), [0, 0, 0, 0, 0]);
+
+    let render = metrics.render_prometheus();
+    for name in CODING_ACTIVITY_COUNTERS {
+        assert!(
+            render.contains(&format!("{name} 0")),
+            "default scrape must emit {name} 0, got:\n{render}"
+        );
+        assert!(
+            !render.contains(&format!("{name}{{")),
+            "{name} must be unlabelled"
+        );
+    }
+}
+
+#[test]
+fn coding_activity_counters_accept_one_and_count_deltas() {
+    let metrics = Metrics::default();
+    metrics.record_model_call();
+    metrics.record_model_calls(2);
+    metrics.record_tool_call();
+    metrics.record_tool_calls(4);
+    metrics.record_tool_failure();
+    metrics.record_tool_failures(1);
+    metrics.record_turn();
+    metrics.record_turns(3);
+    metrics.record_truncation();
+    metrics.record_truncations(6);
+    metrics.record_model_calls(0);
+    metrics.record_tool_calls(0);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.model_calls, 3);
+    assert_eq!(snapshot.tool_calls, 5);
+    assert_eq!(snapshot.tool_failures, 2);
+    assert_eq!(snapshot.turns, 4);
+    assert_eq!(snapshot.truncations, 7);
+
+    let render = metrics.render_prometheus();
+    assert!(render.contains("agent_model_calls_total 3"));
+    assert!(render.contains("agent_tool_calls_total 5"));
+    assert!(render.contains("agent_tool_failures_total 2"));
+    assert!(render.contains("agent_turns_total 4"));
+    assert!(render.contains("agent_truncations_total 7"));
+}
+
+#[test]
+fn coding_activity_counters_saturate_at_u64_max_and_never_wrap() {
+    let metrics = Metrics::default();
+    metrics.record_model_calls(u64::MAX);
+    metrics.record_model_call();
+    metrics.record_model_calls(100);
+    assert_eq!(metrics.snapshot().model_calls, u64::MAX);
+
+    metrics.record_tool_calls(u64::MAX - 1);
+    metrics.record_tool_calls(5);
+    assert_eq!(metrics.snapshot().tool_calls, u64::MAX);
+
+    metrics.record_tool_failures(u64::MAX);
+    metrics.record_tool_failure();
+    assert_eq!(metrics.snapshot().tool_failures, u64::MAX);
+
+    metrics.record_turns(u64::MAX - 3);
+    metrics.record_turns(3);
+    metrics.record_turn();
+    assert_eq!(metrics.snapshot().turns, u64::MAX);
+
+    metrics.record_truncations(u64::MAX);
+    metrics.record_truncations(1);
+    metrics.record_truncation();
+    assert_eq!(metrics.snapshot().truncations, u64::MAX);
+
+    let render = metrics.render_prometheus();
+    for name in CODING_ACTIVITY_COUNTERS {
+        assert!(
+            render.contains(&format!("{name} {}", u64::MAX)),
+            "{name} must render u64::MAX without wrapping, got:\n{render}"
+        );
+        assert!(
+            !render.contains(&format!("{name} 0\n")),
+            "{name} must not wrap back to zero"
+        );
+    }
+}
+
+#[test]
+fn coding_activity_prometheus_help_type_are_deterministic_and_duplicate_free() {
+    let metrics = Metrics::default();
+    metrics.record_model_calls(1);
+    metrics.record_tool_calls(1);
+    metrics.record_tool_failures(1);
+    metrics.record_turns(1);
+    metrics.record_truncations(1);
+
+    let first = metrics.render_prometheus();
+    let second = metrics.render_prometheus();
+    assert_eq!(first, second, "Prometheus text must be deterministic");
+
+    let mut help_names = Vec::new();
+    let mut type_names = Vec::new();
+    let mut lines = first.lines();
+    while let Some(line) = lines.next() {
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let (name, _help) = rest
+                .split_once(' ')
+                .expect("HELP lines must be `# HELP <name> <text>`");
+            help_names.push(name);
+            let type_line = lines
+                .next()
+                .expect("each HELP line must be followed by TYPE");
+            let type_rest = type_line
+                .strip_prefix("# TYPE ")
+                .unwrap_or_else(|| panic!("expected TYPE after HELP {name}, got {type_line}"));
+            let (type_name, kind) = type_rest
+                .split_once(' ')
+                .expect("TYPE lines must be `# TYPE <name> <kind>`");
+            assert_eq!(name, type_name);
+            type_names.push((type_name, kind));
+        }
+    }
+
+    for name in CODING_ACTIVITY_COUNTERS {
+        assert_eq!(
+            help_names.iter().filter(|entry| **entry == name).count(),
+            1,
+            "HELP for {name} must appear exactly once: {help_names:?}"
+        );
+        assert_eq!(
+            type_names
+                .iter()
+                .filter(|(entry, _)| *entry == name)
+                .count(),
+            1,
+            "TYPE for {name} must appear exactly once: {type_names:?}"
+        );
+        assert!(
+            type_names.contains(&(name, "counter")),
+            "{name} must be a counter"
+        );
+    }
+
+    let coding_help_order: Vec<&str> = help_names
+        .iter()
+        .copied()
+        .filter(|name| CODING_ACTIVITY_COUNTERS.contains(name))
+        .collect();
+    assert_eq!(
+        coding_help_order, CODING_ACTIVITY_COUNTERS,
+        "HELP/TYPE order for coding activity counters must be deterministic"
+    );
+
+    let mut sample_lines = Vec::new();
+    for line in first.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        sample_lines.push(line);
+    }
+    let mut unique = sample_lines.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        sample_lines.len(),
+        "sample lines must be duplicate-free: {sample_lines:?}"
+    );
+
+    for name in CODING_ACTIVITY_COUNTERS {
+        let expected = format!("{name} 1");
+        let matches: Vec<_> = sample_lines
+            .iter()
+            .copied()
+            .filter(|line| {
+                line.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+            })
+            .collect();
+        assert_eq!(
+            matches,
+            [expected.as_str()],
+            "{name} must have one unlabelled sample"
+        );
+        assert!(!matches[0].contains('{'));
+    }
+}
+
+#[test]
+fn coding_activity_render_never_includes_sensitive_sentinels() {
+    let metrics = Metrics::default();
+    metrics.record_model_calls(1);
+    metrics.record_tool_calls(2);
+    metrics.record_tool_failures(1);
+    metrics.record_turns(1);
+    metrics.record_truncations(1);
+
+    let render = metrics.render_prometheus();
+    let snapshot = format!("{:?}", metrics.snapshot());
+    for sentinel in SENSITIVE_SENTINELS {
+        assert!(
+            !render.contains(sentinel),
+            "Prometheus text must not contain {sentinel:?}"
+        );
+        assert!(
+            !snapshot.contains(sentinel),
+            "snapshot debug must not contain {sentinel:?}"
+        );
+    }
+}
+
+#[test]
+fn coding_activity_counters_accumulate_under_concurrent_increments() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let metrics = Arc::new(Metrics::default());
+    let threads = 8_u64;
+    let per_thread = 1_000_u64;
+    let mut handles = Vec::new();
+    for _ in 0..threads {
+        let metrics = Arc::clone(&metrics);
+        handles.push(thread::spawn(move || {
+            for _ in 0..per_thread {
+                metrics.record_model_call();
+            }
+            metrics.record_tool_calls(per_thread);
+            metrics.record_tool_failures(per_thread);
+            metrics.record_turns(per_thread);
+            metrics.record_truncations(per_thread);
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("thread should finish");
+    }
+
+    let expected = threads * per_thread;
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.model_calls, expected);
+    assert_eq!(snapshot.tool_calls, expected);
+    assert_eq!(snapshot.tool_failures, expected);
+    assert_eq!(snapshot.turns, expected);
+    assert_eq!(snapshot.truncations, expected);
+
+    metrics.record_model_calls(u64::MAX - expected);
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            let metrics = Arc::clone(&metrics);
+            thread::spawn(move || metrics.record_model_calls(per_thread))
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("saturation thread should finish");
+    }
+    assert_eq!(metrics.snapshot().model_calls, u64::MAX);
 }
 
 /// Accepts one HTTP request and holds the response until the test releases
