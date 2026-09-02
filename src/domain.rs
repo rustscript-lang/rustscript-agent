@@ -496,9 +496,40 @@ fn bound_content_block(block: &LlmContentBlock) -> LlmContentBlock {
         truncated |= cut;
         bounded.arguments_json = Some(arguments_json);
     }
+    if let Some(result) = bounded.result.take() {
+        let (result, cut) = bound_structured_json(result, false);
+        truncated |= cut;
+        bounded.result = Some(result);
+    }
+    if let Some(error) = bounded.error.take() {
+        let (error, cut) = bound_structured_json(error, true);
+        truncated |= cut;
+        bounded.error = Some(error);
+    }
     if let Some(Value::Array(items)) = &bounded.artifact {
         bounded.artifact = items.first().cloned();
     }
     bounded.truncated = truncated.then_some(true);
     bounded
+}
+
+/// Replaces oversized structured `result`/`error` JSON with redacted bounded
+/// metadata so persistence cannot fail after an effect solely because the
+/// payload exceeded the durable message cap. The original byte count is
+/// retained; raw payload bytes are never copied into the replacement.
+fn bound_structured_json(value: Value, retain_error_code: bool) -> (Value, bool) {
+    let original_bytes = serde_json::to_vec(&value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    if original_bytes <= MAX_DURABLE_TEXT_CHARS {
+        return (value, false);
+    }
+    let mut redacted = serde_json::Map::new();
+    redacted.insert("truncated".to_string(), json!(true));
+    redacted.insert("redacted".to_string(), json!(true));
+    redacted.insert("original_bytes".to_string(), json!(original_bytes));
+    if retain_error_code && let Some(code) = value.get("code").cloned() {
+        redacted.insert("code".to_string(), code);
+    }
+    (Value::Object(redacted), true)
 }

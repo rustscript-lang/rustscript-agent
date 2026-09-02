@@ -71,6 +71,18 @@ pub trait DurableEventCommitter: Send + Sync {
         let _ = result;
         self.commit(event_type, data)
     }
+    /// Read-only pre-effect prepare: resolve the durable assistant tool-call
+    /// parent. Missing or name-mismatched parents return
+    /// [`EventCommitError::MissingParent`]. Default is a no-op success so
+    /// in-memory test committers keep working.
+    fn prepare_tool_parent(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<(String, String), EventCommitError> {
+        let _ = tool_call_id;
+        Ok((String::new(), name.to_string()))
+    }
 }
 
 /// Injectable native executor boundary. Production code uses
@@ -324,6 +336,15 @@ impl DispatchContext {
     fn dispatch_one_locked(&self, call: &ToolCall) -> ToolResult {
         if let Some(result) = self.gate_before_publication() {
             return result;
+        }
+        if let Err(error) = self.inner.events.prepare_tool_parent(&call.id, &call.name) {
+            return match error {
+                EventCommitError::MissingParent => missing_parent_result(),
+                EventCommitError::Terminal => {
+                    ToolResult::failure("run_terminal", "run is terminal")
+                }
+                EventCommitError::PersistFailed(_) => persist_failed_result(),
+            };
         }
         let used = self.inner.call_count.fetch_add(1, Ordering::SeqCst);
         if used >= self.inner.limits.max_tool_calls {

@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use rustscript_agent::config::{
@@ -8,10 +10,11 @@ use rustscript_agent::config::{
     MAX_PROVIDER_OPTIONS_BYTES, MAX_RUN_CONTEXT_STORAGE_BYTES, ProviderProfile, RunLimits,
     estimate_admission_query_bytes,
 };
+use rustscript_agent::tools::ToolResult;
 use rustscript_agent::{
     AdmitError, AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, LlmContentBlock,
     ProviderPendingDecision, ScriptedProvider, ToolCall, ToolDescriptor, ToolRegistry,
-    ToolRegistryEntry, Toolset, provider_pending_may_retry,
+    ToolRegistryEntry, Toolset, encode_message_content, provider_pending_may_retry,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -1969,10 +1972,11 @@ async fn missing_tool_result_parent_fails_typed_before_durable_result() {
     );
     let events = service.run_events(&admitted.run_id);
     assert!(
-        events
-            .iter()
-            .all(|event| event["event"] != "tool.failed" && event["event"] != "tool.completed"),
-        "missing parent must not persist a durable tool result: {events:?}"
+        events.iter().all(|event| event["event"] != "tool.started"
+            && event["event"] != "tool.failed"
+            && event["event"] != "tool.completed"
+            && event["event"] != "tool.requested"),
+        "missing parent must not start a tool or persist a result: {events:?}"
     );
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
@@ -2028,6 +2032,13 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
         events.iter().any(|event| event["event"] == "tool.failed"),
         "linked tool result must be durable: {events:?}"
     );
+    let stored = service
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .find(|message| message["role"] == "user" && message["tool_call_id"] == call.id)
+        .expect("tool result message");
+    assert_eq!(stored["parent_message_id"], json!(parent_id));
+    assert_eq!(stored["name"], json!(call.name));
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
 }
@@ -2068,6 +2079,13 @@ async fn in_txn_failpoint_rolls_back_provider_step_on_reopen() {
             None,
         )
         .expect_err("in-txn failpoint must fail");
+    assert!(
+        service
+            .run_events(&admitted.run_id)
+            .iter()
+            .all(|event| event["event"] != "model.completed"),
+        "persist failure must leave live memory unchanged"
+    );
     drop(state);
     let resumed = AgentGatewayState::with_agent_source_and_sqlite(
         AgentGatewayConfig::default(),
@@ -2287,4 +2305,319 @@ async fn pending_provider_with_effect_is_interrupted_without_retry() {
     assert_eq!(interrupted, 1);
     drop(resumed);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn persist_block_hides_store_mutation_until_durable_success() {
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let guard = state.persistence().expect("sqlite").inject_block_persist();
+    let run_id = admitted.run_id.clone();
+    let worker_service = service.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = worker_service.commit_provider_step(
+            &run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "text".to_string(),
+                text: Some("blocked".to_string()),
+                ..LlmContentBlock::default()
+            }],
+            None,
+            Some("stop"),
+            None,
+            None,
+            None,
+        );
+        let _ = done_tx.send(result);
+    });
+    guard.wait_entered();
+    assert!(
+        service
+            .run_events(&admitted.run_id)
+            .iter()
+            .all(|event| event["event"] != "model.completed"),
+        "GET must not observe the step before durable success"
+    );
+    assert_eq!(
+        service
+            .session_messages(&admitted.session_id)
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .count(),
+        0,
+        "session messages must stay pre-commit during persist"
+    );
+    guard.release();
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("blocked persist must finish after release")
+        .expect("provider step should commit after persist");
+    worker.join().expect("persist worker");
+    assert_eq!(
+        service
+            .run_events(&admitted.run_id)
+            .iter()
+            .filter(|event| event["event"] == "model.completed")
+            .count(),
+        1
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn persist_failure_leaves_memory_unchanged_without_rollback() {
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let before_events = service.run_events(&admitted.run_id).len();
+    let before_messages = service.session_messages(&admitted.session_id).len();
+    state
+        .persistence()
+        .expect("sqlite")
+        .inject_persist_failure();
+    service
+        .commit_provider_step(
+            &admitted.run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "text".to_string(),
+                text: Some("must not apply".to_string()),
+                ..LlmContentBlock::default()
+            }],
+            None,
+            Some("stop"),
+            None,
+            None,
+            None,
+        )
+        .expect_err("injected persist failure must fail");
+    assert_eq!(service.run_events(&admitted.run_id).len(), before_events);
+    assert_eq!(
+        service.session_messages(&admitted.session_id).len(),
+        before_messages
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn provider_and_tool_ordinals_are_deterministic_across_reopen() {
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    service
+        .commit_provider_step(
+            &admitted.run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "tool_call".to_string(),
+                tool_call_id: Some("c-ord".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_json: Some("{\"path\":\"a.rs\"}".to_string()),
+                ..LlmContentBlock::default()
+            }],
+            None,
+            Some("tool_calls"),
+            None,
+            None,
+            None,
+        )
+        .expect("provider step");
+    service
+        .commit_tool_step(
+            &admitted.run_id,
+            "tool.completed",
+            json!({"tool_call_id": "c-ord"}),
+            Some(&ToolResult::success("ok", json!({}))),
+        )
+        .expect("tool step");
+    let live_by_id: Vec<(String, i64)> = service
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .filter_map(|message| {
+            Some((
+                message["id"].as_str()?.to_string(),
+                message["ordinal"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert!(
+        live_by_id.len() >= 2,
+        "provider and tool messages must carry ordinals: {live_by_id:?}"
+    );
+    assert!(
+        live_by_id.windows(2).all(|pair| pair[0].1 < pair[1].1),
+        "live ordinals must be strictly increasing: {live_by_id:?}"
+    );
+    drop(state);
+    let resumed = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("reopen");
+    let resumed_by_id: Vec<(String, i64)> = resumed
+        .service()
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .filter_map(|message| {
+            Some((
+                message["id"].as_str()?.to_string(),
+                message["ordinal"].as_i64()?,
+            ))
+        })
+        .collect();
+    assert!(
+        resumed_by_id.windows(2).all(|pair| pair[0].1 < pair[1].1),
+        "reopened ordinals must be strictly increasing: {resumed_by_id:?}"
+    );
+    for (id, ordinal) in &live_by_id {
+        assert_eq!(
+            resumed_by_id
+                .iter()
+                .find(|(resumed_id, _)| resumed_id == id)
+                .map(|(_, resumed_ordinal)| *resumed_ordinal),
+            Some(*ordinal),
+            "ordinal for {id} must survive reopen"
+        );
+    }
+    drop(resumed);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn corrupt_tool_event_without_canonical_result_fails_closed() {
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    service
+        .persist_run_event(
+            &admitted.run_id,
+            "evt-corrupt",
+            "tool.failed",
+            json!({"tool_call_id": "c-corrupt", "error_code": "tool_failed"}),
+        )
+        .expect("orphan tool event");
+    let results = service
+        .dispatch_tools(
+            &admitted.run_id,
+            &[ToolCall {
+                id: "c-corrupt".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "a.rs"}),
+            }],
+        )
+        .expect("corrupt replay must dispatch");
+    assert_eq!(
+        results[0].error.as_ref().map(|error| error.code.as_str()),
+        Some("corrupt_tool_result")
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn terminal_run_refuses_pending_provider_without_retry() {
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    service
+        .commit_provider_request(&admitted.run_id, 1, true, &json!({"prompt": "hi"}))
+        .expect("request boundary");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let provider = ScriptedProvider::new();
+    provider.push_ok(json!({"content": [{"type": "text", "text": "should not run"}]}));
+    assert_eq!(
+        service
+            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .expect("terminal refusal"),
+        ProviderPendingDecision::RefusedTerminal
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(
+        service
+            .run_events(&admitted.run_id)
+            .iter()
+            .filter(|event| event["event"] == "model.completed")
+            .count(),
+        0
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[test]
+fn oversized_tool_result_and_error_are_redacted_not_rejected() {
+    let blob = "x".repeat(70_000);
+    let encoded = encode_message_content(&[LlmContentBlock {
+        block_type: "tool_result".to_string(),
+        tool_call_id: Some("c-bound".to_string()),
+        name: Some("read_file".to_string()),
+        result: Some(json!({"blob": blob})),
+        error: Some(json!({"code": "tool_failed", "message": "y".repeat(70_000)})),
+        ..LlmContentBlock::default()
+    }]);
+    let block = encoded
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("encoded block");
+    assert_eq!(block["result"]["redacted"], json!(true));
+    assert_eq!(block["result"]["truncated"], json!(true));
+    assert!(block["result"].get("blob").is_none());
+    assert_eq!(block["error"]["redacted"], json!(true));
+    assert_eq!(block["error"]["code"], json!("tool_failed"));
+    assert!(block["error"].get("message").is_none());
+    assert_eq!(block["truncated"], json!(true));
 }

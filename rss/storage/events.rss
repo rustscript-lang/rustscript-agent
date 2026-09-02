@@ -39,7 +39,12 @@ struct CursorInput {
 }
 
 pub fn storage_event_append(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let raw_payload: map = json::decode(payload_json);
     let input: EventAppendInput = json::decode::<EventAppendInput>(payload_json);
+    let mut reserved_seq: int = 0;
+    if raw_payload.has("seq") {
+        reserved_seq = raw_payload["seq"].copy();
+    }
     let mut result = { ok: true, code: "ok", message: "", result: [] };
     if !existence::run_exists(db_id, input.run_id.copy()) {
         result = { ok: false, code: "run_not_found", message: "event append targets an unknown run", result: [] };
@@ -47,8 +52,8 @@ pub fn storage_event_append(db_id: resource<sqlite.connection>, payload_json: st
         let max_events: int = schema::max_events_limit(input.max_events.copy());
         let statements = [
             {
-                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
-                params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy(), input.event_id.copy()]
+                sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
+                params: [&input.run_id, reserved_seq.copy(), reserved_seq.copy(), &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy(), input.event_id.copy()]
             },
             {
                 sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
@@ -193,10 +198,18 @@ pub fn storage_step_commit(db_id: resource<sqlite.connection>, payload_json: str
             } else {
                 let encoded: string = messages::storage_message_encode_content(db_id, input.content_json.copy());
                 let max_events: int = schema::max_events_limit(input.max_events.copy());
+                let mut reserved_seq: int = 0;
+                let mut reserved_ordinal: int = 0;
+                if raw_payload.has("seq") {
+                    reserved_seq = raw_payload["seq"].copy();
+                }
+                if raw_payload.has("ordinal") {
+                    reserved_ordinal = raw_payload["ordinal"].copy();
+                }
                 let mut statements = [
                     {
-                        sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
-                        params: [&input.run_id, &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy(), input.event_id.copy()]
+                        sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
+                        params: [&input.run_id, reserved_seq.copy(), reserved_seq.copy(), &input.run_id, &input.event_id, &input.event_type, &input.payload_json, input.now_ms.copy(), input.event_id.copy()]
                     },
                     {
                         sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
@@ -207,8 +220,8 @@ pub fn storage_step_commit(db_id: resource<sqlite.connection>, payload_json: str
                         params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy()]
                     },
                     {
-                        sql: "INSERT OR IGNORE INTO messages (id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ? != ''",
-                        params: [&input.message_id, &input.session_id, &input.session_id, &input.role, &encoded, &input.name, &input.tool_call_id, &input.parent_message_id, input.token_estimate.copy(), &input.metadata_json, &input.run_id, &input.finish_reason, input.now_ms.copy(), &input.message_id]
+                        sql: "INSERT OR IGNORE INTO messages (id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0) + 1 END, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ? != ''",
+                        params: [&input.message_id, &input.session_id, reserved_ordinal.copy(), reserved_ordinal.copy(), &input.session_id, &input.role, &encoded, &input.name, &input.tool_call_id, &input.parent_message_id, input.token_estimate.copy(), &input.metadata_json, &input.run_id, &input.finish_reason, input.now_ms.copy(), &input.message_id]
                     },
                     {
                         sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ? AND ? != ''",
@@ -253,6 +266,10 @@ pub fn storage_effect_reconcile(db_id: resource<sqlite.connection>, payload_json
         },
         {
             sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = sessions.id), last_message_seq), updated_at_ms = ? WHERE id IN (SELECT runs.session_id FROM runs JOIN run_events events ON events.run_id = runs.id WHERE events.event_type = 'tool.failed' AND json_extract(events.payload_json, '$.error_code') = 'interrupted_effect')",
+            params: [input.now_ms.copy()]
+        },
+        {
+            sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT runs.id, COALESCE((SELECT MIN(seq) FROM run_events events WHERE events.run_id = runs.id), 0), COALESCE((SELECT MAX(seq) FROM run_events events WHERE events.run_id = runs.id), 0), ? FROM runs WHERE EXISTS (SELECT 1 FROM run_events events WHERE events.run_id = runs.id AND events.event_type = 'tool.failed' AND json_extract(events.payload_json, '$.error_code') = 'interrupted_effect') ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
             params: [input.now_ms.copy()]
         }
     ];

@@ -15,8 +15,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
-    atomic::AtomicBool,
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
 use std::time::Duration;
@@ -93,6 +93,40 @@ pub struct GatewayPersistence {
     fail_next: std::sync::atomic::AtomicBool,
     fail_after_partial_write: std::sync::atomic::AtomicBool,
     fail_after_commit_before_publish: std::sync::atomic::AtomicBool,
+    persist_block: Mutex<Option<Arc<PersistBlockState>>>,
+}
+
+/// Blocks the next storage command until [`PersistBlockGuard::release`].
+pub struct PersistBlockGuard {
+    inner: Arc<PersistBlockState>,
+}
+
+struct PersistBlockState {
+    mutex: Mutex<()>,
+    entered: AtomicBool,
+    released: AtomicBool,
+    entered_cvar: Condvar,
+    released_cvar: Condvar,
+}
+
+impl PersistBlockGuard {
+    /// Waits until the next storage command has entered the persist path.
+    pub fn wait_entered(&self) {
+        let mut guard = self.inner.mutex.lock().expect("persist block lock");
+        while !self.inner.entered.load(Ordering::SeqCst) {
+            guard = self
+                .inner
+                .entered_cvar
+                .wait(guard)
+                .expect("persist block entered wait");
+        }
+    }
+
+    /// Unblocks the waiting storage command.
+    pub fn release(&self) {
+        self.inner.released.store(true, Ordering::SeqCst);
+        self.inner.released_cvar.notify_all();
+    }
 }
 
 /// One serialized storage request for the dedicated worker thread.
@@ -244,6 +278,7 @@ impl GatewayPersistence {
             fail_next: std::sync::atomic::AtomicBool::new(false),
             fail_after_partial_write: std::sync::atomic::AtomicBool::new(false),
             fail_after_commit_before_publish: std::sync::atomic::AtomicBool::new(false),
+            persist_block: Mutex::new(None),
         })
     }
 
@@ -260,6 +295,22 @@ impl GatewayPersistence {
     /// for the response. The worker thread executes the RSS program; caller
     /// threads never run storage code themselves.
     fn command(&self, op: &str, payload: &Value) -> Result<Value, String> {
+        if let Some(block) = self
+            .persist_block
+            .lock()
+            .expect("persist block lock")
+            .take()
+        {
+            block.entered.store(true, Ordering::SeqCst);
+            block.entered_cvar.notify_all();
+            let mut guard = block.mutex.lock().expect("persist block lock");
+            while !block.released.load(Ordering::SeqCst) {
+                guard = block
+                    .released_cvar
+                    .wait(guard)
+                    .expect("persist block release wait");
+            }
+        }
         if self
             .fail_next
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -396,10 +447,26 @@ impl GatewayPersistence {
     }
 
     /// Test failpoint: the next `step.commit` succeeds durably then returns
-    /// a typed error before the caller can live-publish.
+    /// a typed error before the caller broadcasts. GET remains on the
+    /// pre-commit snapshot until recovery loads the durable event.
     pub fn inject_fail_after_commit_before_publish(&self) {
         self.fail_after_commit_before_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test failpoint: the next storage command blocks until the returned
+    /// guard is released. Used to prove GET/write can proceed without the
+    /// GatewayStore lock being held across SQLite IO.
+    pub fn inject_block_persist(&self) -> PersistBlockGuard {
+        let inner = Arc::new(PersistBlockState {
+            mutex: Mutex::new(()),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_cvar: Condvar::new(),
+            released_cvar: Condvar::new(),
+        });
+        *self.persist_block.lock().expect("persist block lock") = Some(Arc::clone(&inner));
+        PersistBlockGuard { inner }
     }
 
     /// One atomic terminal commit: run status transition plus terminal
