@@ -266,6 +266,12 @@ fn user_text_message(text: string) -> map {
     { role: "user", content: content }
 }
 
+fn system_text_message(text: string) -> map {
+    let mut content: array = [];
+    content[content.length] = text_part(text);
+    { role: "system", content: content }
+}
+
 fn assistant_message(text: string, calls: array) -> map {
     let mut content: array = [];
     if text != "" {
@@ -286,8 +292,12 @@ fn tool_result_message(block: map) -> map {
 }
 
 fn seed_messages(context: map, messages: array) -> array {
-    let mut seeded: array = messages;
-    if seeded.length == 0 {
+    let mut seeded: array = [];
+    let prompt: string = ctx_string(context, "coding_system_prompt", "");
+    if prompt != "" {
+        seeded[seeded.length] = system_text_message(prompt);
+    }
+    if messages.length == 0 {
         let mut text: string = "";
         if context.has("input") {
             if type(context["input"]) == "map" {
@@ -299,6 +309,12 @@ fn seed_messages(context: map, messages: array) -> array {
         }
         if text != "" {
             seeded[seeded.length] = user_text_message(text);
+        }
+    } else {
+        let mut i = 0;
+        while i < messages.length {
+            seeded[seeded.length] = messages[i].copy();
+            i += 1;
         }
     }
     seeded

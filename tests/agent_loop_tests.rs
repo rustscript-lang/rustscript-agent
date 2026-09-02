@@ -18,8 +18,8 @@ use rustscript_agent::tools::{
 };
 use rustscript_agent::{
     AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentProviderHost,
-    AgentRunner, RunCancellation, RunError, ScriptedProvider, ToolDescriptor, ToolRegistry,
-    ToolRegistryEntry, builtin_entries,
+    AgentRunner, RunCancellation, RunContext, RunError, ScriptedProvider, ToolDescriptor,
+    ToolRegistry, ToolRegistryEntry, builtin_entries,
 };
 use rustscript_vm::{CancellationReason, CancellationToken, InvocationError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -213,6 +213,118 @@ fn run_context(
         },
         "config": config
     })
+}
+
+const FROZEN_CODING_PROMPT: &str = "FROZEN-CODING-PROMPT-v1\nExact bytes.";
+
+fn baseline_messages() -> JsonValue {
+    json!([
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "next"}]
+        }
+    ])
+}
+
+fn frozen_run_context(prompt: Option<&str>, tool_schemas: JsonValue) -> RunContext {
+    RunContext {
+        run_id: "run-loop".to_string(),
+        session_id: "session-loop".to_string(),
+        parent_run_id: None,
+        platform: "agent_loop_tests".to_string(),
+        input: json!({"message": "hello"}),
+        messages: baseline_messages(),
+        system_prompt: None,
+        model: "test-model".to_string(),
+        provider: Some("openai".to_string()),
+        provider_options: json!({}),
+        tool_schemas,
+        limits: json!({
+            "max_turns": 4,
+            "max_tool_calls": 8
+        }),
+        metadata: json!({}),
+        coding_system_prompt: prompt.map(str::to_string),
+    }
+}
+
+fn reconstruct_run_context(context: &RunContext) -> RunContext {
+    serde_json::from_value(serde_json::to_value(context).expect("run context should serialize"))
+        .expect("run context should deserialize")
+}
+
+fn decide_vm(runner: &AgentRunner, context: Value) -> JsonValue {
+    let result = runner
+        .run_with_context(context)
+        .unwrap_or_else(|error| panic!("policy decision failed: {error:?}"));
+    let Value::Map(result) = result else {
+        panic!("policy entry should return a decision map");
+    };
+    vm_value_to_json(&Value::Map(result))
+}
+
+fn system_message_count(request: &JsonValue) -> usize {
+    request["messages"]
+        .as_array()
+        .expect("provider request should include messages")
+        .iter()
+        .filter(|message| message["role"] == json!("system"))
+        .count()
+}
+
+fn assert_exactly_one_leading_system(request: &JsonValue, prompt: &str) {
+    let messages = request["messages"]
+        .as_array()
+        .expect("provider request should include messages");
+    assert!(
+        !messages.is_empty(),
+        "provider request should include at least the frozen system message"
+    );
+    assert_eq!(messages[0]["role"], json!("system"));
+    assert_eq!(messages[0]["content"].as_array().map(Vec::len), Some(1));
+    assert_eq!(messages[0]["content"][0]["type"], json!("text"));
+    let text = messages[0]["content"][0]["text"]
+        .as_str()
+        .expect("leading system message should be text");
+    assert_eq!(text.as_bytes(), prompt.as_bytes());
+    assert_eq!(system_message_count(request), 1);
+}
+
+fn assert_baseline_follows(request: &JsonValue, baseline: &JsonValue) {
+    let messages = request["messages"]
+        .as_array()
+        .expect("provider request should include messages");
+    let baseline = baseline
+        .as_array()
+        .expect("baseline messages should be an array");
+    assert!(
+        messages.len() > baseline.len(),
+        "provider messages should keep the frozen prompt plus baseline history"
+    );
+    for (index, expected) in baseline.iter().enumerate() {
+        assert_eq!(&messages[index + 1], expected);
+    }
+}
+
+fn assert_no_system_message(request: &JsonValue) {
+    assert_eq!(system_message_count(request), 0);
+    let first_role = request["messages"]
+        .as_array()
+        .and_then(|messages| messages.first())
+        .and_then(|message| message.get("role"));
+    assert_ne!(first_role, Some(&json!("system")));
+}
+
+fn assert_decision_does_not_leak_prompt(decision: &JsonValue, prompt: &str) {
+    let encoded = serde_json::to_string(decision).expect("decision should serialize");
+    assert!(
+        !encoded.contains(prompt),
+        "frozen coding prompt must not leak into loop events or the decision payload: {encoded}"
+    );
 }
 
 struct MemoryEvents {
@@ -848,6 +960,81 @@ fn loop_completed_tool_effects_are_not_retried() {
     assert_eq!(decision["kind"], json!("run.completed"));
     assert_eq!(executor.count.load(Ordering::SeqCst), 1);
     assert_eq!(provider.call_count(), 3);
+}
+
+#[test]
+fn loop_frozen_coding_prompt_leads_first_request_byte_identically() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("done"));
+    let runner = loop_runner_with(provider.clone(), None);
+    let context =
+        reconstruct_run_context(&frozen_run_context(Some(FROZEN_CODING_PROMPT), json!([])));
+    assert_eq!(
+        context.coding_system_prompt.as_deref(),
+        Some(FROZEN_CODING_PROMPT)
+    );
+    let decision = decide_vm(&runner, context.to_vm_value());
+    assert_no_blocked(&decision);
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(provider.call_count(), 1);
+    let request = &provider.requests()[0];
+    assert_exactly_one_leading_system(request, FROZEN_CODING_PROMPT);
+    assert_baseline_follows(request, &baseline_messages());
+    assert_decision_does_not_leak_prompt(&decision, FROZEN_CODING_PROMPT);
+}
+
+#[test]
+fn loop_frozen_coding_prompt_stays_exactly_one_on_tool_follow_up_and_retry() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": "c1", "name": "read_file", "arguments": {"path": "a.txt"}}]),
+    ));
+    provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
+    provider.push_ok(text_response("after retry"));
+    let (dispatcher, executor, root) = native_dispatcher(8);
+    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let context =
+        reconstruct_run_context(&frozen_run_context(Some(FROZEN_CODING_PROMPT), echo_tool()));
+    let decision = decide_vm(&runner, context.to_vm_value());
+    let _ = fs::remove_dir_all(root);
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(executor.count.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.call_count(), 3);
+    for request in provider.requests() {
+        assert_exactly_one_leading_system(&request, FROZEN_CODING_PROMPT);
+        assert_baseline_follows(&request, &baseline_messages());
+    }
+    let follow = &provider.requests()[1];
+    assert_eq!(follow["messages"][3]["role"], json!("assistant"));
+    assert_eq!(
+        follow["messages"][3]["content"][0]["type"],
+        json!("tool_call")
+    );
+    assert_eq!(follow["messages"][4]["role"], json!("user"));
+    assert_eq!(
+        follow["messages"][4]["content"][0]["type"],
+        json!("tool_result")
+    );
+    assert_decision_does_not_leak_prompt(&decision, FROZEN_CODING_PROMPT);
+}
+
+#[test]
+fn loop_absent_or_empty_coding_prompt_emits_no_system_message() {
+    for prompt in [None, Some("")] {
+        let provider = ScriptedProvider::new();
+        provider.push_ok(text_response("plain"));
+        let runner = loop_runner_with(provider.clone(), None);
+        let context = reconstruct_run_context(&frozen_run_context(prompt, json!([])));
+        assert_eq!(context.coding_system_prompt.as_deref(), prompt);
+        let decision = decide_vm(&runner, context.to_vm_value());
+        assert_eq!(decision["kind"], json!("run.completed"));
+        assert_eq!(provider.call_count(), 1);
+        let requests = provider.requests();
+        assert_no_system_message(&requests[0]);
+        let messages = requests[0]["messages"].as_array().expect("messages");
+        assert_eq!(messages, baseline_messages().as_array().expect("baseline"));
+    }
 }
 
 #[test]

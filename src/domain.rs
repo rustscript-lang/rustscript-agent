@@ -131,6 +131,13 @@ impl RunContext {
                 VmValue::string("metadata"),
                 json_to_vm_value(&self.metadata),
             ),
+            (
+                VmValue::string("coding_system_prompt"),
+                self.coding_system_prompt
+                    .as_deref()
+                    .map(VmValue::string)
+                    .unwrap_or(VmValue::Null),
+            ),
         ])
     }
 }
