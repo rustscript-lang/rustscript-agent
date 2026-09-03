@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod process;
 pub mod types;
 
+mod confined_io;
 mod hash;
 
 pub use artifacts::{ArtifactCapability, ArtifactLimits, ArtifactRef};

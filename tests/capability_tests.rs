@@ -3,21 +3,27 @@
 //! These tests drive native primitives that later RSS tools will consume.
 //! Capability code must not know model-visible tool names.
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
-
-use rustscript_agent::capabilities::{
-    ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityError,
-    CapabilityLifecycle, CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle,
-    FilesystemCapability, FilesystemLimits, LifecycleClock, LifecycleError, LifecycleLimits,
-    PrepareMetadata, PrepareOutcome, ProcessCapability, ProcessLimits, TokenIssuer,
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
-use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner};
+
+use rustscript_agent::{
+    AgentConfig, AgentHostBridges, AgentRunner,
+    capabilities::{
+        ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityError,
+        CapabilityLifecycle, CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle,
+        FilesystemCapability, FilesystemLimits, LifecycleClock, LifecycleError, LifecycleLimits,
+        PrepareMetadata, PrepareOutcome, ProcessCapability, ProcessLimits, TokenIssuer,
+    },
+};
 use rustscript_vm::{HostTypeSchema, Value as VmValue};
 use serde_json::{Value, json};
 
@@ -642,6 +648,36 @@ fn process_output_is_truncated_and_handles_clean_up_on_drop() {
 }
 
 #[test]
+fn dropping_execution_lease_reaps_token_owned_process() {
+    let fixture = Fixture::new("lease-reap");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let lease = fixture.lifecycle.lease(&token).expect("lease");
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 30_000,
+                stdout_limit: 8,
+                stderr_limit: 8,
+                total_limit: 8,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    let pid = spawned.pid;
+    assert!(pid_alive(pid));
+    drop(lease);
+    assert!(
+        wait_until_pid_gone(pid, Duration::from_secs(2)),
+        "dropping the execution lease left pid {pid} alive"
+    );
+}
+
+#[test]
 fn artifact_put_get_and_reference_enforce_quota_and_ownership() {
     let fixture = Fixture::new("arts");
     let artifacts = fixture.artifacts(ArtifactLimits {
@@ -862,6 +898,60 @@ fn listing_enumeration_is_bounded_and_overflow_safe() {
 }
 
 #[test]
+fn listing_paginates_by_cursor_without_materializing_directory() {
+    let fixture = Fixture::new("list-pages");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    let mut expected = Vec::new();
+    for index in 0..12 {
+        let name = format!("f{index:02}");
+        fs::write(fixture.root.join("dir").join(&name), name.as_bytes()).expect("entry");
+        expected.push(name);
+    }
+    expected.sort();
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let mut cursor = 0_u64;
+    let mut seen = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = fs_cap.list(&token, "dir", cursor, 2).expect("bounded page");
+        pages += 1;
+        assert!(
+            page.entries.len() <= 2,
+            "page must respect limit=2, got {}",
+            page.entries.len()
+        );
+        assert!(
+            pages <= 8,
+            "cursor pagination must finish without a global directory dump"
+        );
+        for entry in &page.entries {
+            seen.push(entry.name.clone());
+        }
+        if !page.truncated {
+            break;
+        }
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.next_cursor > cursor);
+        cursor = page.next_cursor;
+    }
+    let mut ordered = seen.clone();
+    ordered.sort();
+    assert_eq!(ordered, expected);
+    assert_eq!(seen.len(), expected.len());
+    let overflow = fs_cap
+        .list(&token, "dir", u64::MAX, 2)
+        .expect("overflow cursor");
+    assert!(overflow.entries.is_empty());
+    assert!(!overflow.truncated);
+    let huge = fs_cap
+        .list(&token, "dir", 1 << 40, 2)
+        .expect("very large cursor");
+    assert!(huge.entries.is_empty());
+    assert!(!huge.truncated);
+}
+
+#[test]
 fn concurrent_cas_writers_serialize_to_one_success() {
     let fixture = Fixture::new("cas-race");
     let fs_cap = fixture.filesystem();
@@ -959,6 +1049,36 @@ fn read_range_permits_window_from_file_larger_than_default_ceiling() {
     assert_eq!(window.offset, 16);
     assert!(window.truncated);
     assert_eq!(window.bytes.len(), 8);
+}
+
+#[test]
+fn read_range_of_sparse_file_beyond_64mib_stays_bounded() {
+    use std::os::unix::fs::FileExt;
+    let fixture = Fixture::new("sparse-range");
+    let offset = 64 * 1024 * 1024 + 4096;
+    let path = fixture.root.join("huge.bin");
+    let file = fs::File::create(&path).expect("create sparse");
+    file.set_len(offset + 16).expect("sparse size");
+    file.write_at(b"windowed", offset)
+        .expect("poke high offset");
+    drop(file);
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let window = fs_cap
+        .read_range(&token, "huge.bin", offset, 8)
+        .expect("bounded high-offset window");
+    assert_eq!(window.bytes, b"windowed");
+    assert_eq!(window.offset, offset);
+    assert!(window.truncated);
+    let hash = window.hash.expect("range identity");
+    assert!(
+        hash.starts_with("range:"),
+        "range read must use a range/version identity, got {hash}"
+    );
+    assert!(
+        !hash.starts_with("sha256:"),
+        "must not label a bounded window as a whole-file hash: {hash}"
+    );
 }
 
 #[test]

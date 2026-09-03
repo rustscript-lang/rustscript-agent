@@ -1,10 +1,14 @@
 //! Injectable durable lifecycle, clock, tokens, and approval.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -248,14 +252,32 @@ impl CapabilityLifecycleBuilder {
 }
 
 enum TokenState {
-    Open(Box<TokenClaims>),
-    Committed { call_id: String },
-    Interrupted { call_id: String },
+    Open {
+        claims: Box<TokenClaims>,
+        resources: Vec<Arc<dyn TokenOwnedResource>>,
+    },
+    Committed {
+        call_id: String,
+    },
+    Interrupted {
+        call_id: String,
+    },
+}
+
+/// Resource bound to an open execution token. Released on interrupt, not on commit.
+pub(crate) trait TokenOwnedResource: Send + Sync {
+    fn release(&self);
+}
+
+fn release_resources(resources: Vec<Arc<dyn TokenOwnedResource>>) {
+    for resource in resources {
+        resource.release();
+    }
 }
 
 fn token_call_id(state: &TokenState) -> &str {
     match state {
-        TokenState::Open(claims) => claims.call_id.as_str(),
+        TokenState::Open { claims, .. } => claims.call_id.as_str(),
         TokenState::Committed { call_id } => call_id.as_str(),
         TokenState::Interrupted { call_id } => call_id.as_str(),
     }
@@ -382,19 +404,22 @@ impl CapabilityLifecycle {
             .unwrap_or_else(|| self.inner.clock.now());
         self.inner.token_states.lock().insert(
             execution_token.clone(),
-            TokenState::Open(Box::new(TokenClaims {
-                owner: self.inner.owner.clone(),
-                call_id: metadata.call_id,
-                tool_name: metadata.tool_name,
-                argument_digest: metadata.argument_digest,
-                registry_identity: metadata.registry_identity,
-                risk_ceiling: ceiling,
-                output_budget: self.inner.limits.max_output_bytes,
-                generation,
-                deadline,
-                deadline_ms: self.inner.deadline_ms,
-                workspace: self.inner.workspace.clone(),
-            })),
+            TokenState::Open {
+                claims: Box::new(TokenClaims {
+                    owner: self.inner.owner.clone(),
+                    call_id: metadata.call_id,
+                    tool_name: metadata.tool_name,
+                    argument_digest: metadata.argument_digest,
+                    registry_identity: metadata.registry_identity,
+                    risk_ceiling: ceiling,
+                    output_budget: self.inner.limits.max_output_bytes,
+                    generation,
+                    deadline,
+                    deadline_ms: self.inner.deadline_ms,
+                    workspace: self.inner.workspace.clone(),
+                }),
+                resources: Vec::new(),
+            },
         );
         self.inner.call_count.fetch_add(1, Ordering::SeqCst);
         Ok(PrepareOutcome::Execute {
@@ -417,7 +442,7 @@ impl CapabilityLifecycle {
         }
         let mut states = self.inner.token_states.lock();
         let claims = match states.get(token) {
-            Some(TokenState::Open(claims)) => claims.clone(),
+            Some(TokenState::Open { claims, .. }) => claims.clone(),
             Some(TokenState::Committed { .. }) => return Err(LifecycleError::DuplicateClose),
             Some(TokenState::Interrupted { .. }) => return Err(LifecycleError::Interrupted),
             None => return Err(LifecycleError::TokenUnknown),
@@ -458,7 +483,7 @@ impl CapabilityLifecycle {
 
     pub fn lease(&self, token: &str) -> Result<ExecutionLease, LifecycleError> {
         match self.inner.token_states.lock().get(token) {
-            Some(TokenState::Open(_)) => Ok(ExecutionLease {
+            Some(TokenState::Open { .. }) => Ok(ExecutionLease {
                 lifecycle: self.clone(),
                 token: token.to_string(),
                 closed: false,
@@ -487,7 +512,7 @@ impl CapabilityLifecycle {
         }
         let states = self.inner.token_states.lock();
         let claims = match states.get(token) {
-            Some(TokenState::Open(claims)) => claims.as_ref().clone(),
+            Some(TokenState::Open { claims, .. }) => claims.as_ref().clone(),
             Some(TokenState::Committed { .. }) => return Err(LifecycleError::DuplicateClose),
             Some(TokenState::Interrupted { .. }) => return Err(LifecycleError::Interrupted),
             None => return Err(LifecycleError::TokenUnknown),
@@ -514,6 +539,31 @@ impl CapabilityLifecycle {
         Ok(claims)
     }
 
+    pub(crate) fn register_resource(
+        &self,
+        token: &str,
+        resource: Arc<dyn TokenOwnedResource>,
+    ) -> Result<(), LifecycleError> {
+        let mut states = self.inner.token_states.lock();
+        match states.get_mut(token) {
+            Some(TokenState::Open { resources, .. }) => {
+                resources.push(resource);
+                Ok(())
+            }
+            Some(TokenState::Committed { .. }) => Err(LifecycleError::DuplicateClose),
+            Some(TokenState::Interrupted { .. }) => {
+                drop(states);
+                resource.release();
+                Err(LifecycleError::Interrupted)
+            }
+            None => {
+                drop(states);
+                resource.release();
+                Err(LifecycleError::TokenUnknown)
+            }
+        }
+    }
+
     pub fn recover_open_tokens(&self) -> Result<Vec<String>, LifecycleError> {
         // Eager Interrupted before durable I/O prevents Drop from racing a still-Open
         // token. Durable interrupt failure is returned to the caller; in-process
@@ -523,19 +573,25 @@ impl CapabilityLifecycle {
         let open: Vec<(String, String)> = states
             .iter()
             .filter_map(|(token, state)| match state {
-                TokenState::Open(claims) => Some((token.clone(), claims.call_id.clone())),
+                TokenState::Open { claims, .. } => Some((token.clone(), claims.call_id.clone())),
                 TokenState::Committed { .. } | TokenState::Interrupted { .. } => None,
             })
             .collect();
+        let mut resources = Vec::new();
         for (token, call_id) in &open {
-            states.insert(
+            if let Some(TokenState::Open {
+                resources: owned, ..
+            }) = states.insert(
                 token.clone(),
                 TokenState::Interrupted {
                     call_id: call_id.clone(),
                 },
-            );
+            ) {
+                resources.extend(owned);
+            }
         }
         drop(states);
+        release_resources(resources);
         let mut recovered = Vec::with_capacity(open.len());
         for (_, call_id) in open {
             self.inner.durable.interrupt(&call_id)?;
@@ -548,17 +604,21 @@ impl CapabilityLifecycle {
     fn interrupt_token(&self, token: &str) -> Result<(), LifecycleError> {
         let mut states = self.inner.token_states.lock();
         let call_id = match states.get(token) {
-            Some(TokenState::Open(claims)) => claims.call_id.clone(),
+            Some(TokenState::Open { claims, .. }) => claims.call_id.clone(),
             Some(TokenState::Interrupted { .. } | TokenState::Committed { .. }) => return Ok(()),
             None => return Err(LifecycleError::TokenUnknown),
         };
-        states.insert(
+        let resources = match states.insert(
             token.to_string(),
             TokenState::Interrupted {
                 call_id: call_id.clone(),
             },
-        );
+        ) {
+            Some(TokenState::Open { resources, .. }) => resources,
+            _ => Vec::new(),
+        };
         drop(states);
+        release_resources(resources);
         self.inner.durable.interrupt(&call_id)
     }
 }

@@ -3,18 +3,22 @@
 //! These operations do not embed model-visible tool names, schemas, or result
 //! formatting. Every effect requires a valid execution token.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use rustscript_vm::{
     ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind, ConfinedFsLimits, ConfinedFsRoot,
-    ConfinedMetadata, EnumerationBudget, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_READ_BYTES,
-    MAX_WRITE_BYTES,
+    ConfinedMetadata, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES,
 };
 
-use super::hash::content_hash;
-use super::lifecycle::CapabilityLifecycle;
-use super::types::{CapabilityError, CapabilityOwner, CapabilityRisk, TokenClaims};
+use super::{
+    confined_io::FrozenDir,
+    hash::content_hash,
+    lifecycle::CapabilityLifecycle,
+    types::{CapabilityError, CapabilityOwner, CapabilityRisk, TokenClaims},
+};
 
 /// Explicit byte and listing ceilings for one filesystem capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +85,7 @@ pub struct FilesystemCapability {
     owner: CapabilityOwner,
     limits: FilesystemLimits,
     root: Arc<ConfinedFsRoot>,
+    frozen: Arc<FrozenDir>,
     cas_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -111,11 +116,13 @@ impl FilesystemCapability {
             },
         )
         .map_err(map_fs_error)?;
+        let frozen = FrozenDir::open(lifecycle.workspace())?;
         Ok(Self {
             lifecycle,
             owner,
             limits,
             root: Arc::new(root),
+            frozen: Arc::new(frozen),
             cas_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -152,37 +159,17 @@ impl FilesystemCapability {
                 "path is not a regular file",
             ));
         }
-        let file_len = meta.len();
-        let start = offset.min(file_len);
-        let want = u64::try_from(limit).unwrap_or(u64::MAX);
-        let end = start.saturating_add(want).min(file_len);
-        let window_len = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
-        if window_len == 0 {
-            return Ok(FsRead {
-                bytes: Vec::new(),
-                offset,
-                truncated: false,
-                hash: Some(bounded_identity(offset, 0, file_len)),
-            });
-        }
-        let mut file = self.root.open_read(path).map_err(map_fs_error)?;
-        let contents = file.read_to_end().map_err(map_fs_error)?;
-        let read_len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-        let start_idx = usize::try_from(start).unwrap_or(usize::MAX);
-        if start_idx >= contents.len() {
-            return Ok(FsRead {
-                bytes: Vec::new(),
-                offset,
-                truncated: file_len > read_len,
-                hash: Some(identity_for(&contents, start, 0, file_len)),
-            });
-        }
-        let end_idx = start_idx.saturating_add(window_len).min(contents.len());
-        let bytes = contents[start_idx..end_idx].to_vec();
-        let truncated = start.saturating_add(bytes.len() as u64) < file_len;
+        let read = self.frozen.read_range(path, offset, limit)?;
+        let file_len = read.file_len;
+        let truncated = offset.saturating_add(read.bytes.len() as u64) < file_len;
+        let complete = offset == 0 && !truncated && (read.bytes.len() as u64) == file_len;
         Ok(FsRead {
-            hash: Some(identity_for(&contents, start, bytes.len(), file_len)),
-            bytes,
+            hash: Some(if complete {
+                content_hash(&read.bytes)
+            } else {
+                bounded_identity(offset, read.bytes.len(), file_len)
+            }),
+            bytes: read.bytes,
             offset,
             truncated,
         })
@@ -212,34 +199,20 @@ impl FilesystemCapability {
                 ));
             }
         }
-        let budget = EnumerationBudget {
-            max_entries: listing_entry_budget(cursor, limit, self.limits.max_list_entries),
-            max_name_bytes: MAX_COMPONENT_BYTES,
-        };
-        let mut entries = self
-            .root
-            .enumerate_with_budget(path, budget)
-            .map_err(map_fs_error)?;
-        entries.retain(|entry| entry.name() != "." && entry.name() != "..");
-        let start = usize::try_from(cursor).unwrap_or(usize::MAX);
-        let page = if start >= entries.len() {
-            Vec::new()
-        } else {
-            entries[start..entries.len().min(start.saturating_add(limit))]
-                .iter()
-                .map(|entry| FsDirEntry {
-                    name: entry.name().to_string(),
-                    file_type: file_type_name(entry.metadata().file_type()),
-                    len: entry.metadata().len(),
-                })
-                .collect()
-        };
-        let next = start.saturating_add(page.len());
+        let page = self.frozen.list_page(path, cursor, limit)?;
         Ok(FsList {
-            truncated: next < entries.len(),
-            next_cursor: u64::try_from(next).unwrap_or(u64::MAX),
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| FsDirEntry {
+                    name: entry.name,
+                    file_type: entry.file_type,
+                    len: entry.len,
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+            truncated: page.truncated,
             cursor,
-            entries: page,
         })
     }
 
@@ -331,26 +304,6 @@ impl FilesystemCapability {
         self.lifecycle
             .authorize(&self.owner, token, risk)
             .map_err(CapabilityError::from)
-    }
-}
-
-fn listing_entry_budget(cursor: u64, limit: usize, max_list_entries: usize) -> usize {
-    let page = limit.min(max_list_entries);
-    let start = usize::try_from(cursor).unwrap_or(usize::MAX);
-    let observe = start
-        .saturating_add(page)
-        .saturating_add(1)
-        .saturating_add(2);
-    let cap = max_list_entries.saturating_add(3);
-    observe.min(cap)
-}
-
-fn identity_for(contents: &[u8], offset: u64, window_len: usize, file_len: u64) -> String {
-    let read_len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-    if read_len == file_len {
-        content_hash(contents)
-    } else {
-        bounded_identity(offset, window_len, file_len)
     }
 }
 
