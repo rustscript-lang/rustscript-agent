@@ -43,7 +43,7 @@ use uuid::Uuid;
 use crate::capabilities::{
     AllowAllApproval, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
     CapabilityOwner, DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
-    LifecycleError, LifecycleLimits, ProcessCapability, SystemClock, UuidIssuer,
+    LifecycleError, LifecycleLimits, ProcessCapability, ProcessLimits, SystemClock, UuidIssuer,
 };
 use crate::config::{
     ADMISSION_IDEMPOTENCY_SCOPE, ADMISSION_RUN_COL_ID, ADMISSION_RUN_COL_INPUT_JSON,
@@ -307,6 +307,7 @@ impl NativeDispatchState {
         if let Some(observer) = &self.shutdown_entered {
             observer();
         }
+        self.processes.cancel_all();
         let _ = self.lifecycle.recover_open_tokens();
         self.dispatcher.close();
         let quiesced = self.dispatcher.try_quiesce(grace);
@@ -362,16 +363,22 @@ impl RunHandle {
 
     fn cancel_native_tools(&self) {
         self.tool_cancel.cancel();
-        let lifecycle = {
+        let (lifecycle, processes) = {
             let phase = self
                 .native_dispatch
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &*phase {
-                NativeDispatchPhase::Ready(state) => Some(Arc::clone(&state.lifecycle)),
-                _ => None,
+                NativeDispatchPhase::Ready(state) => (
+                    Some(Arc::clone(&state.lifecycle)),
+                    Some(Arc::clone(&state.processes)),
+                ),
+                _ => (None, None),
             }
         };
+        if let Some(processes) = processes {
+            processes.cancel_all();
+        }
         if let Some(lifecycle) = lifecycle {
             let _ = lifecycle.recover_open_tokens();
         }
@@ -1780,6 +1787,14 @@ impl AgentService {
         };
         let mut process_config = ProcessToolConfig::for_workspace(&workspace);
         process_config.apply_admitted_output_cap(output_cap);
+        let process_limits = ProcessLimits {
+            timeout_ms: u64::try_from(process_config.max_timeout.as_millis()).unwrap_or(u64::MAX),
+            stdout_limit: process_config.max_stream_bytes,
+            stderr_limit: process_config.max_stream_bytes,
+            total_limit: process_config.max_stream_bytes,
+            stdin_limit: process_config.max_stdin_bytes,
+            log_limit: process_config.max_output_bytes.max(1),
+        };
         let artifacts = self
             .inner
             .artifact_stores
@@ -1874,7 +1889,7 @@ impl AgentService {
             .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
         );
         let processes = Arc::new(
-            ProcessCapability::new(lifecycle.clone(), capability_owner.clone())
+            ProcessCapability::new(lifecycle.clone(), capability_owner.clone(), process_limits)
                 .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
         );
         let artifacts = Arc::new(

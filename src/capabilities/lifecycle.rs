@@ -1,7 +1,7 @@
 //! Injectable durable lifecycle, clock, tokens, and approval.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -286,6 +286,11 @@ pub struct CapabilityLifecycle {
 impl CapabilityLifecycle {
     pub fn builder() -> CapabilityLifecycleBuilder {
         CapabilityLifecycleBuilder::default()
+    }
+
+    /// Frozen workspace path captured at admission.
+    pub fn workspace(&self) -> &Path {
+        &self.inner.workspace
     }
 
     pub fn prepare(

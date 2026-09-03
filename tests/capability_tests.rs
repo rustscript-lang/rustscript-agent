@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_agent::capabilities::{
@@ -272,7 +273,17 @@ impl Fixture {
     }
 
     fn processes(&self) -> ProcessCapability {
-        ProcessCapability::new(self.lifecycle.clone(), self.owner.clone()).expect("processes")
+        ProcessCapability::new(
+            self.lifecycle.clone(),
+            self.owner.clone(),
+            ProcessLimits::default(),
+        )
+        .expect("processes")
+    }
+
+    fn processes_with(&self, host_limits: ProcessLimits) -> ProcessCapability {
+        ProcessCapability::new(self.lifecycle.clone(), self.owner.clone(), host_limits)
+            .expect("processes")
     }
 
     fn artifacts(&self, limits: ArtifactLimits) -> ArtifactCapability {
@@ -283,6 +294,21 @@ impl Fixture {
 
 fn error_code(error: &CapabilityError) -> &str {
     error.code()
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn wait_until_pid_gone(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !pid_alive(pid)
 }
 
 #[test]
@@ -391,7 +417,7 @@ fn read_write_and_list_respect_explicit_bounds() {
     let fixture = Fixture::new("bounds");
     fs::write(fixture.root.join("big.txt"), vec![b'a'; 80]).expect("big");
     fs::create_dir(fixture.root.join("dir")).expect("dir");
-    for name in ["a", "b", "c", "d", "e"] {
+    for name in ["a", "b", "c"] {
         fs::write(fixture.root.join("dir").join(name), name.as_bytes()).expect("entry");
     }
     let fs_cap = fixture.filesystem();
@@ -479,6 +505,7 @@ fn process_spawn_is_isolated_by_owner_and_rejects_forged_handles() {
                 stdout_limit: 64,
                 stderr_limit: 64,
                 total_limit: 64,
+                ..ProcessLimits::default()
             },
         )
         .expect("spawn");
@@ -522,6 +549,7 @@ fn process_deadline_and_cancel_apply_before_and_during_execution() {
                 stdout_limit: 32,
                 stderr_limit: 32,
                 total_limit: 32,
+                ..ProcessLimits::default()
             },
         )
         .expect_err("deadline before spawn");
@@ -540,14 +568,20 @@ fn process_deadline_and_cancel_apply_before_and_during_execution() {
                 stdout_limit: 32,
                 stderr_limit: 32,
                 total_limit: 32,
+                ..ProcessLimits::default()
             },
         )
         .expect("spawn sleep");
+    let pid = spawned.pid;
     fixture.cancel.cancel();
     let error = processes
         .wait(&live, &spawned.handle, Some(2_000))
         .expect_err("cancelled during wait");
     assert_eq!(error_code(&error), "cancelled");
+    assert!(
+        wait_until_pid_gone(pid, Duration::from_secs(2)),
+        "run cancellation left pid {pid} alive"
+    );
 }
 
 #[test]
@@ -570,6 +604,7 @@ fn process_output_is_truncated_and_handles_clean_up_on_drop() {
                 stdout_limit: 16,
                 stderr_limit: 16,
                 total_limit: 16,
+                ..ProcessLimits::default()
             },
         )
         .expect("spawn oversized output");
@@ -590,6 +625,7 @@ fn process_output_is_truncated_and_handles_clean_up_on_drop() {
                 stdout_limit: 8,
                 stderr_limit: 8,
                 total_limit: 8,
+                ..ProcessLimits::default()
             },
         )
         .expect("spawn live");
@@ -748,5 +784,263 @@ fn host_cap_envelope_rejects_invalid_types_without_host_paths() {
         }
         Ok(other) => panic!("expected map envelope, got {other:?}"),
         Err(error) => panic!("expected envelope, got run error {error}"),
+    }
+}
+
+#[test]
+fn committed_token_is_rejected_by_cap_primitives() {
+    let fixture = Fixture::new("committed");
+    fs::write(fixture.root.join("secret.txt"), b"keep").expect("seed");
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect("commit");
+    let error = fs_cap
+        .read_range(&token, "secret.txt", 0, 4)
+        .expect_err("committed");
+    assert_eq!(error_code(&error), "duplicate_close");
+}
+
+#[test]
+fn generation_after_recover_rejects_old_process_handles_and_kills_pid() {
+    let fixture = Fixture::new("recover-gen");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 30_000,
+                stdout_limit: 8,
+                stderr_limit: 8,
+                total_limit: 8,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    assert!(pid_alive(spawned.pid));
+    let recovered = fixture.lifecycle.recover_open_tokens().expect("recover");
+    assert_eq!(recovered.len(), 1);
+    let error = processes
+        .wait(&token, &spawned.handle, Some(1_000))
+        .expect_err("interrupted");
+    assert_eq!(error_code(&error), "interrupted");
+    assert!(wait_until_pid_gone(spawned.pid, Duration::from_secs(2)));
+    let fresh = fixture.token(CapabilityRisk::Execute);
+    let error = processes
+        .poll(&fresh, &spawned.handle, 0, 8)
+        .expect_err("stale generation");
+    assert_eq!(error_code(&error), "process_not_found");
+}
+
+#[test]
+fn listing_enumeration_is_bounded_and_overflow_safe() {
+    let fixture = Fixture::new("list-bound");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    for name in ["a", "b", "c"] {
+        fs::write(fixture.root.join("dir").join(name), name.as_bytes()).expect("entry");
+    }
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let listed = fs_cap.list(&token, "dir", 0, 2).expect("page");
+    assert_eq!(listed.entries.len(), 2);
+    assert!(listed.truncated);
+    let overflow = fs_cap
+        .list(&token, "dir", u64::MAX, 2)
+        .expect("overflow cursor");
+    assert!(overflow.entries.is_empty());
+    assert!(!overflow.truncated);
+}
+
+#[test]
+fn concurrent_cas_writers_serialize_to_one_success() {
+    let fixture = Fixture::new("cas-race");
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Write);
+    fs_cap
+        .write_atomic(&token, "race.txt", "", b"seed")
+        .expect("create");
+    let current = fixture
+        .filesystem()
+        .read_range(&fixture.token(CapabilityRisk::Read), "race.txt", 0, 64)
+        .expect("hash");
+    let expected = current.hash.expect("hash");
+    let left = fs_cap.clone();
+    let right = fs_cap.clone();
+    let expected_left = expected.clone();
+    let expected_right = expected;
+    let token_left = token.clone();
+    let token_right = token.clone();
+    let first =
+        thread::spawn(move || left.write_atomic(&token_left, "race.txt", &expected_left, b"left"));
+    let second = thread::spawn(move || {
+        right.write_atomic(&token_right, "race.txt", &expected_right, b"right")
+    });
+    let results = [first.join().expect("left"), second.join().expect("right")];
+    let wins = results.iter().filter(|result| result.is_ok()).count();
+    let losses = results
+        .iter()
+        .filter(|result| {
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error_code(error) == "cas_mismatch")
+        })
+        .count();
+    assert_eq!(wins, 1);
+    assert_eq!(losses, 1);
+    let body = fs::read(fixture.root.join("race.txt")).expect("body");
+    assert!(body == b"left" || body == b"right");
+
+    let create_left = fs_cap.clone();
+    let create_right = fs_cap.clone();
+    let token_a = token.clone();
+    let token_b = token;
+    let first = thread::spawn(move || create_left.write_atomic(&token_a, "absent.txt", "", b"one"));
+    let second =
+        thread::spawn(move || create_right.write_atomic(&token_b, "absent.txt", "", b"two"));
+    let results = [first.join().expect("a"), second.join().expect("b")];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error_code(error) == "cas_mismatch"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn frozen_workspace_root_does_not_follow_replacement_tree() {
+    let fixture = Fixture::new("frozen-root");
+    fs::write(fixture.root.join("marker.txt"), b"admitted").expect("seed");
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let old = fixture.root.with_extension("admitted");
+    fs::rename(&fixture.root, &old).expect("rename admitted");
+    fs::create_dir(&fixture.root).expect("replacement dir");
+    fs::write(fixture.root.join("marker.txt"), b"replacement").expect("replacement");
+    let result = fs_cap.read_range(&token, "marker.txt", 0, 16);
+    let _ = fs::remove_dir_all(&old);
+    match result {
+        Ok(read) => assert_eq!(read.bytes, b"admitted"),
+        Err(error) => {
+            assert_eq!(error_code(&error), "path_denied");
+            assert!(!error.message().contains("replacement"));
+        }
+    }
+}
+
+#[test]
+fn read_range_permits_window_from_file_larger_than_default_ceiling() {
+    let fixture = Fixture::new("large-range");
+    let size = 8 * 1024 * 1024 + 32;
+    let mut body = vec![0u8; size];
+    body[16..24].copy_from_slice(b"windowed");
+    fs::write(fixture.root.join("huge.bin"), &body).expect("huge");
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let window = fs_cap
+        .read_range(&token, "huge.bin", 16, 8)
+        .expect("bounded window");
+    assert_eq!(window.bytes, b"windowed");
+    assert_eq!(window.offset, 16);
+    assert!(window.truncated);
+    assert_eq!(window.bytes.len(), 8);
+}
+
+#[test]
+fn host_process_ceilings_clamp_caller_timeout() {
+    let fixture = Fixture::new("host-ceil");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 80,
+        stdout_limit: 32,
+        stderr_limit: 32,
+        total_limit: 32,
+        stdin_limit: 8,
+        log_limit: 16,
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let started = Instant::now();
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "5".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 30_000,
+                stdout_limit: 64 * 1024,
+                stderr_limit: 64 * 1024,
+                total_limit: 64 * 1024,
+                stdin_limit: 64 * 1024,
+                log_limit: 64 * 1024,
+            },
+        )
+        .expect("spawn");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(5_000))
+        .expect("wait");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(!snapshot.running);
+    let error = processes
+        .write_stdin(&token, &spawned.handle, &[0; 16])
+        .expect_err("stdin ceiling");
+    assert_eq!(error_code(&error), "budget_exceeded");
+}
+
+#[test]
+fn host_binary_round_trips_fs_and_artifact_bytes() {
+    let fixture = Fixture::new("binary");
+    let payload = vec![0xff, 0x00, 0xfe, b'A'];
+    fs::write(fixture.root.join("bin.dat"), &payload).expect("bin");
+    let fs_cap = fixture.filesystem();
+    let artifacts = fixture.artifacts(ArtifactLimits {
+        max_object_bytes: 32,
+        max_total_bytes: 64,
+        max_objects: 4,
+    });
+    let read_token = fixture.token(CapabilityRisk::Read);
+    let write_token = fixture.token(CapabilityRisk::Write);
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(fixture.lifecycle.clone())),
+        capability_owner: Some(fixture.owner.clone()),
+        filesystem: Some(Arc::new(fs_cap)),
+        processes: Some(Arc::new(fixture.processes())),
+        artifacts: Some(Arc::new(artifacts)),
+        ..AgentHostBridges::default()
+    };
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            let read = cap::fs_read_range("{read_token}", "bin.dat", 0, 8);
+            let put = cap::artifact_put("{write_token}", read.bytes, {{}});
+            cap::artifact_get("{read_token}", put.id)
+        }}
+    "#
+    );
+    let result = AgentRunner::from_source(&source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    let VmValue::Map(fields) = result else {
+        panic!("expected map");
+    };
+    match fields.get(&VmValue::string("bytes")) {
+        Some(VmValue::Bytes(bytes)) => assert_eq!(bytes.as_ref(), payload.as_slice()),
+        other => panic!("expected lossless bytes, got {other:?}"),
     }
 }

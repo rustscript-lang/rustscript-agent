@@ -3,9 +3,13 @@
 //! These operations do not embed model-visible tool names, schemas, or result
 //! formatting. Every effect requires a valid execution token.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use rustscript_vm::{
     ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind, ConfinedFsLimits, ConfinedFsRoot,
-    ConfinedMetadata, EnumerationBudget, MAX_ENUM_ENTRIES,
+    ConfinedMetadata, EnumerationBudget, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_READ_BYTES,
+    MAX_WRITE_BYTES,
 };
 
 use super::hash::content_hash;
@@ -76,10 +80,14 @@ pub struct FilesystemCapability {
     lifecycle: CapabilityLifecycle,
     owner: CapabilityOwner,
     limits: FilesystemLimits,
+    root: Arc<ConfinedFsRoot>,
+    cas_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl FilesystemCapability {
     /// Constructs a filesystem capability. Limits must be positive.
+    ///
+    /// Opens and validates the confined workspace root once at admission.
     pub fn new(
         lifecycle: CapabilityLifecycle,
         owner: CapabilityOwner,
@@ -92,18 +100,30 @@ impl FilesystemCapability {
                 "filesystem limits must be positive",
             ));
         }
+        let root = ConfinedFsRoot::with_limits(
+            lifecycle.workspace(),
+            ConfinedFsLimits {
+                max_read_bytes: MAX_READ_BYTES,
+                max_write_bytes: limits.max_write_bytes.min(MAX_WRITE_BYTES),
+                max_entries: MAX_ENUM_ENTRIES,
+                max_entry_name_bytes: MAX_COMPONENT_BYTES,
+                max_temp_attempts: 32,
+            },
+        )
+        .map_err(map_fs_error)?;
         Ok(Self {
             lifecycle,
             owner,
             limits,
+            root: Arc::new(root),
+            cas_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Stats a workspace-relative path without following a leaf symlink.
     pub fn metadata(&self, token: &str, path: &str) -> Result<FsMetadata, CapabilityError> {
-        let claims = self.authorize(token, CapabilityRisk::Read)?;
-        let root = open_root(&claims)?;
-        let meta = deny_symlink(root.metadata(path).map_err(map_fs_error)?)?;
+        let _claims = self.authorize(token, CapabilityRisk::Read)?;
+        let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
         Ok(FsMetadata {
             file_type: file_type_name(meta.file_type()),
             len: meta.len(),
@@ -118,38 +138,53 @@ impl FilesystemCapability {
         offset: u64,
         limit: usize,
     ) -> Result<FsRead, CapabilityError> {
-        let claims = self.authorize(token, CapabilityRisk::Read)?;
+        let _claims = self.authorize(token, CapabilityRisk::Read)?;
         if limit > self.limits.max_read_bytes {
             return Err(CapabilityError::new(
                 "budget_exceeded",
                 "requested read exceeds the configured bound",
             ));
         }
-        let root = open_root(&claims)?;
-        let meta = deny_symlink(root.metadata(path).map_err(map_fs_error)?)?;
+        let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
         if meta.file_type() != ConfinedFileType::File {
             return Err(CapabilityError::new(
                 "wrong_type",
                 "path is not a regular file",
             ));
         }
-        let contents = root.read_file(path).map_err(map_fs_error)?;
-        let hash = Some(content_hash(&contents));
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        if start >= contents.len() {
+        let file_len = meta.len();
+        let start = offset.min(file_len);
+        let want = u64::try_from(limit).unwrap_or(u64::MAX);
+        let end = start.saturating_add(want).min(file_len);
+        let window_len = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
+        if window_len == 0 {
             return Ok(FsRead {
                 bytes: Vec::new(),
                 offset,
                 truncated: false,
-                hash,
+                hash: Some(bounded_identity(offset, 0, file_len)),
             });
         }
-        let end = start.saturating_add(limit).min(contents.len());
+        let mut file = self.root.open_read(path).map_err(map_fs_error)?;
+        let contents = file.read_to_end().map_err(map_fs_error)?;
+        let read_len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+        let start_idx = usize::try_from(start).unwrap_or(usize::MAX);
+        if start_idx >= contents.len() {
+            return Ok(FsRead {
+                bytes: Vec::new(),
+                offset,
+                truncated: file_len > read_len,
+                hash: Some(identity_for(&contents, start, 0, file_len)),
+            });
+        }
+        let end_idx = start_idx.saturating_add(window_len).min(contents.len());
+        let bytes = contents[start_idx..end_idx].to_vec();
+        let truncated = start.saturating_add(bytes.len() as u64) < file_len;
         Ok(FsRead {
-            bytes: contents[start..end].to_vec(),
+            hash: Some(identity_for(&contents, start, bytes.len(), file_len)),
+            bytes,
             offset,
-            truncated: end < contents.len(),
-            hash,
+            truncated,
         })
     }
 
@@ -161,16 +196,15 @@ impl FilesystemCapability {
         cursor: u64,
         limit: usize,
     ) -> Result<FsList, CapabilityError> {
-        let claims = self.authorize(token, CapabilityRisk::Read)?;
+        let _claims = self.authorize(token, CapabilityRisk::Read)?;
         if limit > self.limits.max_list_entries {
             return Err(CapabilityError::new(
                 "budget_exceeded",
                 "requested listing exceeds the configured bound",
             ));
         }
-        let root = open_root(&claims)?;
         if !path.is_empty() {
-            let meta = deny_symlink(root.metadata(path).map_err(map_fs_error)?)?;
+            let meta = deny_symlink(self.root.metadata(path).map_err(map_fs_error)?)?;
             if meta.file_type() != ConfinedFileType::Directory {
                 return Err(CapabilityError::new(
                     "wrong_type",
@@ -179,10 +213,11 @@ impl FilesystemCapability {
             }
         }
         let budget = EnumerationBudget {
-            max_entries: MAX_ENUM_ENTRIES,
-            max_name_bytes: 255,
+            max_entries: listing_entry_budget(cursor, limit, self.limits.max_list_entries),
+            max_name_bytes: MAX_COMPONENT_BYTES,
         };
-        let mut entries = root
+        let mut entries = self
+            .root
             .enumerate_with_budget(path, budget)
             .map_err(map_fs_error)?;
         entries.retain(|entry| entry.name() != "." && entry.name() != "..");
@@ -218,15 +253,29 @@ impl FilesystemCapability {
         expected_hash: &str,
         bytes: &[u8],
     ) -> Result<FsWrite, CapabilityError> {
-        let claims = self.authorize(token, CapabilityRisk::Write)?;
+        let _claims = self.authorize(token, CapabilityRisk::Write)?;
         if bytes.len() > self.limits.max_write_bytes {
             return Err(CapabilityError::new(
                 "budget_exceeded",
                 "requested write exceeds the configured bound",
             ));
         }
-        let root = open_root(&claims)?;
-        match root.metadata(path) {
+        let lock = self.lock_for(path);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.validate_expected_hash(path, expected_hash)?;
+        self.root.write_file(path, bytes).map_err(map_fs_error)?;
+        Ok(FsWrite {
+            hash: content_hash(bytes),
+            len: bytes.len(),
+        })
+    }
+
+    fn validate_expected_hash(
+        &self,
+        path: &str,
+        expected_hash: &str,
+    ) -> Result<(), CapabilityError> {
+        match self.root.metadata(path) {
             Ok(meta) => {
                 if meta.file_type() == ConfinedFileType::Symlink {
                     return Err(CapabilityError::new(
@@ -246,7 +295,7 @@ impl FilesystemCapability {
                         "destination is not a regular file",
                     ));
                 }
-                let current = root.read_file(path).map_err(map_fs_error)?;
+                let current = self.root.read_file(path).map_err(map_fs_error)?;
                 if content_hash(&current) != expected_hash {
                     return Err(CapabilityError::new(
                         "cas_mismatch",
@@ -264,11 +313,18 @@ impl FilesystemCapability {
             }
             Err(error) => return Err(map_fs_error(error)),
         }
-        root.write_file(path, bytes).map_err(map_fs_error)?;
-        Ok(FsWrite {
-            hash: content_hash(bytes),
-            len: bytes.len(),
-        })
+        Ok(())
+    }
+
+    fn lock_for(&self, path: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .cas_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(path.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
@@ -278,9 +334,28 @@ impl FilesystemCapability {
     }
 }
 
-fn open_root(claims: &TokenClaims) -> Result<ConfinedFsRoot, CapabilityError> {
-    ConfinedFsRoot::with_limits(&claims.workspace, ConfinedFsLimits::default())
-        .map_err(map_fs_error)
+fn listing_entry_budget(cursor: u64, limit: usize, max_list_entries: usize) -> usize {
+    let page = limit.min(max_list_entries);
+    let start = usize::try_from(cursor).unwrap_or(usize::MAX);
+    let observe = start
+        .saturating_add(page)
+        .saturating_add(1)
+        .saturating_add(2);
+    let cap = max_list_entries.saturating_add(3);
+    observe.min(cap)
+}
+
+fn identity_for(contents: &[u8], offset: u64, window_len: usize, file_len: u64) -> String {
+    let read_len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+    if read_len == file_len {
+        content_hash(contents)
+    } else {
+        bounded_identity(offset, window_len, file_len)
+    }
+}
+
+fn bounded_identity(offset: u64, window_len: usize, file_len: u64) -> String {
+    format!("range:{offset}:{window_len}:{file_len}")
 }
 
 fn deny_symlink(meta: ConfinedMetadata) -> Result<ConfinedMetadata, CapabilityError> {

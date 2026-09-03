@@ -9,21 +9,25 @@ use std::time::{Duration, Instant};
 
 use rustscript_vm::{
     BoundedProcess, BoundedProcessError, BoundedProcessHandle, BoundedProcessRequest,
-    CancellationToken as ProcessCancel, ConfinedFsLimits, ConfinedFsRoot, ProcessStatus,
+    CancellationToken as ProcessCancel, ConfinedFsLimits, ConfinedFsRoot, MAX_COMPONENT_BYTES,
+    MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES, ProcessStatus,
 };
 
 use super::lifecycle::CapabilityLifecycle;
-use super::types::{CapabilityError, CapabilityOwner, CapabilityRisk, TokenClaims};
+use super::types::{CapabilityError, CapabilityOwner, CapabilityRisk, LifecycleError, TokenClaims};
 
 const ALLOWED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TZ", "USER", "TERM"];
 
-/// Per-spawn resource ceilings.
+/// Per-spawn resource ceilings. Host values are admitted ceilings; caller
+/// arguments may only reduce them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessLimits {
     pub timeout_ms: u64,
     pub stdout_limit: usize,
     pub stderr_limit: usize,
     pub total_limit: usize,
+    pub stdin_limit: usize,
+    pub log_limit: usize,
 }
 
 impl Default for ProcessLimits {
@@ -33,6 +37,8 @@ impl Default for ProcessLimits {
             stdout_limit: 64 * 1024,
             stderr_limit: 64 * 1024,
             total_limit: 64 * 1024,
+            stdin_limit: 64 * 1024,
+            log_limit: 64 * 1024,
         }
     }
 }
@@ -65,6 +71,8 @@ struct OwnedProcess {
 struct ProcessInner {
     lifecycle: CapabilityLifecycle,
     owner: CapabilityOwner,
+    host_limits: ProcessLimits,
+    root: ConfinedFsRoot,
     table: Mutex<HashMap<String, OwnedProcess>>,
 }
 
@@ -75,8 +83,7 @@ impl Drop for ProcessInner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for owned in table.values() {
-            owned.cancel.cancel();
-            owned.handle.cancel();
+            terminate_owned(owned);
         }
         table.clear();
     }
@@ -89,15 +96,41 @@ pub struct ProcessCapability {
 }
 
 impl ProcessCapability {
-    /// Constructs an empty run-scoped process table.
+    /// Constructs an empty run-scoped process table with admitted host ceilings.
     pub fn new(
         lifecycle: CapabilityLifecycle,
         owner: CapabilityOwner,
+        host_limits: ProcessLimits,
     ) -> Result<Self, CapabilityError> {
+        if host_limits.timeout_ms == 0
+            || host_limits.stdout_limit == 0
+            || host_limits.stderr_limit == 0
+            || host_limits.total_limit == 0
+            || host_limits.stdin_limit == 0
+            || host_limits.log_limit == 0
+        {
+            return Err(CapabilityError::new(
+                "invalid_configuration",
+                "process limits must be positive",
+            ));
+        }
+        let root = ConfinedFsRoot::with_limits(
+            lifecycle.workspace(),
+            ConfinedFsLimits {
+                max_read_bytes: MAX_READ_BYTES,
+                max_write_bytes: MAX_WRITE_BYTES,
+                max_entries: MAX_ENUM_ENTRIES,
+                max_entry_name_bytes: MAX_COMPONENT_BYTES,
+                max_temp_attempts: 32,
+            },
+        )
+        .map_err(|error| CapabilityError::new("path_denied", error.to_string()))?;
         Ok(Self {
             inner: Arc::new(ProcessInner {
                 lifecycle,
                 owner,
+                host_limits,
+                root,
                 table: Mutex::new(HashMap::new()),
             }),
         })
@@ -119,9 +152,10 @@ impl ProcessCapability {
                 "argv must not be empty",
             ));
         }
-        let root = ConfinedFsRoot::with_limits(&claims.workspace, ConfinedFsLimits::default())
-            .map_err(|error| CapabilityError::new("path_denied", error.to_string()))?;
-        let directory = root
+        let limits = self.clamp_limits(limits, &claims);
+        let directory = self
+            .inner
+            .root
             .open_directory(cwd)
             .map_err(|error| CapabilityError::new("path_denied", error.to_string()))?;
         let cancel = ProcessCancel::new();
@@ -172,7 +206,12 @@ impl ProcessCapability {
     ) -> Result<ProcessSnapshot, CapabilityError> {
         let owned = self.lookup(token, handle)?;
         let _ = owned.handle.poll().map_err(map_process_error)?;
-        Ok(snapshot(&owned.handle, handle, cursor, limit))
+        Ok(snapshot(
+            &owned.handle,
+            handle,
+            cursor,
+            limit.min(self.inner.host_limits.log_limit),
+        ))
     }
 
     /// Waits until exit, caller timeout, deadline, or cancellation.
@@ -183,12 +222,18 @@ impl ProcessCapability {
         timeout_ms: Option<u64>,
     ) -> Result<ProcessSnapshot, CapabilityError> {
         let owned = self.lookup(token, handle)?;
+        let timeout_ms = timeout_ms.map(|ms| ms.min(self.inner.host_limits.timeout_ms));
         let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         match owned.handle.wait(deadline) {
             Ok(_) | Err(BoundedProcessError::DeadlineElapsed) => {}
             Err(error) => return Err(map_process_error(error)),
         }
-        Ok(snapshot(&owned.handle, handle, 0, usize::MAX))
+        Ok(snapshot(
+            &owned.handle,
+            handle,
+            0,
+            self.inner.host_limits.log_limit,
+        ))
     }
 
     /// Returns a bounded log window.
@@ -200,7 +245,12 @@ impl ProcessCapability {
         limit: usize,
     ) -> Result<ProcessSnapshot, CapabilityError> {
         let owned = self.lookup(token, handle)?;
-        Ok(snapshot(&owned.handle, handle, cursor, limit))
+        Ok(snapshot(
+            &owned.handle,
+            handle,
+            cursor,
+            limit.min(self.inner.host_limits.log_limit),
+        ))
     }
 
     /// Writes bytes to child stdin.
@@ -211,6 +261,12 @@ impl ProcessCapability {
         bytes: &[u8],
     ) -> Result<(), CapabilityError> {
         let owned = self.lookup(token, handle)?;
+        if bytes.len() > self.inner.host_limits.stdin_limit {
+            return Err(CapabilityError::new(
+                "budget_exceeded",
+                "stdin write exceeds the configured bound",
+            ));
+        }
         owned.handle.write_stdin(bytes).map_err(map_process_error)?;
         Ok(())
     }
@@ -224,16 +280,49 @@ impl ProcessCapability {
     /// Kills the process tree bound to `handle`.
     pub fn kill(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
         let owned = self.lookup(token, handle)?;
-        owned.cancel.cancel();
-        owned.handle.cancel();
+        terminate_owned(&owned);
         Ok(())
     }
 
+    /// Cancels every owned child with the same process-tree path as [`Self::kill`].
+    pub fn cancel_all(&self) {
+        let owned: Vec<OwnedProcess> = self
+            .inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|owned| OwnedProcess {
+                owner_key: owned.owner_key.clone(),
+                generation: owned.generation,
+                handle: owned.handle.clone(),
+                cancel: owned.cancel.clone(),
+            })
+            .collect();
+        for process in owned {
+            terminate_owned(&process);
+        }
+    }
+
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
-        self.inner
+        match self
+            .inner
             .lifecycle
             .authorize(&self.inner.owner, token, risk)
-            .map_err(CapabilityError::from)
+        {
+            Ok(claims) => Ok(claims),
+            Err(error) => {
+                if matches!(
+                    error,
+                    LifecycleError::Cancelled
+                        | LifecycleError::DeadlineElapsed
+                        | LifecycleError::Interrupted
+                ) {
+                    self.cancel_all();
+                }
+                Err(CapabilityError::from(error))
+            }
+        }
     }
 
     fn lookup(&self, token: &str, handle: &str) -> Result<OwnedProcess, CapabilityError> {
@@ -259,6 +348,35 @@ impl ProcessCapability {
             cancel: owned.cancel.clone(),
         })
     }
+
+    fn clamp_limits(&self, caller: ProcessLimits, claims: &TokenClaims) -> ProcessLimits {
+        let host = self.inner.host_limits;
+        let remaining_ms = u64::try_from(
+            claims
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let timeout_ms = caller
+            .timeout_ms
+            .min(host.timeout_ms)
+            .min(remaining_ms)
+            .max(1);
+        ProcessLimits {
+            timeout_ms,
+            stdout_limit: caller.stdout_limit.min(host.stdout_limit).max(1),
+            stderr_limit: caller.stderr_limit.min(host.stderr_limit).max(1),
+            total_limit: caller.total_limit.min(host.total_limit).max(1),
+            stdin_limit: caller.stdin_limit.min(host.stdin_limit).max(1),
+            log_limit: caller.log_limit.min(host.log_limit).max(1),
+        }
+    }
+}
+
+fn terminate_owned(owned: &OwnedProcess) {
+    owned.cancel.cancel();
+    let _ = owned.handle.shutdown();
 }
 
 fn snapshot(handle: &BoundedProcessHandle, id: &str, cursor: u64, limit: usize) -> ProcessSnapshot {
