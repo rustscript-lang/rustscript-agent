@@ -18,7 +18,7 @@ use axum::{
     routing::post,
 };
 use futures_util::StreamExt;
-use rustscript_agent::config::TelegramConfig;
+use rustscript_agent::config::{RunLimits, TelegramConfig};
 use rustscript_agent::gateway::telegram::{TelegramApi, TelegramError};
 use rustscript_agent::service::AdmitRunRequest;
 use serde_json::{Value, json};
@@ -768,14 +768,35 @@ fn last_poll_offset(state: &FixtureState) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
+fn telegram_workspace() -> std::path::PathBuf {
+    let dir = telegram_test_root()
+        .join("workspaces")
+        .join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir).expect("telegram test workspace should be created");
+    dir
+}
+
 fn test_state(
     source: &str,
     db_path: &std::path::Path,
     overrides: impl FnOnce(AgentGatewayConfig) -> AgentGatewayConfig,
 ) -> AgentGatewayState {
     let config = overrides(AgentGatewayConfig::default());
-    AgentGatewayState::with_agent_source_and_sqlite(config, source, db_path)
-        .expect("SQLite state should open")
+    let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, db_path)
+        .expect("SQLite state should open");
+    // Exclusive artifact flocks are keyed by RunLimits.workspace_root.
+    // Default limits share cwd, so an in-process restart collides with a
+    // parked phase-1 worker. Unique workspaces restore the two-process
+    // crash semantics this suite simulates.
+    let workspace = telegram_workspace();
+    state
+        .service()
+        .set_run_limits(
+            RunLimits::new(64, 128, 1024 * 1024, &workspace)
+                .expect("telegram test workspace should validate"),
+        )
+        .expect("telegram test run limits should apply");
+    state
 }
 
 async fn spawn_adapter(state: AgentGatewayState, config: TelegramConfig) -> TelegramAdapter {
@@ -1444,9 +1465,19 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
         1,
         "the new run must complete: {sends:?}"
     );
+    assert_eq!(
+        sends
+            .iter()
+            .filter(|text| text.starts_with("[failed]"))
+            .count(),
+        1,
+        "only the recovered interrupted run should fail: {sends:?}"
+    );
     assert!(
-        !sends.iter().any(|text| text.contains("already active")),
-        "the gate must be released before the new message arrives: {sends:?}"
+        !sends
+            .iter()
+            .any(|text| text.contains("artifact_store_busy") || text.contains("already active")),
+        "the resumed follow-up run must not collide on the parked worker's artifact flock or the session gate: {sends:?}"
     );
     adapter2.shutdown().await;
     let _ = release_tx.send(());
