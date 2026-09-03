@@ -415,23 +415,63 @@ pub(crate) fn typed_fail(code: &str, message: &str) -> JsonValue {
     })
 }
 
+const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
+    "setup",
+    "config",
+    "adapter_unavailable",
+    "malformed_payload",
+    "scripted_exhausted",
+    "cancelled",
+    "deadline_elapsed",
+    "dispatcher_missing",
+    "adapter_failed",
+    "unsupported_parallel",
+    "unsupported_task",
+    "provider_step_persist_failed",
+    "interrupted_provider",
+    "corrupt_provider_step",
+    "run_terminal",
+    "missing_tool_parent",
+];
+
+const TRANSIENT_ERROR_CODES: &[&str] = &[
+    "unavailable",
+    "timeout",
+    "rate_limited",
+    "overloaded",
+    "transport",
+];
+
+fn is_non_retryable_error_code(code: &str) -> bool {
+    NON_RETRYABLE_ERROR_CODES.contains(&code)
+}
+
 pub(crate) fn error_is_retryable_code(code: &str) -> bool {
-    !matches!(
-        code,
-        "setup"
-            | "config"
-            | "adapter_unavailable"
-            | "malformed_payload"
-            | "scripted_exhausted"
-            | "cancelled"
-            | "deadline_elapsed"
-            | "dispatcher_missing"
-            | "adapter_failed"
-            | "unsupported_parallel"
-            | "unsupported_task"
-            | "provider_step_persist_failed"
-            | "interrupted_provider"
-    )
+    if is_non_retryable_error_code(code) {
+        return false;
+    }
+    TRANSIENT_ERROR_CODES.contains(&code)
+}
+
+pub(crate) fn provider_error_is_retryable(error: &JsonValue) -> bool {
+    let code = error.get("code").and_then(JsonValue::as_str).unwrap_or("");
+    if is_non_retryable_error_code(code) {
+        return false;
+    }
+    if let Some(flag) = error.get("retryable").and_then(JsonValue::as_bool) {
+        return flag;
+    }
+    if error_is_retryable_code(code) {
+        return true;
+    }
+    let status = error.get("status").and_then(JsonValue::as_u64).unwrap_or(0);
+    let error_type = error.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    matches!(status, 408 | 429)
+        || (500..=599).contains(&status)
+        || matches!(
+            error_type,
+            "rate_limit_error" | "overloaded_error" | "server_error" | "timeout_error"
+        )
 }
 
 fn error_type_for(code: &str) -> &'static str {

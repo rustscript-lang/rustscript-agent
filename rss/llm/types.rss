@@ -117,6 +117,27 @@ pub fn error_new(
     if code == "scripted_exhausted" {
         retryable = false;
     }
+    if code == "corrupt_provider_step" {
+        retryable = false;
+    }
+    if code == "run_terminal" {
+        retryable = false;
+    }
+    if code == "missing_tool_parent" {
+        retryable = false;
+    }
+    if code == "cancelled" {
+        retryable = false;
+    }
+    if code == "deadline_elapsed" {
+        retryable = false;
+    }
+    if code == "provider_step_persist_failed" {
+        retryable = false;
+    }
+    if code == "interrupted_provider" {
+        retryable = false;
+    }
     {
         status: status,
         type: error_type,

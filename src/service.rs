@@ -1378,13 +1378,14 @@ impl AgentService {
         run.events.iter().any(|event| event.event_id == event_id)
     }
 
-    pub(crate) fn persist_retryable_provider_failure(
+    pub(crate) fn persist_provider_failure(
         &self,
         run_id: &str,
         turn: u64,
         attempt: u64,
         code: &str,
         status: Option<u64>,
+        retryable: bool,
     ) -> Result<(), EventCommitError> {
         let event_id = durable_provider_event_id(run_id, turn, &format!("model.failed:{attempt}"));
         let bounded_code = truncate_for_log(code, 64);
@@ -1392,7 +1393,7 @@ impl AgentService {
             "turn": turn,
             "attempt": attempt,
             "error_code": bounded_code,
-            "retryable": true,
+            "retryable": retryable,
         });
         if let Some(status) = status {
             payload["status"] = json!(status);

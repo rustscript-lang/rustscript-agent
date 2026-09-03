@@ -782,6 +782,35 @@ fn loop_non_retryable_provider_error_fails_without_retry() {
 }
 
 #[test]
+fn loop_structural_commit_replay_errors_are_not_retryable() {
+    for code in [
+        "corrupt_provider_step",
+        "run_terminal",
+        "missing_tool_parent",
+        "cancelled",
+    ] {
+        let provider = ScriptedProvider::new();
+        provider.push_error(provider_error_with_retryable(
+            0,
+            "api_error",
+            code,
+            "structural",
+            true,
+        ));
+        provider.push_ok(text_response("should not run"));
+        let runner = loop_runner_with(provider.clone(), None);
+        let decision = decide(
+            &runner,
+            run_context(3, 8, loop_config(false, false), json!([])),
+        );
+        assert_eq!(decision["kind"], json!("run.failed"), "{code}: {decision}");
+        assert_eq!(decision["error"]["code"], json!(code), "{code}: {decision}");
+        assert_eq!(provider.call_count(), 1, "{code}");
+        assert!(runner.recorded_sleeps().is_empty(), "{code}");
+    }
+}
+
+#[test]
 fn loop_max_turns_is_enforced() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response(

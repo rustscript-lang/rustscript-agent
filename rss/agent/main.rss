@@ -178,6 +178,15 @@ fn error_is_retryable(error: map) -> bool {
     if code == "deadline_elapsed" {
         decided = true;
     }
+    if code == "corrupt_provider_step" {
+        decided = true;
+    }
+    if code == "run_terminal" {
+        decided = true;
+    }
+    if code == "missing_tool_parent" {
+        decided = true;
+    }
     if decided == false {
         if error.has("retryable") {
             if type(error["retryable"]) == "bool" {
