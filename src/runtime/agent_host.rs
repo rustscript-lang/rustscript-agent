@@ -17,6 +17,10 @@ use rustscript_vm::{
 use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
+use crate::capabilities::{
+    CapabilityLifecycle, CapabilityOwner, LifecycleError, parse_prepare_metadata, tool_commit,
+    tool_prepare,
+};
 use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
 use crate::tools::{DispatchContext, ToolResult};
@@ -25,6 +29,8 @@ const PROVIDER_CALL: &str = "agent::provider_call";
 const TOOL_DISPATCH: &str = "agent::tool_dispatch";
 const SLEEP_MS: &str = "agent::sleep_ms";
 const CONTROL_CHECK: &str = "agent::control_check";
+const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
+const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
 
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
@@ -57,6 +63,19 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         builder.function(HostFunctionSchema::with_return(
             CONTROL_CHECK,
             vec![],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            TOOL_PREPARE,
+            vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            TOOL_COMMIT,
+            vec![
+                HostParamSchema::value("execution_token", HostTypeSchema::String),
+                HostParamSchema::value("result", HostTypeSchema::Unknown),
+            ],
             response,
         ));
         Arc::new(builder.build().expect("agent host catalog must build"))
@@ -107,6 +126,8 @@ pub struct AgentHostBridges {
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
     pub metrics: Option<Arc<Metrics>>,
+    pub lifecycle: Option<Arc<CapabilityLifecycle>>,
+    pub capability_owner: Option<CapabilityOwner>,
 }
 
 /// Per-VM state installed before `run(context)`.
@@ -118,6 +139,8 @@ pub struct AgentHostState {
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
     pub metrics: Option<Arc<Metrics>>,
+    pub lifecycle: Option<Arc<CapabilityLifecycle>>,
+    pub capability_owner: Option<CapabilityOwner>,
 }
 
 impl AgentHostState {
@@ -136,6 +159,37 @@ impl AgentHostState {
             return error;
         }
         normalize_provider_envelope(self.provider.call(request, &self.cancellation))
+    }
+
+    fn capability_prepare(&self, metadata: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        match parse_prepare_metadata(metadata) {
+            Ok(metadata) => tool_prepare(lifecycle, owner, metadata),
+            Err(error) => crate::capabilities::host::error_envelope(&error),
+        }
+    }
+
+    fn capability_commit(&self, token: &str, result: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        tool_commit(lifecycle, owner, token, result.clone())
     }
 
     fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
@@ -338,6 +392,8 @@ pub fn register_agent_host_functions(
     register_named(registry, catalog, TOOL_DISPATCH, 1, tool_dispatch_adapter)?;
     register_named(registry, catalog, SLEEP_MS, 1, sleep_ms_adapter)?;
     register_named(registry, catalog, CONTROL_CHECK, 0, control_check_adapter)?;
+    register_named(registry, catalog, TOOL_PREPARE, 1, tool_prepare_adapter)?;
+    register_named(registry, catalog, TOOL_COMMIT, 2, tool_commit_adapter)?;
     Ok(())
 }
 
@@ -386,6 +442,22 @@ fn control_check_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> 
         .control_error()
         .unwrap_or_else(|| json!({"ok": true, "error": {}}));
     return_json(result)
+}
+
+fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let metadata = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_prepare(&vm_value_to_json(&metadata)))
+}
+
+fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let token = match args.first() {
+        Some(Value::String(value)) => value.to_string(),
+        _ => String::new(),
+    };
+    let result = args.get(1).cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_commit(&token, &vm_value_to_json(&result)))
 }
 
 fn installed_state(vm: &mut Vm) -> VmResult<AgentHostState> {
