@@ -190,6 +190,105 @@ page bounds.
 | `RUN_EPOCH_DEADLINE_TICKS` | 1 000 000 000 | Epoch budget granted to one cancellable run; the cancellation watcher jumps the epoch past it. |
 | `RUN_EPOCH_CHECK_INTERVAL` | 1 000 | Interpreter operations between epoch checks on cancellable runs. |
 
+## Coding tools and serial loop
+
+The library `AgentService` worker compiles bundled `rss/agent/main.rss` and
+drives a **serial** native tool loop. RSS builds canonical provider requests
+and dispatches tools only through the native host bridges
+(`agent::provider_call`, `agent::tool_dispatch`). This is not an
+OpenAI-compatible inference path.
+
+Built-in native tools, in registry order:
+
+| Name | Toolset | Risk | Notes |
+| --- | --- | --- | --- |
+| `read_file` | coding | read | Bounded workspace file read. |
+| `search_files` | coding | read | Bounded workspace search. |
+| `write_file` | coding | write | Write complete workspace file contents. |
+| `patch` | coding | write | Minimal unique-string replacement. |
+| `terminal` | process | process | Direct `argv` execution; no shell command string. |
+| `process` | process | process | Background/control sibling of `terminal`. |
+
+Parallel tool calls are rejected (`unsupported_parallel`). Subagents and A6
+parallel fan-out are out of scope.
+
+## Workspace guidance, priority, and budgets
+
+Admission freezes one coding system prompt from the run workspace. Root-level
+guidance files are read in this priority, highest first: `AGENTS.md`,
+`CLAUDE.md`, `.cursorrules`. Default `CodingPromptBudgets` are 16 KiB total
+prompt, 8 KiB combined guidance, and 4 KiB per guidance file. Each admitted
+file is length-prefixed as untrusted content so project bytes cannot forge
+later contract sections. The frozen prompt is reused as the sole system
+message on every subsequent provider request for that run.
+
+## Provider profiles
+
+`ProviderProfile` is a validated, secret-safe snapshot retained on
+`AgentService`. Built-in names map protocol labels only (`local-agent` →
+`local-agent`, `openai` / `openai-compatible` → `openai-chat-completions`).
+Options are request-shaping controls (`profile`, `protocol`,
+`reasoning_effort`, `base_url`, sampling numbers). Credential-bearing keys,
+headers, and unsafe URLs are rejected rather than redacted. Profiles do not
+grant network access; HTTP remains deny-by-default unless hosts **and** ports
+are allowlisted.
+
+## Run limits, deadline, and cancellation
+
+`RunLimits` (`max_turns`, `max_tool_calls`, `max_tool_output_bytes`,
+`workspace_root`) are captured at admission. `workspace_root` must be an
+absolute existing directory and is canonicalized. `AgentGatewayConfig.run_timeout`
+is the per-run wall-clock deadline; it is not reset per provider or tool
+call. `stop` requests cooperative cancellation once: the provider call, RSS
+run, and native process/terminal children share the run token.
+`cancellation_grace` bounds how long the worker waits after a deadline before
+the thread is abandoned. Client-disconnect policy is independent
+(`keep-running` by default).
+
+## Durable replay
+
+Native dispatch is durable-first. Assistant `tool_call` parents and user
+`tool_result` messages carry `parent_message_id` and monotonic `ordinal`
+values. A missing or name-mismatched parent fails closed (`missing_tool_parent`)
+and does not run the executor. Replaying an already durable `ToolResult` does
+not re-account metrics. Pending provider effects fail closed rather than
+retrying after a persist failure.
+
+## Coding metrics
+
+Five saturating coding-agent counters are recorded without prompts, paths, or
+raw outputs:
+
+| Metric | Prometheus name | Counted when |
+| --- | --- | --- |
+| `model_calls` | `agent_model_calls_total` | Each actual `AgentProviderHost::call` |
+| `tool_calls` | `agent_tool_calls_total` | Each freshly executed or failed tool dispatch |
+| `tool_failures` | `agent_tool_failures_total` | Canonical `ToolResult.ok == false` |
+| `turns` | `agent_turns_total` | Successful `ok: true` provider envelopes |
+| `truncations` | `agent_truncations_total` | Typed `truncated` on a model envelope or tool result |
+
+## Security confinement
+
+Coding file tools and `terminal`/`process` are confined to the admitted
+`workspace_root`. `terminal` executes `argv` directly; a `command` shell
+string is rejected (`invalid_argv`). Default HTTP policy denies all hosts and
+ports. The coding loop E2E uses `ScriptedProvider` as model transport and the
+`local-agent` profile so it cannot fall through to an OpenAI-compatible
+network adapter.
+
+## Local coding-agent E2E
+
+The main real coding workflow is covered by:
+
+```bash
+cargo test --test coding_agent_e2e_tests
+```
+
+That suite generates a temporary git workspace, drives the production
+`AgentService` worker and bundled RSS loop, and asserts a real `read_file` →
+`patch` → `terminal` argv test run. It does not cover stop-during-output edge
+paths.
+
 ## Secrets
 
 - `RUSTSCRIPT_AGENT_BEARER_TOKEN` and `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`
