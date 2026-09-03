@@ -4309,17 +4309,25 @@ fn map_event_commit_error(error: EventCommitError) -> LifecycleError {
 }
 
 fn canonical_tool_result(result: &JsonValue) -> Result<ToolResult, LifecycleError> {
-    let ok = result
-        .get("ok")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
+    let ok = match result.get("ok") {
+        Some(JsonValue::Bool(ok)) => *ok,
+        _ => {
+            return Err(LifecycleError::InvalidMetadata(
+                "`ok` is required".to_string(),
+            ));
+        }
+    };
     if ok {
+        let content = result
+            .get("content")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                LifecycleError::InvalidMetadata(
+                    "success result requires string `content`".to_string(),
+                )
+            })?;
         let mut tool_result = ToolResult::success(
-            result
-                .get("content")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("")
-                .to_string(),
+            content.to_string(),
             result.get("data").cloned().unwrap_or_else(|| json!({})),
         );
         tool_result.truncated = result
@@ -4339,12 +4347,34 @@ fn canonical_tool_result(result: &JsonValue) -> Result<ToolResult, LifecycleErro
         let code = error
             .and_then(|value| value.get("code"))
             .and_then(JsonValue::as_str)
-            .unwrap_or("tool_failed");
+            .filter(|code| !code.is_empty())
+            .ok_or_else(|| {
+                LifecycleError::InvalidMetadata(
+                    "failure result requires string `error.code`".to_string(),
+                )
+            })?;
         let message = error
             .and_then(|value| value.get("message"))
             .and_then(JsonValue::as_str)
             .unwrap_or("tool failed");
-        Ok(ToolResult::failure(code, message))
+        let content = result
+            .get("content")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        let data = result.get("data").cloned().unwrap_or_else(|| json!({}));
+        let truncated = result
+            .get("truncated")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let mut tool_result = ToolResult::failure_with(code, message, content, data, truncated);
+        if let Some(artifacts) = result.get("artifacts").and_then(JsonValue::as_array) {
+            tool_result.artifacts = artifacts
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+        Ok(tool_result)
     }
 }
 

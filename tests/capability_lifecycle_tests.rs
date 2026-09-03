@@ -1040,3 +1040,252 @@ fn host_panic_after_prepare_interrupts_open_token() {
     assert_eq!(durable.interrupted(), ["call-1"]);
     assert_eq!(log.snapshot(), ["started", "token", "interrupted"]);
 }
+
+struct FailResultDurable {
+    inner: Arc<MemoryDurable>,
+    attempts: Mutex<u64>,
+}
+
+impl FailResultDurable {
+    fn new(inner: Arc<MemoryDurable>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            attempts: Mutex::new(0),
+        })
+    }
+
+    fn attempts(&self) -> u64 {
+        *self.attempts.lock().expect("attempts")
+    }
+}
+
+impl DurableToolLifecycle for FailResultDurable {
+    fn assert_active_run(&self, run_id: &str) -> Result<(), LifecycleError> {
+        self.inner.assert_active_run(run_id)
+    }
+
+    fn prepare_parent(
+        &self,
+        run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Result<(), LifecycleError> {
+        self.inner.prepare_parent(run_id, call_id, tool_name)
+    }
+
+    fn replay_result(
+        &self,
+        run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        self.inner.replay_result(run_id, call_id, tool_name)
+    }
+
+    fn commit_started(&self, record: &DurableStarted) -> Result<(), LifecycleError> {
+        self.inner.commit_started(record)
+    }
+
+    fn commit_result(&self, _call_id: &str, _result: &Value) -> Result<Value, LifecycleError> {
+        *self.attempts.lock().expect("attempts") += 1;
+        self.inner.log.push("result");
+        Err(LifecycleError::ResultCommitFailed(
+            "injected result failure".to_string(),
+        ))
+    }
+
+    fn interrupt(&self, call_id: &str) -> Result<(), LifecycleError> {
+        self.inner.interrupt(call_id)
+    }
+}
+
+fn engine_with_durable(
+    log: Arc<SequenceLog>,
+    durable: Arc<dyn DurableToolLifecycle>,
+) -> CapabilityLifecycle {
+    CapabilityLifecycle::builder()
+        .owner(owner())
+        .registry_identity("registry-a")
+        .workspace("/tmp/workspace-a")
+        .limits(LifecycleLimits {
+            max_tool_calls: 8,
+            max_output_bytes: 4096,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(10_000)
+        .clock(Arc::clone(&ScriptedClock::new(1_000)) as Arc<dyn LifecycleClock>)
+        .tokens(LoggingIssuer::new(log) as Arc<dyn TokenIssuer>)
+        .durable(durable)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .generation(1)
+        .build()
+        .expect("lifecycle")
+}
+
+#[test]
+fn failed_durable_result_commit_fences_retry_and_same_call_prepare() {
+    let log = SequenceLog::new();
+    let inner = MemoryDurable::new(Arc::clone(&log));
+    let durable = FailResultDurable::new(Arc::clone(&inner));
+    let lifecycle = engine_with_durable(
+        Arc::clone(&log),
+        Arc::clone(&durable) as Arc<dyn DurableToolLifecycle>,
+    );
+    let token = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-1", "fixture_only_tool"))
+            .expect("prepare"),
+    );
+    let error = lifecycle
+        .commit(&owner(), &token, json!({"ok": true, "content": "done"}))
+        .expect_err("durable result commit must fail closed");
+    assert_eq!(
+        error,
+        LifecycleError::ResultCommitFailed("injected result failure".to_string())
+    );
+    assert_eq!(durable.attempts(), 1);
+    assert!(
+        inner
+            .replay_result("run-a", "call-1", "fixture_only_tool")
+            .expect("replay lookup")
+            .is_none()
+    );
+
+    let retry = lifecycle
+        .commit(&owner(), &token, json!({"ok": true, "content": "retry"}))
+        .expect_err("retry commit must not execute after eager close");
+    assert_eq!(retry, LifecycleError::DuplicateClose);
+    assert_eq!(durable.attempts(), 1);
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &token, CapabilityRisk::Read)
+            .expect_err("closed token must not authorize effects"),
+        LifecycleError::DuplicateClose
+    );
+
+    let error = lifecycle
+        .prepare(&owner(), metadata("call-1", "fixture_only_tool"))
+        .expect_err("same-call prepare must not issue another token");
+    assert_eq!(error, LifecycleError::UnresolvedCall);
+    assert_eq!(log.snapshot(), ["started", "token", "result"]);
+    assert_eq!(inner.started_records().len(), 1);
+}
+
+#[test]
+fn terminal_token_states_fence_same_call_prepare_without_durable_replay() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+
+    lifecycle
+        .prepare(&owner(), metadata("open-call", "fixture_only_tool"))
+        .expect("open token");
+    assert_eq!(
+        lifecycle
+            .prepare(&owner(), metadata("open-call", "fixture_only_tool"))
+            .expect_err("Open fences prepare"),
+        LifecycleError::UnresolvedCall
+    );
+
+    let committed = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("committed-call", "fixture_only_tool"))
+            .expect("committed prepare"),
+    );
+    lifecycle
+        .commit(&owner(), &committed, json!({"ok": true, "content": "done"}))
+        .expect("successful commit has durable replay");
+    assert_eq!(
+        lifecycle
+            .prepare(&owner(), metadata("committed-call", "fixture_only_tool"))
+            .expect("Committed with durable replay must replay"),
+        PrepareOutcome::Replay {
+            result: json!({"ok": true, "content": "done"}),
+        }
+    );
+
+    let interrupted = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("interrupted-call", "fixture_only_tool"))
+            .expect("interrupted prepare"),
+    );
+    lifecycle.recover_open_tokens().expect("recover");
+    assert_eq!(
+        lifecycle
+            .commit(
+                &owner(),
+                &interrupted,
+                json!({"ok": true, "content": "late"})
+            )
+            .expect_err("Interrupted rejects commit"),
+        LifecycleError::Interrupted
+    );
+    assert_eq!(
+        lifecycle
+            .prepare(&owner(), metadata("interrupted-call", "fixture_only_tool"))
+            .expect_err("Interrupted without durable replay fences prepare"),
+        LifecycleError::UnresolvedCall
+    );
+    assert_eq!(durable.started_records().len(), 3);
+}
+
+#[test]
+fn commit_rejects_invalid_canonical_results_without_closing_token() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let token = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-1", "fixture_only_tool"))
+            .expect("prepare"),
+    );
+    let mut lease = lifecycle
+        .lease(&token)
+        .expect("open token must be leaseable");
+
+    let invalid = [
+        json!({}),
+        json!({"ok": "true"}),
+        json!({"ok": 1}),
+        json!({"ok": true}),
+        json!({"ok": true, "content": 1}),
+        json!({"ok": true, "content": "x", "truncated": "yes"}),
+        json!({"ok": true, "content": "x", "artifacts": "id"}),
+        json!({"ok": true, "content": "x", "artifacts": [1]}),
+        json!({"ok": true, "content": "x", "data": "nope"}),
+        json!({"ok": false}),
+        json!({"ok": false, "error": {}}),
+        json!({"ok": false, "error": {"code": 1}}),
+    ];
+    for result in invalid {
+        let error = lifecycle
+            .commit(&owner(), &token, result.clone())
+            .expect_err("invalid canonical result must not close");
+        assert!(
+            matches!(error, LifecycleError::InvalidMetadata(_)),
+            "expected InvalidMetadata for {result:?}, got {error:?}"
+        );
+        lifecycle
+            .authorize(&owner(), &token, CapabilityRisk::Read)
+            .expect("token must remain Open/leased after invalid commit");
+    }
+
+    lifecycle
+        .commit(
+            &owner(),
+            &token,
+            json!({
+                "ok": false,
+                "content": "typed failure body",
+                "error": {"code": "not_found", "message": "missing fixture"}
+            }),
+        )
+        .expect("corrected canonical failure must commit");
+    lease.disarm();
+    assert_eq!(
+        lifecycle
+            .commit(&owner(), &token, json!({"ok": true, "content": "late"}))
+            .expect_err("successful close is single-use"),
+        LifecycleError::DuplicateClose
+    );
+}
