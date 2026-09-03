@@ -284,10 +284,18 @@ The main real coding workflow is covered by:
 cargo test --test coding_agent_e2e_tests
 ```
 
-That suite generates a temporary git workspace, drives the production
+Stop-during-terminal cancellation and bounded output-limit overflow are
+covered by:
+
+```bash
+cargo test --test coding_agent_edge_e2e_tests
+```
+
+The main suite generates a temporary git workspace, drives the production
 `AgentService` worker and bundled RSS loop, and asserts a real `read_file` →
-`patch` → `terminal` argv test run. It does not cover stop-during-output edge
-paths.
+`patch` → `terminal` argv test run. The edge suite asserts stop-during-terminal
+child cleanup, exact tool lifecycle, durable parent/name/ordinal chaining,
+truncated overflow artifacts, and that reopening a completed run is a no-op.
 
 ## Secrets
 

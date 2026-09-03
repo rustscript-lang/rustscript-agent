@@ -16,13 +16,11 @@ use rustscript_agent::config::{ADMISSION_SESSION_PROFILE, FileToolConfig, RunLim
 use rustscript_agent::tools::{ArtifactOwner, ArtifactStore};
 use rustscript_agent::{
     AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentProviderHost, AgentService,
-    LlmContentBlock, RunCancellation, ScriptedProvider, ToolCall,
+    LlmContentBlock, RunCancellation, ScriptedProvider, ToolCall, decode_message_blocks,
 };
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
 
-const LEASE_TMP: &str = "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t10-edge-e2e-485ce928";
-const PYTHON: &str = "/usr/bin/python3";
 const OUTPUT_CAP: u64 = 800;
 const OVERFLOW_BYTES: usize = 4096;
 const WAIT_BUDGET: Duration = Duration::from_secs(15);
@@ -31,24 +29,72 @@ const POLL: Duration = Duration::from_millis(5);
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+fn test_temp_root() -> PathBuf {
+    std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn lookup_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn locate_sh() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        for candidate in ["/bin/sh", "/usr/bin/sh"] {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        lookup_in_path("sh")
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn require_sh() -> PathBuf {
+    locate_sh().unwrap_or_else(|| {
+        #[cfg(unix)]
+        panic!("unix coding edge e2e requires sh at /bin/sh, /usr/bin/sh, or PATH");
+        #[cfg(not(unix))]
+        panic!("coding edge e2e requires POSIX sh")
+    })
+}
+
 struct Fixture {
     parent: PathBuf,
     workspace: PathBuf,
+    cleaned: bool,
 }
 
 impl Fixture {
     fn new(label: &str) -> Self {
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let parent = temp_root().join(format!(
+        let parent = test_temp_root().join(format!(
             "{label}-{}-{}-{}",
             std::process::id(),
             sequence,
             Uuid::new_v4()
         ));
+        if parent.exists() {
+            fs::remove_dir_all(&parent).expect("stale edge fixture");
+        }
         let workspace = parent.join("workspace");
         fs::create_dir_all(&workspace).expect("edge e2e workspace");
         let workspace = fs::canonicalize(&workspace).expect("canonical workspace");
-        Self { parent, workspace }
+        Self {
+            parent,
+            workspace,
+            cleaned: false,
+        }
     }
 
     fn db_path(&self) -> PathBuf {
@@ -64,23 +110,31 @@ impl Fixture {
     fn write_script(&self, name: &str, source: &str) {
         fs::write(self.workspace.join(name), source).expect("write workspace script");
     }
+
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        if self.parent.exists() {
+            fs::remove_dir_all(&self.parent).unwrap_or_else(|error| {
+                panic!("edge fixture cleanup {}: {error}", self.parent.display())
+            });
+        }
+        assert!(
+            !self.parent.exists(),
+            "edge fixture root must be removed: {}",
+            self.parent.display()
+        );
+        self.cleaned = true;
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.parent);
+        if !self.cleaned && self.parent.exists() {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
     }
-}
-
-fn temp_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("TEST_TMPDIR") {
-        let root = PathBuf::from(dir);
-        fs::create_dir_all(&root).expect("TEST_TMPDIR");
-        return root;
-    }
-    let root = PathBuf::from(LEASE_TMP);
-    fs::create_dir_all(&root).expect("lease tmp");
-    root
 }
 
 fn agent_loop_source() -> String {
@@ -252,6 +306,76 @@ fn first_event_index(names: &[String], needle: &str) -> Option<usize> {
     names.iter().position(|name| name == needle)
 }
 
+fn json_opt_str<'a>(value: &'a JsonValue, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(JsonValue::as_str)
+}
+
+fn message_id(message: &JsonValue) -> &str {
+    json_opt_str(message, "id").unwrap_or_else(|| panic!("message id: {message}"))
+}
+
+fn run_messages<'a>(messages: &'a [JsonValue], run_id: &str) -> Vec<&'a JsonValue> {
+    messages
+        .iter()
+        .filter(|message| message.get("run_id").and_then(JsonValue::as_str) == Some(run_id))
+        .collect()
+}
+
+fn assistant_tool_call<'a>(messages: &'a [&'a JsonValue], call_id: &str) -> &'a JsonValue {
+    messages
+        .iter()
+        .copied()
+        .find(|message| {
+            json_opt_str(message, "role") == Some("assistant")
+                && decode_message_blocks(&message["content"])
+                    .iter()
+                    .any(|block| {
+                        block.block_type == "tool_call"
+                            && block.tool_call_id.as_deref() == Some(call_id)
+                    })
+        })
+        .unwrap_or_else(|| panic!("assistant tool_call {call_id}"))
+}
+
+fn user_tool_result<'a>(messages: &'a [&'a JsonValue], call_id: &str) -> &'a JsonValue {
+    messages
+        .iter()
+        .copied()
+        .find(|message| {
+            json_opt_str(message, "role") == Some("user")
+                && json_opt_str(message, "tool_call_id") == Some(call_id)
+        })
+        .unwrap_or_else(|| panic!("user tool_result {call_id}"))
+}
+
+fn assert_exact_parent_name_ordinal(
+    result: &JsonValue,
+    parent: &JsonValue,
+    name: &str,
+    ordinal: i64,
+) {
+    assert_eq!(
+        json_opt_str(result, "parent_message_id"),
+        Some(message_id(parent)),
+        "tool_result parent must be the assistant tool_call: result={result} parent={parent}"
+    );
+    assert_eq!(
+        json_opt_str(result, "name"),
+        Some(name),
+        "tool_result name: {result}"
+    );
+    assert_eq!(
+        result.get("ordinal").and_then(JsonValue::as_i64),
+        Some(ordinal),
+        "tool_result ordinal: {result}"
+    );
+    assert_eq!(
+        parent.get("ordinal").and_then(JsonValue::as_i64),
+        Some(ordinal - 1),
+        "assistant tool_call ordinal: {parent}"
+    );
+}
+
 async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -263,6 +387,7 @@ async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     pred()
 }
 
+#[cfg(target_os = "linux")]
 fn pid_alive(pid: u32) -> bool {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => {
@@ -273,6 +398,7 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
     wait_until(timeout, || !pid_alive(pid)).await
 }
@@ -335,41 +461,66 @@ fn u64_field(value: &JsonValue, key: &str) -> Option<u64> {
     value.get(key).and_then(JsonValue::as_u64)
 }
 
-fn sleeper_source() -> &'static str {
-    r#"import os
-import sys
-import time
-
-path = sys.argv[1]
-with open(path, "w", encoding="utf-8") as handle:
-    handle.write(str(os.getpid()))
-    handle.flush()
-    os.fsync(handle.fileno())
-time.sleep(120)
-"#
+fn sleeper_source() -> String {
+    "printf '%s\\n' \"$$\" > \"$1\"\nsleep 120\n".to_string()
 }
 
-fn overflow_source() -> &'static str {
-    r#"import sys
+fn overflow_source(count: usize) -> String {
+    format!(
+        "printf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\n",
+        stdout = "O".repeat(count),
+        stderr = "E".repeat(count)
+    )
+}
 
-count = int(sys.argv[1])
-sys.stdout.write("O" * count)
-sys.stderr.write("E" * count)
-sys.stdout.flush()
-sys.stderr.flush()
-"#
+fn hello_source() -> &'static str {
+    "printf '%s\\n' 'hello-edge'\n"
+}
+
+fn sh_arg(sh: &Path) -> String {
+    sh.to_str().expect("sh path should be utf-8").to_string()
+}
+
+fn assert_stop_lifecycle(names: &[String]) {
+    let requested = first_event_index(names, "tool.requested").expect("tool.requested");
+    let started_at = first_event_index(names, "tool.started").expect("tool.started");
+    let tool_end = first_event_index(names, "tool.failed")
+        .or_else(|| first_event_index(names, "tool.cancelled"))
+        .expect("tool.failed or tool.cancelled");
+    let cancelled_at = first_event_index(names, "run.cancelled").expect("run.cancelled");
+    assert!(
+        requested < started_at && started_at < tool_end && tool_end < cancelled_at,
+        "lifecycle order tool.requested < tool.started < tool.failed/cancelled < run.cancelled: {names:?}"
+    );
+    assert!(
+        names.iter().filter(|name| *name == "run.cancelled").count() == 1
+            && names
+                .iter()
+                .all(|name| name != "run.completed" && name != "run.failed"),
+        "no extra terminal events: {names:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_during_terminal_cancels_child_without_residue() {
-    let fixture = Fixture::new("stop-terminal");
-    fixture.write_script("sleeper.py", sleeper_source());
+    let Some(_) = locate_sh() else {
+        #[cfg(unix)]
+        panic!("unix coding edge e2e requires sh at /bin/sh, /usr/bin/sh, or PATH");
+        #[cfg(not(unix))]
+        {
+            eprintln!("skipping stop-during-terminal without POSIX sh");
+            return;
+        }
+    };
+    let sh = require_sh();
+    let mut fixture = Fixture::new("stop-terminal");
+    fixture.write_script("sleeper.sh", &sleeper_source());
     let pid_name = "child.pid";
     let call = ToolCall {
         id: "call-stop-terminal".to_string(),
         name: "terminal".to_string(),
         arguments: json!({
-            "argv": [PYTHON, "sleeper.py", pid_name],
+            "argv": [sh_arg(&sh), "sleeper.sh", pid_name],
             "timeout_ms": 120_000
         }),
     };
@@ -399,12 +550,22 @@ async fn stop_during_terminal_cancels_child_without_residue() {
 
     let pid_path = fixture.workspace.join(pid_name);
     let started = wait_until(WAIT_BUDGET, || {
-        service
+        let started_event = service
             .run_events(&admitted.run_id)
             .iter()
-            .any(|event| event.get("event") == Some(&json!("tool.started")))
-            && service.process_owner_count(&admitted.run_id) > 0
-            && parse_pid_file(&pid_path).is_some_and(pid_alive)
+            .any(|event| event.get("event") == Some(&json!("tool.started")));
+        let owned = service.process_owner_count(&admitted.run_id) > 0;
+        if !started_event || !owned {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            parse_pid_file(&pid_path).is_some_and(pid_alive)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
     })
     .await;
     assert!(
@@ -414,8 +575,11 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         service.process_owner_count(&admitted.run_id),
         parse_pid_file(&pid_path)
     );
-    let pid = parse_pid_file(&pid_path).expect("pid file");
-    assert!(pid_alive(pid), "child {pid} should be live at stop");
+    #[cfg(target_os = "linux")]
+    {
+        let pid = parse_pid_file(&pid_path).expect("pid file");
+        assert!(pid_alive(pid), "child {pid} should be live at stop");
+    }
     let live_store = service.native_artifact_store(&admitted.run_id);
 
     assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
@@ -439,26 +603,40 @@ async fn stop_during_terminal_cancels_child_without_residue() {
     );
 
     let names = event_names(&service, &admitted.run_id);
-    let requested = first_event_index(&names, "tool.requested").expect("tool.requested");
-    let started_at = first_event_index(&names, "tool.started").expect("tool.started");
-    let cancelled_at = first_event_index(&names, "run.cancelled").expect("run.cancelled");
-    assert!(
-        requested < started_at && started_at < cancelled_at,
-        "lifecycle order tool.requested < tool.started < run.cancelled: {names:?}"
-    );
-    assert!(
-        names.iter().filter(|name| *name == "run.cancelled").count() == 1
-            && names
-                .iter()
-                .all(|name| name != "run.completed" && name != "run.failed"),
-        "no extra terminal events: {names:?}"
-    );
+    assert_stop_lifecycle(&names);
 
-    assert!(
-        wait_until_dead(pid, WAIT_BUDGET).await,
-        "unix pid {pid} must be dead after stop"
+    let messages = service.session_messages(&admitted.session_id);
+    let chain = run_messages(&messages, &admitted.run_id);
+    let parent = assistant_tool_call(&chain, &call.id);
+    let result = user_tool_result(&chain, &call.id);
+    assert_eq!(
+        json_opt_str(parent, "parent_message_id"),
+        None,
+        "seeded assistant tool_call parent is unset until the provider seam commits it"
     );
-    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    assert_exact_parent_name_ordinal(result, parent, "terminal", 3);
+    let result_blocks = decode_message_blocks(&result["content"]);
+    let result_block = result_blocks
+        .iter()
+        .find(|block| block.block_type == "tool_result")
+        .expect("tool_result block");
+    assert_eq!(result_block.tool_call_id.as_deref(), Some(call.id.as_str()));
+    assert_eq!(result_block.name.as_deref(), None);
+    assert_eq!(result_block.is_error, Some(true));
+
+    #[cfg(target_os = "linux")]
+    {
+        let pid = parse_pid_file(&pid_path).expect("pid file");
+        assert!(
+            wait_until_dead(pid, WAIT_BUDGET).await,
+            "linux pid {pid} must be dead after stop"
+        );
+    }
+    assert_eq!(
+        service.process_owner_count(&admitted.run_id),
+        0,
+        "ProcessTable owner count is the portable PID fallback"
+    );
     assert!(service.native_dispatch_closed(&admitted.run_id));
     assert!(!service.native_dispatch_retained(&admitted.run_id));
     let leftover = live_store
@@ -476,17 +654,28 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         leftover, 0,
         "stop-during-terminal must not leave artifact residue"
     );
+    fixture.cleanup();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
-    let fixture = Fixture::new("output-limit");
-    fixture.write_script("overflow.py", overflow_source());
+    let Some(_) = locate_sh() else {
+        #[cfg(unix)]
+        panic!("unix coding edge e2e requires sh at /bin/sh, /usr/bin/sh, or PATH");
+        #[cfg(not(unix))]
+        {
+            eprintln!("skipping output-limit without POSIX sh");
+            return;
+        }
+    };
+    let sh = require_sh();
+    let mut fixture = Fixture::new("output-limit");
+    fixture.write_script("overflow.sh", &overflow_source(OVERFLOW_BYTES));
     let call = ToolCall {
         id: "call-output-limit".to_string(),
         name: "terminal".to_string(),
         arguments: json!({
-            "argv": [PYTHON, "overflow.py", OVERFLOW_BYTES.to_string()],
+            "argv": [sh_arg(&sh), "overflow.sh"],
             "timeout_ms": 10_000
         }),
     };
@@ -527,6 +716,11 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         .expect("artifact store stays live until owner cleanup");
 
     let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "provider follow-up must be bounded to one tool_result request plus the original: {requests:?}"
+    );
     let second = &requests[1];
     let blocks = tool_result_blocks(second);
     assert_eq!(
@@ -548,18 +742,24 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         .get("data")
         .cloned()
         .unwrap_or_else(|| result.clone());
-    assert!(
-        data.get("stdout_gap").is_some() && data.get("stderr_gap").is_some(),
-        "gap fields must be present: {result}"
-    );
-    let omitted_stdout = u64_field(&data, "overflow_stdout_bytes").unwrap_or(0);
-    let omitted_stderr = u64_field(&data, "overflow_stderr_bytes").unwrap_or(0);
     assert_eq!(
-        omitted_stdout, OVERFLOW_BYTES as u64,
+        data.get("stdout_gap"),
+        Some(&json!(false)),
+        "stdout captured from offset 0: {result}"
+    );
+    assert_eq!(
+        data.get("stderr_gap"),
+        Some(&json!(false)),
+        "stderr captured from offset 0: {result}"
+    );
+    assert_eq!(
+        u64_field(&data, "overflow_stdout_bytes"),
+        Some(OVERFLOW_BYTES as u64),
         "omitted stdout count: {result}"
     );
     assert_eq!(
-        omitted_stderr, OVERFLOW_BYTES as u64,
+        u64_field(&data, "overflow_stderr_bytes"),
+        Some(OVERFLOW_BYTES as u64),
         "omitted stderr count: {result}"
     );
     assert_eq!(
@@ -620,6 +820,13 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         "one overflow artifact retained while live"
     );
 
+    let messages = service.session_messages(&admitted.session_id);
+    let chain = run_messages(&messages, &admitted.run_id);
+    let parent = assistant_tool_call(&chain, &call.id);
+    let durable_result = user_tool_result(&chain, &call.id);
+    assert_eq!(json_opt_str(parent, "parent_message_id"), None);
+    assert_exact_parent_name_ordinal(durable_result, parent, "terminal", 3);
+
     let artifact_root = fixture.artifact_root();
     for value in [
         second,
@@ -656,13 +863,17 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
                 encoded_len(&event) <= 32 * 1024,
                 "durable tool event must stay bounded: {event}"
             );
+            assert_eq!(
+                event.pointer("/data/truncated"),
+                Some(&json!(true)),
+                "tool event truncation=true: {event}"
+            );
             assert!(
-                event.pointer("/data/truncated") == Some(&json!(true))
-                    || event
-                        .pointer("/data/artifacts")
-                        .and_then(JsonValue::as_array)
-                        .is_some_and(|items| !items.is_empty()),
-                "tool event should carry truncation or artifact metadata: {event}"
+                event
+                    .pointer("/data/artifacts")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|items| !items.is_empty()),
+                "tool event should carry artifact metadata: {event}"
             );
         }
     }
@@ -697,16 +908,31 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         completed.to_string().contains("bounded-summary"),
         "final summary should complete: {completed}"
     );
+    fixture.cleanup();
 }
 
+/// Reopening a completed run is a no-op: no provider call, no extra terminal.
+/// This does not claim ToolResult replay; pending-turn reopen replay lands on
+/// final integration after the provider seam.
 #[tokio::test(flavor = "multi_thread")]
-async fn completed_run_restart_does_not_reexecute_tools_or_double_metrics() {
-    let fixture = Fixture::new("restart-replay");
+async fn completed_run_reopen_is_noop() {
+    let Some(_) = locate_sh() else {
+        #[cfg(unix)]
+        panic!("unix coding edge e2e requires sh at /bin/sh, /usr/bin/sh, or PATH");
+        #[cfg(not(unix))]
+        {
+            eprintln!("skipping completed reopen without POSIX sh");
+            return;
+        }
+    };
+    let sh = require_sh();
+    let mut fixture = Fixture::new("reopen-noop");
+    fixture.write_script("hello.sh", hello_source());
     let call = ToolCall {
         id: "call-restart".to_string(),
         name: "terminal".to_string(),
         arguments: json!({
-            "argv": ["/usr/bin/printf", "%s", "hello-edge"],
+            "argv": [sh_arg(&sh), "hello.sh"],
             "timeout_ms": 5_000
         }),
     };
@@ -772,11 +998,31 @@ async fn completed_run_restart_does_not_reexecute_tools_or_double_metrics() {
     assert_eq!(
         resumed_provider.call_count(),
         0,
-        "completed restart must not call the provider again"
+        "completed reopen must not call the provider again"
     );
     let after = resumed_service.metrics().snapshot();
     assert_eq!(after.tool_calls, 0, "metrics must not double-count tools");
     assert_eq!(after.model_calls, 0, "metrics must not double-count models");
     assert_eq!(after.turns, 0);
     assert_eq!(resumed_service.process_owner_count(&run_id), 0);
+    fixture.cleanup();
+}
+
+#[test]
+fn docs_name_both_coding_e2e_commands() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let commands = [
+        "cargo test --test coding_agent_e2e_tests",
+        "cargo test --test coding_agent_edge_e2e_tests",
+    ];
+    for relative in ["README.md", "docs/configuration.md"] {
+        let text = fs::read_to_string(root.join(relative)).expect(relative);
+        for command in commands {
+            assert!(text.contains(command), "{relative} must document {command}");
+        }
+        assert!(
+            !text.contains("does not cover stop-during-output"),
+            "{relative} must not claim stop-during-output is uncovered"
+        );
+    }
 }

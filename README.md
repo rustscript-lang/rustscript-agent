@@ -58,7 +58,7 @@ placeholder route is advertised.
 | Observability (A9): bounded metrics registry, `GET /metrics`, structured terminal tracing | Implemented (see [docs/deployment.md](docs/deployment.md)) |
 | Provider protocol adapters (OpenAI Chat/Responses, Anthropic Messages, provider profiles) | **Partial — blocked by core (A3)**. Wire building, standard-shape guard, marker-preservation, and structured provider errors are green; buffered response parsing, streaming, and the Responses/Anthropic adapters stay typed `not_implemented` stubs until core compiler defects are fixed. See [plans/2026-08-13_a3-provider-core-blocker.md](plans/2026-08-13_a3-provider-core-blocker.md). |
 | RSS serial loop + durable compaction policies (A5) | Serial loop is wired into the library `AgentService` worker via bundled `rss/agent/main.rss`. Compaction policies remain implemented and tested (`rss/agent/compact.rss`). OpenAI-compatible buffered/streaming adapters stay A3-blocked; the gateway binary still runs `RUSTSCRIPT_AGENT_SCRIPT` and does not add an OpenAI-compatible inference path. See [plans/2026-08-13_a5-scope-split.md](plans/2026-08-13_a5-scope-split.md). |
-| Native coding tools + workspace-confined loop | Implemented for the library worker: `read_file`, `search_files`, `write_file`, `patch`, `terminal`, `process` run serially through the native registry. Local E2E: `cargo test --test coding_agent_e2e_tests`. See [docs/configuration.md](docs/configuration.md). Parallel tools remain excluded (A6). |
+| Native coding tools + workspace-confined loop | Implemented for the library worker: `read_file`, `search_files`, `write_file`, `patch`, `terminal`, `process` run serially through the native registry. Local E2E: `cargo test --test coding_agent_e2e_tests` and `cargo test --test coding_agent_edge_e2e_tests`. See [docs/configuration.md](docs/configuration.md). Parallel tools remain excluded (A6). |
 | Harness and approval machinery (A4) | Not implemented (excluded from the current milestone scope); approval **repository** CRUD exists, there is no approval flow driving runs |
 | Parallel tools and subagents (A6) | Not implemented (excluded from the current milestone scope) |
 | Scheduled / durable job execution | **Not implemented (explicitly excluded)**. Job CRUD, pause/resume, and latest-output routes exist, but there is no scheduler; `POST /api/jobs/{id}/run` is intentionally absent and answers `404`. |
@@ -68,4 +68,5 @@ Current lifecycle/reliability behavior is covered by the integration
 suites in `tests/` (admission, bounded delivery, terminal-commit retries,
 restart recovery, storage stalls, coding-agent E2E). CI runs them with
 `cargo test --locked --all-features --all-targets`. The main coding
-workflow E2E is `cargo test --test coding_agent_e2e_tests`.
+workflow E2E is `cargo test --test coding_agent_e2e_tests`. Cancellation
+and output-limit edges are `cargo test --test coding_agent_edge_e2e_tests`.

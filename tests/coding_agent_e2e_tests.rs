@@ -17,6 +17,7 @@ use rustscript_agent::{
     LlmContentBlock, RunCancellation, ScriptedProvider, decode_message_blocks,
 };
 use serde_json::{Value as JsonValue, json};
+use uuid::Uuid;
 
 const GUIDANCE_MARKER: &str = "E2E-CODING-GUIDANCE-MARKER";
 const SOURCE_RELATIVE: &str = "src/value.txt";
@@ -26,22 +27,56 @@ const FIXED_SOURCE: &[u8] = b"42\n";
 const CALL_READ: &str = "call-read";
 const CALL_PATCH: &str = "call-patch";
 const CALL_TEST: &str = "call-test";
-const TEMP_ROOT: &str = "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t10-main-e2e-72b06ca2";
 
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn test_temp_root() -> PathBuf {
+    std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn lookup_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn locate_sh() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        for candidate in ["/bin/sh", "/usr/bin/sh"] {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        lookup_in_path("sh")
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
 
 struct WorkspaceFixture {
     root: PathBuf,
     workspace: PathBuf,
+    cleaned: bool,
 }
 
 impl WorkspaceFixture {
-    fn new() -> Self {
-        fs::create_dir_all(TEMP_ROOT).expect("task temp root should be creatable");
+    fn new(sh: &Path) -> Self {
         let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(TEMP_ROOT).join(format!("e2e-{}-{seq}", std::process::id()));
+        let root = test_temp_root().join(format!(
+            "coding-e2e-{}-{seq}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         if root.exists() {
-            let _ = fs::remove_dir_all(&root);
+            fs::remove_dir_all(&root).expect("stale fixture root should be removable");
         }
         let workspace = root.join("workspace");
         fs::create_dir_all(workspace.join("src")).expect("source dir");
@@ -49,14 +84,14 @@ impl WorkspaceFixture {
         fs::write(
             workspace.join("AGENTS.md"),
             format!(
-                "{GUIDANCE_MARKER}\n\nFix `{SOURCE_RELATIVE}` so it contains exactly `42`.\nAfter the edit, run `/bin/sh {TEST_SCRIPT_RELATIVE}`.\n"
+                "{GUIDANCE_MARKER}\n\nFix `{SOURCE_RELATIVE}` so it contains exactly `42`.\nAfter the edit, run the targeted test script `{TEST_SCRIPT_RELATIVE}`.\n"
             ),
         )
         .expect("write AGENTS.md");
         fs::write(workspace.join(SOURCE_RELATIVE), BROKEN_SOURCE).expect("write broken source");
         fs::write(
             workspace.join(TEST_SCRIPT_RELATIVE),
-            "#!/bin/sh\nvalue=$(cat src/value.txt)\ntest \"$value\" = \"42\"\n",
+            "value=$(cat src/value.txt)\ntest \"$value\" = \"42\"\n",
         )
         .expect("write failing test");
         init_git_repo(&workspace);
@@ -65,35 +100,65 @@ impl WorkspaceFixture {
             BROKEN_SOURCE
         );
         assert!(
-            !run_targeted_test(&workspace).success(),
+            !run_targeted_test(sh, &workspace).success(),
             "fixture test must fail before the agent runs"
         );
-        Self { root, workspace }
+        Self {
+            root,
+            workspace,
+            cleaned: false,
+        }
     }
 
     fn source_path(&self) -> PathBuf {
         self.workspace.join(SOURCE_RELATIVE)
     }
+
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        if self.root.exists() {
+            fs::remove_dir_all(&self.root)
+                .unwrap_or_else(|error| panic!("fixture cleanup {}: {error}", self.root.display()));
+        }
+        assert!(
+            !self.root.exists(),
+            "fixture root must be removed: {}",
+            self.root.display()
+        );
+        self.cleaned = true;
+    }
 }
 
 impl Drop for WorkspaceFixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if !self.cleaned && self.root.exists() {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
 
 fn init_git_repo(workspace: &Path) {
+    let empty_config = workspace
+        .parent()
+        .expect("workspace parent")
+        .join("empty.gitconfig");
+    fs::write(&empty_config, "").expect("empty gitconfig");
     let git = |args: &[&str]| {
         let output = Command::new("git")
             .args(args)
             .current_dir(workspace)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", &empty_config)
+            .env("GIT_CONFIG_SYSTEM", &empty_config)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_AUTHOR_NAME", "e2e")
             .env("GIT_AUTHOR_EMAIL", "e2e@example.test")
             .env("GIT_COMMITTER_NAME", "e2e")
             .env("GIT_COMMITTER_EMAIL", "e2e@example.test")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap_or_else(|error| panic!("git {args:?} failed to spawn: {error}"));
         assert!(
@@ -115,8 +180,8 @@ fn init_git_repo(workspace: &Path) {
     ]);
 }
 
-fn run_targeted_test(workspace: &Path) -> std::process::ExitStatus {
-    Command::new("/bin/sh")
+fn run_targeted_test(sh: &Path, workspace: &Path) -> std::process::ExitStatus {
+    Command::new(sh)
         .arg(TEST_SCRIPT_RELATIVE)
         .current_dir(workspace)
         .status()
@@ -289,6 +354,10 @@ fn json_str<'a>(value: &'a JsonValue, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing string field {key}: {value}"))
 }
 
+fn json_opt_str<'a>(value: &'a JsonValue, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(JsonValue::as_str)
+}
+
 fn tool_call_id_of(event: &JsonValue) -> Option<&str> {
     event
         .pointer("/data/tool_call_id")
@@ -361,7 +430,17 @@ fn follow_up_has_tool_pair(request: &JsonValue, call_id: &str, name: &str) -> bo
 
 #[tokio::test(flavor = "multi_thread")]
 async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
-    let fixture = WorkspaceFixture::new();
+    let Some(sh) = locate_sh() else {
+        #[cfg(unix)]
+        panic!("unix coding e2e requires sh at /bin/sh, /usr/bin/sh, or PATH");
+        #[cfg(not(unix))]
+        {
+            eprintln!("skipping coding e2e without POSIX sh");
+            return;
+        }
+    };
+    let sh_arg = sh.to_str().expect("sh path should be utf-8").to_string();
+    let mut fixture = WorkspaceFixture::new(&sh);
     let source = agent_loop_source();
     assert!(
         source.contains("agent::provider_call") && source.contains("agent::tool_dispatch"),
@@ -413,7 +492,7 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
             "id": CALL_TEST,
             "name": "terminal",
             "arguments": {
-                "argv": ["/bin/sh", TEST_SCRIPT_RELATIVE]
+                "argv": [sh_arg, TEST_SCRIPT_RELATIVE]
             }
         }]),
     ));
@@ -475,7 +554,7 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
         FIXED_SOURCE,
         "source bytes must change exactly from 41 to 42"
     );
-    let independent = run_targeted_test(&fixture.workspace);
+    let independent = run_targeted_test(&sh, &fixture.workspace);
     assert!(
         independent.success(),
         "targeted test must exit 0 after the agent patch"
@@ -572,6 +651,56 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
         0,
         "process table owner must be zero after completion"
     );
+    fixture.cleanup();
+}
+
+#[derive(Debug)]
+enum ExpectedParent {
+    None,
+    Index(usize),
+}
+
+struct ExpectedDurable {
+    role: &'static str,
+    name: Option<&'static str>,
+    tool_call_id: Option<&'static str>,
+    block_type: &'static str,
+    block_name: Option<&'static str>,
+    block_tool_call_id: Option<&'static str>,
+    parent: ExpectedParent,
+    ordinal: Option<i64>,
+}
+
+fn message_id(message: &JsonValue) -> &str {
+    json_str(message, "id")
+}
+
+fn summarize_chain(messages: &[&JsonValue]) -> String {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let blocks = decode_message_blocks(&message["content"]);
+            let block_desc: Vec<String> = blocks
+                .iter()
+                .map(|block| {
+                    format!(
+                        "{}:{:?}:{:?}",
+                        block.block_type, block.name, block.tool_call_id
+                    )
+                })
+                .collect();
+            format!(
+                "{index}: role={} name={:?} tool_call_id={:?} parent={:?} ordinal={:?} blocks={block_desc:?}",
+                json_str(message, "role"),
+                json_opt_str(message, "name"),
+                json_opt_str(message, "tool_call_id"),
+                json_opt_str(message, "parent_message_id"),
+                message.get("ordinal").and_then(JsonValue::as_i64),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn assert_canonical_durable_chain(messages: &[JsonValue], run_id: &str) {
@@ -579,98 +708,181 @@ fn assert_canonical_durable_chain(messages: &[JsonValue], run_id: &str) {
         .iter()
         .filter(|message| message.get("run_id").and_then(JsonValue::as_str) == Some(run_id))
         .collect();
-    assert!(
-        run_messages.len() >= 6,
-        "durable chain should include three tool pairs, got {run_messages:?}"
+    let expected = [
+        ExpectedDurable {
+            role: "user",
+            name: None,
+            tool_call_id: None,
+            block_type: "text",
+            block_name: None,
+            block_tool_call_id: None,
+            parent: ExpectedParent::None,
+            ordinal: None,
+        },
+        ExpectedDurable {
+            role: "assistant",
+            name: None,
+            tool_call_id: None,
+            block_type: "tool_call",
+            block_name: Some("read_file"),
+            block_tool_call_id: Some(CALL_READ),
+            parent: ExpectedParent::Index(0),
+            ordinal: Some(2),
+        },
+        ExpectedDurable {
+            role: "user",
+            name: Some("read_file"),
+            tool_call_id: Some(CALL_READ),
+            block_type: "tool_result",
+            block_name: None,
+            block_tool_call_id: Some(CALL_READ),
+            parent: ExpectedParent::Index(1),
+            ordinal: Some(3),
+        },
+        ExpectedDurable {
+            role: "assistant",
+            name: None,
+            tool_call_id: None,
+            block_type: "tool_call",
+            block_name: Some("patch"),
+            block_tool_call_id: Some(CALL_PATCH),
+            parent: ExpectedParent::Index(2),
+            ordinal: Some(4),
+        },
+        ExpectedDurable {
+            role: "user",
+            name: Some("patch"),
+            tool_call_id: Some(CALL_PATCH),
+            block_type: "tool_result",
+            block_name: None,
+            block_tool_call_id: Some(CALL_PATCH),
+            parent: ExpectedParent::Index(3),
+            ordinal: Some(5),
+        },
+        ExpectedDurable {
+            role: "assistant",
+            name: None,
+            tool_call_id: None,
+            block_type: "tool_call",
+            block_name: Some("terminal"),
+            block_tool_call_id: Some(CALL_TEST),
+            parent: ExpectedParent::Index(4),
+            ordinal: Some(6),
+        },
+        ExpectedDurable {
+            role: "user",
+            name: Some("terminal"),
+            tool_call_id: Some(CALL_TEST),
+            block_type: "tool_result",
+            block_name: None,
+            block_tool_call_id: Some(CALL_TEST),
+            parent: ExpectedParent::Index(5),
+            ordinal: Some(7),
+        },
+        ExpectedDurable {
+            role: "assistant",
+            name: None,
+            tool_call_id: None,
+            block_type: "text",
+            block_name: None,
+            block_tool_call_id: None,
+            parent: ExpectedParent::Index(6),
+            ordinal: Some(8),
+        },
+        ExpectedDurable {
+            role: "assistant",
+            name: None,
+            tool_call_id: None,
+            block_type: "text",
+            block_name: None,
+            block_tool_call_id: None,
+            parent: ExpectedParent::None,
+            ordinal: Some(9),
+        },
+    ];
+    assert_eq!(
+        run_messages.len(),
+        expected.len(),
+        "durable chain must match exact count/order, got:\n{}",
+        summarize_chain(&run_messages)
     );
 
-    let mut ordinals = Vec::new();
-    let mut last_id: Option<String> = None;
-    let expected = [
-        ("assistant", Some(CALL_READ), "tool_call"),
-        ("user", Some(CALL_READ), "tool_result"),
-        ("assistant", Some(CALL_PATCH), "tool_call"),
-        ("user", Some(CALL_PATCH), "tool_result"),
-        ("assistant", Some(CALL_TEST), "tool_call"),
-        ("user", Some(CALL_TEST), "tool_result"),
-    ];
-    let mut matched = 0usize;
-    for message in &run_messages {
-        if let Some(ordinal) = message.get("ordinal").and_then(JsonValue::as_i64) {
-            if let Some(previous) = ordinals.last() {
-                assert!(ordinal > *previous, "ordinals must increase: {ordinals:?}");
-            }
-            ordinals.push(ordinal);
-        }
-        if matched >= expected.len() {
-            last_id = message
-                .get("id")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
-            continue;
-        }
-        let (role, call_id, block_type) = expected[matched];
-        if json_str(message, "role") != role {
-            last_id = message
-                .get("id")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
-            continue;
-        }
-        let blocks = decode_message_blocks(&message["content"]);
-        let Some(block) = blocks.iter().find(|block| block.block_type == block_type) else {
-            last_id = message
-                .get("id")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
-            continue;
+    for (index, (message, spec)) in run_messages.iter().zip(expected.iter()).enumerate() {
+        let summary = summarize_chain(&run_messages);
+        assert_eq!(
+            json_str(message, "role"),
+            spec.role,
+            "role at {index}:\n{summary}"
+        );
+        assert_eq!(
+            json_opt_str(message, "name"),
+            spec.name,
+            "name at {index}:\n{summary}"
+        );
+        assert_eq!(
+            json_opt_str(message, "tool_call_id"),
+            spec.tool_call_id,
+            "tool_call_id at {index}:\n{summary}"
+        );
+        assert_eq!(
+            message.get("ordinal").and_then(JsonValue::as_i64),
+            spec.ordinal,
+            "ordinal at {index}:\n{summary}"
+        );
+        let expected_parent = match spec.parent {
+            ExpectedParent::None => None,
+            ExpectedParent::Index(previous) => Some(message_id(run_messages[previous])),
         };
-        assert_eq!(block.tool_call_id.as_deref(), call_id);
-        if role == "user" {
-            assert_eq!(
-                message.get("parent_message_id").and_then(JsonValue::as_str),
-                last_id.as_deref(),
-                "tool_result parent must be the assistant tool_call"
-            );
-            assert_eq!(
-                message.get("tool_call_id").and_then(JsonValue::as_str),
-                call_id
-            );
-        } else {
-            assert!(
-                message
-                    .get("parent_message_id")
-                    .and_then(JsonValue::as_str)
-                    .is_some(),
-                "assistant tool_call should have a parent"
-            );
-        }
-        last_id = message
-            .get("id")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string);
-        matched += 1;
+        assert_eq!(
+            json_opt_str(message, "parent_message_id"),
+            expected_parent,
+            "parent at {index}:\n{summary}"
+        );
+        let blocks = decode_message_blocks(&message["content"]);
+        let block = blocks
+            .iter()
+            .find(|block| block.block_type == spec.block_type)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {} block at {index}: {blocks:?}\n{summary}",
+                    spec.block_type
+                )
+            });
+        assert_eq!(
+            block.name.as_deref(),
+            spec.block_name,
+            "block name at {index}:\n{summary}"
+        );
+        assert_eq!(
+            block.tool_call_id.as_deref(),
+            spec.block_tool_call_id,
+            "block tool_call_id at {index}:\n{summary}"
+        );
     }
-    assert_eq!(
-        matched,
-        expected.len(),
-        "durable assistant tool_call + user tool_result chain in {run_messages:?}"
-    );
 }
 
 #[test]
 fn docs_name_the_local_coding_e2e_command() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let command = "cargo test --test coding_agent_e2e_tests";
+    let commands = [
+        "cargo test --test coding_agent_e2e_tests",
+        "cargo test --test coding_agent_edge_e2e_tests",
+    ];
     for relative in ["README.md", "docs/configuration.md"] {
         let text = fs::read_to_string(root.join(relative)).expect(relative);
-        assert!(
-            text.contains(command),
-            "{relative} must document the exact local E2E command {command}"
-        );
+        for command in commands {
+            assert!(
+                text.contains(command),
+                "{relative} must document the exact local E2E command {command}"
+            );
+        }
         assert!(
             !text.contains("openai-compatible inference path is implemented"),
             "{relative} must not claim an unsupported OpenAI-compatible path"
+        );
+        assert!(
+            !text.contains("does not cover stop-during-output"),
+            "{relative} must not claim stop-during-output is uncovered"
         );
     }
 }
