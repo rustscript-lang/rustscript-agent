@@ -1,12 +1,15 @@
 //! Service-scoped durable provider wrapper for production `run_worker`.
 //!
 //! `DurableProviderHost` sits outermost around the raw/accounting provider.
-//! Before every fresh inner call it durably commits a sanitized
-//! `model.requested` boundary. Completed canonical steps are replayed without
-//! an inner call or turn metric. Pending retry-safe requests retry the same
-//! logical turn without synthesizing an assistant step. Persist failure
-//! prevents the provider call. Malformed `ok:true` envelopes are never
-//! persisted as success.
+//! Fresh request: persist exactly one sanitized `model.requested` boundary
+//! whose `attempt` matches the logical provider attempt about to run, then
+//! call inner. Same-turn retry (pending recovery `Retry`): reuse that single
+//! request-boundary row, set `attempt` from durable `model.failed.attempt`,
+//! and do not append another `model.requested`. Completed canonical steps are
+//! replayed without an inner call or turn metric. Pending retry-safe requests
+//! retry the same logical turn without synthesizing an assistant step.
+//! Persist failure prevents the provider call. Malformed `ok:true` envelopes
+//! are never persisted as success.
 
 use std::sync::{
     Arc,
@@ -61,7 +64,6 @@ pub(crate) struct DurableProviderHost {
     inner: Arc<dyn AgentProviderHost>,
     metrics: Arc<Metrics>,
     turn: AtomicU64,
-    attempt: AtomicU64,
 }
 
 impl DurableProviderHost {
@@ -77,7 +79,6 @@ impl DurableProviderHost {
             inner,
             metrics,
             turn: AtomicU64::new(1),
-            attempt: AtomicU64::new(0),
         }
     }
 
@@ -122,7 +123,6 @@ impl DurableProviderHost {
 
     fn advance_turn(&self) {
         self.turn.fetch_add(1, Ordering::SeqCst);
-        self.attempt.store(0, Ordering::SeqCst);
     }
 
     fn replay_completed(&self, turn: u64) -> Result<Option<JsonValue>, EventCommitError> {
@@ -141,10 +141,11 @@ impl AgentProviderHost for DurableProviderHost {
             Ok(None) => {}
             Err(error) => return Self::map_commit_error(error),
         }
+        let attempt = self.service.next_provider_attempt(&self.run_id, turn);
         if self.service.has_provider_request(&self.run_id, turn) {
             match self
                 .service
-                .recover_pending_provider(&self.run_id, turn, self.inner.as_ref())
+                .recover_pending_provider(&self.run_id, turn, request)
             {
                 Ok(ProviderPendingDecision::Replay) => {
                     return match self.replay_completed(turn) {
@@ -170,16 +171,12 @@ impl AgentProviderHost for DurableProviderHost {
                 }
                 Err(error) => return Self::map_commit_error(error),
             }
-        }
-
-        let attempt = self.attempt.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Err(error) = self
-            .service
-            .commit_provider_request(&self.run_id, turn, true, request)
+        } else if let Err(error) =
+            self.service
+                .commit_provider_request(&self.run_id, turn, attempt, true, request)
         {
             return Self::map_commit_error(error);
-        }
-        if self.service.take_crash_after_provider_request() {
+        } else if self.service.take_crash_after_provider_request() {
             self.service.mark_provider_commit_crashed();
             panic!("provider_request_crash");
         }
@@ -1131,5 +1128,243 @@ mod tests {
             1,
             "non-retryable failure must not reissue"
         );
+    }
+
+    fn events_named(state: &AgentGatewayState, run_id: &str, name: &str) -> Vec<JsonValue> {
+        state
+            .service()
+            .run_events(run_id)
+            .into_iter()
+            .filter(|event| event["event"] == name)
+            .collect()
+    }
+
+    fn retryable_error() -> JsonValue {
+        json!({
+            "status": 503,
+            "type": "server_error",
+            "code": "unavailable",
+            "message": "down",
+            "param": "",
+            "request_id": "",
+            "retryable": true
+        })
+    }
+
+    #[test]
+    fn canonical_fingerprint_is_exact_digest_without_secrets() {
+        let request = json!({
+            "model": "gpt-test",
+            "provider": "openai",
+            "prompt": "SECRET_PROMPT",
+            "messages": [{"role": "user", "content": "SECRET_MSG"}],
+            "api_key": "SECRET_KEY",
+            "provider_options": {"api_key": "SECRET_KEY"},
+            "headers": {"authorization": "SECRET_AUTH"},
+            "body": "SECRET_BODY"
+        });
+        let fingerprint = canonical_provider_request_fingerprint(&request);
+        assert_eq!(
+            fingerprint,
+            "sha256:84f36ce2b6ba7b471a73b3bffa624bf004ceaa4f91d9e160161806c31613ba68"
+        );
+        for needle in [
+            "SECRET_PROMPT",
+            "SECRET_MSG",
+            "SECRET_KEY",
+            "SECRET_AUTH",
+            "SECRET_BODY",
+        ] {
+            assert!(
+                !fingerprint.contains(needle),
+                "fingerprint leaked {needle}: {fingerprint}"
+            );
+        }
+        assert_eq!(
+            canonical_provider_request_fingerprint(&json!({
+                "model": "gpt-test",
+                "provider": "openai"
+            })),
+            fingerprint
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_request_attempt_aligns_with_failed_attempt() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_error(retryable_error());
+        inner.push_ok(text_ok("recovered"));
+        let host = host_for(&state, &run_id, inner.clone());
+        let cancellation = RunCancellation::new();
+        let first = host.call(&request(), &cancellation);
+        assert_eq!(first["ok"], json!(false), "{first}");
+        let requested = events_named(&state, &run_id, "model.requested");
+        assert_eq!(requested.len(), 1, "{requested:?}");
+        assert_eq!(requested[0]["data"]["attempt"], json!(1));
+        let failed = events_named(&state, &run_id, "model.failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["data"]["attempt"], json!(1));
+
+        let second = host.call(&request(), &cancellation);
+        assert_eq!(second["ok"], json!(true), "{second}");
+        let requested = events_named(&state, &run_id, "model.requested");
+        assert_eq!(
+            requested.len(),
+            1,
+            "same-turn retry must not append another request boundary: {requested:?}"
+        );
+        assert_eq!(requested[0]["data"]["attempt"], json!(1));
+        assert_eq!(inner.call_count(), 2);
+        assert_eq!(events_named(&state, &run_id, "model.completed").len(), 1);
+        assert_eq!(state.service().metrics().snapshot().turns, 1);
+    }
+
+    #[tokio::test]
+    async fn redrive_after_retryable_failure_persists_next_attempt() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_error(retryable_error());
+        inner.push_error(retryable_error());
+        let first_host = host_for(&state, &run_id, inner.clone());
+        let cancellation = RunCancellation::new();
+        let first = first_host.call(&request(), &cancellation);
+        assert_eq!(first["ok"], json!(false), "{first}");
+        drop(first_host);
+
+        let second_host = host_for(&state, &run_id, inner.clone());
+        let second = second_host.call(&request(), &cancellation);
+        assert_eq!(second["ok"], json!(false), "{second}");
+        let failed = events_named(&state, &run_id, "model.failed");
+        let attempts: Vec<_> = failed
+            .iter()
+            .filter_map(|event| event["data"]["attempt"].as_u64())
+            .collect();
+        assert_eq!(attempts, vec![1, 2], "{failed:?}");
+        assert_eq!(events_named(&state, &run_id, "model.requested").len(), 1);
+        assert_eq!(inner.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn fingerprint_mismatch_or_corrupt_fails_closed_without_inner() {
+        let (state, run_id, _) = admitted_state().await;
+        state
+            .service()
+            .commit_provider_request(&run_id, 1, 1, true, &request())
+            .expect("request boundary");
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("should not run"));
+        let host = host_for(&state, &run_id, inner.clone());
+        let mismatched = host.call(
+            &json!({"model": "other-model", "provider": "openai"}),
+            &RunCancellation::new(),
+        );
+        assert_eq!(mismatched["ok"], json!(false), "{mismatched}");
+        assert_eq!(mismatched["error"]["code"], json!("interrupted_provider"));
+        assert_eq!(inner.call_count(), 0);
+        assert_eq!(tool_event_count(&state, &run_id), 0);
+        assert_eq!(events_named(&state, &run_id, "model.completed").len(), 0);
+
+        let (state, run_id, _) = admitted_state().await;
+        state
+            .service()
+            .persist_run_event(
+                &run_id,
+                &crate::domain::durable_provider_event_id(&run_id, 1, "model.requested"),
+                "model.requested",
+                json!({
+                    "turn": 1,
+                    "attempt": 1,
+                    "request_fingerprint": "not-a-digest",
+                    "retry_safe": true
+                }),
+            )
+            .expect("corrupt fingerprint");
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("should not run"));
+        let host = host_for(&state, &run_id, inner.clone());
+        let corrupt = host.call(&request(), &RunCancellation::new());
+        assert_eq!(corrupt["error"]["code"], json!("interrupted_provider"));
+        assert_eq!(inner.call_count(), 0);
+        assert_eq!(tool_event_count(&state, &run_id), 0);
+    }
+
+    #[tokio::test]
+    async fn crash_after_request_redrive_retries_once() {
+        let (state, run_id, session_id) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("after-redrive"));
+        state.service().inject_crash_after_provider_request();
+        let host = host_for(&state, &run_id, inner.clone());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.call(&request(), &RunCancellation::new())
+        }));
+        assert!(
+            panicked.is_err(),
+            "first call must stop at request boundary"
+        );
+        assert_eq!(inner.call_count(), 0);
+        assert_eq!(events_named(&state, &run_id, "model.requested").len(), 1);
+        assert_eq!(events_named(&state, &run_id, "model.completed").len(), 0);
+
+        let host = host_for(&state, &run_id, inner.clone());
+        let envelope = host.call(&request(), &RunCancellation::new());
+        assert_eq!(envelope["ok"], json!(true), "{envelope}");
+        assert_eq!(inner.call_count(), 1);
+        assert_eq!(events_named(&state, &run_id, "model.requested").len(), 1);
+        assert_eq!(events_named(&state, &run_id, "model.completed").len(), 1);
+        assert_eq!(
+            state
+                .service()
+                .session_messages(&session_id)
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .count(),
+            1
+        );
+        assert_eq!(state.service().metrics().snapshot().turns, 1);
+        assert_eq!(tool_event_count(&state, &run_id), 0);
+    }
+
+    #[tokio::test]
+    async fn request_persist_failpoint_does_not_call_inner() {
+        let path = temporary_db_path();
+        let source = "pub fn run(context: map) -> map { context; }";
+        let state = AgentGatewayState::with_agent_source_and_sqlite(
+            crate::AgentGatewayConfig::default(),
+            source,
+            &path,
+        )
+        .expect("sqlite gateway");
+        let admitted = state
+            .service()
+            .admit(crate::AdmitRunRequest {
+                input: json!({"message": "hello"}),
+                platform: "durable_provider_tests".to_string(),
+                ..crate::AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit");
+        state
+            .persistence()
+            .expect("sqlite")
+            .inject_fail_model_requested_append();
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("should not run"));
+        let host = host_for(&state, &admitted.run_id, inner.clone());
+        let envelope = host.call(&request(), &RunCancellation::new());
+        assert_eq!(envelope["ok"], json!(false), "{envelope}");
+        assert_eq!(
+            envelope["error"]["code"],
+            json!("provider_step_persist_failed")
+        );
+        assert_eq!(inner.call_count(), 0);
+        assert_eq!(tool_event_count(&state, &admitted.run_id), 0);
+        assert_eq!(
+            events_named(&state, &admitted.run_id, "model.requested").len(),
+            0
+        );
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -2226,7 +2226,7 @@ async fn pending_provider_retries_only_when_safe_and_is_idempotent() {
         .await
         .expect("admit should succeed");
     service
-        .commit_provider_request(&admitted.run_id, 1, true, &json!({"prompt": "hi"}))
+        .commit_provider_request(&admitted.run_id, 1, 1, true, &json!({"prompt": "hi"}))
         .expect("request boundary");
     drop(state);
     let resumed = AgentGatewayState::with_agent_source_and_sqlite(
@@ -2240,7 +2240,7 @@ async fn pending_provider_retries_only_when_safe_and_is_idempotent() {
     provider.push_ok(json!({"content": [{"type": "text", "text": "ok"}]}));
     assert_eq!(
         service
-            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"prompt": "hi"}))
             .expect("retry"),
         ProviderPendingDecision::Retry
     );
@@ -2264,7 +2264,7 @@ async fn pending_provider_retries_only_when_safe_and_is_idempotent() {
     );
     assert_eq!(
         service
-            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"prompt": "hi"}))
             .expect("still retryable"),
         ProviderPendingDecision::Retry
     );
@@ -2288,7 +2288,7 @@ async fn pending_provider_with_effect_is_interrupted_without_retry() {
         .await
         .expect("admit should succeed");
     service
-        .commit_provider_request(&admitted.run_id, 1, true, &json!({"prompt": "hi"}))
+        .commit_provider_request(&admitted.run_id, 1, 1, true, &json!({"prompt": "hi"}))
         .expect("request boundary");
     state
         .persistence()
@@ -2314,14 +2314,14 @@ async fn pending_provider_with_effect_is_interrupted_without_retry() {
     provider.push_ok(json!({"content": [{"type": "text", "text": "should not run"}]}));
     assert_eq!(
         service
-            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"prompt": "hi"}))
             .expect("interrupt"),
         ProviderPendingDecision::Interrupted
     );
     assert_eq!(provider.call_count(), 0);
     assert_eq!(
         service
-            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"prompt": "hi"}))
             .expect("interrupt idempotent"),
         ProviderPendingDecision::Interrupted
     );
@@ -2603,7 +2603,7 @@ async fn terminal_run_refuses_pending_provider_without_retry() {
         .await
         .expect("admit should succeed");
     service
-        .commit_provider_request(&admitted.run_id, 1, true, &json!({"prompt": "hi"}))
+        .commit_provider_request(&admitted.run_id, 1, 1, true, &json!({"prompt": "hi"}))
         .expect("request boundary");
     service
         .clone()
@@ -2613,7 +2613,7 @@ async fn terminal_run_refuses_pending_provider_without_retry() {
     provider.push_ok(json!({"content": [{"type": "text", "text": "should not run"}]}));
     assert_eq!(
         service
-            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"prompt": "hi"}))
             .expect("terminal refusal"),
         ProviderPendingDecision::RefusedTerminal
     );
@@ -2688,6 +2688,7 @@ async fn commit_provider_request_persists_sanitized_model_requested() {
         .commit_provider_request(
             &admitted.run_id,
             1,
+            1,
             true,
             &json!({
                 "model": "gpt-test",
@@ -2747,12 +2748,10 @@ async fn commit_provider_request_persists_sanitized_model_requested() {
         );
     }
     assert_eq!(requested["data"]["retry_safe"], json!(true));
-    assert!(
-        requested["data"]["request_fingerprint"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("sha256:")),
-        "fingerprint: {:?}",
-        requested["data"]["request_fingerprint"]
+    assert_eq!(requested["data"]["attempt"], json!(1));
+    assert_eq!(
+        requested["data"]["request_fingerprint"],
+        json!("sha256:84f36ce2b6ba7b471a73b3bffa624bf004ceaa4f91d9e160161806c31613ba68")
     );
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
@@ -2773,7 +2772,7 @@ async fn unsafe_pending_provider_is_interrupted_without_assistant() {
         .await
         .expect("admit should succeed");
     service
-        .commit_provider_request(&admitted.run_id, 1, false, &json!({"model": "gpt-test"}))
+        .commit_provider_request(&admitted.run_id, 1, 1, false, &json!({"model": "gpt-test"}))
         .expect("unsafe request boundary");
     drop(state);
     let resumed = AgentGatewayState::with_agent_source_and_sqlite(
@@ -2787,7 +2786,7 @@ async fn unsafe_pending_provider_is_interrupted_without_assistant() {
     provider.push_ok(json!({"content": [{"type": "text", "text": "should not run"}]}));
     assert_eq!(
         service
-            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"prompt": "hi"}))
             .expect("interrupt"),
         ProviderPendingDecision::Interrupted
     );
@@ -2827,7 +2826,7 @@ async fn retryable_model_failed_stays_retryable_without_assistant() {
         .await
         .expect("admit should succeed");
     service
-        .commit_provider_request(&admitted.run_id, 1, true, &json!({"model": "gpt-test"}))
+        .commit_provider_request(&admitted.run_id, 1, 1, true, &json!({"model": "gpt-test"}))
         .expect("request boundary");
     state
         .persistence()
@@ -2853,7 +2852,7 @@ async fn retryable_model_failed_stays_retryable_without_assistant() {
     provider.push_ok(json!({"content": [{"type": "text", "text": "should not run"}]}));
     assert_eq!(
         service
-            .recover_pending_provider(&admitted.run_id, 1, &provider)
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"model": "gpt-test"}))
             .expect("retryable"),
         ProviderPendingDecision::Retry
     );
@@ -2865,6 +2864,73 @@ async fn retryable_model_failed_stays_retryable_without_assistant() {
     );
     assert_eq!(event_count(&service, &admitted.run_id, "model.failed"), 1);
     drop(resumed);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn pending_provider_fingerprint_mismatch_or_missing_fails_closed() {
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    service
+        .commit_provider_request(&admitted.run_id, 1, 1, true, &json!({"model": "gpt-test"}))
+        .expect("request boundary");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(json!({"content": [{"type": "text", "text": "should not run"}]}));
+    assert_eq!(
+        service
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"model": "other-model"}))
+            .expect("mismatch"),
+        ProviderPendingDecision::Interrupted
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(assistant_count(&service, &admitted.session_id), 0);
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    service
+        .persist_run_event(
+            &admitted.run_id,
+            &format!("{}:turn:1:model.requested", admitted.run_id),
+            "model.requested",
+            json!({
+                "turn": 1,
+                "attempt": 1,
+                "retry_safe": true
+            }),
+        )
+        .expect("missing fingerprint");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(json!({"content": [{"type": "text", "text": "should not run"}]}));
+    assert_eq!(
+        service
+            .recover_pending_provider(&admitted.run_id, 1, &json!({"model": "gpt-test"}))
+            .expect("missing fingerprint"),
+        ProviderPendingDecision::Interrupted
+    );
+    assert_eq!(provider.call_count(), 0);
+    drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
 }
 

@@ -1235,18 +1235,24 @@ impl AgentService {
     }
 
     /// Persist a sanitized provider request boundary (`model.requested`).
-    /// Never stores request/messages/prompt/provider_options/api_key/headers/body.
+    ///
+    /// Fresh request (no existing boundary for this turn): persist exactly one
+    /// row whose `attempt` is the logical provider attempt about to run
+    /// (normally 1). Same-turn retry must not call this again — reuse the
+    /// existing row so request-boundary ids never conflict. Never stores
+    /// request/messages/prompt/provider_options/api_key/headers/body.
     pub fn commit_provider_request(
         &self,
         run_id: &str,
         turn: u64,
+        attempt: u64,
         request_is_idempotent: bool,
         request: &JsonValue,
     ) -> Result<(), EventCommitError> {
         let event_id = durable_provider_event_id(run_id, turn, "model.requested");
         let mut payload = json!({
             "turn": turn,
-            "attempt": 1,
+            "attempt": attempt,
             "request_fingerprint": crate::durable_provider::canonical_provider_request_fingerprint(request),
             "retry_safe": request_is_idempotent,
         });
@@ -1260,13 +1266,15 @@ impl AgentService {
 
     /// Inspect durable provider-request state. Retry does not call the inner
     /// provider or synthesize an assistant step; Interrupted fail-closes.
+    /// `request` is the current sanitized canonical request; its fingerprint
+    /// must match the stored digest before Retry is allowed.
     pub fn recover_pending_provider(
         &self,
         run_id: &str,
         turn: u64,
-        _provider: &dyn AgentProviderHost,
+        request: &JsonValue,
     ) -> Result<ProviderPendingDecision, EventCommitError> {
-        let decision = self.provider_pending_decision(run_id, turn);
+        let decision = self.provider_pending_decision(run_id, turn, request);
         match decision {
             ProviderPendingDecision::Replay
             | ProviderPendingDecision::RefusedTerminal
@@ -1278,7 +1286,12 @@ impl AgentService {
         }
     }
 
-    pub fn provider_pending_decision(&self, run_id: &str, turn: u64) -> ProviderPendingDecision {
+    pub fn provider_pending_decision(
+        &self,
+        run_id: &str,
+        turn: u64,
+        request: &JsonValue,
+    ) -> ProviderPendingDecision {
         let store = self.inner.store.read();
         let Some(run) = store.runs.get(run_id) else {
             return ProviderPendingDecision::Interrupted;
@@ -1322,13 +1335,16 @@ impl AgentService {
                     .get("idempotent")
                     .and_then(JsonValue::as_bool)
             });
-        let has_fingerprint = requested
+        let stored_fingerprint = requested
             .data
             .get("request_fingerprint")
-            .and_then(JsonValue::as_str)
-            .is_some_and(|value| value.starts_with("sha256:"));
+            .and_then(JsonValue::as_str);
+        let current_fingerprint =
+            crate::durable_provider::canonical_provider_request_fingerprint(request);
+        let fingerprint_ok = stored_fingerprint == Some(current_fingerprint.as_str())
+            && current_fingerprint.starts_with("sha256:");
         let secret_leak = requested_payload_leaks_secrets(&requested.data);
-        if retry_safe != Some(true) || !has_fingerprint || secret_leak {
+        if retry_safe != Some(true) || !fingerprint_ok || secret_leak {
             return ProviderPendingDecision::Interrupted;
         }
         let request_seq = requested.seq;
@@ -1376,6 +1392,26 @@ impl AgentService {
         };
         let event_id = durable_provider_event_id(run_id, turn, "model.requested");
         run.events.iter().any(|event| event.event_id == event_id)
+    }
+
+    /// Next logical provider attempt for `turn`: one past the highest durable
+    /// `model.failed.attempt`, or 1 when no failure has been recorded.
+    pub(crate) fn next_provider_attempt(&self, run_id: &str, turn: u64) -> u64 {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return 1;
+        };
+        let max_attempt = run
+            .events
+            .iter()
+            .filter(|event| {
+                event.event == "model.failed"
+                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn)
+            })
+            .filter_map(|event| event.data.get("attempt").and_then(JsonValue::as_u64))
+            .max()
+            .unwrap_or(0);
+        max_attempt.saturating_add(1)
     }
 
     pub(crate) fn persist_provider_failure(

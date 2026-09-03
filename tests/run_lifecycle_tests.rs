@@ -197,6 +197,22 @@ fn tool_event_count(service: &AgentService, run_id: &str) -> usize {
         .count()
 }
 
+fn named_event_count(service: &AgentService, run_id: &str, name: &str) -> usize {
+    event_names(service, run_id)
+        .into_iter()
+        .filter(|event_name| event_name == name)
+        .count()
+}
+
+fn event_attempts(service: &AgentService, run_id: &str, name: &str) -> Vec<u64> {
+    service
+        .run_events(run_id)
+        .into_iter()
+        .filter(|event| event["event"] == name)
+        .filter_map(|event| event["data"]["attempt"].as_u64())
+        .collect()
+}
+
 fn retryable_provider_error() -> JsonValue {
     json!({
         "status": 503,
@@ -660,6 +676,23 @@ async fn worker_accounts_retryable_failure_then_success_without_turn_on_retry() 
     );
     assert_eq!(provider.call_count(), 2);
     assert_eq!(activity_values(&service), [2, 0, 0, 1, 0]);
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_attempts(&service, &admitted.run_id, "model.requested"),
+        vec![1]
+    );
+    assert_eq!(
+        event_attempts(&service, &admitted.run_id, "model.failed"),
+        vec![1]
+    );
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.completed"),
+        1
+    );
+    assert_eq!(assistant_messages(&service, &admitted.session_id).len(), 1);
     assert_prometheus_matches_snapshot(&service);
     assert_frozen_prompt_exactly_once(&service, &admitted.run_id, &provider);
 }
@@ -690,6 +723,19 @@ async fn worker_accounts_retry_exhaustion_without_turns() {
     );
     assert_eq!(provider.call_count(), 3);
     assert_eq!(activity_values(&service), [3, 0, 0, 0, 0]);
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_attempts(&service, &admitted.run_id, "model.requested"),
+        vec![1]
+    );
+    assert_eq!(
+        event_attempts(&service, &admitted.run_id, "model.failed"),
+        vec![1, 2, 3]
+    );
+    assert_eq!(assistant_messages(&service, &admitted.session_id).len(), 0);
     assert_prometheus_matches_snapshot(&service);
 }
 
@@ -1427,6 +1473,22 @@ async fn concurrent_and_retry_provider_ordinals_are_stable() {
         1,
         "retryable failure must not create an assistant row: {assistants:?}"
     );
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_attempts(&service, &admitted.run_id, "model.requested"),
+        vec![1]
+    );
+    assert_eq!(
+        event_attempts(&service, &admitted.run_id, "model.failed"),
+        vec![1]
+    );
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.completed"),
+        1
+    );
     let _ordinal = assistants[0]["ordinal"].as_u64();
     assert!(
         _ordinal.is_some(),
@@ -1545,5 +1607,181 @@ async fn malformed_ok_envelope_does_not_commit_durable_success() {
     assert_ne!(
         terminal_events(&service, &admitted.run_id),
         vec!["run.completed".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn model_requested_persist_failpoint_leaves_provider_and_tools_zero() {
+    let path = temporary_db_path();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("should not run"));
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &path);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+    state
+        .persistence()
+        .expect("sqlite")
+        .inject_fail_model_requested_append();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.requested"),
+        0
+    );
+    assert_eq!(assistant_messages(&service, &admitted.session_id).len(), 0);
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    let failed = service
+        .run_events(&admitted.run_id)
+        .into_iter()
+        .find(|event| event["event"] == "run.failed")
+        .expect("failed terminal");
+    let rendered = failed.to_string();
+    assert!(
+        rendered.contains("provider_step_persist_failed")
+            || rendered.contains("failed to persist provider step"),
+        "persist failure must be typed: {rendered}"
+    );
+    drop(state);
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_after_provider_request_redrive_retries_once() {
+    let path = temporary_db_path();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("after-redrive"));
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &path);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+    service.inject_crash_after_provider_request();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "crash after request boundary must leave the run started: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_attempts(&service, &admitted.run_id, "model.requested"),
+        vec![1]
+    );
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.completed"),
+        0
+    );
+    assert!(assistant_messages(&service, &admitted.session_id).is_empty());
+    service.evict_run_handle(&admitted.run_id);
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.completed"),
+        1
+    );
+    assert_eq!(assistant_messages(&service, &admitted.session_id).len(), 1);
+    assert_eq!(service.metrics().snapshot().turns, 1);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    drop(state);
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_request_fingerprint_mismatch_fails_closed_without_inner() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("should not run"));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service.admit(admit_request()).await.expect("admit");
+    service
+        .commit_provider_request(
+            &admitted.run_id,
+            1,
+            1,
+            true,
+            &json!({"model": "mismatch-model", "provider": "openai"}),
+        )
+        .expect("mismatched request boundary");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(
+        named_event_count(&service, &admitted.run_id, "model.completed"),
+        0
+    );
+    assert!(assistant_messages(&service, &admitted.session_id).is_empty());
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsafe_pending_request_fails_closed_without_inner() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("should not run"));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service.admit(admit_request()).await.expect("admit");
+    service
+        .commit_provider_request(
+            &admitted.run_id,
+            1,
+            1,
+            false,
+            &json!({"model": "mismatch-model"}),
+        )
+        .expect("unsafe request boundary");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert!(assistant_messages(&service, &admitted.session_id).is_empty());
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
     );
 }

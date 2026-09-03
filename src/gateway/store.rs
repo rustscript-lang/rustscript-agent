@@ -93,6 +93,7 @@ pub struct GatewayPersistence {
     fail_next: std::sync::atomic::AtomicBool,
     fail_after_partial_write: std::sync::atomic::AtomicBool,
     fail_after_commit_before_publish: std::sync::atomic::AtomicBool,
+    fail_model_requested_append: std::sync::atomic::AtomicBool,
     persist_block: Mutex<Option<Arc<PersistBlockState>>>,
 }
 
@@ -278,6 +279,7 @@ impl GatewayPersistence {
             fail_next: std::sync::atomic::AtomicBool::new(false),
             fail_after_partial_write: std::sync::atomic::AtomicBool::new(false),
             fail_after_commit_before_publish: std::sync::atomic::AtomicBool::new(false),
+            fail_model_requested_append: std::sync::atomic::AtomicBool::new(false),
             persist_block: Mutex::new(None),
         })
     }
@@ -406,6 +408,18 @@ impl GatewayPersistence {
     /// Appends one run event with transactional sequence allocation and
     /// retention pruning.
     pub fn event_append(&self, payload: &Value) -> Result<Value, StorageError> {
+        let is_model_requested =
+            payload.get("event_type").and_then(Value::as_str) == Some("model.requested");
+        if is_model_requested
+            && self
+                .fail_model_requested_append
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError {
+                code: "storage_unavailable".to_string(),
+                message: "injected model.requested persist failure".to_string(),
+            });
+        }
         self.command_data("event.append", payload)
     }
 
@@ -451,6 +465,14 @@ impl GatewayPersistence {
     /// pre-commit snapshot until recovery loads the durable event.
     pub fn inject_fail_after_commit_before_publish(&self) {
         self.fail_after_commit_before_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test failpoint: the next `event.append` for a `model.requested`
+    /// boundary fails before SQLite runs. Other event types are ignored so
+    /// the inner provider call is never reached.
+    pub fn inject_fail_model_requested_append(&self) {
+        self.fail_model_requested_append
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
