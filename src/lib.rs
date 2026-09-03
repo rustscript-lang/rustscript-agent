@@ -16,6 +16,8 @@ pub mod runtime;
 pub mod service;
 pub mod tools;
 
+mod durable_provider;
+
 pub use config::{AgentGatewayConfig, TelegramConfig};
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
@@ -32,8 +34,8 @@ pub use runtime::rss_runner::{
 };
 pub use runtime::{AgentHostBridges, AgentProviderHost, ScriptedProvider};
 pub use service::{
-    AdmitError, AdmitRunRequest, AdmittedRun, AgentService, CleanupOutcome,
-    ProviderPendingDecision, RunHandle,
+    AdmitError, AdmitRunRequest, AdmittedRun, AgentService, CleanupOutcome, ProviderCommit,
+    ProviderCommitOutcome, ProviderPendingDecision, RunHandle,
 };
 pub use tools::{
     NativeExecutorContract, NativeToolExecutor, RiskClass, SchemaValidationError,

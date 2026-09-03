@@ -135,18 +135,7 @@ impl AgentHostState {
         if let Some(error) = self.control_error() {
             return error;
         }
-        let envelope = normalize_provider_envelope(self.provider.call(request, &self.cancellation));
-        if let Some(metrics) = &self.metrics {
-            let successful_turn = envelope.get("ok").and_then(JsonValue::as_bool) == Some(true);
-            let truncated = successful_turn
-                && envelope
-                    .get("response")
-                    .and_then(|response| response.get("truncated"))
-                    .and_then(JsonValue::as_bool)
-                    == Some(true);
-            metrics.account_model_attempt(successful_turn, truncated);
-        }
-        envelope
+        normalize_provider_envelope(self.provider.call(request, &self.cancellation))
     }
 
     fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
@@ -410,7 +399,7 @@ fn return_json(value: JsonValue) -> VmResult<CallOutcome> {
     ))))
 }
 
-fn typed_fail(code: &str, message: &str) -> JsonValue {
+pub(crate) fn typed_fail(code: &str, message: &str) -> JsonValue {
     json!({
         "ok": false,
         "response": {},
@@ -426,7 +415,7 @@ fn typed_fail(code: &str, message: &str) -> JsonValue {
     })
 }
 
-fn error_is_retryable_code(code: &str) -> bool {
+pub(crate) fn error_is_retryable_code(code: &str) -> bool {
     !matches!(
         code,
         "setup"
@@ -440,6 +429,8 @@ fn error_is_retryable_code(code: &str) -> bool {
             | "adapter_failed"
             | "unsupported_parallel"
             | "unsupported_task"
+            | "provider_step_persist_failed"
+            | "interrupted_provider"
     )
 }
 

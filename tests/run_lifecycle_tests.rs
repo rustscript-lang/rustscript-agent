@@ -51,34 +51,6 @@ fn background_sleep_call() -> JsonValue {
     }])
 }
 
-fn seed_sleep_tool_parent(service: &AgentService, run_id: &str) {
-    service
-        .commit_provider_step(
-            run_id,
-            1,
-            &[LlmContentBlock {
-                block_type: "tool_call".to_string(),
-                tool_call_id: Some("call-sleep".to_string()),
-                name: Some("terminal".to_string()),
-                arguments_json: Some(
-                    json!({
-                        "argv": ["/bin/sleep", "30"],
-                        "background": true,
-                        "timeout_ms": 5000
-                    })
-                    .to_string(),
-                ),
-                ..LlmContentBlock::default()
-            }],
-            None,
-            Some("tool_calls"),
-            None,
-            None,
-            None,
-        )
-        .expect("durable tool-call parent");
-}
-
 fn admit_request() -> AdmitRunRequest {
     AdmitRunRequest {
         input: json!({"message": "hello"}),
@@ -172,6 +144,59 @@ fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> Agen
     state
 }
 
+fn temporary_db_path() -> PathBuf {
+    let root = std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-tools-agent-integration-c77be280",
+            )
+        });
+    fs::create_dir_all(&root).expect("test database directory should exist");
+    root.join(format!("{}.db", uuid::Uuid::new_v4()))
+}
+
+fn loop_service_sqlite(
+    config: AgentGatewayConfig,
+    provider: &ScriptedProvider,
+    path: &std::path::Path,
+) -> AgentGatewayState {
+    let state = AgentGatewayState::with_agent_source_and_sqlite(config, agent_loop_source(), path)
+        .expect("bundled agent loop should compile against sqlite");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    state
+}
+
+fn assistant_messages(service: &AgentService, session_id: &str) -> Vec<JsonValue> {
+    service
+        .session_messages(session_id)
+        .into_iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect()
+}
+
+fn event_names(service: &AgentService, run_id: &str) -> Vec<String> {
+    service
+        .run_events(run_id)
+        .into_iter()
+        .filter_map(|event| {
+            event
+                .get("event")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn tool_event_count(service: &AgentService, run_id: &str) -> usize {
+    event_names(service, run_id)
+        .into_iter()
+        .filter(|name| name.starts_with("tool."))
+        .count()
+}
+
 fn retryable_provider_error() -> JsonValue {
     json!({
         "status": 503,
@@ -182,27 +207,6 @@ fn retryable_provider_error() -> JsonValue {
         "request_id": "",
         "retryable": true
     })
-}
-
-fn seed_tool_parent(service: &AgentService, run_id: &str, call: &ToolCall) {
-    service
-        .commit_provider_step(
-            run_id,
-            1,
-            &[LlmContentBlock {
-                block_type: "tool_call".to_string(),
-                tool_call_id: Some(call.id.clone()),
-                name: Some(call.name.clone()),
-                arguments_json: Some(call.arguments.to_string()),
-                ..LlmContentBlock::default()
-            }],
-            None,
-            Some("tool_calls"),
-            None,
-            None,
-            None,
-        )
-        .expect("durable tool-call parent");
 }
 
 fn activity_values(service: &AgentService) -> [u64; 5] {
@@ -404,7 +408,6 @@ async fn stop_terminates_child_process_without_residue() {
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    seed_sleep_tool_parent(&service, &admitted.run_id);
     let worker = tokio::spawn({
         let service = service.clone();
         let run_id = admitted.run_id.clone();
@@ -451,7 +454,6 @@ async fn deadline_terminates_child_process_without_residue() {
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    seed_sleep_tool_parent(&service, &admitted.run_id);
     let started = Instant::now();
     service
         .clone()
@@ -614,7 +616,6 @@ async fn worker_accounts_success_multi_turn_and_prometheus_matches_snapshot() {
         .admit(admit_request())
         .await
         .expect("admit should succeed");
-    seed_tool_parent(&service, &admitted.run_id, &call);
 
     service
         .clone()
@@ -720,7 +721,6 @@ async fn worker_accounts_truncated_tool_result_once() {
         .admit(admit_request())
         .await
         .expect("admit should succeed");
-    seed_tool_parent(&service, &admitted.run_id, &call);
 
     service
         .clone()
@@ -761,7 +761,6 @@ async fn durable_tool_replay_does_not_increment_activity() {
         .admit(admit_request())
         .await
         .expect("admit should succeed");
-    seed_tool_parent(&service, &admitted.run_id, &call);
 
     let worker = {
         let service = service.clone();
@@ -1117,4 +1116,433 @@ async fn hanging_http_adapter_stop_cancels() {
         "stop must commit a typed terminal, got {terminals:?}"
     );
     drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_tool_effect_succeeds_with_parent_already_durable() {
+    let provider = ScriptedProvider::new();
+    let call = ToolCall {
+        id: "call-parent".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "README.md"}),
+    };
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(text_response("after-tool"));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    let names = event_names(&service, &admitted.run_id);
+    let completed = names
+        .iter()
+        .position(|name| name == "model.completed")
+        .expect("provider step must be durable before tools");
+    let tool_started = names
+        .iter()
+        .position(|name| name.starts_with("tool."))
+        .expect("tool effect must run");
+    assert!(
+        completed < tool_started,
+        "durable provider parent must precede tool events: {names:?}"
+    );
+    let assistants = assistant_messages(&service, &admitted.session_id);
+    let parent = assistants
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|block| {
+                    block["type"] == "tool_call" && block["tool_call_id"] == json!(call.id)
+                })
+        })
+        .expect("assistant tool_call parent");
+    let parent_id = parent["id"].as_str().expect("parent id");
+    let tool_messages: Vec<_> = service
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .filter(|message| message["tool_call_id"] == json!(call.id))
+        .collect();
+    assert!(
+        !tool_messages.is_empty(),
+        "tool result message should exist"
+    );
+    assert!(
+        tool_messages
+            .iter()
+            .all(|message| message["parent_message_id"] == json!(parent_id)),
+        "tool result parent_message_id must point at the durable assistant: {tool_messages:?}"
+    );
+    assert_eq!(provider.call_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn persist_failpoint_leaves_executor_count_zero() {
+    let path = temporary_db_path();
+    let provider = ScriptedProvider::new();
+    let call = ToolCall {
+        id: "call-persist-fail".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "README.md"}),
+    };
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(text_response("should-not-run"));
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &path);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+    state
+        .persistence()
+        .expect("sqlite persistence")
+        .inject_fail_after_partial_write();
+
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    let failed = service
+        .run_events(&admitted.run_id)
+        .into_iter()
+        .find(|event| event["event"] == "run.failed")
+        .expect("failed terminal");
+    let rendered = failed.to_string();
+    assert!(
+        rendered.contains("provider_step_persist_failed")
+            || rendered.contains("failed to persist provider step"),
+        "persist failure must be typed: {rendered}"
+    );
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    assert_eq!(provider.call_count(), 1);
+    drop(state);
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_commit_crash_restart_replays_provider_and_runs_tool_once() {
+    let path = temporary_db_path();
+    let provider = ScriptedProvider::new();
+    let call = ToolCall {
+        id: "call-crash".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "README.md"}),
+    };
+    provider.push_ok(tool_response(
+        "",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(text_response("after-restart"));
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &path);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+    service.inject_crash_after_provider_commit();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "crash after commit must leave the run started: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    // Process restart of leftover running runs is `gateway_restart`. This
+    // seam is a worker crash after the provider step is durable: evict the
+    // live handle and resume the same started run so replay, not a second
+    // inner call, drives tool dispatch.
+    service.evict_run_handle(&admitted.run_id);
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "restart must replay the committed provider step without a second inner call"
+    );
+    assert_eq!(
+        service
+            .run_events(&admitted.run_id)
+            .iter()
+            .filter(|event| event["event"] == "model.completed")
+            .count(),
+        2
+    );
+    assert!(has_tool_result_event(&service, &admitted.run_id, &call.id));
+    drop(state);
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn final_text_commits_one_assistant_row() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("only-once"));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()]
+    );
+    let assistants = assistant_messages(&service, &admitted.session_id);
+    assert_eq!(
+        assistants.len(),
+        1,
+        "provider step already stored the assistant text: {assistants:?}"
+    );
+    let rendered = assistants[0].to_string();
+    assert!(
+        rendered.contains("only-once"),
+        "assistant row must keep the provider text: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_call_and_text_combined_are_preserved() {
+    let provider = ScriptedProvider::new();
+    let call = ToolCall {
+        id: "call-combined".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "README.md"}),
+    };
+    provider.push_ok(tool_response(
+        "thinking",
+        json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
+    ));
+    provider.push_ok(text_response("done"));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    let assistants = assistant_messages(&service, &admitted.session_id);
+    let combined = assistants
+        .iter()
+        .find(|message| {
+            let blocks = message["content"].as_array().cloned().unwrap_or_default();
+            blocks
+                .iter()
+                .any(|block| block["type"] == "text" && block["text"] == "thinking")
+                && blocks.iter().any(|block| {
+                    block["type"] == "tool_call" && block["tool_call_id"] == json!(call.id)
+                })
+        })
+        .expect("combined text+tool_call assistant");
+    assert!(
+        combined["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .any(|block| block["arguments_json"].as_str()
+                == Some(call.arguments.to_string().as_str())
+                || block["arguments"] == call.arguments),
+        "tool_call arguments must be preserved: {combined}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_and_retry_provider_ordinals_are_stable() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(retryable_provider_error());
+    provider.push_ok(text_response("stable"));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit should succeed");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()]
+    );
+    let assistants = assistant_messages(&service, &admitted.session_id);
+    assert_eq!(
+        assistants.len(),
+        1,
+        "retryable failure must not create an assistant row: {assistants:?}"
+    );
+    let _ordinal = assistants[0]["ordinal"].as_u64();
+    assert!(
+        _ordinal.is_some(),
+        "committed assistant must have an ordinal"
+    );
+
+    let fresh = loop_service(AgentGatewayConfig::default(), &ScriptedProvider::new());
+    let service = fresh.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("fresh admit should succeed");
+    let run_id = admitted.run_id.clone();
+    let blocks = [LlmContentBlock {
+        block_type: "text".to_string(),
+        text: Some("stable".to_string()),
+        ..LlmContentBlock::default()
+    }];
+    let left = {
+        let service = service.clone();
+        let run_id = run_id.clone();
+        let blocks = blocks.clone();
+        thread::spawn(move || {
+            service.commit_provider_step(&run_id, 1, &blocks, None, Some("stop"), None, None, None)
+        })
+    };
+    let right = {
+        let service = service.clone();
+        let run_id = run_id.clone();
+        let blocks = blocks.clone();
+        thread::spawn(move || {
+            service.commit_provider_step(&run_id, 1, &blocks, None, Some("stop"), None, None, None)
+        })
+    };
+    let left_commit = left.join().expect("left join").expect("left commit");
+    let right_commit = right.join().expect("right join").expect("right commit");
+    assert_eq!(left_commit.message_id(), right_commit.message_id());
+    assert_eq!(left_commit.envelope(), right_commit.envelope());
+    let after = assistant_messages(&service, &admitted.session_id);
+    assert_eq!(
+        after.len(),
+        1,
+        "concurrent replay must not duplicate ordinals"
+    );
+    assert_eq!(after[0]["id"].as_str(), Some(left_commit.message_id()));
+    let concurrent_ordinals: Vec<_> = after
+        .iter()
+        .filter_map(|message| message["ordinal"].as_u64())
+        .collect();
+    assert_eq!(concurrent_ordinals.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_workers_occupy_run_once() {
+    let provider = ScriptedProvider::new();
+    provider.push_hang();
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service.admit(admit_request()).await.expect("admit");
+    let worker1 = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    assert!(
+        wait_until(Duration::from_secs(2), || provider.call_count() == 1).await,
+        "first worker should occupy the provider call"
+    );
+    let worker2 = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    tokio::time::timeout(Duration::from_millis(400), worker2)
+        .await
+        .expect("second worker must return while first occupies")
+        .expect("second worker join");
+    assert_eq!(provider.call_count(), 1);
+    service.stop(&admitted.run_id);
+    worker1.await.expect("first worker");
+    assert_eq!(provider.call_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_ok_envelope_does_not_commit_durable_success() {
+    let provider = ScriptedProvider::new();
+    provider.push_envelope(json!({
+        "ok": true,
+        "response": "not-an-object",
+        "error": {}
+    }));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service.admit(admit_request()).await.expect("admit");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(
+        event_names(&service, &admitted.run_id)
+            .into_iter()
+            .filter(|name| name == "model.completed")
+            .count(),
+        0,
+        "malformed envelope must not persist model.completed: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert!(
+        assistant_messages(&service, &admitted.session_id).is_empty(),
+        "malformed envelope must not persist an assistant step"
+    );
+    assert_ne!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()]
+    );
 }

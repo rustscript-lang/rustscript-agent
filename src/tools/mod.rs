@@ -18,6 +18,7 @@ pub use files::{FileTools, ReadFileRequest, SearchFilesRequest};
 pub use process::{
     ProcessAction, ProcessArtifactSink, ProcessExecutor, ProcessOwner, ProcessRequest, ProcessTable,
 };
+pub(crate) use registry::sha256_hex;
 pub use registry::{
     SchemaValidationError, SchemaValidationErrorKind, ToolRegistry, ToolRegistryEntry,
     ToolRegistryError, ToolRegistrySnapshot, builtin_entries, builtin_tool_registry,

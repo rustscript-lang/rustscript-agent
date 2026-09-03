@@ -5312,7 +5312,12 @@ async fn session_messages_api_serializes_canonical_tool_call_blocks() {
         output_tokens: 2,
         total_tokens: 3,
     };
-    let parent_id = service
+    let expected_parent = service
+        .session_messages(&admitted.session_id)
+        .last()
+        .and_then(|message| message["id"].as_str().map(str::to_string))
+        .expect("admission parent");
+    let parent = service
         .commit_provider_step(
             &admitted.run_id,
             1,
@@ -5330,6 +5335,7 @@ async fn session_messages_api_serializes_canonical_tool_call_blocks() {
             Some("parent-1"),
         )
         .expect("provider step should persist");
+    let parent_id = parent.message_id().to_string();
     persistence
         .step_commit(&json!({
             "run_id": admitted.run_id,
@@ -5385,7 +5391,8 @@ async fn session_messages_api_serializes_canonical_tool_call_blocks() {
         .expect("assistant tool-call message");
     assert_eq!(assistant["id"], parent_id);
     assert_eq!(assistant["finish_reason"], "tool_calls");
-    assert_eq!(assistant["parent_message_id"], "parent-1");
+    assert_eq!(assistant["parent_message_id"], expected_parent);
+    assert_ne!(assistant["parent_message_id"], "parent-1");
     assert_eq!(assistant["metadata"]["provider"], "test-provider");
     assert_eq!(assistant["metadata"]["model"], "test-model");
     assert_eq!(assistant["metadata"]["usage"]["total_tokens"], 3);

@@ -814,6 +814,10 @@ fn compile_options() -> CompileSourceFileOptions {
 }
 
 /// Default production provider: invoke the existing RSS adapter harness.
+pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
+    Arc::new(RssAdapterProvider)
+}
+
 struct RssAdapterProvider;
 
 impl AgentProviderHost for RssAdapterProvider {

@@ -116,6 +116,54 @@ pub enum ProviderPendingDecision {
     RefusedTerminal,
 }
 
+/// Canonical durable provider step returned by [`AgentService::commit_provider_step`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderCommit {
+    pub message_id: String,
+    pub envelope: JsonValue,
+}
+
+/// Inserted records a new turn. Existing returns the durable envelope and
+/// never the caller's fresh payload.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProviderCommitOutcome {
+    Inserted(ProviderCommit),
+    Existing(ProviderCommit),
+}
+
+impl ProviderCommitOutcome {
+    pub fn message_id(&self) -> &str {
+        match self {
+            Self::Inserted(commit) | Self::Existing(commit) => &commit.message_id,
+        }
+    }
+
+    pub fn envelope(&self) -> &JsonValue {
+        match self {
+            Self::Inserted(commit) | Self::Existing(commit) => &commit.envelope,
+        }
+    }
+
+    pub fn is_inserted(&self) -> bool {
+        matches!(self, Self::Inserted(_))
+    }
+}
+
+const PROVIDER_RETRY_BUDGET: u64 = 2;
+const SECRET_PROVIDER_REQUEST_KEYS: &[&str] = &[
+    "request",
+    "messages",
+    "prompt",
+    "provider_options",
+    "api_key",
+    "headers",
+    "body",
+    "authorization",
+    "system",
+    "instructions",
+    "content",
+];
+
 /// One run whose terminal state could not be committed durably. The worker
 /// has already exited; a bounded retry loop (janitor cadence) commits the
 /// typed terminal when storage recovers — durable commit first, then
@@ -161,6 +209,9 @@ pub struct RunHandle {
     native_dispatch_cv: Condvar,
     /// Frozen coding system prompt captured at admission.
     coding_system_prompt: Arc<str>,
+    /// Exclusive worker occupancy. Concurrent `run_worker` tasks cannot both
+    /// call the provider or advance the turn. Released on Drop (error/panic).
+    occupancy: AtomicBool,
 }
 
 /// Shared native dispatch machinery for one admitted run.
@@ -547,6 +598,9 @@ struct AgentServiceInner {
     /// cannot interleave. Never held across GET; the GatewayStore lock is
     /// released before SQLite/worker IO.
     commit_gate: Arc<ParkingMutex<()>>,
+    crash_after_provider_commit: AtomicBool,
+    crash_after_provider_request: AtomicBool,
+    provider_commit_crashed: AtomicBool,
 }
 
 impl Drop for AgentServiceInner {
@@ -613,6 +667,9 @@ impl AgentService {
             runner: Mutex::new(None),
             uncooperative_dispatch: Mutex::new(None),
             commit_gate: Arc::new(ParkingMutex::new(())),
+            crash_after_provider_commit: AtomicBool::new(false),
+            crash_after_provider_request: AtomicBool::new(false),
+            provider_commit_crashed: AtomicBool::new(false),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
         Self { inner }
@@ -685,6 +742,47 @@ impl AgentService {
             .as_ref()
             .ok_or_else(|| "agent source is missing".to_string())?;
         Ok(self.cached_agent_runner(source)?.config().clone())
+    }
+
+    /// Test failpoint: panic after a successful provider-step commit, before
+    /// the envelope is returned to RSS. The worker leaves the run started so
+    /// a restart can replay the durable step.
+    pub fn inject_crash_after_provider_commit(&self) {
+        self.inner
+            .crash_after_provider_commit
+            .store(true, Ordering::SeqCst);
+        self.inner
+            .provider_commit_crashed
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Test failpoint: panic after a durable `model.requested` boundary, before
+    /// the inner provider call. Restart may retry the same logical turn.
+    pub fn inject_crash_after_provider_request(&self) {
+        self.inner
+            .crash_after_provider_request
+            .store(true, Ordering::SeqCst);
+        self.inner
+            .provider_commit_crashed
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_crash_after_provider_commit(&self) -> bool {
+        self.inner
+            .crash_after_provider_commit
+            .swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn take_crash_after_provider_request(&self) -> bool {
+        self.inner
+            .crash_after_provider_request
+            .swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_provider_commit_crashed(&self) {
+        self.inner
+            .provider_commit_crashed
+            .store(true, Ordering::SeqCst);
     }
 
     /// Returns the registry snapshot currently used for future admissions.
@@ -984,11 +1082,42 @@ impl AgentService {
         provider: Option<&str>,
         model: Option<&str>,
         parent_message_id: Option<&str>,
-    ) -> Result<String, EventCommitError> {
+    ) -> Result<ProviderCommitOutcome, EventCommitError> {
+        self.commit_provider_step_with_meta(
+            run_id,
+            turn,
+            blocks,
+            usage,
+            finish_reason,
+            provider,
+            model,
+            parent_message_id,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_provider_step_with_meta(
+        &self,
+        run_id: &str,
+        turn: u64,
+        blocks: &[LlmContentBlock],
+        usage: Option<&crate::domain::Usage>,
+        finish_reason: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+        _parent_message_id: Option<&str>,
+        truncated: Option<bool>,
+        reasoning: Option<&JsonValue>,
+    ) -> Result<ProviderCommitOutcome, EventCommitError> {
+        crate::durable_provider::validate_provider_blocks(blocks)?;
         let _serial = self.inner.commit_gate.lock();
         let event_id = durable_provider_event_id(run_id, turn, "model.completed");
         let message_id = durable_message_id(run_id, "turn", &turn.to_string());
         let content = encode_message_content(blocks);
+        let encoded_blocks = decode_message_blocks(&content);
+        crate::durable_provider::validate_provider_blocks(&encoded_blocks)?;
         let mut metadata = serde_json::Map::new();
         metadata.insert("turn".to_string(), json!(turn));
         if let Some(usage) = usage {
@@ -1001,11 +1130,17 @@ impl AgentService {
                 }),
             );
         }
-        if let Some(provider) = provider {
+        if let Some(provider) = provider.filter(|value| !value.is_empty()) {
             metadata.insert("provider".to_string(), json!(provider));
         }
-        if let Some(model) = model {
+        if let Some(model) = model.filter(|value| !value.is_empty()) {
             metadata.insert("model".to_string(), json!(model));
+        }
+        if let Some(truncated) = truncated {
+            metadata.insert("truncated".to_string(), json!(truncated));
+        }
+        if let Some(reasoning) = reasoning {
+            metadata.insert("reasoning".to_string(), reasoning.clone());
         }
         let metadata = JsonValue::Object(metadata);
         let reserved = {
@@ -1014,12 +1149,19 @@ impl AgentService {
                 return Err(EventCommitError::Terminal);
             };
             if run.events.iter().any(|event| event.event_id == event_id) {
-                return Ok(message_id);
+                return existing_provider_commit(&store, run, &message_id);
+            }
+            if run.status == "cancelled" {
+                return Err(EventCommitError::Cancelled);
             }
             if run_refuses_pending_provider(run) {
                 return Err(EventCommitError::Terminal);
             }
             let session_id = run.session_id.clone();
+            let parent_message_id = store
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.messages.last().map(|message| message.id.clone()));
             let mut event = event_candidate(
                 run,
                 "model.completed",
@@ -1043,7 +1185,7 @@ impl AgentService {
                 finish_reason: finish_reason.map(str::to_string),
                 name: None,
                 tool_call_id: None,
-                parent_message_id: parent_message_id.map(str::to_string),
+                parent_message_id: parent_message_id.clone(),
                 token_estimate: usage.map(|usage| usage.total_tokens as i64),
                 metadata: metadata.clone(),
                 ordinal,
@@ -1061,7 +1203,7 @@ impl AgentService {
                 "content_json": serde_json::to_string(&content).unwrap_or_else(|_| "[]".to_string()),
                 "name": "",
                 "tool_call_id": "",
-                "parent_message_id": parent_message_id.unwrap_or(""),
+                "parent_message_id": parent_message_id.unwrap_or_default(),
                 "token_estimate": usage.map(|usage| usage.total_tokens as i64).unwrap_or(0),
                 "metadata_json": serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string()),
                 "finish_reason": finish_reason.unwrap_or(""),
@@ -1076,16 +1218,24 @@ impl AgentService {
                 max_events_per_run: self.inner.config.max_events_per_run,
             }
         };
+        let envelope = crate::durable_provider::reconstruct_provider_envelope(
+            &content,
+            &metadata,
+            finish_reason,
+        )?;
         persist_and_apply(
             &self.inner.store,
             self.inner.persistence.as_deref(),
             reserved,
         )?;
-        Ok(message_id)
+        Ok(ProviderCommitOutcome::Inserted(ProviderCommit {
+            message_id,
+            envelope,
+        }))
     }
 
-    /// Persist a provider request boundary (`model.requested`) with enough
-    /// metadata to decide restart retry vs typed interrupt.
+    /// Persist a sanitized provider request boundary (`model.requested`).
+    /// Never stores request/messages/prompt/provider_options/api_key/headers/body.
     pub fn commit_provider_request(
         &self,
         run_id: &str,
@@ -1094,60 +1244,33 @@ impl AgentService {
         request: &JsonValue,
     ) -> Result<(), EventCommitError> {
         let event_id = durable_provider_event_id(run_id, turn, "model.requested");
-        let payload = json!({
+        let mut payload = json!({
             "turn": turn,
-            "idempotent": request_is_idempotent,
-            "request": request,
-            "effect_boundary": false,
+            "attempt": 1,
+            "request_fingerprint": crate::durable_provider::canonical_provider_request_fingerprint(request),
+            "retry_safe": request_is_idempotent,
         });
+        if let JsonValue::Object(map) = &mut payload {
+            for key in SECRET_PROVIDER_REQUEST_KEYS {
+                map.remove(*key);
+            }
+        }
         self.persist_provider_event(run_id, &event_id, "model.requested", payload)
     }
 
-    /// Inspect durable provider-request state and apply
-    /// [`provider_pending_may_retry`]. Retry calls the provider once and
-    /// commits the response; otherwise reconcile `interrupted_provider`.
+    /// Inspect durable provider-request state. Retry does not call the inner
+    /// provider or synthesize an assistant step; Interrupted fail-closes.
     pub fn recover_pending_provider(
         &self,
         run_id: &str,
         turn: u64,
-        provider: &dyn AgentProviderHost,
+        _provider: &dyn AgentProviderHost,
     ) -> Result<ProviderPendingDecision, EventCommitError> {
         let decision = self.provider_pending_decision(run_id, turn);
         match decision {
-            ProviderPendingDecision::Replay | ProviderPendingDecision::RefusedTerminal => {
-                Ok(decision)
-            }
-            ProviderPendingDecision::Retry => {
-                let request = self
-                    .pending_provider_request(run_id, turn)
-                    .unwrap_or_else(|| json!({}));
-                let cancellation = self
-                    .handle(run_id)
-                    .map(|handle| handle.cancel.clone())
-                    .unwrap_or_default();
-                let envelope = provider.call(&request, &cancellation);
-                if envelope.get("ok") == Some(&JsonValue::Bool(true)) {
-                    let response = envelope
-                        .get("response")
-                        .cloned()
-                        .unwrap_or(JsonValue::Object(Map::new()));
-                    let blocks = provider_response_blocks(&response);
-                    self.commit_provider_step(
-                        run_id,
-                        turn,
-                        &blocks,
-                        None,
-                        Some("stop"),
-                        None,
-                        None,
-                        None,
-                    )?;
-                } else {
-                    self.persist_interrupted_provider(run_id, turn)?;
-                    return Ok(ProviderPendingDecision::Interrupted);
-                }
-                Ok(ProviderPendingDecision::Retry)
-            }
+            ProviderPendingDecision::Replay
+            | ProviderPendingDecision::RefusedTerminal
+            | ProviderPendingDecision::Retry => Ok(decision),
             ProviderPendingDecision::Interrupted => {
                 self.persist_interrupted_provider(run_id, turn)?;
                 Ok(ProviderPendingDecision::Interrupted)
@@ -1167,22 +1290,21 @@ impl AgentService {
             .events
             .iter()
             .find(|event| event.event_id == requested_id);
-        let has_durable_response = run.events.iter().any(|event| {
-            event.event_id == completed_id
-                || event.event_id == interrupted_id
+        let has_completed = run
+            .events
+            .iter()
+            .any(|event| event.event_id == completed_id);
+        if has_completed {
+            return ProviderPendingDecision::Replay;
+        }
+        let has_terminal_failure = run.events.iter().any(|event| {
+            event.event_id == interrupted_id
                 || (event.event == "model.failed"
-                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn))
+                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn)
+                    && !provider_failure_is_retryable(event))
         });
-        if has_durable_response {
-            return if run
-                .events
-                .iter()
-                .any(|event| event.event_id == completed_id)
-            {
-                ProviderPendingDecision::Replay
-            } else {
-                ProviderPendingDecision::Interrupted
-            };
+        if has_terminal_failure {
+            return ProviderPendingDecision::Interrupted;
         }
         if run_refuses_pending_provider(run) {
             return ProviderPendingDecision::RefusedTerminal;
@@ -1190,31 +1312,47 @@ impl AgentService {
         let Some(requested) = requested else {
             return ProviderPendingDecision::Interrupted;
         };
-        let request_is_idempotent = requested
+        let retry_safe = requested
             .data
-            .get("idempotent")
+            .get("retry_safe")
             .and_then(JsonValue::as_bool)
-            .unwrap_or(false);
+            .or_else(|| {
+                requested
+                    .data
+                    .get("idempotent")
+                    .and_then(JsonValue::as_bool)
+            });
+        let has_fingerprint = requested
+            .data
+            .get("request_fingerprint")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|value| value.starts_with("sha256:"));
+        let secret_leak = requested_payload_leaks_secrets(&requested.data);
+        if retry_safe != Some(true) || !has_fingerprint || secret_leak {
+            return ProviderPendingDecision::Interrupted;
+        }
         let request_seq = requested.seq;
         let has_effect = run
             .events
             .iter()
             .any(|event| event.seq > request_seq && event.event.starts_with("tool."));
-        if provider_pending_may_retry(has_durable_response, request_is_idempotent, has_effect) {
+        let retryable_failures = run
+            .events
+            .iter()
+            .filter(|event| {
+                event.event == "model.failed"
+                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn)
+                    && provider_failure_is_retryable(event)
+            })
+            .count() as u64;
+        let has_durable_response = false;
+        if provider_pending_may_retry(has_durable_response, true, has_effect)
+            && retryable_failures <= PROVIDER_RETRY_BUDGET
+        {
             ProviderPendingDecision::Retry
         } else {
             ProviderPendingDecision::Interrupted
         }
-    }
-
-    fn pending_provider_request(&self, run_id: &str, turn: u64) -> Option<JsonValue> {
-        let store = self.inner.store.read();
-        let run = store.runs.get(run_id)?;
-        let event_id = durable_provider_event_id(run_id, turn, "model.requested");
-        run.events
-            .iter()
-            .find(|event| event.event_id == event_id)
-            .and_then(|event| event.data.get("request").cloned())
     }
 
     fn persist_interrupted_provider(
@@ -1226,9 +1364,81 @@ impl AgentService {
         let payload = json!({
             "turn": turn,
             "error_code": "interrupted_provider",
-            "error_message": "pending provider request is not retryable",
+            "retryable": false,
         });
         self.persist_provider_event(run_id, &event_id, "model.failed", payload)
+    }
+
+    pub(crate) fn has_provider_request(&self, run_id: &str, turn: u64) -> bool {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return false;
+        };
+        let event_id = durable_provider_event_id(run_id, turn, "model.requested");
+        run.events.iter().any(|event| event.event_id == event_id)
+    }
+
+    pub(crate) fn persist_retryable_provider_failure(
+        &self,
+        run_id: &str,
+        turn: u64,
+        attempt: u64,
+        code: &str,
+        status: Option<u64>,
+    ) -> Result<(), EventCommitError> {
+        let event_id = durable_provider_event_id(run_id, turn, &format!("model.failed:{attempt}"));
+        let bounded_code = truncate_for_log(code, 64);
+        let mut payload = json!({
+            "turn": turn,
+            "attempt": attempt,
+            "error_code": bounded_code,
+            "retryable": true,
+        });
+        if let Some(status) = status {
+            payload["status"] = json!(status);
+        }
+        self.persist_provider_event(run_id, &event_id, "model.failed", payload)
+    }
+
+    pub(crate) fn replay_provider_envelope(
+        &self,
+        run_id: &str,
+        turn: u64,
+    ) -> Result<Option<JsonValue>, EventCommitError> {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
+        let completed_id = durable_provider_event_id(run_id, turn, "model.completed");
+        let message_id = durable_message_id(run_id, "turn", &turn.to_string());
+        let completed = run
+            .events
+            .iter()
+            .find(|event| event.event_id == completed_id);
+        let message = store.sessions.get(&run.session_id).and_then(|session| {
+            session
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+        });
+        match (completed, message) {
+            (None, None) => Ok(None),
+            (Some(event), Some(message)) if message.role == "assistant" => {
+                let finish_reason = message
+                    .finish_reason
+                    .as_deref()
+                    .or_else(|| event.data.get("finish_reason").and_then(JsonValue::as_str));
+                crate::durable_provider::reconstruct_provider_envelope(
+                    &message.content,
+                    &message.metadata,
+                    finish_reason,
+                )
+                .map(Some)
+            }
+            _ => Err(EventCommitError::Corrupt(
+                "durable provider step is incomplete".to_string(),
+            )),
+        }
     }
 
     fn persist_provider_event(
@@ -1246,6 +1456,9 @@ impl AgentService {
             };
             if run.events.iter().any(|event| event.event_id == event_id) {
                 return Ok(());
+            }
+            if run.status == "cancelled" {
+                return Err(EventCommitError::Cancelled);
             }
             if run_refuses_pending_provider(run) {
                 return Err(EventCommitError::Terminal);
@@ -1684,6 +1897,7 @@ impl AgentService {
             native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
             native_dispatch_cv: Condvar::new(),
             coding_system_prompt: Arc::from(prompt),
+            occupancy: AtomicBool::new(false),
         });
         self.inner
             .runs
@@ -2340,6 +2554,7 @@ impl AgentService {
             native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
             native_dispatch_cv: Condvar::new(),
             coding_system_prompt: Arc::from(coding_system_prompt),
+            occupancy: AtomicBool::new(false),
         });
         self.inner
             .runs
@@ -2749,6 +2964,9 @@ impl AgentService {
             }
             return;
         }
+        let Some(_occupancy) = try_occupy_run(&handle) else {
+            return;
+        };
         let session_id = {
             let store = self.inner.store.read();
             let Some(run) = store.runs.get(&run_id) else {
@@ -2815,12 +3033,23 @@ impl AgentService {
                     return;
                 }
             };
-            let provider = self
+            let raw_provider = self
                 .inner
                 .provider_host
                 .lock()
                 .expect("provider host lock")
-                .take();
+                .take()
+                .unwrap_or_else(crate::runtime::rss_runner::default_agent_provider_host);
+            let accounted = Arc::new(crate::durable_provider::AccountingProvider::new(
+                raw_provider,
+                Arc::clone(&self.inner.metrics),
+            ));
+            let provider = Some(Arc::new(crate::durable_provider::DurableProviderHost::new(
+                AgentService::clone(self.as_ref()),
+                run_id.clone(),
+                accounted,
+                Arc::clone(&self.inner.metrics),
+            )) as Arc<dyn AgentProviderHost>);
             let host = AgentHostBridges {
                 provider,
                 dispatcher,
@@ -2899,6 +3128,14 @@ impl AgentService {
                     .ok()
                     .and_then(|result| result.ok())
                     .unwrap_or_default();
+            if self
+                .inner
+                .provider_commit_crashed
+                .swap(false, Ordering::SeqCst)
+            {
+                self.cleanup_run_hosts(&handle);
+                return;
+            }
             match outcome {
                 WorkerOutcome::Completed(value) => {
                     if let Some(reason) = delivery_outcome.schema_violation {
@@ -3082,60 +3319,81 @@ impl AgentService {
                 let Some(session) = store.sessions.get(&session_id_for_commit) else {
                     return TerminalOutcome::SessionMissing;
                 };
-                let ordinal = next_message_ordinal(session);
-                let message = SessionMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    session_id: session_id_for_commit.clone(),
-                    role: "assistant".to_string(),
-                    content: decode_message_content(&JsonValue::String(
-                        output_text_for_commit.clone(),
-                    )),
-                    created_at: timestamp(),
-                    run_id: Some(run_id_for_commit.clone()),
-                    finish_reason: Some("stop".to_string()),
-                    name: None,
-                    tool_call_id: None,
-                    parent_message_id: None,
-                    token_estimate: None,
-                    metadata: JsonValue::Null,
-                    ordinal: Some(ordinal),
-                };
-                let delta_event = event_candidate(
-                    run,
-                    "message.delta",
-                    json!({
-                        "message_id": message.id,
-                        "delta": output_text_for_commit,
-                        "role": "assistant"
-                    }),
-                    max_event_bytes,
-                );
-                let mut completed_event = event_candidate(
-                    run,
-                    "run.completed",
-                    json!({
-                        "status": "completed",
-                        "output": {"message": message},
-                        "usage": {
-                            "input_tokens": 0,
-                            "output_tokens": 0,
-                            "total_tokens": 0
-                        }
-                    }),
-                    max_event_bytes,
-                );
-                completed_event.seq = delta_event.seq + 1;
-                (message, delta_event, completed_event)
+                let provider_step_present = run
+                    .events
+                    .iter()
+                    .any(|event| event.event == "model.completed");
+                if provider_step_present {
+                    let completed_event = event_candidate(
+                        run,
+                        "run.completed",
+                        json!({
+                            "status": "completed",
+                            "output": {"text": output_text_for_commit},
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0
+                            }
+                        }),
+                        max_event_bytes,
+                    );
+                    (None, vec![completed_event])
+                } else {
+                    let ordinal = next_message_ordinal(session);
+                    let message = SessionMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id: session_id_for_commit.clone(),
+                        role: "assistant".to_string(),
+                        content: decode_message_content(&JsonValue::String(
+                            output_text_for_commit.clone(),
+                        )),
+                        created_at: timestamp(),
+                        run_id: Some(run_id_for_commit.clone()),
+                        finish_reason: Some("stop".to_string()),
+                        name: None,
+                        tool_call_id: None,
+                        parent_message_id: None,
+                        token_estimate: None,
+                        metadata: JsonValue::Null,
+                        ordinal: Some(ordinal),
+                    };
+                    let delta_event = event_candidate(
+                        run,
+                        "message.delta",
+                        json!({
+                            "message_id": message.id,
+                            "delta": output_text_for_commit,
+                            "role": "assistant"
+                        }),
+                        max_event_bytes,
+                    );
+                    let mut completed_event = event_candidate(
+                        run,
+                        "run.completed",
+                        json!({
+                            "status": "completed",
+                            "output": {"message": message},
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0
+                            }
+                        }),
+                        max_event_bytes,
+                    );
+                    completed_event.seq = delta_event.seq + 1;
+                    (Some(message), vec![delta_event, completed_event])
+                }
             };
-            let (message, delta_event, completed_event) = reserved;
-            let events = vec![delta_event.clone(), completed_event.clone()];
+            let (assistant_message, events) = reserved;
             match terminal_commit(
                 persistence.as_deref(),
                 &run_id_for_commit,
                 &session_id_for_commit,
                 "completed",
                 &events,
-                Some(&message),
+                assistant_message.as_ref(),
             ) {
                 Ok(seqs) => {
                     let mut store = service.inner.store.write();
@@ -3145,7 +3403,7 @@ impl AgentService {
                         "completed",
                         &events,
                         &seqs,
-                        Some(&message),
+                        assistant_message.as_ref(),
                         max_events_per_run,
                     );
                     let sender = store
@@ -3154,8 +3412,9 @@ impl AgentService {
                         .and_then(|run| run.sender.clone());
                     drop(store);
                     if let Some(sender) = sender {
-                        let _ = sender.send(delta_event);
-                        let _ = sender.send(completed_event);
+                        for event in events {
+                            let _ = sender.send(event);
+                        }
                     }
                     TerminalOutcome::Committed
                 }
@@ -3164,8 +3423,8 @@ impl AgentService {
                     pending: Box::new(PendingTerminal {
                         to_status: "completed".to_string(),
                         session_id: Some(session_id_for_commit),
-                        events: vec![delta_event, completed_event],
-                        assistant_message: Some(message),
+                        events,
+                        assistant_message,
                         deadline: std::time::Instant::now() + retry_window,
                     }),
                 },
@@ -3959,6 +4218,76 @@ fn next_message_ordinal(session: &SessionRecord) -> i64 {
     max_ordinal.max(session.messages.len() as i64) + 1
 }
 
+struct RunOccupancyGuard {
+    handle: Arc<RunHandle>,
+}
+
+impl Drop for RunOccupancyGuard {
+    fn drop(&mut self) {
+        self.handle.occupancy.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_occupy_run(handle: &Arc<RunHandle>) -> Option<RunOccupancyGuard> {
+    handle
+        .occupancy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()
+        .map(|_| RunOccupancyGuard {
+            handle: Arc::clone(handle),
+        })
+}
+
+fn existing_provider_commit(
+    store: &GatewayStore,
+    run: &RunRecord,
+    message_id: &str,
+) -> Result<ProviderCommitOutcome, EventCommitError> {
+    let Some(session) = store.sessions.get(&run.session_id) else {
+        return Err(EventCommitError::Corrupt(
+            "durable provider step is incomplete".to_string(),
+        ));
+    };
+    let Some(message) = session
+        .messages
+        .iter()
+        .find(|message| message.id == message_id)
+    else {
+        return Err(EventCommitError::Corrupt(
+            "durable provider step is incomplete".to_string(),
+        ));
+    };
+    if message.role != "assistant" {
+        return Err(EventCommitError::Corrupt(
+            "durable provider step is incomplete".to_string(),
+        ));
+    }
+    let envelope = crate::durable_provider::reconstruct_provider_envelope(
+        &message.content,
+        &message.metadata,
+        message.finish_reason.as_deref(),
+    )?;
+    Ok(ProviderCommitOutcome::Existing(ProviderCommit {
+        message_id: message_id.to_string(),
+        envelope,
+    }))
+}
+
+fn provider_failure_is_retryable(event: &GatewayEvent) -> bool {
+    event.data.get("retryable").and_then(JsonValue::as_bool) == Some(true)
+}
+
+fn requested_payload_leaks_secrets(data: &JsonValue) -> bool {
+    match data {
+        JsonValue::Object(map) => map.iter().any(|(key, value)| {
+            SECRET_PROVIDER_REQUEST_KEYS.contains(&key.as_str())
+                || requested_payload_leaks_secrets(value)
+        }),
+        JsonValue::Array(items) => items.iter().any(requested_payload_leaks_secrets),
+        _ => false,
+    }
+}
+
 enum PersistKind {
     Step,
     EventAppend,
@@ -4056,24 +4385,6 @@ fn apply_terminal(
         session.view.message_count = session.messages.len();
         session.view.updated_at = timestamp();
     }
-}
-
-fn provider_response_blocks(response: &JsonValue) -> Vec<LlmContentBlock> {
-    if let Some(content) = response.get("content") {
-        let blocks = decode_message_blocks(content);
-        if !blocks.is_empty() {
-            return blocks;
-        }
-    }
-    let text = response
-        .get("text")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("");
-    vec![LlmContentBlock {
-        block_type: "text".to_string(),
-        text: Some(text.to_string()),
-        ..Default::default()
-    }]
 }
 
 fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValue {

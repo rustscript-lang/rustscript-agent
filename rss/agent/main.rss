@@ -163,6 +163,12 @@ fn error_is_retryable(error: map) -> bool {
     if code == "malformed_payload" {
         decided = true;
     }
+    if code == "provider_step_persist_failed" {
+        decided = true;
+    }
+    if code == "interrupted_provider" {
+        decided = true;
+    }
     if code == "scripted_exhausted" {
         decided = true;
     }

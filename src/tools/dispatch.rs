@@ -48,8 +48,10 @@ pub struct DispatchLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventCommitError {
     Terminal,
+    Cancelled,
     PersistFailed(String),
     MissingParent,
+    Corrupt(String),
 }
 
 /// Durable-first event sink used by dispatch. Implementations must not publish
@@ -355,7 +357,11 @@ impl DispatchContext {
                 EventCommitError::Terminal => {
                     ToolResult::failure("run_terminal", "run is terminal")
                 }
+                EventCommitError::Cancelled => {
+                    ToolResult::failure("cancelled", "run was cancelled")
+                }
                 EventCommitError::PersistFailed(_) => persist_failed_result(),
+                EventCommitError::Corrupt(_) => corrupt_durable_result(),
             };
         }
         let used = self.inner.call_count.fetch_add(1, Ordering::SeqCst);
@@ -462,8 +468,10 @@ impl DispatchContext {
         ) {
             Ok(()) => {}
             Err(EventCommitError::Terminal) => return result,
+            Err(EventCommitError::Cancelled) => return result,
             Err(EventCommitError::PersistFailed(_)) => return persist_failed_result(),
             Err(EventCommitError::MissingParent) => return missing_parent_result(),
+            Err(EventCommitError::Corrupt(_)) => return corrupt_durable_result(),
         }
         if self.inner.events.is_terminal() {
             return result;
@@ -487,8 +495,10 @@ impl DispatchContext {
         ) {
             Ok(()) => result,
             Err(EventCommitError::Terminal) => result,
+            Err(EventCommitError::Cancelled) => result,
             Err(EventCommitError::PersistFailed(_)) => persist_failed_result(),
             Err(EventCommitError::MissingParent) => missing_parent_result(),
+            Err(EventCommitError::Corrupt(_)) => corrupt_durable_result(),
         }
     }
 
@@ -646,7 +656,13 @@ fn pre_effect_commit_failure(error: EventCommitError) -> ToolResult {
         EventCommitError::Terminal => {
             ToolResult::failure("cancelled", "run already committed a terminal state")
         }
+        EventCommitError::Cancelled => ToolResult::failure("cancelled", "run was cancelled"),
+        EventCommitError::Corrupt(_) => corrupt_durable_result(),
     }
+}
+
+fn corrupt_durable_result() -> ToolResult {
+    ToolResult::failure("corrupt_tool_result", "durable state is corrupt")
 }
 
 fn missing_parent_result() -> ToolResult {
