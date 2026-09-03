@@ -41,8 +41,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::capabilities::{
-    AllowAllApproval, CancellationFlag, CapabilityLifecycle, CapabilityOwner, DurableStarted,
-    DurableToolLifecycle, LifecycleError, LifecycleLimits, SystemClock, UuidIssuer,
+    AllowAllApproval, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
+    CapabilityOwner, DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
+    LifecycleError, LifecycleLimits, ProcessCapability, SystemClock, UuidIssuer,
 };
 use crate::config::{
     ADMISSION_IDEMPOTENCY_SCOPE, ADMISSION_RUN_COL_ID, ADMISSION_RUN_COL_INPUT_JSON,
@@ -228,6 +229,9 @@ struct NativeDispatchState {
     cleanup_grace: Duration,
     lifecycle: Arc<CapabilityLifecycle>,
     capability_owner: CapabilityOwner,
+    filesystem: Arc<FilesystemCapability>,
+    processes: Arc<ProcessCapability>,
+    artifacts: Arc<ArtifactCapability>,
 }
 
 /// Two-phase native dispatch slot. The handle lock is never held across
@@ -1764,6 +1768,16 @@ impl AgentService {
         let output_cap = max_tool_output_bytes.clamp(1, MAX_TOOL_OUTPUT_BYTES);
         let mut file_config = FileToolConfig::for_workspace(&workspace);
         file_config.apply_admitted_output_cap(output_cap);
+        let filesystem_limits = FilesystemLimits {
+            max_read_bytes: file_config.max_read_bytes,
+            max_write_bytes: file_config.max_write_bytes,
+            max_list_entries: file_config.max_search_files.max(1),
+        };
+        let artifact_limits = ArtifactLimits {
+            max_object_bytes: file_config.artifact_store.max_object_bytes,
+            max_total_bytes: file_config.artifact_store.max_total_bytes,
+            max_objects: file_config.artifact_store.max_objects.max(1),
+        };
         let mut process_config = ProcessToolConfig::for_workspace(&workspace);
         process_config.apply_admitted_output_cap(output_cap);
         let artifacts = self
@@ -1851,6 +1865,22 @@ impl AgentService {
             .generation(1)
             .build()
             .map_err(|error| invalid_context_metadata(run_id, error.code()))?;
+        let filesystem = Arc::new(
+            FilesystemCapability::new(
+                lifecycle.clone(),
+                capability_owner.clone(),
+                filesystem_limits,
+            )
+            .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+        );
+        let processes = Arc::new(
+            ProcessCapability::new(lifecycle.clone(), capability_owner.clone())
+                .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+        );
+        let artifacts = Arc::new(
+            ArtifactCapability::new(lifecycle.clone(), capability_owner.clone(), artifact_limits)
+                .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+        );
         let dispatcher = DispatchContext::new(
             owner,
             workspace.clone(),
@@ -1906,6 +1936,9 @@ impl AgentService {
             cleanup_grace: self.inner.config.cancellation_grace,
             lifecycle: Arc::new(lifecycle),
             capability_owner,
+            filesystem,
+            processes,
+            artifacts,
         })
     }
 
@@ -3217,14 +3250,17 @@ impl AgentService {
 
         let output_text = if let Some(source) = self.inner.agent_source.clone() {
             let context = self.build_run_context(&run_id);
-            let (dispatcher, lifecycle, capability_owner) =
+            let (dispatcher, lifecycle, capability_owner, filesystem, processes, artifacts) =
                 match self.native_dispatch_state(&run_id, &handle) {
                     Ok(Some(state)) => (
                         Some(Arc::new(state.dispatcher.clone())),
                         Some(Arc::clone(&state.lifecycle)),
                         Some(state.capability_owner.clone()),
+                        Some(Arc::clone(&state.filesystem)),
+                        Some(Arc::clone(&state.processes)),
+                        Some(Arc::clone(&state.artifacts)),
                     ),
-                    Ok(None) => (None, None, None),
+                    Ok(None) => (None, None, None, None, None, None),
                     Err(error) => {
                         if !self.commit_cleanup_or_continue(&run_id, &handle).await {
                             return;
@@ -3260,6 +3296,9 @@ impl AgentService {
                 metrics: Some(Arc::clone(&self.inner.metrics)),
                 lifecycle,
                 capability_owner,
+                filesystem,
+                processes,
+                artifacts,
             };
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling

@@ -193,6 +193,71 @@ impl LifecycleError {
             Self::UnresolvedCall => "unresolved_call",
         }
     }
+
+    /// Human-readable message without host filesystem paths.
+    pub fn message(&self) -> String {
+        match self {
+            Self::OwnerMismatch { expected, actual } => {
+                format!("owner mismatch: expected {expected}, got {actual}")
+            }
+            Self::InactiveRun => "run is not active".to_string(),
+            Self::MissingParent => "durable assistant parent is missing".to_string(),
+            Self::ApprovalDenied { reason } => reason.clone(),
+            Self::ApprovalCeiling { requested, ceiling } => format!(
+                "requested risk {} exceeds approved ceiling {}",
+                requested.as_str(),
+                ceiling.as_str()
+            ),
+            Self::DeadlineElapsed => "deadline elapsed".to_string(),
+            Self::Cancelled => "run was cancelled".to_string(),
+            Self::DuplicateClose => "execution token is already closed".to_string(),
+            Self::TokenUnknown => "execution token is unknown".to_string(),
+            Self::LimitExceeded => "max_tool_calls exceeded".to_string(),
+            Self::StartedCommitFailed(message) | Self::ResultCommitFailed(message) => {
+                message.clone()
+            }
+            Self::ResultTooLarge => "tool result exceeds output budget".to_string(),
+            Self::Interrupted => "execution was interrupted".to_string(),
+            Self::RegistryMismatch => {
+                "registry identity does not match frozen snapshot".to_string()
+            }
+            Self::InvalidMetadata(message) => message.clone(),
+            Self::UnresolvedCall => {
+                "an unresolved execution token already exists for this call".to_string()
+            }
+        }
+    }
+}
+
+/// Typed failure from a generic capability primitive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityError {
+    code: String,
+    message: String,
+}
+
+impl CapabilityError {
+    /// Builds a capability error with a stable machine-readable code.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<LifecycleError> for CapabilityError {
+    fn from(error: LifecycleError) -> Self {
+        Self::new(error.code(), error.message())
+    }
 }
 
 /// Frozen claims bound to one unforgeable execution token.

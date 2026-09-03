@@ -624,6 +624,9 @@ impl AgentRunner {
             metrics: self.host.metrics.clone(),
             lifecycle: self.host.lifecycle.clone(),
             capability_owner: self.host.capability_owner.clone(),
+            filesystem: self.host.filesystem.clone(),
+            processes: self.host.processes.clone(),
+            artifacts: self.host.artifacts.clone(),
             leases: Arc::new(Mutex::new(HashMap::new())),
         });
         if let Some(cancellation) = cancellation {

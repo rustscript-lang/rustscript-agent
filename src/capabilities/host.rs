@@ -14,41 +14,21 @@ pub fn error_envelope(error: &LifecycleError) -> Value {
         "kind": "error",
         "error": {
             "code": error.code(),
-            "message": error_message(error),
+            "message": error.message(),
         }
     })
 }
 
-fn error_message(error: &LifecycleError) -> String {
-    match error {
-        LifecycleError::OwnerMismatch { expected, actual } => {
-            format!("owner mismatch: expected {expected}, got {actual}")
+/// Host envelope for a typed failed capability primitive.
+pub fn capability_error_envelope(error: &super::types::CapabilityError) -> Value {
+    json!({
+        "ok": false,
+        "kind": "error",
+        "error": {
+            "code": error.code(),
+            "message": error.message(),
         }
-        LifecycleError::InactiveRun => "run is not active".to_string(),
-        LifecycleError::MissingParent => "durable assistant parent is missing".to_string(),
-        LifecycleError::ApprovalDenied { reason } => reason.clone(),
-        LifecycleError::ApprovalCeiling { requested, ceiling } => format!(
-            "requested risk {} exceeds approved ceiling {}",
-            requested.as_str(),
-            ceiling.as_str()
-        ),
-        LifecycleError::DeadlineElapsed => "deadline elapsed".to_string(),
-        LifecycleError::Cancelled => "run was cancelled".to_string(),
-        LifecycleError::DuplicateClose => "execution token is already closed".to_string(),
-        LifecycleError::TokenUnknown => "execution token is unknown".to_string(),
-        LifecycleError::LimitExceeded => "max_tool_calls exceeded".to_string(),
-        LifecycleError::StartedCommitFailed(message) => message.clone(),
-        LifecycleError::ResultCommitFailed(message) => message.clone(),
-        LifecycleError::ResultTooLarge => "tool result exceeds output budget".to_string(),
-        LifecycleError::Interrupted => "execution was interrupted".to_string(),
-        LifecycleError::RegistryMismatch => {
-            "registry identity does not match frozen snapshot".to_string()
-        }
-        LifecycleError::InvalidMetadata(message) => message.clone(),
-        LifecycleError::UnresolvedCall => {
-            "an unresolved execution token already exists for this call".to_string()
-        }
-    }
+    })
 }
 
 /// Parse RSS/host map metadata. Public tool names stay opaque strings.
