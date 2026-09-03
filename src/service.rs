@@ -240,6 +240,43 @@ struct ClosedDispatch {
     owner: ProcessOwner,
 }
 
+/// Restores a retriable `Empty` phase if initialization panics or returns
+/// `Err` before `Ready` is published. Drop never waits on IO or the condvar.
+struct NativeDispatchInitGuard {
+    handle: Arc<RunHandle>,
+    armed: bool,
+}
+
+impl NativeDispatchInitGuard {
+    fn arm(handle: &Arc<RunHandle>) -> Self {
+        Self {
+            handle: Arc::clone(handle),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NativeDispatchInitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut phase = self
+            .handle
+            .native_dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*phase, NativeDispatchPhase::Initializing) {
+            *phase = NativeDispatchPhase::Empty;
+        }
+        self.handle.native_dispatch_cv.notify_all();
+    }
+}
+
 impl NativeDispatchState {
     fn owner(&self) -> ProcessOwner {
         ProcessOwner::from(self.dispatcher.owner().clone())
@@ -1556,38 +1593,35 @@ impl AgentService {
             *phase = NativeDispatchPhase::Initializing;
             break;
         }
-        if let Some(observer) = self
+        let mut guard = NativeDispatchInitGuard::arm(handle);
+        let observer = self
             .inner
             .native_dispatch_init_entered
             .lock()
             .expect("native dispatch init observer lock")
-            .clone()
-        {
+            .clone();
+        if let Some(observer) = observer {
             observer();
         }
         let built = self.build_native_dispatch_state(run_id, handle);
-        let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
         match built {
             Ok(state) => {
                 let state = Arc::new(state);
+                let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
                 if matches!(*phase, NativeDispatchPhase::Initializing) {
                     *phase = NativeDispatchPhase::Ready(Arc::clone(&state));
                     handle.native_dispatch_cv.notify_all();
+                    guard.disarm();
                     Ok(Some(state))
                 } else {
                     handle.native_dispatch_cv.notify_all();
+                    guard.disarm();
                     drop(phase);
                     drop(state);
                     Ok(None)
                 }
             }
-            Err(error) => {
-                if !matches!(*phase, NativeDispatchPhase::Closed(_)) {
-                    *phase = NativeDispatchPhase::Empty;
-                }
-                handle.native_dispatch_cv.notify_all();
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 

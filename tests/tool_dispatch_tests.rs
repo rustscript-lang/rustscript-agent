@@ -2511,3 +2511,97 @@ async fn blocked_put_then_cleanup_leaves_no_object_reservation_or_bytes() {
         .expect("sticky closed dispatch");
     assert_cancelled_bounded(&after[0]);
 }
+
+#[tokio::test]
+async fn native_dispatch_init_panic_wakes_waiters_and_allows_retry() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    let run_id = admitted.run_id.clone();
+
+    let entered = Arc::new(Barrier::new(2));
+    let panic_gate = Arc::new(Barrier::new(2));
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let observer_entered = Arc::clone(&entered);
+    let observer_gate = Arc::clone(&panic_gate);
+    let observer_panic = Arc::clone(&panic_once);
+    service.inject_native_dispatch_init_entered_observer(Arc::new(move || {
+        if observer_panic.swap(false, Ordering::SeqCst) {
+            observer_entered.wait();
+            observer_gate.wait();
+            panic!("injected native dispatch init panic");
+        }
+    }));
+
+    let init_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &run_id, 1, &init_calls);
+    let initiator = {
+        let dispatcher = service.clone();
+        let dispatch_id = run_id.clone();
+        thread::spawn(move || dispatcher.dispatch_tools(&dispatch_id, &init_calls))
+    };
+    entered.wait();
+
+    let waiter_calls = [call("c2", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &run_id, 2, &waiter_calls);
+    let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
+    let waiter = {
+        let dispatcher = service.clone();
+        let dispatch_id = run_id.clone();
+        thread::spawn(move || {
+            let result = dispatcher.dispatch_tools(&dispatch_id, &waiter_calls);
+            let _ = waiter_tx.send(result);
+        })
+    };
+
+    panic_gate.wait();
+    assert!(
+        initiator.join().is_err(),
+        "init thread must propagate the injected panic"
+    );
+    let waiter_result = waiter_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("concurrent waiter must complete after init panic recovery");
+    waiter.join().expect("waiter join");
+    let waiter_results = waiter_result.expect("waiter dispatch after recovered init");
+    assert!(
+        waiter_results[0].ok,
+        "recovered waiter must initialize successfully: {:?}",
+        waiter_results[0]
+    );
+
+    let retry_calls = [call("c3", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &run_id, 3, &retry_calls);
+    let retry = service
+        .dispatch_tools(&run_id, &retry_calls)
+        .expect("retry after init panic");
+    assert!(retry[0].ok, "{:?}", retry[0]);
+    assert!(service.native_dispatch_retained(&run_id));
+    assert!(!service.native_dispatch_closed(&run_id));
+    assert_eq!(service.process_owner_count(&run_id), 0);
+}
+
+#[tokio::test]
+async fn native_dispatch_init_error_can_retry_after_fixing_artifact_root() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let artifact_root = derived_artifact_root(&fixture.root);
+    fs::write(&artifact_root, b"not-a-directory").expect("block artifact root with a file");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    let init_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &init_calls);
+    service
+        .dispatch_tools(&admitted.run_id, &init_calls)
+        .expect_err("blocked artifact root must fail native init");
+    assert!(!service.native_dispatch_retained(&admitted.run_id));
+    assert!(!service.native_dispatch_closed(&admitted.run_id));
+    fs::remove_file(&artifact_root).expect("unblock artifact root");
+    let retry = service
+        .dispatch_tools(&admitted.run_id, &init_calls)
+        .expect("retry after init error");
+    assert!(retry[0].ok, "{:?}", retry[0]);
+    assert!(service.native_dispatch_retained(&admitted.run_id));
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+}

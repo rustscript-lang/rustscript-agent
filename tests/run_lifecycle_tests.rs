@@ -3,7 +3,8 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1785,4 +1786,96 @@ async fn unsafe_pending_request_fails_closed_without_inner() {
         "{:?}",
         service.run_events(&admitted.run_id)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_dispatch_init_panic_releases_occupancy_so_redrive_can_complete() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("after-init-panic"));
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let parent = PathBuf::from(
+        "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-final-init-panic-fix-6c6bff52",
+    )
+    .join(format!(
+        "init-panic-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let workspace = parent.join("workspace");
+    fs::create_dir_all(&workspace).expect("isolated workspace");
+    service
+        .set_run_limits(RunLimits::new(8, 8, 64 * 1024, &workspace).expect("run limits"))
+        .expect("set isolated run limits");
+    let admitted = service.admit(admit_request()).await.expect("admit");
+
+    let entered = Arc::new(Barrier::new(2));
+    let panic_gate = Arc::new(Barrier::new(2));
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let observer_entered = Arc::clone(&entered);
+    let observer_gate = Arc::clone(&panic_gate);
+    let observer_panic = Arc::clone(&panic_once);
+    service.inject_native_dispatch_init_entered_observer(Arc::new(move || {
+        if observer_panic.swap(false, Ordering::SeqCst) {
+            observer_entered.wait();
+            observer_gate.wait();
+            panic!("injected native dispatch init panic");
+        }
+    }));
+
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    entered.wait();
+    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
+
+    let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
+    let waiter = {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        thread::spawn(move || {
+            let _ = waiter_tx.send(service.dispatch_tools(&run_id, &[]));
+        })
+    };
+    panic_gate.wait();
+    assert!(
+        worker
+            .await
+            .expect_err("init panic must fail the worker join")
+            .is_panic(),
+        "run_worker must propagate the injected init panic"
+    );
+    waiter_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("concurrent waiter must complete after init panic recovery")
+        .expect("waiter dispatch after recovered init");
+    waiter.join().expect("waiter join");
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "init panic must not hide the panic behind a terminal: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.cancelled".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
+    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    assert_eq!(provider.call_count(), 0);
+    drop(service);
+    drop(state);
+    let _ = fs::remove_dir_all(&parent);
 }
