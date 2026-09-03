@@ -45,6 +45,9 @@ fn error_message(error: &LifecycleError) -> String {
             "registry identity does not match frozen snapshot".to_string()
         }
         LifecycleError::InvalidMetadata(message) => message.clone(),
+        LifecycleError::UnresolvedCall => {
+            "an unresolved execution token already exists for this call".to_string()
+        }
     }
 }
 

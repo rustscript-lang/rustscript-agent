@@ -310,6 +310,14 @@ impl CapabilityLifecycle {
         )? {
             return Ok(PrepareOutcome::Replay { result });
         }
+        {
+            let unresolved = self.inner.token_states.lock().values().any(|state| {
+                matches!(state, TokenState::Open(claims) if claims.call_id == metadata.call_id)
+            });
+            if unresolved {
+                return Err(LifecycleError::UnresolvedCall);
+            }
+        }
         if self.inner.clock.now_ms() >= self.inner.deadline_ms {
             return Err(LifecycleError::DeadlineElapsed);
         }
@@ -439,6 +447,51 @@ impl CapabilityLifecycle {
         }
     }
 
+    /// Lookup and authorize an open execution token before a future `cap::*` effect.
+    pub fn authorize(
+        &self,
+        owner: &CapabilityOwner,
+        token: &str,
+        requested: CapabilityRisk,
+    ) -> Result<TokenClaims, LifecycleError> {
+        if owner != &self.inner.owner {
+            return Err(LifecycleError::OwnerMismatch {
+                expected: self.inner.owner.key(),
+                actual: owner.key(),
+            });
+        }
+        if self.inner.cancellation.is_cancelled() {
+            return Err(LifecycleError::Cancelled);
+        }
+        let states = self.inner.token_states.lock();
+        let claims = match states.get(token) {
+            Some(TokenState::Open(claims)) => claims.as_ref().clone(),
+            Some(TokenState::Committed) => return Err(LifecycleError::DuplicateClose),
+            Some(TokenState::Interrupted) => return Err(LifecycleError::Interrupted),
+            None => return Err(LifecycleError::TokenUnknown),
+        };
+        drop(states);
+        if &claims.owner != owner {
+            return Err(LifecycleError::OwnerMismatch {
+                expected: claims.owner.key(),
+                actual: owner.key(),
+            });
+        }
+        if self.inner.clock.now_ms() >= claims.deadline_ms {
+            return Err(LifecycleError::DeadlineElapsed);
+        }
+        if claims.generation != self.inner.generation.load(Ordering::SeqCst) {
+            return Err(LifecycleError::Interrupted);
+        }
+        if requested > claims.risk_ceiling {
+            return Err(LifecycleError::ApprovalCeiling {
+                requested,
+                ceiling: claims.risk_ceiling,
+            });
+        }
+        Ok(claims)
+    }
+
     pub fn recover_open_tokens(&self) -> Result<Vec<String>, LifecycleError> {
         let mut states = self.inner.token_states.lock();
         let open: Vec<(String, String)> = states
@@ -484,6 +537,11 @@ pub struct ExecutionLease {
 impl ExecutionLease {
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Disarm the lease after a successful commit so Drop does not interrupt.
+    pub fn disarm(&mut self) {
+        self.closed = true;
     }
 }
 

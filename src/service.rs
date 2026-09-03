@@ -303,6 +303,7 @@ impl NativeDispatchState {
         if let Some(observer) = &self.shutdown_entered {
             observer();
         }
+        let _ = self.lifecycle.recover_open_tokens();
         self.dispatcher.close();
         let quiesced = self.dispatcher.try_quiesce(grace);
         let owner = self.owner();
@@ -357,6 +358,19 @@ impl RunHandle {
 
     fn cancel_native_tools(&self) {
         self.tool_cancel.cancel();
+        let lifecycle = {
+            let phase = self
+                .native_dispatch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &*phase {
+                NativeDispatchPhase::Ready(state) => Some(Arc::clone(&state.lifecycle)),
+                _ => None,
+            }
+        };
+        if let Some(lifecycle) = lifecycle {
+            let _ = lifecycle.recover_open_tokens();
+        }
     }
 
     fn native_dispatch_closed(&self) -> bool {
@@ -985,6 +999,26 @@ impl AgentService {
             service: Arc::downgrade(&self.inner),
         }
         .commit_step(event_type, data, result)
+    }
+
+    /// Run-scoped capability engine used by `agent_runtime::tool_prepare`
+    /// and `agent_runtime::tool_commit`. Initializes native dispatch if needed.
+    pub fn capability_lifecycle(
+        &self,
+        run_id: &str,
+    ) -> Result<(Arc<CapabilityLifecycle>, CapabilityOwner), RunContextError> {
+        let handle = self
+            .handle(run_id)
+            .ok_or_else(|| RunContextError::Missing {
+                run_id: run_id.to_string(),
+            })?;
+        match self.native_dispatch_state(run_id, &handle)? {
+            Some(state) => Ok((Arc::clone(&state.lifecycle), state.capability_owner.clone())),
+            None => Err(RunContextError::InvalidMetadata {
+                run_id: run_id.to_string(),
+                reason: "native dispatch is closed".to_string(),
+            }),
+        }
     }
 
     /// Serial, validated native dispatch against the admitted registry snapshot.
@@ -2952,6 +2986,7 @@ impl AgentService {
             // observing the cancellation commits exactly this reason.
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
             handle.cancel.request(CancellationReason::Requested);
+            drop(store);
             handle.cancel_native_tools();
             tracing::debug!(
                 run_id,
@@ -4222,14 +4257,21 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         call_id: &str,
         result: &serde_json::Value,
     ) -> Result<serde_json::Value, LifecycleError> {
+        let tool_result = canonical_tool_result(result)?;
+        let event_type = if tool_result.ok {
+            "tool.completed"
+        } else {
+            "tool.failed"
+        };
+        let mut data = json!({
+            "tool_call_id": call_id,
+            "ok": tool_result.ok,
+        });
+        if let Some(error) = &tool_result.error {
+            data["error_code"] = json!(error.code);
+        }
         self.events
-            .commit(
-                "tool.completed",
-                json!({
-                    "tool_call_id": call_id,
-                    "result": result,
-                }),
-            )
+            .commit_step(event_type, data, Some(&tool_result))
             .map_err(|error| match error {
                 EventCommitError::PersistFailed(message) => {
                     LifecycleError::ResultCommitFailed(message)
@@ -4240,16 +4282,17 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
     }
 
     fn interrupt(&self, call_id: &str) -> Result<(), LifecycleError> {
+        let tool_result =
+            ToolResult::failure("interrupted_effect", "effect interrupted by restart");
         self.events
-            .commit(
+            .commit_step(
                 "tool.failed",
                 json!({
                     "tool_call_id": call_id,
-                    "error": {
-                        "code": "interrupted",
-                        "message": "execution was interrupted",
-                    }
+                    "error_code": "interrupted_effect",
+                    "ok": false,
                 }),
+                Some(&tool_result),
             )
             .map_err(map_event_commit_error)
     }
@@ -4262,6 +4305,46 @@ fn map_event_commit_error(error: EventCommitError) -> LifecycleError {
         EventCommitError::MissingParent => LifecycleError::MissingParent,
         EventCommitError::PersistFailed(message) => LifecycleError::ResultCommitFailed(message),
         EventCommitError::Corrupt(message) => LifecycleError::ResultCommitFailed(message),
+    }
+}
+
+fn canonical_tool_result(result: &JsonValue) -> Result<ToolResult, LifecycleError> {
+    let ok = result
+        .get("ok")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if ok {
+        let mut tool_result = ToolResult::success(
+            result
+                .get("content")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string(),
+            result.get("data").cloned().unwrap_or_else(|| json!({})),
+        );
+        tool_result.truncated = result
+            .get("truncated")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        if let Some(artifacts) = result.get("artifacts").and_then(JsonValue::as_array) {
+            tool_result.artifacts = artifacts
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+        Ok(tool_result)
+    } else {
+        let error = result.get("error");
+        let code = error
+            .and_then(|value| value.get("code"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("tool_failed");
+        let message = error
+            .and_then(|value| value.get("message"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("tool failed");
+        Ok(ToolResult::failure(code, message))
     }
 }
 

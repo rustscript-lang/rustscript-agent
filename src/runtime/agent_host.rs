@@ -4,7 +4,7 @@
 //! through these host functions. Provider adapters stay in RSS; this module
 //! does not add an OpenAI-compatible inference path.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,8 +18,8 @@ use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
 use crate::capabilities::{
-    CapabilityLifecycle, CapabilityOwner, LifecycleError, parse_prepare_metadata, tool_commit,
-    tool_prepare,
+    CapabilityLifecycle, CapabilityOwner, ExecutionLease, LifecycleError, parse_prepare_metadata,
+    tool_commit, tool_prepare,
 };
 use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
@@ -141,6 +141,7 @@ pub struct AgentHostState {
     pub metrics: Option<Arc<Metrics>>,
     pub lifecycle: Option<Arc<CapabilityLifecycle>>,
     pub capability_owner: Option<CapabilityOwner>,
+    pub(crate) leases: Arc<Mutex<HashMap<String, ExecutionLease>>>,
 }
 
 impl AgentHostState {
@@ -172,10 +173,21 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        match parse_prepare_metadata(metadata) {
+        let envelope = match parse_prepare_metadata(metadata) {
             Ok(metadata) => tool_prepare(lifecycle, owner, metadata),
-            Err(error) => crate::capabilities::host::error_envelope(&error),
+            Err(error) => return crate::capabilities::host::error_envelope(&error),
+        };
+        if envelope.get("ok") == Some(&JsonValue::Bool(true))
+            && envelope.get("kind") == Some(&JsonValue::String("execute".to_string()))
+            && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
+            && let Ok(lease) = lifecycle.lease(token)
+        {
+            self.leases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(token.to_string(), lease);
         }
+        envelope
     }
 
     fn capability_commit(&self, token: &str, result: &JsonValue) -> JsonValue {
@@ -189,7 +201,17 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        tool_commit(lifecycle, owner, token, result.clone())
+        let envelope = tool_commit(lifecycle, owner, token, result.clone());
+        if envelope.get("ok") == Some(&JsonValue::Bool(true))
+            && let Some(mut lease) = self
+                .leases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(token)
+        {
+            lease.disarm();
+        }
+        envelope
     }
 
     fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
