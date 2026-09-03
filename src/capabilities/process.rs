@@ -3,9 +3,14 @@
 //! Handles are opaque and isolated by owner/run/generation. Capability code
 //! does not embed terminal or process public-tool dispatch policy.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use rustscript_vm::{
     BoundedProcess, BoundedProcessError, BoundedProcessHandle, BoundedProcessRequest,
@@ -13,8 +18,10 @@ use rustscript_vm::{
     MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES, ProcessStatus,
 };
 
-use super::lifecycle::CapabilityLifecycle;
-use super::types::{CapabilityError, CapabilityOwner, CapabilityRisk, LifecycleError, TokenClaims};
+use super::{
+    lifecycle::{CapabilityLifecycle, TokenOwnedResource},
+    types::{CapabilityError, CapabilityOwner, CapabilityRisk, LifecycleError, TokenClaims},
+};
 
 const ALLOWED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TZ", "USER", "TERM"];
 
@@ -66,6 +73,22 @@ struct OwnedProcess {
     generation: u64,
     handle: BoundedProcessHandle,
     cancel: ProcessCancel,
+}
+
+struct ProcessReaper {
+    handle: BoundedProcessHandle,
+    cancel: ProcessCancel,
+    released: AtomicBool,
+}
+
+impl TokenOwnedResource for ProcessReaper {
+    fn release(&self) {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.cancel.cancel();
+        let _ = self.handle.shutdown();
+    }
 }
 
 struct ProcessInner {
@@ -189,10 +212,27 @@ impl ProcessCapability {
                 OwnedProcess {
                     owner_key: claims.owner.key(),
                     generation: claims.generation,
-                    handle,
-                    cancel,
+                    handle: handle.clone(),
+                    cancel: cancel.clone(),
                 },
             );
+        let reaper = Arc::new(ProcessReaper {
+            handle,
+            cancel,
+            released: AtomicBool::new(false),
+        });
+        if let Err(error) = self.inner.lifecycle.register_resource(token, reaper) {
+            if let Some(owned) = self
+                .inner
+                .table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&id)
+            {
+                terminate_owned(&owned);
+            }
+            return Err(CapabilityError::from(error));
+        }
         Ok(ProcessSpawn { handle: id, pid })
     }
 
