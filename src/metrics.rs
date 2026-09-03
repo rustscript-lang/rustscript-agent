@@ -479,6 +479,40 @@ impl Metrics {
         saturating_add_counter(&self.truncations, count);
     }
 
+    /// Accounts one actual `AgentProviderHost::call` attempt.
+    ///
+    /// Callers pass only deltas/booleans: never raw args, paths, prompts,
+    /// outputs, provider errors, or identifiers. `successful_turn` is true
+    /// only for a successfully normalized `ok: true` envelope. `truncated`
+    /// is true only when that envelope carries a typed `response.truncated`
+    /// flag.
+    #[inline]
+    pub fn account_model_attempt(&self, successful_turn: bool, truncated: bool) {
+        self.record_model_call();
+        if successful_turn {
+            self.record_turn();
+        }
+        if truncated {
+            self.record_truncation();
+        }
+    }
+
+    /// Accounts one freshly executed or failed tool dispatch.
+    ///
+    /// Replay of an already durable `ToolResult` must not call this.
+    /// `failed` maps to canonical `ToolResult.ok == false`. `truncated`
+    /// maps to the typed `ToolResult.truncated` flag.
+    #[inline]
+    pub fn account_tool_attempt(&self, failed: bool, truncated: bool) {
+        self.record_tool_call();
+        if failed {
+            self.record_tool_failure();
+        }
+        if truncated {
+            self.record_truncation();
+        }
+    }
+
     /// Records one run duration (seconds) into the fixed histogram buckets.
     pub fn record_run_duration(&self, seconds: f64) {
         let bucket = RUN_DURATION_BUCKETS_SECONDS

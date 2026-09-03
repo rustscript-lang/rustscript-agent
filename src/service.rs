@@ -743,6 +743,9 @@ impl AgentService {
                 if !pending.is_empty() {
                     let dispatched = state.dispatcher.dispatch(&pending);
                     for (slot, result) in pending_idx.into_iter().zip(dispatched) {
+                        self.inner
+                            .metrics
+                            .account_tool_attempt(!result.ok, result.truncated);
                         results[slot] = Some(result);
                     }
                 }
@@ -2573,6 +2576,7 @@ impl AgentService {
                 cancellation: Some(cancellation.clone()),
                 sleeps: Default::default(),
                 skip_sleep: false,
+                metrics: Some(Arc::clone(&self.inner.metrics)),
             };
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling

@@ -18,6 +18,7 @@ use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
 use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
+use crate::metrics::Metrics;
 use crate::tools::{DispatchContext, ToolResult};
 
 const PROVIDER_CALL: &str = "agent::provider_call";
@@ -105,6 +106,7 @@ pub struct AgentHostBridges {
     pub cancellation: Option<RunCancellation>,
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// Per-VM state installed before `run(context)`.
@@ -115,6 +117,7 @@ pub struct AgentHostState {
     pub cancellation: RunCancellation,
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl AgentHostState {
@@ -132,7 +135,18 @@ impl AgentHostState {
         if let Some(error) = self.control_error() {
             return error;
         }
-        normalize_provider_envelope(self.provider.call(request, &self.cancellation))
+        let envelope = normalize_provider_envelope(self.provider.call(request, &self.cancellation));
+        if let Some(metrics) = &self.metrics {
+            let successful_turn = envelope.get("ok").and_then(JsonValue::as_bool) == Some(true);
+            let truncated = successful_turn
+                && envelope
+                    .get("response")
+                    .and_then(|response| response.get("truncated"))
+                    .and_then(JsonValue::as_bool)
+                    == Some(true);
+            metrics.account_model_attempt(successful_turn, truncated);
+        }
+        envelope
     }
 
     fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
@@ -156,6 +170,9 @@ impl AgentHostState {
             );
         };
         let result = dispatcher.dispatch_one(&parsed);
+        if let Some(metrics) = &self.metrics {
+            metrics.account_tool_attempt(!result.ok, result.truncated);
+        }
         let mut envelope = tool_result_envelope(&parsed, result);
         if let Some(error) = self.control_error() {
             envelope["terminal"] = json!(true);
