@@ -40,6 +40,10 @@ use serde_json::{Map, Value as JsonValue, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+use crate::capabilities::{
+    AllowAllApproval, CancellationFlag, CapabilityLifecycle, CapabilityOwner, DurableStarted,
+    DurableToolLifecycle, LifecycleError, LifecycleLimits, SystemClock, UuidIssuer,
+};
 use crate::config::{
     ADMISSION_IDEMPOTENCY_SCOPE, ADMISSION_RUN_COL_ID, ADMISSION_RUN_COL_INPUT_JSON,
     ADMISSION_RUN_COL_MODEL, ADMISSION_RUN_COL_PARENT_RUN_ID, ADMISSION_RUN_COL_PROVIDER,
@@ -222,6 +226,8 @@ struct NativeDispatchState {
     cleaned: AtomicBool,
     shutdown_entered: Option<Arc<dyn Fn() + Send + Sync>>,
     cleanup_grace: Duration,
+    lifecycle: Arc<CapabilityLifecycle>,
+    capability_owner: CapabilityOwner,
 }
 
 /// Two-phase native dispatch slot. The handle lock is never held across
@@ -1762,7 +1768,7 @@ impl AgentService {
         )
         .map_err(|error| invalid_context_metadata(run_id, &error))?
         .with_artifact_sink(sink);
-        let events = Arc::new(ServiceEventCommitter {
+        let events: Arc<dyn DurableEventCommitter> = Arc::new(ServiceEventCommitter {
             store: Arc::clone(&self.inner.store),
             persistence: self.inner.persistence.clone(),
             run_id: run_id.to_string(),
@@ -1772,9 +1778,48 @@ impl AgentService {
             commit_gate: Arc::clone(&self.inner.commit_gate),
             service: Arc::downgrade(&self.inner),
         });
+        let capability_owner = CapabilityOwner::new(
+            ADMISSION_SESSION_PROFILE,
+            &context.session_id,
+            &context.run_id,
+        )
+        .map_err(|error| invalid_context_metadata(run_id, &error))?;
+        let now = Instant::now();
+        let now_ms = timestamp();
+        let deadline_ms = match handle.cancel.deadline_instant() {
+            Some(deadline) if deadline > now => now_ms.saturating_add(
+                u64::try_from(deadline.duration_since(now).as_millis()).unwrap_or(u64::MAX),
+            ),
+            Some(_) => now_ms,
+            None => now_ms.saturating_add(
+                u64::try_from(self.inner.config.run_timeout.as_millis()).unwrap_or(u64::MAX),
+            ),
+        };
+        let lifecycle = CapabilityLifecycle::builder()
+            .owner(capability_owner.clone())
+            .registry_identity(expected.to_string())
+            .workspace(workspace.clone())
+            .limits(LifecycleLimits {
+                max_tool_calls,
+                max_output_bytes: output_cap,
+                max_summary_bytes: 4096,
+            })
+            .deadline_ms(deadline_ms)
+            .clock(Arc::new(SystemClock))
+            .tokens(Arc::new(UuidIssuer))
+            .durable(Arc::new(ServiceDurableLifecycle {
+                events: Arc::clone(&events),
+            }) as Arc<dyn DurableToolLifecycle>)
+            .approval(Arc::new(AllowAllApproval))
+            .cancellation(Arc::new(HandleCancelFlag {
+                cancel: handle.cancel.clone(),
+            }) as Arc<dyn CancellationFlag>)
+            .generation(1)
+            .build()
+            .map_err(|error| invalid_context_metadata(run_id, error.code()))?;
         let dispatcher = DispatchContext::new(
             owner,
-            workspace,
+            workspace.clone(),
             handle.cancel.token(),
             handle.cancel.deadline_instant().unwrap_or_else(|| {
                 Instant::now()
@@ -1789,7 +1834,7 @@ impl AgentService {
                 max_tool_output_bytes: output_cap,
                 max_event_bytes: self.inner.config.max_event_bytes,
             },
-            events,
+            Arc::clone(&events),
             Arc::new(NativeExecutionDeps {
                 files: files.clone(),
                 terminal,
@@ -1825,6 +1870,8 @@ impl AgentService {
                 .expect("native dispatch shutdown observer lock")
                 .clone(),
             cleanup_grace: self.inner.config.cancellation_grace,
+            lifecycle: Arc::new(lifecycle),
+            capability_owner,
         })
     }
 
@@ -3135,18 +3182,23 @@ impl AgentService {
 
         let output_text = if let Some(source) = self.inner.agent_source.clone() {
             let context = self.build_run_context(&run_id);
-            let dispatcher = match self.native_dispatch_state(&run_id, &handle) {
-                Ok(Some(state)) => Some(Arc::new(state.dispatcher.clone())),
-                Ok(None) => None,
-                Err(error) => {
-                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+            let (dispatcher, lifecycle, capability_owner) =
+                match self.native_dispatch_state(&run_id, &handle) {
+                    Ok(Some(state)) => (
+                        Some(Arc::new(state.dispatcher.clone())),
+                        Some(Arc::clone(&state.lifecycle)),
+                        Some(state.capability_owner.clone()),
+                    ),
+                    Ok(None) => (None, None, None),
+                    Err(error) => {
+                        if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                            return;
+                        }
+                        self.finish_failed(&run_id, failed_payload(error.to_string()))
+                            .await;
                         return;
                     }
-                    self.finish_failed(&run_id, failed_payload(error.to_string()))
-                        .await;
-                    return;
-                }
-            };
+                };
             let raw_provider = self
                 .inner
                 .provider_host
@@ -3171,6 +3223,8 @@ impl AgentService {
                 sleeps: Default::default(),
                 skip_sleep: false,
                 metrics: Some(Arc::clone(&self.inner.metrics)),
+                lifecycle,
+                capability_owner,
             };
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling
@@ -4089,6 +4143,125 @@ fn admit_context_error(error: RunContextError) -> AdmitError {
     match error {
         RunContextError::Persistence(message) => AdmitError::Persistence(message),
         other => AdmitError::Invalid(other.to_string()),
+    }
+}
+
+struct HandleCancelFlag {
+    cancel: RunCancellation,
+}
+
+impl CancellationFlag for HandleCancelFlag {
+    fn is_cancelled(&self) -> bool {
+        self.cancel.requested().is_some()
+    }
+}
+
+struct ServiceDurableLifecycle {
+    events: Arc<dyn DurableEventCommitter>,
+}
+
+impl DurableToolLifecycle for ServiceDurableLifecycle {
+    fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
+        if self.events.is_terminal() {
+            Err(LifecycleError::InactiveRun)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn prepare_parent(
+        &self,
+        _run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Result<(), LifecycleError> {
+        self.events
+            .prepare_tool_parent(call_id, tool_name)
+            .map(|_| ())
+            .map_err(map_event_commit_error)
+    }
+
+    fn replay_result(
+        &self,
+        _run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Result<Option<serde_json::Value>, LifecycleError> {
+        match self.events.replay_durable_tool_result(call_id, tool_name) {
+            Ok(Some(result)) => Ok(Some(
+                serde_json::to_value(&result).unwrap_or_else(|_| json!({})),
+            )),
+            Ok(None) => Ok(None),
+            Err(error) => Err(map_event_commit_error(error)),
+        }
+    }
+
+    fn commit_started(&self, record: &DurableStarted) -> Result<(), LifecycleError> {
+        self.events
+            .commit(
+                "tool.started",
+                json!({
+                    "tool_call_id": record.call_id,
+                    "name": record.tool_name,
+                    "argument_digest": record.argument_digest,
+                    "registry_identity": record.registry_identity,
+                    "risk_class": record.risk_class.as_str(),
+                    "generation": record.generation,
+                }),
+            )
+            .map_err(|error| match error {
+                EventCommitError::PersistFailed(message) => {
+                    LifecycleError::StartedCommitFailed(message)
+                }
+                other => map_event_commit_error(other),
+            })
+    }
+
+    fn commit_result(
+        &self,
+        call_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<serde_json::Value, LifecycleError> {
+        self.events
+            .commit(
+                "tool.completed",
+                json!({
+                    "tool_call_id": call_id,
+                    "result": result,
+                }),
+            )
+            .map_err(|error| match error {
+                EventCommitError::PersistFailed(message) => {
+                    LifecycleError::ResultCommitFailed(message)
+                }
+                other => map_event_commit_error(other),
+            })?;
+        Ok(result.clone())
+    }
+
+    fn interrupt(&self, call_id: &str) -> Result<(), LifecycleError> {
+        self.events
+            .commit(
+                "tool.failed",
+                json!({
+                    "tool_call_id": call_id,
+                    "error": {
+                        "code": "interrupted",
+                        "message": "execution was interrupted",
+                    }
+                }),
+            )
+            .map_err(map_event_commit_error)
+    }
+}
+
+fn map_event_commit_error(error: EventCommitError) -> LifecycleError {
+    match error {
+        EventCommitError::Terminal => LifecycleError::InactiveRun,
+        EventCommitError::Cancelled => LifecycleError::Cancelled,
+        EventCommitError::MissingParent => LifecycleError::MissingParent,
+        EventCommitError::PersistFailed(message) => LifecycleError::ResultCommitFailed(message),
+        EventCommitError::Corrupt(message) => LifecycleError::ResultCommitFailed(message),
     }
 }
 

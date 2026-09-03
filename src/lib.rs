@@ -6,6 +6,7 @@
 //! of stream. The structured run context is the sole callable argument; the
 //! script-visible event builtin is `stream::emit(value)`.
 
+pub mod capabilities;
 pub mod config;
 pub mod domain;
 pub mod events;
