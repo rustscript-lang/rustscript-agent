@@ -29,7 +29,7 @@ use std::sync::{
     Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustscript_vm::{
@@ -65,7 +65,7 @@ use crate::prompt::{CodingPromptBudgets, DateSource, SystemDateSource, build_cod
 use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, apply_event_locked, event_candidate, run_delivery_task,
 };
-use crate::runtime::rss_runner::execute_rss_source;
+use crate::runtime::rss_runner::{AgentConfig, AgentRunner};
 use crate::tools::artifacts::ArtifactStorePool;
 use crate::tools::{
     ArtifactError, ArtifactOwner, ArtifactStore, DispatchContext, DispatchLimits,
@@ -73,7 +73,7 @@ use crate::tools::{
     ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry,
     ToolRegistrySnapshot, ToolResult,
 };
-use crate::{AgentProviderHost, RunCancellation, RunError};
+use crate::{AgentHostBridges, AgentProviderHost, RunCancellation, RunError};
 
 /// Recovery action for a pending provider request after restart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,13 +160,20 @@ impl NativeDispatchState {
         }
         self.dispatcher.close();
         self.dispatcher.quiesce();
-        let owner = self.dispatcher.owner();
-        let _ = self.table.cleanup_owner(&ProcessOwner::from(owner.clone()));
+        let owner = ProcessOwner::from(self.dispatcher.owner().clone());
+        let _ = self.table.cleanup_owner(&owner);
         let _ = self
             .files
             .artifact_store_arc()
-            .cleanup_owner(&ArtifactOwner::from(owner.clone()));
+            .cleanup_owner(&ArtifactOwner::from(self.dispatcher.owner().clone()));
         self.table.shutdown();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            if self.table.owner_count(&owner) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -192,6 +199,12 @@ impl RunHandle {
     /// Frozen coding system prompt captured at admission for this run.
     pub fn coding_system_prompt(&self) -> &str {
         &self.coding_system_prompt
+    }
+
+    /// Sole cancellation root for this run. `stop` requests it; hosts and the
+    /// native dispatcher child tokens are linked to it.
+    pub fn cancellation(&self) -> &RunCancellation {
+        &self.cancel
     }
 
     fn cancel_native_tools(&self) {
@@ -457,6 +470,10 @@ struct AgentServiceInner {
     prompt_read_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     artifact_stores: ArtifactStorePool,
     date_source: RwLock<Arc<dyn DateSource>>,
+    /// Optional injected provider host for tests; production uses RssAdapterProvider.
+    provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
+    /// Compiled agent source reused across workers so compile does not reset the deadline.
+    runner: Mutex<Option<AgentRunner>>,
     /// Serializes durable event/message commits so seq/ordinal reservation
     /// cannot interleave. Never held across GET; the GatewayStore lock is
     /// released before SQLite/worker IO.
@@ -523,6 +540,8 @@ impl AgentService {
             prompt_read_entered: Mutex::new(None),
             artifact_stores: ArtifactStorePool::default(),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
+            provider_host: Mutex::new(None),
+            runner: Mutex::new(None),
             commit_gate: Arc::new(ParkingMutex::new(())),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
@@ -539,6 +558,11 @@ impl AgentService {
 
     pub fn http_config(&self) -> &HttpConfig {
         &self.inner.http_config
+    }
+
+    /// Test/production injection seam for the provider host used by `run_worker`.
+    pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
+        *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
     }
 
     /// Returns the registry snapshot currently used for future admissions.
@@ -1299,8 +1323,11 @@ impl AgentService {
         let dispatcher = DispatchContext::new(
             owner,
             workspace,
-            handle.tool_cancel.clone(),
-            handle.started_at + self.inner.config.run_timeout,
+            handle.cancel.token(),
+            handle
+                .cancel
+                .deadline_instant()
+                .unwrap_or_else(|| Instant::now() + self.inner.config.run_timeout),
             registry,
             expected.to_string(),
             toolset_hash,
@@ -1341,6 +1368,99 @@ impl AgentService {
     pub fn native_dispatch_closed(&self, run_id: &str) -> bool {
         self.handle(run_id)
             .is_some_and(|handle| handle.native_dispatch_closed())
+    }
+
+    /// Live process-owner residue for `run_id`, or 0 after cleanup/close.
+    pub fn process_owner_count(&self, run_id: &str) -> usize {
+        let Some(handle) = self.handle(run_id) else {
+            return 0;
+        };
+        let Ok(phase) = handle.native_dispatch.lock() else {
+            return 0;
+        };
+        match &*phase {
+            NativeDispatchPhase::Ready(state) => {
+                let owner = ProcessOwner::from(state.dispatcher.owner().clone());
+                state.table.owner_count(&owner)
+            }
+            NativeDispatchPhase::Empty
+            | NativeDispatchPhase::Initializing
+            | NativeDispatchPhase::Closed => 0,
+        }
+    }
+
+    fn cleanup_run_hosts(&self, handle: &RunHandle) {
+        handle.release_native_dispatch();
+    }
+
+    fn cached_agent_runner(&self, source: &str) -> Result<AgentRunner, String> {
+        let mut cache = self.inner.runner.lock().expect("runner cache lock");
+        if let Some(runner) = cache.as_ref() {
+            return Ok(runner.clone());
+        }
+        let runner = AgentRunner::from_source(
+            source,
+            AgentConfig {
+                http: self.inner.http_config.clone(),
+                sqlite: self.inner.config.sqlite.clone(),
+                fuel: None,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        *cache = Some(runner.clone());
+        Ok(runner)
+    }
+
+    /// Install a precompiled runner so workers do not recompile the agent source.
+    pub fn install_agent_runner(&self, runner: AgentRunner) {
+        *self.inner.runner.lock().expect("runner cache lock") = Some(runner);
+    }
+
+    /// Drops the live handle so `run_worker` must restore cancellation from
+    /// frozen context metadata (restart seam).
+    pub fn evict_run_handle(&self, run_id: &str) {
+        self.inner.runs.lock().expect("runs lock").remove(run_id);
+    }
+
+    fn restore_handle_from_frozen_context(&self, run_id: &str) -> Option<Arc<RunHandle>> {
+        let status = {
+            let store = self.inner.store.read();
+            store.runs.get(run_id)?.status.clone()
+        };
+        if !matches!(status.as_str(), "started" | "stopping") {
+            return None;
+        }
+        let context = self.run_context(run_id)?;
+        let deadline_at_ms = context.metadata.get("deadline_at_ms").and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        })?;
+        let cancel = RunCancellation::from_wall_deadline_ms(deadline_at_ms, timestamp());
+        let prompt = context.coding_system_prompt.clone().unwrap_or_default();
+        let handle = Arc::new(RunHandle {
+            tool_cancel: cancel.token(),
+            cancel,
+            terminal_at: Mutex::new(None),
+            permit: Mutex::new(None),
+            terminal: AtomicBool::new(false),
+            cancel_reason: Mutex::new(None),
+            subscribers: Mutex::new(SubscriberState {
+                count: 0,
+                notified: false,
+            }),
+            disconnect_policy: self.inner.config.client_disconnect_policy,
+            started_at: Instant::now(),
+            native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
+            native_dispatch_cv: Condvar::new(),
+            coding_system_prompt: Arc::from(prompt),
+        });
+        self.inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .insert(run_id.to_string(), Arc::clone(&handle));
+        Some(handle)
     }
 
     /// Shared owner-scoped artifact store for an initialized run, if any.
@@ -1970,8 +2090,10 @@ impl AgentService {
             );
         }
 
+        let cancel = RunCancellation::with_timeout(self.inner.config.run_timeout);
         let handle = Arc::new(RunHandle {
-            cancel: RunCancellation::with_timeout(self.inner.config.run_timeout),
+            tool_cancel: cancel.token(),
+            cancel,
             terminal_at: Mutex::new(None),
             permit: Mutex::new(Some(capacity_permit)),
             terminal: AtomicBool::new(false),
@@ -1982,7 +2104,6 @@ impl AgentService {
             }),
             disconnect_policy: self.inner.config.client_disconnect_policy,
             started_at: Instant::now(),
-            tool_cancel: CancellationToken::new(),
             native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
             native_dispatch_cv: Condvar::new(),
             coding_system_prompt: Arc::from(coding_system_prompt),
@@ -2377,12 +2498,8 @@ impl AgentService {
     pub async fn run_worker(self: Arc<Self>, run_id: String, _input: String) {
         tokio::task::yield_now().await;
         let Some(handle) = self
-            .inner
-            .runs
-            .lock()
-            .expect("runs lock")
-            .get(&run_id)
-            .cloned()
+            .handle(&run_id)
+            .or_else(|| self.restore_handle_from_frozen_context(&run_id))
         else {
             return;
         };
@@ -2393,12 +2510,33 @@ impl AgentService {
             };
             run.session_id.clone()
         };
+        let cancellation = handle.cancel.clone();
+
+        if let Some(reason) = cancellation.requested() {
+            self.cleanup_run_hosts(&handle);
+            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, reason.as_str()))
+                .await;
+            return;
+        }
+        if cancellation.deadline_passed()
+            || cancellation
+                .remaining_deadline()
+                .is_some_and(|remaining| remaining.is_zero())
+        {
+            cancellation.request(CancellationReason::Deadline);
+            self.cleanup_run_hosts(&handle);
+            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "deadline"))
+                .await;
+            return;
+        }
+
         if let Err(error) = self.verify_run_context(&run_id) {
             tracing::error!(
                 run_id = %run_id,
                 error = %error,
                 "run context verification failed before RSS execution"
             );
+            self.cleanup_run_hosts(&handle);
             self.finish_failed(
                 &run_id,
                 json!({
@@ -2410,19 +2548,32 @@ impl AgentService {
             .await;
             return;
         }
-        let cancellation = handle.cancel.clone();
-
-        if cancellation.requested().is_some() {
-            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
-                .await;
-            return;
-        }
 
         let output_text = if let Some(source) = self.inner.agent_source.clone() {
-            let http_config = self.inner.http_config.clone();
-            let sqlite_policy = self.inner.config.sqlite.clone();
-            let run_timeout = self.inner.config.run_timeout;
             let context = self.build_run_context(&run_id);
+            let dispatcher = match self.native_dispatch_state(&run_id, &handle) {
+                Ok(Some(state)) => Some(Arc::new(state.dispatcher.clone())),
+                Ok(None) => None,
+                Err(error) => {
+                    self.cleanup_run_hosts(&handle);
+                    self.finish_failed(&run_id, failed_payload(error.to_string()))
+                        .await;
+                    return;
+                }
+            };
+            let provider = self
+                .inner
+                .provider_host
+                .lock()
+                .expect("provider host lock")
+                .clone();
+            let host = AgentHostBridges {
+                provider,
+                dispatcher,
+                cancellation: Some(cancellation.clone()),
+                sleeps: Default::default(),
+                skip_sleep: false,
+            };
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling
             // (backpressure). The delivery task validates, sequences, appends
@@ -2442,24 +2593,33 @@ impl AgentService {
             ));
             let mut sink = ChannelEventSink(sender);
             let run_cancellation = cancellation.clone();
+            let runner = match self.cached_agent_runner(source.as_ref()) {
+                Ok(runner) => runner,
+                Err(error) => {
+                    self.cleanup_run_hosts(&handle);
+                    self.finish_failed(
+                        &run_id,
+                        failed_payload(format!("compile RSS run source: {error}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let mut worker = tokio::task::spawn_blocking(move || {
-                execute_rss_source(
-                    &source,
-                    http_config,
-                    sqlite_policy,
+                runner.with_host(host).run_with_context_and_events(
                     context,
                     &mut sink,
                     &run_cancellation,
                 )
             });
-            let outcome = match tokio::time::timeout(run_timeout, &mut worker).await {
+            let remaining = cancellation
+                .remaining_deadline()
+                .unwrap_or(Duration::from_millis(1));
+            let outcome = match tokio::time::timeout(remaining, &mut worker).await {
                 Ok(Ok(Ok(value))) => WorkerOutcome::Completed(value),
                 Ok(Ok(Err(error))) => WorkerOutcome::from_run_error(error),
                 Ok(Err(error)) => WorkerOutcome::Failed(format!("RSS worker join failed: {error}")),
                 Err(_) => {
-                    // The timeout is authoritative: cancel with the typed
-                    // deadline reason and wait only the configured grace for
-                    // worker exit.
                     tracing::warn!(
                         run_id,
                         reason = "deadline",
@@ -2485,11 +2645,13 @@ impl AgentService {
             match outcome {
                 WorkerOutcome::Completed(value) => {
                     if let Some(reason) = delivery_outcome.schema_violation {
+                        self.cleanup_run_hosts(&handle);
                         self.finish_failed(&run_id, events::schema_violation_error(&reason))
                             .await;
                         return;
                     }
                     if delivery_outcome.persist_failed {
+                        self.cleanup_run_hosts(&handle);
                         self.finish_failed(
                             &run_id,
                             json!({
@@ -2501,17 +2663,32 @@ impl AgentService {
                         .await;
                         return;
                     }
-                    vm_value_to_json(&value).to_string()
+                    match interpret_loop_decision(&value, &cancellation) {
+                        WorkerOutcome::Completed(value) => completed_output_text(&value),
+                        WorkerOutcome::Cancelled(core_reason) => {
+                            self.cleanup_run_hosts(&handle);
+                            self.finish_cancelled(
+                                &run_id,
+                                handle_cancel_reason(&handle, core_reason),
+                            )
+                            .await;
+                            return;
+                        }
+                        WorkerOutcome::Failed(error) => {
+                            self.cleanup_run_hosts(&handle);
+                            self.finish_failed(&run_id, failed_payload(error)).await;
+                            return;
+                        }
+                    }
                 }
                 WorkerOutcome::Cancelled(core_reason) => {
-                    // Prefer the typed gateway reason recorded on the handle
-                    // (stop/halt/client disconnect); the core-derived string
-                    // is the fallback for worker-requested cancellations.
+                    self.cleanup_run_hosts(&handle);
                     self.finish_cancelled(&run_id, handle_cancel_reason(&handle, core_reason))
                         .await;
                     return;
                 }
                 WorkerOutcome::Failed(error) => {
+                    self.cleanup_run_hosts(&handle);
                     self.finish_failed(&run_id, failed_payload(error)).await;
                     return;
                 }
@@ -2527,11 +2704,13 @@ impl AgentService {
         };
 
         if cancellation.requested().is_some() {
+            self.cleanup_run_hosts(&handle);
             self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
                 .await;
             return;
         }
 
+        self.cleanup_run_hosts(&handle);
         self.finish_completed(&run_id, &session_id, &output_text)
             .await;
     }
@@ -2987,6 +3166,14 @@ impl AgentService {
         metadata.insert(
             "message_id".to_string(),
             JsonValue::String(admission.message_id.clone()),
+        );
+        let created_at_ms = timestamp();
+        let timeout_ms =
+            u64::try_from(self.inner.config.run_timeout.as_millis()).unwrap_or(u64::MAX);
+        metadata.insert("created_at_ms".to_string(), JsonValue::from(created_at_ms));
+        metadata.insert(
+            "deadline_at_ms".to_string(),
+            JsonValue::from(created_at_ms.saturating_add(timeout_ms)),
         );
         RunContext {
             run_id: admission.run_id.clone(),
@@ -4009,6 +4196,51 @@ impl WorkerOutcome {
             }
         }
     }
+}
+
+fn interpret_loop_decision(value: &VmValue, cancellation: &RunCancellation) -> WorkerOutcome {
+    if let Some(reason) = cancellation.requested() {
+        return WorkerOutcome::Cancelled(reason.as_str());
+    }
+    if cancellation.deadline_passed() {
+        return WorkerOutcome::Cancelled("deadline");
+    }
+    let json = vm_value_to_json(value);
+    match json.get("kind").and_then(JsonValue::as_str) {
+        Some("run.failed") => {
+            let code = json
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("failed");
+            match code {
+                "cancelled" => WorkerOutcome::Cancelled("requested"),
+                "deadline_elapsed" => WorkerOutcome::Cancelled("deadline"),
+                other => {
+                    let message = json
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(other)
+                        .to_string();
+                    WorkerOutcome::Failed(message)
+                }
+            }
+        }
+        _ => WorkerOutcome::Completed(value.clone()),
+    }
+}
+
+fn completed_output_text(value: &VmValue) -> String {
+    let json = vm_value_to_json(value);
+    if json.get("kind").and_then(JsonValue::as_str) == Some("run.completed") {
+        match json.get("answer") {
+            Some(JsonValue::String(answer)) => return answer.clone(),
+            Some(answer) => return answer.to_string(),
+            None => {}
+        }
+    }
+    json.to_string()
 }
 
 /// Outcome of one durable terminal commit attempt.

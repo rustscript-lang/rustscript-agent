@@ -196,6 +196,22 @@ impl ProcessTable {
         self.len() == 0
     }
 
+    /// Live process plus in-flight foreground ops owned by `owner`.
+    pub fn owner_count(&self, owner: &ProcessOwner) -> usize {
+        let state = self.inner.lock();
+        let processes = state
+            .processes
+            .values()
+            .filter(|entry| entry.owner == *owner)
+            .count();
+        let foreground = state
+            .foreground
+            .values()
+            .filter(|op| op.owner == *owner)
+            .count();
+        processes + foreground
+    }
+
     pub fn cleanup_owner(&self, owner: &ProcessOwner) -> Result<usize, String> {
         Ok(self.cleanup_scope(CleanupMask::Run {
             profile_id: owner.profile_id().to_string(),

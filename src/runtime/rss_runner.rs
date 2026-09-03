@@ -19,7 +19,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
@@ -27,10 +27,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallReturn, CancellationReason, CompileSourceFileOptions, EpochHandle, HostAsyncBridge,
-    HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt, InvocationError,
-    InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy, Value, Vm, VmError,
-    VmResult, VmStatus, VmYieldReason, compile_source_file_with_options,
+    CallReturn, CancellationReason, CancellationToken, CompileSourceFileOptions, EpochHandle,
+    HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt,
+    InvocationError, InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy,
+    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason, compile_source_file_with_options,
     compile_source_with_flavor_and_options, register_http_builtin_module_from_catalog,
     register_sqlite_builtin_module_from_catalog,
 };
@@ -42,6 +42,13 @@ use super::agent_host::{
 use crate::domain::{json_to_vm_value, vm_value_to_json};
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
+
+fn compile_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Epoch ticks granted to one cancellable run. The cancellation watcher jumps
 /// the epoch past this deadline, so the interpreter's next epoch check
@@ -261,6 +268,8 @@ struct RunCancellationInner {
     epoch: Arc<Mutex<Option<EpochHandle>>>,
     watcher: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     stop: Arc<AtomicBool>,
+    /// Native/process token linked to this root. `request` and deadline fire cancel it.
+    token: CancellationToken,
 }
 
 impl RunCancellation {
@@ -272,15 +281,31 @@ impl RunCancellation {
                 epoch: Arc::new(Mutex::new(None)),
                 watcher: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
+                token: CancellationToken::new(),
             }),
         }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
+        Self::with_deadline(Instant::now() + timeout)
+    }
+
+    pub fn with_deadline(deadline: Instant) -> Self {
         let cancellation = Self::new();
-        *cancellation.inner.deadline.lock().expect("deadline lock") =
-            Some(Instant::now() + timeout);
+        *cancellation.inner.deadline.lock().expect("deadline lock") = Some(deadline);
         cancellation
+    }
+
+    /// Rebuilds cancellation from a persisted wall-clock deadline. Expired
+    /// deadlines fail immediately and never grant a fresh full timeout.
+    pub fn from_wall_deadline_ms(deadline_at_ms: u64, now_ms: u64) -> Self {
+        if now_ms >= deadline_at_ms {
+            let cancellation = Self::with_deadline(Instant::now());
+            cancellation.request(CancellationReason::Deadline);
+            cancellation
+        } else {
+            Self::with_timeout(Duration::from_millis(deadline_at_ms - now_ms))
+        }
     }
 
     pub fn request(&self, reason: CancellationReason) {
@@ -288,22 +313,34 @@ impl RunCancellation {
         if requested.is_none() {
             *requested = Some(reason);
         }
+        drop(requested);
+        self.inner.token.cancel();
     }
 
     pub fn requested(&self) -> Option<CancellationReason> {
         *self.inner.requested.lock().expect("requested lock")
     }
 
-    pub(crate) fn deadline_passed(&self) -> bool {
+    /// Native dispatcher parent token linked to this cancellation root.
+    pub fn token(&self) -> CancellationToken {
+        self.inner.token.clone()
+    }
+
+    pub fn deadline_passed(&self) -> bool {
         self.deadline_instant()
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    pub(crate) fn deadline_instant(&self) -> Option<Instant> {
+    pub fn deadline_instant(&self) -> Option<Instant> {
         *self.inner.deadline.lock().expect("deadline lock")
     }
 
-    /// Nested adapter runs share request/deadline flags but own their epoch
+    pub fn remaining_deadline(&self) -> Option<Duration> {
+        self.deadline_instant()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Nested adapter runs share request/deadline/token flags but own their epoch
     /// watcher so the parent run is not disarmed when the nested invocation ends.
     pub(crate) fn child(&self) -> Self {
         Self {
@@ -313,6 +350,7 @@ impl RunCancellation {
                 epoch: Arc::new(Mutex::new(None)),
                 watcher: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
+                token: self.inner.token.clone(),
             }),
         }
     }
@@ -330,6 +368,7 @@ impl RunCancellation {
             .expect("armed epoch");
         let requested = Arc::clone(&self.inner.requested);
         let deadline = Arc::clone(&self.inner.deadline);
+        let token = self.inner.token.clone();
         let watcher = thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
                 let fire = requested.lock().expect("requested lock").is_some()
@@ -338,6 +377,7 @@ impl RunCancellation {
                         .expect("deadline lock")
                         .is_some_and(|deadline| Instant::now() >= deadline);
                 if fire {
+                    token.cancel();
                     epoch.increment_by(RUN_EPOCH_DEADLINE_TICKS);
                     return;
                 }
@@ -379,6 +419,7 @@ impl AgentRunner {
                 MAX_AGENT_SOURCE_BYTES
             )));
         }
+        let _compile = compile_lock();
         let program = compile_source_with_flavor_and_options(
             source,
             SourceFlavor::RustScript,
@@ -398,6 +439,7 @@ impl AgentRunner {
                 MAX_AGENT_SOURCE_BYTES
             )));
         }
+        let _compile = compile_lock();
         let program = compile_source_file_with_options(&path, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
@@ -424,6 +466,18 @@ impl AgentRunner {
     /// Installs the Task 5 dispatcher used by `agent::tool_dispatch`.
     pub fn with_dispatcher(mut self, dispatcher: Arc<crate::tools::DispatchContext>) -> Self {
         self.host.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Replaces the full host-bridge bundle for one run.
+    pub fn with_host(mut self, host: AgentHostBridges) -> Self {
+        self.host = host;
+        self
+    }
+
+    /// Installs the sole run cancellation root onto the host bridges.
+    pub fn with_cancellation(mut self, cancellation: RunCancellation) -> Self {
+        self.host.cancellation = Some(cancellation);
         self
     }
 
@@ -483,7 +537,10 @@ impl AgentRunner {
         vm.host_context().set_module_state(AgentHostState {
             provider,
             dispatcher: self.host.dispatcher.clone(),
-            cancellation: cancellation.cloned().unwrap_or_default(),
+            cancellation: cancellation
+                .cloned()
+                .or_else(|| self.host.cancellation.clone())
+                .unwrap_or_default(),
             sleeps: Arc::clone(&self.host.sleeps),
             skip_sleep: self.host.skip_sleep,
         });

@@ -76,7 +76,7 @@ impl AgentGatewayState {
                 crate::MAX_AGENT_SOURCE_BYTES
             ));
         }
-        rustscript_vm::compile_source(&source)
+        let runner = crate::AgentRunner::from_source(&source, crate::AgentConfig::default())
             .map_err(|error| format!("compile RSS agent source: {error}"))?;
         let http_config = config.http.clone();
         config
@@ -93,6 +93,7 @@ impl AgentGatewayState {
             http_config.clone(),
             Arc::clone(&metrics),
         ));
+        service.install_agent_runner(runner);
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -115,7 +116,7 @@ impl AgentGatewayState {
                 crate::MAX_AGENT_SOURCE_BYTES
             ));
         }
-        rustscript_vm::compile_source(&source)
+        let runner = crate::AgentRunner::from_source(&source, crate::AgentConfig::default())
             .map_err(|error| format!("compile RSS agent source: {error}"))?;
         let http_config = config.http.clone();
         config
@@ -143,6 +144,7 @@ impl AgentGatewayState {
             http_config.clone(),
             Arc::clone(&metrics),
         ));
+        service.install_agent_runner(runner);
         Ok(Self {
             config: Arc::clone(service.config()),
             store,

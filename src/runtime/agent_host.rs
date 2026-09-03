@@ -101,6 +101,8 @@ pub trait AgentProviderHost: Send + Sync {
 pub struct AgentHostBridges {
     pub provider: Option<Arc<dyn AgentProviderHost>>,
     pub dispatcher: Option<Arc<DispatchContext>>,
+    /// Shared with the runner invocation; never an independent cancellation root.
+    pub cancellation: Option<RunCancellation>,
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
 }
@@ -270,19 +272,53 @@ impl ScriptedProvider {
     pub fn call_count(&self) -> u64 {
         self.inner.state.lock().expect("scripted provider").calls
     }
+
+    /// Blocks inside `call` until the shared run cancellation fires (tests).
+    pub fn hang(&self) {
+        self.push_hang();
+    }
+
+    /// Queues a call that waits for the shared run cancellation root.
+    pub fn push_hang(&self) {
+        self.inner
+            .state
+            .lock()
+            .expect("scripted provider")
+            .outcomes
+            .push_back(json!({ "__hang": true }));
+    }
 }
 
 impl AgentProviderHost for ScriptedProvider {
-    fn call(&self, request: &JsonValue, _cancellation: &RunCancellation) -> JsonValue {
-        let mut state = self.inner.state.lock().expect("scripted provider");
-        state.calls = state.calls.saturating_add(1);
-        state.requests.push(request.clone());
-        state.outcomes.pop_front().unwrap_or_else(|| {
-            typed_fail(
-                "scripted_exhausted",
-                "scripted provider has no remaining outcomes",
-            )
-        })
+    fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
+        {
+            let mut state = self.inner.state.lock().expect("scripted provider");
+            state.calls = state.calls.saturating_add(1);
+            state.requests.push(request.clone());
+        }
+        let outcome = self
+            .inner
+            .state
+            .lock()
+            .expect("scripted provider")
+            .outcomes
+            .pop_front()
+            .unwrap_or_else(|| {
+                typed_fail(
+                    "scripted_exhausted",
+                    "scripted provider has no remaining outcomes",
+                )
+            });
+        if outcome.get("__hang").and_then(JsonValue::as_bool) == Some(true) {
+            while cancellation.requested().is_none() && !cancellation.deadline_passed() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if cancellation.deadline_passed() && cancellation.requested().is_none() {
+                return typed_fail("deadline_elapsed", "run deadline elapsed");
+            }
+            return typed_fail("cancelled", "run was cancelled");
+        }
+        outcome
     }
 }
 
