@@ -134,6 +134,15 @@ fn error_code(result: &ToolResult) -> &str {
         .as_str()
 }
 
+fn assert_replayed_canonical(result: &ToolResult, canonical: &ToolResult) {
+    assert_eq!(result.ok, canonical.ok);
+    assert_eq!(result.content, canonical.content);
+    assert_eq!(result.data, canonical.data);
+    assert_eq!(result.error, canonical.error);
+    assert_eq!(result.truncated, canonical.truncated);
+    assert_eq!(result.artifacts, canonical.artifacts);
+}
+
 fn pid_alive(pid: u32) -> bool {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => {
@@ -329,6 +338,44 @@ impl DurableEventCommitter for MemoryEvents {
         }
         self.events.lock().push((event_type.to_string(), data));
         Ok(())
+    }
+}
+
+struct ReplayEvents {
+    inner: Arc<MemoryEvents>,
+    replay: Mutex<Result<Option<ToolResult>, EventCommitError>>,
+}
+
+impl ReplayEvents {
+    fn new(replay: Result<Option<ToolResult>, EventCommitError>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryEvents::new(),
+            replay: Mutex::new(replay),
+        })
+    }
+}
+
+impl DurableEventCommitter for ReplayEvents {
+    fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.inner.stop_requested()
+    }
+
+    fn commit(&self, event_type: &str, data: Value) -> Result<(), EventCommitError> {
+        self.inner.commit(event_type, data)
+    }
+
+    fn replay_durable_tool_result(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
+        assert_eq!(tool_call_id, "c-replay");
+        assert_eq!(name, "read_file");
+        self.replay.lock().clone()
     }
 }
 
@@ -1066,6 +1113,83 @@ fn terminal_after_requested_prevents_started_and_effect() {
     assert!(!result.ok);
     assert_eq!(executor.count.load(Ordering::SeqCst), 0);
     assert_eq!(events.types(), ["tool.requested"]);
+}
+
+fn replay_dispatcher(
+    fixture: &Fixture,
+    events: Arc<ReplayEvents>,
+    executor: Arc<CountingExecutor>,
+) -> DispatchContext {
+    context_with(
+        tool_owner(),
+        fixture.root.clone(),
+        events,
+        executor,
+        default_limits(),
+    )
+}
+
+fn replay_call() -> ToolCall {
+    call("c-replay", "read_file", json!({"path": "a.txt"}))
+}
+
+#[test]
+fn completed_durable_replay_skips_native_effect_and_lifecycle() {
+    let fixture = Fixture::new();
+    let canonical = ToolResult::success("cached-output", json!({"from": "durable"}));
+    let events = ReplayEvents::new(Ok(Some(canonical.clone())));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_replayed_canonical(&result, &canonical);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
+}
+
+#[test]
+fn failed_durable_replay_skips_native_effect_and_lifecycle() {
+    let fixture = Fixture::new();
+    let canonical = ToolResult::failure("tool_failed", "cached failure");
+    let events = ReplayEvents::new(Ok(Some(canonical.clone())));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_replayed_canonical(&result, &canonical);
+    assert_eq!(error_code(&result), "tool_failed");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
+}
+
+#[test]
+fn interrupted_durable_replay_skips_native_effect_and_lifecycle() {
+    let fixture = Fixture::new();
+    let canonical = ToolResult::failure("interrupted_effect", "effect interrupted by restart");
+    let events = ReplayEvents::new(Ok(Some(canonical.clone())));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_replayed_canonical(&result, &canonical);
+    assert_eq!(error_code(&result), "interrupted_effect");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
+}
+
+#[test]
+fn corrupt_durable_replay_fails_closed_without_native_effect() {
+    let fixture = Fixture::new();
+    let events = ReplayEvents::new(Err(EventCommitError::Corrupt(
+        "durable tool output is missing a canonical result payload".to_string(),
+    )));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_eq!(error_code(&result), "corrupt_tool_result");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
 }
 
 #[test]

@@ -159,7 +159,9 @@ impl AgentHostState {
             );
         };
         let result = dispatcher.dispatch_one(&parsed);
-        if let Some(metrics) = &self.metrics {
+        if let Some(metrics) = &self.metrics
+            && !result.replayed
+        {
             metrics.account_tool_attempt(!result.ok, result.truncated);
         }
         let mut envelope = tool_result_envelope(&parsed, result);

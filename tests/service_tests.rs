@@ -2588,6 +2588,186 @@ async fn corrupt_tool_event_without_canonical_result_fails_closed() {
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
 }
 
+fn commit_tool_parent(service: &rustscript_agent::AgentService, run_id: &str, call: &ToolCall) {
+    service
+        .commit_provider_step(
+            run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "tool_call".to_string(),
+                tool_call_id: Some(call.id.clone()),
+                name: Some(call.name.clone()),
+                arguments_json: Some(call.arguments.to_string()),
+                ..LlmContentBlock::default()
+            }],
+            None,
+            Some("tool_calls"),
+            None,
+            None,
+            None,
+        )
+        .expect("assistant tool-call parent must be durable first");
+}
+
+fn event_type_count(events: &[Value], name: &str) -> usize {
+    events.iter().filter(|event| event["event"] == name).count()
+}
+
+#[tokio::test]
+async fn completed_durable_tool_replay_returns_canonical_result_without_reexecution() {
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-completed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("note.txt"), "hello-durable").expect("seed file");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-read".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let first = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("first dispatch should run");
+    assert_eq!(first.len(), 1);
+    assert!(first[0].ok, "first read should succeed: {:?}", first[0]);
+    assert!(first[0].content.contains("hello-durable"));
+    let first_metrics = service.metrics().snapshot();
+    let first_events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&first_events, "tool.started"), 1);
+    assert_eq!(event_type_count(&first_events, "tool.completed"), 1);
+    let second = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("replay should succeed");
+    assert_eq!(second.len(), 1);
+    assert!(second[0].ok);
+    assert_eq!(second[0].content, first[0].content);
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&events, "tool.started"), 1);
+    assert_eq!(event_type_count(&events, "tool.completed"), 1);
+    let metrics = service.metrics().snapshot();
+    assert_eq!(metrics.tool_calls, first_metrics.tool_calls);
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn failed_durable_tool_replay_returns_canonical_result_without_reexecution() {
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-failed-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-missing".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let first = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("first dispatch should run");
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].ok);
+    assert_eq!(
+        first[0].error.as_ref().map(|error| error.code.as_str()),
+        Some("not_found")
+    );
+    let first_metrics = service.metrics().snapshot();
+    let first_events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&first_events, "tool.failed"), 1);
+    let second = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("replay should succeed");
+    assert_eq!(
+        second[0].error.as_ref().map(|error| error.code.as_str()),
+        Some("not_found")
+    );
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&events, "tool.failed"), 1);
+    assert_eq!(event_type_count(&events, "tool.started"), 1);
+    let metrics = service.metrics().snapshot();
+    assert_eq!(metrics.tool_failures, first_metrics.tool_failures);
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn interrupted_durable_tool_replay_returns_canonical_result_without_native_effect() {
+    let path = temporary_db_path();
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-interrupted".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "a.rs"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    service
+        .persist_run_event(
+            &admitted.run_id,
+            "evt-interrupted",
+            "tool.failed",
+            json!({
+                "tool_call_id": call.id,
+                "error_code": "interrupted_effect"
+            }),
+        )
+        .expect("interrupted event");
+    let first_metrics = service.metrics().snapshot();
+    let results = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("interrupted replay must dispatch");
+    assert_eq!(
+        results[0].error.as_ref().map(|error| error.code.as_str()),
+        Some("interrupted_effect")
+    );
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&events, "tool.started"), 0);
+    assert_eq!(event_type_count(&events, "tool.failed"), 1);
+    let metrics = service.metrics().snapshot();
+    assert_eq!(metrics.tool_calls, first_metrics.tool_calls);
+    assert_eq!(metrics.tool_failures, first_metrics.tool_failures);
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
 #[tokio::test]
 async fn terminal_run_refuses_pending_provider_without_retry() {
     let path = temporary_db_path();

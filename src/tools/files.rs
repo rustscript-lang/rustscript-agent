@@ -916,6 +916,7 @@ fn success(content: String, data: Value, truncated: bool, artifacts: Vec<String>
         error: None,
         truncated,
         artifacts,
+        replayed: false,
     }
 }
 
@@ -930,6 +931,7 @@ fn fail(code: &str, message: &str, data: Value) -> ToolResult {
         }),
         truncated: false,
         artifacts: Vec::new(),
+        replayed: false,
     }
 }
 

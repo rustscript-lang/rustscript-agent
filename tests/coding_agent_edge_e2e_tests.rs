@@ -1298,6 +1298,131 @@ async fn completed_provider_step_restart_replays_without_duplicate_tool() {
     fixture.cleanup();
 }
 
+/// Crash after durable tool completion, before the next provider response:
+/// evict/re-drive replays the same tool_call without a second native effect.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_tool_step_restart_replays_without_duplicate_effect() {
+    let Some(sh) = require_posix_sh() else {
+        return;
+    };
+    let mut fixture = Fixture::new("completed-tool-replay");
+    fixture.write_script("once.sh", once_source());
+    let counter = fixture.workspace.join("counter.txt");
+    let call = once_tool_call(&sh, "call-tool-replay");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(text_response("after-tool-replay"));
+
+    let db = fixture.db_path();
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
+    let service = state.service();
+    apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    service.inject_crash_after_tool_commit();
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("tool-commit-crash worker should finish");
+
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "post-tool-commit crash must not commit a terminal: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.completed"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.started"),
+        1
+    );
+    assert_eq!(
+        durable_tool_result_messages(&service, &admitted.session_id).len(),
+        1
+    );
+    assert_eq!(
+        fs::read(&counter).expect("counter after first drive"),
+        b"x",
+        "first drive must execute the tool once"
+    );
+    assert_eq!(provider.call_count(), 1);
+    let first_metrics = service.metrics().snapshot();
+    assert_eq!(first_metrics.tool_failures, 0);
+    service.evict_run_handle(&admitted.run_id);
+    service.inject_provider_host(Arc::new(provider.clone()));
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("replay worker should finish");
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "replayed tool must not call the inner provider again for turn 1"
+    );
+    assert_eq!(
+        fs::read(&counter).expect("counter after replay"),
+        b"x",
+        "durable tool replay must execute the tool exactly once"
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.started"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.completed"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.requested"),
+        1
+    );
+    assert_eq!(
+        durable_tool_result_messages(&service, &admitted.session_id).len(),
+        1
+    );
+    assert_tool_parent_chain(&service, &admitted.session_id, &admitted.run_id, &call);
+    let metrics = service.metrics().snapshot();
+    assert_eq!(
+        metrics.tool_calls, first_metrics.tool_calls,
+        "replayed tool must not increment tool_calls"
+    );
+    assert_eq!(metrics.tool_failures, 0);
+    assert!(
+        metrics.tool_calls <= 1,
+        "tool_calls must not double-count: {}",
+        metrics.tool_calls
+    );
+    assert_eq!(
+        metrics.model_calls,
+        first_metrics.model_calls + 1,
+        "replayed tool must not double-count the first model call"
+    );
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(state);
+    fixture.cleanup();
+}
+
 /// An unsafe pending request fail-closes: no inner provider call and no tool effect.
 #[tokio::test(flavor = "multi_thread")]
 async fn unsafe_pending_provider_request_fails_closed_without_tool() {

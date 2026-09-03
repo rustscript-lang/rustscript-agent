@@ -637,6 +637,7 @@ struct AgentServiceInner {
     commit_gate: Arc<ParkingMutex<()>>,
     crash_after_provider_commit: AtomicBool,
     crash_after_provider_request: AtomicBool,
+    crash_after_tool_commit: AtomicBool,
     provider_commit_crashed: AtomicBool,
 }
 
@@ -706,6 +707,7 @@ impl AgentService {
             commit_gate: Arc::new(ParkingMutex::new(())),
             crash_after_provider_commit: AtomicBool::new(false),
             crash_after_provider_request: AtomicBool::new(false),
+            crash_after_tool_commit: AtomicBool::new(false),
             provider_commit_crashed: AtomicBool::new(false),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
@@ -798,6 +800,18 @@ impl AgentService {
     pub fn inject_crash_after_provider_request(&self) {
         self.inner
             .crash_after_provider_request
+            .store(true, Ordering::SeqCst);
+        self.inner
+            .provider_commit_crashed
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Test failpoint: panic after a successful durable tool completion, before
+    /// the next provider response. The worker leaves the run started so a
+    /// restart can replay the canonical tool result without a second effect.
+    pub fn inject_crash_after_tool_commit(&self) {
+        self.inner
+            .crash_after_tool_commit
             .store(true, Ordering::SeqCst);
         self.inner
             .provider_commit_crashed
@@ -962,6 +976,7 @@ impl AgentService {
             max_event_bytes: self.inner.config.max_event_bytes,
             max_events_per_run: self.inner.config.max_events_per_run,
             commit_gate: Arc::clone(&self.inner.commit_gate),
+            service: Arc::downgrade(&self.inner),
         }
         .commit_step(event_type, data, result)
     }
@@ -989,20 +1004,24 @@ impl AgentService {
                 let mut pending = Vec::new();
                 let mut pending_idx = Vec::new();
                 for (index, call) in calls.iter().enumerate() {
-                    if let Some(replayed) = self.replay_durable_tool_result(run_id, &call.id) {
-                        results.push(Some(replayed));
-                    } else {
-                        results.push(None);
-                        pending.push(call.clone());
-                        pending_idx.push(index);
+                    match self.replay_durable_tool_result(run_id, &call.id, &call.name) {
+                        Ok(Some(replayed)) => results.push(Some(replayed)),
+                        Ok(None) => {
+                            results.push(None);
+                            pending.push(call.clone());
+                            pending_idx.push(index);
+                        }
+                        Err(error) => results.push(Some(replay_commit_failure(error))),
                     }
                 }
                 if !pending.is_empty() {
                     let dispatched = state.dispatcher.dispatch(&pending);
                     for (slot, result) in pending_idx.into_iter().zip(dispatched) {
-                        self.inner
-                            .metrics
-                            .account_tool_attempt(!result.ok, result.truncated);
+                        if !result.replayed {
+                            self.inner
+                                .metrics
+                                .account_tool_attempt(!result.ok, result.truncated);
+                        }
                         results[slot] = Some(result);
                     }
                 }
@@ -1018,9 +1037,18 @@ impl AgentService {
     /// Replay a completed/failed tool result from durable messages/events.
     /// Completed effects are never dispatched again. Interrupted effects
     /// surface as typed `interrupted_effect` failures without re-execution.
-    fn replay_durable_tool_result(&self, run_id: &str, tool_call_id: &str) -> Option<ToolResult> {
+    /// Corrupt canonical state fails closed. Name must match the durable
+    /// parent/result when present.
+    fn replay_durable_tool_result(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
         let store = self.inner.store.read();
-        let run = store.runs.get(run_id)?;
+        let Some(run) = store.runs.get(run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
         let has_output = run.events.iter().any(|event| {
             matches!(
                 event.event.as_str(),
@@ -1028,12 +1056,27 @@ impl AgentService {
             ) && event.data.get("tool_call_id").and_then(JsonValue::as_str) == Some(tool_call_id)
         });
         if !has_output {
-            return None;
+            return Ok(None);
+        }
+        if let Some((_, stored_name)) =
+            lookup_tool_call_parent(&store, &run.session_id, tool_call_id)
+            && stored_name != name
+        {
+            return Err(EventCommitError::Corrupt(
+                "tool call name does not match durable parent".to_string(),
+            ));
         }
         if let Some(session) = store.sessions.get(&run.session_id) {
             for message in session.messages.iter().rev() {
                 if message.tool_call_id.as_deref() != Some(tool_call_id) {
                     continue;
+                }
+                if let Some(stored_name) = message.name.as_deref()
+                    && stored_name != name
+                {
+                    return Err(EventCommitError::Corrupt(
+                        "tool result name does not match the requested tool".to_string(),
+                    ));
                 }
                 for block in decode_message_blocks(&message.content) {
                     if block.block_type != "tool_result"
@@ -1062,7 +1105,7 @@ impl AgentService {
                             .unwrap_or_else(|| {
                                 ("tool_failed".to_string(), "tool failed".to_string())
                             });
-                        return Some(ToolResult::failure(code, message_text));
+                        return Ok(Some(ToolResult::failure(code, message_text)));
                     }
                     let mut result = ToolResult::success(
                         block.content.clone().unwrap_or_default(),
@@ -1082,7 +1125,7 @@ impl AgentService {
                             .map(str::to_string)
                             .collect();
                     }
-                    return Some(result);
+                    return Ok(Some(result));
                 }
             }
         }
@@ -1093,14 +1136,13 @@ impl AgentService {
                 && event.data.get("tool_call_id").and_then(JsonValue::as_str) == Some(tool_call_id)
         });
         if interrupted {
-            return Some(ToolResult::failure(
+            return Ok(Some(ToolResult::failure(
                 "interrupted_effect",
                 "effect interrupted by restart",
-            ));
+            )));
         }
-        Some(ToolResult::failure(
-            "corrupt_tool_result",
-            "durable tool output is missing a canonical result payload",
+        Err(EventCommitError::Corrupt(
+            "durable tool output is missing a canonical result payload".to_string(),
         ))
     }
 
@@ -1728,6 +1770,7 @@ impl AgentService {
             max_event_bytes: self.inner.config.max_event_bytes,
             max_events_per_run: self.inner.config.max_events_per_run,
             commit_gate: Arc::clone(&self.inner.commit_gate),
+            service: Arc::downgrade(&self.inner),
         });
         let dispatcher = DispatchContext::new(
             owner,
@@ -4057,6 +4100,7 @@ struct ServiceEventCommitter {
     max_event_bytes: usize,
     max_events_per_run: usize,
     commit_gate: Arc<ParkingMutex<()>>,
+    service: Weak<AgentServiceInner>,
 }
 
 impl DurableEventCommitter for ServiceEventCommitter {
@@ -4094,6 +4138,18 @@ impl DurableEventCommitter for ServiceEventCommitter {
             Some((parent_id, stored_name)) if stored_name == name => Ok((parent_id, stored_name)),
             _ => Err(EventCommitError::MissingParent),
         }
+    }
+
+    fn replay_durable_tool_result(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
+        let Some(inner) = self.service.upgrade() else {
+            return Err(EventCommitError::Terminal);
+        };
+        let _serial = self.commit_gate.lock();
+        AgentService { inner }.replay_durable_tool_result(&self.run_id, tool_call_id, name)
     }
 
     fn commit_step(
@@ -4232,7 +4288,34 @@ impl DurableEventCommitter for ServiceEventCommitter {
                 max_events_per_run: self.max_events_per_run,
             }
         };
-        persist_and_apply(&self.store, self.persistence.as_deref(), reserved)
+        let result = persist_and_apply(&self.store, self.persistence.as_deref(), reserved);
+        if result.is_ok()
+            && matches!(event_type, "tool.completed" | "tool.failed")
+            && let Some(inner) = self.service.upgrade()
+            && inner.crash_after_tool_commit.swap(false, Ordering::SeqCst)
+        {
+            inner.provider_commit_crashed.store(true, Ordering::SeqCst);
+            panic!("tool_commit_crash");
+        }
+        result
+    }
+}
+
+fn replay_commit_failure(error: EventCommitError) -> ToolResult {
+    match error {
+        EventCommitError::Corrupt(_) => ToolResult::failure(
+            "corrupt_tool_result",
+            "durable tool output is missing a canonical result payload",
+        ),
+        EventCommitError::MissingParent => ToolResult::failure(
+            "missing_tool_parent",
+            "tool result parent tool_call is missing",
+        ),
+        EventCommitError::Cancelled => ToolResult::failure("cancelled", "run was cancelled"),
+        EventCommitError::Terminal => ToolResult::failure("run_terminal", "run is terminal"),
+        EventCommitError::PersistFailed(_) => {
+            ToolResult::failure("persist_failed", "durable event persist failed")
+        }
     }
 }
 

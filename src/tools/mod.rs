@@ -93,6 +93,10 @@ pub struct ToolResult {
     pub error: Option<ToolError>,
     pub truncated: bool,
     pub artifacts: Vec<String>,
+    /// Set when dispatch returned a durable canonical result without a native
+    /// effect. Never serialized; callers must not count metrics for it.
+    #[serde(skip)]
+    pub(crate) replayed: bool,
 }
 
 /// Typed failure carried in [`ToolResult::error`].
@@ -111,6 +115,7 @@ impl ToolResult {
             error: None,
             truncated: false,
             artifacts: Vec::new(),
+            replayed: false,
         }
     }
 
@@ -125,6 +130,7 @@ impl ToolResult {
             }),
             truncated: false,
             artifacts: Vec::new(),
+            replayed: false,
         }
     }
 
@@ -145,6 +151,7 @@ impl ToolResult {
             }),
             truncated,
             artifacts: Vec::new(),
+            replayed: false,
         }
     }
 }

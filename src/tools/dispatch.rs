@@ -85,6 +85,18 @@ pub trait DurableEventCommitter: Send + Sync {
         let _ = tool_call_id;
         Ok((String::new(), name.to_string()))
     }
+    /// Read-only pre-effect replay: return a canonical completed/failed/
+    /// interrupted `ToolResult` when durable state already has one. Default
+    /// is `Ok(None)` so in-memory test committers keep executing natively.
+    /// Corrupt canonical state must return [`EventCommitError::Corrupt`].
+    fn replay_durable_tool_result(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
+        let _ = (tool_call_id, name);
+        Ok(None)
+    }
 }
 
 /// Injectable native executor boundary. Production code uses
@@ -363,6 +375,15 @@ impl DispatchContext {
                 EventCommitError::PersistFailed(_) => persist_failed_result(),
                 EventCommitError::Corrupt(_) => corrupt_durable_result(),
             };
+        }
+        match self
+            .inner
+            .events
+            .replay_durable_tool_result(&call.id, &call.name)
+        {
+            Ok(None) => {}
+            Ok(Some(result)) => return mark_replayed(result),
+            Err(error) => return mark_replayed(pre_effect_commit_failure(error)),
         }
         let used = self.inner.call_count.fetch_add(1, Ordering::SeqCst);
         if used >= self.inner.limits.max_tool_calls {
@@ -670,6 +691,11 @@ fn missing_parent_result() -> ToolResult {
         "missing_tool_parent",
         "tool result parent tool_call is missing",
     )
+}
+
+fn mark_replayed(mut result: ToolResult) -> ToolResult {
+    result.replayed = true;
+    result
 }
 
 fn lifecycle_data(
