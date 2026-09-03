@@ -247,12 +247,27 @@ the thread is abandoned. Client-disconnect policy is independent
 
 ## Durable replay
 
+`DurableProviderHost` is the production provider seam. Before each fresh inner
+call it commits a sanitized `model.requested` boundary (`retry_safe` plus a
+`sha256:` fingerprint; never `request`/`messages`/`prompt`/`provider_options`/
+`api_key`/`headers`/`body`). Completed canonical provider steps
+(`model.completed` plus the assistant message) replay on restart without an
+inner call or a second `turns` increment. Pending retry-safe requests retry the
+same logical turn and do not synthesize an assistant/tool parent. Pending
+requests that are not retry-safe, lack a fingerprint, leak secret keys, or
+already have a later tool effect fail closed (`interrupted_provider`) with no
+provider or tool effect.
+
 Native dispatch is durable-first. Assistant `tool_call` parents and user
 `tool_result` messages carry `parent_message_id` and monotonic `ordinal`
 values. A missing or name-mismatched parent fails closed (`missing_tool_parent`)
 and does not run the executor. Replaying an already durable `ToolResult` does
-not re-account metrics. Pending provider effects fail closed rather than
-retrying after a persist failure.
+not re-account metrics.
+
+Exactly-once delivery to an external receiver is impossible: event delivery is
+at-least-once. Durable replay guarantees the agent does not duplicate tool
+effects or provider-step rows; subscribers may observe the same durable event
+more than once.
 
 ## Coding metrics
 
@@ -295,7 +310,9 @@ The main suite generates a temporary git workspace, drives the production
 `AgentService` worker and bundled RSS loop, and asserts a real `read_file` →
 `patch` → `terminal` argv test run. The edge suite asserts stop-during-terminal
 child cleanup, exact tool lifecycle, durable parent/name/ordinal chaining,
-truncated overflow artifacts, and that reopening a completed run is a no-op.
+truncated overflow artifacts, that reopening a completed run is a no-op, and
+pending provider-turn restart: retry-safe replay/retry, completed-step replay
+fidelity, unsafe fail-closed, and no duplicate tool effect or metric count.
 
 ## Secrets
 

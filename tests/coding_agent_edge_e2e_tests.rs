@@ -1,10 +1,9 @@
-//! Task 10 edge E2E: stop-during-terminal and output-limit through production
-//! AgentService + bundled RSS + native tools with ScriptedProvider.
+//! Task 10 edge E2E: stop-during-terminal, output-limit, and durable provider
+//! recovery through production AgentService + bundled RSS + native tools.
 //!
-//! Helpers are localized. The current service committer still requires a
-//! durable assistant `tool_call` parent (`MissingParent`); `seed_tool_parent`
-//! is idempotent if a later Task 9 cleanup starts committing that parent
-//! itself.
+//! `ScriptedProvider` is injected as the inner model transport. Production
+//! `DurableProviderHost` commits provider steps, replays completed turns, and
+//! fail-closes unsafe pending requests.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +15,7 @@ use rustscript_agent::config::{ADMISSION_SESSION_PROFILE, FileToolConfig, RunLim
 use rustscript_agent::tools::{ArtifactOwner, ArtifactStore};
 use rustscript_agent::{
     AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentProviderHost, AgentService,
-    LlmContentBlock, RunCancellation, ScriptedProvider, ToolCall, decode_message_blocks,
+    RunCancellation, ScriptedProvider, ToolCall, decode_message_blocks,
 };
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
@@ -246,28 +245,6 @@ fn apply_workspace_limits(service: &AgentService, workspace: &Path, max_tool_out
         .expect("set run limits");
 }
 
-/// Localized durable parent seed. Idempotent with `commit_provider_step`.
-fn seed_tool_parent(service: &AgentService, run_id: &str, call: &ToolCall) {
-    service
-        .commit_provider_step(
-            run_id,
-            1,
-            &[LlmContentBlock {
-                block_type: "tool_call".to_string(),
-                tool_call_id: Some(call.id.clone()),
-                name: Some(call.name.clone()),
-                arguments_json: Some(call.arguments.to_string()),
-                ..LlmContentBlock::default()
-            }],
-            None,
-            Some("tool_calls"),
-            None,
-            None,
-            None,
-        )
-        .expect("durable tool-call parent");
-}
-
 fn terminal_events(service: &AgentService, run_id: &str) -> Vec<String> {
     service
         .run_events(run_id)
@@ -286,6 +263,20 @@ fn event_names(service: &AgentService, run_id: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|event| event.get("event")?.as_str().map(str::to_string))
         .collect()
+}
+
+fn event_name_count(service: &AgentService, run_id: &str, name: &str) -> usize {
+    event_names(service, run_id)
+        .into_iter()
+        .filter(|event| event == name)
+        .count()
+}
+
+fn tool_event_count(service: &AgentService, run_id: &str) -> usize {
+    event_names(service, run_id)
+        .into_iter()
+        .filter(|event| event.starts_with("tool."))
+        .count()
 }
 
 fn cancel_reason(service: &AgentService, run_id: &str) -> String {
@@ -477,6 +468,10 @@ fn hello_source() -> &'static str {
     "printf '%s\\n' 'hello-edge'\n"
 }
 
+fn once_source() -> &'static str {
+    "printf x >> counter.txt\n"
+}
+
 fn sh_arg(sh: &Path) -> String {
     sh.to_str().expect("sh path should be utf-8").to_string()
 }
@@ -538,7 +533,6 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    seed_tool_parent(&service, &admitted.run_id, &call);
 
     let worker = tokio::spawn({
         let service = service.clone();
@@ -611,8 +605,8 @@ async fn stop_during_terminal_cancels_child_without_residue() {
     let result = user_tool_result(&chain, &call.id);
     assert_eq!(
         json_opt_str(parent, "parent_message_id"),
-        None,
-        "seeded assistant tool_call parent is unset until the provider seam commits it"
+        Some(message_id(chain[0])),
+        "assistant tool_call parent is the durable user admission message"
     );
     assert_exact_parent_name_ordinal(result, parent, "terminal", 3);
     let result_blocks = decode_message_blocks(&result["content"]);
@@ -697,7 +691,6 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    seed_tool_parent(&service, &admitted.run_id, &call);
 
     let worker = tokio::spawn({
         let service = service.clone();
@@ -824,7 +817,11 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     let chain = run_messages(&messages, &admitted.run_id);
     let parent = assistant_tool_call(&chain, &call.id);
     let durable_result = user_tool_result(&chain, &call.id);
-    assert_eq!(json_opt_str(parent, "parent_message_id"), None);
+    assert_eq!(
+        json_opt_str(parent, "parent_message_id"),
+        Some(message_id(chain[0])),
+        "assistant tool_call parent is the durable user admission message"
+    );
     assert_exact_parent_name_ordinal(durable_result, parent, "terminal", 3);
 
     let artifact_root = fixture.artifact_root();
@@ -911,9 +908,9 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     fixture.cleanup();
 }
 
-/// Reopening a completed run is a no-op: no provider call, no extra terminal.
-/// This does not claim ToolResult replay; pending-turn reopen replay lands on
-/// final integration after the provider seam.
+/// Reopening a completed run is a no-op: no provider call, no extra terminal,
+/// and metrics do not double-count. Pending-turn recovery is covered by the
+/// restart tests below.
 #[tokio::test(flavor = "multi_thread")]
 async fn completed_run_reopen_is_noop() {
     let Some(_) = locate_sh() else {
@@ -944,14 +941,13 @@ async fn completed_run_reopen_is_noop() {
     provider.push_ok(text_response("restart-summary"));
 
     let db = fixture.db_path();
-    let first = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
-    let service = first.service();
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
+    let service = state.service();
     apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
     let admitted = service
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    seed_tool_parent(&service, &admitted.run_id, &call);
     tokio::time::timeout(WORKER_BUDGET, {
         let service = service.clone();
         let run_id = admitted.run_id.clone();
@@ -973,7 +969,7 @@ async fn completed_run_reopen_is_noop() {
     assert_eq!(before.turns, 2);
     assert_eq!(provider.call_count(), 2);
     let run_id = admitted.run_id.clone();
-    drop(first);
+    drop(state);
 
     let resumed_provider = ScriptedProvider::new();
     resumed_provider.push_ok(text_response("must-not-run"));
@@ -1005,6 +1001,357 @@ async fn completed_run_reopen_is_noop() {
     assert_eq!(after.model_calls, 0, "metrics must not double-count models");
     assert_eq!(after.turns, 0);
     assert_eq!(resumed_service.process_owner_count(&run_id), 0);
+    fixture.cleanup();
+}
+
+fn require_posix_sh() -> Option<PathBuf> {
+    let Some(_) = locate_sh() else {
+        #[cfg(unix)]
+        panic!("unix coding edge e2e requires sh at /bin/sh, /usr/bin/sh, or PATH");
+        #[cfg(not(unix))]
+        {
+            eprintln!("skipping durable provider recovery without POSIX sh");
+            return None;
+        }
+    };
+    Some(require_sh())
+}
+
+fn once_tool_call(sh: &Path, id: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: "terminal".to_string(),
+        arguments: json!({
+            "argv": [sh_arg(sh), "once.sh"],
+            "timeout_ms": 5_000
+        }),
+    }
+}
+
+fn rich_tool_response(call: &ToolCall) -> JsonValue {
+    json!({
+        "text": "need-once",
+        "tool_calls": [{"id": call.id, "name": call.name, "arguments": call.arguments}],
+        "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+        "reasoning": {"summary": "append once"},
+        "stop_reason": "tool_calls",
+        "truncated": false,
+        "model": "scripted-model",
+        "provider": "scripted-provider",
+    })
+}
+
+fn assert_tool_parent_chain(
+    service: &AgentService,
+    session_id: &str,
+    run_id: &str,
+    call: &ToolCall,
+) {
+    let messages = service.session_messages(session_id);
+    let chain = run_messages(&messages, run_id);
+    let parent = assistant_tool_call(&chain, &call.id);
+    let result = user_tool_result(&chain, &call.id);
+    assert_eq!(
+        json_opt_str(parent, "parent_message_id"),
+        Some(message_id(chain[0])),
+        "assistant tool_call parent is the durable user admission message"
+    );
+    assert_exact_parent_name_ordinal(result, parent, "terminal", 3);
+}
+
+/// Crash after the durable `model.requested` boundary: reopen retries the same
+/// logical turn, runs the tool once, and does not double-count completed metrics.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_provider_request_restart_retries_without_duplicate_tool() {
+    let Some(sh) = require_posix_sh() else {
+        return;
+    };
+    let mut fixture = Fixture::new("pending-request-retry");
+    fixture.write_script("once.sh", once_source());
+    let counter = fixture.workspace.join("counter.txt");
+    let call = once_tool_call(&sh, "call-pending-retry");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(text_response("after-retry"));
+
+    let db = fixture.db_path();
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
+    let service = state.service();
+    apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    service.inject_crash_after_provider_request();
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("crash worker should finish");
+
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "pending request crash must not commit a terminal: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.completed"),
+        0
+    );
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "inner provider must not run before the requested crash"
+    );
+    assert!(!counter.exists(), "tool must not run before recovery");
+    service.evict_run_handle(&admitted.run_id);
+    service.inject_provider_host(Arc::new(provider.clone()));
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("recovery worker should finish");
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(
+        fs::read(&counter).expect("counter after retry"),
+        b"x",
+        "retry-safe pending request must execute the tool exactly once"
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.started"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.completed"),
+        2
+    );
+    assert_tool_parent_chain(&service, &admitted.session_id, &admitted.run_id, &call);
+    let messages = service.session_messages(&admitted.session_id);
+    let chain = run_messages(&messages, &admitted.run_id);
+    let parent = assistant_tool_call(&chain, &call.id);
+    assert_eq!(parent["metadata"]["usage"]["total_tokens"], json!(18));
+    assert_eq!(parent["metadata"]["provider"], json!("scripted-provider"));
+    assert_eq!(parent["metadata"]["model"], json!("scripted-model"));
+    assert_eq!(parent["metadata"]["truncated"], json!(false));
+    assert_eq!(
+        parent["metadata"]["reasoning"],
+        json!({"summary": "append once"})
+    );
+    assert_eq!(parent["finish_reason"], json!("tool_calls"));
+    let metrics = service.metrics().snapshot();
+    assert_eq!(metrics.model_calls, 2);
+    assert_eq!(metrics.tool_calls, 1);
+    assert_eq!(metrics.turns, 2);
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(state);
+    fixture.cleanup();
+}
+
+/// Crash after a durable completed provider step: reopen replays the envelope
+/// without a second inner call or duplicate tool effect, preserving metadata.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_provider_step_restart_replays_without_duplicate_tool() {
+    let Some(sh) = require_posix_sh() else {
+        return;
+    };
+    let mut fixture = Fixture::new("completed-step-replay");
+    fixture.write_script("once.sh", once_source());
+    let counter = fixture.workspace.join("counter.txt");
+    let call = once_tool_call(&sh, "call-completed-replay");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(text_response("after-replay"));
+
+    let db = fixture.db_path();
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
+    let service = state.service();
+    apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    service.inject_crash_after_provider_commit();
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("commit-crash worker should finish");
+
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "post-commit crash must not commit a terminal: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.completed"),
+        1
+    );
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(provider.call_count(), 1);
+    assert!(!counter.exists(), "tool must not run before replay");
+    let messages = service.session_messages(&admitted.session_id);
+    let chain = run_messages(&messages, &admitted.run_id);
+    let parent = assistant_tool_call(&chain, &call.id);
+    let committed_id = message_id(parent).to_string();
+    let committed_metadata = parent["metadata"].clone();
+    let committed_finish = parent["finish_reason"].clone();
+    assert_eq!(committed_metadata["usage"]["input_tokens"], json!(11));
+    assert_eq!(committed_metadata["usage"]["output_tokens"], json!(7));
+    assert_eq!(committed_metadata["usage"]["total_tokens"], json!(18));
+    assert_eq!(committed_metadata["provider"], json!("scripted-provider"));
+    assert_eq!(committed_metadata["model"], json!("scripted-model"));
+    assert_eq!(committed_metadata["truncated"], json!(false));
+    assert_eq!(
+        committed_metadata["reasoning"],
+        json!({"summary": "append once"})
+    );
+    assert_eq!(committed_finish, json!("tool_calls"));
+    let first_metrics = service.metrics().snapshot();
+    assert_eq!(first_metrics.model_calls, 1);
+    assert_eq!(first_metrics.turns, 1);
+    assert_eq!(first_metrics.tool_calls, 0);
+    service.evict_run_handle(&admitted.run_id);
+    service.inject_provider_host(Arc::new(provider.clone()));
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("replay worker should finish");
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "replayed completed step must not call the inner provider again for turn 1"
+    );
+    assert_eq!(
+        fs::read(&counter).expect("counter after replay"),
+        b"x",
+        "completed durable replay must execute the tool exactly once"
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.started"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.completed"),
+        2
+    );
+    assert_tool_parent_chain(&service, &admitted.session_id, &admitted.run_id, &call);
+    let messages = service.session_messages(&admitted.session_id);
+    let chain = run_messages(&messages, &admitted.run_id);
+    let replayed = assistant_tool_call(&chain, &call.id);
+    assert_eq!(message_id(replayed), committed_id);
+    assert_eq!(replayed["metadata"], committed_metadata);
+    assert_eq!(replayed["finish_reason"], committed_finish);
+    let metrics = service.metrics().snapshot();
+    assert_eq!(
+        metrics.model_calls,
+        first_metrics.model_calls + 1,
+        "replayed turn must not count a second model call"
+    );
+    assert_eq!(metrics.tool_calls, 1);
+    assert_eq!(
+        metrics.turns,
+        first_metrics.turns + 1,
+        "replayed completed step must not double-count turns"
+    );
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(state);
+    fixture.cleanup();
+}
+
+/// An unsafe pending request fail-closes: no inner provider call and no tool effect.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsafe_pending_provider_request_fails_closed_without_tool() {
+    let Some(sh) = require_posix_sh() else {
+        return;
+    };
+    let mut fixture = Fixture::new("unsafe-pending");
+    fixture.write_script("once.sh", once_source());
+    let counter = fixture.workspace.join("counter.txt");
+    let call = once_tool_call(&sh, "call-unsafe-pending");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(text_response("must-not-run"));
+
+    let db = fixture.db_path();
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
+    let service = state.service();
+    apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    service
+        .commit_provider_request(&admitted.run_id, 1, false, &json!({"model": "local-agent"}))
+        .expect("unsafe pending request boundary");
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("unsafe pending worker should finish");
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert!(
+        service.run_events(&admitted.run_id).iter().any(|event| {
+            event["event"] == "model.failed"
+                && event["data"]["error_code"] == "interrupted_provider"
+        }),
+        "unsafe pending must fail closed as interrupted_provider: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert!(!counter.exists(), "unsafe pending must not run the tool");
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(state);
     fixture.cleanup();
 }
 

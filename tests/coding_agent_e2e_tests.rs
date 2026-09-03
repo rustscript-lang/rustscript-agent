@@ -1,8 +1,8 @@
 //! Task 10: production `AgentService` worker + bundled RSS loop + real native tools.
 //!
-//! `ScriptedProvider` is the model transport only. Native tools execute against
-//! a generated git workspace. Provider-host injection stays in this file
-//! because a parallel Task 9 change may alter that API.
+//! `ScriptedProvider` is injected as the inner model transport. Production
+//! `DurableProviderHost` owns provider-step durability, replay, and recovery.
+//! Native tools execute against a generated git workspace.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 
 use rustscript_agent::config::{ProviderProfile, RunLimits};
 use rustscript_agent::{
-    AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentProviderHost, AgentService,
-    LlmContentBlock, RunCancellation, ScriptedProvider, decode_message_blocks,
+    AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, ScriptedProvider, decode_message_blocks,
 };
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
@@ -213,129 +212,6 @@ fn tool_response(text: &str, tool_calls: JsonValue) -> JsonValue {
     })
 }
 
-/// Model transport plus localized durable-parent commit.
-///
-/// Production dispatch requires a durable assistant `tool_call` parent before
-/// native tools run. The bundled RSS loop does not call `commit_provider_step`;
-/// this wrapper does so the E2E still uses real tools. If Task 9 later commits
-/// provider steps inside the host, this wrapper can become a passthrough.
-struct ScriptedModelTransport {
-    inner: ScriptedProvider,
-    service: Arc<AgentService>,
-    run_id: String,
-    turn: AtomicU64,
-}
-
-impl ScriptedModelTransport {
-    fn new(inner: ScriptedProvider, service: Arc<AgentService>, run_id: String) -> Self {
-        Self {
-            inner,
-            service,
-            run_id,
-            turn: AtomicU64::new(0),
-        }
-    }
-
-    fn commit_response(&self, response: &JsonValue) {
-        let turn = self.turn.fetch_add(1, Ordering::SeqCst) + 1;
-        let blocks = blocks_from_provider_response(response);
-        if blocks.is_empty() {
-            return;
-        }
-        let parent_message_id = self
-            .service
-            .session_messages(
-                &self
-                    .service
-                    .run_context(&self.run_id)
-                    .expect("run context")
-                    .session_id,
-            )
-            .last()
-            .and_then(|message| message.get("id").and_then(JsonValue::as_str))
-            .map(str::to_string);
-        let finish_reason = if response
-            .get("tool_calls")
-            .and_then(JsonValue::as_array)
-            .is_some_and(|calls| !calls.is_empty())
-        {
-            Some("tool_calls")
-        } else {
-            Some("stop")
-        };
-        self.service
-            .commit_provider_step(
-                &self.run_id,
-                turn,
-                &blocks,
-                None,
-                finish_reason,
-                Some("local-agent"),
-                Some("local-agent"),
-                parent_message_id.as_deref(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("commit_provider_step turn {turn} should succeed: {error:?}")
-            });
-    }
-}
-
-impl AgentProviderHost for ScriptedModelTransport {
-    fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
-        let envelope = self.inner.call(request, cancellation);
-        if envelope.get("ok") == Some(&JsonValue::Bool(true))
-            && let Some(response) = envelope.get("response")
-        {
-            self.commit_response(response);
-        }
-        envelope
-    }
-}
-
-fn blocks_from_provider_response(response: &JsonValue) -> Vec<LlmContentBlock> {
-    let mut blocks = Vec::new();
-    if let Some(text) = response.get("text").and_then(JsonValue::as_str)
-        && !text.is_empty()
-    {
-        blocks.push(LlmContentBlock {
-            block_type: "text".to_string(),
-            text: Some(text.to_string()),
-            ..LlmContentBlock::default()
-        });
-    }
-    if let Some(calls) = response.get("tool_calls").and_then(JsonValue::as_array) {
-        for call in calls {
-            blocks.push(LlmContentBlock {
-                block_type: "tool_call".to_string(),
-                tool_call_id: call
-                    .get("id")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
-                name: call
-                    .get("name")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
-                arguments_json: call.get("arguments").map(|arguments| arguments.to_string()),
-                ..LlmContentBlock::default()
-            });
-        }
-    }
-    blocks
-}
-
-/// Localized injection point: Task 9 may rename/replace `inject_provider_host`.
-fn inject_scripted_model_transport(
-    service: &Arc<AgentService>,
-    provider: ScriptedProvider,
-    run_id: &str,
-) {
-    service.inject_provider_host(Arc::new(ScriptedModelTransport::new(
-        provider,
-        Arc::clone(service),
-        run_id.to_string(),
-    )));
-}
-
 async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -532,7 +408,7 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
         "the E2E must not select an openai-compatible protocol"
     );
 
-    inject_scripted_model_transport(&service, provider.clone(), &admitted.run_id);
+    service.inject_provider_host(Arc::new(provider.clone()));
     service
         .clone()
         .run_worker(admitted.run_id.clone(), "ignored".to_string())
@@ -788,16 +664,6 @@ fn assert_canonical_durable_chain(messages: &[JsonValue], run_id: &str) {
             block_tool_call_id: None,
             parent: ExpectedParent::Index(6),
             ordinal: Some(8),
-        },
-        ExpectedDurable {
-            role: "assistant",
-            name: None,
-            tool_call_id: None,
-            block_type: "text",
-            block_name: None,
-            block_tool_call_id: None,
-            parent: ExpectedParent::None,
-            ordinal: Some(9),
         },
     ];
     assert_eq!(

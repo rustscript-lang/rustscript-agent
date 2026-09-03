@@ -1286,6 +1286,7 @@ async fn post_commit_crash_restart_replays_provider_and_runs_tool_once() {
     // live handle and resume the same started run so replay, not a second
     // inner call, drives tool dispatch.
     service.evict_run_handle(&admitted.run_id);
+    service.inject_provider_host(Arc::new(provider.clone()));
     service
         .clone()
         .run_worker(admitted.run_id.clone(), "ignored".to_string())
