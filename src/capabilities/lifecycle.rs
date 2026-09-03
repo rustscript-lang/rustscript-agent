@@ -249,8 +249,16 @@ impl CapabilityLifecycleBuilder {
 
 enum TokenState {
     Open(Box<TokenClaims>),
-    Committed,
-    Interrupted,
+    Committed { call_id: String },
+    Interrupted { call_id: String },
+}
+
+fn token_call_id(state: &TokenState) -> &str {
+    match state {
+        TokenState::Open(claims) => claims.call_id.as_str(),
+        TokenState::Committed { call_id } => call_id.as_str(),
+        TokenState::Interrupted { call_id } => call_id.as_str(),
+    }
 }
 
 struct LifecycleInner {
@@ -311,9 +319,12 @@ impl CapabilityLifecycle {
             return Ok(PrepareOutcome::Replay { result });
         }
         {
-            let unresolved = self.inner.token_states.lock().values().any(|state| {
-                matches!(state, TokenState::Open(claims) if claims.call_id == metadata.call_id)
-            });
+            let unresolved = self
+                .inner
+                .token_states
+                .lock()
+                .values()
+                .any(|state| token_call_id(state) == metadata.call_id);
             if unresolved {
                 return Err(LifecycleError::UnresolvedCall);
             }
@@ -402,8 +413,8 @@ impl CapabilityLifecycle {
         let mut states = self.inner.token_states.lock();
         let claims = match states.get(token) {
             Some(TokenState::Open(claims)) => claims.clone(),
-            Some(TokenState::Committed) => return Err(LifecycleError::DuplicateClose),
-            Some(TokenState::Interrupted) => return Err(LifecycleError::Interrupted),
+            Some(TokenState::Committed { .. }) => return Err(LifecycleError::DuplicateClose),
+            Some(TokenState::Interrupted { .. }) => return Err(LifecycleError::Interrupted),
             None => return Err(LifecycleError::TokenUnknown),
         };
         if &claims.owner != owner {
@@ -421,7 +432,13 @@ impl CapabilityLifecycle {
         if self.inner.cancellation.is_cancelled() {
             return Err(LifecycleError::Cancelled);
         }
-        states.insert(token.to_string(), TokenState::Committed);
+        validate_canonical_result(&result)?;
+        states.insert(
+            token.to_string(),
+            TokenState::Committed {
+                call_id: claims.call_id.clone(),
+            },
+        );
         drop(states);
         let committed = self.inner.durable.commit_result(&claims.call_id, &result)?;
         Ok(CommitOutcome {
@@ -441,8 +458,8 @@ impl CapabilityLifecycle {
                 token: token.to_string(),
                 closed: false,
             }),
-            Some(TokenState::Committed) => Err(LifecycleError::DuplicateClose),
-            Some(TokenState::Interrupted) => Err(LifecycleError::Interrupted),
+            Some(TokenState::Committed { .. }) => Err(LifecycleError::DuplicateClose),
+            Some(TokenState::Interrupted { .. }) => Err(LifecycleError::Interrupted),
             None => Err(LifecycleError::TokenUnknown),
         }
     }
@@ -466,8 +483,8 @@ impl CapabilityLifecycle {
         let states = self.inner.token_states.lock();
         let claims = match states.get(token) {
             Some(TokenState::Open(claims)) => claims.as_ref().clone(),
-            Some(TokenState::Committed) => return Err(LifecycleError::DuplicateClose),
-            Some(TokenState::Interrupted) => return Err(LifecycleError::Interrupted),
+            Some(TokenState::Committed { .. }) => return Err(LifecycleError::DuplicateClose),
+            Some(TokenState::Interrupted { .. }) => return Err(LifecycleError::Interrupted),
             None => return Err(LifecycleError::TokenUnknown),
         };
         drop(states);
@@ -493,16 +510,25 @@ impl CapabilityLifecycle {
     }
 
     pub fn recover_open_tokens(&self) -> Result<Vec<String>, LifecycleError> {
+        // Eager Interrupted before durable I/O prevents Drop from racing a still-Open
+        // token. Durable interrupt failure is returned to the caller; in-process
+        // re-prepare is fenced by the Interrupted call_id unless durable replay
+        // already exists. Cross-restart repeated effects are Task 0F.
         let mut states = self.inner.token_states.lock();
         let open: Vec<(String, String)> = states
             .iter()
             .filter_map(|(token, state)| match state {
                 TokenState::Open(claims) => Some((token.clone(), claims.call_id.clone())),
-                _ => None,
+                TokenState::Committed { .. } | TokenState::Interrupted { .. } => None,
             })
             .collect();
-        for (token, _) in &open {
-            states.insert(token.clone(), TokenState::Interrupted);
+        for (token, call_id) in &open {
+            states.insert(
+                token.clone(),
+                TokenState::Interrupted {
+                    call_id: call_id.clone(),
+                },
+            );
         }
         drop(states);
         let mut recovered = Vec::with_capacity(open.len());
@@ -518,10 +544,15 @@ impl CapabilityLifecycle {
         let mut states = self.inner.token_states.lock();
         let call_id = match states.get(token) {
             Some(TokenState::Open(claims)) => claims.call_id.clone(),
-            Some(TokenState::Interrupted | TokenState::Committed) => return Ok(()),
+            Some(TokenState::Interrupted { .. } | TokenState::Committed { .. }) => return Ok(()),
             None => return Err(LifecycleError::TokenUnknown),
         };
-        states.insert(token.to_string(), TokenState::Interrupted);
+        states.insert(
+            token.to_string(),
+            TokenState::Interrupted {
+                call_id: call_id.clone(),
+            },
+        );
         drop(states);
         self.inner.durable.interrupt(&call_id)
     }
@@ -558,4 +589,91 @@ fn json_size(value: &Value) -> usize {
     serde_json::to_vec(value)
         .map(|bytes| bytes.len())
         .unwrap_or(usize::MAX)
+}
+
+fn validate_canonical_result(result: &Value) -> Result<(), LifecycleError> {
+    let object = result
+        .as_object()
+        .ok_or_else(|| LifecycleError::InvalidMetadata("tool result must be a map".to_string()))?;
+    let ok = match object.get("ok") {
+        Some(Value::Bool(ok)) => *ok,
+        Some(_) => {
+            return Err(LifecycleError::InvalidMetadata(
+                "`ok` must be a boolean".to_string(),
+            ));
+        }
+        None => {
+            return Err(LifecycleError::InvalidMetadata(
+                "`ok` is required".to_string(),
+            ));
+        }
+    };
+    if ok {
+        match object.get("content") {
+            Some(Value::String(_)) => {}
+            _ => {
+                return Err(LifecycleError::InvalidMetadata(
+                    "success result requires string `content`".to_string(),
+                ));
+            }
+        }
+    } else {
+        let error = object.get("error").and_then(Value::as_object);
+        match error.and_then(|error| error.get("code")) {
+            Some(Value::String(code)) if !code.is_empty() => {}
+            _ => {
+                return Err(LifecycleError::InvalidMetadata(
+                    "failure result requires string `error.code`".to_string(),
+                ));
+            }
+        }
+        if let Some(error) = error
+            && let Some(message) = error.get("message")
+            && !message.is_string()
+        {
+            return Err(LifecycleError::InvalidMetadata(
+                "`error.message` must be a string".to_string(),
+            ));
+        }
+        if let Some(content) = object.get("content")
+            && !content.is_string()
+        {
+            return Err(LifecycleError::InvalidMetadata(
+                "failure `content` must be a string".to_string(),
+            ));
+        }
+    }
+    validate_optional_result_fields(object)
+}
+
+fn validate_optional_result_fields(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), LifecycleError> {
+    if let Some(truncated) = object.get("truncated")
+        && !truncated.is_boolean()
+    {
+        return Err(LifecycleError::InvalidMetadata(
+            "`truncated` must be a boolean".to_string(),
+        ));
+    }
+    if let Some(data) = object.get("data")
+        && !data.is_object()
+    {
+        return Err(LifecycleError::InvalidMetadata(
+            "`data` must be a map".to_string(),
+        ));
+    }
+    if let Some(artifacts) = object.get("artifacts") {
+        let Some(items) = artifacts.as_array() else {
+            return Err(LifecycleError::InvalidMetadata(
+                "`artifacts` must be an array of strings".to_string(),
+            ));
+        };
+        if items.iter().any(|item| !item.is_string()) {
+            return Err(LifecycleError::InvalidMetadata(
+                "`artifacts` must be an array of strings".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
