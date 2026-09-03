@@ -168,6 +168,7 @@ pub enum LifecycleError {
     Interrupted,
     RegistryMismatch,
     InvalidMetadata(String),
+    UnresolvedCall,
 }
 
 impl LifecycleError {
@@ -189,6 +190,7 @@ impl LifecycleError {
             Self::Interrupted => "interrupted",
             Self::RegistryMismatch => "registry_mismatch",
             Self::InvalidMetadata(_) => "invalid_metadata",
+            Self::UnresolvedCall => "unresolved_call",
         }
     }
 }

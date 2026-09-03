@@ -597,6 +597,23 @@ fn prepare_rejects_registry_mismatch_and_call_limit() {
 }
 
 #[test]
+fn prepare_rejects_second_token_for_unresolved_call() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    lifecycle
+        .prepare(&owner(), metadata("call-1", "fixture_only_tool"))
+        .expect("first prepare");
+    let error = lifecycle
+        .prepare(&owner(), metadata("call-1", "fixture_only_tool"))
+        .expect_err("same-run retry must not issue a second token");
+    assert_eq!(error, LifecycleError::UnresolvedCall);
+    assert_eq!(error.code(), "unresolved_call");
+    assert_eq!(log.snapshot(), ["started", "token"]);
+    assert_eq!(durable.started_records().len(), 1);
+}
+
+#[test]
 fn commit_validates_ownership_single_close_and_bounds() {
     let log = SequenceLog::new();
     let durable = MemoryDurable::new(Arc::clone(&log));
@@ -662,6 +679,138 @@ fn recover_open_tokens_interrupts_without_reuse() {
 }
 
 #[test]
+fn authorize_returns_bounded_immutable_claims_for_open_token() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let token = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-1", "fixture_only_tool"))
+            .expect("prepare"),
+    );
+    let claims = lifecycle
+        .authorize(&owner(), &token, CapabilityRisk::Read)
+        .expect("open token must authorize");
+    assert_eq!(claims.owner, owner());
+    assert_eq!(claims.call_id, "call-1");
+    assert_eq!(claims.tool_name, "fixture_only_tool");
+    assert_eq!(claims.argument_digest, "digest-a");
+    assert_eq!(claims.registry_identity, "registry-a");
+    assert_eq!(claims.risk_ceiling, CapabilityRisk::Read);
+    assert_eq!(claims.output_budget, 4096);
+    assert_eq!(claims.generation, 1);
+    assert_eq!(claims.deadline_ms, 10_000);
+    assert_eq!(claims.workspace.as_os_str(), "/tmp/workspace-a");
+    let mut mutated = claims.clone();
+    mutated.call_id = "forged".to_string();
+    let reread = lifecycle
+        .authorize(&owner(), &token, CapabilityRisk::Read)
+        .expect("claims stay immutable");
+    assert_eq!(reread.call_id, "call-1");
+}
+
+#[test]
+fn authorize_rejects_invalid_state_owner_deadline_cancel_generation_and_ceiling() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let cancel = FlagCancel::new();
+    let clock = ScriptedClock::new(1_000);
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner())
+        .registry_identity("registry-a")
+        .workspace("/tmp/workspace-a")
+        .limits(LifecycleLimits {
+            max_tool_calls: 8,
+            max_output_bytes: 4096,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(10_000)
+        .clock(Arc::clone(&clock) as Arc<dyn LifecycleClock>)
+        .tokens(LoggingIssuer::new(Arc::clone(&log)) as Arc<dyn TokenIssuer>)
+        .durable(Arc::clone(&durable) as Arc<dyn DurableToolLifecycle>)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .cancellation(Arc::clone(&cancel) as Arc<dyn CancellationFlag>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+    let token = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-1", "fixture_only_tool"))
+            .expect("prepare"),
+    );
+    let other = CapabilityOwner::new("other-profile", "session-a", "run-a").expect("other");
+    assert_eq!(
+        lifecycle
+            .authorize(&other, &token, CapabilityRisk::Read)
+            .expect_err("foreign owner"),
+        LifecycleError::OwnerMismatch {
+            expected: "profile-a/session-a/run-a".to_string(),
+            actual: "other-profile/session-a/run-a".to_string(),
+        }
+    );
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), "forged-token", CapabilityRisk::Read)
+            .expect_err("unknown"),
+        LifecycleError::TokenUnknown
+    );
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &token, CapabilityRisk::Write)
+            .expect_err("ceiling"),
+        LifecycleError::ApprovalCeiling {
+            requested: CapabilityRisk::Write,
+            ceiling: CapabilityRisk::Read,
+        }
+    );
+    clock.set_now_ms(10_000);
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &token, CapabilityRisk::Read)
+            .expect_err("deadline"),
+        LifecycleError::DeadlineElapsed
+    );
+    clock.set_now_ms(1_000);
+    cancel.cancel();
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &token, CapabilityRisk::Read)
+            .expect_err("cancelled"),
+        LifecycleError::Cancelled
+    );
+
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let committed = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-2", "fixture_only_tool"))
+            .expect("prepare"),
+    );
+    lifecycle
+        .commit(&owner(), &committed, json!({"ok": true, "content": "done"}))
+        .expect("commit");
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &committed, CapabilityRisk::Read)
+            .expect_err("committed"),
+        LifecycleError::DuplicateClose
+    );
+    let interrupted = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-3", "fixture_only_tool"))
+            .expect("prepare"),
+    );
+    lifecycle.recover_open_tokens().expect("recover");
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &interrupted, CapabilityRisk::Read)
+            .expect_err("interrupted"),
+        LifecycleError::Interrupted
+    );
+}
+
+#[test]
 fn panic_cleanup_interrupts_open_lease() {
     let log = SequenceLog::new();
     let durable = MemoryDurable::new(Arc::clone(&log));
@@ -722,4 +871,172 @@ fn host_prepare_and_commit_treat_tool_names_as_opaque() {
     assert_eq!(kind, &VmValue::string("committed"));
     assert_eq!(log.snapshot(), ["started", "token", "result"]);
     assert_eq!(durable.started_records()[0].tool_name, "fixture_only_tool");
+}
+
+#[test]
+fn host_prepare_without_commit_interrupts_on_drop() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(lifecycle)),
+        capability_owner: Some(owner()),
+        ..AgentHostBridges::default()
+    };
+    let source = r#"
+        pub fn run(input: map) -> map {
+            agent_runtime::tool_prepare({
+                run_id: "run-a",
+                call_id: "call-1",
+                name: "fixture_only_tool",
+                argument_digest: "digest-a",
+                registry_identity: "registry-a",
+                risk_class: "read",
+                summary: "read fixture",
+            })
+        }
+    "#;
+    let result = AgentRunner::from_source(source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    let VmValue::Map(fields) = result else {
+        panic!("expected map envelope, got {result:?}");
+    };
+    let kind = fields.get(&VmValue::string("kind")).expect("kind");
+    assert_eq!(kind, &VmValue::string("execute"));
+    assert_eq!(durable.interrupted(), ["call-1"]);
+    assert_eq!(log.snapshot(), ["started", "token", "interrupted"]);
+}
+
+#[test]
+fn host_commit_disarms_lease_so_drop_does_not_interrupt() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(lifecycle)),
+        capability_owner: Some(owner()),
+        ..AgentHostBridges::default()
+    };
+    let source = r#"
+        pub fn run(input: map) -> map {
+            let prepared: map = agent_runtime::tool_prepare({
+                run_id: "run-a",
+                call_id: "call-1",
+                name: "fixture_only_tool",
+                argument_digest: "digest-a",
+                registry_identity: "registry-a",
+                risk_class: "read",
+                summary: "read fixture",
+            });
+            agent_runtime::tool_commit(prepared.execution_token, {
+                ok: true,
+                content: "from-rss",
+            })
+        }
+    "#;
+    AgentRunner::from_source(source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    assert!(durable.interrupted().is_empty());
+    assert_eq!(log.snapshot(), ["started", "token", "result"]);
+}
+
+#[test]
+fn host_same_run_retry_does_not_issue_second_token() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(lifecycle)),
+        capability_owner: Some(owner()),
+        ..AgentHostBridges::default()
+    };
+    let source = r#"
+        pub fn run(input: map) -> map {
+            let first: map = agent_runtime::tool_prepare({
+                run_id: "run-a",
+                call_id: "call-1",
+                name: "fixture_only_tool",
+                argument_digest: "digest-a",
+                registry_identity: "registry-a",
+                risk_class: "read",
+                summary: "read fixture",
+            });
+            let second: map = agent_runtime::tool_prepare({
+                run_id: "run-a",
+                call_id: "call-1",
+                name: "fixture_only_tool",
+                argument_digest: "digest-a",
+                registry_identity: "registry-a",
+                risk_class: "read",
+                summary: "read fixture",
+            });
+            { first: first, second: second }
+        }
+    "#;
+    let result = AgentRunner::from_source(source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    let VmValue::Map(fields) = result else {
+        panic!("expected map envelope, got {result:?}");
+    };
+    let second = fields.get(&VmValue::string("second")).expect("second");
+    let VmValue::Map(second) = second else {
+        panic!("expected second map, got {second:?}");
+    };
+    let ok = second.get(&VmValue::string("ok")).expect("ok");
+    assert_eq!(ok, &VmValue::Bool(false));
+    let error = second.get(&VmValue::string("error")).expect("error");
+    let VmValue::Map(error) = error else {
+        panic!("expected error map, got {error:?}");
+    };
+    assert_eq!(
+        error.get(&VmValue::string("code")).expect("code"),
+        &VmValue::string("unresolved_call")
+    );
+    assert_eq!(log.snapshot(), ["started", "token", "interrupted"]);
+    assert_eq!(durable.interrupted(), ["call-1"]);
+}
+
+#[test]
+fn host_panic_after_prepare_interrupts_open_token() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(lifecycle)),
+        capability_owner: Some(owner()),
+        ..AgentHostBridges::default()
+    };
+    let source = r#"
+        pub fn run(input: map) -> map {
+            let prepared: map = agent_runtime::tool_prepare({
+                run_id: "run-a",
+                call_id: "call-1",
+                name: "fixture_only_tool",
+                argument_digest: "digest-a",
+                registry_identity: "registry-a",
+                risk_class: "read",
+                summary: "read fixture",
+            });
+            assert(false);
+            prepared
+        }
+    "#;
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        AgentRunner::from_source(source, AgentConfig::default())
+            .expect("compile")
+            .with_host(host)
+            .run_with_context(VmValue::map(vec![]))
+    }));
+    assert!(panicked.is_err() || panicked.as_ref().is_ok_and(|result| result.is_err()));
+    assert_eq!(durable.interrupted(), ["call-1"]);
+    assert_eq!(log.snapshot(), ["started", "token", "interrupted"]);
 }
