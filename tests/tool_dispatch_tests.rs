@@ -2638,6 +2638,9 @@ async fn blocked_put_then_cleanup_leaves_no_object_reservation_or_bytes() {
 
 #[tokio::test]
 async fn native_dispatch_init_panic_wakes_waiters_and_allows_retry() {
+    // Empty restore: the init guard returns the slot to Empty, waiters wake,
+    // and a later dispatch can initialize Ready. Closed-vs-panic is covered by
+    // `native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancels_once`.
     let fixture = Fixture::new();
     fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
     let (_state, service) = admit_dispatch_service(&fixture).await;

@@ -715,6 +715,22 @@ fn telegram_test_artifacts_land_under_an_explicit_root() {
             .starts_with("layout-"),
         "the label must prefix the unique file name"
     );
+    let workspace = TelegramWorkspaceGuard::create_in(&base);
+    let workspace_path = workspace.path().to_path_buf();
+    assert!(
+        workspace_path.starts_with(&base),
+        "the workspace must live under the explicit root, got {workspace_path:?}"
+    );
+    assert_eq!(
+        workspace_path.parent(),
+        Some(base.join("workspaces").as_path()),
+        "unique workspaces must stay isolated under workspaces/"
+    );
+    workspace.cleanup();
+    assert!(
+        !workspace_path.exists(),
+        "explicit workspace cleanup must remove the unique directory"
+    );
     std::fs::remove_dir_all(&base).expect("temporary root should be removed");
 }
 
@@ -768,35 +784,92 @@ fn last_poll_offset(state: &FixtureState) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
-fn telegram_workspace() -> std::path::PathBuf {
-    let dir = telegram_test_root()
-        .join("workspaces")
-        .join(Uuid::new_v4().to_string());
-    std::fs::create_dir_all(&dir).expect("telegram test workspace should be created");
-    dir
+/// Unique per-call workspace for Telegram adapter tests. Exclusive artifact
+/// flocks are keyed by `RunLimits.workspace_root`; sharing cwd would collide
+/// an in-process restart with a parked phase-1 worker.
+struct TelegramWorkspaceGuard {
+    path: std::path::PathBuf,
+    cleaned: bool,
+}
+
+impl TelegramWorkspaceGuard {
+    fn create_in(root: &std::path::Path) -> Self {
+        let path = root.join("workspaces").join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&path).expect("telegram test workspace should be created");
+        Self {
+            path,
+            cleaned: false,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn cleanup(mut self) {
+        std::fs::remove_dir_all(&self.path).unwrap_or_else(|error| {
+            panic!(
+                "telegram test workspace should be removed ({}): {error}",
+                self.path.display()
+            )
+        });
+        self.cleaned = true;
+    }
+}
+
+impl Drop for TelegramWorkspaceGuard {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Owns `AgentGatewayState` for the full adapter-test lifetime and the unique
+/// workspace that isolates artifact flocks. Call [`Self::cleanup`] after the
+/// adapter shuts down so removal errors surface; `Drop` is best-effort only.
+struct TelegramTestGateway {
+    state: AgentGatewayState,
+    workspace: TelegramWorkspaceGuard,
+}
+
+impl TelegramTestGateway {
+    fn workspace(&self) -> &std::path::Path {
+        self.workspace.path()
+    }
+
+    fn cleanup(self) {
+        let TelegramTestGateway { state, workspace } = self;
+        drop(state);
+        workspace.cleanup();
+    }
+}
+
+impl std::ops::Deref for TelegramTestGateway {
+    type Target = AgentGatewayState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
 }
 
 fn test_state(
     source: &str,
     db_path: &std::path::Path,
     overrides: impl FnOnce(AgentGatewayConfig) -> AgentGatewayConfig,
-) -> AgentGatewayState {
+) -> TelegramTestGateway {
     let config = overrides(AgentGatewayConfig::default());
     let state = AgentGatewayState::with_agent_source_and_sqlite(config, source, db_path)
         .expect("SQLite state should open");
-    // Exclusive artifact flocks are keyed by RunLimits.workspace_root.
-    // Default limits share cwd, so an in-process restart collides with a
-    // parked phase-1 worker. Unique workspaces restore the two-process
-    // crash semantics this suite simulates.
-    let workspace = telegram_workspace();
+    let workspace = TelegramWorkspaceGuard::create_in(&telegram_test_root());
     state
         .service()
         .set_run_limits(
-            RunLimits::new(64, 128, 1024 * 1024, &workspace)
+            RunLimits::new(64, 128, 1024 * 1024, workspace.path())
                 .expect("telegram test workspace should validate"),
         )
         .expect("telegram test run limits should apply");
-    state
+    TelegramTestGateway { state, workspace }
 }
 
 async fn spawn_adapter(state: AgentGatewayState, config: TelegramConfig) -> TelegramAdapter {
@@ -854,6 +927,7 @@ async fn adapter_denies_everything_by_default_and_advances_the_offset() {
     })
     .await;
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -893,6 +967,7 @@ async fn adapter_maps_dm_group_and_topic_to_stable_sessions() {
         assert_eq!(row[5], json!(thread_id), "thread id for {session_id}");
     }
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -924,6 +999,7 @@ async fn adapter_deduplicates_duplicate_updates_and_messages() {
         "one run must render one terminal line: {sends:?}"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -966,6 +1042,7 @@ async fn adapter_commands_new_status_compact_respond_explicitly() {
         "/compact must not advertise itself as done: {compact}"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1020,6 +1097,7 @@ async fn adapter_renders_delta_edits_and_status_lines_from_agent_events() {
         );
     }
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1079,6 +1157,7 @@ async fn adapter_status_sends_never_rewrite_the_delta_edit_target() {
         "the status lines must still be delivered as separate sends: {sends:?}"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1123,6 +1202,7 @@ async fn adapter_chunks_oversized_output_at_4096_utf16() {
         "the delta must be delivered losslessly across chunks"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1144,7 +1224,7 @@ async fn adapter_persists_offset_and_cursor_across_restart_without_duplicates() 
     })
     .await;
     adapter.shutdown().await;
-    drop(gateway);
+    gateway.cleanup();
     let sends_after_phase1 = state.sent_texts().len();
 
     // Phase 2: a fresh gateway on the same durable state. The poller must
@@ -1164,6 +1244,7 @@ async fn adapter_persists_offset_and_cursor_across_restart_without_duplicates() 
         state.sent_texts()
     );
     adapter2.shutdown().await;
+    restored.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1300,6 +1381,7 @@ async fn adapter_resumes_undelivered_events_after_restart() {
     // renderer is blocked before its first send, so the cursor never
     // advances and the terminal is genuinely undelivered at shutdown.
     let gateway = test_state(ECHO_SOURCE, &db, |config| config);
+    let workspace = gateway.workspace().to_path_buf();
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
         // The blocked request is recorded on arrival, so this is the
@@ -1327,12 +1409,17 @@ async fn adapter_resumes_undelivered_events_after_restart() {
     })
     .await;
     adapter.shutdown().await;
-    drop(gateway);
+    gateway.cleanup();
+    assert!(
+        !workspace.exists(),
+        "explicit cleanup must remove the unique workspace"
+    );
 
     // Phase 2: the same durable state resumes. The undelivered terminal is
     // rendered by the restart catch-up (cursor < retained high-water), and
     // the session gate is released once the resumed renderer ends.
     let restored = test_state(ECHO_SOURCE, &db, |config| config);
+    let restored_workspace = restored.workspace().to_path_buf();
     let adapter2 = spawn_adapter(restored.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
         state.sent_texts().iter().any(|text| text == "[done]")
@@ -1397,6 +1484,11 @@ async fn adapter_resumes_undelivered_events_after_restart() {
         "the gate must be released before the new message arrives: {sends:?}"
     );
     adapter2.shutdown().await;
+    restored.cleanup();
+    assert!(
+        !restored_workspace.exists(),
+        "explicit cleanup must remove the resumed unique workspace"
+    );
     drop(release);
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
@@ -1417,7 +1509,7 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
     })
     .await;
     adapter.shutdown().await;
-    drop(gateway);
+    gateway.cleanup();
 
     // Phase 2: the same durable state restarts. The recovered (terminal)
     // run's catch-up renderer must end as soon as it renders the terminal
@@ -1480,6 +1572,7 @@ async fn adapter_resume_releases_the_gate_so_new_messages_are_admitted() {
         "the resumed follow-up run must not collide on the parked worker's artifact flock or the session gate: {sends:?}"
     );
     adapter2.shutdown().await;
+    restored.cleanup();
     let _ = release_tx.send(());
     holding.join().expect("holding fixture");
     std::fs::remove_file(&db).expect("temporary db should be removed");
@@ -1628,6 +1721,7 @@ async fn adapter_new_cancels_and_waits_before_resetting_the_session() {
         "the post-reset run must complete exactly once: {sends:?}"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1831,6 +1925,7 @@ async fn adapter_new_late_old_renderer_drop_keeps_the_new_gate() {
         "no further rejection after the gate release: {sends:?}"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -1929,6 +2024,7 @@ async fn adapter_new_epoch_bump_mid_send_stops_the_old_renderer() {
         "only the post-reset run may complete: {sends:?}"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2027,6 +2123,7 @@ async fn adapter_new_wait_timeout_keeps_the_session_and_run() {
         "the run must survive a failed reset"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2085,6 +2182,7 @@ async fn adapter_drops_pending_updates_on_first_boot_by_default() {
     })
     .await;
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2106,6 +2204,7 @@ async fn adapter_replays_pending_updates_when_drop_is_disabled() {
     })
     .await;
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2180,6 +2279,7 @@ async fn adapter_drop_pending_drain_retries_then_persists_before_processing() {
         "only the post-drain run completes: {sends:?}"
     );
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2258,6 +2358,7 @@ async fn adapter_drop_pending_drain_failure_disables_polling_without_zero_offset
     );
     assert_eq!(adapter2.processed_updates(), 0);
     adapter2.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2297,6 +2398,7 @@ async fn adapter_stops_polling_after_bounded_unauthorized_failures() {
     );
     assert_eq!(adapter.processed_updates(), 0);
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2344,6 +2446,7 @@ async fn adapter_stop_command_cancels_the_active_run() {
     })
     .await;
     adapter.shutdown().await;
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2363,6 +2466,7 @@ async fn adapter_shutdown_is_bounded() {
         started.elapsed() < std::time::Duration::from_secs(10),
         "shutdown must be bounded"
     );
+    gateway.cleanup();
     std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
@@ -2596,6 +2700,7 @@ async fn adapter_logs_never_contain_the_bot_token() {
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     adapter.shutdown().await;
+    gateway.cleanup();
     let captured = messages.lock().expect("messages lock");
     assert!(
         !captured.is_empty(),

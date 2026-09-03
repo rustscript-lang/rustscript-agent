@@ -4,7 +4,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1789,13 +1789,17 @@ async fn unsafe_pending_request_fails_closed_without_inner() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn native_dispatch_init_panic_releases_occupancy_so_redrive_can_complete() {
+async fn native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancels_once() {
+    // Empty restore after init panic is covered by
+    // `native_dispatch_init_panic_wakes_waiters_and_allows_retry`. This test
+    // pins the stop+close-before-panic contract: the guard must not overwrite
+    // Closed, occupancy must unwind, and redrive commits exactly one cancel.
     let provider = ScriptedProvider::new();
     provider.push_ok(text_response("after-init-panic"));
     let state = loop_service(AgentGatewayConfig::default(), &provider);
     let service = state.service();
     let parent = PathBuf::from(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-final-init-panic-fix-6c6bff52",
+        "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-final-test-hygiene-fix-09acaf18",
     )
     .join(format!(
         "init-panic-{}-{}",
@@ -1832,15 +1836,12 @@ async fn native_dispatch_init_panic_releases_occupancy_so_redrive_can_complete()
     });
     entered.wait();
     assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
+    service.cleanup_session_native_dispatch(&admitted.session_id);
+    assert!(
+        service.native_dispatch_closed(&admitted.run_id),
+        "stop/cleanup must sticky-close before the init panic"
+    );
 
-    let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
-    let waiter = {
-        let service = service.clone();
-        let run_id = admitted.run_id.clone();
-        thread::spawn(move || {
-            let _ = waiter_tx.send(service.dispatch_tools(&run_id, &[]));
-        })
-    };
     panic_gate.wait();
     assert!(
         worker
@@ -1849,11 +1850,11 @@ async fn native_dispatch_init_panic_releases_occupancy_so_redrive_can_complete()
             .is_panic(),
         "run_worker must propagate the injected init panic"
     );
-    waiter_rx
-        .recv_timeout(Duration::from_secs(8))
-        .expect("concurrent waiter must complete after init panic recovery")
-        .expect("waiter dispatch after recovered init");
-    waiter.join().expect("waiter join");
+    assert!(
+        service.native_dispatch_closed(&admitted.run_id),
+        "init panic guard must not overwrite Closed"
+    );
+    assert!(!service.native_dispatch_retained(&admitted.run_id));
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     assert!(
         terminal_events(&service, &admitted.run_id).is_empty(),
@@ -1877,5 +1878,5 @@ async fn native_dispatch_init_panic_releases_occupancy_so_redrive_can_complete()
     assert_eq!(provider.call_count(), 0);
     drop(service);
     drop(state);
-    let _ = fs::remove_dir_all(&parent);
+    fs::remove_dir_all(&parent).expect("isolated init-panic workspace should be removed");
 }
