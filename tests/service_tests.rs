@@ -1807,6 +1807,378 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
 }
 
 #[tokio::test]
+async fn production_tool_lifecycle_replays_one_canonical_result_after_restart() {
+    let path = temporary_db_path();
+    let source = r#"
+        pub fn run(context: map) -> map {
+            let metadata: map = context["metadata"];
+            let prepared: map = agent_runtime::tool_prepare({
+                run_id: context["run_id"],
+                call_id: "call-production",
+                name: "opaque_tool",
+                argument_digest: "digest-production",
+                registry_identity: metadata["registry_identity"],
+                risk_class: "read",
+                summary: "opaque capability",
+            });
+            if prepared["kind"] == "replay" => {
+                let replay_result: map = prepared["result"];
+                {
+                    kind: "run.completed",
+                    answer: replay_result["content"]
+                }
+            } else => {
+                let execution_token: string = prepared["execution_token"];
+                let committed: map = agent_runtime::tool_commit(
+                    execution_token,
+                    {
+                        ok: true,
+                        content: "canonical-production-result",
+                        data: { value: 7 }
+                    }
+                );
+                let committed_result: map = committed["result"];
+                {
+                    kind: "run.completed",
+                    answer: committed_result["content"]
+                }
+            }
+        }
+    "#;
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        source,
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-production".to_string(),
+        name: "opaque_tool".to_string(),
+        arguments: json!({}),
+    };
+    service
+        .commit_provider_step(
+            &admitted.run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "tool_call".to_string(),
+                tool_call_id: Some(call.id.clone()),
+                name: Some(call.name.clone()),
+                arguments_json: Some("{}".to_string()),
+                ..LlmContentBlock::default()
+            }],
+            None,
+            Some("tool_calls"),
+            None,
+            None,
+            None,
+        )
+        .expect("assistant tool-call parent must be durable first");
+    service.inject_crash_after_tool_commit();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let first_events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        first_events
+            .iter()
+            .filter(|event| event["event"] == "tool.completed")
+            .count(),
+        1,
+        "the first attempt must durably record one completion event"
+    );
+    service.evict_run_handle(&admitted.run_id);
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "tool.completed")
+            .count(),
+        1,
+        "restart replay must not append a second completion event"
+    );
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "run.completed")
+        .unwrap_or_else(|| panic!("restart should complete the replayed run: {events:?}"));
+    assert_eq!(
+        completed["data"]["output"]["text"], "canonical-production-result",
+        "restart must return the persisted canonical ToolResult"
+    );
+    let result_messages: Vec<Value> = service
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .filter(|message| message["tool_call_id"] == "call-production")
+        .collect();
+    assert_eq!(
+        result_messages.len(),
+        1,
+        "one canonical result message is durable"
+    );
+    assert_eq!(result_messages[0]["content"][0]["type"], "tool_result");
+    assert_eq!(
+        result_messages[0]["content"][0]["result"],
+        json!({"value": 7})
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn production_tool_failure_uses_failed_event_and_replays_once() {
+    let path = temporary_db_path();
+    let source = r#"
+        pub fn run(context: map) -> map {
+            let metadata: map = context["metadata"];
+            let prepared: map = agent_runtime::tool_prepare({
+                run_id: context["run_id"],
+                call_id: "call-production-failure",
+                name: "opaque_tool",
+                argument_digest: "digest-production-failure",
+                registry_identity: metadata["registry_identity"],
+                risk_class: "read",
+                summary: "opaque capability",
+            });
+            if prepared["kind"] == "replay" => {
+                let replay_result: map = prepared["result"];
+                let replay_error: map = replay_result["error"];
+                {
+                    kind: "run.completed",
+                    answer: replay_error["code"]
+                }
+            } else => {
+                let execution_token: string = prepared["execution_token"];
+                let committed: map = agent_runtime::tool_commit(
+                    execution_token,
+                    {
+                        ok: false,
+                        error: {
+                            code: "effect_denied",
+                            message: "capability denied"
+                        }
+                    }
+                );
+                let committed_result: map = committed["result"];
+                let committed_error: map = committed_result["error"];
+                {
+                    kind: "run.completed",
+                    answer: committed_error["code"]
+                }
+            }
+        }
+    "#;
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        source,
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    service
+        .commit_provider_step(
+            &admitted.run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "tool_call".to_string(),
+                tool_call_id: Some("call-production-failure".to_string()),
+                name: Some("opaque_tool".to_string()),
+                arguments_json: Some("{}".to_string()),
+                ..LlmContentBlock::default()
+            }],
+            None,
+            Some("tool_calls"),
+            None,
+            None,
+            None,
+        )
+        .expect("assistant tool-call parent must be durable first");
+    service.inject_crash_after_tool_commit();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let first_events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&first_events, "tool.completed"), 0);
+    assert_eq!(event_type_count(&first_events, "tool.failed"), 1);
+    let failure_event = first_events
+        .iter()
+        .find(|event| event["event"] == "tool.failed")
+        .expect("failure event");
+    assert_eq!(failure_event["data"]["error_code"], "effect_denied");
+    assert_eq!(failure_event["data"]["error_message"], "capability denied");
+
+    service.evict_run_handle(&admitted.run_id);
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&events, "tool.completed"), 0);
+    assert_eq!(event_type_count(&events, "tool.failed"), 1);
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "run.completed")
+        .expect("replayed failure should complete the retry");
+    assert_eq!(completed["data"]["output"]["text"], "effect_denied");
+    let result_messages: Vec<Value> = service
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .filter(|message| message["tool_call_id"] == "call-production-failure")
+        .collect();
+    assert_eq!(result_messages.len(), 1);
+    assert_eq!(result_messages[0]["content"][0]["is_error"], true);
+    assert_eq!(
+        result_messages[0]["content"][0]["error"]["code"],
+        "effect_denied"
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn production_interrupt_persists_and_replays_canonical_failure() {
+    let path = temporary_db_path();
+    let source = r#"
+        pub fn run(context: map) -> map {
+            let metadata: map = context["metadata"];
+            let prepared: map = agent_runtime::tool_prepare({
+                run_id: context["run_id"],
+                call_id: "call-production-interrupt",
+                name: "opaque_tool",
+                argument_digest: "digest-production",
+                registry_identity: metadata["registry_identity"],
+                risk_class: "read",
+                summary: "opaque capability",
+            });
+            if prepared["kind"] == "replay" => {
+                let replay_result: map = prepared["result"];
+                let replay_error: map = replay_result["error"];
+                {
+                    kind: "run.completed",
+                    answer: replay_error["code"]
+                }
+            } else => {
+                {
+                    kind: "run.completed",
+                    answer: "execute"
+                }
+            }
+        }
+    "#;
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        source,
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    service
+        .commit_provider_step(
+            &admitted.run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "tool_call".to_string(),
+                tool_call_id: Some("call-production-interrupt".to_string()),
+                name: Some("opaque_tool".to_string()),
+                arguments_json: Some("{}".to_string()),
+                ..LlmContentBlock::default()
+            }],
+            None,
+            Some("tool_calls"),
+            None,
+            None,
+            None,
+        )
+        .expect("assistant tool-call parent must be durable first");
+    service.inject_crash_after_tool_commit();
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let first_events = service.run_events(&admitted.run_id);
+    assert!(
+        first_events
+            .iter()
+            .all(|event| event["event"] != "run.completed"),
+        "the interruption crash must leave the run retryable: {first_events:?}"
+    );
+    let interrupted_events: Vec<&Value> = first_events
+        .iter()
+        .filter(|event| event["event"] == "tool.failed")
+        .collect();
+    assert_eq!(interrupted_events.len(), 1);
+    assert_eq!(
+        interrupted_events[0]["data"]["error_code"],
+        "interrupted_effect"
+    );
+    assert_eq!(
+        interrupted_events[0]["data"]["error_message"],
+        "execution was interrupted"
+    );
+    service.evict_run_handle(&admitted.run_id);
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "tool.started")
+            .count(),
+        1,
+        "interrupted replay must not issue another effect token"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "tool.failed")
+            .count(),
+        1,
+        "interrupted replay must not append another failure"
+    );
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "run.completed")
+        .expect("replayed interruption should complete the retry");
+    assert_eq!(completed["data"]["output"]["text"], "interrupted_effect");
+    let result_messages: Vec<Value> = service
+        .session_messages(&admitted.session_id)
+        .into_iter()
+        .filter(|message| message["tool_call_id"] == "call-production-interrupt")
+        .collect();
+    assert_eq!(result_messages.len(), 1);
+    assert_eq!(result_messages[0]["content"][0]["is_error"], true);
+    assert_eq!(
+        result_messages[0]["content"][0]["error"]["code"],
+        "interrupted_effect"
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
 async fn persist_failure_rolls_back_tool_step_without_live_publish() {
     let path = temporary_db_path();
     let state = AgentGatewayState::with_agent_source_and_sqlite(

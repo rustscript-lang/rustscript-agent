@@ -624,6 +624,7 @@ impl AgentRunner {
             metrics: self.host.metrics.clone(),
             lifecycle: self.host.lifecycle.clone(),
             capability_owner: self.host.capability_owner.clone(),
+            leases: Default::default(),
         });
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)

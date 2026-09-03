@@ -13,7 +13,8 @@ use std::time::Instant;
 use rustscript_agent::capabilities::{
     ApprovalGate, CancellationFlag, CapabilityLifecycle, CapabilityOwner, CapabilityRisk,
     DurableStarted, DurableToolLifecycle, ExecutionLease, LifecycleClock, LifecycleError,
-    LifecycleLimits, PrepareMetadata, PrepareOutcome, TokenIssuer,
+    LifecycleLimits, MAX_CLAIM_FIELD_BYTES, NeverCancelled, PrepareMetadata, PrepareOutcome,
+    TokenIssuer,
 };
 use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner};
 use rustscript_vm::Value as VmValue;
@@ -286,6 +287,22 @@ fn metadata(call_id: &str, name: &str) -> PrepareMetadata {
 }
 
 fn engine(log: Arc<SequenceLog>, durable: Arc<MemoryDurable>) -> CapabilityLifecycle {
+    engine_with(
+        log,
+        durable,
+        ScriptedClock::new(1_000),
+        Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>,
+        Arc::new(AllowAll) as Arc<dyn ApprovalGate>,
+    )
+}
+
+fn engine_with(
+    log: Arc<SequenceLog>,
+    durable: Arc<MemoryDurable>,
+    clock: Arc<ScriptedClock>,
+    cancellation: Arc<dyn CancellationFlag>,
+    approval: Arc<dyn ApprovalGate>,
+) -> CapabilityLifecycle {
     CapabilityLifecycle::builder()
         .owner(owner())
         .registry_identity("registry-a")
@@ -296,10 +313,11 @@ fn engine(log: Arc<SequenceLog>, durable: Arc<MemoryDurable>) -> CapabilityLifec
             max_summary_bytes: 256,
         })
         .deadline_ms(10_000)
-        .clock(Arc::clone(&ScriptedClock::new(1_000)) as Arc<dyn LifecycleClock>)
+        .clock(clock as Arc<dyn LifecycleClock>)
         .tokens(LoggingIssuer::new(log) as Arc<dyn TokenIssuer>)
         .durable(durable as Arc<dyn DurableToolLifecycle>)
-        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .approval(approval)
+        .cancellation(cancellation)
         .generation(1)
         .build()
         .expect("lifecycle")
@@ -642,6 +660,203 @@ fn commit_validates_ownership_single_close_and_bounds() {
     assert_eq!(error, LifecycleError::TokenUnknown);
 }
 
+#[test]
+fn authorize_returns_bounded_claims_and_checks_risk_deadline_cancellation_and_owner() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let clock = ScriptedClock::new(1_000);
+    let cancellation = FlagCancel::new();
+    let lifecycle = engine_with(
+        Arc::clone(&log),
+        Arc::clone(&durable),
+        Arc::clone(&clock),
+        Arc::clone(&cancellation) as Arc<dyn CancellationFlag>,
+        Arc::new(CeilingGate {
+            ceiling: CapabilityRisk::Read,
+        }) as Arc<dyn ApprovalGate>,
+    );
+    let token = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-claims", "opaque_tool"))
+            .expect("prepare"),
+    );
+
+    let claims = lifecycle
+        .authorize(&owner(), &token, CapabilityRisk::Read)
+        .expect("read should be authorized");
+    assert_eq!(claims.owner(), &owner());
+    assert_eq!(claims.call_id(), "call-claims");
+    assert_eq!(claims.tool_name(), "opaque_tool");
+    assert_eq!(claims.argument_digest(), "digest-a");
+    assert_eq!(claims.registry_identity(), "registry-a");
+    assert_eq!(claims.risk_ceiling(), CapabilityRisk::Read);
+    assert_eq!(claims.output_budget(), 4096);
+    assert_eq!(claims.generation(), 1);
+    assert_eq!(claims.deadline_ms(), 10_000);
+    assert_eq!(claims.workspace().to_string_lossy(), "/tmp/workspace-a");
+
+    let error = lifecycle
+        .authorize(&owner(), &token, CapabilityRisk::Write)
+        .expect_err("write must exceed the frozen read ceiling");
+    assert_eq!(
+        error,
+        LifecycleError::ApprovalCeiling {
+            requested: CapabilityRisk::Write,
+            ceiling: CapabilityRisk::Read,
+        }
+    );
+
+    let other = CapabilityOwner::new("profile-b", "session-a", "run-a").expect("other");
+    assert_eq!(
+        lifecycle
+            .authorize(&other, &token, CapabilityRisk::Read)
+            .expect_err("foreign owner must not authorize the token"),
+        LifecycleError::OwnerMismatch {
+            expected: owner().key(),
+            actual: other.key(),
+        }
+    );
+
+    let mut oversized = metadata("call-bounded", "opaque_tool");
+    oversized.call_id = "x".repeat(MAX_CLAIM_FIELD_BYTES + 1);
+    assert_eq!(
+        lifecycle
+            .prepare(&owner(), oversized)
+            .expect_err("claim metadata must remain bounded"),
+        LifecycleError::InvalidMetadata("call_id exceeds the configured bound".to_string())
+    );
+
+    cancellation.cancel();
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &token, CapabilityRisk::Read)
+            .expect_err("cancelled token must not authorize effects"),
+        LifecycleError::Cancelled
+    );
+
+    let deadline_log = SequenceLog::new();
+    let deadline_durable = MemoryDurable::new(Arc::clone(&deadline_log));
+    let deadline_clock = ScriptedClock::new(1_000);
+    let deadline_lifecycle = engine_with(
+        Arc::clone(&deadline_log),
+        Arc::clone(&deadline_durable),
+        Arc::clone(&deadline_clock),
+        Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>,
+        Arc::new(AllowAll) as Arc<dyn ApprovalGate>,
+    );
+    let deadline_token = token_of(
+        deadline_lifecycle
+            .prepare(&owner(), metadata("call-deadline", "opaque_tool"))
+            .expect("deadline prepare"),
+    );
+    deadline_clock.set_now_ms(10_000);
+    assert_eq!(
+        deadline_lifecycle
+            .lookup_claims(&owner(), &deadline_token)
+            .expect_err("deadline must be checked at claims lookup"),
+        LifecycleError::DeadlineElapsed
+    );
+}
+
+#[test]
+fn duplicate_open_prepare_cannot_issue_a_second_token_for_one_call() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let first = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-duplicate", "opaque_tool"))
+            .expect("first prepare"),
+    );
+    let error = lifecycle
+        .prepare(&owner(), metadata("call-duplicate", "opaque_tool"))
+        .expect_err("an open call must not receive a second token");
+    assert_eq!(
+        error,
+        LifecycleError::InvalidMetadata(
+            "tool call already has an open execution token".to_string()
+        )
+    );
+    assert_eq!(first, "tok-1");
+    assert_eq!(durable.started_records().len(), 1);
+    assert_eq!(log.snapshot(), ["started", "token"]);
+}
+
+#[test]
+fn closing_a_lease_disarms_drop_recovery() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let token = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-close", "opaque_tool"))
+            .expect("prepare"),
+    );
+    let mut lease = lifecycle.lease(&token).expect("lease");
+    lease.close();
+    assert!(lease.is_closed());
+    drop(lease);
+    assert!(durable.interrupted().is_empty());
+    lifecycle
+        .commit(&owner(), &token, json!({"ok": true, "content": "done"}))
+        .expect("closed lease must not close the lifecycle token");
+}
+
+#[test]
+fn recover_open_tokens_invalidates_generation_and_prevents_reuse() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = engine(Arc::clone(&log), Arc::clone(&durable));
+    let token = token_of(
+        lifecycle
+            .prepare(&owner(), metadata("call-generation", "opaque_tool"))
+            .expect("prepare"),
+    );
+    let lease = lifecycle.lease(&token).expect("lease");
+    lifecycle.recover_open_tokens().expect("recovery");
+    drop(lease);
+    assert_eq!(durable.interrupted(), ["call-generation"]);
+    assert_eq!(
+        lifecycle
+            .authorize(&owner(), &token, CapabilityRisk::Read)
+            .expect_err("recovered token is not an open generation claim"),
+        LifecycleError::Interrupted
+    );
+}
+
+#[test]
+fn host_drop_recovers_retained_prepare_lease_without_second_effect() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let lifecycle = Arc::new(engine(Arc::clone(&log), Arc::clone(&durable)));
+    let host = AgentHostBridges {
+        lifecycle: Some(lifecycle),
+        capability_owner: Some(owner()),
+        ..AgentHostBridges::default()
+    };
+    let source = r#"
+        pub fn run(input: map) -> map {
+            agent_runtime::tool_prepare({
+                run_id: "run-a",
+                call_id: "call-host-drop",
+                name: "opaque_tool",
+                argument_digest: "digest-a",
+                registry_identity: "registry-a",
+                risk_class: "read",
+                summary: "read fixture",
+            })
+        }
+    "#;
+    let result = AgentRunner::from_source(source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    assert!(matches!(result, VmValue::Map(_)));
+    assert_eq!(durable.interrupted(), ["call-host-drop"]);
+    assert_eq!(durable.started_records().len(), 1);
+    assert_eq!(log.snapshot(), ["started", "token", "interrupted"]);
+}
 #[test]
 fn recover_open_tokens_interrupts_without_reuse() {
     let log = SequenceLog::new();

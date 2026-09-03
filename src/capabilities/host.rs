@@ -34,6 +34,9 @@ fn error_message(error: &LifecycleError) -> String {
         ),
         LifecycleError::DeadlineElapsed => "deadline elapsed".to_string(),
         LifecycleError::Cancelled => "run was cancelled".to_string(),
+        LifecycleError::StaleGeneration => {
+            "execution token belongs to an old generation".to_string()
+        }
         LifecycleError::DuplicateClose => "execution token is already closed".to_string(),
         LifecycleError::TokenUnknown => "execution token is unknown".to_string(),
         LifecycleError::LimitExceeded => "max_tool_calls exceeded".to_string(),

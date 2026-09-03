@@ -4,7 +4,7 @@
 //! through these host functions. Provider adapters stay in RSS; this module
 //! does not add an OpenAI-compatible inference path.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,8 +18,8 @@ use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
 use crate::capabilities::{
-    CapabilityLifecycle, CapabilityOwner, LifecycleError, parse_prepare_metadata, tool_commit,
-    tool_prepare,
+    CapabilityLifecycle, CapabilityOwner, ExecutionLease, LifecycleError, parse_prepare_metadata,
+    tool_commit, tool_prepare,
 };
 use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
@@ -141,6 +141,7 @@ pub struct AgentHostState {
     pub metrics: Option<Arc<Metrics>>,
     pub lifecycle: Option<Arc<CapabilityLifecycle>>,
     pub capability_owner: Option<CapabilityOwner>,
+    pub(crate) leases: Arc<Mutex<HashMap<String, ExecutionLease>>>,
 }
 
 impl AgentHostState {
@@ -173,7 +174,28 @@ impl AgentHostState {
             ));
         };
         match parse_prepare_metadata(metadata) {
-            Ok(metadata) => tool_prepare(lifecycle, owner, metadata),
+            Ok(metadata) => {
+                let prepared = tool_prepare(lifecycle, owner, metadata);
+                let Some(token) = prepared.get("execution_token").and_then(JsonValue::as_str)
+                else {
+                    return prepared;
+                };
+                match lifecycle.lease(token) {
+                    Ok(lease) => {
+                        let mut leases = self.leases.lock().expect("capability lease lock");
+                        if leases.contains_key(token) {
+                            return crate::capabilities::host::error_envelope(
+                                &LifecycleError::InvalidMetadata(
+                                    "execution token is already retained".to_string(),
+                                ),
+                            );
+                        }
+                        leases.insert(token.to_string(), lease);
+                        prepared
+                    }
+                    Err(error) => crate::capabilities::host::error_envelope(&error),
+                }
+            }
             Err(error) => crate::capabilities::host::error_envelope(&error),
         }
     }
@@ -189,7 +211,17 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        tool_commit(lifecycle, owner, token, result.clone())
+        let committed = tool_commit(lifecycle, owner, token, result.clone());
+        if committed.get("ok").and_then(JsonValue::as_bool) == Some(true)
+            && let Some(mut lease) = self
+                .leases
+                .lock()
+                .expect("capability lease lock")
+                .remove(token)
+        {
+            lease.close();
+        }
+        committed
     }
 
     fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {

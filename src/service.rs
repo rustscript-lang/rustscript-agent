@@ -304,6 +304,7 @@ impl NativeDispatchState {
             observer();
         }
         self.dispatcher.close();
+        let lifecycle_recovered = self.lifecycle.recover_open_tokens().is_ok();
         let quiesced = self.dispatcher.try_quiesce(grace);
         let owner = self.owner();
         let _ = self.table.cleanup_owner(&owner);
@@ -311,7 +312,9 @@ impl NativeDispatchState {
             .files
             .artifact_store_arc()
             .cleanup_owner(&ArtifactOwner::from(self.dispatcher.owner().clone()));
-        if !quiesced || self.table.owner_count(&owner) > 0 {
+        if !lifecycle_recovered {
+            CleanupOutcome::Failed
+        } else if !quiesced || self.table.owner_count(&owner) > 0 {
             CleanupOutcome::Timeout
         } else {
             CleanupOutcome::Clean
@@ -4222,34 +4225,52 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         call_id: &str,
         result: &serde_json::Value,
     ) -> Result<serde_json::Value, LifecycleError> {
+        let tool_result = canonical_tool_result(call_id, result).map_err(|error| match error {
+            LifecycleError::InvalidMetadata(message) => LifecycleError::ResultCommitFailed(message),
+            other => other,
+        })?;
+        let (event_type, status) = if tool_result.ok {
+            ("tool.completed", "completed")
+        } else {
+            ("tool.failed", "failed")
+        };
+        let mut event_data = json!({
+            "tool_call_id": call_id,
+            "status": status,
+            "ok": tool_result.ok,
+        });
+        if let Some(error) = &tool_result.error {
+            event_data["error_code"] = json!(error.code);
+            event_data["error_message"] = json!(error.message);
+        }
         self.events
-            .commit(
-                "tool.completed",
-                json!({
-                    "tool_call_id": call_id,
-                    "result": result,
-                }),
-            )
+            .commit_step(event_type, event_data, Some(&tool_result))
             .map_err(|error| match error {
                 EventCommitError::PersistFailed(message) => {
                     LifecycleError::ResultCommitFailed(message)
                 }
                 other => map_event_commit_error(other),
             })?;
-        Ok(result.clone())
+        serde_json::to_value(tool_result).map_err(|error| {
+            LifecycleError::ResultCommitFailed(format!(
+                "canonical tool result encode failed: {error}"
+            ))
+        })
     }
 
     fn interrupt(&self, call_id: &str) -> Result<(), LifecycleError> {
+        let tool_result = ToolResult::failure("interrupted_effect", "execution was interrupted");
         self.events
-            .commit(
+            .commit_step(
                 "tool.failed",
                 json!({
                     "tool_call_id": call_id,
-                    "error": {
-                        "code": "interrupted",
-                        "message": "execution was interrupted",
-                    }
+                    "status": "interrupted",
+                    "ok": false,
+                    "error_code": "interrupted_effect",
+                    "error_message": "execution was interrupted",
                 }),
+                Some(&tool_result),
             )
             .map_err(map_event_commit_error)
     }
@@ -4278,10 +4299,17 @@ struct ServiceEventCommitter {
 
 impl DurableEventCommitter for ServiceEventCommitter {
     fn is_terminal(&self) -> bool {
-        self.handle
-            .upgrade()
-            .map(|handle| handle.is_terminal())
-            .unwrap_or(true)
+        self.handle.upgrade().map_or_else(
+            || {
+                self.store
+                    .read()
+                    .runs
+                    .get(&self.run_id)
+                    .map(|run| run_is_terminal(&run.status))
+                    .unwrap_or(true)
+            },
+            |handle| handle.is_terminal(),
+        )
     }
 
     fn stop_requested(&self) -> bool {
@@ -4743,6 +4771,99 @@ fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValu
         truncated: truncated.then_some(true),
         ..LlmContentBlock::default()
     }])
+}
+
+fn canonical_tool_result(
+    tool_call_id: &str,
+    value: &JsonValue,
+) -> Result<ToolResult, LifecycleError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| LifecycleError::InvalidMetadata("tool result must be a map".to_string()))?;
+    let ok = object
+        .get("ok")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            LifecycleError::InvalidMetadata("tool result ok must be a boolean".to_string())
+        })?;
+    if !ok {
+        let error_object = object.get("error").and_then(JsonValue::as_object);
+        let code = error_object
+            .and_then(|error| error.get("code"))
+            .and_then(JsonValue::as_str)
+            .or_else(|| object.get("error_code").and_then(JsonValue::as_str))
+            .filter(|code| !code.is_empty())
+            .ok_or_else(|| {
+                LifecycleError::InvalidMetadata("failed tool result code is missing".to_string())
+            })?;
+        let message = error_object
+            .and_then(|error| error.get("message"))
+            .and_then(JsonValue::as_str)
+            .or_else(|| object.get("error_message").and_then(JsonValue::as_str))
+            .unwrap_or("tool failed");
+        return Ok(ToolResult::failure(code, message));
+    }
+
+    let content = match object.get("content") {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| {
+                LifecycleError::InvalidMetadata(
+                    "successful tool content must be a string".to_string(),
+                )
+            })?
+            .to_string(),
+        None => String::new(),
+    };
+    let data = object.get("data").cloned().unwrap_or(JsonValue::Null);
+    let mut result = ToolResult::success(content, data);
+    if let Some(value) = object.get("truncated") {
+        result.truncated = value.as_bool().ok_or_else(|| {
+            LifecycleError::InvalidMetadata("tool result truncated must be a boolean".to_string())
+        })?;
+    }
+    if let Some(value) = object.get("artifacts") {
+        let artifacts = value.as_array().ok_or_else(|| {
+            LifecycleError::InvalidMetadata("tool result artifacts must be an array".to_string())
+        })?;
+        result.artifacts = artifacts
+            .iter()
+            .map(|artifact| {
+                artifact.as_str().map(str::to_string).ok_or_else(|| {
+                    LifecycleError::InvalidMetadata(
+                        "tool result artifact ids must be strings".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    let encoded = tool_result_content_json(tool_call_id, &result);
+    let block = decode_message_blocks(&encoded)
+        .into_iter()
+        .find(|block| block.block_type == "tool_result")
+        .ok_or_else(|| {
+            LifecycleError::InvalidMetadata("canonical tool result encoding failed".to_string())
+        })?;
+    let mut canonical = ToolResult::success(
+        block.content.unwrap_or_default(),
+        block.result.unwrap_or(JsonValue::Null),
+    );
+    canonical.truncated = block.truncated.unwrap_or(false);
+    canonical.artifacts = match block.artifact {
+        Some(JsonValue::Object(artifact)) => artifact
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default(),
+        Some(JsonValue::String(id)) => vec![id],
+        Some(JsonValue::Array(artifacts)) => artifacts
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(canonical)
 }
 
 fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {

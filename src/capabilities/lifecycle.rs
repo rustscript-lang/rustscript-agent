@@ -56,6 +56,12 @@ pub trait CancellationFlag: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
 
+/// Maximum bytes retained for one opaque claim metadata field.
+pub const MAX_CLAIM_FIELD_BYTES: usize = 256;
+
+/// Maximum bytes retained for the workspace path in a claim snapshot.
+const MAX_CLAIM_WORKSPACE_BYTES: usize = 4096;
+
 /// Production clock: unix milliseconds plus monotonic Instant.
 #[derive(Debug, Default)]
 pub struct SystemClock;
@@ -199,6 +205,17 @@ impl CapabilityLifecycleBuilder {
         let workspace = self
             .workspace
             .ok_or_else(|| LifecycleError::InvalidMetadata("workspace is required".to_string()))?;
+        validate_bounded_field(
+            &registry_identity,
+            "registry identity",
+            MAX_CLAIM_FIELD_BYTES,
+            true,
+        )?;
+        if workspace.as_os_str().len() > MAX_CLAIM_WORKSPACE_BYTES {
+            return Err(LifecycleError::InvalidMetadata(
+                "workspace exceeds the configured bound".to_string(),
+            ));
+        }
         let limits = self.limits.ok_or_else(|| {
             LifecycleError::InvalidMetadata("lifecycle limits are required".to_string())
         })?;
@@ -297,6 +314,25 @@ impl CapabilityLifecycle {
                 actual: self.inner.owner.with_run(&metadata.run_id),
             });
         }
+        validate_bounded_field(&metadata.call_id, "call_id", MAX_CLAIM_FIELD_BYTES, true)?;
+        validate_bounded_field(
+            &metadata.tool_name,
+            "tool name",
+            MAX_CLAIM_FIELD_BYTES,
+            true,
+        )?;
+        validate_bounded_field(
+            &metadata.argument_digest,
+            "argument digest",
+            MAX_CLAIM_FIELD_BYTES,
+            true,
+        )?;
+        validate_bounded_field(
+            &metadata.registry_identity,
+            "registry identity",
+            MAX_CLAIM_FIELD_BYTES,
+            true,
+        )?;
         self.inner.durable.assert_active_run(&metadata.run_id)?;
         self.inner.durable.prepare_parent(
             &metadata.run_id,
@@ -310,6 +346,17 @@ impl CapabilityLifecycle {
         )? {
             return Ok(PrepareOutcome::Replay { result });
         }
+        if self
+            .inner
+            .token_states
+            .lock()
+            .values()
+            .any(|state| matches!(state, TokenState::Open(claims) if claims.call_id() == metadata.call_id))
+        {
+            return Err(LifecycleError::InvalidMetadata(
+                "tool call already has an open execution token".to_string(),
+            ));
+        }
         if self.inner.clock.now_ms() >= self.inner.deadline_ms {
             return Err(LifecycleError::DeadlineElapsed);
         }
@@ -318,11 +365,6 @@ impl CapabilityLifecycle {
         }
         if metadata.registry_identity != self.inner.registry_identity {
             return Err(LifecycleError::RegistryMismatch);
-        }
-        if metadata.call_id.is_empty() || metadata.tool_name.is_empty() {
-            return Err(LifecycleError::InvalidMetadata(
-                "call_id and tool name are required".to_string(),
-            ));
         }
         if metadata.summary.len() > self.inner.limits.max_summary_bytes {
             return Err(LifecycleError::InvalidMetadata(
@@ -356,7 +398,15 @@ impl CapabilityLifecycle {
             .now()
             .checked_add(std::time::Duration::from_millis(remaining_ms))
             .unwrap_or_else(|| self.inner.clock.now());
-        self.inner.token_states.lock().insert(
+        let mut states = self.inner.token_states.lock();
+        if states.contains_key(&execution_token) {
+            drop(states);
+            let _ = self.inner.durable.interrupt(&metadata.call_id);
+            return Err(LifecycleError::InvalidMetadata(
+                "token issuer returned a duplicate execution token".to_string(),
+            ));
+        }
+        states.insert(
             execution_token.clone(),
             TokenState::Open(Box::new(TokenClaims {
                 owner: self.inner.owner.clone(),
@@ -379,48 +429,99 @@ impl CapabilityLifecycle {
         })
     }
 
-    pub fn commit(
+    /// Look up the immutable claims for an open token.
+    ///
+    /// This is the common pre-effect gate: it validates the caller owner,
+    /// token state, lifecycle generation, deadline, and cancellation before
+    /// returning a cloned snapshot that cannot mutate token state.
+    pub fn lookup_claims(
         &self,
         owner: &CapabilityOwner,
         token: &str,
-        result: Value,
-    ) -> Result<CommitOutcome, LifecycleError> {
+    ) -> Result<TokenClaims, LifecycleError> {
         if owner != &self.inner.owner {
             return Err(LifecycleError::OwnerMismatch {
                 expected: self.inner.owner.key(),
                 actual: owner.key(),
             });
         }
-        let mut states = self.inner.token_states.lock();
-        let claims = match states.get(token) {
-            Some(TokenState::Open(claims)) => claims.clone(),
-            Some(TokenState::Committed) => return Err(LifecycleError::DuplicateClose),
-            Some(TokenState::Interrupted) => return Err(LifecycleError::Interrupted),
-            None => return Err(LifecycleError::TokenUnknown),
+        let claims = {
+            let states = self.inner.token_states.lock();
+            match states.get(token) {
+                Some(TokenState::Open(claims)) => claims.as_ref().clone(),
+                Some(TokenState::Committed) => return Err(LifecycleError::DuplicateClose),
+                Some(TokenState::Interrupted) => return Err(LifecycleError::Interrupted),
+                None => return Err(LifecycleError::TokenUnknown),
+            }
         };
-        if &claims.owner != owner {
+        if claims.owner() != owner {
             return Err(LifecycleError::OwnerMismatch {
-                expected: claims.owner.key(),
+                expected: claims.owner().key(),
                 actual: owner.key(),
             });
         }
-        if json_size(&result) > claims.output_budget {
-            return Err(LifecycleError::ResultTooLarge);
+        if claims.generation() != self.inner.generation.load(Ordering::SeqCst) {
+            return Err(LifecycleError::StaleGeneration);
         }
-        if self.inner.clock.now_ms() >= claims.deadline_ms {
+        if self.inner.clock.now_ms() >= claims.deadline_ms()
+            || self.inner.clock.now() >= claims.deadline()
+        {
             return Err(LifecycleError::DeadlineElapsed);
         }
         if self.inner.cancellation.is_cancelled() {
             return Err(LifecycleError::Cancelled);
         }
+        Ok(claims)
+    }
+
+    /// Authorize a requested capability risk against an open token's ceiling.
+    ///
+    /// Callers performing a later `cap::*` effect should use this method before
+    /// touching the effect. The returned claims are bounded and immutable.
+    pub fn authorize(
+        &self,
+        owner: &CapabilityOwner,
+        token: &str,
+        requested: CapabilityRisk,
+    ) -> Result<TokenClaims, LifecycleError> {
+        let claims = self.lookup_claims(owner, token)?;
+        if requested > claims.risk_ceiling() {
+            return Err(LifecycleError::ApprovalCeiling {
+                requested,
+                ceiling: claims.risk_ceiling(),
+            });
+        }
+        Ok(claims)
+    }
+
+    pub fn commit(
+        &self,
+        owner: &CapabilityOwner,
+        token: &str,
+        result: Value,
+    ) -> Result<CommitOutcome, LifecycleError> {
+        let claims = self.lookup_claims(owner, token)?;
+        if json_size(&result) > claims.output_budget() {
+            return Err(LifecycleError::ResultTooLarge);
+        }
+        let mut states = self.inner.token_states.lock();
+        match states.get(token) {
+            Some(TokenState::Open(_)) => {}
+            Some(TokenState::Committed) => return Err(LifecycleError::DuplicateClose),
+            Some(TokenState::Interrupted) => return Err(LifecycleError::Interrupted),
+            None => return Err(LifecycleError::TokenUnknown),
+        }
         states.insert(token.to_string(), TokenState::Committed);
         drop(states);
-        let committed = self.inner.durable.commit_result(&claims.call_id, &result)?;
+        let committed = self
+            .inner
+            .durable
+            .commit_result(claims.call_id(), &result)?;
         Ok(CommitOutcome {
             envelope: json!({
                 "ok": true,
                 "kind": "committed",
-                "call_id": claims.call_id,
+                "call_id": claims.call_id(),
                 "result": committed,
             }),
         })
@@ -444,7 +545,7 @@ impl CapabilityLifecycle {
         let open: Vec<(String, String)> = states
             .iter()
             .filter_map(|(token, state)| match state {
-                TokenState::Open(claims) => Some((token.clone(), claims.call_id.clone())),
+                TokenState::Open(claims) => Some((token.clone(), claims.call_id().to_string())),
                 _ => None,
             })
             .collect();
@@ -453,18 +554,30 @@ impl CapabilityLifecycle {
         }
         drop(states);
         let mut recovered = Vec::with_capacity(open.len());
+        let mut first_error = None;
         for (_, call_id) in open {
-            self.inner.durable.interrupt(&call_id)?;
-            recovered.push(call_id);
+            match self.inner.durable.interrupt(&call_id) {
+                Ok(()) => recovered.push(call_id),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
         }
-        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        if !recovered.is_empty() || first_error.is_some() {
+            self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(recovered)
     }
 
     fn interrupt_token(&self, token: &str) -> Result<(), LifecycleError> {
         let mut states = self.inner.token_states.lock();
         let call_id = match states.get(token) {
-            Some(TokenState::Open(claims)) => claims.call_id.clone(),
+            Some(TokenState::Open(claims)) => claims.call_id().to_string(),
             Some(TokenState::Interrupted | TokenState::Committed) => return Ok(()),
             None => return Err(LifecycleError::TokenUnknown),
         };
@@ -485,15 +598,48 @@ impl ExecutionLease {
     pub fn token(&self) -> &str {
         &self.token
     }
+
+    /// Disarm the drop recovery after the owning commit has closed the token.
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
 }
 
 impl Drop for ExecutionLease {
     fn drop(&mut self) {
         if !self.closed {
-            self.closed = true;
+            self.close();
             let _ = self.lifecycle.interrupt_token(&self.token);
         }
     }
+}
+
+fn validate_bounded_field(
+    value: &str,
+    name: &str,
+    max_bytes: usize,
+    required: bool,
+) -> Result<(), LifecycleError> {
+    if required && value.is_empty() {
+        return Err(LifecycleError::InvalidMetadata(format!(
+            "{name} must not be empty"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(LifecycleError::InvalidMetadata(format!(
+            "{name} is invalid"
+        )));
+    }
+    if value.len() > max_bytes {
+        return Err(LifecycleError::InvalidMetadata(format!(
+            "{name} exceeds the configured bound"
+        )));
+    }
+    Ok(())
 }
 
 fn json_size(value: &Value) -> usize {

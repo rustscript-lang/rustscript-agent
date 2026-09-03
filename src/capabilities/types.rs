@@ -159,6 +159,7 @@ pub enum LifecycleError {
     },
     DeadlineElapsed,
     Cancelled,
+    StaleGeneration,
     DuplicateClose,
     TokenUnknown,
     LimitExceeded,
@@ -180,6 +181,7 @@ impl LifecycleError {
             Self::ApprovalCeiling { .. } => "approval_ceiling",
             Self::DeadlineElapsed => "deadline_elapsed",
             Self::Cancelled => "cancelled",
+            Self::StaleGeneration => "stale_generation",
             Self::DuplicateClose => "duplicate_close",
             Self::TokenUnknown => "token_unknown",
             Self::LimitExceeded => "max_tool_calls",
@@ -194,17 +196,67 @@ impl LifecycleError {
 }
 
 /// Frozen claims bound to one unforgeable execution token.
+///
+/// Claims are returned as a cloned, read-only snapshot. The fields remain
+/// private so a caller cannot widen a token by mutating its risk, owner,
+/// deadline, generation, or output budget after authorization.
 #[derive(Clone, Debug)]
 pub struct TokenClaims {
-    pub owner: CapabilityOwner,
-    pub call_id: String,
-    pub tool_name: String,
-    pub argument_digest: String,
-    pub registry_identity: String,
-    pub risk_ceiling: CapabilityRisk,
-    pub output_budget: usize,
-    pub generation: u64,
-    pub deadline: Instant,
-    pub deadline_ms: u64,
-    pub workspace: PathBuf,
+    pub(crate) owner: CapabilityOwner,
+    pub(crate) call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) argument_digest: String,
+    pub(crate) registry_identity: String,
+    pub(crate) risk_ceiling: CapabilityRisk,
+    pub(crate) output_budget: usize,
+    pub(crate) generation: u64,
+    pub(crate) deadline: Instant,
+    pub(crate) deadline_ms: u64,
+    pub(crate) workspace: PathBuf,
+}
+
+impl TokenClaims {
+    pub fn owner(&self) -> &CapabilityOwner {
+        &self.owner
+    }
+
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    pub fn argument_digest(&self) -> &str {
+        &self.argument_digest
+    }
+
+    pub fn registry_identity(&self) -> &str {
+        &self.registry_identity
+    }
+
+    pub const fn risk_ceiling(&self) -> CapabilityRisk {
+        self.risk_ceiling
+    }
+
+    pub const fn output_budget(&self) -> usize {
+        self.output_budget
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub const fn deadline_ms(&self) -> u64 {
+        self.deadline_ms
+    }
+
+    pub fn workspace(&self) -> &PathBuf {
+        &self.workspace
+    }
 }
