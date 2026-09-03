@@ -2,7 +2,7 @@
 
 **Goal:** 将当前已通过 E2E 的 serial coding-agent engine 变成可直接配置真实模型、选择项目、安全运行并可长期恢复的 gateway/CLI agent。
 
-**Architecture:** 引入版本化 `config.yaml` 与独立的 `auth.yaml`。`config.yaml` 只保存 provider、model、OAuth 公共端点、workspace、agent policy 等非敏感配置；`auth.yaml` 只保存命名 credential 及 token 生命周期状态。Rust 层在 `rustscript-agent` 仓库内实现通用 OAuth、PKCE、token refresh、安全文件存储和 RSS host bridge；RustScript 层实现 OpenAI Codex 特有的 device-login 状态机。运行时通过 config 中的 credential 引用读取短期 access token，凭据绝不进入 SQLite run context、durable messages、events、metrics 或日志。
+**Architecture:** 所有 model-visible tools 的名称、描述、JSON Schema、验证、dispatch、算法和结果整形由 `rss/tools/*` 实现；Rust 只提供 workspace-confined filesystem/process、artifact、approval、deadline/cancellation 和 durable lifecycle 等通用 capabilities。随后引入版本化 `config.yaml` 与独立的 `auth.yaml`。`config.yaml` 只保存 provider、model、OAuth 公共端点、workspace、agent policy 等非敏感配置；`auth.yaml` 只保存命名 credential 及 token 生命周期状态。Rust 层在 `rustscript-agent` 仓库内实现通用 OAuth、PKCE、token refresh、安全文件存储和 RSS host bridge；RustScript 层实现 OpenAI Codex 特有的 device-login 状态机。运行时通过 config 中的 credential 引用读取短期 access token，凭据绝不进入 SQLite run context、durable messages、events、metrics 或日志。
 
 **Tech Stack:** Rust 2024、Tokio、Axum/Hyper/Rustls、Serde YAML、RustScript/pd-vm host API、OAuth 2.0 Authorization Code + PKCE、refresh-token grant、OpenAI Codex device authorization、SQLite durable agent state。
 
@@ -12,18 +12,66 @@
 
 本计划包含当前 agent 从“library/E2E 可运行”到“用户可配置并部署”的完整收尾路线：
 
-1. `config.yaml` / `auth.yaml` 双层配置。
-2. Rust 通用 OAuth library 与 RSS host functions。
-3. RSS Codex device login。
-4. 通用 browser OAuth flow，包含 PKCE、loopback callback、headless/manual fallback 与 refresh。
-5. 真实 provider runtime 接入，先闭合 OpenAI Codex。
-6. bundled coding agent 默认入口。
-7. 显式 workspace 选择与 session 绑定。
-8. write/process approval 执行链。
-9. 自动/手动 compaction。
-10. master 集成、部署与发布验收。
+1. 将现有 native model-facing tools 迁移为 RSS tools + Rust generic capabilities。
+2. `config.yaml` / `auth.yaml` 双层配置。
+3. Rust 通用 OAuth library 与 RSS host functions。
+4. RSS Codex device login。
+5. 通用 browser OAuth flow，包含 PKCE、loopback callback、headless/manual fallback 与 refresh。
+6. 真实 provider runtime 接入，先闭合 OpenAI Codex。
+7. bundled coding agent 默认入口。
+8. 显式 workspace 选择与 session 绑定。
+9. write/process approval 执行链。
+10. 自动/手动 compaction。
+11. master 集成、部署与发布验收。
 
 以下能力继续后置，不阻塞本计划完成：parallel tool calls、subagents、durable scheduler、多 gateway 共享同一 SQLite、OpenAI Responses/Anthropic 的全部 provider 覆盖。
+
+## 1A. RSS tool ownership and Rust capability boundary
+
+The approved design is specified in `docs/superpowers/specs/2026-09-03-rss-tools-rust-capabilities-design.md` and is a prerequisite for every later task in this plan.
+
+Target RSS layout:
+
+```text
+rss/tools/
+├── types.rss
+├── registry.rss
+├── validate.rss
+├── dispatch.rss
+├── read_file.rss
+├── search_files.rss
+├── write_file.rss
+├── patch.rss
+├── terminal.rss
+└── process.rss
+```
+
+RSS owns all provider-visible descriptors, schemas, validation, dispatch, tool-specific algorithms, error mapping and output formatting. `rss/agent/main.rss` calls `tools::dispatch` directly.
+
+Target Rust layout:
+
+```text
+src/capabilities/
+├── mod.rs
+├── types.rs
+├── filesystem.rs
+├── process.rs
+├── artifacts.rs
+├── lifecycle.rs
+└── host.rs
+```
+
+Rust owns only generic security/resource boundaries: frozen workspace capabilities, atomic file operations, process ownership, deadline/cancellation, output/artifact caps, approval ceilings and durable tool lifecycle. Rust treats the public tool name as opaque metadata. Production Rust code must contain no built-in public tool order, public descriptor/schema fixtures, `NativeToolExecutor`, or dispatch branches keyed by `read_file`, `search_files`, `write_file`, `patch`, `terminal` or `process`.
+
+The generic lifecycle contract is:
+
+```text
+agent_runtime::tool_prepare(metadata) -> execute token | durable replay
+cap::* (execution_token, ...) -> bounded native capability result
+agent_runtime::tool_commit(execution_token, result) -> committed envelope
+```
+
+`tool_prepare` commits durable started state before issuing a capability token. Every capability validates run/call ownership, risk ceiling, workspace, deadline and cancellation. RSS cannot mint, modify or reuse execution tokens. `tool_commit` durably closes the call. Open tokens are interrupted and their owned processes are cancelled during stop, deadline, source failure or recovery.
 
 ## 2. Configuration ownership
 
@@ -423,6 +471,68 @@ Tests run a long real coding loop across compaction and reopen, asserting no los
 
 ## 11. Task sequence and TDD gates
 
+The RSS-tool migration is the first implementation phase. Tasks 1–13 remain blocked until Tasks 0A–0F pass their gates.
+
+### Task 0A: Define RSS tool contracts and registry
+
+**Files:** create `rss/tools/types.rss`, `rss/tools/registry.rss`, `rss/tools/validate.rss`; add `tests/rss_tool_registry_tests.rs`.
+
+**RED:** fixture tests for exact descriptors, deterministic ordering/identity, duplicate names, schema bounds, enablement and an extra fixture-only RSS tool that requires no Rust enum change.
+
+**GREEN:** RSS exports canonical descriptors and registry identity; Rust only performs generic structural bounds on the exported snapshot.
+
+**Commit:** `feat(tools): define rss tool registry contracts`
+
+### Task 0B: Add generic lifecycle execution tokens
+
+**Files:** create `src/capabilities/types.rs`, `src/capabilities/lifecycle.rs`, `src/capabilities/host.rs`; modify `src/runtime/agent_host.rs`, `src/service.rs`; add `tests/capability_lifecycle_tests.rs`.
+
+**RED:** durable-before-token, owner mismatch, replay, approval ceiling, deadline, cancellation, single-close, open-token recovery and panic cleanup tests.
+
+**GREEN:** expose `agent_runtime::tool_prepare` and `agent_runtime::tool_commit`; public tool names remain opaque.
+
+**Commit:** `feat(runtime): issue scoped tool capability tokens`
+
+### Task 0C: Migrate read-only file tools to RSS
+
+**Files:** create `src/capabilities/filesystem.rs`, `rss/tools/read_file.rss`, `rss/tools/search_files.rss`; modify `src/runtime/agent_host.rs`; add RSS/capability equivalence fixtures.
+
+**RED:** exact old/new envelopes for pagination, line numbering, regex/glob behavior, ordering, invalid paths, symlink races, cancellation and output caps.
+
+**GREEN:** RSS owns arguments, search/read algorithms and formatting; Rust exposes confined metadata/list/read-range primitives only.
+
+**Commit:** `feat(tools): implement file reads in rss`
+
+### Task 0D: Migrate mutating file tools to RSS
+
+**Files:** create `rss/tools/write_file.rss`, `rss/tools/patch.rss`; extend `src/capabilities/filesystem.rs`; add atomic-write and patch fixture tests.
+
+**RED:** exact write/patch envelopes, replacement uniqueness, patch grammar, expected-hash conflict, atomic replacement, file mode, symlink replacement, cancellation and interrupted recovery.
+
+**GREEN:** RSS owns write/patch semantics and diff formatting; Rust exposes atomic compare-and-write and root confinement only.
+
+**Commit:** `feat(tools): implement file mutation in rss`
+
+### Task 0E: Migrate process tools to RSS
+
+**Files:** create `src/capabilities/process.rs`, `rss/tools/terminal.rss`, `rss/tools/process.rss`; add process capability and RSS mapping tests.
+
+**RED:** spawn/poll/log/stdin/kill, cwd, environment allowlist, process group, output cursor, deadline, cancellation, stop and reopen fixtures.
+
+**GREEN:** RSS owns public terminal/process validation, actions and formatting; Rust owns opaque process resources and bounded native process operations.
+
+**Commit:** `feat(tools): implement process tools in rss`
+
+### Task 0F: Switch agent dispatch and remove native tool domain
+
+**Files:** create `rss/tools/dispatch.rss`; modify `rss/agent/main.rss`, `src/runtime/agent_host.rs`, `src/service.rs`, `src/config.rs`, `src/lib.rs`; remove superseded `src/tools/*`; update all tool/agent/gateway E2E.
+
+**RED:** architecture tests that fail while `agent::tool_dispatch`, `NativeToolExecutor`, built-in Rust tool order, public Rust descriptors or name-keyed Rust dispatch remain.
+
+**GREEN:** `rss/agent/main.rss` calls `tools::dispatch`; surviving generic code lives under `src/capabilities`; existing durable message/event contracts remain compatible.
+
+**Commit:** `refactor(tools): complete rss tool ownership`
+
 ### Task 1: Add config/auth schemas and path resolution
 
 **Files:** create `src/config_file.rs`, `src/auth/config.rs`; modify `src/config.rs`, `src/lib.rs`; add `tests/config_file_tests.rs`.
@@ -525,11 +635,11 @@ Tests run a long real coding loop across compaction and reopen, asserting no los
 
 ### Task 11: Wire approval decisions into execution
 
-**Files:** modify `src/service.rs`, `src/tools/dispatch.rs`, gateway/Telegram handlers and approval storage RSS; add approval E2E.
+**Files:** modify `src/service.rs`, `src/capabilities/lifecycle.rs`, `rss/tools/dispatch.rss`, gateway/Telegram handlers and approval storage RSS; add approval E2E.
 
-**RED:** no-effect-before-approval, reject/expire/stop/restart/replay cases.
+**RED:** no-effect-before-approval, reject/expire/stop/restart/replay cases, plus a risk-class downgrade attempt from RSS after approval.
 
-**GREEN:** durable approval state machine before native effect.
+**GREEN:** generic Rust lifecycle validates the frozen RSS descriptor and approval ceiling before issuing an execution token; RSS retains public tool dispatch ownership.
 
 **Commit:** `feat(approval): gate mutating tool effects`
 
@@ -553,7 +663,7 @@ Actions:
 - Document current protocol matrix accurately.
 - Migrate supported `RUSTSCRIPT_AGENT_*` behavior settings into `config.yaml`; keep only home/bootstrap migration inputs in environment.
 - Document `auth.yaml` backup/restore and permission requirements without showing token examples that resemble real secrets.
-- Merge the 34-commit integration stack into `master` using repository history rules.
+- Merge the integration stack into `master` using repository history rules.
 - Build source and packaged binaries from a clean checkout.
 
 **Commit:** `docs(agent): document authenticated production setup`
@@ -572,6 +682,11 @@ cargo test --locked --workspace --all-features --all-targets --release -- --test
 
 Additional mandatory security gates:
 
+- verify every model-visible tool descriptor, schema, validator, dispatcher and formatter is sourced from `rss/tools/*`.
+- scan production Rust source for the removed `agent::tool_dispatch`, `NativeToolExecutor`, built-in public tool ordering and branches keyed by the six public tool names.
+- register and execute a fixture-only RSS tool without changing any Rust enum or public-name dispatch table.
+- verify production host catalogs omit unrestricted pd-vm filesystem/process APIs that bypass execution-token checks.
+- crash before/after `tool_prepare`, each capability effect and `tool_commit`; verify durable-first ordering, interrupted recovery and no automatic repeat of mutating effects.
 - scan persisted SQLite, YAML, event, message, artifact and log fixtures for exact synthetic access/refresh/device/code-verifier secrets.
 - crash at every boundary: before auth write, after temp fsync, after rename, after refresh response, after durable provider request and before provider completion.
 - concurrent process refresh using a one-use fake refresh token; assert one network refresh or generation adoption and one valid final credential.
@@ -583,18 +698,25 @@ Additional mandatory security gates:
 
 The finished system must satisfy all of these statements:
 
-1. A fresh user can create config, run Codex device login, select a workspace and start the bundled coding agent without editing RSS or injecting a test provider.
-2. OAuth access tokens refresh automatically and atomically; refresh-token rotation survives concurrent gateway/CLI access.
-3. `config.yaml` contains no credentials; `auth.yaml` contains no behavior policy.
-4. Codex device-login policy is implemented in RSS; generic OAuth transport, PKCE, storage and refresh are implemented in Rust inside `rustscript-agent`.
-5. No OAuth functionality is added to RustScript core.
-6. Raw auth material is absent from durable agent state, events, metrics, logs, artifacts and error text.
-7. Mutating tool effects respect workspace and approval policy.
-8. Long sessions compact durably and reopen without losing tool parent relationships.
-9. Full debug and release suites pass from the final integrated commit.
+1. Every model-visible tool is defined and implemented in `rss/tools/*`.
+2. RSS owns public tool schemas, validation, dispatch, algorithms and result formatting; Rust owns only generic confined capabilities and lifecycle enforcement.
+3. Rust production code contains no `NativeToolExecutor`, built-in public tool list/schema or public-name dispatch branches.
+4. `rss/agent/main.rss` calls RSS tool dispatch directly; `agent::tool_dispatch` is removed.
+5. A new RSS-only tool can be registered and executed without editing Rust dispatch code.
+6. A fresh user can create config, run Codex device login, select a workspace and start the bundled coding agent without editing RSS or injecting a test provider.
+7. OAuth access tokens refresh automatically and atomically; refresh-token rotation survives concurrent gateway/CLI access.
+8. `config.yaml` contains no credentials; `auth.yaml` contains no behavior policy.
+9. Codex device-login policy is implemented in RSS; generic OAuth transport, PKCE, storage and refresh are implemented in Rust inside `rustscript-agent`.
+10. No OAuth functionality is added to RustScript core.
+11. Raw auth material is absent from durable agent state, events, metrics, logs, artifacts and error text.
+12. Mutating tool effects respect workspace and approval policy.
+13. Long sessions compact durably and reopen without losing tool parent relationships.
+14. Full debug and release suites pass from the final integrated commit.
 
 ## 14. Main risks and chosen trade-offs
 
+- **RSS tool logic still needs native safeguards:** every effect requires a Rust-issued execution token. Production host catalogs exclude unrestricted file/process APIs that could bypass workspace, approval, deadline or durable lifecycle checks.
+- **Migration can change output contracts:** each tool migrates against exact old/new fixtures before old native dispatch is removed. Public tool names and durable message/event shapes remain compatible.
 - **YAML contains plaintext tokens:** initial scope uses strict local-file protection and atomic writes. OS keychain integration may be added later behind the same `AuthStore` trait without changing RSS or provider contracts.
 - **Codex device endpoints are provider-specific:** endpoint paths and response interpretation stay in RSS/config; Rust exports symbolic confined operations and generic token persistence.
 - **Refresh tokens may rotate on every use:** per-credential serialization plus generation revalidation is mandatory from the first release.
