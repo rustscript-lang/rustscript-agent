@@ -116,7 +116,7 @@ impl From<std::io::Error> for AgentError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
@@ -270,7 +270,32 @@ struct RunCancellationInner {
     stop: Arc<AtomicBool>,
     /// Native/process token linked to this root. `request` and deadline fire cancel it.
     token: CancellationToken,
+    /// Set when a timeout/deadline cannot be represented as `Instant`.
+    deadline_overflow: AtomicBool,
 }
+
+/// RAII guard that disarms the epoch watcher on every exit path, including panic.
+struct EpochWatcherGuard<'a> {
+    cancellation: &'a RunCancellation,
+}
+
+impl Drop for EpochWatcherGuard<'_> {
+    fn drop(&mut self) {
+        self.cancellation.disarm();
+    }
+}
+
+/// Injected runner fault used to prove watcher cleanup on error/panic paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunnerPrepareFault {
+    #[default]
+    None,
+    PanicAfterArm,
+    ErrorAfterArm,
+    PanicDuringDrive,
+}
+
+pub const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl RunCancellation {
     pub fn new() -> Self {
@@ -282,12 +307,31 @@ impl RunCancellation {
                 watcher: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
                 token: CancellationToken::new(),
+                deadline_overflow: AtomicBool::new(false),
             }),
         }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
-        Self::with_deadline(Instant::now() + timeout)
+        if timeout > MAX_RUN_TIMEOUT {
+            let cancellation = Self::new();
+            cancellation
+                .inner
+                .deadline_overflow
+                .store(true, Ordering::SeqCst);
+            return cancellation;
+        }
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => Self::with_deadline(deadline),
+            None => {
+                let cancellation = Self::new();
+                cancellation
+                    .inner
+                    .deadline_overflow
+                    .store(true, Ordering::SeqCst);
+                cancellation
+            }
+        }
     }
 
     pub fn with_deadline(deadline: Instant) -> Self {
@@ -298,14 +342,25 @@ impl RunCancellation {
 
     /// Rebuilds cancellation from a persisted wall-clock deadline. Expired
     /// deadlines fail immediately and never grant a fresh full timeout.
+    /// Enormous remaining durations never panic; they mark overflow instead.
     pub fn from_wall_deadline_ms(deadline_at_ms: u64, now_ms: u64) -> Self {
         if now_ms >= deadline_at_ms {
-            let cancellation = Self::with_deadline(Instant::now());
+            let cancellation = Self::new();
             cancellation.request(CancellationReason::Deadline);
             cancellation
         } else {
             Self::with_timeout(Duration::from_millis(deadline_at_ms - now_ms))
         }
+    }
+
+    /// True when a timeout or persisted deadline could not be converted to Instant.
+    pub fn has_deadline_overflow(&self) -> bool {
+        self.inner.deadline_overflow.load(Ordering::SeqCst)
+    }
+
+    /// True while an epoch watcher thread is armed.
+    pub fn watcher_is_armed(&self) -> bool {
+        self.inner.watcher.lock().expect("watcher lock").is_some()
     }
 
     pub fn request(&self, reason: CancellationReason) {
@@ -351,6 +406,9 @@ impl RunCancellation {
                 watcher: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
                 token: self.inner.token.clone(),
+                deadline_overflow: AtomicBool::new(
+                    self.inner.deadline_overflow.load(Ordering::SeqCst),
+                ),
             }),
         }
     }
@@ -369,21 +427,24 @@ impl RunCancellation {
         let requested = Arc::clone(&self.inner.requested);
         let deadline = Arc::clone(&self.inner.deadline);
         let token = self.inner.token.clone();
-        let watcher = thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                let fire = requested.lock().expect("requested lock").is_some()
-                    || deadline
-                        .lock()
-                        .expect("deadline lock")
-                        .is_some_and(|deadline| Instant::now() >= deadline);
-                if fire {
-                    token.cancel();
-                    epoch.increment_by(RUN_EPOCH_DEADLINE_TICKS);
-                    return;
+        let watcher = thread::Builder::new()
+            .name("run-epoch-watcher".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let fire = requested.lock().expect("requested lock").is_some()
+                        || deadline
+                            .lock()
+                            .expect("deadline lock")
+                            .is_some_and(|deadline| Instant::now() >= deadline);
+                    if fire {
+                        token.cancel();
+                        epoch.increment_by(RUN_EPOCH_DEADLINE_TICKS);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
                 }
-                thread::sleep(Duration::from_millis(1));
-            }
-        });
+            })
+            .expect("spawn run-epoch-watcher");
         *self.inner.watcher.lock().expect("watcher lock") = Some(watcher);
     }
 
@@ -409,6 +470,7 @@ pub struct AgentRunner {
     config: AgentConfig,
     registry: Arc<HostFunctionRegistry>,
     host: AgentHostBridges,
+    prepare_fault: RunnerPrepareFault,
 }
 
 impl AgentRunner {
@@ -454,7 +516,19 @@ impl AgentRunner {
             config,
             registry: Arc::new(registry),
             host: AgentHostBridges::default(),
+            prepare_fault: RunnerPrepareFault::None,
         })
+    }
+
+    /// Effective HTTP/SQLite/fuel policy compiled into this runner.
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
+    /// Injects a prepare/drive fault for watcher RAII tests.
+    pub fn with_prepare_fault(mut self, fault: RunnerPrepareFault) -> Self {
+        self.prepare_fault = fault;
+        self
     }
 
     /// Installs a scripted or custom provider for the serial loop host bridge.
@@ -513,7 +587,11 @@ impl AgentRunner {
         sink: &mut dyn RunEventSink,
         cancellation: &RunCancellation,
     ) -> std::result::Result<Value, RunError> {
+        let _watcher_guard = EpochWatcherGuard { cancellation };
         let (mut vm, callable) = self.prepare_vm(Some(cancellation))?;
+        if self.prepare_fault == RunnerPrepareFault::PanicDuringDrive {
+            panic!("injected drive panic");
+        }
         self.run_invocation(&mut vm, callable, context, Some(sink), Some(cancellation))
     }
 
@@ -551,6 +629,15 @@ impl AgentRunner {
             vm.set_epoch_deadline(RUN_EPOCH_DEADLINE_TICKS)
                 .map_err(RunError::Setup)?;
             cancellation.arm(vm.epoch_handle());
+            match self.prepare_fault {
+                RunnerPrepareFault::PanicAfterArm => panic!("injected prepare panic"),
+                RunnerPrepareFault::ErrorAfterArm => {
+                    return Err(RunError::Setup(VmError::HostError(
+                        "injected prepare error".to_string(),
+                    )));
+                }
+                RunnerPrepareFault::None | RunnerPrepareFault::PanicDuringDrive => {}
+            }
         } else if let Some(fuel) = self.config.fuel {
             vm.set_fuel(fuel);
         }
@@ -638,6 +725,9 @@ impl AgentRunner {
         mut sink: Option<&mut dyn RunEventSink>,
         cancellation: Option<&RunCancellation>,
     ) -> std::result::Result<Value, RunError> {
+        if matches!(self.prepare_fault, RunnerPrepareFault::PanicDuringDrive) {
+            panic!("injected drive panic");
+        }
         let result = (|| {
             let mut invocation = vm
                 .start_invocation(callable, vec![context])

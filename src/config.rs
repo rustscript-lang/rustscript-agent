@@ -5,7 +5,9 @@
 //! values. Configuration is native-owned; RSS never reads ambient config.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::runtime::rss_runner::MAX_RUN_TIMEOUT;
 
 use rustscript_vm::{
     HttpConfig, MAX_ENUM_ENTRIES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, MAX_TIMEOUT, SqlitePolicy,
@@ -1701,6 +1703,11 @@ impl AgentGatewayConfig {
         }
         if self.run_timeout.is_zero() {
             return Err("run_timeout must be positive".to_string());
+        }
+        if self.run_timeout > MAX_RUN_TIMEOUT
+            || Instant::now().checked_add(self.run_timeout).is_none()
+        {
+            return Err("run_timeout overflows Instant deadline arithmetic".to_string());
         }
         if self.event_channel_capacity == 0 {
             return Err("event_channel_capacity must be positive".to_string());

@@ -29,6 +29,7 @@ use std::sync::{
     Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
@@ -74,6 +75,36 @@ use crate::tools::{
     ToolRegistrySnapshot, ToolResult,
 };
 use crate::{AgentHostBridges, AgentProviderHost, RunCancellation, RunError};
+
+/// Typed outcome of bounded native-host cleanup. Never claims success when
+/// dispatcher or process residue could not be confirmed stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupOutcome {
+    Clean,
+    Timeout,
+    Failed,
+}
+
+struct CachedAgentRunner {
+    source_digest: u64,
+    config: AgentConfig,
+    runner: AgentRunner,
+}
+
+fn agent_source_digest(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn failed_payload_with_code(code: &str, error: String) -> JsonValue {
+    json!({
+        "status": "failed",
+        "error_code": code,
+        "error_message": error,
+    })
+}
 
 /// Recovery action for a pending provider request after restart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,40 +170,57 @@ struct NativeDispatchState {
     table: Arc<ProcessTable>,
     cleaned: AtomicBool,
     shutdown_entered: Option<Arc<dyn Fn() + Send + Sync>>,
+    cleanup_grace: Duration,
 }
 
 /// Two-phase native dispatch slot. The handle lock is never held across
-/// FileTools/ArtifactStore filesystem IO.
+/// FileTools/ArtifactStore filesystem IO. `Closed` retains the process table so
+/// residue stays observable after FileTools are released.
 enum NativeDispatchPhase {
     Empty,
     Initializing,
     Ready(Arc<NativeDispatchState>),
-    Closed,
+    Closed(Option<ClosedDispatch>),
+}
+
+#[derive(Clone)]
+struct ClosedDispatch {
+    table: Arc<ProcessTable>,
+    owner: ProcessOwner,
 }
 
 impl NativeDispatchState {
-    fn shutdown(&self) {
+    fn owner(&self) -> ProcessOwner {
+        ProcessOwner::from(self.dispatcher.owner().clone())
+    }
+
+    fn shutdown(&self) -> CleanupOutcome {
+        self.shutdown_with_grace(self.cleanup_grace)
+    }
+
+    fn shutdown_with_grace(&self, grace: Duration) -> CleanupOutcome {
         if self.cleaned.swap(true, Ordering::SeqCst) {
-            return;
+            return if self.table.owner_count(&self.owner()) == 0 {
+                CleanupOutcome::Clean
+            } else {
+                CleanupOutcome::Timeout
+            };
         }
         if let Some(observer) = &self.shutdown_entered {
             observer();
         }
         self.dispatcher.close();
-        self.dispatcher.quiesce();
-        let owner = ProcessOwner::from(self.dispatcher.owner().clone());
+        let quiesced = self.dispatcher.try_quiesce(grace);
+        let owner = self.owner();
         let _ = self.table.cleanup_owner(&owner);
         let _ = self
             .files
             .artifact_store_arc()
             .cleanup_owner(&ArtifactOwner::from(self.dispatcher.owner().clone()));
-        self.table.shutdown();
-        let deadline = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < deadline {
-            if self.table.owner_count(&owner) == 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        if !quiesced || self.table.owner_count(&owner) > 0 {
+            CleanupOutcome::Timeout
+        } else {
+            CleanupOutcome::Clean
         }
     }
 }
@@ -207,6 +255,12 @@ impl RunHandle {
         &self.cancel
     }
 
+    fn request_user_stop(&self) {
+        *self.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
+        self.cancel.request(CancellationReason::Requested);
+        self.cancel_native_tools();
+    }
+
     fn cancel_native_tools(&self) {
         self.tool_cancel.cancel();
     }
@@ -214,25 +268,37 @@ impl RunHandle {
     fn native_dispatch_closed(&self) -> bool {
         matches!(
             *self.native_dispatch.lock().expect("native dispatch lock"),
-            NativeDispatchPhase::Closed
+            NativeDispatchPhase::Closed(_)
         )
     }
 
-    fn release_native_dispatch(&self) {
+    fn release_native_dispatch(&self) -> CleanupOutcome {
         self.tool_cancel.cancel();
         let state = {
             let mut phase = self.native_dispatch.lock().expect("native dispatch lock");
-            let previous = std::mem::replace(&mut *phase, NativeDispatchPhase::Closed);
-            self.native_dispatch_cv.notify_all();
-            match previous {
-                NativeDispatchPhase::Ready(state) => Some(state),
-                NativeDispatchPhase::Empty
-                | NativeDispatchPhase::Initializing
-                | NativeDispatchPhase::Closed => None,
+            match std::mem::replace(&mut *phase, NativeDispatchPhase::Closed(None)) {
+                NativeDispatchPhase::Ready(state) => {
+                    *phase = NativeDispatchPhase::Closed(Some(ClosedDispatch {
+                        table: Arc::clone(&state.table),
+                        owner: state.owner(),
+                    }));
+                    self.native_dispatch_cv.notify_all();
+                    Some(state)
+                }
+                NativeDispatchPhase::Closed(existing) => {
+                    *phase = NativeDispatchPhase::Closed(existing);
+                    self.native_dispatch_cv.notify_all();
+                    None
+                }
+                NativeDispatchPhase::Empty | NativeDispatchPhase::Initializing => {
+                    self.native_dispatch_cv.notify_all();
+                    None
+                }
             }
         };
-        if let Some(state) = state {
-            state.shutdown();
+        match state {
+            Some(state) => state.shutdown(),
+            None => CleanupOutcome::Clean,
         }
     }
 
@@ -470,10 +536,13 @@ struct AgentServiceInner {
     prompt_read_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     artifact_stores: ArtifactStorePool,
     date_source: RwLock<Arc<dyn DateSource>>,
-    /// Optional injected provider host for tests; production uses RssAdapterProvider.
+    /// Optional one-shot injected provider host for tests. Consumed atomically
+    /// by the next `run_worker`; production uses RssAdapterProvider.
     provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
-    runner: Mutex<Option<AgentRunner>>,
+    runner: Mutex<Option<CachedAgentRunner>>,
+    /// When set, the next native dispatcher holds its serial mutex until released.
+    uncooperative_dispatch: Mutex<Option<Arc<AtomicBool>>>,
     /// Serializes durable event/message commits so seq/ordinal reservation
     /// cannot interleave. Never held across GET; the GatewayStore lock is
     /// released before SQLite/worker IO.
@@ -542,6 +611,7 @@ impl AgentService {
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
             runner: Mutex::new(None),
+            uncooperative_dispatch: Mutex::new(None),
             commit_gate: Arc::new(ParkingMutex::new(())),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
@@ -560,9 +630,61 @@ impl AgentService {
         &self.inner.http_config
     }
 
-    /// Test/production injection seam for the provider host used by `run_worker`.
+    /// Test seam: one-shot provider host consumed by the next `run_worker`.
+    /// A second run without another inject uses the production adapter.
     pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
         *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
+    }
+
+    /// Installs or replaces a provider profile used by later admissions.
+    pub fn upsert_provider_profile(&self, profile: ProviderProfile) {
+        self.inner
+            .provider_profiles
+            .write()
+            .insert(profile.name.clone(), profile);
+    }
+
+    /// Holds the next native dispatcher's serial mutex until
+    /// [`Self::release_uncooperative_dispatch`].
+    pub fn inject_uncooperative_dispatch(&self) {
+        *self
+            .inner
+            .uncooperative_dispatch
+            .lock()
+            .expect("uncooperative dispatch lock") = Some(Arc::new(AtomicBool::new(false)));
+    }
+
+    /// Releases an injected uncooperative dispatcher lock.
+    pub fn release_uncooperative_dispatch(&self) {
+        if let Some(flag) = self
+            .inner
+            .uncooperative_dispatch
+            .lock()
+            .expect("uncooperative dispatch lock")
+            .take()
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Effective AgentConfig compiled into the cached runner, if any.
+    pub fn cached_runner_config(&self) -> Option<AgentConfig> {
+        self.inner
+            .runner
+            .lock()
+            .expect("runner cache lock")
+            .as_ref()
+            .map(|cached| cached.config.clone())
+    }
+
+    /// Compiles or reuses the cached runner using current source + effective config.
+    pub fn materialize_cached_runner(&self) -> Result<AgentConfig, String> {
+        let source = self
+            .inner
+            .agent_source
+            .as_ref()
+            .ok_or_else(|| "agent source is missing".to_string())?;
+        Ok(self.cached_agent_runner(source)?.config().clone())
     }
 
     /// Returns the registry snapshot currently used for future admissions.
@@ -1166,7 +1288,7 @@ impl AgentService {
     ) -> Result<Option<Arc<NativeDispatchState>>, RunContextError> {
         loop {
             let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
-            if matches!(*phase, NativeDispatchPhase::Closed) {
+            if matches!(*phase, NativeDispatchPhase::Closed(_)) {
                 return Ok(None);
             }
             if let NativeDispatchPhase::Ready(state) = &*phase {
@@ -1210,7 +1332,7 @@ impl AgentService {
                 }
             }
             Err(error) => {
-                if !matches!(*phase, NativeDispatchPhase::Closed) {
+                if !matches!(*phase, NativeDispatchPhase::Closed(_)) {
                     *phase = NativeDispatchPhase::Empty;
                 }
                 handle.native_dispatch_cv.notify_all();
@@ -1327,10 +1449,11 @@ impl AgentService {
             owner,
             workspace,
             handle.cancel.token(),
-            handle
-                .cancel
-                .deadline_instant()
-                .unwrap_or_else(|| Instant::now() + self.inner.config.run_timeout),
+            handle.cancel.deadline_instant().unwrap_or_else(|| {
+                Instant::now()
+                    .checked_add(self.inner.config.run_timeout)
+                    .unwrap_or_else(Instant::now)
+            }),
             registry,
             expected.to_string(),
             toolset_hash,
@@ -1347,6 +1470,22 @@ impl AgentService {
             }),
         )
         .map_err(|error| invalid_context_metadata(run_id, &error))?;
+        if let Some(release) = self
+            .inner
+            .uncooperative_dispatch
+            .lock()
+            .expect("uncooperative dispatch lock")
+            .clone()
+        {
+            let holder = dispatcher.clone();
+            thread::spawn(move || {
+                let _guard = holder.lock_serial();
+                while !release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+            thread::sleep(Duration::from_millis(5));
+        }
         Ok(NativeDispatchState {
             dispatcher,
             files,
@@ -1358,6 +1497,7 @@ impl AgentService {
                 .lock()
                 .expect("native dispatch shutdown observer lock")
                 .clone(),
+            cleanup_grace: self.inner.config.cancellation_grace,
         })
     }
 
@@ -1386,43 +1526,129 @@ impl AgentService {
                 let owner = ProcessOwner::from(state.dispatcher.owner().clone());
                 state.table.owner_count(&owner)
             }
+            NativeDispatchPhase::Closed(Some(closed)) => closed.table.owner_count(&closed.owner),
             NativeDispatchPhase::Empty
             | NativeDispatchPhase::Initializing
-            | NativeDispatchPhase::Closed => 0,
+            | NativeDispatchPhase::Closed(None) => 0,
         }
     }
 
-    fn cleanup_run_hosts(&self, handle: &RunHandle) {
-        handle.release_native_dispatch();
+    /// OS PIDs retained for `run_id`, including draining residue after close.
+    pub fn process_owner_pids(&self, run_id: &str) -> Vec<u32> {
+        let Some(handle) = self.handle(run_id) else {
+            return Vec::new();
+        };
+        let Ok(phase) = handle.native_dispatch.lock() else {
+            return Vec::new();
+        };
+        match &*phase {
+            NativeDispatchPhase::Ready(state) => {
+                let owner = ProcessOwner::from(state.dispatcher.owner().clone());
+                state.table.owner_pids(&owner)
+            }
+            NativeDispatchPhase::Closed(Some(closed)) => closed.table.owner_pids(&closed.owner),
+            NativeDispatchPhase::Empty
+            | NativeDispatchPhase::Initializing
+            | NativeDispatchPhase::Closed(None) => Vec::new(),
+        }
+    }
+
+    fn cleanup_run_hosts(&self, handle: &RunHandle) -> CleanupOutcome {
+        handle.release_native_dispatch()
+    }
+
+    async fn commit_cleanup_or_continue(&self, run_id: &str, handle: &RunHandle) -> bool {
+        match self.cleanup_run_hosts(handle) {
+            CleanupOutcome::Clean => true,
+            CleanupOutcome::Timeout => {
+                self.finish_failed(
+                    run_id,
+                    failed_payload_with_code(
+                        "cleanup_timeout",
+                        "native dispatcher or process cleanup exceeded grace".into(),
+                    ),
+                )
+                .await;
+                false
+            }
+            CleanupOutcome::Failed => {
+                self.finish_failed(
+                    run_id,
+                    failed_payload_with_code(
+                        "cleanup_failed",
+                        "native dispatcher or process cleanup failed".into(),
+                    ),
+                )
+                .await;
+                false
+            }
+        }
     }
 
     fn cached_agent_runner(&self, source: &str) -> Result<AgentRunner, String> {
+        let expected = self.effective_agent_config();
+        let digest = agent_source_digest(source);
         let mut cache = self.inner.runner.lock().expect("runner cache lock");
-        if let Some(runner) = cache.as_ref() {
-            return Ok(runner.clone());
+        if let Some(cached) = cache.as_ref()
+            && cached.source_digest == digest
+            && cached.config == expected
+        {
+            return Ok(cached.runner.clone());
         }
-        let runner = AgentRunner::from_source(
-            source,
-            AgentConfig {
-                http: self.inner.http_config.clone(),
-                sqlite: self.inner.config.sqlite.clone(),
-                fuel: None,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        *cache = Some(runner.clone());
+        let runner = AgentRunner::from_source(source, expected.clone())
+            .map_err(|error| error.to_string())?;
+        *cache = Some(CachedAgentRunner {
+            source_digest: digest,
+            config: expected,
+            runner: runner.clone(),
+        });
         Ok(runner)
+    }
+
+    fn effective_agent_config(&self) -> AgentConfig {
+        AgentConfig {
+            http: self.inner.http_config.clone(),
+            sqlite: self.inner.config.sqlite.clone(),
+            fuel: self.inner.config.fuel,
+        }
     }
 
     /// Install a precompiled runner so workers do not recompile the agent source.
     pub fn install_agent_runner(&self, runner: AgentRunner) {
-        *self.inner.runner.lock().expect("runner cache lock") = Some(runner);
+        let digest = self
+            .inner
+            .agent_source
+            .as_ref()
+            .map(|source| agent_source_digest(source))
+            .unwrap_or(0);
+        *self.inner.runner.lock().expect("runner cache lock") = Some(CachedAgentRunner {
+            source_digest: digest,
+            config: runner.config().clone(),
+            runner,
+        });
     }
 
     /// Drops the live handle so `run_worker` must restore cancellation from
     /// frozen context metadata (restart seam).
     pub fn evict_run_handle(&self, run_id: &str) {
         self.inner.runs.lock().expect("runs lock").remove(run_id);
+    }
+
+    /// Test seam: overwrite frozen context deadline for overflow restore tests.
+    pub fn set_context_deadline_at_ms(&self, run_id: &str, deadline_at_ms: u64) {
+        if let Some(context) = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get_mut(run_id)
+            && let Some(metadata) = context.metadata.as_object_mut()
+        {
+            metadata.insert(
+                "deadline_at_ms".to_string(),
+                JsonValue::from(deadline_at_ms.to_string()),
+            );
+        }
     }
 
     fn restore_handle_from_frozen_context(&self, run_id: &str) -> Option<Arc<RunHandle>> {
@@ -1438,6 +1664,7 @@ impl AgentService {
             value
                 .as_u64()
                 .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
         })?;
         let cancel = RunCancellation::from_wall_deadline_ms(deadline_at_ms, timestamp());
         let prompt = context.coding_system_prompt.clone().unwrap_or_default();
@@ -1463,6 +1690,9 @@ impl AgentService {
             .lock()
             .expect("runs lock")
             .insert(run_id.to_string(), Arc::clone(&handle));
+        if status == "stopping" {
+            handle.request_user_stop();
+        }
         Some(handle)
     }
 
@@ -1474,7 +1704,7 @@ impl AgentService {
             NativeDispatchPhase::Ready(state) => Some(state.files.artifact_store_arc()),
             NativeDispatchPhase::Empty
             | NativeDispatchPhase::Initializing
-            | NativeDispatchPhase::Closed => None,
+            | NativeDispatchPhase::Closed(_) => None,
         }
     }
 
@@ -2506,6 +2736,19 @@ impl AgentService {
         else {
             return;
         };
+        if handle.cancel.has_deadline_overflow() {
+            if self.commit_cleanup_or_continue(&run_id, &handle).await {
+                self.finish_failed(
+                    &run_id,
+                    failed_payload_with_code(
+                        "invalid_deadline",
+                        "persisted run deadline overflowed Instant arithmetic".into(),
+                    ),
+                )
+                .await;
+            }
+            return;
+        }
         let session_id = {
             let store = self.inner.store.read();
             let Some(run) = store.runs.get(&run_id) else {
@@ -2516,7 +2759,9 @@ impl AgentService {
         let cancellation = handle.cancel.clone();
 
         if let Some(reason) = cancellation.requested() {
-            self.cleanup_run_hosts(&handle);
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
             self.finish_cancelled(&run_id, handle_cancel_reason(&handle, reason.as_str()))
                 .await;
             return;
@@ -2527,7 +2772,9 @@ impl AgentService {
                 .is_some_and(|remaining| remaining.is_zero())
         {
             cancellation.request(CancellationReason::Deadline);
-            self.cleanup_run_hosts(&handle);
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
             self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "deadline"))
                 .await;
             return;
@@ -2539,7 +2786,9 @@ impl AgentService {
                 error = %error,
                 "run context verification failed before RSS execution"
             );
-            self.cleanup_run_hosts(&handle);
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
             self.finish_failed(
                 &run_id,
                 json!({
@@ -2558,7 +2807,9 @@ impl AgentService {
                 Ok(Some(state)) => Some(Arc::new(state.dispatcher.clone())),
                 Ok(None) => None,
                 Err(error) => {
-                    self.cleanup_run_hosts(&handle);
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
                     self.finish_failed(&run_id, failed_payload(error.to_string()))
                         .await;
                     return;
@@ -2569,7 +2820,7 @@ impl AgentService {
                 .provider_host
                 .lock()
                 .expect("provider host lock")
-                .clone();
+                .take();
             let host = AgentHostBridges {
                 provider,
                 dispatcher,
@@ -2600,7 +2851,9 @@ impl AgentService {
             let runner = match self.cached_agent_runner(source.as_ref()) {
                 Ok(runner) => runner,
                 Err(error) => {
-                    self.cleanup_run_hosts(&handle);
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
                     self.finish_failed(
                         &run_id,
                         failed_payload(format!("compile RSS run source: {error}")),
@@ -2649,13 +2902,17 @@ impl AgentService {
             match outcome {
                 WorkerOutcome::Completed(value) => {
                     if let Some(reason) = delivery_outcome.schema_violation {
-                        self.cleanup_run_hosts(&handle);
+                        if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                            return;
+                        }
                         self.finish_failed(&run_id, events::schema_violation_error(&reason))
                             .await;
                         return;
                     }
                     if delivery_outcome.persist_failed {
-                        self.cleanup_run_hosts(&handle);
+                        if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                            return;
+                        }
                         self.finish_failed(
                             &run_id,
                             json!({
@@ -2670,7 +2927,9 @@ impl AgentService {
                     match interpret_loop_decision(&value, &cancellation) {
                         WorkerOutcome::Completed(value) => completed_output_text(&value),
                         WorkerOutcome::Cancelled(core_reason) => {
-                            self.cleanup_run_hosts(&handle);
+                            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                                return;
+                            }
                             self.finish_cancelled(
                                 &run_id,
                                 handle_cancel_reason(&handle, core_reason),
@@ -2679,20 +2938,26 @@ impl AgentService {
                             return;
                         }
                         WorkerOutcome::Failed(error) => {
-                            self.cleanup_run_hosts(&handle);
+                            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                                return;
+                            }
                             self.finish_failed(&run_id, failed_payload(error)).await;
                             return;
                         }
                     }
                 }
                 WorkerOutcome::Cancelled(core_reason) => {
-                    self.cleanup_run_hosts(&handle);
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
                     self.finish_cancelled(&run_id, handle_cancel_reason(&handle, core_reason))
                         .await;
                     return;
                 }
                 WorkerOutcome::Failed(error) => {
-                    self.cleanup_run_hosts(&handle);
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
                     self.finish_failed(&run_id, failed_payload(error)).await;
                     return;
                 }
@@ -2708,13 +2973,17 @@ impl AgentService {
         };
 
         if cancellation.requested().is_some() {
-            self.cleanup_run_hosts(&handle);
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
             self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
                 .await;
             return;
         }
 
-        self.cleanup_run_hosts(&handle);
+        if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+            return;
+        }
         self.finish_completed(&run_id, &session_id, &output_text)
             .await;
     }

@@ -28,10 +28,12 @@ pub use gateway::{AgentGatewayState, build_agent_gateway_app};
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
+    RunnerPrepareFault,
 };
 pub use runtime::{AgentHostBridges, AgentProviderHost, ScriptedProvider};
 pub use service::{
-    AdmitError, AdmitRunRequest, AdmittedRun, AgentService, ProviderPendingDecision, RunHandle,
+    AdmitError, AdmitRunRequest, AdmittedRun, AgentService, CleanupOutcome,
+    ProviderPendingDecision, RunHandle,
 };
 pub use tools::{
     NativeExecutorContract, NativeToolExecutor, RiskClass, SchemaValidationError,

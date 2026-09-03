@@ -371,6 +371,8 @@ fn histogram_records_edge_durations_into_the_fixed_buckets() {
     );
 }
 
+/// Coding activity counters are unlabelled integers with no string-bearing
+/// recording API. Recording is compile-time typed as `u64` only.
 const CODING_ACTIVITY_COUNTERS: [&str; 5] = [
     "agent_model_calls_total",
     "agent_tool_calls_total",
@@ -379,22 +381,48 @@ const CODING_ACTIVITY_COUNTERS: [&str; 5] = [
     "agent_truncations_total",
 ];
 
-/// Strings that must never appear in snapshots or Prometheus text: tool args,
-/// paths, stdin/env, output, prompt, provider responses/error text, and
-/// model/provider/run/session identifiers.
-const SENSITIVE_SENTINELS: [&str; 11] = [
-    "/secret/workspace/src/main.rs",
-    "{\"path\":\"/etc/passwd\",\"offset\":12}",
-    "STDIN_PAYLOAD_DO_NOT_RECORD",
-    "ENV_SECRET_TOKEN=abc123",
-    "tool stdout: leaked file contents",
-    "system prompt: never reveal this",
-    "provider response: you are gpt-secret",
-    "provider-error-text: connection refused to 10.0.0.1",
-    "model-id-claude-opus-secret",
-    "run-id-550e8400-e29b-41d4-a716-446655440000",
-    "session-id-sess_secret_999",
-];
+#[test]
+fn coding_counters_have_no_labels_or_string_recording_api() {
+    let metrics = Metrics::default();
+    // Recording APIs accept only u64 counts — no labels, paths, or payload text.
+    metrics.record_model_calls(3);
+    metrics.record_tool_calls(2);
+    metrics.record_tool_failures(1);
+    metrics.record_turns(4);
+    metrics.record_truncations(5);
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(coding_activity_values(&snapshot), [3, 2, 1, 4, 5]);
+
+    let first = metrics.render_prometheus();
+    let second = metrics.render_prometheus();
+    assert_eq!(first, second, "scrape must be deterministic");
+    for name in CODING_ACTIVITY_COUNTERS {
+        let expected = format!(
+            "{name} {}",
+            match name {
+                "agent_model_calls_total" => 3,
+                "agent_tool_calls_total" => 2,
+                "agent_tool_failures_total" => 1,
+                "agent_turns_total" => 4,
+                "agent_truncations_total" => 5,
+                _ => unreachable!(),
+            }
+        );
+        assert!(
+            first.contains(&expected),
+            "{name} must render as an unlabelled integer, got:\\n{first}"
+        );
+        for line in first.lines() {
+            if line.starts_with(name) {
+                assert!(
+                    !line.contains('{') && !line.contains('}'),
+                    "coding counter must not carry labels: {line}"
+                );
+            }
+        }
+    }
+}
 
 fn coding_activity_values(snapshot: &MetricsSnapshot) -> [u64; 5] {
     [
@@ -593,29 +621,6 @@ fn coding_activity_prometheus_help_type_are_deterministic_and_duplicate_free() {
             "{name} must have one unlabelled sample"
         );
         assert!(!matches[0].contains('{'));
-    }
-}
-
-#[test]
-fn coding_activity_render_never_includes_sensitive_sentinels() {
-    let metrics = Metrics::default();
-    metrics.record_model_calls(1);
-    metrics.record_tool_calls(2);
-    metrics.record_tool_failures(1);
-    metrics.record_turns(1);
-    metrics.record_truncations(1);
-
-    let render = metrics.render_prometheus();
-    let snapshot = format!("{:?}", metrics.snapshot());
-    for sentinel in SENSITIVE_SENTINELS {
-        assert!(
-            !render.contains(sentinel),
-            "Prometheus text must not contain {sentinel:?}"
-        );
-        assert!(
-            !snapshot.contains(sentinel),
-            "snapshot debug must not contain {sentinel:?}"
-        );
     }
 }
 

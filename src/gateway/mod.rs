@@ -23,6 +23,7 @@ use rustscript_vm::HttpConfig;
 
 use crate::config::AgentGatewayConfig;
 use crate::metrics::Metrics;
+use crate::runtime::rss_runner::{AgentConfig, AgentRunner};
 use crate::service::AgentService;
 
 pub use api_server::build_agent_gateway_app;
@@ -76,12 +77,17 @@ impl AgentGatewayState {
                 crate::MAX_AGENT_SOURCE_BYTES
             ));
         }
-        let runner = crate::AgentRunner::from_source(&source, crate::AgentConfig::default())
-            .map_err(|error| format!("compile RSS agent source: {error}"))?;
-        let http_config = config.http.clone();
         config
             .validate()
             .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let agent_config = AgentConfig {
+            http: config.http.clone(),
+            sqlite: config.sqlite.clone(),
+            fuel: config.fuel,
+        };
+        let runner = AgentRunner::from_source(&source, agent_config)
+            .map_err(|error| format!("compile RSS agent source: {error}"))?;
+        let http_config = config.http.clone();
         let store = Arc::new(RwLock::new(store::GatewayStore::default()));
         let agent_source = Some(Arc::new(source));
         let metrics = Arc::new(Metrics::default());
@@ -116,12 +122,17 @@ impl AgentGatewayState {
                 crate::MAX_AGENT_SOURCE_BYTES
             ));
         }
-        let runner = crate::AgentRunner::from_source(&source, crate::AgentConfig::default())
-            .map_err(|error| format!("compile RSS agent source: {error}"))?;
-        let http_config = config.http.clone();
         config
             .validate()
             .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let agent_config = AgentConfig {
+            http: config.http.clone(),
+            sqlite: config.sqlite.clone(),
+            fuel: config.fuel,
+        };
+        let runner = AgentRunner::from_source(&source, agent_config)
+            .map_err(|error| format!("compile RSS agent source: {error}"))?;
+        let http_config = config.http.clone();
         let metrics = Arc::new(Metrics::default());
         let persistence = Arc::new(
             store::GatewayPersistence::open_with_metrics(

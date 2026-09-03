@@ -1,14 +1,16 @@
 //! Task 9: real service worker, unified cancellation/deadline, zero-residue cleanup.
 
 use std::fs;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use rustscript_agent::config::RunLimits;
+use rustscript_agent::config::{ProviderProfile, RunLimits};
 use rustscript_agent::{
-    AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentService, LlmContentBlock,
-    ScriptedProvider, ToolCall,
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner, AgentService,
+    LlmContentBlock, ScriptedProvider, ToolCall,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -128,6 +130,37 @@ async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     false
+}
+
+fn pid_alive(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            let Some(close) = stat.rfind(')') else {
+                return true;
+            };
+            let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
+            state != "Z"
+        }
+        Err(_) => false,
+    }
+}
+
+fn failed_error_code(service: &AgentService, run_id: &str) -> String {
+    service
+        .run_events(run_id)
+        .into_iter()
+        .rev()
+        .find_map(|event| {
+            (event.get("event").and_then(JsonValue::as_str) == Some("run.failed"))
+                .then(|| {
+                    event
+                        .pointer("/data/error_code")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
+        .unwrap_or_default()
 }
 
 fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> AgentGatewayState {
@@ -383,9 +416,17 @@ async fn stop_terminates_child_process_without_residue() {
         service.process_owner_count(&admitted.run_id) > 0
     })
     .await;
+    assert!(spawned, "child process should be owned before stop");
+    let pids = service.process_owner_pids(&admitted.run_id);
+    assert!(!pids.is_empty());
+    for pid in &pids {
+        assert!(
+            pid_alive(*pid),
+            "owned PID {pid} should be live before stop"
+        );
+    }
     let _ = service.stop(&admitted.run_id);
     worker.await.expect("worker join");
-    assert!(spawned, "child process should be owned before stop");
 
     assert_eq!(
         terminal_events(&service, &admitted.run_id),
@@ -393,6 +434,9 @@ async fn stop_terminates_child_process_without_residue() {
     );
     assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    for pid in pids {
+        assert!(!pid_alive(pid), "PID {pid} should be dead after cleanup");
+    }
     assert!(service.native_dispatch_closed(&admitted.run_id));
 }
 
@@ -440,6 +484,17 @@ async fn deadline_is_cumulative_from_admission() {
         .await
         .expect("admission should succeed");
     tokio::time::sleep(Duration::from_millis(250)).await;
+    let remaining = service
+        .handle(&admitted.run_id)
+        .expect("live handle")
+        .cancellation()
+        .remaining_deadline()
+        .expect("deadline");
+    assert!(
+        remaining < timeout,
+        "remaining deadline {remaining:?} must be less than the original {timeout:?}"
+    );
+    assert!(remaining > Duration::from_millis(20));
     let started = Instant::now();
     service
         .clone()
@@ -453,7 +508,7 @@ async fn deadline_is_cumulative_from_admission() {
     );
     assert_eq!(cancel_reason(&service, &admitted.run_id), "deadline");
     assert!(
-        elapsed < Duration::from_millis(350),
+        elapsed < timeout,
         "worker should observe remaining deadline, not a fresh {timeout:?}: {elapsed:?}"
     );
 }
@@ -739,4 +794,327 @@ async fn durable_tool_replay_does_not_increment_activity() {
         terminal_events(&service, &admitted.run_id),
         vec!["run.cancelled".to_string()]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uncooperative_dispatcher_cleanup_is_bounded_and_fail_closed() {
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("ok"));
+    let mut config = short_config(Duration::from_secs(8));
+    config.cancellation_grace = Duration::from_millis(80);
+    let state = loop_service(config, &provider);
+    let service = state.service();
+    service.inject_uncooperative_dispatch();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    let started = Instant::now();
+    let finished = tokio::time::timeout(
+        Duration::from_secs(3),
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    service.release_uncooperative_dispatch();
+    assert!(
+        finished.is_ok(),
+        "uncooperative dispatcher must not block cleanup indefinitely: {elapsed:?}"
+    );
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        failed_error_code(&service, &admitted.run_id),
+        "cleanup_timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "uncooperative dispatcher must not block cleanup indefinitely: {elapsed:?}"
+    );
+    assert!(service.native_dispatch_closed(&admitted.run_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_stopping_requests_cancel_before_provider() {
+    let provider = ScriptedProvider::new();
+    provider.push_hang();
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
+    service.evict_run_handle(&admitted.run_id);
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("restore stopping must stay bounded");
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.cancelled".to_string()]
+    );
+    assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_runner_uses_http_sqlite_and_fuel_and_rejects_stale_cache() {
+    let mut config = AgentGatewayConfig::default();
+    config.http.allowed_hosts = vec!["example.test".to_string()];
+    config.sqlite.database_root = Some("/tmp/agent-sqlite-task9".to_string());
+    config.fuel = Some(12_345);
+    let state = AgentGatewayState::with_agent_source(config, agent_loop_source())
+        .expect("compile gateway agent");
+    let service = state.service();
+    let installed = service
+        .cached_runner_config()
+        .expect("gateway should install a runner");
+    assert_eq!(installed.http.allowed_hosts, ["example.test"]);
+    assert_eq!(
+        installed.sqlite.database_root.as_deref(),
+        Some("/tmp/agent-sqlite-task9")
+    );
+    assert_eq!(installed.fuel, Some(12_345));
+
+    let stale = AgentRunner::from_source(&agent_loop_source(), AgentConfig::default())
+        .expect("compile default runner");
+    service.install_agent_runner(stale);
+    assert_ne!(
+        service.cached_runner_config().expect("stale cache").fuel,
+        Some(12_345)
+    );
+    let refreshed = service
+        .materialize_cached_runner()
+        .expect("rebuild stale runner");
+    assert_eq!(refreshed.http.allowed_hosts, ["example.test"]);
+    assert_eq!(refreshed.fuel, Some(12_345));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn huge_persisted_deadline_restore_fails_typed_without_panic() {
+    let provider = ScriptedProvider::new();
+    provider.push_hang();
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    service.set_context_deadline_at_ms(&admitted.run_id, u64::MAX);
+    service.evict_run_handle(&admitted.run_id);
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("huge deadline restore must not hang");
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed".to_string()]
+    );
+    assert_eq!(
+        failed_error_code(&service, &admitted.run_id),
+        "invalid_deadline"
+    );
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn injected_provider_is_one_shot_and_second_run_uses_default() {
+    let hang = ScriptedProvider::new();
+    hang.push_hang();
+    let ok = ScriptedProvider::new();
+    ok.push_ok(text_response("second-ok"));
+    let state =
+        AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), agent_loop_source())
+            .expect("compile");
+    let service = state.service();
+    service.inject_provider_host(Arc::new(hang.clone()));
+    service.inject_provider_host(Arc::new(ok.clone()));
+    let first = service.admit(admit_request()).await.expect("admit first");
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        service
+            .clone()
+            .run_worker(first.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("first injected run");
+    assert_eq!(
+        terminal_events(&service, &first.run_id),
+        vec!["run.completed".to_string()]
+    );
+    assert_eq!(ok.call_count(), 1);
+    assert_eq!(hang.call_count(), 0);
+
+    let second = service.admit(admit_request()).await.expect("admit second");
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        service
+            .clone()
+            .run_worker(second.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("second run without inject must not hang on the consumed host");
+    assert_eq!(
+        ok.call_count(),
+        1,
+        "one-shot inject must not leak to the second run"
+    );
+    assert_eq!(hang.call_count(), 0);
+    assert_eq!(
+        terminal_events(&service, &second.run_id).len(),
+        1,
+        "second run must still commit a terminal without the injected host: {:?}",
+        service.run_events(&second.run_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_backoff_sleep_is_interrupted_by_stop() {
+    let provider = ScriptedProvider::new();
+    provider.push_error(retryable_provider_error());
+    provider.push_hang();
+    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    assert!(
+        wait_until(Duration::from_secs(4), || provider.call_count() >= 1).await,
+        "first retryable provider error should land"
+    );
+    let _ = service.stop(&admitted.run_id);
+    worker.await.expect("worker join");
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.cancelled".to_string()]
+    );
+    assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_expired_restart_keeps_remaining_deadline() {
+    let provider = ScriptedProvider::new();
+    provider.push_hang();
+    let timeout = Duration::from_secs(5);
+    let state = loop_service(short_config(timeout), &provider);
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    service.evict_run_handle(&admitted.run_id);
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    assert!(
+        wait_until(Duration::from_secs(4), || provider.call_count() >= 1).await,
+        "restored worker should reach the hang"
+    );
+    let remaining = service
+        .handle(&admitted.run_id)
+        .expect("restored handle")
+        .cancellation()
+        .remaining_deadline()
+        .expect("deadline");
+    assert!(
+        remaining < timeout - Duration::from_millis(200),
+        "restart must keep the remaining deadline, not a fresh {timeout:?}: {remaining:?}"
+    );
+    assert!(remaining > Duration::from_millis(100));
+    let _ = service.stop(&admitted.run_id);
+    worker.await.expect("worker join");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hanging_http_adapter_stop_cancels() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hang server");
+    let port = listener.local_addr().expect("local addr").port();
+    let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accepted_flag = Arc::clone(&accepted);
+    let server = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            accepted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            thread::sleep(Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+    let mut config = short_config(Duration::from_secs(8));
+    config.http.allowed_hosts = vec!["127.0.0.1".to_string()];
+    config.http.allowed_schemes = vec!["http".to_string()];
+    config.http.allowed_ports = vec![port];
+    config.http.allow_private_ips = true;
+    let state = AgentGatewayState::with_agent_source(config, agent_loop_source())
+        .expect("compile adapter run");
+    let service = state.service();
+    service.upsert_provider_profile(
+        ProviderProfile::new(
+            "local-agent",
+            json!({ "base_url": format!("http://127.0.0.1:{port}") }),
+        )
+        .expect("profile"),
+    );
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admission should succeed");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
+    assert!(
+        wait_until(Duration::from_secs(4), || {
+            accepted.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await,
+        "RssAdapterProvider should connect to the hanging HTTP server"
+    );
+    let _ = service.stop(&admitted.run_id);
+    tokio::time::timeout(Duration::from_secs(6), worker)
+        .await
+        .expect("hanging HTTP stop must stay bounded")
+        .expect("worker join");
+    let terminals = terminal_events(&service, &admitted.run_id);
+    assert_eq!(
+        terminals.len(),
+        1,
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert!(
+        terminals[0] == "run.cancelled" || terminals[0] == "run.failed",
+        "stop must commit a typed terminal, got {terminals:?}"
+    );
+    drop(server);
 }

@@ -96,6 +96,7 @@ pub trait ProcessArtifactSink: Send + Sync {
 struct OwnedProcess {
     owner: ProcessOwner,
     process: BoundedProcess,
+    draining: bool,
 }
 
 struct ForegroundOp {
@@ -210,6 +211,17 @@ impl ProcessTable {
             .filter(|op| op.owner == *owner)
             .count();
         processes + foreground
+    }
+
+    /// OS PIDs still retained for this owner, including draining residue.
+    pub fn owner_pids(&self, owner: &ProcessOwner) -> Vec<u32> {
+        self.inner
+            .lock()
+            .processes
+            .values()
+            .filter(|entry| entry.owner == *owner)
+            .map(|entry| entry.process.lifecycle_handle().pid())
+            .collect()
     }
 
     pub fn cleanup_owner(&self, owner: &ProcessOwner) -> Result<usize, String> {
@@ -335,9 +347,14 @@ impl ProcessTable {
                 return self.reject_insert(process, failure);
             }
         };
-        state
-            .processes
-            .insert(id.clone(), OwnedProcess { owner, process });
+        state.processes.insert(
+            id.clone(),
+            OwnedProcess {
+                owner,
+                process,
+                draining: false,
+            },
+        );
         Ok(id)
     }
 
@@ -363,39 +380,64 @@ impl ProcessTable {
     }
 
     fn cleanup_scope(&self, mask: CleanupMask) -> usize {
-        let taken = {
+        let ids = {
             let mut state = self.inner.lock();
-            state.cleaning.push(mask.clone());
+            if !state.cleaning.iter().any(|existing| existing == &mask) {
+                state.cleaning.push(mask.clone());
+            }
             for op in state.foreground.values() {
                 if mask.matches(&op.owner) {
                     op.token.cancel();
                 }
             }
-            let ids: Vec<String> = state
-                .processes
-                .iter()
-                .filter(|(_, entry)| mask.matches(&entry.owner))
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| state.processes.remove(&id))
-                .collect::<Vec<_>>()
-        };
-        let count = taken.len();
-        bounded_shutdown(
-            taken.into_iter().map(|entry| entry.process).collect(),
-            self.config.cleanup_timeout,
-        );
-        let mut state = self.inner.lock();
-        for op in state.foreground.values() {
-            if mask.matches(&op.owner) {
-                op.token.cancel();
+            let mut ids = Vec::new();
+            for (id, entry) in state.processes.iter_mut() {
+                if mask.matches(&entry.owner) {
+                    entry.draining = true;
+                    entry.process.lifecycle_handle().cancel();
+                    ids.push(id.clone());
+                }
             }
+            ids
+        };
+        if ids.is_empty() {
+            let mut state = self.inner.lock();
+            if let Some(index) = state.cleaning.iter().rposition(|item| item == &mask) {
+                state.cleaning.remove(index);
+            }
+            return 0;
         }
-        if let Some(index) = state.cleaning.iter().rposition(|item| item == &mask) {
-            state.cleaning.remove(index);
+        let deadline = saturating_instant_add(Instant::now(), self.config.cleanup_timeout);
+        loop {
+            {
+                let mut state = self.inner.lock();
+                let mut remove = Vec::new();
+                for id in &ids {
+                    if let Some(entry) = state.processes.get(id)
+                        && matches!(entry.process.lifecycle_handle().try_wait(), Ok(Some(_)))
+                    {
+                        remove.push(id.clone());
+                    }
+                }
+                for id in &remove {
+                    state.processes.remove(id);
+                }
+                let remaining = ids
+                    .iter()
+                    .filter(|id| state.processes.contains_key(*id))
+                    .count();
+                if remaining == 0 {
+                    if let Some(index) = state.cleaning.iter().rposition(|item| item == &mask) {
+                        state.cleaning.remove(index);
+                    }
+                    return ids.len();
+                }
+                if Instant::now() >= deadline {
+                    return ids.len();
+                }
+            }
+            thread::sleep(Duration::from_millis(5).min(self.config.cleanup_timeout));
         }
-        count
     }
 }
 

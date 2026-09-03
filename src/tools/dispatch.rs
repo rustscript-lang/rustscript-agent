@@ -308,9 +308,21 @@ impl DispatchContext {
         self.inner.cancellation.cancel();
     }
 
-    /// Waits for any in-flight serial dispatch to finish, then releases the gate.
+    /// Blocks until in-flight dispatch releases the serial mutex.
     pub fn quiesce(&self) {
         drop(self.inner.serial.lock());
+    }
+
+    /// Deadline-aware quiesce. Returns true if the serial mutex was acquired
+    /// before `timeout` elapsed.
+    pub fn try_quiesce(&self, timeout: Duration) -> bool {
+        self.inner.serial.try_lock_for(timeout).is_some()
+    }
+
+    /// Holds the serial mutex until the returned guard is dropped. Test seam
+    /// for uncooperative in-flight dispatch.
+    pub fn lock_serial(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.serial.lock()
     }
 
     /// Canonical workspace retained at construction.
