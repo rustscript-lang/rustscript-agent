@@ -19,8 +19,8 @@ use serde_json::{Value as JsonValue, json};
 use super::rss_runner::RunCancellation;
 use crate::capabilities::{
     ArtifactCapability, CapabilityError, CapabilityLifecycle, CapabilityOwner, ExecutionLease,
-    FilesystemCapability, LifecycleError, ProcessCapability, ProcessLimits, ProcessSnapshot,
-    capability_error_envelope, parse_prepare_metadata, tool_commit, tool_prepare,
+    FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
+    ProcessSnapshot, capability_error_envelope, parse_prepare_metadata, tool_commit, tool_prepare,
 };
 use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
@@ -365,27 +365,13 @@ impl AgentHostState {
         }
     }
 
-    fn cap_fs_read_range(
-        &self,
-        token: String,
-        path: String,
-        offset: u64,
-        limit: usize,
-    ) -> JsonValue {
+    fn cap_fs_read_range(&self, token: String, path: String, offset: u64, limit: usize) -> Value {
         let Some(fs) = self.filesystem.as_ref() else {
-            return Self::missing_capability("filesystem");
+            return json_to_vm_value(&Self::missing_capability("filesystem"));
         };
         match fs.read_range(&token, &path, offset, limit) {
-            Ok(read) => json!({
-                "ok": true,
-                "kind": "fs_read",
-                "offset": read.offset,
-                "truncated": read.truncated,
-                "hash": read.hash,
-                "len": read.bytes.len(),
-                "bytes": String::from_utf8_lossy(&read.bytes),
-            }),
-            Err(error) => capability_error_envelope(&error),
+            Ok(read) => fs_read_value(read),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
         }
     }
 
@@ -547,18 +533,21 @@ impl AgentHostState {
         }
     }
 
-    fn cap_artifact_get(&self, token: String, id: String) -> JsonValue {
+    fn cap_artifact_get(&self, token: String, id: String) -> Value {
         let Some(artifacts) = self.artifacts.as_ref() else {
-            return Self::missing_capability("artifact");
+            return json_to_vm_value(&Self::missing_capability("artifact"));
         };
         match artifacts.get(&token, &id) {
-            Ok(bytes) => json!({
-                "ok": true,
-                "kind": "artifact_get",
-                "len": bytes.len(),
-                "bytes": String::from_utf8_lossy(&bytes),
-            }),
-            Err(error) => capability_error_envelope(&error),
+            Ok(bytes) => Value::map(vec![
+                (Value::string("ok"), Value::Bool(true)),
+                (Value::string("kind"), Value::string("artifact_get")),
+                (
+                    Value::string("len"),
+                    Value::Int(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+                ),
+                (Value::string("bytes"), Value::bytes(bytes)),
+            ]),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
         }
     }
 
@@ -946,7 +935,7 @@ fn cap_fs_metadata_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>
 
 fn cap_fs_read_range_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    return_json(state.cap_fs_read_range(
+    return_value(state.cap_fs_read_range(
         arg_string(args, 0),
         arg_string(args, 1),
         arg_u64(args, 2),
@@ -1044,7 +1033,7 @@ fn cap_artifact_put_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
 
 fn cap_artifact_get_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    return_json(state.cap_artifact_get(arg_string(args, 0), arg_string(args, 1)))
+    return_value(state.cap_artifact_get(arg_string(args, 0), arg_string(args, 1)))
 }
 
 fn cap_artifact_reference_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -1060,9 +1049,32 @@ fn installed_state(vm: &mut Vm) -> VmResult<AgentHostState> {
 }
 
 fn return_json(value: JsonValue) -> VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(CallReturn::One(json_to_vm_value(
-        &value,
-    ))))
+    return_value(json_to_vm_value(&value))
+}
+
+fn return_value(value: Value) -> VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::One(value)))
+}
+
+fn fs_read_value(read: FsRead) -> Value {
+    let mut fields = vec![
+        (Value::string("ok"), Value::Bool(true)),
+        (Value::string("kind"), Value::string("fs_read")),
+        (
+            Value::string("offset"),
+            Value::Int(i64::try_from(read.offset).unwrap_or(i64::MAX)),
+        ),
+        (Value::string("truncated"), Value::Bool(read.truncated)),
+        (
+            Value::string("len"),
+            Value::Int(i64::try_from(read.bytes.len()).unwrap_or(i64::MAX)),
+        ),
+        (Value::string("bytes"), Value::bytes(read.bytes)),
+    ];
+    if let Some(hash) = read.hash {
+        fields.push((Value::string("hash"), Value::string(hash)));
+    }
+    Value::map(fields)
 }
 
 fn arg_string(args: &[Value], index: usize) -> String {
@@ -1130,6 +1142,12 @@ fn arg_process_limits(value: Option<&Value>) -> ProcessLimits {
     }
     if let Some(total_limit) = fields.get("total_limit").and_then(JsonValue::as_u64) {
         limits.total_limit = usize::try_from(total_limit).unwrap_or(limits.total_limit);
+    }
+    if let Some(stdin_limit) = fields.get("stdin_limit").and_then(JsonValue::as_u64) {
+        limits.stdin_limit = usize::try_from(stdin_limit).unwrap_or(limits.stdin_limit);
+    }
+    if let Some(log_limit) = fields.get("log_limit").and_then(JsonValue::as_u64) {
+        limits.log_limit = usize::try_from(log_limit).unwrap_or(limits.log_limit);
     }
     limits
 }
