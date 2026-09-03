@@ -1321,7 +1321,13 @@ async fn unsafe_pending_provider_request_fails_closed_without_tool() {
         .await
         .expect("admission should succeed");
     service
-        .commit_provider_request(&admitted.run_id, 1, false, &json!({"model": "local-agent"}))
+        .commit_provider_request(
+            &admitted.run_id,
+            1,
+            1,
+            false,
+            &json!({"model": "local-agent"}),
+        )
         .expect("unsafe pending request boundary");
     tokio::time::timeout(WORKER_BUDGET, {
         let service = service.clone();

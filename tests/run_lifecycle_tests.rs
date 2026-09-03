@@ -1694,6 +1694,7 @@ async fn crash_after_provider_request_redrive_retries_once() {
     );
     assert!(assistant_messages(&service, &admitted.session_id).is_empty());
     service.evict_run_handle(&admitted.run_id);
+    service.inject_provider_host(Arc::new(provider.clone()));
     service
         .clone()
         .run_worker(admitted.run_id.clone(), "ignored".to_string())
