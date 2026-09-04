@@ -714,6 +714,48 @@ fn process_output_is_truncated_and_handles_clean_up_on_drop() {
 }
 
 #[test]
+fn process_list_spawn_stdin_and_log_cursors_are_owner_scoped() {
+    let fixture = Fixture::new("proc-list");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/cat".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 2_000,
+                stdout_limit: 64,
+                stderr_limit: 64,
+                total_limit: 64,
+                stdin_limit: 64,
+                log_limit: 64,
+            },
+        )
+        .expect("spawn");
+    let listed = processes.list(&token).expect("list");
+    assert_eq!(listed, vec![spawned.handle.clone()]);
+    let wrote = processes
+        .write_stdin(&token, &spawned.handle, b"hello-cursor\n")
+        .expect("write");
+    assert_eq!(wrote, 13);
+    processes
+        .close_stdin(&token, &spawned.handle)
+        .expect("close");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait");
+    assert!(snapshot.stdout.contains("hello-cursor"));
+    assert_eq!(snapshot.stdout_cursor.offset, 0);
+    assert!(snapshot.stdout_cursor.next_offset > 0);
+    assert!(snapshot.stdout_cursor.eof);
+    let log = processes.log(&token, &spawned.handle, 0, 64).expect("log");
+    assert_eq!(log.stdout_cursor.offset, 0);
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
 fn dropping_execution_lease_reaps_token_owned_process() {
     let fixture = Fixture::new("lease-reap");
     let processes = fixture.processes();

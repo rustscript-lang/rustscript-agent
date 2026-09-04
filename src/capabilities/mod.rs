@@ -22,7 +22,9 @@ pub use lifecycle::{
     CapabilityLifecycleBuilder, DurableToolLifecycle, ExecutionLease, LifecycleClock,
     NeverCancelled, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
-pub use process::{ProcessCapability, ProcessLimits, ProcessSnapshot, ProcessSpawn};
+pub use process::{
+    ProcessCapability, ProcessLimits, ProcessLogCursor, ProcessSnapshot, ProcessSpawn,
+};
 pub use types::{
     CapabilityError, CapabilityOwner, CapabilityRisk, CommitOutcome, DurableStarted,
     LifecycleError, LifecycleLimits, PrepareMetadata, PrepareOutcome, TokenClaims,

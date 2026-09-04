@@ -1,0 +1,486 @@
+use self::types as types;
+use bytes;
+use json;
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn utf8_len(text: string) -> int {
+    bytes::from_utf8(text).length
+}
+
+fn encoded_len(value: map) -> int {
+    let encoded: string = json::encode(value);
+    utf8_len(encoded)
+}
+
+fn unpublished() -> map {
+    {}
+}
+
+fn succeed(content: string, data: map, truncated: bool) -> map {
+    {
+        ok: true,
+        content: content,
+        data: data,
+        error: null,
+        truncated: truncated,
+        artifacts: []
+    }
+}
+
+fn fail(code: string, message: string, data: map) -> map {
+    fail_with(code, message, "", data, false)
+}
+
+fn fail_with(code: string, message: string, content: string, data: map, truncated: bool) -> map {
+    let mut mapped: string = message;
+    if code == "cancelled" {
+        mapped = "tool execution was cancelled";
+    }
+    if code == "deadline_elapsed" {
+        mapped = "process deadline elapsed";
+    }
+    if code == "process_not_found" {
+        mapped = "process not found";
+    }
+    {
+        ok: false,
+        content: content,
+        data: data,
+        error: {
+            code: code,
+            message: mapped
+        },
+        truncated: truncated,
+        artifacts: []
+    }
+}
+
+fn model_content(stdout: string, stderr: string) -> string {
+    let mut content: string = stdout;
+    if utf8_len(stdout) == 0 {
+        if utf8_len(stderr) > 0 {
+            content = stderr;
+        }
+    }
+    content
+}
+
+fn stream_truncated(data: map) -> bool {
+    let mut truncated: bool = false;
+    if map_bool(data, "stdout_truncated", false) {
+        truncated = true;
+    }
+    if map_bool(data, "stderr_truncated", false) {
+        truncated = true;
+    }
+    truncated
+}
+
+fn config_int(config: map, name: string, fallback: int) -> int {
+    map_int(config, name, fallback)
+}
+
+fn argv_is_string_array(arguments: map) -> bool {
+    let mut ok: bool = false;
+    if arguments.has("argv") {
+        if type(arguments["argv"].copy()) == "array" {
+            let argv: array = arguments["argv"];
+            if argv.length > 0 {
+                ok = true;
+                let mut index: int = 0;
+                while ok && index < argv.length {
+                    if type(argv[index].copy()) != "string" {
+                        ok = false;
+                    }
+                    index = index + 1;
+                }
+            }
+        }
+    }
+    ok
+}
+
+fn validate(arguments: map, config: map) -> map {
+    let mut result: map = {ok: true, code: "", message: ""};
+    if argv_is_string_array(arguments) == false {
+        result = {ok: false, code: "invalid_argv", message: "argv must be a non-empty string array"};
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("timeout_ms") {
+            if type(arguments["timeout_ms"].copy()) != "int" {
+                result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
+            } else {
+                let timeout_ms: int = arguments["timeout_ms"];
+                if timeout_ms < 0 {
+                    result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
+                } else {
+                    if timeout_ms == 0 {
+                        result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be positive"};
+                    } else {
+                        if timeout_ms > config_int(config, "max_timeout_ms", 3600000) {
+                            result = {ok: false, code: "invalid_timeout", message: "timeout exceeds the configured bound"};
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("max_output_bytes") {
+            if type(arguments["max_output_bytes"].copy()) != "int" {
+                result = {ok: false, code: "invalid_output_limit", message: "max_output_bytes must be a non-negative integer"};
+            } else {
+                let max_output_bytes: int = arguments["max_output_bytes"];
+                if max_output_bytes < 0 {
+                    result = {ok: false, code: "invalid_output_limit", message: "max_output_bytes must be a non-negative integer"};
+                } else {
+                    if max_output_bytes == 0 {
+                        result = {ok: false, code: "invalid_output_limit", message: "max_output_bytes must be positive"};
+                    } else {
+                        if max_output_bytes > config_int(config, "max_stream_bytes", 1048576) {
+                            result = {ok: false, code: "invalid_output_limit", message: "max_output_bytes exceeds the configured bound"};
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("stdin") {
+            if type(arguments["stdin"].copy()) != "string" {
+                result = {ok: false, code: "invalid_stdin", message: "stdin must be a string"};
+            } else {
+                let stdin_text: string = arguments["stdin"];
+                if utf8_len(stdin_text) > config_int(config, "max_stdin_bytes", 1048576) {
+                    result = {ok: false, code: "invalid_stdin", message: "stdin exceeds the configured bound"};
+                }
+            }
+        }
+    }
+    result
+}
+
+fn snapshot_data(envelope: map, include_background: bool, background: bool) -> map {
+    let mut data: map = {};
+    data.stdout = types::map_string(envelope, "stdout", "");
+    data.stdout_offset = map_int(envelope, "stdout_offset", 0);
+    data.stdout_next_offset = map_int(envelope, "stdout_next_offset", 0);
+    data.stdout_truncated = map_bool(envelope, "stdout_truncated", false);
+    data.stdout_gap = map_bool(envelope, "stdout_gap", false);
+    data.stdout_eof = map_bool(envelope, "stdout_eof", false);
+    data.stderr = types::map_string(envelope, "stderr", "");
+    data.stderr_offset = map_int(envelope, "stderr_offset", 0);
+    data.stderr_next_offset = map_int(envelope, "stderr_next_offset", 0);
+    data.stderr_truncated = map_bool(envelope, "stderr_truncated", false);
+    data.stderr_gap = map_bool(envelope, "stderr_gap", false);
+    data.stderr_eof = map_bool(envelope, "stderr_eof", false);
+    if map_bool(envelope, "running", false) {
+        data.status = "running";
+    } else {
+        if map_bool(envelope, "signaled", false) {
+            data.status = "signaled";
+            if envelope.has("signal") {
+                if type(envelope["signal"].copy()) == "int" {
+                    data.signal = map_int(envelope, "signal", 0);
+                }
+            }
+        } else {
+            if map_bool(envelope, "unknown", false) {
+                data.status = "unknown";
+            } else {
+                data.status = "exited";
+                if envelope.has("exit_code") {
+                    if type(envelope["exit_code"].copy()) == "int" {
+                        data.exit_code = map_int(envelope, "exit_code", 0);
+                    }
+                }
+            }
+        }
+    }
+    if include_background {
+        data.background = background;
+    }
+    data
+}
+
+fn apply_output_bounds(result: map, token: string, max_output_bytes: int) -> map {
+    let mut bounded: map = result;
+    if encoded_len(bounded) > max_output_bytes {
+        bounded.truncated = true;
+        let stdout: string = types::map_string(types::map_map(bounded, "data"), "stdout", "");
+        let stderr: string = types::map_string(types::map_map(bounded, "data"), "stderr", "");
+        let labeled: string = "stdout:\n" + stdout + "\nstderr:\n" + stderr;
+        let payload: bytes = bytes::from_utf8(labeled);
+        let stored: map = cap::artifact_put(token, payload, {kind: "process_output", encoding: "labeled-utf8"});
+        let mut data: map = types::map_map(bounded, "data");
+        if map_bool(stored, "ok", false) {
+            data.stdout = "";
+            data.stderr = "";
+            data.stdout_truncated = true;
+            data.stderr_truncated = true;
+            data.truncated = true;
+            data.overflow = true;
+            data.overflow_reason = "compacted";
+            data.overflow_artifact = types::map_string(stored, "id", "");
+            data.overflow_encoding = "labeled-utf8";
+            data.overflow_stdout_bytes = utf8_len(stdout);
+            data.overflow_stderr_bytes = utf8_len(stderr);
+            bounded.data = data;
+            bounded.truncated = true;
+            let mut artifacts: array = [];
+            artifacts[0] = types::map_string(stored, "id", "");
+            bounded.artifacts = artifacts;
+        } else {
+            data = unpublished();
+            data.overflow = true;
+            data.overflow_reason = "artifact_unavailable";
+            bounded.data = data;
+            bounded.content = "";
+            bounded.truncated = true;
+        }
+        if encoded_len(bounded) > max_output_bytes {
+            bounded.content = "";
+            let mut compact: map = types::map_map(bounded, "data");
+            if compact.has("stdout") {
+                compact.stdout = "";
+            }
+            if compact.has("stderr") {
+                compact.stderr = "";
+            }
+            bounded.data = compact;
+        }
+    }
+    bounded
+}
+
+fn map_spawn_error(envelope: map) -> map {
+    let error: map = types::map_map(envelope, "error");
+    let code: string = types::map_string(error, "code", "spawn_failed");
+    let message: string = types::map_string(error, "message", "process spawn failed");
+    let mut mapped: map = fail(code, message, unpublished());
+    if code == "path_denied" {
+        mapped = fail("invalid_cwd", "cwd is outside the workspace", unpublished());
+    } else {
+        if code == "process_failed" || code == "invalid_request" {
+            mapped = fail("spawn_failed", message, unpublished());
+        } else {
+            if code == "budget_exceeded" {
+                mapped = fail("invalid_stdin", "stdin exceeds the configured bound", unpublished());
+            }
+        }
+    }
+    mapped
+}
+
+fn poll_snapshot(token: string, handle: string, log_limit: int) -> map {
+    cap::process_poll(token, handle, 0, log_limit)
+}
+
+fn view_result(envelope: map, background: bool) -> map {
+    let data: map = snapshot_data(envelope, true, background);
+    succeed(model_content(types::map_string(data, "stdout", ""), types::map_string(data, "stderr", "")), data, stream_truncated(data))
+}
+
+fn fail_from_snapshot(code: string, message: string, envelope: map) -> map {
+    let data: map = snapshot_data(envelope, true, false);
+    fail_with(code, message, model_content(types::map_string(data, "stdout", ""), types::map_string(data, "stderr", "")), data, stream_truncated(data))
+}
+
+fn execute(context: map) -> map {
+    let arguments: map = types::map_map(context, "arguments");
+    let config: map = types::map_map(context, "config");
+    let token: string = types::map_string(context, "execution_token", "");
+    let max_timeout: int = config_int(config, "max_timeout_ms", 3600000);
+    let default_timeout: int = config_int(config, "default_timeout_ms", 30000);
+    let max_stream: int = config_int(config, "max_stream_bytes", 1048576);
+    let max_output: int = config_int(config, "max_output_bytes", 65536);
+    let max_stdin: int = config_int(config, "max_stdin_bytes", 1048576);
+    let mut timeout_ms: int = map_int(arguments, "timeout_ms", default_timeout);
+    if timeout_ms > max_timeout {
+        timeout_ms = max_timeout;
+    }
+    let mut stream_limit: int = map_int(arguments, "max_output_bytes", max_stream);
+    if stream_limit <= 0 {
+        stream_limit = max_stream;
+    }
+    let cwd: string = types::map_string(arguments, "cwd", "");
+    let background: bool = map_bool(arguments, "background", false);
+    let has_stdin: bool = arguments.has("stdin");
+    let stdin_text: string = types::map_string(arguments, "stdin", "");
+    let argv: array = types::map_array(arguments, "argv");
+    let control: map = agent::control_check();
+    let mut outcome: map = fail("cancelled", "tool execution was cancelled", unpublished());
+    if map_bool(control, "ok", false) == false {
+        let error: map = types::map_map(control, "error");
+        outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "tool execution was cancelled"), unpublished());
+    } else {
+        let limits: map = {
+            timeout_ms: timeout_ms,
+            stdout_limit: stream_limit,
+            stderr_limit: stream_limit,
+            total_limit: stream_limit,
+            stdin_limit: max_stdin,
+            log_limit: stream_limit
+        };
+        let spawned: map = cap::process_spawn(token, argv, cwd, [], limits);
+        if map_bool(spawned, "ok", false) == false {
+            outcome = map_spawn_error(spawned);
+        } else {
+            let handle: string = types::map_string(spawned, "handle", "");
+            if has_stdin {
+                let written: map = cap::process_write(token, handle, bytes::from_utf8(stdin_text));
+                if map_bool(written, "ok", false) == false {
+                    let ignored: bool = false;
+                }
+            }
+            if background == false {
+                let closed: map = cap::process_close(token, handle);
+                if map_bool(closed, "ok", false) == false {
+                    let ignored_close: bool = false;
+                }
+            }
+            if background {
+                let mut data: map = {};
+                data.background = true;
+                data.process_id = handle;
+                data.status = "running";
+                outcome = succeed("", data, false);
+            } else {
+                let start: map = cap::clock_monotonic_ms(token);
+                let start_ms: int = map_int(start, "ms", 0);
+                let mut finished: bool = false;
+                outcome = fail("internal_error", "process poll loop exhausted", unpublished());
+                let mut iters: int = 0;
+                while finished == false && iters < 1000000 {
+                    iters = iters + 1;
+                    let again: map = agent::control_check();
+                    if map_bool(again, "ok", false) == false {
+                        let killed: map = cap::process_kill(token, handle);
+                        if map_bool(killed, "ok", false) == false {
+                            let ignored_kill: bool = false;
+                        }
+                        let snap: map = poll_snapshot(token, handle, stream_limit);
+                        let error: map = types::map_map(again, "error");
+                        outcome = fail_from_snapshot(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "tool execution was cancelled"), snap);
+                        finished = true;
+                    } else {
+                        let snap: map = poll_snapshot(token, handle, stream_limit);
+                        if map_bool(snap, "ok", false) == false {
+                            let error: map = types::map_map(snap, "error");
+                            let code: string = types::map_string(error, "code", "process_failed");
+                            if code == "deadline_elapsed" {
+                                outcome = fail_from_snapshot("deadline_elapsed", "process deadline elapsed", snap);
+                            } else {
+                                if code == "cancelled" {
+                                    outcome = fail_from_snapshot("cancelled", "tool execution was cancelled", snap);
+                                } else {
+                                    outcome = fail(code, types::map_string(error, "message", "process failed"), unpublished());
+                                }
+                            }
+                            finished = true;
+                        } else {
+                            if map_bool(snap, "deadline_elapsed", false) {
+                                outcome = fail_from_snapshot("deadline_elapsed", "process deadline elapsed", snap);
+                                finished = true;
+                            } else {
+                                if map_bool(snap, "cancelled", false) {
+                                    outcome = fail_from_snapshot("cancelled", "tool execution was cancelled", snap);
+                                    finished = true;
+                                } else {
+                                    if map_bool(snap, "running", true) == false {
+                                        outcome = view_result(snap, false);
+                                        finished = true;
+                                    } else {
+                                        let now: map = cap::clock_monotonic_ms(token);
+                                        let now_ms: int = map_int(now, "ms", start_ms);
+                                        if now_ms >= start_ms && now_ms - start_ms >= timeout_ms {
+                                            let killed: map = cap::process_kill(token, handle);
+                                            if map_bool(killed, "ok", false) == false {
+                                                let ignored_timeout_kill: bool = false;
+                                            }
+                                            let timed: map = poll_snapshot(token, handle, stream_limit);
+                                            outcome = fail_from_snapshot("deadline_elapsed", "process deadline elapsed", timed);
+                                            finished = true;
+                                        } else {
+                                            agent::sleep_ms(5);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    apply_output_bounds(outcome, token, max_output)
+}
+
+pub fn descriptor() -> map {
+    types::terminal_descriptor()
+}
+
+pub fn run(context: map) -> map {
+    let kind: string = types::map_string(context, "kind", "");
+    let mut result: map = descriptor();
+    if kind != "descriptor" {
+        let arguments: map = types::map_map(context, "arguments");
+        let config: map = types::map_map(context, "config");
+        let validated: map = validate(arguments, config);
+        if map_bool(validated, "ok", false) == false {
+            result = fail(types::map_string(validated, "code", "invalid_arguments"), types::map_string(validated, "message", "invalid arguments"), unpublished());
+        } else {
+            let prepare: map = types::map_map(context, "prepare");
+            let prepared: map = agent_runtime::tool_prepare({
+                run_id: types::map_string(prepare, "run_id", ""),
+                call_id: types::map_string(prepare, "call_id", ""),
+                name: types::map_string(prepare, "name", "terminal"),
+                argument_digest: types::map_string(prepare, "argument_digest", ""),
+                registry_identity: types::map_string(prepare, "registry_identity", ""),
+                risk_class: "execute",
+                summary: types::map_string(prepare, "summary", "terminal")
+            });
+            if map_bool(prepared, "ok", false) == false {
+                let error: map = types::map_map(prepared, "error");
+                result = fail(types::map_string(error, "code", "internal_error"), types::map_string(error, "message", "prepare failed"), unpublished());
+            } else {
+                if types::map_string(prepared, "kind", "") == "replay" {
+                    result = types::map_map(prepared, "result");
+                } else {
+                    let mut exec_context: map = context;
+                    exec_context.execution_token = types::map_string(prepared, "execution_token", "");
+                    let canonical: map = execute(exec_context);
+                    let committed: map = agent_runtime::tool_commit(types::map_string(prepared, "execution_token", ""), canonical);
+                    if map_bool(committed, "ok", false) == false {
+                        let error: map = types::map_map(committed, "error");
+                        result = fail(types::map_string(error, "code", "internal_error"), types::map_string(error, "message", "commit failed"), unpublished());
+                    } else {
+                        result = types::map_map(committed, "result");
+                    }
+                }
+            }
+        }
+    }
+    result
+}

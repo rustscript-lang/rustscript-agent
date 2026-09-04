@@ -528,7 +528,9 @@ impl AgentHostState {
             return Self::missing_capability("process");
         };
         match processes.write_stdin(&token, &handle, &bytes) {
-            Ok(()) => json!({"ok": true, "kind": "process_write"}),
+            Ok(wrote_bytes) => {
+                json!({"ok": true, "kind": "process_write", "wrote_bytes": wrote_bytes})
+            }
             Err(error) => capability_error_envelope(&error),
         }
     }
@@ -1453,9 +1455,24 @@ fn process_snapshot_envelope(kind: &str, snapshot: &ProcessSnapshot) -> JsonValu
         "handle": snapshot.handle,
         "running": snapshot.running,
         "exit_code": snapshot.exit_code,
+        "signal": snapshot.signal,
         "stdout": snapshot.stdout,
         "stderr": snapshot.stderr,
         "truncated": snapshot.truncated,
+        "stdout_offset": snapshot.stdout_cursor.offset,
+        "stdout_next_offset": snapshot.stdout_cursor.next_offset,
+        "stdout_truncated": snapshot.stdout_cursor.truncated,
+        "stdout_gap": snapshot.stdout_cursor.gap,
+        "stdout_eof": snapshot.stdout_cursor.eof,
+        "stderr_offset": snapshot.stderr_cursor.offset,
+        "stderr_next_offset": snapshot.stderr_cursor.next_offset,
+        "stderr_truncated": snapshot.stderr_cursor.truncated,
+        "stderr_gap": snapshot.stderr_cursor.gap,
+        "stderr_eof": snapshot.stderr_cursor.eof,
+        "signaled": snapshot.signaled,
+        "unknown": snapshot.unknown,
+        "deadline_elapsed": snapshot.deadline_elapsed,
+        "cancelled": snapshot.cancelled,
     })
 }
 

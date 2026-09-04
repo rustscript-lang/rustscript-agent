@@ -57,15 +57,32 @@ pub struct ProcessSpawn {
     pub pid: u32,
 }
 
+/// Cursor metadata for one captured stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessLogCursor {
+    pub offset: u64,
+    pub next_offset: u64,
+    pub truncated: bool,
+    pub gap: bool,
+    pub eof: bool,
+}
+
 /// Bounded process snapshot used by poll/wait/log.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessSnapshot {
     pub handle: String,
     pub running: bool,
     pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     pub truncated: bool,
+    pub stdout_cursor: ProcessLogCursor,
+    pub stderr_cursor: ProcessLogCursor,
+    pub signaled: bool,
+    pub unknown: bool,
+    pub deadline_elapsed: bool,
+    pub cancelled: bool,
 }
 
 struct OwnedProcess {
@@ -168,6 +185,19 @@ impl ProcessCapability {
         env_names: &[String],
         limits: ProcessLimits,
     ) -> Result<ProcessSpawn, CapabilityError> {
+        self.spawn_with(token, argv, cwd, env_names, limits, None)
+    }
+
+    /// Spawns argv with optional stdin bytes attached at start.
+    pub fn spawn_with(
+        &self,
+        token: &str,
+        argv: &[String],
+        cwd: &str,
+        env_names: &[String],
+        limits: ProcessLimits,
+        stdin: Option<&[u8]>,
+    ) -> Result<ProcessSpawn, CapabilityError> {
         let claims = self.authorize(token, CapabilityRisk::Execute)?;
         if argv.is_empty() {
             return Err(CapabilityError::new(
@@ -176,6 +206,12 @@ impl ProcessCapability {
             ));
         }
         let limits = self.clamp_limits(limits, &claims);
+        if stdin.is_some_and(|stdin| stdin.len() > limits.stdin_limit) {
+            return Err(CapabilityError::new(
+                "budget_exceeded",
+                "stdin exceeds the configured bound",
+            ));
+        }
         let directory = self
             .inner
             .root
@@ -199,10 +235,13 @@ impl ProcessCapability {
                 request = request.with_env(name.clone(), value);
             }
         }
+        if let Some(stdin) = stdin {
+            request = request.with_stdin(stdin.to_vec());
+        }
         let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
         let handle = process.lifecycle_handle();
         let pid = handle.pid();
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().simple().to_string();
         self.inner
             .table
             .lock()
@@ -250,14 +289,22 @@ impl ProcessCapability {
                 "limit must be positive",
             ));
         }
+        let _ = cursor;
         let owned = self.lookup(token, handle)?;
-        let _ = owned.handle.poll().map_err(map_process_error)?;
-        Ok(snapshot(
-            &owned.handle,
-            handle,
-            cursor,
-            limit.min(self.inner.host_limits.log_limit),
-        ))
+        let poll_result = owned.handle.poll();
+        let mut snap = snapshot(&owned.handle, handle, None);
+        match poll_result {
+            Ok(_) => Ok(snap),
+            Err(BoundedProcessError::DeadlineElapsed) => {
+                snap.deadline_elapsed = true;
+                Ok(snap)
+            }
+            Err(BoundedProcessError::Cancelled) => {
+                snap.cancelled = true;
+                Ok(snap)
+            }
+            Err(error) => Err(map_process_error(error)),
+        }
     }
 
     /// Waits until exit, caller timeout, deadline, or cancellation.
@@ -274,12 +321,7 @@ impl ProcessCapability {
             Ok(_) | Err(BoundedProcessError::DeadlineElapsed) => {}
             Err(error) => return Err(map_process_error(error)),
         }
-        Ok(snapshot(
-            &owned.handle,
-            handle,
-            0,
-            self.inner.host_limits.log_limit,
-        ))
+        Ok(snapshot(&owned.handle, handle, None))
     }
 
     /// Returns a bounded log window.
@@ -297,12 +339,8 @@ impl ProcessCapability {
             ));
         }
         let owned = self.lookup(token, handle)?;
-        Ok(snapshot(
-            &owned.handle,
-            handle,
-            cursor,
-            limit.min(self.inner.host_limits.log_limit),
-        ))
+        let _ = limit.min(self.inner.host_limits.log_limit);
+        Ok(snapshot(&owned.handle, handle, Some(cursor)))
     }
 
     /// Writes bytes to child stdin.
@@ -311,7 +349,7 @@ impl ProcessCapability {
         token: &str,
         handle: &str,
         bytes: &[u8],
-    ) -> Result<(), CapabilityError> {
+    ) -> Result<usize, CapabilityError> {
         let owned = self.lookup(token, handle)?;
         if bytes.len() > self.inner.host_limits.stdin_limit {
             return Err(CapabilityError::new(
@@ -319,14 +357,33 @@ impl ProcessCapability {
                 "stdin write exceeds the configured bound",
             ));
         }
-        owned.handle.write_stdin(bytes).map_err(map_process_error)?;
-        Ok(())
+        owned.handle.write_stdin(bytes).map_err(map_process_error)
     }
 
     /// Closes child stdin.
     pub fn close_stdin(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
         let owned = self.lookup(token, handle)?;
-        owned.handle.close_stdin().map_err(map_process_error)
+        match owned.handle.close_stdin() {
+            Ok(()) | Err(BoundedProcessError::StdinClosed) => Ok(()),
+            Err(error) => Err(map_process_error(error)),
+        }
+    }
+
+    /// Lists opaque handles owned by this token's owner and generation.
+    pub fn list(&self, token: &str) -> Result<Vec<String>, CapabilityError> {
+        let claims = self.authorize(token, CapabilityRisk::Execute)?;
+        let table = self
+            .inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(table
+            .iter()
+            .filter(|(_, owned)| {
+                owned.owner_key == claims.owner.key() && owned.generation == claims.generation
+            })
+            .map(|(handle, _)| handle.clone())
+            .collect())
     }
 
     /// Kills the process tree bound to `handle`.
@@ -431,32 +488,45 @@ fn terminate_owned(owned: &OwnedProcess) {
     let _ = owned.handle.shutdown();
 }
 
-fn snapshot(handle: &BoundedProcessHandle, id: &str, cursor: u64, limit: usize) -> ProcessSnapshot {
-    let stdout = handle.stdout_snapshot_from(cursor);
-    let stderr = handle.stderr_snapshot_from(cursor);
-    let stdout_truncated = stdout.truncated;
-    let stderr_truncated = stderr.truncated;
-    let stdout_len = stdout.len();
-    let stderr_len = stderr.len();
-    let mut stdout_bytes = stdout.bytes;
-    let mut stderr_bytes = stderr.bytes;
-    if limit != usize::MAX {
-        stdout_bytes.truncate(limit);
-        stderr_bytes.truncate(limit);
-    }
-    let truncated = stdout_truncated
-        || stderr_truncated
-        || stdout_bytes.len() < stdout_len
-        || stderr_bytes.len() < stderr_len;
-    let running = handle.terminal_status().is_none();
-    let exit_code = handle.terminal_status().and_then(ProcessStatus::exit_code);
+fn snapshot(handle: &BoundedProcessHandle, id: &str, offset: Option<u64>) -> ProcessSnapshot {
+    let stdout = match offset {
+        Some(offset) => handle.stdout_snapshot_from(offset),
+        None => handle.stdout_snapshot(),
+    };
+    let stderr = match offset {
+        Some(offset) => handle.stderr_snapshot_from(offset),
+        None => handle.stderr_snapshot(),
+    };
+    let status = handle.terminal_status();
+    let running = status.is_none();
+    let signaled = matches!(status, Some(ProcessStatus::Signaled { .. }));
+    let unknown = matches!(status, Some(ProcessStatus::Unknown));
     ProcessSnapshot {
         handle: id.to_string(),
         running,
-        exit_code,
-        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-        truncated,
+        exit_code: status.and_then(ProcessStatus::exit_code),
+        signal: status.and_then(ProcessStatus::signal),
+        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+        truncated: stdout.truncated || stderr.truncated,
+        stdout_cursor: ProcessLogCursor {
+            offset: stdout.offset,
+            next_offset: stdout.next_offset,
+            truncated: stdout.truncated,
+            gap: stdout.gap,
+            eof: stdout.eof,
+        },
+        stderr_cursor: ProcessLogCursor {
+            offset: stderr.offset,
+            next_offset: stderr.next_offset,
+            truncated: stderr.truncated,
+            gap: stderr.gap,
+            eof: stderr.eof,
+        },
+        signaled,
+        unknown,
+        deadline_elapsed: false,
+        cancelled: false,
     }
 }
 
