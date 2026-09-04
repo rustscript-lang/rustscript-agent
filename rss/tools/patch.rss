@@ -574,7 +574,7 @@ fn count_matches(source: string, needle: string) -> map {
     let mut index: int = 0;
     let mut scanned: int = 0;
     let mut result: map = { ok: true, count: 0, code: "", message: "" };
-    while map_bool(result, "ok", false) && index + needle.length <= source.length {
+    while map_bool(result, "ok", false) && can_scan(index, needle.length, source.length) {
         if source[index:(index + needle.length)] == needle {
             count = count + 1;
             index = index + needle.length;
@@ -601,27 +601,162 @@ fn count_matches(source: string, needle: string) -> map {
     result
 }
 
-fn replace_text(source: string, old: string, new: string, limit: int) -> string {
-    let mut out: string = "";
-    let mut start: int = 0;
-    let mut index: int = 0;
-    let mut replaced: int = 0;
-    while index + old.length <= source.length {
-        if replaced == limit {
-            index = source.length;
-        } else {
-            if source[index:(index + old.length)] == old {
-                out = out + source[start:index] + new;
-                index = index + old.length;
-                start = index;
-                replaced = replaced + 1;
-            } else {
-                index = index + 1;
+fn can_scan(index: int, needle_len: int, source_len: int) -> bool {
+    let mut result: bool = false;
+    if index >= 0 {
+        if needle_len >= 0 {
+            if source_len >= 0 {
+                if needle_len <= source_len {
+                    if index <= source_len - needle_len {
+                        result = true;
+                    }
+                }
             }
         }
     }
-    out = out + source[start:source.length];
-    out
+    result
+}
+
+fn chunk_bound(limit: int) -> map {
+    let mut result: map = { ok: false, value: 0 };
+    if limit >= 0 {
+        if limit <= 2147483646 {
+            result = { ok: true, value: limit * 2 + 1 };
+        }
+    }
+    result
+}
+
+fn join_string_chunks(chunks: array) -> string {
+    let mut current: array = chunks.copy();
+    while current.length > 1 {
+        let mut next: array = [];
+        let mut i: int = 0;
+        let current_len: int = current.length;
+        while i < current_len {
+            if i + 1 < current_len {
+                let left: string = current[i].copy();
+                let right: string = current[i + 1].copy();
+                let joined: string = left + right;
+                next[next.length] = joined;
+                i = i + 2;
+            } else {
+                let leftover: string = current[i].copy();
+                next[next.length] = leftover;
+                i = i + 1;
+            }
+        }
+        current = next.copy();
+    }
+    let mut text: string = "";
+    if current.length == 1 {
+        text = current[0].copy();
+    }
+    text
+}
+
+fn replace_text(source: string, old: string, new: string, limit: int) -> map {
+    let mut result: map = { ok: true, text: "", code: "", message: "" };
+    let bound: map = chunk_bound(limit);
+    if map_bool(bound, "ok", false) == false {
+        result = {
+            ok: false,
+            text: "",
+            code: "internal_error",
+            message: "replacement chunk bound overflow"
+        };
+    } else {
+        let max_chunks: int = map_int(bound, "value", 0);
+        let mut chunks: array = [];
+        let mut start: int = 0;
+        let mut index: int = 0;
+        let mut replaced: int = 0;
+        let mut scanned: int = 0;
+        while map_bool(result, "ok", false) && can_scan(index, old.length, source.length) {
+            if replaced == limit {
+                index = source.length;
+            } else {
+                if source[index:(index + old.length)] == old {
+                    let prefix: string = source[start:index];
+                    if prefix.length > 0 {
+                        if chunks.length >= max_chunks {
+                            result = {
+                                ok: false,
+                                text: "",
+                                code: "internal_error",
+                                message: "replacement chunk bound exceeded"
+                            };
+                        } else {
+                            chunks[chunks.length] = prefix;
+                        }
+                    }
+                    if map_bool(result, "ok", false) {
+                        if new.length > 0 {
+                            if chunks.length >= max_chunks {
+                                result = {
+                                    ok: false,
+                                    text: "",
+                                    code: "internal_error",
+                                    message: "replacement chunk bound exceeded"
+                                };
+                            } else {
+                                chunks[chunks.length] = new.copy();
+                            }
+                        }
+                    }
+                    if map_bool(result, "ok", false) {
+                        index = index + old.length;
+                        start = index;
+                        replaced = replaced + 1;
+                    }
+                } else {
+                    index = index + 1;
+                }
+            }
+            scanned = scanned + 1;
+            if scanned == 64 {
+                scanned = 0;
+                let checked: map = control_failure();
+                if map_bool(checked, "ok", false) == false {
+                    result = {
+                        ok: false,
+                        text: "",
+                        code: types::map_string(checked, "code", "cancelled"),
+                        message: types::map_string(checked, "message", "")
+                    };
+                }
+            }
+        }
+        if map_bool(result, "ok", false) {
+            let tail: string = source[start:source.length];
+            if tail.length > 0 {
+                if chunks.length >= max_chunks {
+                    result = {
+                        ok: false,
+                        text: "",
+                        code: "internal_error",
+                        message: "replacement chunk bound exceeded"
+                    };
+                } else {
+                    chunks[chunks.length] = tail;
+                }
+            }
+        }
+        if map_bool(result, "ok", false) {
+            let finished: map = control_failure();
+            if map_bool(finished, "ok", false) == false {
+                result = {
+                    ok: false,
+                    text: "",
+                    code: types::map_string(finished, "code", "cancelled"),
+                    message: types::map_string(finished, "message", "")
+                };
+            } else {
+                result.text = join_string_chunks(chunks);
+            }
+        }
+    }
+    result
 }
 
 pub fn descriptor() -> map {
@@ -703,7 +838,7 @@ pub fn execute(context: map, arguments: map) -> map {
                     result = fail_host(meta);
                 } else {
                     let file_type: string = types::map_string(meta, "file_type", "");
-                    if file_type != "file" {
+                    if file_type == "directory" || file_type == "other" {
                         result = fail("path_denied", "read-only open requires a regular file", unpublished());
                     } else {
                         let file_len: int = map_int(meta, "len", 0);
@@ -771,33 +906,38 @@ pub fn execute(context: map, arguments: map) -> map {
                                             if replace_all {
                                                 limit = matches;
                                             }
-                                            let updated: string = replace_text(source, old_string, new_string, limit);
-                                            if utf8_len(updated) > max_patch_bytes {
-                                                result = fail("patch_too_large", "result exceeds the configured patch budget", unpublished());
+                                            let replaced_text: map = replace_text(source, old_string, new_string, limit);
+                                            if map_bool(replaced_text, "ok", false) == false {
+                                                result = fail(types::map_string(replaced_text, "code", "cancelled"), types::map_string(replaced_text, "message", ""), unpublished());
                                             } else {
-                                                let before_publish: map = control_failure();
-                                                if map_bool(before_publish, "ok", false) == false {
-                                                    result = fail(types::map_string(before_publish, "code", "cancelled"), types::map_string(before_publish, "message", ""), unpublished());
+                                                let updated: string = types::map_string(replaced_text, "text", "");
+                                                if utf8_len(updated) > max_patch_bytes {
+                                                    result = fail("patch_too_large", "result exceeds the configured patch budget", unpublished());
                                                 } else {
-                                                    let payload: bytes = bytes::from_utf8(updated);
-                                                    let written: map = cap::fs_write_atomic(token, path, expected_hash, payload);
-                                                    if map_bool(written, "ok", false) == false {
-                                                        result = fail_host(written);
+                                                    let before_publish: map = control_failure();
+                                                    if map_bool(before_publish, "ok", false) == false {
+                                                        result = fail(types::map_string(before_publish, "code", "cancelled"), types::map_string(before_publish, "message", ""), unpublished());
                                                     } else {
-                                                        let preview: string = bounded_diff(path, source, updated, max_patch_preview_bytes);
-                                                        let mut published: map = succeed(
-                                                            preview,
-                                                            {
-                                                                publication: "published",
-                                                                durable: map_bool(written, "durable", true),
-                                                                staging_cleaned: map_bool(written, "staging_cleaned", true),
-                                                                bytes: map_int(written, "len", utf8_len(updated)),
-                                                                replacements: replacements
-                                                            },
-                                                            false,
-                                                            []
-                                                        );
-                                                        result = shrink_result(published, max_output_bytes, token);
+                                                        let payload: bytes = bytes::from_utf8(updated);
+                                                        let written: map = cap::fs_write_atomic(token, path, expected_hash, payload);
+                                                        if map_bool(written, "ok", false) == false {
+                                                            result = fail_host(written);
+                                                        } else {
+                                                            let preview: string = bounded_diff(path, source, updated, max_patch_preview_bytes);
+                                                            let mut published: map = succeed(
+                                                                preview,
+                                                                {
+                                                                    publication: "published",
+                                                                    durable: map_bool(written, "durable", true),
+                                                                    staging_cleaned: map_bool(written, "staging_cleaned", true),
+                                                                    bytes: map_int(written, "len", utf8_len(updated)),
+                                                                    replacements: replacements
+                                                                },
+                                                                false,
+                                                                []
+                                                            );
+                                                            result = shrink_result(published, max_output_bytes, token);
+                                                        }
                                                     }
                                                 }
                                             }

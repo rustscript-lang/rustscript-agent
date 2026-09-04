@@ -1109,6 +1109,54 @@ fn write_symlink_hardlink_and_directory_match_native() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn patch_leaf_and_intermediate_symlink_match_native_without_touching_outside() {
+    let fixture = Fixture::new("patch-symlink");
+    let outside = fixture.parent.join("secret.txt");
+    fs::write(&outside, "outside-secret\n").unwrap();
+    fs::write(fixture.root.join("target.txt"), "inside-needle\n").unwrap();
+    symlink(&outside, fixture.root.join("leaf-link")).unwrap();
+    fs::create_dir(fixture.root.join("nested")).unwrap();
+    symlink(fixture.root.join("nested"), fixture.root.join("dir-link")).unwrap();
+    fs::write(fixture.root.join("nested/inner.txt"), "inner-needle\n").unwrap();
+    fs::create_dir(fixture.root.join("dir")).unwrap();
+
+    assert_patch_eq(
+        &fixture,
+        || {},
+        json!({"path": "leaf-link", "old_string": "outside-secret", "new_string": "changed", "replace_all": false}),
+    );
+    assert!(
+        fixture
+            .root
+            .join("leaf-link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "leaf symlink must remain a symlink"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside-secret\n");
+
+    assert_patch_eq(
+        &fixture,
+        || {},
+        json!({"path": "dir-link/inner.txt", "old_string": "inner-needle", "new_string": "changed", "replace_all": false}),
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("nested/inner.txt")).unwrap(),
+        "inner-needle\n"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside-secret\n");
+
+    assert_patch_eq(
+        &fixture,
+        || {},
+        json!({"path": "dir", "old_string": "x", "new_string": "y", "replace_all": false}),
+    );
+}
+
 #[test]
 fn patch_zero_one_multiple_and_replace_all_match_native() {
     let fixture = Fixture::new("patch-basic");
@@ -1172,6 +1220,29 @@ fn patch_overlapping_replacement_containing_search_and_newlines_match_native() {
         || fs::write(root.join("del.txt"), "keep needle keep").unwrap(),
         json!({"path": "del.txt", "old_string": "needle", "new_string": "", "replace_all": false}),
     );
+}
+
+#[test]
+fn patch_high_match_count_stays_in_budget_and_matches_native() {
+    let fixture = Fixture::new("patch-high-match");
+    let source = "a".repeat(2048);
+    let root = fixture.root.clone();
+    let source_for_setup = source.clone();
+    assert_patch_eq(
+        &fixture,
+        move || fs::write(root.join("many.txt"), &source_for_setup).unwrap(),
+        json!({
+            "path": "many.txt",
+            "old_string": "a",
+            "new_string": "b",
+            "replace_all": true
+        }),
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("many.txt")).unwrap(),
+        "b".repeat(2048)
+    );
+    assert!(leftover_temps(&fixture.root).is_empty());
 }
 
 #[test]
@@ -2090,6 +2161,50 @@ fn run_cancellation_is_observed_by_control_check_before_publish() {
 }
 
 #[test]
+fn patch_mid_replace_cancellation_leaves_target_and_temps_clean() {
+    let fixture = Fixture::new("patch-mid-replace-cancel");
+    let source = "a".repeat(256);
+    fs::write(fixture.root.join("keep.txt"), &source).unwrap();
+    // execute start (1) + count_matches cadences for 256 scans (4) = 5 checks
+    // without replace-loop checks. The 7th check exists only once replace_text
+    // itself observes control at cadence; otherwise the write would succeed.
+    let nth = 7_u64;
+    let (cancel, hook, seen) = cancel_on_nth(nth, CancellationReason::Requested);
+    let mut exec = mutation_exec(
+        "patch.rss",
+        "patch",
+        json!({
+            "path": "keep.txt",
+            "old_string": "a",
+            "new_string": "b",
+            "replace_all": true
+        }),
+        MemoryDurable::new(),
+        "call-mid-replace-cancel",
+    );
+    exec.run_cancellation = Some(cancel);
+    exec.control_hook = Some(hook);
+    exec.unlimited_fuel = true;
+    let rss = run_rss_exec(&fixture, &fixture.config(), exec);
+    assert!(
+        seen.load(Ordering::SeqCst) >= nth,
+        "replace_text control_check was not observed"
+    );
+    assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
+    assert_eq!(rss.result["error"]["code"], json!("cancelled"));
+    assert_eq!(
+        rss.result["error"]["message"],
+        json!("tool execution was cancelled")
+    );
+    assert_eq!(rss.result["data"]["publication"], json!("not_published"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        source
+    );
+    assert!(leftover_temps(&fixture.root).is_empty());
+}
+
+#[test]
 fn patch_pre_publish_hook_cancel_and_deadline_leave_target_and_temps_clean() {
     let fixture = Fixture::new("patch-pre-publish-hook");
     fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
@@ -2171,9 +2286,8 @@ fn patch_pre_publish_hook_cancel_and_deadline_leave_target_and_temps_clean() {
 }
 
 #[test]
-fn publication_indeterminate_maps_to_native_publication_status() {
+fn publication_indeterminate_after_publish_maps_real_host_envelope() {
     let fixture = Fixture::new("pub-indeterminate");
-    fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
     let durable = MemoryDurable::new();
     let lifecycle = Arc::new(build_lifecycle(
         &fixture.root,
@@ -2191,11 +2305,11 @@ fn publication_indeterminate_maps_to_native_publication_status() {
         )
         .expect("fs"),
     );
-    fs_cap.inject_before_write(Arc::new(|_, _| {
-        Err(CapabilityError::new(
-            "publication_indeterminate",
-            "write publication could not be classified",
-        ))
+    let published = Arc::new(AtomicU64::new(0));
+    let published_hook = Arc::clone(&published);
+    fs_cap.inject_after_publish(Arc::new(move |_, _| {
+        published_hook.fetch_add(1, Ordering::SeqCst);
+        true
     }));
     for (module, tool_name, arguments, call_id) in [
         (
@@ -2211,7 +2325,8 @@ fn publication_indeterminate_maps_to_native_publication_status() {
             "call-pub-patch",
         ),
     ] {
-        let mut exec = mutation_exec(module, tool_name, arguments, MemoryDurable::new(), call_id);
+        fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
+        let mut exec = mutation_exec(module, tool_name, arguments, Arc::clone(&durable), call_id);
         exec.shared_lifecycle = Some(Arc::clone(&lifecycle));
         exec.shared_filesystem = Some(Arc::clone(&fs_cap));
         let rss = run_rss_exec(&fixture, &fixture.config(), exec);
@@ -2220,13 +2335,46 @@ fn publication_indeterminate_maps_to_native_publication_status() {
             rss.result["error"]["code"],
             json!("publication_indeterminate")
         );
+        assert_eq!(
+            rss.result["error"]["message"],
+            json!("write publication could not be classified")
+        );
         assert_eq!(rss.result["data"]["publication"], json!("indeterminate"));
+        assert!(
+            rss.result["data"].get("durable").is_none(),
+            "indeterminate must not claim durable success: {}",
+            rss.result
+        );
+        assert!(
+            rss.result["data"].get("staging_cleaned").is_none(),
+            "indeterminate must not claim staging cleanup success: {}",
+            rss.result
+        );
         assert_eq!(
             fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
-            "keep\n"
+            "changed\n",
+            "{tool_name} target may contain published bytes"
         );
         assert!(leftover_temps(&fixture.root).is_empty());
+        assert!(
+            rss.started > 0,
+            "{tool_name} lifecycle started before indeterminate"
+        );
+        let stored = durable
+            .stored_result(call_id)
+            .expect("committed failure result");
+        assert_eq!(stored["ok"], json!(false), "stored={stored}");
+        assert_eq!(
+            stored["error"]["code"],
+            json!("publication_indeterminate"),
+            "lifecycle must not falsely complete"
+        );
     }
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        2,
+        "after-publish seam must run for write_file and patch"
+    );
 }
 
 #[test]
@@ -2402,16 +2550,7 @@ fn nested_and_swapped_parent_symlink_race_does_not_touch_outside_secret() {
     )
     .unwrap();
 
-    assert_write_eq(
-        &fixture,
-        || {},
-        json!({"path": "nested/swapped/secret.txt", "content": "changed\n"}),
-    );
-    assert_write_eq(
-        &fixture,
-        || {},
-        json!({"path": "nested/real/link.txt", "content": "changed\n"}),
-    );
+    // Patch the live leaf symlink before any write can replace the link.
     assert_patch_eq(
         &fixture,
         || {},
@@ -2421,6 +2560,31 @@ fn nested_and_swapped_parent_symlink_race_does_not_touch_outside_secret() {
             "new_string": "changed",
             "replace_all": false
         }),
+    );
+    assert!(
+        fixture
+            .root
+            .join("nested/real/link.txt")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "leaf symlink must remain a symlink after patch"
+    );
+    assert_eq!(
+        fs::read_to_string(outside_dir.join("secret.txt")).unwrap(),
+        "outside-secret\n"
+    );
+
+    assert_write_eq(
+        &fixture,
+        || {},
+        json!({"path": "nested/swapped/secret.txt", "content": "changed\n"}),
+    );
+    assert_write_eq(
+        &fixture,
+        || {},
+        json!({"path": "nested/real/link.txt", "content": "changed\n"}),
     );
     assert_eq!(
         fs::read_to_string(outside_dir.join("secret.txt")).unwrap(),
