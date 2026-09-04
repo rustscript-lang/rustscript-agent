@@ -81,6 +81,8 @@ pub struct FsWrite {
     pub staging_cleaned: bool,
 }
 
+type BeforeWriteHook = Arc<dyn Fn(&str, &[u8]) -> Result<(), CapabilityError> + Send + Sync>;
+
 /// Confined filesystem capability bound to one lifecycle owner.
 #[derive(Clone)]
 pub struct FilesystemCapability {
@@ -90,6 +92,7 @@ pub struct FilesystemCapability {
     root: Arc<ConfinedFsRoot>,
     frozen: Arc<FrozenDir>,
     cas_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    before_write: Arc<Mutex<Option<BeforeWriteHook>>>,
 }
 
 impl FilesystemCapability {
@@ -127,7 +130,19 @@ impl FilesystemCapability {
             root: Arc::new(root),
             frozen: Arc::new(frozen),
             cas_locks: Arc::new(Mutex::new(HashMap::new())),
+            before_write: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Installs a production-neutral pre-publish hook for tests.
+    ///
+    /// The hook runs after authorization and the write-size bound, immediately
+    /// before the per-path CAS lock and atomic publish. It is tool-name-agnostic.
+    pub fn inject_before_write(&self, hook: BeforeWriteHook) {
+        *self
+            .before_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     /// Stats a workspace-relative path without following a leaf symlink.
@@ -249,6 +264,14 @@ impl FilesystemCapability {
                 "budget_exceeded",
                 "requested write exceeds the configured bound",
             ));
+        }
+        if let Some(hook) = self
+            .before_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook(path, bytes)?;
         }
         let lock = self.lock_for(path);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

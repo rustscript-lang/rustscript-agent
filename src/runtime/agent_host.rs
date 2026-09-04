@@ -10,9 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostFunctionRegistry,
-    HostFunctionSchema, HostParamSchema, HostTypeSchema, Value, Vm, VmError, VmResult,
-    catalog_import_schemas, standard_host_catalog,
+    CallOutcome, CallReturn, CancellationReason, HostApiBuilder, HostApiCatalog,
+    HostFunctionRegistry, HostFunctionSchema, HostParamSchema, HostTypeSchema, Value, Vm, VmError,
+    VmResult, catalog_import_schemas, standard_host_catalog,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -258,6 +258,8 @@ pub trait AgentProviderHost: Send + Sync {
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue;
 }
 
+pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
+
 /// Injectable host bridges for one compiled runner.
 #[derive(Clone, Default)]
 pub struct AgentHostBridges {
@@ -273,6 +275,9 @@ pub struct AgentHostBridges {
     pub filesystem: Option<Arc<FilesystemCapability>>,
     pub processes: Option<Arc<ProcessCapability>>,
     pub artifacts: Option<Arc<ArtifactCapability>>,
+    /// Optional test hook invoked from `agent::control_check` before reading
+    /// cancellation/deadline. Production callers leave this unset.
+    pub control_hook: Option<ControlCheckHook>,
 }
 
 /// Per-VM state installed before `run(context)`.
@@ -290,12 +295,21 @@ pub struct AgentHostState {
     pub processes: Option<Arc<ProcessCapability>>,
     pub artifacts: Option<Arc<ArtifactCapability>>,
     pub(crate) leases: Arc<Mutex<HashMap<String, ExecutionLease>>>,
+    pub(crate) control_hook: Option<ControlCheckHook>,
 }
 
 impl AgentHostState {
     fn control_error(&self) -> Option<JsonValue> {
-        if self.cancellation.requested().is_some() {
-            return Some(typed_fail("cancelled", "run was cancelled"));
+        if let Some(hook) = &self.control_hook {
+            hook(&self.cancellation);
+        }
+        if let Some(reason) = self.cancellation.requested() {
+            return Some(match reason {
+                CancellationReason::Deadline => {
+                    typed_fail("deadline_elapsed", "run deadline elapsed")
+                }
+                _ => typed_fail("cancelled", "run was cancelled"),
+            });
         }
         if self.cancellation.deadline_passed() {
             return Some(typed_fail("deadline_elapsed", "run deadline elapsed"));
