@@ -350,13 +350,15 @@ impl AgentHostState {
             ));
         };
         let envelope = tool_commit(lifecycle, owner, token, result.clone());
-        if envelope.get("ok") == Some(&JsonValue::Bool(true))
-            && let Some(mut lease) = self
-                .leases
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(token)
-        {
+        let Some(mut lease) = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(token)
+        else {
+            return envelope;
+        };
+        if envelope.get("ok") == Some(&JsonValue::Bool(true)) {
             lease.disarm();
         }
         envelope
@@ -579,11 +581,17 @@ impl AgentHostState {
             return Self::missing_capability("lifecycle");
         };
         match lifecycle.authorize(owner, &token, CapabilityRisk::Read) {
-            Ok(_) => json!({
-                "ok": true,
-                "kind": "clock_monotonic",
-                "ms": lifecycle.now_ms(),
-            }),
+            Ok(_) => match lifecycle.monotonic_ms() {
+                Some(ms) if ms <= i64::MAX as u64 => json!({
+                    "ok": true,
+                    "kind": "clock_monotonic",
+                    "ms": ms,
+                }),
+                _ => capability_error_envelope(&CapabilityError::new(
+                    "internal_error",
+                    "monotonic clock overflow",
+                )),
+            },
             Err(error) => {
                 let error = CapabilityError::from(error);
                 json!({

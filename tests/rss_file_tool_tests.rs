@@ -14,7 +14,7 @@ use rustscript_agent::capabilities::{
     ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
     CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle, FilesystemCapability,
     FilesystemLimits, LifecycleClock, LifecycleError, LifecycleLimits, NeverCancelled,
-    PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer,
+    PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
 use rustscript_agent::config::FileToolConfig;
 use rustscript_agent::tools::{ArtifactOwner, FileTools, NativeToolExecutor, ToolResult};
@@ -75,10 +75,18 @@ fn vm_map_key_to_string(value: &VmValue) -> String {
 }
 
 const REGISTRY_IDENTITY: &str = "rss-file-tool-equivalence";
-const TMP_ROOT: &str =
-    "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0c-rss-readonly-30473d83";
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_parent(label: &str) -> PathBuf {
+    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "rss-file-{}-{}-{}",
+        label.replace('/', "-"),
+        std::process::id(),
+        sequence
+    ))
+}
 
 struct Fixture {
     root: PathBuf,
@@ -87,13 +95,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let parent = PathBuf::from(TMP_ROOT).join(format!(
-            "rss-file-{}-{}-{}",
-            label,
-            std::process::id(),
-            sequence
-        ));
+        let parent = unique_temp_parent(label);
         let root = parent.join("workspace");
         fs::create_dir_all(&root).expect("create rss file fixture");
         Self { root, parent }
@@ -128,6 +130,7 @@ struct MemoryDurable {
     results: Mutex<std::collections::HashMap<String, Value>>,
     parent_ok: Mutex<bool>,
     active: Mutex<bool>,
+    fail_next_commit: AtomicBool,
 }
 
 impl MemoryDurable {
@@ -137,11 +140,16 @@ impl MemoryDurable {
             results: Mutex::new(std::collections::HashMap::new()),
             parent_ok: Mutex::new(true),
             active: Mutex::new(true),
+            fail_next_commit: AtomicBool::new(false),
         })
     }
 
     fn started_len(&self) -> usize {
         self.started.lock().expect("started").len()
+    }
+
+    fn fail_next_commit(&self) {
+        self.fail_next_commit.store(true, Ordering::SeqCst);
     }
 
     fn seed_result(&self, call_id: &str, result: Value) {
@@ -189,6 +197,11 @@ impl DurableToolLifecycle for MemoryDurable {
     }
 
     fn commit_result(&self, call_id: &str, result: &Value) -> Result<Value, LifecycleError> {
+        if self.fail_next_commit.load(Ordering::SeqCst) {
+            return Err(LifecycleError::ResultCommitFailed(
+                "injected result failure".to_string(),
+            ));
+        }
         self.results
             .lock()
             .expect("results")
@@ -288,7 +301,7 @@ fn rss_config_json(config: &FileToolConfig) -> Value {
         "max_search_depth": config.max_search_depth,
         "max_search_matches": config.max_search_matches,
         "max_search_output_bytes": config.max_search_output_bytes,
-        "max_search_wall_time_ms": config.max_search_wall_time.as_millis() as u64,
+        "max_search_wall_time_ms": positive_duration_ms(config.max_search_wall_time),
         "max_tool_output_bytes": config.max_output_bytes,
     })
 }
@@ -336,7 +349,8 @@ struct JumpClock {
     base: u64,
     jump_after: u64,
     jump_to: u64,
-    calls: AtomicU64,
+    wall_calls: AtomicU64,
+    mono_calls: AtomicU64,
     instant: Instant,
 }
 
@@ -346,7 +360,8 @@ impl JumpClock {
             base,
             jump_after,
             jump_to,
-            calls: AtomicU64::new(0),
+            wall_calls: AtomicU64::new(0),
+            mono_calls: AtomicU64::new(0),
             instant: Instant::now(),
         })
     }
@@ -354,7 +369,7 @@ impl JumpClock {
 
 impl LifecycleClock for JumpClock {
     fn now_ms(&self) -> u64 {
-        let seen = self.calls.fetch_add(1, Ordering::SeqCst);
+        let seen = self.wall_calls.fetch_add(1, Ordering::SeqCst);
         if seen >= self.jump_after {
             self.jump_to
         } else {
@@ -364,6 +379,15 @@ impl LifecycleClock for JumpClock {
 
     fn now(&self) -> Instant {
         self.instant
+    }
+
+    fn monotonic_ms(&self) -> Option<u64> {
+        let seen = self.mono_calls.fetch_add(1, Ordering::SeqCst);
+        Some(if seen >= self.jump_after {
+            self.jump_to
+        } else {
+            self.base
+        })
     }
 }
 
@@ -582,16 +606,22 @@ fn assert_exact_envelope(native: &ToolResult, rss: &Value) {
         .and_then(Value::as_str)
     {
         assert!(
-            !message.contains(TMP_ROOT),
+            !message_leaks_temp_root(message),
             "rss error leaked temp root: {message}"
         );
     }
     if let Some(native_error) = native.error.as_ref() {
         assert!(
-            !native_error.message.contains(TMP_ROOT),
+            !message_leaks_temp_root(&native_error.message),
             "native error leaked temp root"
         );
     }
+}
+
+fn message_leaks_temp_root(message: &str) -> bool {
+    std::env::temp_dir()
+        .to_str()
+        .is_some_and(|tmp| message.contains(tmp))
 }
 
 fn run_rss_read(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -> RssRun {
@@ -1237,26 +1267,49 @@ fn search_path_policy_is_rejected_before_prepare() {
 }
 
 #[test]
-fn search_one_nanosecond_wall_time_truncates_like_native() {
-    let fixture = Fixture::new("search-1ns");
+fn search_one_nanosecond_budget_ceils_to_one_ms_and_matches_native() {
+    assert_eq!(positive_duration_ms(Duration::ZERO), 0);
+    assert_eq!(positive_duration_ms(Duration::from_nanos(1)), 1);
+    assert_eq!(positive_duration_ms(Duration::from_micros(999)), 1);
+    assert_eq!(positive_duration_ms(Duration::from_millis(1)), 1);
+    assert_eq!(positive_duration_ms(Duration::from_millis(2)), 2);
+
+    let fixture = Fixture::new("search-1ns-ceil");
     fs::write(fixture.root.join("a.txt"), "alpha\n").unwrap();
     fs::write(fixture.root.join("b.txt"), "alpha\n").unwrap();
     let mut config = fixture.config();
     config.max_search_wall_time = Duration::from_nanos(1);
-    let arguments = json!({"pattern": "alpha", "max_search_wall_time_ms": 999_999});
+    assert_eq!(
+        rss_config_json(&config)["max_search_wall_time_ms"],
+        json!(1)
+    );
+
+    let arguments = json!({"pattern": "alpha"});
     let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
+        &fixture.tools(),
         NativeToolExecutor::SearchFiles,
         &arguments,
     );
-    let rss = run_rss_search(&fixture, &config, arguments);
-    assert!(native.ok, "native 1ns fixture must succeed: {native:?}");
-    assert!(
-        native.truncated,
-        "native 1ns fixture must truncate: {native:?}"
+    let rss = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            module: "search_files.rss",
+            tool_name: "search_files",
+            arguments,
+            durable: MemoryDurable::new(),
+            approval: Arc::new(AllowAll),
+            cancellation: Arc::new(NeverCancelled),
+            clock: JumpClock::new(1_000, u64::MAX, 1_000),
+            deadline_ms: 1_000_000,
+            install_artifacts: false,
+            artifact_limits: default_artifact_limits(),
+            call_id: "call-1ns-ceil".to_string(),
+        },
     );
+    assert_exact_envelope(&native, &rss.result);
     assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
-    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
     assert!(rss.started > 0);
 }
 
@@ -1277,7 +1330,7 @@ fn search_fake_clock_wall_time_truncates_without_deadline_failure() {
             durable,
             approval: Arc::new(AllowAll),
             cancellation: Arc::new(NeverCancelled),
-            clock: JumpClock::new(1_000, 4, 1_002),
+            clock: JumpClock::new(1_000, 1, 1_002),
             deadline_ms: 1_000_000,
             install_artifacts: false,
             artifact_limits: default_artifact_limits(),
@@ -1560,4 +1613,181 @@ fn oversized_read_and_search_artifact_publication_matches_native_with_owner() {
             .expect("rss search stored");
         assert_eq!(native_bytes, rss_bytes);
     }
+}
+
+#[test]
+fn read_cjk_output_budget_uses_utf8_bytes_like_native() {
+    let fixture = Fixture::new("read-cjk-bytes");
+    let content = "你好世界".repeat(80);
+    fs::write(fixture.root.join("cjk.txt"), &content).unwrap();
+    let mut config = fixture.config();
+    config.max_output_bytes = 512;
+    config.max_search_output_bytes = 512;
+    config.max_read_bytes = 8192;
+    config.artifact_store.max_object_bytes = 8192;
+    config.artifact_store.max_total_bytes = 16384;
+    let native_tools = fixture
+        .tools_with_config(config.clone())
+        .with_owner(artifact_owner());
+    let arguments = json!({"path": "cjk.txt"});
+    let native = native_execute(&native_tools, NativeToolExecutor::ReadFile, &arguments);
+    let rss = run_rss_tool(
+        "read_file.rss",
+        &fixture,
+        &config,
+        "read_file",
+        arguments,
+        MemoryDurable::new(),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        true,
+    );
+    assert_exact_envelope(&native, &rss.result);
+    assert_eq!(rss.result["ok"], json!(true));
+    assert_ne!(
+        rss.result["error"]["code"],
+        json!("result_too_large"),
+        "cjk byte budget must shrink/artifact rather than fail commit"
+    );
+    assert!(
+        !native.artifacts.is_empty(),
+        "native should publish a CJK result artifact under the byte cap"
+    );
+}
+
+#[test]
+fn search_cjk_match_budget_uses_utf8_bytes_like_native() {
+    let fixture = Fixture::new("search-cjk-bytes");
+    fs::write(fixture.root.join("cjk.txt"), "needle 你好世界\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_output_bytes = 24;
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+}
+
+#[test]
+fn search_file_glob_non_string_is_ignored_like_native() {
+    let fixture = Fixture::new("glob-types");
+    fs::write(fixture.root.join("keep.rs"), "alpha\n").unwrap();
+    fs::write(fixture.root.join("skip.txt"), "alpha\n").unwrap();
+    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": 1}));
+    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": true}));
+    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": {}}));
+    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": []}));
+    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": null}));
+    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": "*.rs"}));
+}
+
+#[test]
+fn search_glob_question_mark_matches_one_utf8_byte_like_native() {
+    let fixture = Fixture::new("glob-byte-q");
+    fs::write(fixture.root.join("a.rs"), "keep\n").unwrap();
+    fs::write(fixture.root.join("你.rs"), "cjk\n").unwrap();
+    assert_search_eq(&fixture, json!({"target": "files", "file_glob": "?.rs"}));
+    assert_search_eq(&fixture, json!({"target": "files", "file_glob": "???.rs"}));
+    assert_search_eq(&fixture, json!({"pattern": "keep", "file_glob": "?.rs"}));
+}
+
+#[cfg(unix)]
+#[test]
+fn search_skips_non_utf8_names_like_native() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("non-utf8-names");
+    fs::write(fixture.root.join("keep.txt"), "keep alpha\n").unwrap();
+    let bad = fixture
+        .root
+        .join(OsString::from_vec(vec![0xff, b'x', 0x80]));
+    fs::write(&bad, "secret alpha\n").unwrap();
+    assert_search_eq(&fixture, json!({"pattern": "alpha"}));
+    assert_search_eq(&fixture, json!({"target": "files", "file_glob": "*"}));
+}
+
+#[test]
+fn search_directory_order_is_byte_lexicographic_including_multibyte() {
+    let fixture = Fixture::new("sort-multi");
+    for name in ["z.txt", "a.txt", "m.txt", "中.txt", "あ.txt", "A.txt"] {
+        fs::write(fixture.root.join(name), "needle\n").unwrap();
+    }
+    assert_search_eq(&fixture, json!({"pattern": "needle"}));
+    assert_search_eq(&fixture, json!({"target": "files"}));
+}
+
+#[test]
+fn search_high_entry_directory_order_matches_native() {
+    let fixture = Fixture::new("sort-high");
+    for i in (0..80).rev() {
+        fs::write(fixture.root.join(format!("f-{i:03}.txt")), "needle\n").unwrap();
+    }
+    assert_search_eq(&fixture, json!({"pattern": "needle"}));
+    assert_search_eq(&fixture, json!({"target": "files"}));
+}
+
+#[test]
+fn search_fake_clock_backward_jump_does_not_extend_budget() {
+    let fixture = Fixture::new("search-clock-back");
+    fs::write(fixture.root.join("a.txt"), "alpha\n").unwrap();
+    fs::write(fixture.root.join("b.txt"), "alpha\n").unwrap();
+    fs::write(fixture.root.join("c.txt"), "alpha\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_wall_time = Duration::from_millis(2);
+    let rss = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            module: "search_files.rss",
+            tool_name: "search_files",
+            arguments: json!({"pattern": "alpha"}),
+            durable: MemoryDurable::new(),
+            approval: Arc::new(AllowAll),
+            cancellation: Arc::new(NeverCancelled),
+            clock: JumpClock::new(1_000, 1, 0),
+            deadline_ms: 1_000_000,
+            install_artifacts: false,
+            artifact_limits: default_artifact_limits(),
+            call_id: "call-clock-back".to_string(),
+        },
+    );
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["error"], Value::Null);
+}
+
+#[test]
+fn published_result_artifact_is_retracted_when_commit_fails() {
+    let fixture = Fixture::new("artifact-rollback");
+    fs::write(fixture.root.join("wide.txt"), "你好世界".repeat(80)).unwrap();
+    let mut config = fixture.config();
+    config.max_output_bytes = 200;
+    config.max_search_output_bytes = 200;
+    config.max_read_bytes = 8192;
+    config.artifact_store.max_object_bytes = 8192;
+    config.artifact_store.max_total_bytes = 16384;
+    let durable = MemoryDurable::new();
+    durable.fail_next_commit();
+    let rss = run_rss_tool(
+        "read_file.rss",
+        &fixture,
+        &config,
+        "read_file",
+        json!({"path": "wide.txt"}),
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        true,
+    );
+    assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
+    assert_eq!(rss.result["error"]["code"], json!("result_commit_failed"));
+    assert_eq!(
+        rss.artifacts.as_ref().expect("rss store").stored_len(),
+        0,
+        "commit failure must not leave a visible result artifact"
+    );
 }

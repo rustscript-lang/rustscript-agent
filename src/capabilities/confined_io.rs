@@ -291,6 +291,7 @@ mod unix {
             return Err(map_io("fs::enumerate", io::Error::last_os_error()));
         }
         let mut skipped = 0usize;
+        let mut consumed = 0u64;
         let mut entries = Vec::new();
         let mut truncated = false;
         loop {
@@ -319,19 +320,27 @@ mod unix {
                 truncated = true;
                 break;
             }
+            let Some(name) = std::str::from_utf8(name_bytes).ok().map(str::to_string) else {
+                consumed = consumed.saturating_add(1);
+                continue;
+            };
             let (file_type, len) = match metadata_at(directory_fd, name_bytes) {
                 Ok(meta) => meta,
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    consumed = consumed.saturating_add(1);
+                    continue;
+                }
                 Err(error) => return Err(map_io("fs::enumerate", error)),
             };
             entries.push(ListEntry {
-                name: String::from_utf8_lossy(name_bytes).into_owned(),
+                name,
                 file_type,
                 len,
             });
+            consumed = consumed.saturating_add(1);
         }
         Ok(ListPage {
-            next_cursor: cursor.saturating_add(entries.len() as u64),
+            next_cursor: cursor.saturating_add(consumed),
             truncated,
             entries,
         })

@@ -4,12 +4,13 @@
 //! generation. This module does not format agent-facing artifact payloads.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
 use super::hash::content_hash;
-use super::lifecycle::CapabilityLifecycle;
+use super::lifecycle::{CapabilityLifecycle, TokenOwnedResource};
 use super::types::{CapabilityError, CapabilityOwner, CapabilityRisk, TokenClaims};
 
 /// Store-wide artifact ceilings.
@@ -128,7 +129,24 @@ impl ArtifactCapability {
             }
         }
         match self.store_bytes(&claims, bytes, &bound) {
-            Ok(refer) => Ok(refer),
+            Ok(refer) => {
+                let guard = Arc::new(ResultArtifactGuard {
+                    inner: Arc::clone(&self.inner),
+                    id: refer.id.clone(),
+                    call_key: call_key.clone(),
+                    len: refer.len,
+                    released: AtomicBool::new(false),
+                });
+                if let Err(error) = self
+                    .inner
+                    .lifecycle
+                    .register_resource(token, Arc::clone(&guard) as Arc<dyn TokenOwnedResource>)
+                {
+                    guard.rollback_unpublished_side_effects();
+                    return Err(CapabilityError::from(error));
+                }
+                Ok(refer)
+            }
             Err(error) => {
                 self.inner
                     .result_calls
@@ -265,6 +283,59 @@ impl ArtifactCapability {
         objects
             .get(id)
             .map(|record| (record.bytes.clone(), record.metadata.clone()))
+    }
+
+    /// Count currently visible result/generic objects. Used by lifecycle tests.
+    pub fn stored_len(&self) -> usize {
+        self.inner
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+struct ResultArtifactGuard {
+    inner: Arc<ArtifactInner>,
+    id: String,
+    call_key: String,
+    len: usize,
+    released: AtomicBool,
+}
+
+impl ResultArtifactGuard {
+    fn retract(&self) {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut objects = self
+            .inner
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if objects.remove(&self.id).is_some() {
+            let mut total = self
+                .inner
+                .total_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *total = total.saturating_sub(self.len);
+        }
+        self.inner
+            .result_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.call_key);
+    }
+}
+
+impl TokenOwnedResource for ResultArtifactGuard {
+    fn release(&self) {
+        self.retract();
+    }
+
+    fn rollback_unpublished_side_effects(&self) {
+        self.retract();
     }
 }
 
