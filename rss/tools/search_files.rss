@@ -595,6 +595,7 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                         let mut mapped_code: string = code;
                         let mut mapped_message: string = types::map_string(error, "message", "");
                         if mapped_message == "symlinks are not followed" {
+                            mapped_code = "wrong_type";
                             mapped_message = "operating-system operation failed";
                         } else {
                             if code == "wrong_type" {
