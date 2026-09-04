@@ -244,6 +244,12 @@ impl ProcessCapability {
         cursor: u64,
         limit: usize,
     ) -> Result<ProcessSnapshot, CapabilityError> {
+        if limit == 0 {
+            return Err(CapabilityError::new(
+                "invalid_request",
+                "limit must be positive",
+            ));
+        }
         let owned = self.lookup(token, handle)?;
         let _ = owned.handle.poll().map_err(map_process_error)?;
         Ok(snapshot(
@@ -284,6 +290,12 @@ impl ProcessCapability {
         cursor: u64,
         limit: usize,
     ) -> Result<ProcessSnapshot, CapabilityError> {
+        if limit == 0 {
+            return Err(CapabilityError::new(
+                "invalid_request",
+                "limit must be positive",
+            ));
+        }
         let owned = self.lookup(token, handle)?;
         Ok(snapshot(
             &owned.handle,

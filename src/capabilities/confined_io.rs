@@ -297,10 +297,7 @@ mod unix {
             clear_errno();
             let entry = unsafe { libc::readdir(guard.0) };
             if entry.is_null() {
-                let errno = current_errno();
-                if errno != 0 {
-                    return Err(map_io("fs::enumerate", io::Error::from_raw_os_error(errno)));
-                }
+                classify_readdir_end(errno_abi())?;
                 break;
             }
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
@@ -370,16 +367,66 @@ mod unix {
         unsafe {
             *libc::__errno_location() = 0;
         }
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        unsafe {
+            *libc::__error() = 0;
+        }
     }
 
-    fn current_errno() -> i32 {
+    enum ErrnoAbi {
+        Known(i32),
+        #[allow(dead_code)]
+        Unsupported,
+    }
+
+    fn errno_abi() -> ErrnoAbi {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            unsafe { *libc::__errno_location() }
+            ErrnoAbi::Known(unsafe { *libc::__errno_location() })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
         {
-            0
+            ErrnoAbi::Known(unsafe { *libc::__error() })
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        {
+            ErrnoAbi::Unsupported
+        }
+    }
+
+    fn classify_readdir_end(errno: ErrnoAbi) -> Result<(), CapabilityError> {
+        match errno {
+            ErrnoAbi::Known(0) => Ok(()),
+            ErrnoAbi::Known(code) => {
+                Err(map_io("fs::enumerate", io::Error::from_raw_os_error(code)))
+            }
+            ErrnoAbi::Unsupported => Err(CapabilityError::new(
+                "unsupported_platform",
+                "readdir errno is unavailable on this target",
+            )),
         }
     }
 
@@ -566,5 +613,74 @@ mod unix {
             _ => "path_denied",
         };
         CapabilityError::new(code, format!("{operation}: {error}"))
+    }
+
+    #[cfg(test)]
+    mod errno_tests {
+        use super::*;
+
+        #[test]
+        fn readdir_end_never_treats_unknown_errno_abi_as_eof() {
+            assert!(classify_readdir_end(ErrnoAbi::Known(0)).is_ok());
+            let error = classify_readdir_end(ErrnoAbi::Known(5))
+                .expect_err("nonzero errno must not be treated as EOF");
+            assert_ne!(error.code(), "unsupported_platform");
+            let unsupported = classify_readdir_end(ErrnoAbi::Unsupported)
+                .expect_err("missing errno ABI must fail closed");
+            assert_eq!(unsupported.code(), "unsupported_platform");
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn linux_errno_location_clears_and_reads_zero() {
+            clear_errno();
+            assert!(matches!(errno_abi(), ErrnoAbi::Known(0)));
+        }
+
+        #[cfg(any(
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        #[test]
+        fn bsd_errno_error_clears_and_reads_zero() {
+            clear_errno();
+            assert!(matches!(errno_abi(), ErrnoAbi::Known(0)));
+        }
+
+        #[test]
+        fn current_target_does_not_report_unsupported_when_accessor_exists() {
+            match errno_abi() {
+                ErrnoAbi::Known(_) => {
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "dragonfly",
+                        target_os = "freebsd",
+                        target_os = "ios",
+                        target_os = "macos",
+                        target_os = "netbsd",
+                        target_os = "openbsd"
+                    )))]
+                    panic!("unsupported Unix target must fail closed");
+                }
+                ErrnoAbi::Unsupported => {
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "dragonfly",
+                        target_os = "freebsd",
+                        target_os = "ios",
+                        target_os = "macos",
+                        target_os = "netbsd",
+                        target_os = "openbsd"
+                    ))]
+                    panic!("supported target must expose a real errno accessor");
+                }
+            }
+        }
     }
 }
