@@ -6,9 +6,10 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -24,6 +25,7 @@ use super::{
 };
 
 const ALLOWED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TZ", "USER", "TERM"];
+const WAIT_POLL_SLICE: Duration = Duration::from_millis(5);
 
 /// Per-spawn resource ceilings. Host values are admitted ceilings; caller
 /// arguments may only reduce them.
@@ -76,6 +78,8 @@ pub struct ProcessSnapshot {
     pub signal: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    pub stdout_bytes: Vec<u8>,
+    pub stderr_bytes: Vec<u8>,
     pub truncated: bool,
     pub stdout_cursor: ProcessLogCursor,
     pub stderr_cursor: ProcessLogCursor,
@@ -93,18 +97,37 @@ struct OwnedProcess {
 }
 
 struct ProcessReaper {
+    inner: Weak<ProcessInner>,
+    id: String,
     handle: BoundedProcessHandle,
     cancel: ProcessCancel,
     released: AtomicBool,
 }
 
-impl TokenOwnedResource for ProcessReaper {
-    fn release(&self) {
+impl ProcessReaper {
+    fn shutdown_and_forget(&self) {
         if self.released.swap(true, Ordering::SeqCst) {
             return;
         }
         self.cancel.cancel();
+        if let Some(inner) = self.inner.upgrade() {
+            let _ = inner
+                .table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.id);
+        }
         let _ = self.handle.shutdown();
+    }
+}
+
+impl TokenOwnedResource for ProcessReaper {
+    fn release(&self) {
+        self.shutdown_and_forget();
+    }
+
+    fn rollback_unpublished_side_effects(&self) {
+        self.shutdown_and_forget();
     }
 }
 
@@ -235,8 +258,24 @@ impl ProcessCapability {
                 request = request.with_env(name.clone(), value);
             }
         }
+        if let Some(stdin) = stdin
+            && !stdin.is_empty()
+        {
+            request = request.with_stdin(stdin.to_vec());
+        }
         let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
         let handle = process.lifecycle_handle();
+        if stdin.map(|bytes| !bytes.is_empty()).unwrap_or(false) {
+            let flush_deadline = Instant::now() + Duration::from_millis(20);
+            let mut spins = 0_u32;
+            while Instant::now() < flush_deadline && handle.terminal_status().is_none() {
+                thread::sleep(Duration::from_millis(1));
+                spins += 1;
+                if spins >= 2 {
+                    break;
+                }
+            }
+        }
         let pid = handle.pid();
         let id = uuid::Uuid::new_v4().simple().to_string();
         self.inner
@@ -253,6 +292,8 @@ impl ProcessCapability {
                 },
             );
         let reaper = Arc::new(ProcessReaper {
+            inner: Arc::downgrade(&self.inner),
+            id: id.clone(),
             handle,
             cancel,
             released: AtomicBool::new(false),
@@ -260,22 +301,6 @@ impl ProcessCapability {
         if let Err(error) = self.inner.lifecycle.register_resource(token, reaper) {
             self.remove_and_terminate(&id);
             return Err(CapabilityError::from(error));
-        }
-        match stdin {
-            Some(stdin) if !stdin.is_empty() => {
-                if let Err(error) = self.write_stdin(token, &id, stdin, Some(limits.timeout_ms)) {
-                    let still_running = self
-                        .lookup(token, &id)
-                        .ok()
-                        .map(|owned| owned.handle.terminal_status().is_none())
-                        .unwrap_or(false);
-                    if still_running || error.code() != "stdin_closed" {
-                        self.remove_and_terminate(&id);
-                        return Err(error);
-                    }
-                }
-            }
-            _ => {}
         }
         Ok(ProcessSpawn { handle: id, pid })
     }
@@ -313,20 +338,61 @@ impl ProcessCapability {
     }
 
     /// Waits until exit, caller timeout, deadline, or cancellation.
+    ///
+    /// A wait-own timeout sets `deadline_elapsed` and preserves a running
+    /// snapshot. It does not kill the child. Process-deadline and cancel stay
+    /// distinct: process deadline also sets the flag after the child is reaped;
+    /// cancel still surfaces as an error.
     pub fn wait(
         &self,
         token: &str,
         handle: &str,
         timeout_ms: Option<u64>,
     ) -> Result<ProcessSnapshot, CapabilityError> {
-        let owned = self.lookup(token, handle)?;
         let timeout_ms = timeout_ms.map(|ms| ms.min(self.inner.host_limits.timeout_ms));
-        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-        match owned.handle.wait(deadline) {
-            Ok(_) | Err(BoundedProcessError::DeadlineElapsed) => {}
-            Err(error) => return Err(map_process_error(error)),
+        let wait_deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        loop {
+            let owned = self.lookup(token, handle)?;
+            match owned.handle.poll() {
+                Ok(_) => {
+                    let mut snap = snapshot(&owned.handle, handle, None, None);
+                    if !snap.running {
+                        return Ok(snap);
+                    }
+                    if wait_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        snap.deadline_elapsed = true;
+                        return Ok(snap);
+                    }
+                    thread::sleep(WAIT_POLL_SLICE);
+                }
+                Err(BoundedProcessError::DeadlineElapsed) => {
+                    let mut snap = snapshot(&owned.handle, handle, None, None);
+                    snap.deadline_elapsed = true;
+                    return Ok(snap);
+                }
+                Err(error) => return Err(map_process_error(error)),
+            }
         }
-        Ok(snapshot(&owned.handle, handle, None, None))
+    }
+
+    /// Count currently tracked handles. Used by lifecycle tests.
+    pub fn table_len(&self) -> usize {
+        self.inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// PIDs currently recorded in the process table. Used by lifecycle tests.
+    pub fn live_pids(&self) -> Vec<u32> {
+        self.inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|owned| owned.handle.pid())
+            .collect()
     }
 
     /// Returns a bounded log window.
@@ -377,7 +443,9 @@ impl ProcessCapability {
     pub fn close_stdin(&self, token: &str, handle: &str) -> Result<(), CapabilityError> {
         let owned = self.lookup(token, handle)?;
         match owned.handle.close_stdin() {
-            Ok(()) | Err(BoundedProcessError::StdinClosed) => Ok(()),
+            Ok(())
+            | Err(BoundedProcessError::StdinClosed)
+            | Err(BoundedProcessError::StdinWriteFailed { .. }) => Ok(()),
             Err(error) => Err(map_process_error(error)),
         }
     }
@@ -576,6 +644,8 @@ fn snapshot(
         signal: status.and_then(ProcessStatus::signal),
         stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+        stdout_bytes: stdout.bytes.clone(),
+        stderr_bytes: stderr.bytes.clone(),
         truncated: stdout.truncated || stderr.truncated,
         stdout_cursor: ProcessLogCursor {
             offset: stdout.offset,

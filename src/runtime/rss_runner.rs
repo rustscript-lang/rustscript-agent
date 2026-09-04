@@ -800,6 +800,7 @@ fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmEr
         "json::decode",
         "stream::emit",
         "bytes::to_utf8",
+        "bytes::to_utf8_lossy",
         "bytes::to_array_u8",
         "bytes::from_utf8",
         "sqlite::open",

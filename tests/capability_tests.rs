@@ -2280,3 +2280,71 @@ fn list_rejects_regular_hardlinks_and_preserves_dirs_and_files() {
     );
     let _ = fs::remove_file(&outside);
 }
+
+#[test]
+fn process_wait_own_timeout_sets_deadline_elapsed_and_keeps_running() {
+    let fixture = Fixture::new("proc-wait-deadline");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 30_000,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn sleep");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(80))
+        .expect("wait timeout");
+    assert!(
+        snapshot.deadline_elapsed,
+        "wait timeout must set deadline_elapsed"
+    );
+    assert!(
+        snapshot.running,
+        "wait timeout must preserve the running snapshot"
+    );
+    assert!(!snapshot.cancelled);
+    assert_eq!(processes.table_len(), 1);
+    assert!(
+        fs::read_to_string(format!("/proc/{}/status", spawned.pid)).is_ok(),
+        "child must still be alive after wait timeout"
+    );
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_spawn_initial_stdin_epipe_does_not_fail() {
+    let fixture = Fixture::new("proc-stdin-epipe");
+    let processes = fixture.processes();
+    for i in 0..16 {
+        let token = fixture.token(CapabilityRisk::Execute);
+        let payload = format!("payload-{i}\n");
+        let spawned = processes
+            .spawn_with(
+                &token,
+                &["/bin/true".to_string()],
+                "",
+                &[],
+                ProcessLimits {
+                    timeout_ms: 2_000,
+                    stdin_limit: 4_096,
+                    ..ProcessLimits::default()
+                },
+                Some(payload.as_bytes()),
+            )
+            .unwrap_or_else(|error| panic!("spawn {i} failed: {error:?}"));
+        let snapshot = processes
+            .wait(&token, &spawned.handle, Some(2_000))
+            .expect("wait true");
+        assert!(!snapshot.running, "iteration {i} still running");
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert!(!snapshot.deadline_elapsed);
+        assert!(!snapshot.cancelled);
+    }
+}

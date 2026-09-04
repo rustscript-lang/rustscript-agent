@@ -24,6 +24,17 @@ fn map_bool(value: map, key: string, fallback: bool) -> bool {
     result
 }
 
+fn map_bytes(value: map, key: string) -> bytes {
+    let mut result: bytes = bytes::from_utf8("");
+    if value.has(key) {
+        if type(value[key]) == "bytes" {
+            let coerced: bytes = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
 fn utf8_len(text: string) -> int {
     bytes::from_utf8(text).length
 }
@@ -288,13 +299,30 @@ fn overflow_artifact_cap(config: map) -> int {
     stream * 2 + 18
 }
 
-fn overflow_payload(stdout: string, stderr: string, cap: int) -> string {
-    let mut labeled: string = "stdout:\n" + stdout;
-    if char_at(labeled, labeled.length - 1) != "\n" {
-        labeled = labeled + "\n";
+fn overflow_payload(stdout: bytes, stderr: bytes, cap: int) -> bytes {
+    let mut out: string = "";
+    out = append_lossy_bounded(out, "stdout:\n", cap);
+    out = append_lossy_bounded(out, bytes::to_utf8_lossy(stdout), cap);
+    if utf8_len(out) < cap {
+        if out.length > 0 {
+            if char_at(out, out.length - 1) != "\n" {
+                out = append_lossy_bounded(out, "\n", cap);
+            }
+        }
+        out = append_lossy_bounded(out, "stderr:\n", cap);
+        out = append_lossy_bounded(out, bytes::to_utf8_lossy(stderr), cap);
     }
-    labeled = labeled + "stderr:\n" + stderr;
-    truncate_to_bytes(labeled, cap)
+    let payload: bytes = bytes::from_utf8(out);
+    payload
+}
+
+fn append_lossy_bounded(out: string, chunk: string, cap: int) -> string {
+    let room: int = cap - utf8_len(out);
+    let mut combined: string = out;
+    if room > 0 {
+        combined = out + truncate_to_bytes(chunk, room);
+    }
+    combined
 }
 
 fn compact_overflow_envelope(result: map) -> map {
@@ -365,7 +393,7 @@ fn enforce_serialized_cap(result: map, cap: int) -> map {
     bounded
 }
 
-fn apply_output_bounds(result: map, token: string, config: map) -> map {
+fn apply_output_bounds(result: map, token: string, config: map, envelope: map) -> map {
     let max_output_bytes: int = config_int(config, "max_output_bytes", 65536);
     let mut bounded: map = result;
     let mut data: map = types::map_map(bounded, "data");
@@ -379,13 +407,12 @@ fn apply_output_bounds(result: map, token: string, config: map) -> map {
     bounded.truncated = ring_truncated;
     if encoded_len(bounded) > max_output_bytes {
         bounded.truncated = true;
-        let stdout: string = types::map_string(data, "stdout", "");
-        let stderr: string = types::map_string(data, "stderr", "");
-        let labeled: string = overflow_payload(stdout, stderr, overflow_artifact_cap(config));
-        let payload: bytes = bytes::from_utf8(labeled);
+        let stdout_raw: bytes = map_bytes(envelope, "stdout_bytes");
+        let stderr_raw: bytes = map_bytes(envelope, "stderr_bytes");
+        let payload: bytes = overflow_payload(stdout_raw, stderr_raw, overflow_artifact_cap(config));
         data.overflow_encoding = "labeled-utf8";
-        data.overflow_stdout_bytes = map_int(data, "stdout_next_offset", 0) - map_int(data, "stdout_offset", 0);
-        data.overflow_stderr_bytes = map_int(data, "stderr_next_offset", 0) - map_int(data, "stderr_offset", 0);
+        data.overflow_stdout_bytes = stdout_raw.length;
+        data.overflow_stderr_bytes = stderr_raw.length;
         bounded.data = data;
         let stored: map = cap::artifact_put(token, payload, {kind: "process_output", encoding: "labeled-utf8"});
         let mut stored_artifact: bool = false;
@@ -465,6 +492,7 @@ fn execute(context: map) -> map {
     let argv: array = types::map_array(arguments, "argv");
     let control: map = agent::control_check();
     let mut outcome: map = fail("cancelled", "process was cancelled", unpublished());
+    let mut last_envelope: map = {};
     if map_bool(control, "ok", false) == false {
         let error: map = types::map_map(control, "error");
         outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), unpublished());
@@ -523,11 +551,13 @@ fn execute(context: map) -> map {
                             let ignored_kill: bool = false;
                         }
                         let snap: map = poll_snapshot(token, handle, stream_limit);
+                        last_envelope = snap;
                         let error: map = types::map_map(again, "error");
                         outcome = fail_from_snapshot(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), snap);
                         finished = true;
                     } else {
                         let snap: map = poll_snapshot(token, handle, stream_limit);
+                        last_envelope = snap;
                         if map_bool(snap, "ok", false) == false {
                             let error: map = types::map_map(snap, "error");
                             let code: string = types::map_string(error, "code", "process_failed");
@@ -562,6 +592,7 @@ fn execute(context: map) -> map {
                                                 let ignored_timeout_kill: bool = false;
                                             }
                                             let timed: map = poll_snapshot(token, handle, stream_limit);
+                                            last_envelope = timed;
                                             outcome = fail_from_snapshot("deadline_elapsed", "process deadline elapsed", timed);
                                             finished = true;
                                         } else {
@@ -577,7 +608,7 @@ fn execute(context: map) -> map {
             }
         }
     }
-    apply_output_bounds(outcome, token, config)
+    apply_output_bounds(outcome, token, config, last_envelope)
 }
 
 pub fn descriptor() -> map {
