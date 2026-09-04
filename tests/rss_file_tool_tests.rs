@@ -1185,6 +1185,31 @@ fn search_match_file_dir_and_scan_caps_match_native() {
     assert_exact_envelope(&native, &rss.result);
 }
 
+#[test]
+fn search_depth_rejected_child_dirs_are_not_counted() {
+    let fixture = Fixture::new("search-depth-dirs-visited");
+    fs::create_dir_all(fixture.root.join("nested/deep")).unwrap();
+    fs::write(
+        fixture.root.join("nested/deep/hidden.txt"),
+        "needle hidden\n",
+    )
+    .unwrap();
+
+    let mut config = fixture.config();
+    config.max_search_depth = 1;
+    config.artifact_store.root = fixture.parent.join("artifacts-depth-dirs");
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_eq!(native.data["dirs_visited"], json!(2));
+    assert_eq!(rss.result["data"]["dirs_visited"], json!(2));
+    assert_exact_envelope(&native, &rss.result);
+}
+
 fn write_search_files(fixture: &Fixture, relative_paths: &[&str]) {
     for name in relative_paths {
         let path = fixture.root.join(name);

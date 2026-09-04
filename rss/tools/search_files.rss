@@ -737,9 +737,6 @@ fn walk_search(state: map, path: string, depth: int) -> map {
     state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
     state = observe_limits(state);
     if map_bool(state, "stop", false) == false {
-        if depth > map_int(state, "max_search_depth", 32) {
-            state.truncated = true;
-        } else {
             let remaining: int = map_int(state, "max_search_files", 10000) - map_int(state, "files_visited", 0);
             if remaining <= 0 {
                 state.truncated = true;
@@ -806,7 +803,11 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                             let child: string = join_rel(path, name);
                             let file_type: string = types::map_string(entry, "file_type", "");
                             if file_type == "directory" {
-                                state = walk_search(state, child, depth + 1);
+                                if depth + 1 > map_int(state, "max_search_depth", 32) {
+                                    state.truncated = true;
+                                } else {
+                                    state = walk_search(state, child, depth + 1);
+                                }
                             } else {
                                 if file_type == "file" {
                                     state = observe_limits(state);
@@ -867,7 +868,6 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                 }
             }
             }
-        }
     }
     state
 }
