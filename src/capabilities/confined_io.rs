@@ -225,7 +225,9 @@ mod unix {
             ));
         }
         if stat_u64(stat.st_nlink) > 1 {
-            return Err(path_denied("hard links are not permitted"));
+            return Err(path_denied(
+                "regular files with multiple hard links are not permitted",
+            ));
         }
         let file_len = stat_u64(stat.st_size);
         if limit == 0 || offset >= file_len {
@@ -321,17 +323,22 @@ mod unix {
                 truncated = true;
                 break;
             }
-            let Some(name) = std::str::from_utf8(name_bytes).ok().map(str::to_string) else {
-                consumed = consumed.saturating_add(1);
-                continue;
-            };
-            let (file_type, len) = match metadata_at(directory_fd, name_bytes) {
+            let (file_type, len, nlink) = match metadata_at(directory_fd, name_bytes) {
                 Ok(meta) => meta,
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
                     consumed = consumed.saturating_add(1);
                     continue;
                 }
                 Err(error) => return Err(map_io("fs::enumerate", error)),
+            };
+            if file_type == "file" && nlink > 1 {
+                return Err(path_denied(
+                    "regular files with multiple hard links are not permitted",
+                ));
+            }
+            let Some(name) = std::str::from_utf8(name_bytes).ok().map(str::to_string) else {
+                consumed = consumed.saturating_add(1);
+                continue;
             };
             entries.push(ListEntry {
                 name,
@@ -347,7 +354,10 @@ mod unix {
         })
     }
 
-    fn metadata_at(directory_fd: RawFd, name: &[u8]) -> Result<(&'static str, u64), io::Error> {
+    fn metadata_at(
+        directory_fd: RawFd,
+        name: &[u8],
+    ) -> Result<(&'static str, u64, u64), io::Error> {
         let name = CString::new(name).expect("validated component contains no NUL");
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         let result = unsafe {
@@ -369,7 +379,7 @@ mod unix {
             libc::S_IFLNK => "symlink",
             _ => "other",
         };
-        Ok((file_type, stat_u64(stat.st_size)))
+        Ok((file_type, stat_u64(stat.st_size), stat_u64(stat.st_nlink)))
     }
 
     fn clear_errno() {
