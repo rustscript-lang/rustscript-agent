@@ -1253,6 +1253,21 @@ fn search_enumeration_budget_counts_dot_slots_like_native() {
         "exam-nested-rem-2",
         5,
         &["adir/f0.txt", "adir/f1.txt", "adir/f2.txt", "zdir/late.txt"],
+        content.clone(),
+    );
+
+    // After the first subtree consumes the file budget, entering the next
+    // sibling increments dirs_visited before truncation (native walk-entry order).
+    assert_search_exam_budget_eq(
+        "exam-nested-rem-0",
+        6,
+        &[
+            "adir/f0.txt",
+            "adir/f1.txt",
+            "adir/f2.txt",
+            "adir/f3.txt",
+            "zdir/late.txt",
+        ],
         content,
     );
 }
@@ -1808,6 +1823,48 @@ fn search_skips_non_utf8_names_like_native() {
     assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
 }
 
+#[cfg(unix)]
+#[test]
+fn search_non_utf8_name_consumes_exam_slot_and_does_not_leak_secret() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("search-non-utf8-cap");
+    fs::write(
+        fixture
+            .root
+            .join(OsString::from_vec(vec![0xff, b'x', 0x80])),
+        "secret needle\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("secret.txt"), "secret needle\n").unwrap();
+    fs::write(fixture.root.join("other.txt"), "other\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_files = 4;
+    config.artifact_store.root = fixture.parent.join("artifacts-non-utf8-cap");
+    let arguments = json!({"pattern": "secret"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert!(native.ok, "native={native:?}");
+    assert!(native.truncated, "native must truncate at the exam cap");
+    assert!(
+        !native.content.contains("secret.txt"),
+        "secret.txt must not leak after a non-UTF8 exam slot: native={native:?}"
+    );
+    assert!(
+        !rss.result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("secret.txt")),
+        "secret.txt must not leak after a non-UTF8 exam slot: rss={}",
+        rss.result
+    );
+}
+
 #[test]
 fn search_directory_order_is_byte_lexicographic_including_multibyte() {
     let fixture = Fixture::new("sort-multi");
@@ -1856,6 +1913,88 @@ fn search_fake_clock_backward_jump_does_not_extend_budget() {
     assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["error"], Value::Null);
+}
+
+struct OverflowAfterClock {
+    ok_ticks: AtomicU64,
+    overflow_after: u64,
+    instant: Instant,
+}
+
+impl OverflowAfterClock {
+    fn after_ok_ticks(ok_ticks: u64) -> Arc<Self> {
+        Arc::new(Self {
+            ok_ticks: AtomicU64::new(0),
+            overflow_after: ok_ticks,
+            instant: Instant::now(),
+        })
+    }
+}
+
+impl LifecycleClock for OverflowAfterClock {
+    fn now_ms(&self) -> u64 {
+        1_000
+    }
+
+    fn now(&self) -> Instant {
+        self.instant
+    }
+
+    fn monotonic_ms(&self) -> Option<u64> {
+        let seen = self.ok_ticks.fetch_add(1, Ordering::SeqCst);
+        if seen >= self.overflow_after {
+            None
+        } else {
+            Some(1_000)
+        }
+    }
+}
+
+#[test]
+fn search_fake_clock_overflow_uses_nested_capability_error_envelope() {
+    let fixture = Fixture::new("search-clock-overflow");
+    fs::write(fixture.root.join("a.txt"), "alpha\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_wall_time = Duration::from_millis(2_000);
+    let rss = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            module: "search_files.rss",
+            tool_name: "search_files",
+            arguments: json!({"pattern": "alpha"}),
+            durable: MemoryDurable::new(),
+            approval: Arc::new(AllowAll),
+            cancellation: Arc::new(NeverCancelled),
+            clock: OverflowAfterClock::after_ok_ticks(1),
+            deadline_ms: 1_000_000,
+            install_artifacts: false,
+            artifact_limits: default_artifact_limits(),
+            call_id: "call-clock-overflow".to_string(),
+        },
+    );
+    assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
+    assert_eq!(
+        rss.result["error"]["code"],
+        json!("internal_error"),
+        "overflow must preserve the nested capability code, rss={}",
+        rss.result
+    );
+    assert_eq!(
+        rss.result["error"]["message"],
+        json!("monotonic clock overflow"),
+        "overflow must preserve the nested capability message, rss={}",
+        rss.result
+    );
+    assert_ne!(
+        rss.result["error"]["code"],
+        json!("cancelled"),
+        "top-level code must not collapse overflow to cancelled"
+    );
+    assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
+    assert_eq!(rss.result["content"], json!(""));
+    assert_eq!(rss.result["data"], json!({}));
+    assert_eq!(rss.result["artifacts"], json!([]));
 }
 
 #[test]

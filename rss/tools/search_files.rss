@@ -698,8 +698,8 @@ fn observe_limits(state: map) -> map {
     let tick: map = cap::clock_monotonic_ms(types::map_string(state, "token", ""));
     if map_bool(tick, "ok", false) == false {
         state.fatal = true;
-        state.fatal_code = types::map_string(tick, "code", "cancelled");
-        state.fatal_message = types::map_string(tick, "message", "clock failed");
+        state.fatal_code = types::map_string(types::map_map(tick, "error"), "code", "internal_error");
+        state.fatal_message = types::map_string(types::map_map(tick, "error"), "message", "capability failed");
         state.stop = true;
     } else {
         let now: int = map_int(tick, "ms", 0);
@@ -734,6 +734,7 @@ fn observe_limits(state: map) -> map {
 }
 
 fn walk_search(state: map, path: string, depth: int) -> map {
+    state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
     state = observe_limits(state);
     if map_bool(state, "stop", false) == false {
         if depth > map_int(state, "max_search_depth", 32) {
@@ -745,7 +746,6 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                 state.stop = true;
             } else {
                 if remaining <= 1 {
-                    state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
                     state.truncated = true;
                     state.stop = true;
                 } else {
@@ -758,7 +758,6 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                     let error: map = types::map_map(listed, "error");
                     let code: string = types::map_string(error, "code", "internal_error");
                     if code == "budget_exceeded" {
-                        state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
                         state.truncated = true;
                         state.stop = true;
                     } else {
@@ -778,7 +777,6 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                         state.stop = true;
                     }
                 } else {
-                    state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
                     let mut drop_page: bool = false;
                     if remaining <= 2 {
                         let probe_entries: array = types::map_array(listed, "entries");
@@ -1030,7 +1028,10 @@ pub fn execute(context: map, arguments: map) -> map {
                 result = fail_host(start_clock);
             } else {
                 state.start_ms = map_int(start_clock, "ms", 0);
-                state = walk_search(state, path, 0);
+                state = observe_limits(state);
+                if map_bool(state, "stop", false) == false {
+                    state = walk_search(state, path, 0);
+                }
                 if map_bool(state, "fatal", false) {
                     result = fail(types::map_string(state, "fatal_code", "internal_error"), types::map_string(state, "fatal_message", ""), {});
                 } else {

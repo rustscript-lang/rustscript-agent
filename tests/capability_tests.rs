@@ -1877,3 +1877,114 @@ fn list_omits_non_utf8_names() {
             .collect::<Vec<_>>()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn list_examination_budget_counts_non_utf8_slots() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("list-exam-slots");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x80])),
+        "secret",
+    )
+    .expect("invalid-a");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x81])),
+        "secret",
+    )
+    .expect("invalid-b");
+    fs::write(fixture.root.join("dir").join("keep.txt"), "ok").expect("keep");
+
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let mut cursor = 0_u64;
+    let mut pages = 0_usize;
+    let mut seen_keep = false;
+    loop {
+        pages += 1;
+        assert!(pages <= 8, "pagination must not loop");
+        let page = fs_cap.list(&token, "dir", cursor, 1).expect("page");
+        let examined = page.next_cursor.saturating_sub(page.cursor);
+        assert!(
+            examined <= 1,
+            "limit must bound physical dirents examined, got examined={examined} page={page:?}"
+        );
+        assert!(
+            page.entries.len() <= 1,
+            "page must not emit more names than the examination budget"
+        );
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| !entry.name.contains('\u{FFFD}')),
+            "lossy names must not be listed: {:?}",
+            page.entries
+                .iter()
+                .map(|entry| &entry.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !page.entries.iter().any(|entry| entry.name == "secret"),
+            "invalid-byte contents must not leak through the name slot"
+        );
+        if page.entries.iter().any(|entry| entry.name == "keep.txt") {
+            seen_keep = true;
+        }
+        if page.truncated {
+            assert_ne!(
+                page.next_cursor, cursor,
+                "truncated pages must advance next_cursor"
+            );
+            cursor = page.next_cursor;
+            continue;
+        }
+        break;
+    }
+    assert!(seen_keep, "valid keep.txt must remain reachable by cursor");
+
+    let host_fs = Arc::new(fixture.filesystem());
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::fs_list("{token}", "dir", 0, 1)
+        }}
+    "#
+    );
+    let result = run_cap_source(&fixture, Some(host_fs), None, None, &source);
+    let VmValue::Map(fields) = &result else {
+        panic!("expected list envelope, got {result:?}");
+    };
+    assert_eq!(
+        fields.get(&VmValue::string("ok")),
+        Some(&VmValue::Bool(true))
+    );
+    let Some(VmValue::Int(next_cursor)) = fields.get(&VmValue::string("next_cursor")) else {
+        panic!("expected next_cursor, got {result:?}");
+    };
+    assert!(
+        *next_cursor <= 1,
+        "host list must charge examined slots, got {result:?}"
+    );
+    if let Some(VmValue::Array(entries)) = fields.get(&VmValue::string("entries")) {
+        for entry in entries.iter() {
+            let VmValue::Map(entry) = entry else {
+                panic!("expected entry map, got {entry:?}");
+            };
+            if let Some(VmValue::String(name)) = entry.get(&VmValue::string("name")) {
+                assert!(
+                    !name.contains('\u{FFFD}'),
+                    "host list must not expose lossy names: {name}"
+                );
+            }
+        }
+    }
+}

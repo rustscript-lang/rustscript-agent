@@ -35,7 +35,8 @@ pub(crate) struct ListEntry {
     pub len: u64,
 }
 
-/// One cursor page. Only `limit` entries are retained, plus constant lookahead.
+/// One cursor page. `limit` bounds physical dirents examined (not only emitted
+/// valid names), plus constant one-entry lookahead for `truncated`.
 pub(crate) struct ListPage {
     pub entries: Vec<ListEntry>,
     pub next_cursor: u64,
@@ -316,7 +317,7 @@ mod unix {
                 skipped += 1;
                 continue;
             }
-            if entries.len() >= limit {
+            if consumed >= u64::try_from(limit).unwrap_or(u64::MAX) {
                 truncated = true;
                 break;
             }
