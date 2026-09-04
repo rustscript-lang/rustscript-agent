@@ -21,7 +21,8 @@ use rustscript_agent::{
         ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityError,
         CapabilityLifecycle, CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle,
         FilesystemCapability, FilesystemLimits, LifecycleClock, LifecycleError, LifecycleLimits,
-        PrepareMetadata, PrepareOutcome, ProcessCapability, ProcessLimits, TokenIssuer,
+        NeverCancelled, PrepareMetadata, PrepareOutcome, ProcessCapability, ProcessLimits,
+        SystemClock, TokenIssuer,
     },
 };
 use rustscript_vm::{HostTypeSchema, Value as VmValue};
@@ -182,20 +183,16 @@ impl Drop for Fixture {
 fn tmp_root(label: &str) -> PathBuf {
     let unique = format!(
         "cap-{}-{}-{}",
-        label,
+        label.replace('/', "-"),
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
+        NEXT_CAP_TMP.fetch_add(1, Ordering::Relaxed)
     );
-    let root = Path::new(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0c-capabilities-272f7bb4",
-    )
-    .join(unique);
+    let root = std::env::temp_dir().join(unique);
     fs::create_dir_all(&root).expect("create workspace");
     root
 }
+
+static NEXT_CAP_TMP: AtomicU64 = AtomicU64::new(0);
 
 fn owner() -> CapabilityOwner {
     CapabilityOwner::new("profile-a", "session-a", "run-a").expect("owner")
@@ -1557,4 +1554,326 @@ fn zero_limit_pagination_is_invalid_and_cannot_loop() {
         }
         break;
     }
+}
+
+#[test]
+fn system_clock_monotonic_ms_is_instant_origin_not_unix_wall_clock() {
+    let clock = SystemClock;
+    let ms = clock.monotonic_ms().expect("monotonic");
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("unix")
+        .as_millis() as u64;
+    assert!(
+        ms < unix / 1_000,
+        "monotonic {ms} must not be unix wall {unix}"
+    );
+    let later = clock.monotonic_ms().expect("later");
+    assert!(later >= ms);
+}
+
+struct OverflowClock;
+
+impl LifecycleClock for OverflowClock {
+    fn now_ms(&self) -> u64 {
+        1_000
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn monotonic_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[test]
+fn cap_clock_monotonic_ms_overflow_is_fail_closed() {
+    let root = tmp_root("clock-overflow");
+    let owner = owner();
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner.clone())
+        .registry_identity("registry-a")
+        .workspace(&root)
+        .limits(LifecycleLimits {
+            max_tool_calls: 32,
+            max_output_bytes: 64 * 1024,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(60_000)
+        .clock(Arc::new(OverflowClock) as Arc<dyn LifecycleClock>)
+        .tokens(SequenceIssuer::new() as Arc<dyn TokenIssuer>)
+        .durable(MemoryDurable::new() as Arc<dyn DurableToolLifecycle>)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .cancellation(Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+    let token = token_of(
+        lifecycle
+            .prepare(&owner, metadata("call-overflow", CapabilityRisk::Read))
+            .expect("prepare"),
+    );
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(lifecycle)),
+        capability_owner: Some(owner),
+        ..AgentHostBridges::default()
+    };
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::clock_monotonic_ms("{token}")
+        }}
+    "#
+    );
+    let result = AgentRunner::from_source(&source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    assert_eq!(envelope_error_code(&result), "internal_error");
+    let _ = fs::remove_dir_all(&root);
+}
+
+struct FailCommitDurable;
+
+impl DurableToolLifecycle for FailCommitDurable {
+    fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn prepare_parent(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn replay_result(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        Ok(None)
+    }
+
+    fn commit_started(&self, _record: &DurableStarted) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn commit_result(&self, _call_id: &str, _result: &Value) -> Result<Value, LifecycleError> {
+        Err(LifecycleError::ResultCommitFailed(
+            "injected result failure".to_string(),
+        ))
+    }
+
+    fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+}
+
+fn artifact_lifecycle(
+    root: &Path,
+    durable: Arc<dyn DurableToolLifecycle>,
+) -> (CapabilityLifecycle, CapabilityOwner) {
+    let owner = owner();
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner.clone())
+        .registry_identity("registry-a")
+        .workspace(root)
+        .limits(LifecycleLimits {
+            max_tool_calls: 32,
+            max_output_bytes: 64 * 1024,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(60_000)
+        .clock(ScriptedClock::new(1_000) as Arc<dyn LifecycleClock>)
+        .tokens(SequenceIssuer::new() as Arc<dyn TokenIssuer>)
+        .durable(durable)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .cancellation(Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+    (lifecycle, owner)
+}
+
+fn default_artifact_limits() -> ArtifactLimits {
+    ArtifactLimits {
+        max_object_bytes: 1024,
+        max_total_bytes: 4096,
+        max_objects: 8,
+    }
+}
+
+#[test]
+fn result_artifact_is_retracted_on_commit_storage_failure() {
+    let root = tmp_root("artifact-commit-fail");
+    let (lifecycle, owner) = artifact_lifecycle(&root, Arc::new(FailCommitDurable));
+    let token = token_of(
+        lifecycle
+            .prepare(&owner, metadata("call-art-fail", CapabilityRisk::Read))
+            .expect("prepare"),
+    );
+    let artifacts =
+        ArtifactCapability::new(lifecycle.clone(), owner.clone(), default_artifact_limits())
+            .expect("artifacts");
+    let published = artifacts
+        .put_result(&token, b"payload", &json!({}))
+        .expect("put");
+    assert_eq!(artifacts.stored_len(), 1);
+    let error = lifecycle
+        .commit(&owner, &token, json!({"ok": true, "content": "done"}))
+        .expect_err("commit storage");
+    assert!(matches!(error, LifecycleError::ResultCommitFailed(_)));
+    assert!(artifacts.stored(&published.id).is_none());
+    assert_eq!(artifacts.stored_len(), 0);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn result_artifact_is_retracted_on_interrupt_and_reservation_is_released() {
+    let fixture = Fixture::new("artifact-interrupt");
+    let artifacts = fixture.artifacts(default_artifact_limits());
+    let token = fixture.token(CapabilityRisk::Read);
+    let published = artifacts
+        .put_result(&token, b"payload", &json!({}))
+        .expect("put");
+    assert!(artifacts.stored(&published.id).is_some());
+    fixture.lifecycle.recover_open_tokens().expect("recover");
+    assert!(artifacts.stored(&published.id).is_none());
+    assert_eq!(artifacts.stored_len(), 0);
+    let token2 = fixture.token(CapabilityRisk::Read);
+    let again = artifacts
+        .put_result(&token2, b"again", &json!({}))
+        .expect("republish");
+    assert!(artifacts.stored(&again.id).is_some());
+}
+
+#[test]
+fn result_artifact_is_retracted_on_cancel_after_publication() {
+    let fixture = Fixture::new("artifact-cancel");
+    let artifacts = fixture.artifacts(default_artifact_limits());
+    let token = fixture.token(CapabilityRisk::Read);
+    let published = artifacts
+        .put_result(&token, b"payload", &json!({}))
+        .expect("put");
+    fixture.cancel.cancel();
+    let error = fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect_err("cancelled");
+    assert!(matches!(error, LifecycleError::Cancelled));
+    assert!(artifacts.stored(&published.id).is_none());
+    assert_eq!(artifacts.stored_len(), 0);
+}
+
+#[test]
+fn successful_commit_retains_result_artifact_for_replay() {
+    let fixture = Fixture::new("artifact-keep");
+    let artifacts = fixture.artifacts(default_artifact_limits());
+    let token = fixture.token(CapabilityRisk::Read);
+    let published = artifacts
+        .put_result(&token, b"keep-me", &json!({}))
+        .expect("put");
+    fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect("commit");
+    let (bytes, _) = artifacts.stored(&published.id).expect("retained");
+    assert_eq!(bytes, b"keep-me");
+    fixture.lifecycle.recover_open_tokens().expect("recover");
+    let (bytes, _) = artifacts.stored(&published.id).expect("still retained");
+    assert_eq!(bytes, b"keep-me");
+}
+
+#[test]
+fn concurrent_result_artifacts_rollback_only_failed_call() {
+    let fixture = Fixture::new("artifact-concurrent");
+    let artifacts = Arc::new(fixture.artifacts(default_artifact_limits()));
+    let token_ok = fixture.token(CapabilityRisk::Read);
+    let token_fail = fixture.token(CapabilityRisk::Read);
+    thread::scope(|scope| {
+        let artifacts_ok = Arc::clone(&artifacts);
+        let artifacts_fail = Arc::clone(&artifacts);
+        let token_ok = token_ok.clone();
+        let token_fail = token_fail.clone();
+        scope.spawn(move || {
+            artifacts_ok
+                .put_result(&token_ok, b"ok-payload", &json!({}))
+                .expect("put ok");
+        });
+        scope.spawn(move || {
+            artifacts_fail
+                .put_result(&token_fail, b"fail-payload", &json!({}))
+                .expect("put fail");
+        });
+    });
+    assert_eq!(artifacts.stored_len(), 2);
+    fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token_ok,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect("commit ok");
+    fixture.cancel.cancel();
+    fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token_fail,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect_err("cancelled fail call");
+    assert_eq!(artifacts.stored_len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn list_omits_non_utf8_names() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("list-non-utf8");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    fs::write(fixture.root.join("dir").join("keep.txt"), "ok").expect("keep");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x80])),
+        "secret",
+    )
+    .expect("invalid name");
+    let listed = fixture
+        .filesystem()
+        .list(&fixture.token(CapabilityRisk::Read), "dir", 0, 4)
+        .expect("list");
+    assert!(listed.entries.iter().any(|entry| entry.name == "keep.txt"));
+    assert!(
+        listed
+            .entries
+            .iter()
+            .all(|entry| !entry.name.contains('\u{FFFD}')),
+        "replacement-character names must not be listed: {:?}",
+        listed
+            .entries
+            .iter()
+            .map(|entry| &entry.name)
+            .collect::<Vec<_>>()
+    );
 }

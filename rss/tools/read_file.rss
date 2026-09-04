@@ -314,7 +314,55 @@ fn control_failure() -> map {
 
 fn encoded_len(result: map) -> int {
     let encoded: string = json::encode(result);
-    encoded.length
+    utf8_len(encoded)
+}
+
+fn utf8_len(value: string) -> int {
+    let payload: bytes = bytes::from_utf8(value);
+    payload.length
+}
+
+fn truncate_to_utf8_bytes(text: string, limit: int) -> string {
+    let mut end: int = 0;
+    let mut used: int = 0;
+    let mut walking: bool = true;
+    while walking && end < text.length {
+        let ch: string = char_at(text, end);
+        let ch_bytes: int = utf8_len(ch);
+        if used + ch_bytes > limit {
+            walking = false;
+        } else {
+            used = used + ch_bytes;
+            end = end + 1;
+        }
+    }
+    text[0:end]
+}
+
+fn fit_content_to_budget(result: map, cap: int) -> map {
+    let content: string = types::map_string(result, "content", "");
+    let mut fitted: map = result;
+    fitted.content = "";
+    fitted.truncated = true;
+    if encoded_len(fitted) <= cap {
+        let mut budget: int = cap - encoded_len(fitted);
+        let mut walking: bool = true;
+        while walking {
+            fitted.content = truncate_to_utf8_bytes(content, budget);
+            fitted.truncated = true;
+            if encoded_len(fitted) <= cap {
+                walking = false;
+            } else {
+                if budget <= 0 {
+                    fitted.content = "";
+                    walking = false;
+                } else {
+                    budget = budget / 2;
+                }
+            }
+        }
+    }
+    fitted
 }
 
 fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
@@ -327,7 +375,7 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
             let put: map = cap::artifact_put_result(token, payload, {});
             if map_bool(put, "ok", false) {
                 let id: string = types::map_string(put, "id", "");
-                let len: int = map_int(put, "len", content.length);
+                let len: int = map_int(put, "len", utf8_len(content));
                 let mut artifacts: array = [];
                 artifacts[0] = id;
                 let mut summary: string = "artifact " + id + " (" + int_to_string(len) + " bytes)";
@@ -339,6 +387,9 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
                     current = succeed("artifact", data, true, artifacts);
                 }
             }
+        }
+        if encoded_len(current) > max_output_bytes {
+            current = fit_content_to_budget(current, max_output_bytes);
         }
         if encoded_len(current) > max_output_bytes {
             current = fail("output_truncated", "tool result exceeds the configured bound", {});

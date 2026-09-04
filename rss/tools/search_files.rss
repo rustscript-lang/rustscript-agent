@@ -15,7 +15,10 @@ fn map_int(value: map, key: string, fallback: int) -> int {
 fn map_bool(value: map, key: string, fallback: bool) -> bool {
     let mut result: bool = fallback;
     if value.has(key) {
-        result = value[key];
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
     }
     result
 }
@@ -50,16 +53,24 @@ fn string_contains(haystack: string, needle: string) -> bool {
 }
 
 fn glob_match(pattern: string, text: string) -> bool {
+    let pattern_bytes: bytes = bytes::from_utf8(pattern);
+    let text_bytes: bytes = bytes::from_utf8(text);
+    let pat: array = bytes::to_array_u8(pattern_bytes);
+    let data: array = bytes::to_array_u8(text_bytes);
+    glob_match_bytes(pat, data)
+}
+
+fn glob_match_bytes(pat: array, text: array) -> bool {
     let mut pi: int = 0;
     let mut ti: int = 0;
     let mut star_p: int = -1;
     let mut star_t: int = 0;
     while ti < text.length {
         let mut advanced: bool = false;
-        if pi < pattern.length {
-            let pat: string = char_at(pattern, pi);
-            if pat != "*" {
-                if pat == "?" || pat == char_at(text, ti) {
+        if pi < pat.length {
+            let p: int = pat[pi];
+            if p != 42 {
+                if p == 63 || p == text[ti] {
                     pi = pi + 1;
                     ti = ti + 1;
                     advanced = true;
@@ -67,8 +78,8 @@ fn glob_match(pattern: string, text: string) -> bool {
             }
         }
         if advanced == false {
-            if pi < pattern.length {
-                if char_at(pattern, pi) == "*" {
+            if pi < pat.length {
+                if pat[pi] == 42 {
                     star_p = pi;
                     pi = pi + 1;
                     star_t = ti;
@@ -89,14 +100,14 @@ fn glob_match(pattern: string, text: string) -> bool {
             pi = -1;
         }
     }
-    while pi >= 0 && pi < pattern.length {
-        if char_at(pattern, pi) == "*" {
+    while pi >= 0 && pi < pat.length {
+        if pat[pi] == 42 {
             pi = pi + 1;
         } else {
             pi = -1;
         }
     }
-    pi == pattern.length
+    pi == pat.length
 }
 
 fn glob_ok(pattern: string, name: string, child: string) -> bool {
@@ -175,47 +186,147 @@ fn join_lines(lines: array) -> string {
 }
 
 fn sort_strings(items: array) -> array {
-    let mut i: int = 1;
-    while i < items.length {
-        let key: string = items[i].copy();
-        let mut j: int = i;
-        let mut walking: bool = true;
-        while walking && j > 0 {
-            let prev: string = items[j - 1].copy();
-            if prev <= key {
-                walking = false;
-            } else {
-                items[j] = prev;
-                j = j - 1;
-            }
-        }
-        items[j] = key;
-        i = i + 1;
-    }
-    items
+    merge_sort_strings(copy_array(items))
 }
 
 fn sort_entries(entries: array) -> array {
-    let mut i: int = 1;
-    while i < entries.length {
-        let key: map = entries[i].copy();
-        let key_name: string = types::map_string(key, "name", "");
-        let mut j: int = i;
-        let mut walking: bool = true;
-        while walking && j > 0 {
-            let prev: map = entries[j - 1].copy();
-            let prev_name: string = types::map_string(prev, "name", "");
-            if prev_name <= key_name {
-                walking = false;
-            } else {
-                entries[j] = prev;
-                j = j - 1;
-            }
-        }
-        entries[j] = key;
+    merge_sort_maps(copy_array(entries))
+}
+
+fn copy_array(items: array) -> array {
+    let mut out: array = [];
+    let mut i: int = 0;
+    while i < items.length {
+        out[out.length] = items[i].copy();
         i = i + 1;
     }
-    entries
+    out
+}
+
+fn merge_sort_strings(items: array) -> array {
+    let mut current: array = items;
+    let mut width: int = 1;
+    while width < current.length {
+        let mut next: array = [];
+        let mut start: int = 0;
+        while start < current.length {
+            let mut mid: int = start + width;
+            if mid > current.length {
+                mid = current.length;
+            }
+            let mut end: int = mid + width;
+            if end > current.length {
+                end = current.length;
+            }
+            let left: array = slice_array(current, start, mid);
+            let right: array = slice_array(current, mid, end);
+            let merged: array = merge_string_arrays(left, right);
+            let mut k: int = 0;
+            while k < merged.length {
+                next[next.length] = merged[k].copy();
+                k = k + 1;
+            }
+            start = start + width + width;
+        }
+        current = copy_array(next);
+        width = width + width;
+    }
+    current
+}
+
+fn merge_sort_maps(items: array) -> array {
+    let mut current: array = items;
+    let mut width: int = 1;
+    while width < current.length {
+        let mut next: array = [];
+        let mut start: int = 0;
+        while start < current.length {
+            let mut mid: int = start + width;
+            if mid > current.length {
+                mid = current.length;
+            }
+            let mut end: int = mid + width;
+            if end > current.length {
+                end = current.length;
+            }
+            let left: array = slice_array(current, start, mid);
+            let right: array = slice_array(current, mid, end);
+            let merged: array = merge_map_arrays(left, right);
+            let mut k: int = 0;
+            while k < merged.length {
+                next[next.length] = merged[k].copy();
+                k = k + 1;
+            }
+            start = start + width + width;
+        }
+        current = copy_array(next);
+        width = width + width;
+    }
+    current
+}
+
+fn slice_array(items: array, start: int, end: int) -> array {
+    let mut out: array = [];
+    let mut i: int = start;
+    while i < end {
+        out[out.length] = items[i].copy();
+        i = i + 1;
+    }
+    out
+}
+
+fn merge_string_arrays(left: array, right: array) -> array {
+    let mut out: array = [];
+    let mut i: int = 0;
+    let mut j: int = 0;
+    while i < left.length && j < right.length {
+        let a: string = left[i].copy();
+        let b: string = right[j].copy();
+        if a <= b {
+            out[out.length] = a;
+            i = i + 1;
+        } else {
+            out[out.length] = b;
+            j = j + 1;
+        }
+    }
+    while i < left.length {
+        out[out.length] = left[i].copy();
+        i = i + 1;
+    }
+    while j < right.length {
+        out[out.length] = right[j].copy();
+        j = j + 1;
+    }
+    out
+}
+
+fn merge_map_arrays(left: array, right: array) -> array {
+    let mut out: array = [];
+    let mut i: int = 0;
+    let mut j: int = 0;
+    while i < left.length && j < right.length {
+        let left_item: map = left[i].copy();
+        let right_item: map = right[j].copy();
+        let a: string = types::map_string(left_item, "name", "");
+        let b: string = types::map_string(right_item, "name", "");
+        if a <= b {
+            out[out.length] = left_item;
+            i = i + 1;
+        } else {
+            out[out.length] = right_item;
+            j = j + 1;
+        }
+    }
+    while i < left.length {
+        out[out.length] = left[i].copy();
+        i = i + 1;
+    }
+    while j < right.length {
+        out[out.length] = right[j].copy();
+        j = j + 1;
+    }
+    out
 }
 
 fn slice_lines(lines: array, offset: int, limit: int) -> array {
@@ -455,7 +566,55 @@ fn fail_host(envelope: map) -> map {
 
 fn encoded_len(value: map) -> int {
     let encoded: string = json::encode(value);
-    encoded.length
+    utf8_len(encoded)
+}
+
+fn utf8_len(value: string) -> int {
+    let payload: bytes = bytes::from_utf8(value);
+    payload.length
+}
+
+fn truncate_to_utf8_bytes(text: string, limit: int) -> string {
+    let mut end: int = 0;
+    let mut used: int = 0;
+    let mut walking: bool = true;
+    while walking && end < text.length {
+        let ch: string = char_at(text, end);
+        let ch_bytes: int = utf8_len(ch);
+        if used + ch_bytes > limit {
+            walking = false;
+        } else {
+            used = used + ch_bytes;
+            end = end + 1;
+        }
+    }
+    text[0:end]
+}
+
+fn fit_content_to_budget(result: map, cap: int) -> map {
+    let content: string = types::map_string(result, "content", "");
+    let mut fitted: map = result;
+    fitted.content = "";
+    fitted.truncated = true;
+    if encoded_len(fitted) <= cap {
+        let mut budget: int = cap - encoded_len(fitted);
+        let mut walking: bool = true;
+        while walking {
+            fitted.content = truncate_to_utf8_bytes(content, budget);
+            fitted.truncated = true;
+            if encoded_len(fitted) <= cap {
+                walking = false;
+            } else {
+                if budget <= 0 {
+                    fitted.content = "";
+                    walking = false;
+                } else {
+                    budget = budget / 2;
+                }
+            }
+        }
+    }
+    fitted
 }
 
 fn skip_search_code(code: string) -> bool {
@@ -519,13 +678,13 @@ fn push_match(state: map, line: string) -> map {
         state.truncated = true;
         state.stop = true;
     } else {
-        if extra + line.length + map_int(state, "match_bytes", 0) > max_output_bytes {
+        if extra + utf8_len(line) + map_int(state, "match_bytes", 0) > max_output_bytes {
             state.truncated = true;
             state.stop = true;
         } else {
             lines[lines.length] = line;
             state.lines = lines;
-            state.match_bytes = map_int(state, "match_bytes", 0) + extra + line.length;
+            state.match_bytes = map_int(state, "match_bytes", 0) + extra + utf8_len(line);
             if lines.length >= max_matches {
                 state.truncated = true;
                 state.stop = true;
@@ -545,13 +704,15 @@ fn observe_limits(state: map) -> map {
     } else {
         let now: int = map_int(tick, "ms", 0);
         let start: int = map_int(state, "start_ms", 0);
-        let mut elapsed: int = now - start;
-        if elapsed < 0 {
-            elapsed = 0;
-        }
-        if elapsed >= map_int(state, "max_search_wall_time_ms", 2000) {
+        if now < start {
             state.truncated = true;
             state.stop = true;
+        } else {
+            let elapsed: int = now - start;
+            if elapsed >= map_int(state, "max_search_wall_time_ms", 2000) {
+                state.truncated = true;
+                state.stop = true;
+            }
         }
     }
     if map_int(state, "files_visited", 0) >= map_int(state, "max_search_files", 10000) {
@@ -698,7 +859,7 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
             let put: map = cap::artifact_put_result(token, payload, {});
             if map_bool(put, "ok", false) {
                 let id: string = types::map_string(put, "id", "");
-                let len: int = map_int(put, "len", content.length);
+                let len: int = map_int(put, "len", utf8_len(content));
                 let mut artifacts: array = [];
                 artifacts[0] = id;
                 let mut summary: string = "artifact " + id + " (" + json::encode(len) + " bytes)";
@@ -710,6 +871,9 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
                     current = succeed("artifact", data, true, artifacts);
                 }
             }
+        }
+        if encoded_len(current) > max_output_bytes {
+            current = fit_content_to_budget(current, max_output_bytes);
         }
         if encoded_len(current) > max_output_bytes {
             current = fail("output_truncated", "tool result exceeds the configured bound", {});
@@ -795,8 +959,10 @@ pub fn execute(context: map, arguments: map) -> map {
             let mut file_glob: string = "";
             let mut file_glob_active: bool = false;
             if arguments.has("file_glob") {
-                file_glob = arguments.file_glob;
-                file_glob_active = true;
+                if type(arguments.file_glob) == "string" {
+                    file_glob = arguments.file_glob;
+                    file_glob_active = true;
+                }
             }
             let mut offset: int = 0;
             if arguments.has("offset") {

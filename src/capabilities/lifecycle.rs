@@ -4,10 +4,10 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -23,6 +23,23 @@ use super::types::{
 pub trait LifecycleClock: Send + Sync {
     fn now_ms(&self) -> u64;
     fn now(&self) -> Instant;
+    /// Monotonic milliseconds from an admitted origin.
+    ///
+    /// Fake clocks may return `now_ms()` so JumpClock tests stay deterministic.
+    /// Overflow is fail-closed (`None`).
+    fn monotonic_ms(&self) -> Option<u64> {
+        Some(self.now_ms())
+    }
+}
+
+/// Serialize a duration as whole milliseconds, ceiling any positive sub-ms
+/// value to `1` so a non-zero budget cannot collapse to zero. Zero stays zero.
+pub fn positive_duration_ms(duration: Duration) -> u64 {
+    match u64::try_from(duration.as_millis()) {
+        Ok(0) if !duration.is_zero() => 1,
+        Ok(ms) => ms,
+        Err(_) => u64::MAX,
+    }
 }
 
 /// Issues opaque, unforgeable execution token identifiers.
@@ -64,6 +81,11 @@ pub trait CancellationFlag: Send + Sync {
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
+fn system_clock_origin() -> Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
 impl LifecycleClock for SystemClock {
     fn now_ms(&self) -> u64 {
         crate::domain::timestamp()
@@ -71,6 +93,12 @@ impl LifecycleClock for SystemClock {
 
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn monotonic_ms(&self) -> Option<u64> {
+        let elapsed = system_clock_origin().elapsed().as_millis();
+        let ms = u64::try_from(elapsed).ok()?;
+        (ms <= i64::MAX as u64).then_some(ms)
     }
 }
 
@@ -267,6 +295,10 @@ enum TokenState {
 /// Resource bound to an open execution token. Released on interrupt, not on commit.
 pub(crate) trait TokenOwnedResource: Send + Sync {
     fn release(&self);
+    /// Retract unpublished side effects when commit fails after publication.
+    /// Interrupt still uses [`release`](Self::release). Default is a no-op so
+    /// process reapers are not killed on a retryable commit rejection.
+    fn rollback_unpublished_side_effects(&self) {}
 }
 
 fn release_resources(resources: Vec<Arc<dyn TokenOwnedResource>>) {
@@ -435,7 +467,28 @@ impl CapabilityLifecycle {
         })
     }
 
+    pub fn monotonic_ms(&self) -> Option<u64> {
+        self.inner.clock.monotonic_ms()
+    }
+
     pub fn commit(
+        &self,
+        owner: &CapabilityOwner,
+        token: &str,
+        result: Value,
+    ) -> Result<CommitOutcome, LifecycleError> {
+        match self.commit_inner(owner, token, result) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                if should_rollback_unpublished(&error) {
+                    self.rollback_unpublished(token);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn commit_inner(
         &self,
         owner: &CapabilityOwner,
         token: &str,
@@ -470,6 +523,15 @@ impl CapabilityLifecycle {
             return Err(LifecycleError::Cancelled);
         }
         validate_canonical_result(&result)?;
+        let resources = match states.remove(token) {
+            Some(TokenState::Open { resources, .. }) => resources,
+            other => {
+                if let Some(state) = other {
+                    states.insert(token.to_string(), state);
+                }
+                return Err(LifecycleError::TokenUnknown);
+            }
+        };
         states.insert(
             token.to_string(),
             TokenState::Committed {
@@ -477,15 +539,38 @@ impl CapabilityLifecycle {
             },
         );
         drop(states);
-        let committed = self.inner.durable.commit_result(&claims.call_id, &result)?;
-        Ok(CommitOutcome {
-            envelope: json!({
-                "ok": true,
-                "kind": "committed",
-                "call_id": claims.call_id,
-                "result": committed,
-            }),
-        })
+        match self.inner.durable.commit_result(&claims.call_id, &result) {
+            Ok(committed) => {
+                drop(resources);
+                Ok(CommitOutcome {
+                    envelope: json!({
+                        "ok": true,
+                        "kind": "committed",
+                        "call_id": claims.call_id,
+                        "result": committed,
+                    }),
+                })
+            }
+            Err(error) => {
+                for resource in resources {
+                    resource.rollback_unpublished_side_effects();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn rollback_unpublished(&self, token: &str) {
+        let resources = {
+            let states = self.inner.token_states.lock();
+            match states.get(token) {
+                Some(TokenState::Open { resources, .. }) => resources.clone(),
+                _ => return,
+            }
+        };
+        for resource in resources {
+            resource.rollback_unpublished_side_effects();
+        }
     }
 
     pub fn lease(&self, token: &str) -> Result<ExecutionLease, LifecycleError> {
@@ -661,6 +746,16 @@ fn json_size(value: &Value) -> usize {
     serde_json::to_vec(value)
         .map(|bytes| bytes.len())
         .unwrap_or(usize::MAX)
+}
+
+fn should_rollback_unpublished(error: &LifecycleError) -> bool {
+    matches!(
+        error,
+        LifecycleError::Cancelled
+            | LifecycleError::DeadlineElapsed
+            | LifecycleError::ResultTooLarge
+            | LifecycleError::ResultCommitFailed(_)
+    )
 }
 
 fn validate_canonical_result(result: &Value) -> Result<(), LifecycleError> {
