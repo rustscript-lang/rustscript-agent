@@ -1210,6 +1210,102 @@ fn search_depth_rejected_child_dirs_are_not_counted() {
     assert_exact_envelope(&native, &rss.result);
 }
 
+fn assert_search_exact_envelope(
+    label: &str,
+    files: &[(&str, &str)],
+    mut config_edit: impl FnMut(&mut FileToolConfig),
+    arguments: Value,
+) -> (ToolResult, RssRun) {
+    let fixture = Fixture::new(label);
+    for (name, contents) in files {
+        fs::write(fixture.root.join(name), contents).unwrap();
+    }
+    let mut config = fixture.config();
+    config_edit(&mut config);
+    config.artifact_store.root = fixture.parent.join(format!("artifacts-{label}"));
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    (native, rss)
+}
+
+#[test]
+fn search_exact_fill_scan_cap_matches_all_lines_without_truncation() {
+    let one_line = "needle\n";
+    let (native, rss) = assert_search_exact_envelope(
+        "search-exact-fill-one",
+        &[("exact.txt", one_line)],
+        |config| config.max_search_scanned_bytes = one_line.len(),
+        json!({"pattern": "needle"}),
+    );
+    assert!(native.ok, "native={native:?}");
+    assert!(!native.truncated, "native={native:?}");
+    assert_eq!(native.data["match_count"], json!(1));
+    assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
+    assert_eq!(rss.result["data"]["match_count"], json!(1));
+
+    let multi = "n1\nn2\n";
+    let (native, rss) = assert_search_exact_envelope(
+        "search-exact-fill-multi",
+        &[("exact.txt", multi)],
+        |config| config.max_search_scanned_bytes = multi.len(),
+        json!({"pattern": "n"}),
+    );
+    assert!(native.ok, "native={native:?}");
+    assert!(!native.truncated, "native={native:?}");
+    assert_eq!(native.data["match_count"], json!(2));
+    assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
+    assert_eq!(rss.result["data"]["match_count"], json!(2));
+}
+
+#[test]
+fn search_exact_fill_then_later_positive_file_truncates_like_native() {
+    let first = "n1\nn2\n";
+    let (native, rss) = assert_search_exact_envelope(
+        "search-exact-fill-later",
+        &[("a.txt", first), ("b.txt", "n3\n")],
+        |config| config.max_search_scanned_bytes = first.len(),
+        json!({"pattern": "n"}),
+    );
+    assert!(native.ok, "native={native:?}");
+    assert!(native.truncated, "native={native:?}");
+    assert_eq!(native.data["match_count"], json!(2));
+    assert!(
+        native.content.contains("a.txt"),
+        "exact-fill file must match: native={native:?}"
+    );
+    assert!(
+        !native.content.contains("b.txt"),
+        "later file must not match after exact fill: native={native:?}"
+    );
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["data"]["match_count"], json!(2));
+}
+
+#[test]
+fn search_final_files_visited_slot_is_fully_matched() {
+    let (native, rss) = assert_search_exact_envelope(
+        "search-final-file-slot",
+        &[("a.txt", "n0\n"), ("b.txt", "n1\nn2\n")],
+        |config| config.max_search_files = 4,
+        json!({"pattern": "n"}),
+    );
+    assert!(native.ok, "native={native:?}");
+    assert!(!native.truncated, "native={native:?}");
+    assert_eq!(native.data["files_visited"], json!(2));
+    assert_eq!(native.data["match_count"], json!(3));
+    assert!(
+        native.content.contains("b.txt:1:n1") && native.content.contains("b.txt:2:n2"),
+        "final files_visited slot must be fully matched: native={native:?}"
+    );
+    assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
+    assert_eq!(rss.result["data"]["match_count"], json!(3));
+}
+
 fn write_search_files(fixture: &Fixture, relative_paths: &[&str]) {
     for name in relative_paths {
         let path = fixture.root.join(name);

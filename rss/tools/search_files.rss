@@ -694,7 +694,7 @@ fn push_match(state: map, line: string) -> map {
     state
 }
 
-fn observe_limits(state: map) -> map {
+fn observe_controls(state: map) -> map {
     let tick: map = cap::clock_monotonic_ms(types::map_string(state, "token", ""));
     if map_bool(tick, "ok", false) == false {
         state.fatal = true;
@@ -715,14 +715,6 @@ fn observe_limits(state: map) -> map {
             }
         }
     }
-    if map_int(state, "files_visited", 0) >= map_int(state, "max_search_files", 10000) {
-        state.truncated = true;
-        state.stop = true;
-    }
-    if map_int(state, "scanned_bytes", 0) >= map_int(state, "max_search_scanned_bytes", 16777216) {
-        state.truncated = true;
-        state.stop = true;
-    }
     let checked: map = control_failure();
     if map_bool(checked, "ok", false) == false {
         state.fatal = true;
@@ -733,9 +725,17 @@ fn observe_limits(state: map) -> map {
     state
 }
 
+fn observe_file_count(state: map) -> map {
+    if map_int(state, "files_visited", 0) >= map_int(state, "max_search_files", 10000) {
+        state.truncated = true;
+        state.stop = true;
+    }
+    state
+}
+
 fn walk_search(state: map, path: string, depth: int) -> map {
     state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
-    state = observe_limits(state);
+    state = observe_controls(state);
     if map_bool(state, "stop", false) == false {
             let remaining: int = map_int(state, "max_search_files", 10000) - map_int(state, "files_visited", 0);
             if remaining <= 0 {
@@ -810,8 +810,10 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                                 }
                             } else {
                                 if file_type == "file" {
-                                    state = observe_limits(state);
+                                    state = observe_controls(state);
                                     if map_bool(state, "stop", false) == false {
+                                        state = observe_file_count(state);
+                                        if map_bool(state, "stop", false) == false {
                                         state.files_visited = map_int(state, "files_visited", 0) + 1;
                                         if file_glob_ok(state, name, child) {
                                             let token: string = types::map_string(state, "token", "");
@@ -841,7 +843,7 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                                                                 let lines: array = split_inclusive_newline(text);
                                                                 let mut line_index: int = 0;
                                                                 while map_bool(state, "stop", false) == false && line_index < lines.length {
-                                                                    state = observe_limits(state);
+                                                                    state = observe_controls(state);
                                                                     if map_bool(state, "stop", false) == false {
                                                                         let line: string = lines[line_index].copy();
                                                                         if string_contains(line, pattern) {
@@ -857,6 +859,7 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                                                     }
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                 }
@@ -1028,7 +1031,7 @@ pub fn execute(context: map, arguments: map) -> map {
                 result = fail_host(start_clock);
             } else {
                 state.start_ms = map_int(start_clock, "ms", 0);
-                state = observe_limits(state);
+                state = observe_controls(state);
                 if map_bool(state, "stop", false) == false {
                     state = walk_search(state, path, 0);
                 }
