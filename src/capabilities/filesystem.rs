@@ -146,6 +146,12 @@ impl FilesystemCapability {
         limit: usize,
     ) -> Result<FsRead, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
+        if limit == 0 {
+            return Err(CapabilityError::new(
+                "invalid_request",
+                "limit must be positive",
+            ));
+        }
         if limit > self.limits.max_read_bytes {
             return Err(CapabilityError::new(
                 "budget_exceeded",
@@ -184,6 +190,12 @@ impl FilesystemCapability {
         limit: usize,
     ) -> Result<FsList, CapabilityError> {
         let _claims = self.authorize(token, CapabilityRisk::Read)?;
+        if limit == 0 {
+            return Err(CapabilityError::new(
+                "invalid_request",
+                "limit must be positive",
+            ));
+        }
         if limit > self.limits.max_list_entries {
             return Err(CapabilityError::new(
                 "budget_exceeded",

@@ -302,6 +302,46 @@ fn error_code(error: &CapabilityError) -> &str {
     error.code()
 }
 
+fn run_cap_source(
+    fixture: &Fixture,
+    filesystem: Option<Arc<FilesystemCapability>>,
+    processes: Option<Arc<ProcessCapability>>,
+    artifacts: Option<Arc<ArtifactCapability>>,
+    source: &str,
+) -> VmValue {
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(fixture.lifecycle.clone())),
+        capability_owner: Some(fixture.owner.clone()),
+        filesystem,
+        processes,
+        artifacts,
+        ..AgentHostBridges::default()
+    };
+    AgentRunner::from_source(source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run")
+}
+
+fn envelope_error_code(value: &VmValue) -> String {
+    let VmValue::Map(fields) = value else {
+        panic!("expected map envelope, got {value:?}");
+    };
+    assert_eq!(
+        fields.get(&VmValue::string("ok")),
+        Some(&VmValue::Bool(false)),
+        "expected typed failure, got {value:?}"
+    );
+    let Some(VmValue::Map(error)) = fields.get(&VmValue::string("error")) else {
+        panic!("expected error map, got {value:?}");
+    };
+    match error.get(&VmValue::string("code")) {
+        Some(VmValue::String(code)) => code.to_string(),
+        other => panic!("expected error code string, got {other:?}"),
+    }
+}
+
 fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
@@ -1162,5 +1202,263 @@ fn host_binary_round_trips_fs_and_artifact_bytes() {
     match fields.get(&VmValue::string("bytes")) {
         Some(VmValue::Bytes(bytes)) => assert_eq!(bytes.as_ref(), payload.as_slice()),
         other => panic!("expected lossless bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn host_negative_offset_cannot_read_byte_zero() {
+    let fixture = Fixture::new("neg-off");
+    fs::write(fixture.root.join("bin.dat"), b"ABC").expect("seed");
+    let fs_cap = Arc::new(fixture.filesystem());
+    let token = fixture.token(CapabilityRisk::Read);
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::fs_read_range("{token}", "bin.dat", -1, 1)
+        }}
+    "#
+    );
+    let result = run_cap_source(
+        &fixture,
+        Some(Arc::clone(&fs_cap)),
+        Some(Arc::new(fixture.processes())),
+        None,
+        &source,
+    );
+    assert_eq!(envelope_error_code(&result), "invalid_request");
+    if let VmValue::Map(fields) = &result
+        && let Some(VmValue::Bytes(bytes)) = fields.get(&VmValue::string("bytes"))
+    {
+        panic!("negative offset must not return file bytes, got {bytes:?}");
+    }
+}
+
+#[test]
+fn host_malformed_write_payload_does_not_create_or_modify_file() {
+    let fixture = Fixture::new("bad-write");
+    let path = fixture.root.join("out.bin");
+    fs::write(&path, b"keep").expect("seed");
+    let fs_cap = Arc::new(fixture.filesystem());
+    let token = fixture.token(CapabilityRisk::Write);
+    for payload in ["{}", "\"hello\"", "1"] {
+        let source = format!(
+            r#"
+            pub fn run(input: map) -> map {{
+                cap::fs_write_atomic("{token}", "out.bin", "", {payload})
+            }}
+        "#
+        );
+        let result = run_cap_source(
+            &fixture,
+            Some(Arc::clone(&fs_cap)),
+            Some(Arc::new(fixture.processes())),
+            None,
+            &source,
+        );
+        assert_eq!(
+            envelope_error_code(&result),
+            "invalid_request",
+            "payload {payload}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("unchanged"),
+            b"keep",
+            "payload {payload}"
+        );
+    }
+    assert!(!fixture.root.join("created.bin").exists());
+    let create = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::fs_write_atomic("{token}", "created.bin", "", {{}})
+        }}
+    "#
+    );
+    let result = run_cap_source(
+        &fixture,
+        Some(fs_cap),
+        Some(Arc::new(fixture.processes())),
+        None,
+        &create,
+    );
+    assert_eq!(envelope_error_code(&result), "invalid_request");
+    assert!(!fixture.root.join("created.bin").exists());
+}
+
+#[test]
+fn host_malformed_process_and_artifact_values_fail_without_effects() {
+    let fixture = Fixture::new("bad-cap-vals");
+    let artifacts = Arc::new(fixture.artifacts(ArtifactLimits {
+        max_object_bytes: 32,
+        max_total_bytes: 64,
+        max_objects: 4,
+    }));
+    let processes = Arc::new(fixture.processes());
+    let write = fixture.token(CapabilityRisk::Write);
+    let execute = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &execute,
+            &["/bin/cat".to_string()],
+            "",
+            &[],
+            ProcessLimits::default(),
+        )
+        .expect("spawn");
+
+    let put = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::artifact_put("{write}", {{}}, {{}})
+        }}
+    "#
+    );
+    let put_result = run_cap_source(
+        &fixture,
+        None,
+        Some(Arc::clone(&processes)),
+        Some(Arc::clone(&artifacts)),
+        &put,
+    );
+    assert_eq!(envelope_error_code(&put_result), "invalid_request");
+    if let VmValue::Map(fields) = &put_result
+        && let Some(VmValue::String(id)) = fields.get(&VmValue::string("id"))
+    {
+        panic!("malformed artifact put must not mint an id, got {id}");
+    }
+
+    let stdin = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::process_write("{execute}", "{}", {{}})
+        }}
+    "#,
+        spawned.handle
+    );
+    let write_result = run_cap_source(
+        &fixture,
+        None,
+        Some(Arc::clone(&processes)),
+        Some(Arc::clone(&artifacts)),
+        &stdin,
+    );
+    assert_eq!(envelope_error_code(&write_result), "invalid_request");
+
+    let spawn = r#"
+        pub fn run(input: map) -> map {
+            cap::process_spawn(input.token, input.argv, "", [], {timeout_ms: -1})
+        }
+    "#;
+    let spawn_host = AgentHostBridges {
+        lifecycle: Some(Arc::new(fixture.lifecycle.clone())),
+        capability_owner: Some(fixture.owner.clone()),
+        processes: Some(Arc::clone(&processes)),
+        artifacts: Some(artifacts),
+        ..AgentHostBridges::default()
+    };
+    let spawn_result = AgentRunner::from_source(spawn, AgentConfig::default())
+        .expect("compile")
+        .with_host(spawn_host)
+        .run_with_context(VmValue::map(vec![
+            (VmValue::string("token"), VmValue::string(&execute)),
+            (
+                VmValue::string("argv"),
+                VmValue::array(vec![VmValue::string("/bin/true")]),
+            ),
+        ]))
+        .expect("run");
+    assert_eq!(envelope_error_code(&spawn_result), "invalid_request");
+
+    processes.kill(&execute, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn zero_limit_pagination_is_invalid_and_cannot_loop() {
+    let fixture = Fixture::new("zero-limit");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    for name in ["a", "b", "c"] {
+        fs::write(fixture.root.join("dir").join(name), name.as_bytes()).expect("entry");
+    }
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let error = fs_cap
+        .list(&token, "dir", 0, 0)
+        .expect_err("zero list limit");
+    assert_eq!(error_code(&error), "invalid_request");
+    let error = fs_cap
+        .read_range(&token, "dir/a", 0, 0)
+        .expect_err("zero read limit");
+    assert_eq!(error_code(&error), "invalid_request");
+
+    let processes = fixture.processes();
+    let execute = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &execute,
+            &["/bin/echo".to_string(), "hello".to_string()],
+            "",
+            &[],
+            ProcessLimits::default(),
+        )
+        .expect("spawn");
+    let _ = processes
+        .wait(&execute, &spawned.handle, Some(5_000))
+        .expect("wait");
+    let error = processes
+        .log(&execute, &spawned.handle, 0, 0)
+        .expect_err("zero log limit");
+    assert_eq!(error_code(&error), "invalid_request");
+    let error = processes
+        .poll(&execute, &spawned.handle, 0, 0)
+        .expect_err("zero poll limit");
+    assert_eq!(error_code(&error), "invalid_request");
+
+    let host_fs = Arc::new(fixture.filesystem());
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::fs_list("{token}", "dir", 0, 0)
+        }}
+    "#
+    );
+    let result = run_cap_source(
+        &fixture,
+        Some(host_fs),
+        Some(Arc::new(fixture.processes())),
+        None,
+        &source,
+    );
+    assert_eq!(envelope_error_code(&result), "invalid_request");
+    if let VmValue::Map(fields) = &result {
+        assert_ne!(
+            (
+                fields.get(&VmValue::string("truncated")),
+                fields.get(&VmValue::string("next_cursor")),
+                fields.get(&VmValue::string("cursor"))
+            ),
+            (
+                Some(&VmValue::Bool(true)),
+                Some(&VmValue::Int(0)),
+                Some(&VmValue::Int(0))
+            ),
+            "clients must not receive truncated=true with an unchanged cursor"
+        );
+    }
+
+    let mut cursor = 0_u64;
+    let mut pages = 0_usize;
+    loop {
+        pages += 1;
+        assert!(pages <= 8, "pagination must not loop");
+        let page = fs_cap.list(&token, "dir", cursor, 2).expect("page");
+        if page.truncated {
+            assert_ne!(
+                page.next_cursor, cursor,
+                "truncated pages must advance next_cursor"
+            );
+            cursor = page.next_cursor;
+            continue;
+        }
+        break;
     }
 }
