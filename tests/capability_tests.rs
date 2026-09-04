@@ -714,7 +714,7 @@ fn process_output_is_truncated_and_handles_clean_up_on_drop() {
 }
 
 #[test]
-fn process_list_spawn_stdin_and_log_cursors_are_owner_scoped() {
+fn process_spawn_stdin_and_log_cursors_are_owner_scoped() {
     let fixture = Fixture::new("proc-list");
     let processes = fixture.processes();
     let token = fixture.token(CapabilityRisk::Execute);
@@ -734,10 +734,8 @@ fn process_list_spawn_stdin_and_log_cursors_are_owner_scoped() {
             },
         )
         .expect("spawn");
-    let listed = processes.list(&token).expect("list");
-    assert_eq!(listed, vec![spawned.handle.clone()]);
     let wrote = processes
-        .write_stdin(&token, &spawned.handle, b"hello-cursor\n")
+        .write_stdin(&token, &spawned.handle, b"hello-cursor\n", None)
         .expect("write");
     assert_eq!(wrote, 13);
     processes
@@ -752,6 +750,126 @@ fn process_list_spawn_stdin_and_log_cursors_are_owner_scoped() {
     assert!(snapshot.stdout_cursor.eof);
     let log = processes.log(&token, &spawned.handle, 0, 64).expect("log");
     assert_eq!(log.stdout_cursor.offset, 0);
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_log_limit_truncates_each_stream_and_advances_offsets() {
+    let fixture = Fixture::new("proc-log-limit");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &[
+                "/usr/bin/printf".to_string(),
+                "%s".to_string(),
+                "0123456789ABCDEF".to_string(),
+            ],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 2_000,
+                stdout_limit: 64,
+                stderr_limit: 64,
+                total_limit: 64,
+                stdin_limit: 64,
+                log_limit: 64,
+            },
+        )
+        .expect("spawn");
+    let waited = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait");
+    assert!(!waited.running);
+    let first = processes
+        .log(&token, &spawned.handle, 0, 4)
+        .expect("log first");
+    assert_eq!(first.stdout, "0123");
+    assert_eq!(first.stdout_cursor.offset, 0);
+    assert_eq!(first.stdout_cursor.next_offset, 4);
+    assert!(first.stdout_cursor.truncated);
+    assert!(!first.stdout_cursor.eof);
+    let second = processes
+        .log(&token, &spawned.handle, first.stdout_cursor.next_offset, 4)
+        .expect("log second");
+    assert_eq!(second.stdout, "4567");
+    assert_eq!(second.stdout_cursor.offset, 4);
+    assert_eq!(second.stdout_cursor.next_offset, 8);
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_write_timeout_caps_a_full_pipe() {
+    let fixture = Fixture::new("proc-write-timeout");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+        total_limit: 64 * 1024,
+        stdin_limit: 2 * 1024 * 1024,
+        log_limit: 64 * 1024,
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdout_limit: 64 * 1024,
+                stderr_limit: 64 * 1024,
+                total_limit: 64 * 1024,
+                stdin_limit: 2 * 1024 * 1024,
+                log_limit: 64 * 1024,
+            },
+        )
+        .expect("spawn");
+    let started = Instant::now();
+    let error = processes
+        .write_stdin(&token, &spawned.handle, &vec![b'x'; 1024 * 1024], Some(80))
+        .expect_err("full pipe write");
+    let elapsed = started.elapsed();
+    assert_eq!(error_code(&error), "deadline_elapsed");
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "timed write blocked for {elapsed:?}"
+    );
+    processes.kill(&token, &spawned.handle).expect("kill");
+    assert!(wait_until_pid_gone(spawned.pid, Duration::from_secs(2)));
+}
+
+#[test]
+fn process_spawn_with_stdin_writes_before_return() {
+    let fixture = Fixture::new("proc-spawn-stdin");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn_with(
+            &token,
+            &["/bin/cat".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 2_000,
+                stdout_limit: 64,
+                stderr_limit: 64,
+                total_limit: 64,
+                stdin_limit: 64,
+                log_limit: 64,
+            },
+            Some(b"from-spawn\n"),
+        )
+        .expect("spawn_with");
+    processes
+        .close_stdin(&token, &spawned.handle)
+        .expect("close");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait");
+    assert!(snapshot.stdout.contains("from-spawn"));
     processes.kill(&token, &spawned.handle).expect("kill");
 }
 
@@ -1320,7 +1438,7 @@ fn host_process_ceilings_clamp_caller_timeout() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(!snapshot.running);
     let error = processes
-        .write_stdin(&token, &spawned.handle, &[0; 16])
+        .write_stdin(&token, &spawned.handle, &[0; 16], None)
         .expect_err("stdin ceiling");
     assert_eq!(error_code(&error), "budget_exceeded");
 }
@@ -1494,7 +1612,7 @@ fn host_malformed_process_and_artifact_values_fail_without_effects() {
     let stdin = format!(
         r#"
         pub fn run(input: map) -> map {{
-            cap::process_write("{execute}", "{}", {{}})
+            cap::process_write("{execute}", "{}", {{}}, 0)
         }}
     "#,
         spawned.handle
@@ -1509,8 +1627,9 @@ fn host_malformed_process_and_artifact_values_fail_without_effects() {
     assert_eq!(envelope_error_code(&write_result), "invalid_request");
 
     let spawn = r#"
+        use bytes;
         pub fn run(input: map) -> map {
-            cap::process_spawn(input.token, input.argv, "", [], {timeout_ms: -1})
+            cap::process_spawn(input.token, input.argv, "", [], {timeout_ms: -1}, bytes::from_utf8(""))
         }
     "#;
     let spawn_host = AgentHostBridges {

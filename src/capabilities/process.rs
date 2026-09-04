@@ -14,8 +14,8 @@ use std::{
 
 use rustscript_vm::{
     BoundedProcess, BoundedProcessError, BoundedProcessHandle, BoundedProcessRequest,
-    CancellationToken as ProcessCancel, ConfinedFsLimits, ConfinedFsRoot, MAX_COMPONENT_BYTES,
-    MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES, ProcessStatus,
+    CancellationToken as ProcessCancel, ConfinedFsLimits, ConfinedFsRoot, LogSnapshot,
+    MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES, ProcessStatus,
 };
 
 use super::{
@@ -235,9 +235,6 @@ impl ProcessCapability {
                 request = request.with_env(name.clone(), value);
             }
         }
-        if let Some(stdin) = stdin {
-            request = request.with_stdin(stdin.to_vec());
-        }
         let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
         let handle = process.lifecycle_handle();
         let pid = handle.pid();
@@ -261,16 +258,24 @@ impl ProcessCapability {
             released: AtomicBool::new(false),
         });
         if let Err(error) = self.inner.lifecycle.register_resource(token, reaper) {
-            if let Some(owned) = self
-                .inner
-                .table
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&id)
-            {
-                terminate_owned(&owned);
-            }
+            self.remove_and_terminate(&id);
             return Err(CapabilityError::from(error));
+        }
+        match stdin {
+            Some(stdin) if !stdin.is_empty() => {
+                if let Err(error) = self.write_stdin(token, &id, stdin, Some(limits.timeout_ms)) {
+                    let still_running = self
+                        .lookup(token, &id)
+                        .ok()
+                        .map(|owned| owned.handle.terminal_status().is_none())
+                        .unwrap_or(false);
+                    if still_running || error.code() != "stdin_closed" {
+                        self.remove_and_terminate(&id);
+                        return Err(error);
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(ProcessSpawn { handle: id, pid })
     }
@@ -292,7 +297,7 @@ impl ProcessCapability {
         let _ = cursor;
         let owned = self.lookup(token, handle)?;
         let poll_result = owned.handle.poll();
-        let mut snap = snapshot(&owned.handle, handle, None);
+        let mut snap = snapshot(&owned.handle, handle, None, None);
         match poll_result {
             Ok(_) => Ok(snap),
             Err(BoundedProcessError::DeadlineElapsed) => {
@@ -321,7 +326,7 @@ impl ProcessCapability {
             Ok(_) | Err(BoundedProcessError::DeadlineElapsed) => {}
             Err(error) => return Err(map_process_error(error)),
         }
-        Ok(snapshot(&owned.handle, handle, None))
+        Ok(snapshot(&owned.handle, handle, None, None))
     }
 
     /// Returns a bounded log window.
@@ -339,16 +344,16 @@ impl ProcessCapability {
             ));
         }
         let owned = self.lookup(token, handle)?;
-        let _ = limit.min(self.inner.host_limits.log_limit);
-        Ok(snapshot(&owned.handle, handle, Some(cursor)))
+        Ok(snapshot(&owned.handle, handle, Some(cursor), Some(limit)))
     }
 
-    /// Writes bytes to child stdin.
+    /// Writes bytes to child stdin, honoring caller timeout, cancel, and deadline.
     pub fn write_stdin(
         &self,
         token: &str,
         handle: &str,
         bytes: &[u8],
+        timeout_ms: Option<u64>,
     ) -> Result<usize, CapabilityError> {
         let owned = self.lookup(token, handle)?;
         if bytes.len() > self.inner.host_limits.stdin_limit {
@@ -357,7 +362,15 @@ impl ProcessCapability {
                 "stdin write exceeds the configured bound",
             ));
         }
-        owned.handle.write_stdin(bytes).map_err(map_process_error)
+        let mut deadline = owned.handle.deadline();
+        if let Some(ms) = timeout_ms {
+            match Instant::now().checked_add(Duration::from_millis(ms)) {
+                Some(bound) if bound < deadline => deadline = bound,
+                None => deadline = Instant::now(),
+                Some(_) => {}
+            }
+        }
+        self.write_stdin_until(token, &owned.handle, bytes, deadline)
     }
 
     /// Closes child stdin.
@@ -367,23 +380,6 @@ impl ProcessCapability {
             Ok(()) | Err(BoundedProcessError::StdinClosed) => Ok(()),
             Err(error) => Err(map_process_error(error)),
         }
-    }
-
-    /// Lists opaque handles owned by this token's owner and generation.
-    pub fn list(&self, token: &str) -> Result<Vec<String>, CapabilityError> {
-        let claims = self.authorize(token, CapabilityRisk::Execute)?;
-        let table = self
-            .inner
-            .table
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(table
-            .iter()
-            .filter(|(_, owned)| {
-                owned.owner_key == claims.owner.key() && owned.generation == claims.generation
-            })
-            .map(|(handle, _)| handle.clone())
-            .collect())
     }
 
     /// Kills the process tree bound to `handle`.
@@ -458,6 +454,69 @@ impl ProcessCapability {
         })
     }
 
+    fn remove_and_terminate(&self, handle: &str) {
+        if let Some(owned) = self
+            .inner
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(handle)
+        {
+            terminate_owned(&owned);
+        }
+    }
+
+    fn write_stdin_until(
+        &self,
+        token: &str,
+        handle: &BoundedProcessHandle,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<usize, CapabilityError> {
+        const WRITE_POLL_SLICE: Duration = Duration::from_millis(5);
+        const WRITE_JOIN_GRACE: Duration = Duration::from_millis(200);
+        if bytes.is_empty() {
+            self.authorize(token, CapabilityRisk::Execute)?;
+            return Ok(0);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = tx.send(handle.write_stdin(bytes));
+            });
+            loop {
+                if let Err(error) = self.authorize(token, CapabilityRisk::Execute) {
+                    let _ = handle.close_stdin();
+                    let _ = rx.recv_timeout(WRITE_JOIN_GRACE);
+                    return Err(error);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    let _ = handle.close_stdin();
+                    return match rx.recv_timeout(WRITE_JOIN_GRACE) {
+                        Ok(Ok(wrote)) => Ok(wrote),
+                        Ok(Err(_)) | Err(_) => Err(CapabilityError::new(
+                            "deadline_elapsed",
+                            "process deadline elapsed",
+                        )),
+                    };
+                }
+                let slice = WRITE_POLL_SLICE.min(deadline.saturating_duration_since(now));
+                match rx.recv_timeout(slice) {
+                    Ok(Ok(wrote)) => return Ok(wrote),
+                    Ok(Err(error)) => return Err(map_process_error(error)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(CapabilityError::new(
+                            "process_failed",
+                            "stdin write worker ended",
+                        ));
+                    }
+                }
+            }
+        })
+    }
+
     fn clamp_limits(&self, caller: ProcessLimits, claims: &TokenClaims) -> ProcessLimits {
         let host = self.inner.host_limits;
         let remaining_ms = u64::try_from(
@@ -488,15 +547,24 @@ fn terminate_owned(owned: &OwnedProcess) {
     let _ = owned.handle.shutdown();
 }
 
-fn snapshot(handle: &BoundedProcessHandle, id: &str, offset: Option<u64>) -> ProcessSnapshot {
-    let stdout = match offset {
+fn snapshot(
+    handle: &BoundedProcessHandle,
+    id: &str,
+    offset: Option<u64>,
+    limit: Option<usize>,
+) -> ProcessSnapshot {
+    let mut stdout = match offset {
         Some(offset) => handle.stdout_snapshot_from(offset),
         None => handle.stdout_snapshot(),
     };
-    let stderr = match offset {
+    let mut stderr = match offset {
         Some(offset) => handle.stderr_snapshot_from(offset),
         None => handle.stderr_snapshot(),
     };
+    if let Some(limit) = limit {
+        stdout = truncate_log_snapshot(stdout, limit);
+        stderr = truncate_log_snapshot(stderr, limit);
+    }
     let status = handle.terminal_status();
     let running = status.is_none();
     let signaled = matches!(status, Some(ProcessStatus::Signaled { .. }));
@@ -527,6 +595,22 @@ fn snapshot(handle: &BoundedProcessHandle, id: &str, offset: Option<u64>) -> Pro
         unknown,
         deadline_elapsed: false,
         cancelled: false,
+    }
+}
+
+fn truncate_log_snapshot(snapshot: LogSnapshot, limit: usize) -> LogSnapshot {
+    if snapshot.bytes.len() <= limit {
+        return snapshot;
+    }
+    let mut bytes = snapshot.bytes;
+    bytes.truncate(limit);
+    LogSnapshot {
+        bytes,
+        offset: snapshot.offset,
+        next_offset: snapshot.offset.saturating_add(limit as u64),
+        truncated: true,
+        gap: snapshot.gap,
+        eof: false,
     }
 }
 

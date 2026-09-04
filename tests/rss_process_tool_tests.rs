@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 use rustscript_agent::capabilities::{
     ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
     CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle, LifecycleClock,
-    LifecycleError, LifecycleLimits, NeverCancelled, PrepareMetadata, ProcessCapability,
-    ProcessLimits, SystemClock, TokenIssuer, UuidIssuer,
+    LifecycleError, LifecycleLimits, NeverCancelled, PrepareMetadata, PrepareOutcome,
+    ProcessCapability, ProcessLimits, SystemClock, TokenIssuer, UuidIssuer,
 };
 use rustscript_agent::config::ProcessToolConfig;
 use rustscript_agent::tools::{
-    ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolResult,
+    ProcessArtifactSink, ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolResult,
 };
 use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolRegistry};
 use rustscript_vm::Value as VmValue;
@@ -362,6 +362,15 @@ impl NativePair {
             table,
         }
     }
+
+    fn with_artifact_sink(config: ProcessToolConfig, sink: Arc<dyn ProcessArtifactSink>) -> Self {
+        let pair = Self::new(config);
+        Self {
+            terminal: pair.terminal.with_artifact_sink(Arc::clone(&sink)),
+            process: pair.process.with_artifact_sink(sink),
+            table: pair.table,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -372,6 +381,7 @@ struct RssRun {
     call_id: String,
     processes: Arc<ProcessCapability>,
     lifecycle: Arc<CapabilityLifecycle>,
+    artifacts: Option<Arc<ArtifactCapability>>,
 }
 
 struct RssExec {
@@ -388,6 +398,7 @@ struct RssExec {
     shared_lifecycle: Option<Arc<CapabilityLifecycle>>,
     shared_processes: Option<Arc<ProcessCapability>>,
     artifact_limits: ArtifactLimits,
+    enable_artifacts: bool,
 }
 
 fn default_artifact_limits() -> ArtifactLimits {
@@ -417,15 +428,19 @@ fn run_rss_exec(fixture: &Fixture, config: &ProcessToolConfig, exec: RssExec) ->
                 .expect("process capability"),
         ),
     };
-    let artifacts = Arc::new(
-        ArtifactCapability::new(lifecycle.as_ref().clone(), owner(), exec.artifact_limits)
-            .expect("artifacts"),
-    );
+    let artifacts = if exec.enable_artifacts {
+        Some(Arc::new(
+            ArtifactCapability::new(lifecycle.as_ref().clone(), owner(), exec.artifact_limits)
+                .expect("artifacts"),
+        ))
+    } else {
+        None
+    };
     let host = AgentHostBridges {
         lifecycle: Some(Arc::clone(&lifecycle)),
         capability_owner: Some(owner()),
         processes: Some(Arc::clone(&processes)),
-        artifacts: Some(artifacts),
+        artifacts: artifacts.clone(),
         ..AgentHostBridges::default()
     };
     let context = json!({
@@ -458,6 +473,7 @@ fn run_rss_exec(fixture: &Fixture, config: &ProcessToolConfig, exec: RssExec) ->
         call_id: exec.call_id.clone(),
         processes,
         lifecycle,
+        artifacts,
     }
 }
 
@@ -478,6 +494,7 @@ fn default_exec(module: &'static str, tool_name: &'static str, arguments: Value)
         shared_lifecycle: None,
         shared_processes: None,
         artifact_limits: default_artifact_limits(),
+        enable_artifacts: true,
     }
 }
 
@@ -739,7 +756,7 @@ fn foreground_timeout_kills_child_and_grandchild() {
         "argv": [
             "/bin/sh",
             "-c",
-            "echo $$ > \"$1\"; /bin/sh -c 'echo $$ > \"$2\"; sleep 60' nested \"$2\" & wait",
+            "echo $$ > \"$1\"; /bin/sleep 60 & echo $! > \"$2\"; wait",
             "timeout-child",
             marker.to_string_lossy(),
             grand.to_string_lossy()
@@ -766,10 +783,16 @@ fn foreground_timeout_kills_child_and_grandchild() {
         .parse()
         .expect("pid");
     wait_until_dead(pid);
-    if let Ok(text) = fs::read_to_string(&grand) {
-        let grand_pid: u32 = text.trim().parse().expect("grand pid");
-        wait_until_dead(grand_pid);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !grand.exists() {
+        std::thread::sleep(Duration::from_millis(20));
     }
+    let grand_pid: u32 = fs::read_to_string(&grand)
+        .expect("grand pid marker")
+        .trim()
+        .parse()
+        .expect("grand pid");
+    wait_until_dead(grand_pid);
 }
 
 #[test]
@@ -1053,6 +1076,10 @@ fn cancellation_during_foreground_wait_is_typed() {
     );
     assert_eq!(rss.result["ok"], json!(false));
     assert_eq!(error_code(&rss.result), "cancelled");
+    assert_eq!(
+        rss.result["error"]["message"].as_str(),
+        Some("process was cancelled")
+    );
 }
 
 #[test]
@@ -1072,4 +1099,658 @@ fn output_truncation_and_overflow_artifact_match_native() {
     );
     assert_exact_envelope(&native, &rss.result);
     assert!(native.truncated);
+}
+
+fn error_message(value: &Value) -> &str {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn rss_process(
+    fixture: &Fixture,
+    config: &ProcessToolConfig,
+    previous: &RssRun,
+    arguments: Value,
+) -> RssRun {
+    run_rss_exec(
+        fixture,
+        config,
+        RssExec {
+            shared_lifecycle: Some(Arc::clone(&previous.lifecycle)),
+            shared_processes: Some(Arc::clone(&previous.processes)),
+            unlimited_fuel: true,
+            ..default_exec("process.rss", "process", arguments)
+        },
+    )
+}
+
+fn rss_terminal(fixture: &Fixture, config: &ProcessToolConfig, arguments: Value) -> RssRun {
+    run_rss_exec(
+        fixture,
+        config,
+        default_exec("terminal.rss", "terminal", arguments),
+    )
+}
+
+fn artifact_bytes(run: &RssRun, id: &str) -> Vec<u8> {
+    let artifacts = run.artifacts.as_ref().expect("artifacts store");
+    let prepared = run
+        .lifecycle
+        .prepare(
+            &owner(),
+            PrepareMetadata {
+                run_id: "run-test".to_string(),
+                call_id: format!(
+                    "artifact-read-{}",
+                    NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+                ),
+                tool_name: "process".to_string(),
+                argument_digest: "digest".to_string(),
+                registry_identity: REGISTRY_IDENTITY.to_string(),
+                risk_class: CapabilityRisk::Execute,
+                summary: "artifact-read".to_string(),
+            },
+        )
+        .expect("prepare artifact token");
+    let PrepareOutcome::Execute {
+        execution_token, ..
+    } = prepared
+    else {
+        panic!("expected execute token for artifact read, got {prepared:?}");
+    };
+    artifacts.get(&execution_token, id).expect("artifact bytes")
+}
+
+#[derive(Default)]
+struct MemorySink {
+    stored: Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl ProcessArtifactSink for MemorySink {
+    fn store(&self, _owner: &ProcessOwner, bytes: &[u8]) -> Result<String, String> {
+        let id = format!("artifact-{:02}", self.stored.lock().unwrap().len() + 1);
+        self.stored
+            .lock()
+            .unwrap()
+            .push((id.clone(), bytes.to_vec()));
+        Ok(id)
+    }
+}
+
+#[test]
+fn process_log_limit_sequence_matches_native_envelopes() {
+    let fixture = Fixture::new("log-limit");
+    let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({
+        "argv": ["/usr/bin/printf", "%s", "0123456789ABCDEF"],
+        "background": true
+    });
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let rss_spawn = rss_terminal(&fixture, &config, spawn_args);
+    assert_exact_envelope(&native_spawn, &rss_spawn.result);
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rss_id = rss_spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wait_native = json!({"action": "wait", "process_id": native_id, "timeout_ms": 2000});
+    let wait_rss = json!({"action": "wait", "process_id": rss_id, "timeout_ms": 2000});
+    assert_exact_envelope(
+        &native.process.execute(&wait_native),
+        &rss_process(&fixture, &config, &rss_spawn, wait_rss).result,
+    );
+    let first_native = native.process.execute(&json!({
+        "action": "log",
+        "process_id": native_id,
+        "offset": 0,
+        "limit": 4
+    }));
+    let first_rss = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "log", "process_id": rss_id, "offset": 0, "limit": 4}),
+    );
+    assert_exact_envelope(&first_native, &first_rss.result);
+    assert_eq!(first_native.data["stdout"].as_str().unwrap(), "0123");
+    let next = first_native.data["stdout_next_offset"].as_u64().unwrap();
+    let second_native = native.process.execute(&json!({
+        "action": "log",
+        "process_id": native_id,
+        "offset": next,
+        "limit": 4
+    }));
+    let second_rss = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "log", "process_id": rss_id, "offset": next, "limit": 4}),
+    );
+    assert_exact_envelope(&second_native, &second_rss.result);
+    assert_eq!(second_native.data["stdout"].as_str().unwrap(), "4567");
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
+}
+
+#[test]
+fn process_write_timeout_on_full_pipe_matches_native_deadline_elapsed() {
+    let fixture = Fixture::new("write-timeout");
+    let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({
+        "argv": ["/bin/sleep", "30"],
+        "background": true,
+        "timeout_ms": 5000
+    });
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let rss_spawn = rss_terminal(&fixture, &config, spawn_args);
+    assert_exact_envelope(&native_spawn, &rss_spawn.result);
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rss_id = rss_spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payload = "x".repeat(1024 * 1024);
+    let started = Instant::now();
+    let native_write = native.process.execute(&json!({
+        "action": "write",
+        "process_id": native_id,
+        "data": payload,
+        "timeout_ms": 80
+    }));
+    let native_elapsed = started.elapsed();
+    let started = Instant::now();
+    let rss_write = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({
+            "action": "write",
+            "process_id": rss_id,
+            "data": payload,
+            "timeout_ms": 80
+        }),
+    );
+    let rss_elapsed = started.elapsed();
+    assert_exact_envelope(&native_write, &rss_write.result);
+    assert_eq!(error_code(&rss_write.result), "deadline_elapsed");
+    assert!(
+        native_elapsed < Duration::from_millis(800),
+        "{native_elapsed:?}"
+    );
+    assert!(rss_elapsed < Duration::from_secs(2), "{rss_elapsed:?}");
+    let rss_pid = rss_spawn.result["data"]["pid"].as_u64().unwrap_or(0) as u32;
+    let _ = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "kill", "process_id": rss_id}),
+    );
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
+    if rss_pid > 0 {
+        wait_until_dead(rss_pid);
+    }
+}
+
+#[test]
+fn process_write_cancel_during_full_pipe_uses_exact_cancelled_envelope() {
+    let fixture = Fixture::new("write-cancel");
+    let config = fixture.config();
+    let flag = FlagCancel::new();
+    let spawn = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000}),
+            )
+        },
+    );
+    assert_eq!(spawn.result["ok"], json!(true));
+    let rss_id = spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = spawn.result["data"]["pid"].as_u64().unwrap_or(0) as u32;
+    let cancel = Arc::clone(&flag);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        cancel.cancel();
+    });
+    let written = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            shared_lifecycle: Some(Arc::clone(&spawn.lifecycle)),
+            shared_processes: Some(Arc::clone(&spawn.processes)),
+            ..default_exec(
+                "process.rss",
+                "process",
+                json!({
+                    "action": "write",
+                    "process_id": rss_id,
+                    "data": "x".repeat(1024 * 1024),
+                    "timeout_ms": 2000
+                }),
+            )
+        },
+    );
+    assert_eq!(written.result["ok"], json!(false));
+    assert_eq!(error_code(&written.result), "cancelled");
+    assert_eq!(error_message(&written.result), "process was cancelled");
+    let _ = rss_process(
+        &fixture,
+        &config,
+        &spawn,
+        json!({"action": "kill", "process_id": rss_id}),
+    );
+    if pid > 0 {
+        wait_until_dead(pid);
+    }
+}
+
+#[test]
+fn cancelled_envelopes_are_process_was_cancelled_for_pre_spawn_and_wait() {
+    let fixture = Fixture::new("cancel-envelope");
+    let config = fixture.config();
+    let flag = FlagCancel::new();
+    flag.cancel();
+    let pre_spawn = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: Arc::clone(&flag) as Arc<dyn CancellationFlag>,
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({"argv": ["/bin/sleep", "2"]}),
+            )
+        },
+    );
+    assert_eq!(error_code(&pre_spawn.result), "cancelled");
+    assert_eq!(error_message(&pre_spawn.result), "process was cancelled");
+    let native = NativePair::new(config.clone());
+    let cancelled = rustscript_vm::CancellationToken::new();
+    cancelled.cancel();
+    let native_pre = native.terminal.execute_with_controls(
+        &json!({"argv": ["/bin/sleep", "2"]}),
+        &cancelled,
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert_eq!(native_pre.error.as_ref().unwrap().code, "cancelled");
+    assert_eq!(
+        native_pre.error.as_ref().unwrap().message,
+        "process was cancelled"
+    );
+}
+
+#[test]
+fn overflow_artifact_bytes_and_no_sink_match_native() {
+    let fixture = Fixture::new("overflow-bytes");
+    let mut config = fixture.config();
+    config.max_stream_bytes = 256;
+    config.max_output_bytes = 180;
+    let arguments = json!({
+        "argv": ["/usr/bin/printf", "%s", "o".repeat(200)]
+    });
+    let sink = Arc::new(MemorySink::default());
+    let native = NativePair::with_artifact_sink(
+        config.clone(),
+        Arc::clone(&sink) as Arc<dyn ProcessArtifactSink>,
+    )
+    .terminal
+    .execute(&arguments);
+    let rss = rss_terminal(&fixture, &config, arguments.clone());
+    assert_exact_envelope(&native, &rss.result);
+    if let Some(id) = rss
+        .result
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .and_then(Value::as_str)
+    {
+        let rss_bytes = artifact_bytes(&rss, id);
+        let native_bytes = sink.stored.lock().unwrap()[0].1.clone();
+        assert_eq!(rss_bytes, native_bytes);
+    }
+    let native_no_sink = NativePair::new(config.clone()).terminal.execute(&arguments);
+    let rss_no_sink = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            enable_artifacts: false,
+            ..default_exec("terminal.rss", "terminal", arguments)
+        },
+    );
+    assert_exact_envelope(&native_no_sink, &rss_no_sink.result);
+}
+
+#[test]
+fn overflow_tiny_threshold_matches_native() {
+    let fixture = Fixture::new("overflow-tiny");
+    let mut config = fixture.config();
+    config.max_stream_bytes = 32;
+    config.max_output_bytes = 48;
+    let arguments = json!({"argv": ["/bin/echo", "tiny-overflow"]});
+    let native = NativePair::new(config.clone()).terminal.execute(&arguments);
+    let rss = rss_terminal(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+}
+
+#[test]
+fn foreground_stdin_empty_multibyte_large_and_child_exit_match_native() {
+    let fixture = Fixture::new("stdin-matrix");
+    assert_terminal_eq(&fixture, json!({"argv": ["/bin/cat"], "stdin": ""}));
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/cat"], "stdin": "多字节\u{1F980}\n"}),
+    );
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/cat"], "stdin": "x".repeat(8 * 1024)}),
+    );
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/true"], "stdin": "unused-stdin\n"}),
+    );
+    let spawn_fail = rss_terminal(
+        &fixture,
+        &fixture.config(),
+        json!({"argv": ["/no/such/rss-process-binary"]}),
+    );
+    assert_eq!(spawn_fail.result["ok"], json!(false));
+}
+
+#[test]
+fn process_timeout_bound_uses_config_max_timeout_ms() {
+    let fixture = Fixture::new("timeout-bound");
+    let mut config = fixture.config();
+    config.default_timeout = Duration::from_millis(400);
+    config.max_timeout = Duration::from_millis(400);
+    let native = NativePair::new(config.clone());
+    for arguments in [
+        json!({"argv": ["/bin/true"], "timeout_ms": 400}),
+        json!({"argv": ["/bin/true"], "timeout_ms": 401}),
+        json!({"argv": ["/bin/true"], "timeout_ms": 0}),
+        json!({"argv": ["/bin/true"], "timeout_ms": -1}),
+        json!({"argv": ["/bin/true"], "timeout_ms": "nope"}),
+        json!({"argv": ["/bin/true"], "timeout_ms": u64::MAX}),
+    ] {
+        let native_result = native.terminal.execute(&arguments);
+        let rss = rss_terminal(&fixture, &config, arguments);
+        assert_exact_envelope(&native_result, &rss.result);
+    }
+}
+
+#[test]
+fn wait_timeout_while_running_matches_native_success_envelope() {
+    let fixture = Fixture::new("wait-running");
+    let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({"argv": ["/bin/sleep", "8"], "background": true, "timeout_ms": 5000});
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let rss_spawn = rss_terminal(&fixture, &config, spawn_args);
+    assert_exact_envelope(&native_spawn, &rss_spawn.result);
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rss_id = rss_spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let native_wait = native.process.execute(&json!({
+        "action": "wait",
+        "process_id": native_id,
+        "timeout_ms": 80
+    }));
+    let rss_wait = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "wait", "process_id": rss_id, "timeout_ms": 80}),
+    );
+    assert_exact_envelope(&native_wait, &rss_wait.result);
+    assert!(native_wait.ok);
+    assert_eq!(native_wait.data["status"].as_str(), Some("running"));
+    let _ = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "kill", "process_id": rss_id}),
+    );
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
+}
+
+#[test]
+fn repeated_close_kill_forged_stale_and_signal_exits_match_native() {
+    let fixture = Fixture::new("oracle-matrix");
+    let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({"argv": ["/bin/sleep", "8"], "background": true, "timeout_ms": 5000});
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let rss_spawn = rss_terminal(&fixture, &config, spawn_args);
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rss_id = rss_spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for action in ["close", "close"] {
+        let native_result = native
+            .process
+            .execute(&json!({"action": action, "process_id": native_id}));
+        let rss_result = rss_process(
+            &fixture,
+            &config,
+            &rss_spawn,
+            json!({"action": action, "process_id": rss_id}),
+        );
+        assert_exact_envelope(&native_result, &rss_result.result);
+    }
+    let native_kill = native
+        .process
+        .execute(&json!({"action": "kill", "process_id": native_id}));
+    let rss_kill = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "kill", "process_id": rss_id}),
+    );
+    assert_eq!(
+        native_kill.data.get("status").and_then(Value::as_str),
+        rss_kill.result["data"]
+            .get("status")
+            .and_then(Value::as_str)
+    );
+    let native_kill2 = native
+        .process
+        .execute(&json!({"action": "kill", "process_id": native_id}));
+    let rss_kill2 = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "kill", "process_id": rss_id}),
+    );
+    assert_eq!(
+        native_kill2.data.get("status").and_then(Value::as_str),
+        rss_kill2.result["data"]
+            .get("status")
+            .and_then(Value::as_str)
+    );
+    let forged = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "poll", "process_id": "forged-handle"}),
+    );
+    let native_forged = native
+        .process
+        .execute(&json!({"action": "poll", "process_id": "forged-handle"}));
+    assert_exact_envelope(&native_forged, &forged.result);
+    let stale = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "poll", "process_id": rss_id}),
+    );
+    let native_stale = native
+        .process
+        .execute(&json!({"action": "poll", "process_id": native_id}));
+    assert_exact_envelope(&native_stale, &stale.result);
+}
+
+#[test]
+fn commit_failure_after_background_spawn_leaves_no_process_residue() {
+    let fixture = Fixture::new("commit-residue");
+    let config = fixture.config();
+    let durable = MemoryDurable::new();
+    durable.fail_next_commit();
+    let rss = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            durable: Arc::clone(&durable),
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000}),
+            )
+        },
+    );
+    assert_eq!(rss.result["ok"], json!(false));
+    let pid = rss.result["data"]["pid"].as_u64().unwrap_or(0) as u32;
+    if pid > 0 {
+        wait_until_dead(pid);
+    }
+}
+
+#[test]
+fn durable_replay_does_not_repeat_spawn_write_or_kill() {
+    let fixture = Fixture::new("replay-matrix");
+    let config = fixture.config();
+    let durable = MemoryDurable::new();
+    let first = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            durable: Arc::clone(&durable),
+            call_id: "replay-spawn".to_string(),
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({"argv": ["/bin/sleep", "8"], "background": true, "timeout_ms": 5000}),
+            )
+        },
+    );
+    assert_eq!(first.result["ok"], json!(true));
+    let handle = first.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replay_spawn = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            durable: Arc::clone(&durable),
+            call_id: "replay-spawn".to_string(),
+            shared_lifecycle: Some(Arc::clone(&first.lifecycle)),
+            shared_processes: Some(Arc::clone(&first.processes)),
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({"argv": ["/bin/sleep", "8"], "background": true, "timeout_ms": 5000}),
+            )
+        },
+    );
+    assert_eq!(replay_spawn.result, first.result);
+    let write = rss_process(
+        &fixture,
+        &config,
+        &first,
+        json!({"action": "write", "process_id": handle, "data": "x"}),
+    );
+    assert!(write.result["ok"].as_bool().unwrap_or(false) || !error_code(&write.result).is_empty());
+    let kill = rss_process(
+        &fixture,
+        &config,
+        &first,
+        json!({"action": "kill", "process_id": handle}),
+    );
+    assert_eq!(kill.result["ok"], json!(true));
+}
+
+#[test]
+fn mid_loop_cancel_wait_envelope_is_process_was_cancelled() {
+    let fixture = Fixture::new("mid-cancel");
+    let config = fixture.config();
+    let flag = FlagCancel::new();
+    let spawn = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({"argv": ["/bin/sleep", "8"], "background": true, "timeout_ms": 5000}),
+            )
+        },
+    );
+    let handle = spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cancel = Arc::clone(&flag);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        cancel.cancel();
+    });
+    let waited = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            shared_lifecycle: Some(Arc::clone(&spawn.lifecycle)),
+            shared_processes: Some(Arc::clone(&spawn.processes)),
+            unlimited_fuel: true,
+            ..default_exec(
+                "process.rss",
+                "process",
+                json!({"action": "wait", "process_id": handle, "timeout_ms": 2000}),
+            )
+        },
+    );
+    assert_eq!(error_code(&waited.result), "cancelled");
+    assert_eq!(error_message(&waited.result), "process was cancelled");
+    let _ = rss_process(
+        &fixture,
+        &config,
+        &spawn,
+        json!({"action": "kill", "process_id": handle}),
+    );
 }
