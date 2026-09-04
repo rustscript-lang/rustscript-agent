@@ -773,6 +773,100 @@ fn artifact_put_get_and_reference_enforce_quota_and_ownership() {
 }
 
 #[test]
+fn read_token_cannot_put_generic_artifact_but_can_publish_one_result() {
+    let fixture = Fixture::new("result-pub");
+    let artifacts = fixture.artifacts(ArtifactLimits {
+        max_object_bytes: 16,
+        max_total_bytes: 32,
+        max_objects: 2,
+    });
+    let read = fixture.token(CapabilityRisk::Read);
+    let denied = artifacts
+        .put(&read, b"nope", &json!({}))
+        .expect_err("read token must not use generic put");
+    assert_eq!(error_code(&denied), "approval_ceiling");
+
+    let malformed = artifacts
+        .put_result(&read, b"ok", &json!("not-an-object"))
+        .expect_err("non-object metadata");
+    assert_eq!(error_code(&malformed), "invalid_request");
+
+    let unknown = artifacts
+        .put_result(&read, b"ok", &json!({"purpose": "result"}))
+        .expect_err("unknown metadata field");
+    assert_eq!(error_code(&unknown), "invalid_request");
+
+    let mismatched = artifacts
+        .put_result(&read, b"ok", &json!({"call_id": "other-call"}))
+        .expect_err("mismatched call_id");
+    assert_eq!(error_code(&mismatched), "invalid_request");
+
+    let published = artifacts
+        .put_result(&read, b"payload", &json!({}))
+        .expect("valid result publication");
+    assert_eq!(published.len, 7);
+    assert_eq!(published.metadata["run"], json!("run-a"));
+    assert_eq!(published.metadata["call_id"], json!("call-1"));
+
+    let second = artifacts
+        .put_result(&read, b"again", &json!({}))
+        .expect_err("second result");
+    assert_eq!(error_code(&second), "artifact_already_published");
+
+    let quota = fixture.artifacts(ArtifactLimits {
+        max_object_bytes: 4,
+        max_total_bytes: 4,
+        max_objects: 1,
+    });
+    let read2 = fixture.token(CapabilityRisk::Read);
+    let exhausted = quota
+        .put_result(&read2, b"too-big", &json!({}))
+        .expect_err("quota");
+    assert_eq!(error_code(&exhausted), "artifact_too_large");
+}
+
+#[test]
+fn clock_monotonic_ms_requires_read_token_and_cannot_be_forged() {
+    let fixture = Fixture::new("clock");
+    fixture.clock.set_now_ms(4_000);
+    let read = fixture.token(CapabilityRisk::Read);
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(fixture.lifecycle.clone())),
+        capability_owner: Some(fixture.owner.clone()),
+        filesystem: Some(Arc::new(fixture.filesystem())),
+        ..AgentHostBridges::default()
+    };
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::clock_monotonic_ms("{read}")
+        }}
+    "#
+    );
+    let result = AgentRunner::from_source(&source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    let json = match result {
+        VmValue::Map(fields) => fields,
+        other => panic!("expected map, got {other:?}"),
+    };
+    match json.get(&VmValue::string("ms")) {
+        Some(VmValue::Int(ms)) => assert_eq!(*ms, 4_000),
+        other => panic!("expected host clock ms, got {other:?}"),
+    }
+
+    let forged = r#"
+        pub fn run(input: map) -> map {
+            cap::clock_monotonic_ms("forged-token")
+        }
+    "#;
+    let denied = run_cap_source(&fixture, None, None, None, forged);
+    assert_ne!(envelope_error_code(&denied), "");
+}
+
+#[test]
 fn host_catalog_registers_cap_functions_with_typed_bounds() {
     let catalog = rustscript_agent::agent_host_catalog();
     let names: Vec<&str> = catalog
@@ -793,8 +887,10 @@ fn host_catalog_registers_cap_functions_with_typed_bounds() {
         "cap::process_close",
         "cap::process_kill",
         "cap::artifact_put",
+        "cap::artifact_put_result",
         "cap::artifact_get",
         "cap::artifact_reference",
+        "cap::clock_monotonic_ms",
         "agent::tool_dispatch",
     ] {
         assert!(

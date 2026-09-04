@@ -18,8 +18,8 @@ use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
 use crate::capabilities::{
-    ArtifactCapability, CapabilityError, CapabilityLifecycle, CapabilityOwner, ExecutionLease,
-    FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
+    ArtifactCapability, CapabilityError, CapabilityLifecycle, CapabilityOwner, CapabilityRisk,
+    ExecutionLease, FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
     ProcessSnapshot, capability_error_envelope, parse_prepare_metadata, tool_commit, tool_prepare,
 };
 use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
@@ -44,8 +44,10 @@ const CAP_PROCESS_WRITE: &str = "cap::process_write";
 const CAP_PROCESS_CLOSE: &str = "cap::process_close";
 const CAP_PROCESS_KILL: &str = "cap::process_kill";
 const CAP_ARTIFACT_PUT: &str = "cap::artifact_put";
+const CAP_ARTIFACT_PUT_RESULT: &str = "cap::artifact_put_result";
 const CAP_ARTIFACT_GET: &str = "cap::artifact_get";
 const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
+const CAP_CLOCK_MONOTONIC_MS: &str = "cap::clock_monotonic_ms";
 
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
@@ -189,6 +191,15 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
             response.clone(),
         ));
         builder.function(HostFunctionSchema::with_return(
+            CAP_ARTIFACT_PUT_RESULT,
+            vec![
+                token.clone(),
+                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
+                HostParamSchema::value("metadata", HostTypeSchema::Unknown),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
             CAP_ARTIFACT_GET,
             vec![
                 token.clone(),
@@ -198,7 +209,15 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         ));
         builder.function(HostFunctionSchema::with_return(
             CAP_ARTIFACT_REFERENCE,
-            vec![token, HostParamSchema::value("id", HostTypeSchema::String)],
+            vec![
+                token.clone(),
+                HostParamSchema::value("id", HostTypeSchema::String),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_CLOCK_MONOTONIC_MS,
+            vec![token],
             response,
         ));
         Arc::new(builder.build().expect("agent host catalog must build"))
@@ -521,14 +540,7 @@ impl AgentHostState {
             return Self::missing_capability("artifact");
         };
         let json_meta = vm_value_to_json(&metadata);
-        let result_publication =
-            json_meta.get("purpose").and_then(JsonValue::as_str) == Some("result");
-        let put = if result_publication {
-            artifacts.put_result(&token, &bytes, &json_meta)
-        } else {
-            artifacts.put(&token, &bytes, &json_meta)
-        };
-        match put {
+        match artifacts.put(&token, &bytes, &json_meta) {
             Ok(refer) => json!({
                 "ok": true,
                 "kind": "artifact_put",
@@ -538,6 +550,53 @@ impl AgentHostState {
                 "metadata": refer.metadata,
             }),
             Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_artifact_put_result(&self, token: String, bytes: Vec<u8>, metadata: Value) -> JsonValue {
+        let Some(artifacts) = self.artifacts.as_ref() else {
+            return Self::missing_capability("artifact");
+        };
+        let json_meta = vm_value_to_json(&metadata);
+        match artifacts.put_result(&token, &bytes, &json_meta) {
+            Ok(refer) => json!({
+                "ok": true,
+                "kind": "artifact_put_result",
+                "id": refer.id,
+                "len": refer.len,
+                "hash": refer.hash,
+                "metadata": refer.metadata,
+            }),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_clock_monotonic_ms(&self, token: String) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Self::missing_capability("lifecycle");
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return Self::missing_capability("lifecycle");
+        };
+        match lifecycle.authorize(owner, &token, CapabilityRisk::Read) {
+            Ok(_) => json!({
+                "ok": true,
+                "kind": "clock_monotonic",
+                "ms": lifecycle.now_ms(),
+            }),
+            Err(error) => {
+                let error = CapabilityError::from(error);
+                json!({
+                    "ok": false,
+                    "kind": "error",
+                    "code": error.code(),
+                    "message": error.message(),
+                    "error": {
+                        "code": error.code(),
+                        "message": error.message(),
+                    }
+                })
+            }
         }
     }
 
@@ -859,6 +918,13 @@ pub fn register_agent_host_functions(
     register_named(
         registry,
         catalog,
+        CAP_ARTIFACT_PUT_RESULT,
+        3,
+        cap_artifact_put_result_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
         CAP_ARTIFACT_GET,
         2,
         cap_artifact_get_adapter,
@@ -869,6 +935,13 @@ pub fn register_agent_host_functions(
         CAP_ARTIFACT_REFERENCE,
         2,
         cap_artifact_reference_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_CLOCK_MONOTONIC_MS,
+        1,
+        cap_clock_monotonic_ms_adapter,
     )?;
     Ok(())
 }
@@ -1117,6 +1190,30 @@ fn cap_artifact_put_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
             ))
         },
         |(token, bytes, metadata)| return_json(state.cap_artifact_put(token, bytes, metadata)),
+    )
+}
+
+fn cap_artifact_put_result_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_bytes(args, 1, "bytes")?,
+                args.get(2).cloned().unwrap_or(Value::Null),
+            ))
+        },
+        |(token, bytes, metadata)| {
+            return_json(state.cap_artifact_put_result(token, bytes, metadata))
+        },
+    )
+}
+
+fn cap_clock_monotonic_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || arg_string(args, 0, "execution_token"),
+        |token| return_json(state.cap_clock_monotonic_ms(token)),
     )
 }
 

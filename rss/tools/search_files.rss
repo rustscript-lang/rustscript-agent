@@ -5,7 +5,9 @@ use json;
 fn map_int(value: map, key: string, fallback: int) -> int {
     let mut result: int = fallback;
     if value.has(key) {
-        result = value[key];
+        if type(value[key]) == "int" {
+            result = value[key];
+        }
     }
     result
 }
@@ -534,6 +536,24 @@ fn push_match(state: map, line: string) -> map {
 }
 
 fn observe_limits(state: map) -> map {
+    let tick: map = cap::clock_monotonic_ms(types::map_string(state, "token", ""));
+    if map_bool(tick, "ok", false) == false {
+        state.fatal = true;
+        state.fatal_code = types::map_string(tick, "code", "cancelled");
+        state.fatal_message = types::map_string(tick, "message", "clock failed");
+        state.stop = true;
+    } else {
+        let now: int = map_int(tick, "ms", 0);
+        let start: int = map_int(state, "start_ms", 0);
+        let mut elapsed: int = now - start;
+        if elapsed < 0 {
+            elapsed = 0;
+        }
+        if elapsed >= map_int(state, "max_search_wall_time_ms", 2000) {
+            state.truncated = true;
+            state.stop = true;
+        }
+    }
     if map_int(state, "files_visited", 0) >= map_int(state, "max_search_files", 10000) {
         state.truncated = true;
         state.stop = true;
@@ -675,7 +695,7 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
         let data: map = types::map_map(current, "data");
         if content.length > 0 {
             let payload: bytes = bytes::from_utf8(content);
-            let put: map = cap::artifact_put(token, payload, { purpose: "result" });
+            let put: map = cap::artifact_put_result(token, payload, {});
             if map_bool(put, "ok", false) {
                 let id: string = types::map_string(put, "id", "");
                 let len: int = map_int(put, "len", content.length);
@@ -714,55 +734,42 @@ pub fn descriptor() -> map {
 pub fn validate(arguments: map) -> map {
     let mut result: map = { ok: true, code: "", message: "" };
     if arguments.has("pattern") == false {
-        result = { ok: false, code: "invalid_arguments", message: "search_files requires a pattern" };
+        result = { ok: false, code: "invalid_arguments", message: "search_files requires pattern" };
     } else {
         if type(arguments.pattern) != "string" {
-            result = { ok: false, code: "invalid_arguments", message: "pattern must be a string" };
+            result = { ok: false, code: "invalid_arguments", message: "search_files requires pattern" };
         } else {
             let pattern: string = arguments.pattern;
             if pattern.length == 0 {
                 result = { ok: false, code: "invalid_arguments", message: "search_files requires a pattern" };
+            }
+        }
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("path") {
+            if type(arguments.path) == "string" {
+                result = validate_tool_path(arguments.path, true);
+            }
+        }
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("offset") {
+            if type(arguments.offset) != "int" {
+                result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
             } else {
-                if arguments.has("path") {
-                    if type(arguments.path) != "string" {
-                        result = { ok: false, code: "invalid_arguments", message: "path must be a string" };
-                    }
+                if arguments.offset < 0 {
+                    result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
                 }
-                if map_bool(result, "ok", false) {
-                    if arguments.has("target") {
-                        if type(arguments.target) != "string" {
-                            result = { ok: false, code: "invalid_arguments", message: "target must be a string" };
-                        }
-                    }
-                }
-                if map_bool(result, "ok", false) {
-                    if arguments.has("file_glob") {
-                        if type(arguments.file_glob) != "string" {
-                            result = { ok: false, code: "invalid_arguments", message: "file_glob must be a string" };
-                        }
-                    }
-                }
-                if map_bool(result, "ok", false) {
-                    if arguments.has("offset") {
-                        if type(arguments.offset) != "int" {
-                            result = { ok: false, code: "invalid_arguments", message: "offset must be an integer" };
-                        } else {
-                            if arguments.offset < 0 {
-                                result = { ok: false, code: "invalid_arguments", message: "offset must be an integer" };
-                            }
-                        }
-                    }
-                }
-                if map_bool(result, "ok", false) {
-                    if arguments.has("limit") {
-                        if type(arguments.limit) != "int" {
-                            result = { ok: false, code: "invalid_arguments", message: "limit must be an integer" };
-                        } else {
-                            if arguments.limit < 0 {
-                                result = { ok: false, code: "invalid_arguments", message: "limit must be an integer" };
-                            }
-                        }
-                    }
+            }
+        }
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("limit") {
+            if type(arguments.limit) != "int" {
+                result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
+            } else {
+                if arguments.limit < 0 {
+                    result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
                 }
             }
         }
@@ -818,6 +825,7 @@ pub fn execute(context: map, arguments: map) -> map {
                 fatal: false,
                 fatal_code: "",
                 fatal_message: "",
+                start_ms: 0,
                 max_search_files: map_int(config, "max_search_files", 10000),
                 max_search_scanned_bytes: map_int(config, "max_search_scanned_bytes", 16777216),
                 max_search_depth: map_int(config, "max_search_depth", 32),
@@ -826,27 +834,33 @@ pub fn execute(context: map, arguments: map) -> map {
                 max_search_wall_time_ms: map_int(config, "max_search_wall_time_ms", 2000),
                 max_read_bytes: map_int(config, "max_read_bytes", 1048576)
             };
-            state = walk_search(state, path, 0);
-            if map_bool(state, "fatal", false) {
-                result = fail(types::map_string(state, "fatal_code", "internal_error"), types::map_string(state, "fatal_message", ""), {});
+            let start_clock: map = cap::clock_monotonic_ms(token);
+            if map_bool(start_clock, "ok", false) == false {
+                result = fail_host(start_clock);
             } else {
-                let collected: array = types::map_array(state, "lines");
-                let sorted: array = sort_strings(collected);
-                let selected: array = slice_lines(sorted, offset, limit);
-                result = shrink_result(
-                    succeed(
-                        join_lines(selected),
-                        {
-                            match_count: selected.length,
-                            files_visited: map_int(state, "files_visited", 0),
-                            dirs_visited: map_int(state, "dirs_visited", 0)
-                        },
-                        map_bool(state, "truncated", false),
-                        []
-                    ),
-                    map_int(config, "max_tool_output_bytes", 65536),
-                    token
-                );
+                state.start_ms = map_int(start_clock, "ms", 0);
+                state = walk_search(state, path, 0);
+                if map_bool(state, "fatal", false) {
+                    result = fail(types::map_string(state, "fatal_code", "internal_error"), types::map_string(state, "fatal_message", ""), {});
+                } else {
+                    let collected: array = types::map_array(state, "lines");
+                    let sorted: array = sort_strings(collected);
+                    let selected: array = slice_lines(sorted, offset, limit);
+                    result = shrink_result(
+                        succeed(
+                            join_lines(selected),
+                            {
+                                match_count: selected.length,
+                                files_visited: map_int(state, "files_visited", 0),
+                                dirs_visited: map_int(state, "dirs_visited", 0)
+                            },
+                            map_bool(state, "truncated", false),
+                            []
+                        ),
+                        map_int(config, "max_tool_output_bytes", 65536),
+                        token
+                    );
+                }
             }
         }
     }

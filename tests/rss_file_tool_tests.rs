@@ -8,6 +8,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rustscript_agent::capabilities::{
     ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
@@ -16,7 +17,7 @@ use rustscript_agent::capabilities::{
     PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer,
 };
 use rustscript_agent::config::FileToolConfig;
-use rustscript_agent::tools::{FileTools, ReadFileRequest, SearchFilesRequest, ToolResult};
+use rustscript_agent::tools::{ArtifactOwner, FileTools, NativeToolExecutor, ToolResult};
 use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolRegistry};
 use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
@@ -141,6 +142,13 @@ impl MemoryDurable {
 
     fn started_len(&self) -> usize {
         self.started.lock().expect("started").len()
+    }
+
+    fn seed_result(&self, call_id: &str, result: Value) {
+        self.results
+            .lock()
+            .expect("results")
+            .insert(call_id.to_string(), result);
     }
 }
 
@@ -324,32 +332,99 @@ fn build_lifecycle(
         .expect("lifecycle")
 }
 
+struct JumpClock {
+    base: u64,
+    jump_after: u64,
+    jump_to: u64,
+    calls: AtomicU64,
+    instant: Instant,
+}
+
+impl JumpClock {
+    fn new(base: u64, jump_after: u64, jump_to: u64) -> Arc<Self> {
+        Arc::new(Self {
+            base,
+            jump_after,
+            jump_to,
+            calls: AtomicU64::new(0),
+            instant: Instant::now(),
+        })
+    }
+}
+
+impl LifecycleClock for JumpClock {
+    fn now_ms(&self) -> u64 {
+        let seen = self.calls.fetch_add(1, Ordering::SeqCst);
+        if seen >= self.jump_after {
+            self.jump_to
+        } else {
+            self.base
+        }
+    }
+
+    fn now(&self) -> Instant {
+        self.instant
+    }
+}
+
+struct CancelAfter {
+    checks: AtomicU64,
+    cancel_at: u64,
+}
+
+impl CancelAfter {
+    fn after_checks(cancel_at: u64) -> Arc<Self> {
+        Arc::new(Self {
+            checks: AtomicU64::new(0),
+            cancel_at,
+        })
+    }
+}
+
+impl CancellationFlag for CancelAfter {
+    fn is_cancelled(&self) -> bool {
+        let seen = self.checks.fetch_add(1, Ordering::SeqCst);
+        seen >= self.cancel_at
+    }
+}
+
 struct RssRun {
     result: Value,
     started: usize,
+    artifacts: Option<Arc<ArtifactCapability>>,
+    durable: Arc<MemoryDurable>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_rss_tool(
-    module: &str,
-    fixture: &Fixture,
-    config: &FileToolConfig,
-    tool_name: &str,
+struct RssExec {
+    module: &'static str,
+    tool_name: &'static str,
     arguments: Value,
     durable: Arc<MemoryDurable>,
     approval: Arc<dyn ApprovalGate>,
     cancellation: Arc<dyn CancellationFlag>,
+    clock: Arc<dyn LifecycleClock>,
+    deadline_ms: u64,
     install_artifacts: bool,
-) -> RssRun {
-    let clock = Arc::new(SystemClock);
-    let deadline_ms = clock.now_ms() + 60_000;
+    artifact_limits: ArtifactLimits,
+    call_id: String,
+}
+
+fn default_artifact_limits() -> ArtifactLimits {
+    ArtifactLimits {
+        max_object_bytes: 8 * 1024 * 1024,
+        max_total_bytes: 64 * 1024 * 1024,
+        max_objects: 64,
+    }
+}
+
+fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> RssRun {
     let lifecycle = Arc::new(build_lifecycle(
         &fixture.root,
-        Arc::clone(&durable),
-        approval,
-        cancellation,
-        clock,
-        deadline_ms,
+        Arc::clone(&exec.durable),
+        exec.approval,
+        exec.cancellation,
+        exec.clock,
+        exec.deadline_ms,
     ));
     let fs_cap = FilesystemCapability::new(
         lifecycle.as_ref().clone(),
@@ -357,18 +432,10 @@ fn run_rss_tool(
         filesystem_limits(config),
     )
     .expect("filesystem capability");
-    let artifacts = if install_artifacts {
+    let artifacts = if exec.install_artifacts {
         Some(Arc::new(
-            ArtifactCapability::new(
-                lifecycle.as_ref().clone(),
-                owner(),
-                ArtifactLimits {
-                    max_object_bytes: 8 * 1024 * 1024,
-                    max_total_bytes: 64 * 1024 * 1024,
-                    max_objects: 64,
-                },
-            )
-            .expect("artifacts"),
+            ArtifactCapability::new(lifecycle.as_ref().clone(), owner(), exec.artifact_limits)
+                .expect("artifacts"),
         ))
     } else {
         None
@@ -377,50 +444,154 @@ fn run_rss_tool(
         lifecycle: Some(Arc::clone(&lifecycle)),
         capability_owner: Some(owner()),
         filesystem: Some(Arc::new(fs_cap)),
-        artifacts,
+        artifacts: artifacts.clone(),
         ..AgentHostBridges::default()
     };
     let context = json!({
         "kind": "execute",
-        "arguments": arguments,
+        "arguments": exec.arguments,
         "prepare": {
             "run_id": "run-test",
-            "call_id": format!("call-{}", NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)),
-            "name": tool_name,
+            "call_id": exec.call_id,
+            "name": exec.tool_name,
             "argument_digest": "digest",
             "registry_identity": REGISTRY_IDENTITY,
             "risk_class": "read",
-            "summary": tool_name,
+            "summary": exec.tool_name,
         },
         "config": rss_config_json(config),
     });
-    let runner = compile_rss(module);
+    let runner = compile_rss(exec.module);
     let output = runner
         .with_host(host)
         .run_with_context(json_to_vm_value(&context))
-        .unwrap_or_else(|error| panic!("rss {module} run failed: {error}"));
+        .unwrap_or_else(|error| panic!("rss {} run failed: {error}", exec.module));
     RssRun {
-        result: canonicalize_rss_result(vm_value_to_json(&output)),
-        started: durable.started_len(),
+        result: unwrap_committed(vm_value_to_json(&output)),
+        started: exec.durable.started_len(),
+        artifacts,
+        durable: exec.durable,
     }
 }
 
-fn canonicalize_rss_result(value: Value) -> Value {
-    let mut result = if value.get("kind").and_then(Value::as_str) == Some("committed") {
+#[allow(clippy::too_many_arguments)]
+fn run_rss_tool(
+    module: &'static str,
+    fixture: &Fixture,
+    config: &FileToolConfig,
+    tool_name: &'static str,
+    arguments: Value,
+    durable: Arc<MemoryDurable>,
+    approval: Arc<dyn ApprovalGate>,
+    cancellation: Arc<dyn CancellationFlag>,
+    install_artifacts: bool,
+) -> RssRun {
+    let clock = Arc::new(SystemClock);
+    let deadline_ms = clock.now_ms() + 60_000;
+    run_rss_exec(
+        fixture,
+        config,
+        RssExec {
+            module,
+            tool_name,
+            arguments,
+            durable,
+            approval,
+            cancellation,
+            clock,
+            deadline_ms,
+            install_artifacts,
+            artifact_limits: default_artifact_limits(),
+            call_id: format!("call-{}", NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)),
+        },
+    )
+}
+
+fn unwrap_committed(value: Value) -> Value {
+    if value.get("kind").and_then(Value::as_str) == Some("committed") {
         value.get("result").cloned().unwrap_or(value)
     } else {
         value
-    };
-    if let Some(object) = result.as_object_mut() {
-        object.entry("error".to_string()).or_insert(Value::Null);
-        object.entry("artifacts".to_string()).or_insert(json!([]));
-        object
-            .entry("truncated".to_string())
-            .or_insert(json!(false));
-        object.entry("content".to_string()).or_insert(json!(""));
-        object.entry("data".to_string()).or_insert(json!({}));
     }
-    result
+}
+
+/// Project opaque artifact IDs so envelope comparison stays exact on the
+/// deterministic fields. IDs are replaced with `artifact-{index}` in both
+/// the `artifacts` array and any matching `content` substring. Bytes and
+/// metadata are compared separately by fetching each store.
+fn project_artifact_ids(value: &Value) -> Value {
+    let ids: Vec<String> = value
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut projected = value.clone();
+    if let Some(entries) = projected.get_mut("artifacts").and_then(Value::as_array_mut) {
+        for (index, slot) in entries.iter_mut().enumerate() {
+            *slot = json!(format!("artifact-{index}"));
+        }
+    }
+    if let Some(content) = projected
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        let mut rewritten = content;
+        for (index, id) in ids.iter().enumerate() {
+            rewritten = rewritten.replace(id, &format!("artifact-{index}"));
+        }
+        projected["content"] = json!(rewritten);
+    }
+    projected
+}
+
+fn native_execute(
+    tools: &FileTools,
+    executor: NativeToolExecutor,
+    arguments: &Value,
+) -> ToolResult {
+    tools.execute(&executor, arguments)
+}
+
+fn native_envelope(result: &ToolResult) -> Value {
+    serde_json::to_value(result).expect("serialize native tool result")
+}
+
+fn canonical_envelope(value: &Value) -> Value {
+    let parsed: ToolResult =
+        serde_json::from_value(value.clone()).expect("canonical tool result schema");
+    serde_json::to_value(parsed).expect("serialize canonical tool result")
+}
+
+fn assert_exact_envelope(native: &ToolResult, rss: &Value) {
+    let native_json = native_envelope(native);
+    let rss_json = canonical_envelope(rss);
+    assert_eq!(
+        project_artifact_ids(&native_json),
+        project_artifact_ids(&rss_json),
+        "exact canonical envelopes must match\nnative={native_json}\nrss={rss_json}"
+    );
+    if let Some(message) = rss
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        assert!(
+            !message.contains(TMP_ROOT),
+            "rss error leaked temp root: {message}"
+        );
+    }
+    if let Some(native_error) = native.error.as_ref() {
+        assert!(
+            !native_error.message.contains(TMP_ROOT),
+            "native error leaked temp root"
+        );
+    }
 }
 
 fn run_rss_read(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -> RssRun {
@@ -451,104 +622,31 @@ fn run_rss_search(fixture: &Fixture, config: &FileToolConfig, arguments: Value) 
     )
 }
 
-fn native_read(tools: &FileTools, arguments: &Value) -> ToolResult {
-    let request = ReadFileRequest {
-        path: arguments["path"].as_str().unwrap_or("").to_string(),
-        offset: arguments
-            .get("offset")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize),
-        limit: arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize),
-    };
-    tools.read_file(request)
-}
-
-fn native_search(tools: &FileTools, arguments: &Value) -> ToolResult {
-    let request = SearchFilesRequest {
-        path: arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        pattern: arguments["pattern"].as_str().unwrap_or("").to_string(),
-        target: arguments
-            .get("target")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        file_glob: arguments
-            .get("file_glob")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        limit: arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize),
-        offset: arguments
-            .get("offset")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize),
-    };
-    tools.search_files(request)
-}
-
-fn assert_success_eq(native: &ToolResult, rss: &Value) {
-    let native_json = serde_json::to_value(native).expect("serialize native");
-    assert_eq!(native_json, *rss, "canonical success envelopes must match");
-}
-
-fn assert_error_eq(native: &ToolResult, rss: &Value) {
-    assert_eq!(native.ok, rss["ok"].as_bool().unwrap_or(true));
-    assert_eq!(
-        native.error.as_ref().map(|error| error.code.as_str()),
-        rss["error"]["code"].as_str(),
-        "error codes must match: native={native:?} rss={rss}"
-    );
-    let rss_message = rss["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        !rss_message.contains(TMP_ROOT),
-        "rss error leaked temp root: {rss_message}"
-    );
-    if let Some(native_error) = native.error.as_ref() {
-        assert!(
-            !native_error.message.contains(TMP_ROOT),
-            "native error leaked temp root"
-        );
-        assert_eq!(
-            native_error.message, rss_message,
-            "error messages must match: native={native:?} rss={rss}"
-        );
-    }
+fn artifact_owner() -> ArtifactOwner {
+    ArtifactOwner::new("profile-test", "session-test", "run-test").expect("artifact owner")
 }
 
 fn assert_read_eq(fixture: &Fixture, arguments: Value) {
     let config = fixture.config();
-    let native = native_read(&fixture.tools(), &arguments);
+    let native = native_execute(&fixture.tools(), NativeToolExecutor::ReadFile, &arguments);
     let rss = run_rss_read(fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
     if native.ok {
-        assert_success_eq(&native, &rss.result);
         assert!(rss.started > 0, "successful read must prepare");
-    } else {
-        assert_error_eq(&native, &rss.result);
     }
 }
 
 fn assert_search_eq(fixture: &Fixture, arguments: Value) {
     let config = fixture.config();
-    let native = native_search(&fixture.tools(), &arguments);
+    let native = native_execute(
+        &fixture.tools(),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
     let rss = run_rss_search(fixture, &config, arguments.clone());
-    if native.ok != rss.result["ok"].as_bool().unwrap_or(false) {
-        panic!(
-            "ok mismatch for {arguments}: native={native:?} rss={}",
-            rss.result
-        );
-    }
+    assert_exact_envelope(&native, &rss.result);
     if native.ok {
-        assert_success_eq(&native, &rss.result);
         assert!(rss.started > 0, "successful search must prepare");
-    } else {
-        assert_error_eq(&native, &rss.result);
     }
 }
 
@@ -648,12 +746,13 @@ fn read_large_file_and_output_cap_match_native() {
     let mut config = fixture.config();
     config.max_read_bytes = 16;
     config.artifact_store.root = fixture.parent.join("artifacts-big");
-    let native = native_read(
+    let native = native_execute(
         &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::ReadFile,
         &json!({"path": "big.txt"}),
     );
     let rss = run_rss_read(&fixture, &config, json!({"path": "big.txt"}));
-    assert_error_eq(&native, &rss.result);
+    assert_exact_envelope(&native, &rss.result);
 
     let mut output_config = fixture.config();
     output_config.max_output_bytes = 32;
@@ -664,12 +763,13 @@ fn read_large_file_and_output_cap_match_native() {
         format!("{}\n", "w".repeat(80)),
     )
     .unwrap();
-    let native = native_read(
+    let native = native_execute(
         &fixture.tools_with_config(output_config.clone()),
+        NativeToolExecutor::ReadFile,
         &json!({"path": "wide.txt"}),
     );
     let rss = run_rss_read(&fixture, &output_config, json!({"path": "wide.txt"}));
-    assert_error_eq(&native, &rss.result);
+    assert_exact_envelope(&native, &rss.result);
     assert_eq!(
         native.error.as_ref().map(|error| error.code.as_str()),
         Some("output_truncated")
@@ -798,13 +898,13 @@ fn search_caps_invalid_paths_and_symlinks_match_native() {
     config.max_search_matches = 1;
     config.artifact_store.root = fixture.parent.join("artifacts-search");
     let arguments = json!({"pattern": "alpha"});
-    let native = native_search(&fixture.tools_with_config(config.clone()), &arguments);
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    if native.ok {
-        assert_success_eq(&native, &rss.result);
-    } else {
-        assert_error_eq(&native, &rss.result);
-    }
+    assert_exact_envelope(&native, &rss.result);
 }
 
 #[test]
@@ -1016,33 +1116,440 @@ fn search_match_file_dir_and_scan_caps_match_native() {
     files.max_search_files = 1;
     files.artifact_store.root = fixture.parent.join("artifacts-files");
     let arguments = json!({"pattern": "needle"});
-    let native = native_search(&fixture.tools_with_config(files.clone()), &arguments);
+    let native = native_execute(
+        &fixture.tools_with_config(files.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
     let rss = run_rss_search(&fixture, &files, arguments.clone());
-    if native.ok {
-        assert_success_eq(&native, &rss.result);
-    } else {
-        assert_error_eq(&native, &rss.result);
-    }
+    assert_exact_envelope(&native, &rss.result);
 
     let mut depth = fixture.config();
     depth.max_search_depth = 1;
     depth.artifact_store.root = fixture.parent.join("artifacts-depth");
-    let native = native_search(&fixture.tools_with_config(depth.clone()), &arguments);
+    let native = native_execute(
+        &fixture.tools_with_config(depth.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
     let rss = run_rss_search(&fixture, &depth, arguments.clone());
-    if native.ok {
-        assert_success_eq(&native, &rss.result);
-    } else {
-        assert_error_eq(&native, &rss.result);
-    }
+    assert_exact_envelope(&native, &rss.result);
 
     let mut scan = fixture.config();
     scan.max_search_scanned_bytes = 8;
     scan.artifact_store.root = fixture.parent.join("artifacts-scan");
-    let native = native_search(&fixture.tools_with_config(scan.clone()), &arguments);
+    let native = native_execute(
+        &fixture.tools_with_config(scan.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
     let rss = run_rss_search(&fixture, &scan, arguments);
-    if native.ok {
-        assert_success_eq(&native, &rss.result);
-    } else {
-        assert_error_eq(&native, &rss.result);
+    assert_exact_envelope(&native, &rss.result);
+}
+
+fn assert_policy_denied_before_prepare(
+    module: &'static str,
+    tool_name: &'static str,
+    executor: NativeToolExecutor,
+    fixture: &Fixture,
+    arguments: Value,
+) {
+    let durable = MemoryDurable::new();
+    let rss = run_rss_tool(
+        module,
+        fixture,
+        &fixture.config(),
+        tool_name,
+        arguments.clone(),
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        false,
+    );
+    let native = native_execute(&fixture.tools(), executor, &arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert_eq!(
+        rss.started, 0,
+        "syntactic/path policy must not prepare: {arguments} rss={}",
+        rss.result
+    );
+    assert_eq!(durable.started_len(), 0);
+}
+
+#[test]
+fn read_path_policy_is_rejected_before_prepare() {
+    let fixture = Fixture::new("read-policy");
+    fs::write(fixture.root.join("notes.txt"), "alpha\n").unwrap();
+    for arguments in [
+        json!({}),
+        json!({"path": 1}),
+        json!({"path": ""}),
+        json!({"path": "../outside"}),
+        json!({"path": "/tmp"}),
+        json!({"path": "bad\u{0000}name"}),
+        json!({"path": "a:b"}),
+        json!({"path": "a\\b"}),
+        json!({"path": "notes.txt."}),
+        json!({"path": "notes.txt", "offset": 0}),
+        json!({"path": "notes.txt", "offset": -1}),
+    ] {
+        assert_policy_denied_before_prepare(
+            "read_file.rss",
+            "read_file",
+            NativeToolExecutor::ReadFile,
+            &fixture,
+            arguments,
+        );
+    }
+}
+
+#[test]
+fn search_path_policy_is_rejected_before_prepare() {
+    let fixture = Fixture::new("search-policy");
+    fs::write(fixture.root.join("a.txt"), "alpha\n").unwrap();
+    for arguments in [
+        json!({}),
+        json!({"pattern": 1}),
+        json!({"pattern": ""}),
+        json!({"pattern": "alpha", "path": "../outside"}),
+        json!({"pattern": "alpha", "path": "/tmp"}),
+        json!({"pattern": "alpha", "path": "bad\u{0000}name"}),
+        json!({"pattern": "alpha", "path": "a:b"}),
+        json!({"pattern": "alpha", "path": "a\\b"}),
+        json!({"pattern": "alpha", "offset": -1}),
+    ] {
+        assert_policy_denied_before_prepare(
+            "search_files.rss",
+            "search_files",
+            NativeToolExecutor::SearchFiles,
+            &fixture,
+            arguments,
+        );
+    }
+}
+
+#[test]
+fn search_one_nanosecond_wall_time_truncates_like_native() {
+    let fixture = Fixture::new("search-1ns");
+    fs::write(fixture.root.join("a.txt"), "alpha\n").unwrap();
+    fs::write(fixture.root.join("b.txt"), "alpha\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_wall_time = Duration::from_nanos(1);
+    let arguments = json!({"pattern": "alpha", "max_search_wall_time_ms": 999_999});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert!(native.ok, "native 1ns fixture must succeed: {native:?}");
+    assert!(
+        native.truncated,
+        "native 1ns fixture must truncate: {native:?}"
+    );
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert!(rss.started > 0);
+}
+
+#[test]
+fn search_fake_clock_wall_time_truncates_without_deadline_failure() {
+    let fixture = Fixture::new("search-clock");
+    fs::write(fixture.root.join("a.txt"), "alpha\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_wall_time = Duration::from_millis(2);
+    let durable = MemoryDurable::new();
+    let rss = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            module: "search_files.rss",
+            tool_name: "search_files",
+            arguments: json!({"pattern": "alpha"}),
+            durable,
+            approval: Arc::new(AllowAll),
+            cancellation: Arc::new(NeverCancelled),
+            clock: JumpClock::new(1_000, 4, 1_002),
+            deadline_ms: 1_000_000,
+            install_artifacts: false,
+            artifact_limits: default_artifact_limits(),
+            call_id: "call-clock".to_string(),
+        },
+    );
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["error"], Value::Null);
+    assert!(rss.started > 0);
+}
+
+#[test]
+fn cancellation_during_read_and_search_has_no_later_effects() {
+    let fixture = Fixture::new("mid-cancel");
+    fs::write(fixture.root.join("notes.txt"), "alpha\n").unwrap();
+    let durable = MemoryDurable::new();
+    let rss = run_rss_tool(
+        "read_file.rss",
+        &fixture,
+        &fixture.config(),
+        "read_file",
+        json!({"path": "notes.txt"}),
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        CancelAfter::after_checks(1),
+        false,
+    );
+    assert_eq!(
+        rss.result["error"]["code"], "cancelled",
+        "rss={}",
+        rss.result
+    );
+    assert_eq!(rss.started, 1);
+    assert_eq!(durable.started_len(), 1);
+
+    let durable = MemoryDurable::new();
+    let rss = run_rss_tool(
+        "search_files.rss",
+        &fixture,
+        &fixture.config(),
+        "search_files",
+        json!({"pattern": "alpha"}),
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        CancelAfter::after_checks(1),
+        false,
+    );
+    assert_eq!(
+        rss.result["error"]["code"], "cancelled",
+        "rss={}",
+        rss.result
+    );
+    assert_eq!(rss.started, 1);
+}
+
+#[test]
+fn deadline_during_read_and_search_has_no_later_effects() {
+    let fixture = Fixture::new("mid-deadline");
+    fs::write(fixture.root.join("notes.txt"), "alpha\n").unwrap();
+    let durable = MemoryDurable::new();
+    let rss = run_rss_exec(
+        &fixture,
+        &fixture.config(),
+        RssExec {
+            module: "read_file.rss",
+            tool_name: "read_file",
+            arguments: json!({"path": "notes.txt"}),
+            durable: Arc::clone(&durable),
+            approval: Arc::new(AllowAll),
+            cancellation: Arc::new(NeverCancelled),
+            clock: JumpClock::new(1_000, 2, 5_000),
+            deadline_ms: 5_000,
+            install_artifacts: false,
+            artifact_limits: default_artifact_limits(),
+            call_id: "call-deadline-read".to_string(),
+        },
+    );
+    assert_eq!(
+        rss.result["error"]["code"], "deadline_elapsed",
+        "rss={}",
+        rss.result
+    );
+    assert_eq!(rss.started, 1);
+
+    let durable = MemoryDurable::new();
+    let rss = run_rss_exec(
+        &fixture,
+        &fixture.config(),
+        RssExec {
+            module: "search_files.rss",
+            tool_name: "search_files",
+            arguments: json!({"pattern": "alpha"}),
+            durable: Arc::clone(&durable),
+            approval: Arc::new(AllowAll),
+            cancellation: Arc::new(NeverCancelled),
+            clock: JumpClock::new(1_000, 2, 5_000),
+            deadline_ms: 5_000,
+            install_artifacts: false,
+            artifact_limits: default_artifact_limits(),
+            call_id: "call-deadline-search".to_string(),
+        },
+    );
+    assert_eq!(
+        rss.result["error"]["code"], "deadline_elapsed",
+        "rss={}",
+        rss.result
+    );
+    assert_eq!(rss.started, 1);
+}
+
+#[test]
+fn symlink_swap_never_leaks_outside_bytes() {
+    let fixture = Fixture::new("toctou");
+    let secret = "outside-secret-do-not-leak\n";
+    fs::write(fixture.parent.join("secret.txt"), secret).unwrap();
+    fs::write(fixture.root.join("inside.txt"), "inside-ok\n").unwrap();
+    fs::remove_file(fixture.root.join("inside.txt")).unwrap();
+    symlink(
+        fixture.parent.join("secret.txt"),
+        fixture.root.join("inside.txt"),
+    )
+    .unwrap();
+
+    let rss = run_rss_read(&fixture, &fixture.config(), json!({"path": "inside.txt"}));
+    let content = rss.result["content"].as_str().unwrap_or("");
+    let message = rss.result["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !content.contains("outside-secret") && !message.contains("outside-secret"),
+        "rss leaked outside bytes: {}",
+        rss.result
+    );
+    let native = native_execute(
+        &fixture.tools(),
+        NativeToolExecutor::ReadFile,
+        &json!({"path": "inside.txt"}),
+    );
+    assert_exact_envelope(&native, &rss.result);
+
+    let rss = run_rss_search(
+        &fixture,
+        &fixture.config(),
+        json!({"pattern": "outside-secret"}),
+    );
+    let content = rss.result["content"].as_str().unwrap_or("");
+    assert!(
+        !content.contains("outside-secret"),
+        "search leaked outside bytes: {}",
+        rss.result
+    );
+}
+
+#[test]
+fn durable_replay_returns_stored_result_without_filesystem_effect() {
+    let fixture = Fixture::new("replay");
+    fs::write(fixture.root.join("notes.txt"), "first\n").unwrap();
+    let stored = json!({
+        "ok": true,
+        "content": "replayed-bytes",
+        "data": {"path": "notes.txt", "offset": 1, "line_count": 1},
+        "error": null,
+        "truncated": false,
+        "artifacts": []
+    });
+    let durable = MemoryDurable::new();
+    durable.seed_result("call-replay", stored.clone());
+    fs::write(fixture.root.join("notes.txt"), "changed-after-store\n").unwrap();
+    let rss = run_rss_exec(
+        &fixture,
+        &fixture.config(),
+        RssExec {
+            module: "read_file.rss",
+            tool_name: "read_file",
+            arguments: json!({"path": "notes.txt"}),
+            durable: Arc::clone(&durable),
+            approval: Arc::new(AllowAll),
+            cancellation: Arc::new(NeverCancelled),
+            clock: Arc::new(SystemClock),
+            deadline_ms: SystemClock.now_ms() + 60_000,
+            install_artifacts: false,
+            artifact_limits: default_artifact_limits(),
+            call_id: "call-replay".to_string(),
+        },
+    );
+    assert_eq!(rss.result, stored);
+    assert_eq!(rss.started, 0);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("notes.txt")).unwrap(),
+        "changed-after-store\n"
+    );
+}
+
+#[test]
+fn oversized_read_and_search_artifact_publication_matches_native_with_owner() {
+    let fixture = Fixture::new("artifact-parity");
+    fs::write(
+        fixture.root.join("wide.txt"),
+        format!("{}\n", "w".repeat(4000)),
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("hit.txt"),
+        format!("needle {}\n", "x".repeat(4000)),
+    )
+    .unwrap();
+    let mut config = fixture.config();
+    config.max_output_bytes = 512;
+    config.max_search_output_bytes = 512;
+    config.max_read_bytes = 8192;
+    config.artifact_store.max_object_bytes = 8192;
+    config.artifact_store.max_total_bytes = 16384;
+
+    let native_tools = fixture
+        .tools_with_config(config.clone())
+        .with_owner(artifact_owner());
+    let arguments = json!({"path": "wide.txt"});
+    let native = native_execute(&native_tools, NativeToolExecutor::ReadFile, &arguments);
+    let rss = run_rss_tool(
+        "read_file.rss",
+        &fixture,
+        &config,
+        "read_file",
+        arguments,
+        MemoryDurable::new(),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        true,
+    );
+    assert_exact_envelope(&native, &rss.result);
+    let native_id = native.artifacts.first().expect("native artifact");
+    let rss_id = rss.result["artifacts"][0].as_str().expect("rss artifact");
+    let native_bytes = native_tools
+        .artifact_store()
+        .retrieve(&artifact_owner(), native_id)
+        .expect("native bytes");
+    let (rss_bytes, rss_meta) = rss
+        .artifacts
+        .as_ref()
+        .expect("rss store")
+        .stored(rss_id)
+        .expect("rss stored");
+    assert_eq!(native_bytes, rss_bytes);
+    assert_eq!(rss_meta["run"], json!("run-test"));
+    assert_eq!(
+        rss_meta["call_id"],
+        json!(rss.durable.started.lock().expect("started")[0].call_id)
+    );
+
+    let native_tools = fixture
+        .tools_with_config(config.clone())
+        .with_owner(artifact_owner());
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(&native_tools, NativeToolExecutor::SearchFiles, &arguments);
+    let rss = run_rss_tool(
+        "search_files.rss",
+        &fixture,
+        &config,
+        "search_files",
+        arguments,
+        MemoryDurable::new(),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        true,
+    );
+    assert_exact_envelope(&native, &rss.result);
+    if !native.artifacts.is_empty() {
+        let native_id = native.artifacts.first().expect("native search artifact");
+        let rss_id = rss.result["artifacts"][0]
+            .as_str()
+            .expect("rss search artifact");
+        let native_bytes = native_tools
+            .artifact_store()
+            .retrieve(&artifact_owner(), native_id)
+            .expect("native search bytes");
+        let (rss_bytes, _) = rss
+            .artifacts
+            .as_ref()
+            .expect("rss store")
+            .stored(rss_id)
+            .expect("rss search stored");
+        assert_eq!(native_bytes, rss_bytes);
     }
 }
