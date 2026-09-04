@@ -1,0 +1,554 @@
+use self::types as types;
+use bytes;
+use json;
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn int_to_string(value: int) -> string {
+    let encoded: string = json::encode(value);
+    encoded
+}
+
+fn starts_with(value: string, prefix: string) -> bool {
+    let mut result: bool = false;
+    if prefix.length <= value.length {
+        result = value[0:prefix.length] == prefix;
+    }
+    result
+}
+
+fn char_at(value: string, index: int) -> string {
+    value[index:(index + 1)]
+}
+
+fn fail(code: string, message: string, data: map) -> map {
+    let mut mapped: string = message;
+    if code == "cancelled" {
+        mapped = "tool execution was cancelled";
+    }
+    if code == "deadline_elapsed" {
+        mapped = "tool deadline elapsed";
+    }
+    {
+        ok: false,
+        content: "",
+        data: data,
+        error: {
+            code: code,
+            message: mapped
+        },
+        truncated: false,
+        artifacts: []
+    }
+}
+
+fn succeed(content: string, data: map, truncated: bool, artifacts: array) -> map {
+    {
+        ok: true,
+        content: content,
+        data: data,
+        error: null,
+        truncated: truncated,
+        artifacts: artifacts
+    }
+}
+
+fn fail_host(envelope: map) -> map {
+    let error: map = types::map_map(envelope, "error");
+    let code: string = types::map_string(error, "code", "internal_error");
+    let mut message: string = types::map_string(error, "message", "capability failed");
+    if message == "symlinks are not followed" {
+        message = "operating-system operation failed";
+    }
+    fail(code, message, {})
+}
+
+fn deny_path(message: string) -> map {
+    { ok: false, code: "path_denied", message: message }
+}
+
+fn ok_path() -> map {
+    { ok: true, code: "", message: "" }
+}
+
+fn validate_tool_path(path: string, allow_empty: bool) -> map {
+    let mut result: map = ok_path();
+    if path.length == 0 {
+        if allow_empty == false {
+            result = deny_path("empty paths are not valid file paths");
+        }
+    } else {
+        if path.length > 4096 {
+            result = deny_path("relative path exceeds the hard bound");
+        }
+        if map_bool(result, "ok", false) {
+            let mut index: int = 0;
+            while map_bool(result, "ok", false) && index < path.length {
+                if char_at(path, index) == "\0" {
+                    result = deny_path("path contains a NUL byte");
+                }
+                index = index + 1;
+            }
+        }
+        if map_bool(result, "ok", false) {
+            if starts_with(path, "/") {
+                result = deny_path("rooted or trailing-separator paths are not permitted");
+            }
+        }
+        if map_bool(result, "ok", false) {
+            if char_at(path, path.length - 1) == "/" {
+                result = deny_path("rooted or trailing-separator paths are not permitted");
+            }
+        }
+        if map_bool(result, "ok", false) {
+            let mut index: int = 0;
+            while map_bool(result, "ok", false) && index < path.length {
+                if char_at(path, index) == "\\" {
+                    result = deny_path("backslash is not a permitted path separator");
+                }
+                if char_at(path, index) == ":" {
+                    result = deny_path("drive and prefix syntax is not permitted");
+                }
+                index = index + 1;
+            }
+        }
+        if map_bool(result, "ok", false) {
+            let mut start: int = 0;
+            let mut index: int = 0;
+            while map_bool(result, "ok", false) && index <= path.length {
+                let at_end: bool = index == path.length;
+                let mut is_sep: bool = false;
+                if at_end == false {
+                    if char_at(path, index) == "/" {
+                        is_sep = true;
+                    }
+                }
+                if at_end || is_sep {
+                    if index == start {
+                        result = deny_path("empty path components are not permitted");
+                    } else {
+                        let component: string = path[start:index];
+                        if component == "." || component == ".." {
+                            result = deny_path("dot and parent components are not permitted");
+                        }
+                        if map_bool(result, "ok", false) {
+                            if char_at(component, component.length - 1) == "." {
+                                result = deny_path("trailing-dot components are not permitted");
+                            }
+                        }
+                        if map_bool(result, "ok", false) {
+                            if component.length > 255 {
+                                result = deny_path("path component exceeds the hard bound");
+                            }
+                        }
+                        start = index + 1;
+                    }
+                }
+                index = index + 1;
+            }
+        }
+    }
+    result
+}
+
+fn split_inclusive_newline(text: string) -> array {
+    let mut lines: array = [];
+    if text.length > 0 {
+        let mut start: int = 0;
+        let mut index: int = 0;
+        while index < text.length {
+            if char_at(text, index) == "\n" {
+                lines[lines.length] = text[start:(index + 1)];
+                start = index + 1;
+            }
+            index = index + 1;
+        }
+        if start < text.length {
+            lines[lines.length] = text[start:text.length];
+        }
+    }
+    lines
+}
+
+fn concat_lines(lines: array) -> string {
+    let mut out: string = "";
+    let mut index: int = 0;
+    while index < lines.length {
+        let line: string = lines[index].copy();
+        out = out + line;
+        index = index + 1;
+    }
+    out
+}
+
+fn bytes_contains_nul(data: array) -> bool {
+    let mut found: bool = false;
+    let mut index: int = 0;
+    while found == false && index < data.length {
+        let byte: int = data[index];
+        if byte == 0 {
+            found = true;
+        }
+        index = index + 1;
+    }
+    found
+}
+
+fn utf8_is_valid(data: array) -> bool {
+    let mut valid: bool = true;
+    let mut index: int = 0;
+    while valid && index < data.length {
+        let byte: int = data[index];
+        if byte < 0 || byte > 255 {
+            valid = false;
+        } else {
+            if byte <= 127 {
+                index = index + 1;
+            } else {
+                if byte >= 194 && byte <= 223 {
+                    if index + 1 >= data.length {
+                        valid = false;
+                    } else {
+                        let cont: int = data[index + 1];
+                        if cont < 128 || cont > 191 {
+                            valid = false;
+                        } else {
+                            index = index + 2;
+                        }
+                    }
+                } else {
+                    if byte >= 224 && byte <= 239 {
+                        if index + 2 >= data.length {
+                            valid = false;
+                        } else {
+                            let c1: int = data[index + 1];
+                            let c2: int = data[index + 2];
+                            if c1 < 128 || c1 > 191 || c2 < 128 || c2 > 191 {
+                                valid = false;
+                            } else {
+                                if byte == 224 {
+                                    if c1 < 160 {
+                                        valid = false;
+                                    }
+                                }
+                                if byte == 237 {
+                                    if c1 > 159 {
+                                        valid = false;
+                                    }
+                                }
+                                if valid {
+                                    index = index + 3;
+                                }
+                            }
+                        }
+                    } else {
+                        if byte >= 240 && byte <= 244 {
+                            if index + 3 >= data.length {
+                                valid = false;
+                            } else {
+                                let d1: int = data[index + 1];
+                                let d2: int = data[index + 2];
+                                let d3: int = data[index + 3];
+                                if d1 < 128 || d1 > 191 || d2 < 128 || d2 > 191 || d3 < 128 || d3 > 191 {
+                                    valid = false;
+                                } else {
+                                    if byte == 240 {
+                                        if d1 < 144 {
+                                            valid = false;
+                                        }
+                                    }
+                                    if byte == 244 {
+                                        if d1 > 143 {
+                                            valid = false;
+                                        }
+                                    }
+                                    if valid {
+                                        index = index + 4;
+                                    }
+                                }
+                            }
+                        } else {
+                            valid = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    valid
+}
+
+fn control_failure() -> map {
+    let control: map = agent::control_check();
+    if map_bool(control, "ok", false) => {
+        { ok: true, code: "", message: "" }
+    } else => {
+        let error: map = types::map_map(control, "error");
+        {
+            ok: false,
+            code: types::map_string(error, "code", "cancelled"),
+            message: types::map_string(error, "message", "cancelled")
+        }
+    }
+}
+
+fn encoded_len(result: map) -> int {
+    let encoded: string = json::encode(result);
+    encoded.length
+}
+
+fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
+    let mut current: map = result;
+    if encoded_len(current) > max_output_bytes {
+        let content: string = types::map_string(current, "content", "");
+        let data: map = types::map_map(current, "data");
+        if content.length > 0 {
+            let payload: bytes = bytes::from_utf8(content);
+            let put: map = cap::artifact_put(token, payload, { purpose: "result" });
+            if map_bool(put, "ok", false) {
+                let id: string = types::map_string(put, "id", "");
+                let len: int = map_int(put, "len", content.length);
+                let mut artifacts: array = [];
+                artifacts[0] = id;
+                let mut summary: string = "artifact " + id + " (" + int_to_string(len) + " bytes)";
+                current = succeed(summary, data, true, artifacts);
+                if encoded_len(current) > max_output_bytes {
+                    current = succeed("artifact " + id, data, true, artifacts);
+                }
+                if encoded_len(current) > max_output_bytes {
+                    current = succeed("artifact", data, true, artifacts);
+                }
+            }
+        }
+        if encoded_len(current) > max_output_bytes {
+            current = fail("output_truncated", "tool result exceeds the configured bound", {});
+            current.truncated = true;
+            if encoded_len(current) > max_output_bytes {
+                current = fail("output_truncated", "bounded", {});
+                current.truncated = true;
+                if encoded_len(current) > max_output_bytes {
+                    current = fail("output_truncated", "", {});
+                    current.truncated = true;
+                }
+            }
+        }
+    }
+    current
+}
+
+pub fn descriptor() -> map {
+    types::read_file_descriptor()
+}
+
+pub fn validate(arguments: map) -> map {
+    let mut result: map = { ok: true, code: "", message: "" };
+    if arguments.has("path") == false {
+        result = { ok: false, code: "invalid_arguments", message: "path is required" };
+    } else {
+        if type(arguments.path) != "string" {
+            result = { ok: false, code: "invalid_arguments", message: "path must be a string" };
+        }
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("offset") {
+            if type(arguments.offset) != "int" {
+                result = { ok: false, code: "invalid_arguments", message: "offset must be an integer" };
+            } else {
+                if arguments.offset < 0 {
+                    result = { ok: false, code: "invalid_arguments", message: "offset must be an integer" };
+                } else {
+                    if arguments.offset == 0 {
+                        result = { ok: false, code: "invalid_offset", message: "read_file offset is 1-based" };
+                    }
+                }
+            }
+        }
+    }
+    if map_bool(result, "ok", false) {
+        if arguments.has("limit") {
+            if type(arguments.limit) != "int" {
+                result = { ok: false, code: "invalid_arguments", message: "limit must be an integer" };
+            } else {
+                if arguments.limit < 0 {
+                    result = { ok: false, code: "invalid_arguments", message: "limit must be an integer" };
+                }
+            }
+        }
+    }
+    result
+}
+
+pub fn execute(context: map, arguments: map) -> map {
+    let token: string = types::map_string(context, "execution_token", "");
+    let config: map = types::map_map(context, "config");
+    let path: string = types::map_string(arguments, "path", "");
+    let mut result: map = { ok: true, content: "", data: {}, error: null, truncated: false, artifacts: [] };
+    let checked: map = control_failure();
+    if map_bool(checked, "ok", false) == false {
+        result = fail(types::map_string(checked, "code", "cancelled"), types::map_string(checked, "message", ""), {});
+    } else {
+        let path_ok: map = validate_tool_path(path, false);
+        if map_bool(path_ok, "ok", false) == false {
+            result = fail(types::map_string(path_ok, "code", "path_denied"), types::map_string(path_ok, "message", ""), {});
+        } else {
+            let mut offset: int = 1;
+            if arguments.has("offset") {
+                offset = arguments.offset;
+            }
+            let max_read_lines: int = map_int(config, "max_read_lines", 10000);
+            let max_read_bytes: int = map_int(config, "max_read_bytes", 1048576);
+            let max_output_bytes: int = map_int(config, "max_tool_output_bytes", 65536);
+            let mut limit: int = max_read_lines;
+            if arguments.has("limit") {
+                limit = arguments.limit;
+                if limit > max_read_lines {
+                    limit = max_read_lines;
+                }
+            }
+            let meta: map = cap::fs_metadata(token, path);
+            if map_bool(meta, "ok", false) == false {
+                let error: map = types::map_map(meta, "error");
+                let code: string = types::map_string(error, "code", "internal_error");
+                if code == "wrong_type" {
+                    result = fail("path_denied", types::map_string(error, "message", "path denied"), {});
+                } else {
+                    result = fail_host(meta);
+                }
+            } else {
+                let file_type: string = types::map_string(meta, "file_type", "");
+                if file_type != "file" {
+                    result = fail("wrong_type", "read-only open requires a regular file", {});
+                } else {
+                    let file_len: int = map_int(meta, "len", 0);
+                    if file_len > max_read_bytes {
+                        result = fail("budget_exceeded", "read budget exceeded", {});
+                    } else {
+                        let mut text: string = "";
+                        let mut decoded: bool = true;
+                        if file_len > 0 {
+                            let read: map = cap::fs_read_range(token, path, 0, file_len);
+                            if map_bool(read, "ok", false) == false {
+                                result = fail_host(read);
+                                decoded = false;
+                            } else {
+                                if map_bool(read, "truncated", false) {
+                                    result = fail("budget_exceeded", "read budget exceeded", {});
+                                    decoded = false;
+                                } else {
+                                    let payload: bytes = read.bytes;
+                                    let data: array = bytes::to_array_u8(payload);
+                                    if bytes_contains_nul(data) {
+                                        result = fail("binary_file", "file contains binary content", {});
+                                        decoded = false;
+                                    } else {
+                                        if utf8_is_valid(data) == false {
+                                            result = fail("invalid_utf8", "file is not valid UTF-8", {});
+                                            decoded = false;
+                                        } else {
+                                            text = bytes::to_utf8(payload);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if decoded {
+                            let lines: array = split_inclusive_newline(text);
+                            let skip: int = offset - 1;
+                            let mut window: array = [];
+                            let mut index: int = 0;
+                            while index < lines.length {
+                                if index >= skip {
+                                    if window.length < limit {
+                                        window[window.length] = lines[index].copy();
+                                    }
+                                }
+                                index = index + 1;
+                            }
+                            result = shrink_result(
+                                succeed(
+                                    concat_lines(window),
+                                    {
+                                        offset: offset,
+                                        line_count: window.length
+                                    },
+                                    false,
+                                    []
+                                ),
+                                max_output_bytes,
+                                token
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+pub fn run(context: map) -> map {
+    let kind: string = types::map_string(context, "kind", "execute");
+    if kind == "descriptor" => {
+        descriptor()
+    } else if kind == "validate" => {
+        validate(types::map_map(context, "arguments"))
+    } else => {
+        let arguments: map = types::map_map(context, "arguments");
+        let validated: map = validate(arguments);
+        if map_bool(validated, "ok", false) == false => {
+            let mut data: map = {};
+            if types::map_string(validated, "code", "") == "invalid_offset" {
+                data = { offset: 0 };
+            }
+            fail(
+                types::map_string(validated, "code", "invalid_arguments"),
+                types::map_string(validated, "message", "invalid arguments"),
+                data
+            )
+        } else => {
+            let prepared: map = agent_runtime::tool_prepare(types::map_map(context, "prepare"));
+            if types::map_string(prepared, "kind", "") == "replay" => {
+                types::map_map(prepared, "result")
+            } else if map_bool(prepared, "ok", false) == false => {
+                fail_host(prepared)
+            } else => {
+                let token: string = types::map_string(prepared, "execution_token", "");
+                let result: map = execute(
+                    {
+                        execution_token: token,
+                        config: types::map_map(context, "config")
+                    },
+                    arguments
+                );
+                let committed: map = agent_runtime::tool_commit(token, result);
+                if types::map_string(committed, "kind", "") == "committed" => {
+                    types::map_map(committed, "result")
+                } else if map_bool(committed, "ok", false) == false => {
+                    fail_host(committed)
+                } else => {
+                    result
+                }
+            }
+        }
+    }
+}
