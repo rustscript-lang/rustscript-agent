@@ -82,6 +82,7 @@ pub struct FsWrite {
 }
 
 type BeforeWriteHook = Arc<dyn Fn(&str, &[u8]) -> Result<(), CapabilityError> + Send + Sync>;
+type AfterPublishHook = Arc<dyn Fn(&str, &[u8]) -> bool + Send + Sync>;
 
 /// Confined filesystem capability bound to one lifecycle owner.
 #[derive(Clone)]
@@ -93,6 +94,7 @@ pub struct FilesystemCapability {
     frozen: Arc<FrozenDir>,
     cas_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     before_write: Arc<Mutex<Option<BeforeWriteHook>>>,
+    after_publish: Arc<Mutex<Option<AfterPublishHook>>>,
 }
 
 impl FilesystemCapability {
@@ -131,6 +133,7 @@ impl FilesystemCapability {
             frozen: Arc::new(frozen),
             cas_locks: Arc::new(Mutex::new(HashMap::new())),
             before_write: Arc::new(Mutex::new(None)),
+            after_publish: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -141,6 +144,18 @@ impl FilesystemCapability {
     pub fn inject_before_write(&self, hook: BeforeWriteHook) {
         *self
             .before_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Installs a production-neutral post-publish hook for tests.
+    ///
+    /// The hook runs after confined rename/publish returns a published
+    /// outcome. Returning true forces the same `publication_indeterminate`
+    /// capability error produced by `ConfinedPublicationState::Indeterminate`.
+    pub fn inject_after_publish(&self, hook: AfterPublishHook) {
+        *self
+            .after_publish
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
@@ -279,26 +294,35 @@ impl FilesystemCapability {
             self.validate_expected_hash(path, expected_hash)?;
         }
         match self.root.write_file(path, bytes) {
-            Ok(publication) => Ok(FsWrite {
-                hash: content_hash(bytes),
-                len: bytes.len(),
-                durable: publication.is_durable(),
-                staging_cleaned: publication.staging_cleaned(),
-            }),
+            Ok(publication) => {
+                if self.after_publish_forces_indeterminate(path, bytes) {
+                    return Err(publication_indeterminate_error());
+                }
+                Ok(FsWrite {
+                    hash: content_hash(bytes),
+                    len: bytes.len(),
+                    durable: publication.is_durable(),
+                    staging_cleaned: publication.staging_cleaned(),
+                })
+            }
             Err(error) => match error.publication_state() {
                 ConfinedPublicationState::Published {
                     durable,
                     staging_cleaned,
-                } => Ok(FsWrite {
-                    hash: content_hash(bytes),
-                    len: bytes.len(),
-                    durable,
-                    staging_cleaned,
-                }),
-                ConfinedPublicationState::Indeterminate { .. } => Err(CapabilityError::new(
-                    "publication_indeterminate",
-                    "write publication could not be classified",
-                )),
+                } => {
+                    if self.after_publish_forces_indeterminate(path, bytes) {
+                        return Err(publication_indeterminate_error());
+                    }
+                    Ok(FsWrite {
+                        hash: content_hash(bytes),
+                        len: bytes.len(),
+                        durable,
+                        staging_cleaned,
+                    })
+                }
+                ConfinedPublicationState::Indeterminate { .. } => {
+                    Err(publication_indeterminate_error())
+                }
                 ConfinedPublicationState::NotPublished => Err(map_fs_error(error)),
             },
         }
@@ -366,6 +390,21 @@ impl FilesystemCapability {
             .authorize(&self.owner, token, risk)
             .map_err(CapabilityError::from)
     }
+
+    fn after_publish_forces_indeterminate(&self, path: &str, bytes: &[u8]) -> bool {
+        self.after_publish
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|hook| hook(path, bytes))
+    }
+}
+
+fn publication_indeterminate_error() -> CapabilityError {
+    CapabilityError::new(
+        "publication_indeterminate",
+        "write publication could not be classified",
+    )
 }
 
 fn bounded_identity(offset: u64, window_len: usize, file_len: u64) -> String {
