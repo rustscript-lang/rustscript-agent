@@ -433,6 +433,8 @@ impl AgentHostState {
                 "kind": "fs_write",
                 "hash": write.hash,
                 "len": write.len,
+                "durable": write.durable,
+                "staging_cleaned": write.staging_cleaned,
             }),
             Err(error) => capability_error_envelope(&error),
         }
