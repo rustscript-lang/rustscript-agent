@@ -285,11 +285,16 @@ fn truncate_to_bytes(text: string, limit: int) -> string {
 
 fn overflow_artifact_cap(config: map) -> int {
     let stream: int = config_int(config, "max_stream_bytes", 256);
-    stream * 2 + 17
+    stream * 2 + 18
 }
 
 fn overflow_payload(stdout: string, stderr: string, cap: int) -> string {
-    truncate_to_bytes("stdout:\n" + stdout + "\n" + "stderr:\n" + stderr, cap)
+    let mut labeled: string = "stdout:\n" + stdout;
+    if char_at(labeled, labeled.length - 1) != "\n" {
+        labeled = labeled + "\n";
+    }
+    labeled = labeled + "stderr:\n" + stderr;
+    truncate_to_bytes(labeled, cap)
 }
 
 fn compact_overflow_envelope(result: map) -> map {
@@ -379,8 +384,8 @@ fn apply_output_bounds(result: map, token: string, config: map) -> map {
         let labeled: string = overflow_payload(stdout, stderr, overflow_artifact_cap(config));
         let payload: bytes = bytes::from_utf8(labeled);
         data.overflow_encoding = "labeled-utf8";
-        data.overflow_stdout_bytes = utf8_len(stdout);
-        data.overflow_stderr_bytes = utf8_len(stderr);
+        data.overflow_stdout_bytes = map_int(data, "stdout_next_offset", 0) - map_int(data, "stdout_offset", 0);
+        data.overflow_stderr_bytes = map_int(data, "stderr_next_offset", 0) - map_int(data, "stderr_offset", 0);
         bounded.data = data;
         let stored: map = cap::artifact_put(token, payload, {kind: "process_output", encoding: "labeled-utf8"});
         let mut stored_artifact: bool = false;

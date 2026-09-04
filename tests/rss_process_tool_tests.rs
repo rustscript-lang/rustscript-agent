@@ -24,6 +24,7 @@ use rustscript_agent::tools::{
 use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolRegistry};
 use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 fn json_to_vm_value(value: &Value) -> VmValue {
     match value {
@@ -78,18 +79,17 @@ fn vm_map_key_to_string(value: &VmValue) -> String {
 }
 
 const REGISTRY_IDENTITY: &str = "rss-process-tool-equivalence";
-const TEMP_ROOT: &str =
-    "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0e-rss-process-9ecdfd71";
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 fn unique_temp_parent(label: &str) -> PathBuf {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(TEMP_ROOT).join(format!(
-        "rss-proc-{}-{}-{}",
+    std::env::temp_dir().join(format!(
+        "rss-proc-{}-{}-{}-{}",
         label.replace('/', "-"),
         std::process::id(),
-        sequence
+        sequence,
+        Uuid::new_v4().simple()
     ))
 }
 
@@ -100,10 +100,20 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let parent = unique_temp_parent(label);
-        let root = parent.join("workspace");
-        fs::create_dir_all(&root).expect("create rss process fixture");
-        Self { root, parent }
+        let mut last_error = None;
+        for _ in 0..8 {
+            let parent = unique_temp_parent(label);
+            if parent.exists() {
+                continue;
+            }
+            let root = parent.join("workspace");
+            match fs::create_dir_all(&root) {
+                Ok(()) => return Self { root, parent },
+                Err(error) => last_error = Some((parent, error)),
+            }
+        }
+        let (parent, error) = last_error.expect("fixture create attempts");
+        panic!("create rss process fixture {}: {error}", parent.display());
     }
 
     fn config(&self) -> ProcessToolConfig {
@@ -1454,6 +1464,178 @@ fn overflow_tiny_threshold_matches_native() {
     let native = NativePair::new(config.clone()).terminal.execute(&arguments);
     let rss = rss_terminal(&fixture, &config, arguments);
     assert_exact_envelope(&native, &rss.result);
+}
+
+fn first_artifact_id(value: &Value) -> Option<&str> {
+    value
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .and_then(Value::as_str)
+}
+
+fn assert_overflow_payload_shape(label: &str, payload: &[u8], stdout_has_trailing_newline: bool) {
+    let text = String::from_utf8_lossy(payload);
+    assert!(
+        text.starts_with("stdout:\n"),
+        "{label} payload must start with stdout label: {text:?}"
+    );
+    if stdout_has_trailing_newline {
+        assert!(
+            !text.contains("\n\nstderr:\n"),
+            "{label} must not insert an extra newline before stderr: {text:?}"
+        );
+    }
+}
+
+fn assert_terminal_overflow_payload(
+    label: &str,
+    arguments: Value,
+    max_stream_bytes: usize,
+    stdout_has_trailing_newline: bool,
+) {
+    let fixture = Fixture::new(label);
+    let mut config = fixture.config();
+    config.max_stream_bytes = max_stream_bytes;
+    config.max_output_bytes = 600;
+    let sink = Arc::new(MemorySink::default());
+    let native = NativePair::with_artifact_sink(
+        config.clone(),
+        Arc::clone(&sink) as Arc<dyn ProcessArtifactSink>,
+    )
+    .terminal
+    .execute(&arguments);
+    let rss = rss_terminal(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    let rss_id = first_artifact_id(&rss.result)
+        .unwrap_or_else(|| panic!("{label} rss overflow artifact id: {}", rss.result));
+    let rss_bytes = artifact_bytes(&rss, rss_id);
+    let stored = sink.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1, "{label} native overflow sink");
+    assert_eq!(rss_bytes, stored[0].1, "{label} overflow artifact bytes");
+    assert_overflow_payload_shape(label, &rss_bytes, stdout_has_trailing_newline);
+}
+
+fn assert_process_wait_overflow_payload(
+    label: &str,
+    spawn_args: Value,
+    max_stream_bytes: usize,
+    stdout_has_trailing_newline: bool,
+) {
+    let fixture = Fixture::new(label);
+    let mut config = fixture.config();
+    config.max_stream_bytes = max_stream_bytes;
+    config.max_output_bytes = 600;
+    let sink = Arc::new(MemorySink::default());
+    let native = NativePair::with_artifact_sink(
+        config.clone(),
+        Arc::clone(&sink) as Arc<dyn ProcessArtifactSink>,
+    );
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .expect("native process id")
+        .to_string();
+    let rss_spawn = rss_terminal(&fixture, &config, spawn_args);
+    let rss_id = rss_spawn.result["data"]["process_id"]
+        .as_str()
+        .expect("rss process id")
+        .to_string();
+    let native_wait = native.process.execute(&json!({
+        "action": "wait",
+        "process_id": native_id,
+        "timeout_ms": 2000
+    }));
+    let rss_wait = rss_process(
+        &fixture,
+        &config,
+        &rss_spawn,
+        json!({"action": "wait", "process_id": rss_id, "timeout_ms": 2000}),
+    );
+    assert_exact_envelope(&native_wait, &rss_wait.result);
+    let rss_artifact = first_artifact_id(&rss_wait.result)
+        .unwrap_or_else(|| panic!("{label} rss wait overflow artifact id: {}", rss_wait.result));
+    let rss_bytes = artifact_bytes(&rss_wait, rss_artifact);
+    let stored = sink.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1, "{label} native wait overflow sink");
+    assert_eq!(
+        rss_bytes, stored[0].1,
+        "{label} process overflow artifact bytes"
+    );
+    assert_overflow_payload_shape(label, &rss_bytes, stdout_has_trailing_newline);
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup overflow wait");
+}
+
+#[test]
+fn overflow_echo_and_printf_artifact_bytes_match_native_at_exact_cap_and_one_over() {
+    let exact_echo = "x".repeat(299); // 299 bytes + echo newline = 300
+    let one_over_echo = "x".repeat(300); // 300 bytes + echo newline = 301
+    assert_terminal_overflow_payload(
+        "overflow-echo-nl-exact",
+        json!({"argv": ["/bin/echo", exact_echo]}),
+        300,
+        true,
+    );
+    assert_terminal_overflow_payload(
+        "overflow-echo-nl-one-over",
+        json!({"argv": ["/bin/echo", one_over_echo]}),
+        300,
+        true,
+    );
+    assert_terminal_overflow_payload(
+        "overflow-printf-none-exact",
+        json!({"argv": ["/usr/bin/printf", "%s", "x".repeat(300)]}),
+        300,
+        false,
+    );
+    assert_terminal_overflow_payload(
+        "overflow-printf-none-one-over",
+        json!({"argv": ["/usr/bin/printf", "%s", "x".repeat(301)]}),
+        300,
+        false,
+    );
+    assert_terminal_overflow_payload(
+        "overflow-empty-stdout",
+        json!({"argv": ["/bin/sh", "-c", format!("printf '%s' '{}' >&2", "E".repeat(400))]}),
+        8192,
+        true,
+    );
+    assert_terminal_overflow_payload(
+        "overflow-stderr-binary",
+        json!({"argv": ["/bin/sh", "-c", format!("printf '{}'; printf '\\200\\377' >&2", "B".repeat(300))]}),
+        8192,
+        false,
+    );
+}
+
+#[test]
+fn overflow_process_wait_echo_and_printf_artifact_bytes_match_native() {
+    assert_process_wait_overflow_payload(
+        "overflow-wait-echo-nl",
+        json!({"argv": ["/bin/echo", "x".repeat(299)], "background": true}),
+        300,
+        true,
+    );
+    assert_process_wait_overflow_payload(
+        "overflow-wait-printf-none",
+        json!({"argv": ["/usr/bin/printf", "%s", "x".repeat(300)], "background": true}),
+        300,
+        false,
+    );
+}
+
+#[test]
+fn process_fixture_roots_live_under_std_temp_dir() {
+    let fixture = Fixture::new("portable-root");
+    assert!(
+        fixture.parent.starts_with(std::env::temp_dir()),
+        "fixture parent {:?} must be under {:?}",
+        fixture.parent,
+        std::env::temp_dir()
+    );
 }
 
 #[test]
