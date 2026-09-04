@@ -10,7 +10,8 @@ use std::{
 
 use rustscript_vm::{
     ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind, ConfinedFsLimits, ConfinedFsRoot,
-    ConfinedMetadata, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES,
+    ConfinedMetadata, ConfinedPublicationState, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES,
+    MAX_READ_BYTES, MAX_WRITE_BYTES,
 };
 
 use super::{
@@ -76,6 +77,8 @@ pub struct FsList {
 pub struct FsWrite {
     pub hash: String,
     pub len: usize,
+    pub durable: bool,
+    pub staging_cleaned: bool,
 }
 
 /// Confined filesystem capability bound to one lifecycle owner.
@@ -231,6 +234,8 @@ impl FilesystemCapability {
     /// Atomically writes a file when the expected content hash matches.
     ///
     /// An empty `expected_hash` requires the destination not to exist.
+    /// The tool-name-agnostic sentinel `"*"` skips compare-and-swap and
+    /// publishes create-or-replace under the same confinement policy.
     pub fn write_atomic(
         &self,
         token: &str,
@@ -247,12 +252,33 @@ impl FilesystemCapability {
         }
         let lock = self.lock_for(path);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.validate_expected_hash(path, expected_hash)?;
-        self.root.write_file(path, bytes).map_err(map_fs_error)?;
-        Ok(FsWrite {
-            hash: content_hash(bytes),
-            len: bytes.len(),
-        })
+        if expected_hash != "*" {
+            self.validate_expected_hash(path, expected_hash)?;
+        }
+        match self.root.write_file(path, bytes) {
+            Ok(publication) => Ok(FsWrite {
+                hash: content_hash(bytes),
+                len: bytes.len(),
+                durable: publication.is_durable(),
+                staging_cleaned: publication.staging_cleaned(),
+            }),
+            Err(error) => match error.publication_state() {
+                ConfinedPublicationState::Published {
+                    durable,
+                    staging_cleaned,
+                } => Ok(FsWrite {
+                    hash: content_hash(bytes),
+                    len: bytes.len(),
+                    durable,
+                    staging_cleaned,
+                }),
+                ConfinedPublicationState::Indeterminate { .. } => Err(CapabilityError::new(
+                    "publication_indeterminate",
+                    "write publication could not be classified",
+                )),
+                ConfinedPublicationState::NotPublished => Err(map_fs_error(error)),
+            },
+        }
     }
 
     fn validate_expected_hash(
