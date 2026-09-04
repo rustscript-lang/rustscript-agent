@@ -754,7 +754,19 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                 if map_bool(listed, "ok", false) == false {
                     let error: map = types::map_map(listed, "error");
                     let code: string = types::map_string(error, "code", "internal_error");
+                    let mut treat_truncated: bool = false;
                     if code == "budget_exceeded" {
+                        treat_truncated = true;
+                    } else {
+                        if remaining <= 2 {
+                            if code == "path_denied" {
+                                if types::map_string(error, "message", "") == "regular files with multiple hard links are not permitted" {
+                                    treat_truncated = true;
+                                }
+                            }
+                        }
+                    }
+                    if treat_truncated {
                         state.truncated = true;
                         state.stop = true;
                     } else {

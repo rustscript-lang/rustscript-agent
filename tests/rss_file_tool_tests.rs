@@ -2159,6 +2159,103 @@ fn search_hardlink_in_child_discards_parent_matches_like_native() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn search_remaining_2_hardlink_only_truncates_like_native() {
+    let fixture = Fixture::new("search-rem2-hardlink");
+    let outside = fixture.parent.join("outside-shared-rem2");
+    fs::write(&outside, "needle shared\n").unwrap();
+    fs::hard_link(&outside, fixture.root.join("linked")).unwrap();
+    let mut config = fixture.config();
+    config.max_search_files = 2;
+    config.artifact_store.root = fixture.parent.join("artifacts-rem2-hardlink");
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert!(native.ok, "native={native:?}");
+    assert!(native.truncated, "native must truncate: {native:?}");
+    assert_eq!(native.content, "");
+    assert_eq!(native.data["match_count"], json!(0));
+    assert_eq!(native.data["files_visited"], json!(0));
+    assert_eq!(native.data["dirs_visited"], json!(1));
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["content"], json!(""));
+    assert_eq!(rss.result["data"]["match_count"], json!(0));
+    assert_eq!(rss.result["data"]["files_visited"], json!(0));
+    assert_eq!(rss.result["data"]["dirs_visited"], json!(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn search_nested_remaining_2_hardlink_sibling_stops_later_siblings_like_native() {
+    let fixture = Fixture::new("search-nested-rem2-hardlink");
+    fs::create_dir_all(fixture.root.join("adir")).unwrap();
+    fs::create_dir_all(fixture.root.join("bdir")).unwrap();
+    fs::create_dir_all(fixture.root.join("zdir")).unwrap();
+    fs::write(fixture.root.join("adir/f0.txt"), "needle\n").unwrap();
+    fs::write(fixture.root.join("adir/f1.txt"), "needle\n").unwrap();
+    fs::write(fixture.root.join("adir/f2.txt"), "needle\n").unwrap();
+    let outside = fixture.parent.join("outside-shared-nested");
+    fs::write(&outside, "secret needle\n").unwrap();
+    fs::hard_link(&outside, fixture.root.join("bdir/linked")).unwrap();
+    fs::write(fixture.root.join("zdir/late.txt"), "needle late\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_files = 5;
+    config.artifact_store.root = fixture.parent.join("artifacts-nested-rem2-hardlink");
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert!(native.ok, "native={native:?}");
+    assert!(native.truncated, "native must truncate: {native:?}");
+    assert!(
+        native.content.contains("adir/f0.txt")
+            && native.content.contains("adir/f1.txt")
+            && native.content.contains("adir/f2.txt"),
+        "prior matches must remain: native={native:?}"
+    );
+    assert!(
+        !native.content.contains("late.txt"),
+        "later sibling must not be traversed after remaining<=2 hardlink: native={native:?}"
+    );
+    assert!(
+        !native.content.contains("linked"),
+        "hardlink must not be searched after remaining<=2: native={native:?}"
+    );
+    assert_eq!(native.data["files_visited"], json!(3));
+    assert_eq!(native.data["dirs_visited"], json!(3));
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["data"]["files_visited"], json!(3));
+    assert_eq!(rss.result["data"]["dirs_visited"], json!(3));
+    assert!(
+        rss.result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("adir/f0.txt")
+                && content.contains("adir/f1.txt")
+                && content.contains("adir/f2.txt")),
+        "prior matches must remain: rss={}",
+        rss.result
+    );
+    assert!(
+        !rss.result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("late.txt") || content.contains("linked")),
+        "later sibling and hardlink must not leak: rss={}",
+        rss.result
+    );
+}
+
 #[test]
 fn search_directory_order_is_byte_lexicographic_including_multibyte() {
     let fixture = Fixture::new("sort-multi");
