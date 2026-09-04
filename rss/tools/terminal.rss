@@ -503,7 +503,8 @@ fn execute(context: map) -> map {
             stderr_limit: stream_limit,
             total_limit: stream_limit,
             stdin_limit: max_stdin,
-            log_limit: stream_limit
+            log_limit: stream_limit,
+            close_after_initial: background == false
         };
         let stdin_bytes: bytes = bytes::from_utf8(stdin_text);
         let spawned: map = cap::process_spawn(token, argv, cwd, [], limits, stdin_bytes);

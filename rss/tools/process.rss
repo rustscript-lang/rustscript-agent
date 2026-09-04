@@ -519,12 +519,16 @@ fn execute(context: map) -> map {
                         let error: map = types::map_map(written, "error");
                         let code: string = types::map_string(error, "code", "process_failed");
                         let message: string = types::map_string(error, "message", "process failed");
-                        let snap: map = cap::process_poll(token, handle, 0, stream_limit);
-                        last_envelope = snap;
-                        if map_bool(snap, "ok", false) == false {
+                        if code == "cancelled" {
                             outcome = fail(code, message, unpublished());
                         } else {
-                            outcome = view_failure(code, message, snap);
+                            let snap: map = cap::process_poll(token, handle, 0, stream_limit);
+                            last_envelope = snap;
+                            if map_bool(snap, "ok", false) == false {
+                                outcome = fail(code, message, unpublished());
+                            } else {
+                                outcome = view_failure(code, message, snap);
+                            }
                         }
                     } else {
                         let mut data: map = {};
@@ -581,10 +585,8 @@ fn execute(context: map) -> map {
                                     iters = iters + 1;
                                     let again: map = agent::control_check();
                                     if map_bool(again, "ok", false) == false {
-                                        let snap: map = cap::process_poll(token, handle, 0, stream_limit);
-                                        last_envelope = snap;
                                         let error: map = types::map_map(again, "error");
-                                        outcome = view_failure(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), snap);
+                                        outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), unpublished());
                                         finished = true;
                                     } else {
                                         if has_timeout {

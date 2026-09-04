@@ -1414,6 +1414,13 @@ fn arg_process_limits(value: Option<&Value>) -> Result<ProcessLimits, JsonValue>
     if let Some(log_limit) = json_usize_field(&fields, "log_limit")? {
         limits.log_limit = log_limit;
     }
+    if let Some(JsonValue::Bool(close_after_initial)) = fields.get("close_after_initial") {
+        limits.close_after_initial = *close_after_initial;
+    } else if fields.contains_key("close_after_initial") {
+        return Err(invalid_request(
+            "close_after_initial must be a boolean".to_string(),
+        ));
+    }
     Ok(limits)
 }
 
