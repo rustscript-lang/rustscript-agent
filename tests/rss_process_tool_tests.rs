@@ -22,7 +22,7 @@ use rustscript_agent::tools::{
     ProcessArtifactSink, ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolResult,
 };
 use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolRegistry};
-use rustscript_vm::Value as VmValue;
+use rustscript_vm::{CancellationToken, Value as VmValue};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -134,6 +134,7 @@ struct MemoryDurable {
     parent_ok: Mutex<bool>,
     active: Mutex<bool>,
     fail_next_commit: AtomicBool,
+    commit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl MemoryDurable {
@@ -145,6 +146,7 @@ impl MemoryDurable {
             parent_ok: Mutex::new(true),
             active: Mutex::new(true),
             fail_next_commit: AtomicBool::new(false),
+            commit_hook: Mutex::new(None),
         })
     }
 
@@ -168,6 +170,10 @@ impl MemoryDurable {
 
     fn fail_next_commit(&self) {
         self.fail_next_commit.store(true, Ordering::SeqCst);
+    }
+
+    fn on_commit(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.commit_hook.lock().expect("commit hook") = Some(Arc::new(hook));
     }
 }
 
@@ -208,6 +214,9 @@ impl DurableToolLifecycle for MemoryDurable {
     }
 
     fn commit_result(&self, call_id: &str, result: &Value) -> Result<Value, LifecycleError> {
+        if let Some(hook) = self.commit_hook.lock().expect("commit hook").clone() {
+            hook();
+        }
         if self.fail_next_commit.load(Ordering::SeqCst) {
             return Err(LifecycleError::ResultCommitFailed(
                 "injected result failure".to_string(),
@@ -639,6 +648,28 @@ fn wait_until_dead(pid: u32) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("pid {pid} is still alive");
+}
+
+fn proc_children(pid: u32) -> Vec<u32> {
+    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|value| value.parse().ok())
+        .collect()
+}
+
+fn collect_tree(pid: u32) -> Vec<u32> {
+    let mut out = vec![pid];
+    let mut stack = vec![pid];
+    while let Some(current) = stack.pop() {
+        for child in proc_children(current) {
+            if !out.contains(&child) {
+                out.push(child);
+                stack.push(child);
+            }
+        }
+    }
+    out
 }
 
 fn error_code(value: &Value) -> &str {
@@ -1321,17 +1352,16 @@ fn process_write_timeout_on_full_pipe_matches_native_deadline_elapsed() {
 fn process_write_cancel_during_full_pipe_uses_exact_cancelled_envelope() {
     let fixture = Fixture::new("write-cancel");
     let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000});
+    let native_spawn = native.terminal.execute(&spawn_args);
     let flag = FlagCancel::new();
     let spawn = run_rss_exec(
         &fixture,
         &config,
         RssExec {
             cancellation: flag.clone(),
-            ..default_exec(
-                "terminal.rss",
-                "terminal",
-                json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000}),
-            )
+            ..default_exec("terminal.rss", "terminal", spawn_args)
         },
     );
     assert_eq!(spawn.result["ok"], json!(true));
@@ -1339,12 +1369,30 @@ fn process_write_cancel_during_full_pipe_uses_exact_cancelled_envelope() {
         .as_str()
         .unwrap()
         .to_string();
-    let pid = spawn.result["data"]["pid"].as_u64().unwrap_or(0) as u32;
-    let cancel = Arc::clone(&flag);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
-        cancel.cancel();
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = spawn
+        .processes
+        .live_pids()
+        .first()
+        .copied()
+        .expect("spawn pid");
+    flag.cancel();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let write_args = json!({
+        "action": "write",
+        "process_id": native_id,
+        "data": "x".repeat(1024 * 1024),
+        "timeout_ms": 2000
     });
+    let native_write = native.process.execute_with_controls(
+        &write_args,
+        &cancelled,
+        Instant::now() + Duration::from_secs(5),
+    );
     let written = run_rss_exec(
         &fixture,
         &config,
@@ -1364,18 +1412,17 @@ fn process_write_cancel_during_full_pipe_uses_exact_cancelled_envelope() {
             )
         },
     );
-    assert_eq!(written.result["ok"], json!(false));
+    assert_exact_envelope(&native_write, &written.result);
     assert_eq!(error_code(&written.result), "cancelled");
     assert_eq!(error_message(&written.result), "process was cancelled");
-    let _ = rss_process(
-        &fixture,
-        &config,
-        &spawn,
-        json!({"action": "kill", "process_id": rss_id}),
-    );
-    if pid > 0 {
-        wait_until_dead(pid);
-    }
+    assert_eq!(spawn.processes.table_len(), 1);
+    assert!(pid_alive(pid), "cancel must not kill the child");
+    spawn.processes.cancel_all();
+    wait_until_dead(pid);
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
 }
 
 #[test]
@@ -1810,25 +1857,86 @@ fn repeated_close_kill_forged_stale_and_signal_exits_match_native() {
 fn commit_failure_after_background_spawn_leaves_no_process_residue() {
     let fixture = Fixture::new("commit-residue");
     let config = fixture.config();
+    let clock = Arc::new(SystemClock);
+    let deadline_ms = clock.now_ms() + 60_000;
     let durable = MemoryDurable::new();
+    let lifecycle = Arc::new(build_lifecycle(
+        &fixture.root,
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        Arc::clone(&clock) as Arc<dyn LifecycleClock>,
+        deadline_ms,
+    ));
+    let processes = Arc::new(
+        ProcessCapability::new(lifecycle.as_ref().clone(), owner(), process_limits(&config))
+            .expect("process capability"),
+    );
+    let captured = Arc::new(Mutex::new(Vec::<u32>::new()));
+    {
+        let captured = Arc::clone(&captured);
+        let processes = Arc::clone(&processes);
+        durable.on_commit(move || {
+            let mut tree = Vec::new();
+            for pid in processes.live_pids() {
+                tree.extend(collect_tree(pid));
+            }
+            *captured.lock().expect("captured pids") = tree;
+        });
+    }
     durable.fail_next_commit();
     let rss = run_rss_exec(
         &fixture,
         &config,
         RssExec {
             durable: Arc::clone(&durable),
+            call_id: "call-commit-fail".into(),
+            shared_lifecycle: Some(Arc::clone(&lifecycle)),
+            shared_processes: Some(Arc::clone(&processes)),
             ..default_exec(
                 "terminal.rss",
                 "terminal",
-                json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000}),
+                json!({
+                    "argv": ["/bin/sh", "-c", "sleep 60 & exec sleep 60"],
+                    "background": true,
+                    "timeout_ms": 5000
+                }),
             )
         },
     );
     assert_eq!(rss.result["ok"], json!(false));
-    let pid = rss.result["data"]["pid"].as_u64().unwrap_or(0) as u32;
-    if pid > 0 {
-        wait_until_dead(pid);
+    assert_eq!(error_code(&rss.result), "result_commit_failed");
+    assert_eq!(durable.stored_result("call-commit-fail"), None);
+    let pids = captured.lock().expect("captured pids").clone();
+    assert!(
+        !pids.is_empty(),
+        "commit must observe a live child from the process table"
+    );
+    for pid in &pids {
+        wait_until_dead(*pid);
     }
+    assert_eq!(processes.table_len(), 0);
+    let replay = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            durable: Arc::clone(&durable),
+            call_id: "call-commit-fail".into(),
+            shared_lifecycle: Some(lifecycle),
+            shared_processes: Some(Arc::clone(&processes)),
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({
+                    "argv": ["/bin/sh", "-c", "sleep 60 & exec sleep 60"],
+                    "background": true,
+                    "timeout_ms": 5000
+                }),
+            )
+        },
+    );
+    assert_eq!(error_code(&replay.result), "unresolved_call");
+    assert_eq!(processes.table_len(), 0);
 }
 
 #[test]
@@ -1876,7 +1984,8 @@ fn durable_replay_does_not_repeat_spawn_write_or_kill() {
         &first,
         json!({"action": "write", "process_id": handle, "data": "x"}),
     );
-    assert!(write.result["ok"].as_bool().unwrap_or(false) || !error_code(&write.result).is_empty());
+    assert_eq!(write.result["ok"], json!(true));
+    assert_eq!(write.result["data"]["wrote_bytes"], json!(1));
     let kill = rss_process(
         &fixture,
         &config,
@@ -1890,28 +1999,40 @@ fn durable_replay_does_not_repeat_spawn_write_or_kill() {
 fn mid_loop_cancel_wait_envelope_is_process_was_cancelled() {
     let fixture = Fixture::new("mid-cancel");
     let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({"argv": ["/bin/sleep", "8"], "background": true, "timeout_ms": 5000});
+    let native_spawn = native.terminal.execute(&spawn_args);
     let flag = FlagCancel::new();
     let spawn = run_rss_exec(
         &fixture,
         &config,
         RssExec {
             cancellation: flag.clone(),
-            ..default_exec(
-                "terminal.rss",
-                "terminal",
-                json!({"argv": ["/bin/sleep", "8"], "background": true, "timeout_ms": 5000}),
-            )
+            ..default_exec("terminal.rss", "terminal", spawn_args)
         },
     );
     let handle = spawn.result["data"]["process_id"]
         .as_str()
         .unwrap()
         .to_string();
-    let cancel = Arc::clone(&flag);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
-        cancel.cancel();
-    });
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = spawn
+        .processes
+        .live_pids()
+        .first()
+        .copied()
+        .expect("spawn pid");
+    flag.cancel();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let native_wait = native.process.execute_with_controls(
+        &json!({"action": "wait", "process_id": native_id, "timeout_ms": 2000}),
+        &cancelled,
+        Instant::now() + Duration::from_secs(5),
+    );
     let waited = run_rss_exec(
         &fixture,
         &config,
@@ -1927,12 +2048,79 @@ fn mid_loop_cancel_wait_envelope_is_process_was_cancelled() {
             )
         },
     );
+    assert_exact_envelope(&native_wait, &waited.result);
     assert_eq!(error_code(&waited.result), "cancelled");
     assert_eq!(error_message(&waited.result), "process was cancelled");
-    let _ = rss_process(
-        &fixture,
-        &config,
-        &spawn,
-        json!({"action": "kill", "process_id": handle}),
+    assert_eq!(spawn.processes.table_len(), 1);
+    assert!(pid_alive(pid), "wait cancel must not kill the child");
+    spawn.processes.cancel_all();
+    wait_until_dead(pid);
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
+}
+
+#[test]
+fn initial_stdin_epipe_from_fast_child_does_not_fail_terminal_spawn() {
+    let fixture = Fixture::new("stdin-epipe");
+    let config = fixture.config();
+    for i in 0..24 {
+        let arguments = json!({
+            "argv": ["/bin/true"],
+            "stdin": format!("epipe-{i}\n"),
+        });
+        let rss = rss_terminal(&fixture, &config, arguments);
+        assert_eq!(
+            rss.result["ok"],
+            json!(true),
+            "iteration {i} rss={}",
+            rss.result
+        );
+        assert_ne!(error_code(&rss.result), "process_failed");
+        assert_ne!(error_code(&rss.result), "spawn_failed");
+        let pid = rss
+            .processes
+            .live_pids()
+            .first()
+            .copied()
+            .expect("table pid");
+        wait_until_dead(pid);
+    }
+}
+
+#[test]
+fn overflow_invalid_utf8_and_boundary_cap_match_native_memory_sink() {
+    assert_terminal_overflow_payload(
+        "overflow-utf8-stdout",
+        json!({
+            "argv": [
+                "/bin/sh",
+                "-c",
+                format!("printf '\\200\\377{}'", "A".repeat(300))
+            ]
+        }),
+        8192,
+        false,
+    );
+    assert_terminal_overflow_payload(
+        "overflow-utf8-stderr",
+        json!({
+            "argv": [
+                "/bin/sh",
+                "-c",
+                format!("printf '{}'; printf '\\200\\377' >&2", "B".repeat(300))
+            ]
+        }),
+        8192,
+        false,
+    );
+    assert_terminal_overflow_payload(
+        "overflow-utf8-boundary",
+        json!({
+            "argv": ["/usr/bin/printf", "%s", "x".repeat(301)]
+        }),
+        300,
+        false,
     );
 }

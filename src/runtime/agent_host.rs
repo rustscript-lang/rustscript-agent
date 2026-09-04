@@ -484,50 +484,33 @@ impl AgentHostState {
         }
     }
 
-    fn cap_process_poll(
-        &self,
-        token: String,
-        handle: String,
-        cursor: u64,
-        limit: usize,
-    ) -> JsonValue {
+    fn cap_process_poll(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
         let Some(processes) = self.processes.as_ref() else {
-            return Self::missing_capability("process");
+            return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.poll(&token, &handle, cursor, limit) {
-            Ok(snapshot) => process_snapshot_envelope("process_poll", &snapshot),
-            Err(error) => capability_error_envelope(&error),
+            Ok(snapshot) => process_snapshot_value("process_poll", &snapshot),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
         }
     }
 
-    fn cap_process_wait(
-        &self,
-        token: String,
-        handle: String,
-        timeout_ms: Option<u64>,
-    ) -> JsonValue {
+    fn cap_process_wait(&self, token: String, handle: String, timeout_ms: Option<u64>) -> Value {
         let Some(processes) = self.processes.as_ref() else {
-            return Self::missing_capability("process");
+            return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.wait(&token, &handle, timeout_ms) {
-            Ok(snapshot) => process_snapshot_envelope("process_wait", &snapshot),
-            Err(error) => capability_error_envelope(&error),
+            Ok(snapshot) => process_snapshot_value("process_wait", &snapshot),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
         }
     }
 
-    fn cap_process_log(
-        &self,
-        token: String,
-        handle: String,
-        cursor: u64,
-        limit: usize,
-    ) -> JsonValue {
+    fn cap_process_log(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
         let Some(processes) = self.processes.as_ref() else {
-            return Self::missing_capability("process");
+            return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.log(&token, &handle, cursor, limit) {
-            Ok(snapshot) => process_snapshot_envelope("process_log", &snapshot),
-            Err(error) => capability_error_envelope(&error),
+            Ok(snapshot) => process_snapshot_value("process_log", &snapshot),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
         }
     }
 
@@ -1142,7 +1125,7 @@ fn cap_process_poll_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
             ))
         },
         |(token, handle, cursor, limit)| {
-            return_json(state.cap_process_poll(token, handle, cursor, limit))
+            return_value(state.cap_process_poll(token, handle, cursor, limit))
         },
     )
 }
@@ -1158,7 +1141,7 @@ fn cap_process_wait_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
             ))
         },
         |(token, handle, timeout_ms)| {
-            return_json(state.cap_process_wait(token, handle, timeout_ms))
+            return_value(state.cap_process_wait(token, handle, timeout_ms))
         },
     )
 }
@@ -1175,7 +1158,7 @@ fn cap_process_log_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>
             ))
         },
         |(token, handle, cursor, limit)| {
-            return_json(state.cap_process_log(token, handle, cursor, limit))
+            return_value(state.cap_process_log(token, handle, cursor, limit))
         },
     )
 }
@@ -1466,32 +1449,87 @@ fn json_usize_field(
     }
 }
 
-fn process_snapshot_envelope(kind: &str, snapshot: &ProcessSnapshot) -> JsonValue {
-    json!({
-        "ok": true,
-        "kind": kind,
-        "handle": snapshot.handle,
-        "running": snapshot.running,
-        "exit_code": snapshot.exit_code,
-        "signal": snapshot.signal,
-        "stdout": snapshot.stdout,
-        "stderr": snapshot.stderr,
-        "truncated": snapshot.truncated,
-        "stdout_offset": snapshot.stdout_cursor.offset,
-        "stdout_next_offset": snapshot.stdout_cursor.next_offset,
-        "stdout_truncated": snapshot.stdout_cursor.truncated,
-        "stdout_gap": snapshot.stdout_cursor.gap,
-        "stdout_eof": snapshot.stdout_cursor.eof,
-        "stderr_offset": snapshot.stderr_cursor.offset,
-        "stderr_next_offset": snapshot.stderr_cursor.next_offset,
-        "stderr_truncated": snapshot.stderr_cursor.truncated,
-        "stderr_gap": snapshot.stderr_cursor.gap,
-        "stderr_eof": snapshot.stderr_cursor.eof,
-        "signaled": snapshot.signaled,
-        "unknown": snapshot.unknown,
-        "deadline_elapsed": snapshot.deadline_elapsed,
-        "cancelled": snapshot.cancelled,
-    })
+fn process_snapshot_value(kind: &str, snapshot: &ProcessSnapshot) -> Value {
+    Value::map(vec![
+        (Value::string("ok"), Value::Bool(true)),
+        (Value::string("kind"), Value::string(kind)),
+        (Value::string("handle"), Value::string(&snapshot.handle)),
+        (Value::string("running"), Value::Bool(snapshot.running)),
+        (
+            Value::string("exit_code"),
+            snapshot
+                .exit_code
+                .map(i64::from)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            Value::string("signal"),
+            snapshot
+                .signal
+                .map(i64::from)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+        ),
+        (Value::string("stdout"), Value::string(&snapshot.stdout)),
+        (Value::string("stderr"), Value::string(&snapshot.stderr)),
+        (
+            Value::string("stdout_bytes"),
+            Value::bytes(snapshot.stdout_bytes.clone()),
+        ),
+        (
+            Value::string("stderr_bytes"),
+            Value::bytes(snapshot.stderr_bytes.clone()),
+        ),
+        (Value::string("truncated"), Value::Bool(snapshot.truncated)),
+        (
+            Value::string("stdout_offset"),
+            Value::Int(i64::try_from(snapshot.stdout_cursor.offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stdout_next_offset"),
+            Value::Int(i64::try_from(snapshot.stdout_cursor.next_offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stdout_truncated"),
+            Value::Bool(snapshot.stdout_cursor.truncated),
+        ),
+        (
+            Value::string("stdout_gap"),
+            Value::Bool(snapshot.stdout_cursor.gap),
+        ),
+        (
+            Value::string("stdout_eof"),
+            Value::Bool(snapshot.stdout_cursor.eof),
+        ),
+        (
+            Value::string("stderr_offset"),
+            Value::Int(i64::try_from(snapshot.stderr_cursor.offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stderr_next_offset"),
+            Value::Int(i64::try_from(snapshot.stderr_cursor.next_offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stderr_truncated"),
+            Value::Bool(snapshot.stderr_cursor.truncated),
+        ),
+        (
+            Value::string("stderr_gap"),
+            Value::Bool(snapshot.stderr_cursor.gap),
+        ),
+        (
+            Value::string("stderr_eof"),
+            Value::Bool(snapshot.stderr_cursor.eof),
+        ),
+        (Value::string("signaled"), Value::Bool(snapshot.signaled)),
+        (Value::string("unknown"), Value::Bool(snapshot.unknown)),
+        (
+            Value::string("deadline_elapsed"),
+            Value::Bool(snapshot.deadline_elapsed),
+        ),
+        (Value::string("cancelled"), Value::Bool(snapshot.cancelled)),
+    ])
 }
 
 pub(crate) fn typed_fail(code: &str, message: &str) -> JsonValue {
