@@ -892,7 +892,37 @@ fn search_caps_invalid_paths_and_symlinks_match_native() {
     assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "../outside"}));
     assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "/tmp"}));
     assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "missing"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "leaf-link"}));
+
+    let leaf_link_arguments = json!({"pattern": "alpha", "path": "leaf-link"});
+    let native_leaf_link = native_execute(
+        &fixture.tools(),
+        NativeToolExecutor::SearchFiles,
+        &leaf_link_arguments,
+    );
+    let rss_leaf_link = run_rss_search(&fixture, &fixture.config(), leaf_link_arguments);
+    let expected_leaf_link = json!({
+        "ok": false,
+        "content": "",
+        "data": {},
+        "error": {
+            "code": "path_denied",
+            "message": "operating-system operation failed"
+        },
+        "truncated": false,
+        "artifacts": []
+    });
+    assert_eq!(
+        canonical_envelope(&rss_leaf_link.result),
+        expected_leaf_link
+    );
+    assert_eq!(
+        native_leaf_link
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some("operating-system operation failed")
+    );
+    assert!(!native_leaf_link.ok);
 
     let mut config = fixture.config();
     config.max_search_matches = 1;
