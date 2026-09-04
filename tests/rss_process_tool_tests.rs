@@ -5,8 +5,10 @@
 //! IDs and artifact IDs are projected before exact envelope comparison.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,8 +23,10 @@ use rustscript_agent::config::ProcessToolConfig;
 use rustscript_agent::tools::{
     ProcessArtifactSink, ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolResult,
 };
-use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolRegistry};
-use rustscript_vm::{CancellationToken, Value as VmValue};
+use rustscript_agent::{
+    AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolRegistry,
+};
+use rustscript_vm::{CancellationReason, CancellationToken, Value as VmValue};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -324,6 +328,7 @@ fn process_limits(config: &ProcessToolConfig) -> ProcessLimits {
         total_limit: config.max_stream_bytes,
         stdin_limit: config.max_stdin_bytes,
         log_limit: config.max_stream_bytes,
+        close_after_initial: false,
     }
 }
 
@@ -418,6 +423,8 @@ struct RssExec {
     shared_processes: Option<Arc<ProcessCapability>>,
     artifact_limits: ArtifactLimits,
     enable_artifacts: bool,
+    control_hook: Option<ControlCheckHook>,
+    run_cancellation: Option<RunCancellation>,
 }
 
 fn default_artifact_limits() -> ArtifactLimits {
@@ -460,6 +467,8 @@ fn run_rss_exec(fixture: &Fixture, config: &ProcessToolConfig, exec: RssExec) ->
         capability_owner: Some(owner()),
         processes: Some(Arc::clone(&processes)),
         artifacts: artifacts.clone(),
+        cancellation: exec.run_cancellation.clone(),
+        control_hook: exec.control_hook.clone(),
         ..AgentHostBridges::default()
     };
     let context = json!({
@@ -514,6 +523,8 @@ fn default_exec(module: &'static str, tool_name: &'static str, arguments: Value)
         shared_processes: None,
         artifact_limits: default_artifact_limits(),
         enable_artifacts: true,
+        control_hook: None,
+        run_cancellation: None,
     }
 }
 
@@ -2122,5 +2133,354 @@ fn overflow_invalid_utf8_and_boundary_cap_match_native_memory_sink() {
         }),
         300,
         false,
+    );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("sha256sum");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(bytes)
+        .expect("write sha256");
+    let output = child.wait_with_output().expect("sha256sum wait");
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .split_whitespace()
+        .next()
+        .expect("digest")
+        .to_string()
+}
+
+fn cancelled_native_process(native: &ProcessExecutor, arguments: Value) -> ToolResult {
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    native.execute_with_controls(
+        &arguments,
+        &cancelled,
+        Instant::now() + Duration::from_secs(5),
+    )
+}
+
+fn wait_for_descendants(pid: u32) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let tree = collect_tree(pid);
+        if tree.len() >= 2 || Instant::now() >= deadline {
+            return tree;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn wait_in_loop_host_cancel_after_first_poll_matches_native_and_keeps_tree() {
+    let fixture = Fixture::new("wait-in-loop-host");
+    let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({
+        "argv": ["/bin/sh", "-c", "sleep 30 & wait"],
+        "background": true,
+        "timeout_ms": 5000
+    });
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let spawn = rss_terminal(&fixture, &config, spawn_args);
+    assert_eq!(spawn.result["ok"], json!(true));
+    let handle = spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = spawn
+        .processes
+        .live_pids()
+        .first()
+        .copied()
+        .expect("spawn pid");
+    let tree = wait_for_descendants(pid);
+    let run_cancellation = RunCancellation::new();
+    spawn.processes.set_after_running_poll_hook(Arc::new({
+        let run_cancellation = run_cancellation.clone();
+        move || {
+            run_cancellation.request(CancellationReason::Requested);
+        }
+    }));
+    let native_wait = cancelled_native_process(
+        &native.process,
+        json!({"action": "wait", "process_id": native_id, "timeout_ms": 8000}),
+    );
+    let waited = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            shared_lifecycle: Some(Arc::clone(&spawn.lifecycle)),
+            shared_processes: Some(Arc::clone(&spawn.processes)),
+            unlimited_fuel: true,
+            run_cancellation: Some(run_cancellation),
+            ..default_exec(
+                "process.rss",
+                "process",
+                json!({"action": "wait", "process_id": handle, "timeout_ms": 8000}),
+            )
+        },
+    );
+    assert_exact_envelope(&native_wait, &waited.result);
+    assert_eq!(error_code(&waited.result), "cancelled");
+    assert_eq!(error_message(&waited.result), "process was cancelled");
+    assert_eq!(waited.result["data"], json!({}));
+    assert_eq!(spawn.processes.table_len(), 1);
+    for live in &tree {
+        assert!(
+            pid_alive(*live),
+            "pid {live} must stay live after wait cancel"
+        );
+    }
+    spawn.processes.cancel_all();
+    for live in tree {
+        wait_until_dead(live);
+    }
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
+}
+
+#[test]
+fn wait_in_loop_lifecycle_cancel_after_first_poll_keeps_owned_child() {
+    let fixture = Fixture::new("wait-in-loop-life");
+    let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({
+        "argv": ["/bin/sh", "-c", "sleep 30 & wait"],
+        "background": true,
+        "timeout_ms": 5000
+    });
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let flag = FlagCancel::new();
+    let spawn = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            ..default_exec("terminal.rss", "terminal", spawn_args)
+        },
+    );
+    assert_eq!(spawn.result["ok"], json!(true));
+    let handle = spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = spawn
+        .processes
+        .live_pids()
+        .first()
+        .copied()
+        .expect("spawn pid");
+    let tree = wait_for_descendants(pid);
+    spawn.processes.set_after_running_poll_hook(Arc::new({
+        let flag = flag.clone();
+        move || flag.cancel()
+    }));
+    let native_wait = cancelled_native_process(
+        &native.process,
+        json!({"action": "wait", "process_id": native_id, "timeout_ms": 8000}),
+    );
+    let waited = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            shared_lifecycle: Some(Arc::clone(&spawn.lifecycle)),
+            shared_processes: Some(Arc::clone(&spawn.processes)),
+            unlimited_fuel: true,
+            ..default_exec(
+                "process.rss",
+                "process",
+                json!({"action": "wait", "process_id": handle, "timeout_ms": 8000}),
+            )
+        },
+    );
+    assert_exact_envelope(&native_wait, &waited.result);
+    assert_eq!(waited.result["data"], json!({}));
+    assert_eq!(spawn.processes.table_len(), 1);
+    for live in &tree {
+        assert!(
+            pid_alive(*live),
+            "lifecycle cancel must not kill pid {live}"
+        );
+    }
+    spawn.processes.cancel_all();
+    for live in tree {
+        wait_until_dead(live);
+    }
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
+}
+
+#[test]
+fn write_in_loop_cancel_after_full_pipe_matches_native_and_keeps_child() {
+    let fixture = Fixture::new("write-in-loop");
+    let config = fixture.config();
+    let native = NativePair::new(config.clone());
+    let spawn_args = json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000});
+    let native_spawn = native.terminal.execute(&spawn_args);
+    let flag = FlagCancel::new();
+    let spawn = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            ..default_exec("terminal.rss", "terminal", spawn_args)
+        },
+    );
+    assert_eq!(spawn.result["ok"], json!(true));
+    let rss_id = spawn.result["data"]["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let native_id = native_spawn.data["process_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pid = spawn
+        .processes
+        .live_pids()
+        .first()
+        .copied()
+        .expect("spawn pid");
+    spawn.processes.set_write_blocked_hook(Arc::new({
+        let flag = flag.clone();
+        move || flag.cancel()
+    }));
+    let payload = "x".repeat(1024 * 1024);
+    let native_write = cancelled_native_process(
+        &native.process,
+        json!({
+            "action": "write",
+            "process_id": native_id,
+            "data": payload,
+            "timeout_ms": 2000
+        }),
+    );
+    let written = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            shared_lifecycle: Some(Arc::clone(&spawn.lifecycle)),
+            shared_processes: Some(Arc::clone(&spawn.processes)),
+            unlimited_fuel: true,
+            ..default_exec(
+                "process.rss",
+                "process",
+                json!({
+                    "action": "write",
+                    "process_id": rss_id,
+                    "data": payload,
+                    "timeout_ms": 2000
+                }),
+            )
+        },
+    );
+    assert_exact_envelope(&native_write, &written.result);
+    assert_eq!(error_code(&written.result), "cancelled");
+    assert_eq!(error_message(&written.result), "process was cancelled");
+    assert_eq!(written.result["data"], json!({}));
+    assert_eq!(spawn.processes.table_len(), 1);
+    assert!(pid_alive(pid), "write cancel must not kill the child");
+    spawn.processes.cancel_all();
+    wait_until_dead(pid);
+    native
+        .table
+        .cleanup_owner(&process_owner())
+        .expect("cleanup");
+}
+
+#[test]
+fn foreground_slow_reader_receives_full_max_stdin_payload() {
+    let fixture = Fixture::new("slow-stdin");
+    let config = fixture.config();
+    let payload = "A".repeat(config.max_stdin_bytes);
+    let digest = sha256_hex(payload.as_bytes());
+    let script = "import hashlib,sys,time\ntime.sleep(0.05)\ndata=sys.stdin.buffer.read()\nsys.stdout.write('%d %s' % (len(data), hashlib.sha256(data).hexdigest()))";
+    let rss = rss_terminal(
+        &fixture,
+        &config,
+        json!({
+            "argv": ["/usr/bin/python3", "-c", script],
+            "stdin": payload,
+            "timeout_ms": 15000
+        }),
+    );
+    assert_eq!(rss.result["ok"], json!(true), "{}", rss.result);
+    let stdout = rss.result["data"]["stdout"].as_str().unwrap_or("");
+    assert_eq!(stdout, format!("{} {digest}", payload.len()));
+}
+
+#[test]
+fn foreground_cancel_during_initial_stdin_write_cleans_process_group() {
+    let fixture = Fixture::new("stdin-cancel");
+    let config = fixture.config();
+    let flag = FlagCancel::new();
+    let clock = Arc::new(SystemClock);
+    let deadline_ms = clock.now_ms() + 60_000;
+    let durable = MemoryDurable::new();
+    let lifecycle = Arc::new(build_lifecycle(
+        &fixture.root,
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        flag.clone(),
+        clock,
+        deadline_ms,
+    ));
+    let processes = Arc::new(
+        ProcessCapability::new(lifecycle.as_ref().clone(), owner(), process_limits(&config))
+            .expect("processes"),
+    );
+    processes.set_write_blocked_hook(Arc::new({
+        let flag = flag.clone();
+        move || flag.cancel()
+    }));
+    let payload = "x".repeat(config.max_stdin_bytes);
+    let rss = run_rss_exec(
+        &fixture,
+        &config,
+        RssExec {
+            cancellation: flag.clone(),
+            shared_lifecycle: Some(Arc::clone(&lifecycle)),
+            shared_processes: Some(Arc::clone(&processes)),
+            unlimited_fuel: true,
+            ..default_exec(
+                "terminal.rss",
+                "terminal",
+                json!({
+                    "argv": ["/bin/sh", "-c", "sleep 30 & wait"],
+                    "stdin": payload,
+                    "timeout_ms": 10000
+                }),
+            )
+        },
+    );
+    assert_eq!(error_code(&rss.result), "cancelled");
+    assert_eq!(error_message(&rss.result), "process was cancelled");
+    assert_eq!(processes.table_len(), 0);
+    assert!(
+        processes.live_pids().is_empty(),
+        "initial-write cancel must clean the process group"
     );
 }

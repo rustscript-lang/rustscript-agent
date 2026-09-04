@@ -1794,6 +1794,7 @@ impl AgentService {
             total_limit: process_config.max_stream_bytes,
             stdin_limit: process_config.max_stdin_bytes,
             log_limit: process_config.max_output_bytes.max(1),
+            close_after_initial: false,
         };
         let artifacts = self
             .inner

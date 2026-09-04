@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
     },
     thread,
     time::{Duration, Instant},
@@ -21,11 +22,15 @@ use rustscript_vm::{
 
 use super::{
     lifecycle::{CapabilityLifecycle, TokenOwnedResource},
-    types::{CapabilityError, CapabilityOwner, CapabilityRisk, LifecycleError, TokenClaims},
+    types::{CapabilityError, CapabilityOwner, CapabilityRisk, TokenClaims},
 };
 
 const ALLOWED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TZ", "USER", "TERM"];
 const WAIT_POLL_SLICE: Duration = Duration::from_millis(5);
+const WRITE_POLL_SLICE: Duration = Duration::from_millis(5);
+const WRITE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+type ProcessOpHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Per-spawn resource ceilings. Host values are admitted ceilings; caller
 /// arguments may only reduce them.
@@ -37,6 +42,9 @@ pub struct ProcessLimits {
     pub total_limit: usize,
     pub stdin_limit: usize,
     pub log_limit: usize,
+    /// Foreground spawns wait for the initial stdin payload, then close.
+    /// Background spawns keep native `with_stdin` semantics (stdin stays open).
+    pub close_after_initial: bool,
 }
 
 impl Default for ProcessLimits {
@@ -48,6 +56,7 @@ impl Default for ProcessLimits {
             total_limit: 64 * 1024,
             stdin_limit: 64 * 1024,
             log_limit: 64 * 1024,
+            close_after_initial: false,
         }
     }
 }
@@ -137,6 +146,9 @@ struct ProcessInner {
     host_limits: ProcessLimits,
     root: ConfinedFsRoot,
     table: Mutex<HashMap<String, OwnedProcess>>,
+    after_running_poll_hook: Mutex<Option<ProcessOpHook>>,
+    write_blocked_hook: Mutex<Option<ProcessOpHook>>,
+    before_write_cycle_hook: Mutex<Option<ProcessOpHook>>,
 }
 
 impl Drop for ProcessInner {
@@ -195,6 +207,9 @@ impl ProcessCapability {
                 host_limits,
                 root,
                 table: Mutex::new(HashMap::new()),
+                after_running_poll_hook: Mutex::new(None),
+                write_blocked_hook: Mutex::new(None),
+                before_write_cycle_hook: Mutex::new(None),
             }),
         })
     }
@@ -258,24 +273,15 @@ impl ProcessCapability {
                 request = request.with_env(name.clone(), value);
             }
         }
-        if let Some(stdin) = stdin
+        if !limits.close_after_initial
+            && let Some(stdin) = stdin
             && !stdin.is_empty()
         {
             request = request.with_stdin(stdin.to_vec());
         }
         let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
         let handle = process.lifecycle_handle();
-        if stdin.map(|bytes| !bytes.is_empty()).unwrap_or(false) {
-            let flush_deadline = Instant::now() + Duration::from_millis(20);
-            let mut spins = 0_u32;
-            while Instant::now() < flush_deadline && handle.terminal_status().is_none() {
-                thread::sleep(Duration::from_millis(1));
-                spins += 1;
-                if spins >= 2 {
-                    break;
-                }
-            }
-        }
+        let write_handle = handle.clone();
         let pid = handle.pid();
         let id = uuid::Uuid::new_v4().simple().to_string();
         self.inner
@@ -302,6 +308,35 @@ impl ProcessCapability {
             self.remove_and_terminate(&id);
             return Err(CapabilityError::from(error));
         }
+        if limits.close_after_initial {
+            if let Some(bytes) = stdin.filter(|bytes| !bytes.is_empty()) {
+                let mut deadline = claims.deadline;
+                if let Some(bound) =
+                    Instant::now().checked_add(Duration::from_millis(limits.timeout_ms))
+                    && bound < deadline
+                {
+                    deadline = bound;
+                }
+                match self.write_stdin_until(token, &write_handle, bytes, deadline) {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.code() == "stdin_closed" || error.code() == "process_failed" => {}
+                    Err(error) => {
+                        self.remove_and_terminate(&id);
+                        return Err(error);
+                    }
+                }
+            }
+            match write_handle.close_stdin() {
+                Ok(())
+                | Err(BoundedProcessError::StdinClosed)
+                | Err(BoundedProcessError::StdinWriteFailed { .. }) => {}
+                Err(error) => {
+                    self.remove_and_terminate(&id);
+                    return Err(map_process_error(error));
+                }
+            }
+        }
         Ok(ProcessSpawn { handle: id, pid })
     }
 
@@ -324,17 +359,19 @@ impl ProcessCapability {
         let poll_result = owned.handle.poll();
         let mut snap = snapshot(&owned.handle, handle, None, None);
         match poll_result {
-            Ok(_) => Ok(snap),
+            Ok(_) => {}
             Err(BoundedProcessError::DeadlineElapsed) => {
                 snap.deadline_elapsed = true;
-                Ok(snap)
             }
             Err(BoundedProcessError::Cancelled) => {
                 snap.cancelled = true;
-                Ok(snap)
             }
-            Err(error) => Err(map_process_error(error)),
+            Err(error) => return Err(map_process_error(error)),
         }
+        if snap.running {
+            fire_hook(&self.inner.after_running_poll_hook);
+        }
+        Ok(snap)
     }
 
     /// Waits until exit, caller timeout, deadline, or cancellation.
@@ -393,6 +430,33 @@ impl ProcessCapability {
             .values()
             .map(|owned| owned.handle.pid())
             .collect()
+    }
+
+    /// Test barrier: fires once after a successful poll of a still-running child.
+    pub fn set_after_running_poll_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .after_running_poll_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Test barrier: fires once after a timed write observes a full pipe / EAGAIN.
+    pub fn set_write_blocked_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .write_blocked_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Test barrier: fires once at the start of the timed-write observation loop.
+    pub fn set_before_write_cycle_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .before_write_cycle_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     /// Returns a bounded log window.
@@ -484,17 +548,7 @@ impl ProcessCapability {
             .authorize(&self.inner.owner, token, risk)
         {
             Ok(claims) => Ok(claims),
-            Err(error) => {
-                if matches!(
-                    error,
-                    LifecycleError::Cancelled
-                        | LifecycleError::DeadlineElapsed
-                        | LifecycleError::Interrupted
-                ) {
-                    self.cancel_all();
-                }
-                Err(CapabilityError::from(error))
-            }
+            Err(error) => Err(CapabilityError::from(error)),
         }
     }
 
@@ -541,48 +595,51 @@ impl ProcessCapability {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<usize, CapabilityError> {
-        const WRITE_POLL_SLICE: Duration = Duration::from_millis(5);
-        const WRITE_JOIN_GRACE: Duration = Duration::from_millis(200);
         if bytes.is_empty() {
             self.authorize(token, CapabilityRisk::Execute)?;
             return Ok(0);
         }
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let _ = tx.send(handle.write_stdin(bytes));
-            });
-            loop {
-                if let Err(error) = self.authorize(token, CapabilityRisk::Execute) {
-                    let _ = handle.close_stdin();
-                    let _ = rx.recv_timeout(WRITE_JOIN_GRACE);
-                    return Err(error);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let writer = handle.clone();
+        let payload = bytes.to_vec();
+        let worker = thread::Builder::new()
+            .name("process-cap-write".to_string())
+            .spawn(move || {
+                let _ = tx.send(writer.write_stdin(&payload));
+            })
+            .map_err(|_| {
+                CapabilityError::new("process_failed", "stdin write worker failed to start")
+            })?;
+        let outcome = loop {
+            fire_hook(&self.inner.before_write_cycle_hook);
+            if let Err(error) = self.authorize(token, CapabilityRisk::Execute) {
+                break interrupt_write_worker(handle, &rx, error);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break interrupt_write_worker(
+                    handle,
+                    &rx,
+                    CapabilityError::new("deadline_elapsed", "process deadline elapsed"),
+                );
+            }
+            let slice = WRITE_POLL_SLICE.min(deadline.saturating_duration_since(now));
+            match rx.recv_timeout(slice) {
+                Ok(Ok(wrote)) => break Ok(wrote),
+                Ok(Err(error)) => break Err(map_process_error(error)),
+                Err(RecvTimeoutError::Timeout) => {
+                    fire_hook(&self.inner.write_blocked_hook);
                 }
-                let now = Instant::now();
-                if now >= deadline {
-                    let _ = handle.close_stdin();
-                    return match rx.recv_timeout(WRITE_JOIN_GRACE) {
-                        Ok(Ok(wrote)) => Ok(wrote),
-                        Ok(Err(_)) | Err(_) => Err(CapabilityError::new(
-                            "deadline_elapsed",
-                            "process deadline elapsed",
-                        )),
-                    };
-                }
-                let slice = WRITE_POLL_SLICE.min(deadline.saturating_duration_since(now));
-                match rx.recv_timeout(slice) {
-                    Ok(Ok(wrote)) => return Ok(wrote),
-                    Ok(Err(error)) => return Err(map_process_error(error)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(CapabilityError::new(
-                            "process_failed",
-                            "stdin write worker ended",
-                        ));
-                    }
+                Err(RecvTimeoutError::Disconnected) => {
+                    break Err(CapabilityError::new(
+                        "process_failed",
+                        "stdin write worker ended",
+                    ));
                 }
             }
-        })
+        };
+        drop(worker);
+        outcome
     }
 
     fn clamp_limits(&self, caller: ProcessLimits, claims: &TokenClaims) -> ProcessLimits {
@@ -606,7 +663,30 @@ impl ProcessCapability {
             total_limit: caller.total_limit.min(host.total_limit).max(1),
             stdin_limit: caller.stdin_limit.min(host.stdin_limit).max(1),
             log_limit: caller.log_limit.min(host.log_limit).max(1),
+            close_after_initial: caller.close_after_initial,
         }
+    }
+}
+
+fn fire_hook(slot: &Mutex<Option<ProcessOpHook>>) {
+    if let Some(hook) = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        hook();
+    }
+}
+
+fn interrupt_write_worker(
+    handle: &BoundedProcessHandle,
+    rx: &mpsc::Receiver<Result<usize, BoundedProcessError>>,
+    interrupt: CapabilityError,
+) -> Result<usize, CapabilityError> {
+    let _ = handle.close_stdin();
+    match rx.recv_timeout(WRITE_CLEANUP_TIMEOUT) {
+        Ok(Ok(wrote)) => Ok(wrote),
+        Ok(Err(_)) | Err(_) => Err(interrupt),
     }
 }
 

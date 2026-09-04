@@ -651,8 +651,13 @@ fn process_deadline_and_cancel_apply_before_and_during_execution() {
         .expect_err("cancelled during wait");
     assert_eq!(error_code(&error), "cancelled");
     assert!(
+        pid_alive(pid),
+        "wait cancellation must leave pid {pid} alive"
+    );
+    processes.cancel_all();
+    assert!(
         wait_until_pid_gone(pid, Duration::from_secs(2)),
-        "run cancellation left pid {pid} alive"
+        "explicit cleanup left pid {pid} alive"
     );
 }
 
@@ -731,6 +736,7 @@ fn process_spawn_stdin_and_log_cursors_are_owner_scoped() {
                 total_limit: 64,
                 stdin_limit: 64,
                 log_limit: 64,
+                close_after_initial: false,
             },
         )
         .expect("spawn");
@@ -775,6 +781,7 @@ fn process_log_limit_truncates_each_stream_and_advances_offsets() {
                 total_limit: 64,
                 stdin_limit: 64,
                 log_limit: 64,
+                close_after_initial: false,
             },
         )
         .expect("spawn");
@@ -809,6 +816,7 @@ fn process_write_timeout_caps_a_full_pipe() {
         total_limit: 64 * 1024,
         stdin_limit: 2 * 1024 * 1024,
         log_limit: 64 * 1024,
+        ..ProcessLimits::default()
     });
     let token = fixture.token(CapabilityRisk::Execute);
     let spawned = processes
@@ -824,6 +832,7 @@ fn process_write_timeout_caps_a_full_pipe() {
                 total_limit: 64 * 1024,
                 stdin_limit: 2 * 1024 * 1024,
                 log_limit: 64 * 1024,
+                close_after_initial: false,
             },
         )
         .expect("spawn");
@@ -859,6 +868,7 @@ fn process_spawn_with_stdin_writes_before_return() {
                 total_limit: 64,
                 stdin_limit: 64,
                 log_limit: 64,
+                close_after_initial: true,
             },
             Some(b"from-spawn\n"),
         )
@@ -1413,6 +1423,7 @@ fn host_process_ceilings_clamp_caller_timeout() {
         total_limit: 32,
         stdin_limit: 8,
         log_limit: 16,
+        ..ProcessLimits::default()
     });
     let token = fixture.token(CapabilityRisk::Execute);
     let started = Instant::now();
@@ -1429,6 +1440,7 @@ fn host_process_ceilings_clamp_caller_timeout() {
                 total_limit: 64 * 1024,
                 stdin_limit: 64 * 1024,
                 log_limit: 64 * 1024,
+                close_after_initial: false,
             },
         )
         .expect("spawn");
@@ -2347,4 +2359,139 @@ fn process_spawn_initial_stdin_epipe_does_not_fail() {
         assert!(!snapshot.deadline_elapsed);
         assert!(!snapshot.cancelled);
     }
+}
+
+#[test]
+fn process_write_completion_wins_when_cancelled_after_worker_finishes() {
+    let fixture = Fixture::new("proc-write-complete-cancel");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/cat".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 64,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    processes.set_before_write_cycle_hook(Arc::new({
+        let cancel = Arc::clone(&fixture.cancel);
+        move || {
+            thread::sleep(Duration::from_millis(30));
+            cancel.cancel();
+        }
+    }));
+    let wrote = processes
+        .write_stdin(&token, &spawned.handle, b"hello\n", Some(2_000))
+        .expect("completed write should win at cancel");
+    assert_eq!(wrote, 6);
+    processes.cancel_all();
+}
+
+#[test]
+fn process_write_to_exited_child_is_stdin_closed() {
+    let fixture = Fixture::new("proc-write-epipe");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/true".to_string()],
+            "",
+            &[],
+            ProcessLimits::default(),
+        )
+        .expect("spawn");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait true");
+    assert!(!snapshot.running);
+    let error = processes
+        .write_stdin(&token, &spawned.handle, b"late\n", Some(1_000))
+        .expect_err("write after exit");
+    assert!(
+        error_code(&error) == "stdin_closed" || error_code(&error) == "process_failed",
+        "EPIPE after exit, got {}",
+        error_code(&error)
+    );
+}
+
+#[test]
+fn process_write_full_pipe_timeout_returns_within_cleanup_timeout() {
+    let fixture = Fixture::new("proc-write-cleanup");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdin_limit: 2 * 1024 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 2 * 1024 * 1024,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    let started = Instant::now();
+    let error = processes
+        .write_stdin(&token, &spawned.handle, &vec![b'x'; 1024 * 1024], Some(50))
+        .expect_err("full pipe timeout");
+    let elapsed = started.elapsed();
+    assert_eq!(error_code(&error), "deadline_elapsed");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "timed write cleanup hung: {elapsed:?}"
+    );
+    assert!(pid_alive(spawned.pid), "timeout must not kill the child");
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_spawn_close_after_initial_delivers_slow_reader_payload() {
+    let fixture = Fixture::new("proc-close-after-initial");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 15_000,
+        stdin_limit: 256 * 1024,
+        stdout_limit: 8 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let payload = vec![b'A'; 128 * 1024];
+    let spawned = processes
+        .spawn_with(
+            &token,
+            &[
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                "import sys,time\ntime.sleep(0.05)\nsys.stdout.write(str(len(sys.stdin.buffer.read())))".to_string(),
+            ],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 15_000,
+                stdin_limit: 256 * 1024,
+                stdout_limit: 8 * 1024,
+                close_after_initial: true,
+                ..ProcessLimits::default()
+            },
+            Some(&payload),
+        )
+        .expect("spawn");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(15_000))
+        .expect("wait");
+    assert!(!snapshot.running);
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.stdout, payload.len().to_string());
 }
