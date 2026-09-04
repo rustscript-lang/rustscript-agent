@@ -1986,6 +1986,179 @@ fn search_non_utf8_name_consumes_exam_slot_and_does_not_leak_secret() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn search_remaining_2_invalid_byte_filename_truncates_like_native() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("search-rem2-invalid");
+    fs::write(
+        fixture
+            .root
+            .join(OsString::from_vec(vec![0xff, b'x', 0x80])),
+        "secret needle\n",
+    )
+    .unwrap();
+    let mut config = fixture.config();
+    config.max_search_files = 2;
+    config.artifact_store.root = fixture.parent.join("artifacts-rem2-invalid");
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert!(native.ok, "native={native:?}");
+    assert!(native.truncated, "native must truncate: {native:?}");
+    assert_eq!(native.content, "");
+    assert_eq!(native.data["match_count"], json!(0));
+    assert_eq!(native.data["files_visited"], json!(0));
+    assert_eq!(native.data["dirs_visited"], json!(1));
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["content"], json!(""));
+    assert_eq!(rss.result["data"]["match_count"], json!(0));
+    assert_eq!(rss.result["data"]["files_visited"], json!(0));
+    assert_eq!(rss.result["data"]["dirs_visited"], json!(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn search_nested_remaining_2_hidden_dirent_stops_later_siblings_like_native() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("search-nested-rem2-hidden");
+    fs::create_dir_all(fixture.root.join("adir")).unwrap();
+    fs::create_dir_all(fixture.root.join("bdir")).unwrap();
+    fs::create_dir_all(fixture.root.join("zdir")).unwrap();
+    fs::write(fixture.root.join("adir/f0.txt"), "needle\n").unwrap();
+    fs::write(fixture.root.join("adir/f1.txt"), "needle\n").unwrap();
+    fs::write(fixture.root.join("adir/f2.txt"), "needle\n").unwrap();
+    fs::write(
+        fixture
+            .root
+            .join("bdir")
+            .join(OsString::from_vec(vec![0xff, 0x80])),
+        "secret needle\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("zdir/late.txt"), "needle late\n").unwrap();
+    let mut config = fixture.config();
+    config.max_search_files = 5;
+    config.artifact_store.root = fixture.parent.join("artifacts-nested-rem2-hidden");
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert!(native.ok, "native={native:?}");
+    assert!(native.truncated, "native must truncate: {native:?}");
+    assert!(
+        native.content.contains("adir/f0.txt")
+            && native.content.contains("adir/f1.txt")
+            && native.content.contains("adir/f2.txt"),
+        "prior matches must remain: native={native:?}"
+    );
+    assert!(
+        !native.content.contains("late.txt"),
+        "later sibling must not be traversed after remaining<=2 hidden consumption: native={native:?}"
+    );
+    assert_eq!(native.data["files_visited"], json!(3));
+    assert_eq!(native.data["dirs_visited"], json!(3));
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["data"]["files_visited"], json!(3));
+    assert_eq!(rss.result["data"]["dirs_visited"], json!(3));
+    assert!(
+        !rss.result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("late.txt")),
+        "later sibling must not leak: rss={}",
+        rss.result
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn search_hardlink_only_directory_is_fatal_like_native() {
+    let fixture = Fixture::new("search-hardlink-only");
+    let outside = fixture.parent.join("outside-shared");
+    fs::write(&outside, "needle shared\n").unwrap();
+    fs::hard_link(&outside, fixture.root.join("linked")).unwrap();
+    let mut config = fixture.config();
+    config.artifact_store.root = fixture.parent.join("artifacts-hardlink-only");
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert!(!native.ok, "native={native:?}");
+    let native_error = native.error.as_ref().expect("native error");
+    assert_eq!(native_error.code, "path_denied");
+    assert_eq!(
+        native_error.message,
+        "regular files with multiple hard links are not permitted"
+    );
+    assert_eq!(native.content, "");
+    assert_eq!(native.data, json!({}));
+    assert!(!native.truncated);
+    assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
+    assert_eq!(rss.result["error"]["code"], json!("path_denied"));
+    assert_eq!(
+        rss.result["error"]["message"],
+        json!("regular files with multiple hard links are not permitted")
+    );
+    assert_eq!(rss.result["content"], json!(""));
+}
+
+#[cfg(unix)]
+#[test]
+fn search_hardlink_in_child_discards_parent_matches_like_native() {
+    let fixture = Fixture::new("search-hardlink-child");
+    fs::write(fixture.root.join("a.txt"), "needle parent\n").unwrap();
+    fs::create_dir(fixture.root.join("sub")).unwrap();
+    let outside = fixture.parent.join("outside-shared");
+    fs::write(&outside, "needle child\n").unwrap();
+    fs::hard_link(&outside, fixture.root.join("sub/linked")).unwrap();
+    let mut config = fixture.config();
+    config.artifact_store.root = fixture.parent.join("artifacts-hardlink-child");
+    let arguments = json!({"pattern": "needle"});
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+    assert!(
+        !native.ok,
+        "native must discard partial matches: {native:?}"
+    );
+    let native_error = native.error.as_ref().expect("native error");
+    assert_eq!(native_error.code, "path_denied");
+    assert_eq!(
+        native_error.message,
+        "regular files with multiple hard links are not permitted"
+    );
+    assert_eq!(native.content, "");
+    assert_eq!(native.data, json!({}));
+    assert!(
+        !rss.result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("a.txt")),
+        "parent matches must be discarded: rss={}",
+        rss.result
+    );
+}
+
 #[test]
 fn search_directory_order_is_byte_lexicographic_including_multibyte() {
     let fixture = Fixture::new("sort-multi");

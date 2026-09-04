@@ -1988,3 +1988,105 @@ fn list_examination_budget_counts_non_utf8_slots() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn list_consumed_non_utf8_only_page_advances_next_cursor() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("list-non-utf8-only");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x80])),
+        "secret",
+    )
+    .expect("invalid name");
+    let listed = fixture
+        .filesystem()
+        .list(&fixture.token(CapabilityRisk::Read), "dir", 0, 1)
+        .expect("list");
+    assert!(
+        listed.entries.is_empty(),
+        "omitted invalid-byte names must not appear: {:?}",
+        listed.entries
+    );
+    assert!(
+        listed.next_cursor > listed.cursor,
+        "consumed-but-omitted dirents must advance next_cursor: {listed:?}"
+    );
+    assert!(
+        !listed.truncated,
+        "a single consumed-omitted dirent must not claim leftover pages: {listed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn list_rejects_regular_hardlinks_and_preserves_dirs_and_files() {
+    let fixture = Fixture::new("list-hardlink");
+    fs::create_dir(fixture.root.join("keep-dir")).expect("dir");
+    fs::write(fixture.root.join("keep.txt"), "ok").expect("keep");
+    let outside = fixture.root.parent().unwrap().join(format!(
+        "outside-shared-{}-{}",
+        std::process::id(),
+        NEXT_CAP_TMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&outside, "shared").expect("outside");
+    fs::hard_link(&outside, fixture.root.join("linked")).expect("hard link");
+
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let error = fs_cap
+        .list(&token, "", 0, 4)
+        .expect_err("listing a regular hardlink must fail");
+    assert_eq!(error_code(&error), "path_denied");
+    assert_eq!(
+        error.message(),
+        "regular files with multiple hard links are not permitted"
+    );
+
+    let nested = fixture.root.join("keep-dir");
+    fs::write(nested.join("inner.txt"), "inner").expect("inner");
+    let listed = fs_cap
+        .list(&token, "keep-dir", 0, 4)
+        .expect("ordinary directory listing must succeed");
+    assert!(
+        listed
+            .entries
+            .iter()
+            .any(|entry| entry.name == "inner.txt" && entry.file_type == "file")
+    );
+    assert!(
+        listed.entries.iter().all(|entry| entry.name != "linked"),
+        "hardlinked names must not leak through a nested listing: {:?}",
+        listed.entries
+    );
+
+    let host_fs = Arc::new(fixture.filesystem());
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::fs_list("{token}", "", 0, 4)
+        }}
+    "#
+    );
+    let result = run_cap_source(&fixture, Some(host_fs), None, None, &source);
+    assert_eq!(envelope_error_code(&result), "path_denied");
+    let VmValue::Map(fields) = &result else {
+        panic!("expected map envelope, got {result:?}");
+    };
+    let Some(VmValue::Map(error)) = fields.get(&VmValue::string("error")) else {
+        panic!("expected error map, got {result:?}");
+    };
+    assert_eq!(
+        error.get(&VmValue::string("message")),
+        Some(&VmValue::string(
+            "regular files with multiple hard links are not permitted"
+        ))
+    );
+    let _ = fs::remove_file(&outside);
+}

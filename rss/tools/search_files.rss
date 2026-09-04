@@ -782,6 +782,10 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                         } else {
                             if probe_entries.length > 0 {
                                 drop_page = true;
+                            } else {
+                                if map_int(listed, "next_cursor", 0) > map_int(listed, "cursor", 0) {
+                                    drop_page = true;
+                                }
                             }
                         }
                     } else {
