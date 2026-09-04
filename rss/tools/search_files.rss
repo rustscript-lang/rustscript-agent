@@ -453,7 +453,7 @@ fn validate_tool_path(path: string, allow_empty: bool) -> map {
             result = deny_path("empty paths are not valid file paths");
         }
     } else {
-        if path.length > 4096 {
+        if utf8_len(path) > 4096 {
             result = deny_path("relative path exceeds the hard bound");
         }
         if map_bool(result, "ok", false) {
@@ -512,7 +512,7 @@ fn validate_tool_path(path: string, allow_empty: bool) -> map {
                             }
                         }
                         if map_bool(result, "ok", false) {
-                            if component.length > 255 {
+                            if utf8_len(component) > 255 {
                                 result = deny_path("path component exceeds the hard bound");
                             }
                         }
@@ -744,7 +744,16 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                 state.truncated = true;
                 state.stop = true;
             } else {
-                let listed: map = cap::fs_list(types::map_string(state, "token", ""), path, 0, remaining);
+                if remaining <= 1 {
+                    state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
+                    state.truncated = true;
+                    state.stop = true;
+                } else {
+                    let mut list_limit: int = remaining - 2;
+                    if list_limit <= 0 {
+                        list_limit = 1;
+                    }
+                    let listed: map = cap::fs_list(types::map_string(state, "token", ""), path, 0, list_limit);
                 if map_bool(listed, "ok", false) == false {
                     let error: map = types::map_map(listed, "error");
                     let code: string = types::map_string(error, "code", "internal_error");
@@ -770,7 +779,22 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                     }
                 } else {
                     state.dirs_visited = map_int(state, "dirs_visited", 0) + 1;
-                    if map_bool(listed, "truncated", false) {
+                    let mut drop_page: bool = false;
+                    if remaining <= 2 {
+                        let probe_entries: array = types::map_array(listed, "entries");
+                        if map_bool(listed, "truncated", false) {
+                            drop_page = true;
+                        } else {
+                            if probe_entries.length > 0 {
+                                drop_page = true;
+                            }
+                        }
+                    } else {
+                        if map_bool(listed, "truncated", false) {
+                            drop_page = true;
+                        }
+                    }
+                    if drop_page {
                         state.truncated = true;
                         state.stop = true;
                     } else {
@@ -843,6 +867,7 @@ fn walk_search(state: map, path: string, depth: int) -> map {
                     }
                     }
                 }
+            }
             }
         }
     }

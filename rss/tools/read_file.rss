@@ -98,7 +98,7 @@ fn validate_tool_path(path: string, allow_empty: bool) -> map {
             result = deny_path("empty paths are not valid file paths");
         }
     } else {
-        if path.length > 4096 {
+        if utf8_len(path) > 4096 {
             result = deny_path("relative path exceeds the hard bound");
         }
         if map_bool(result, "ok", false) {
@@ -157,7 +157,7 @@ fn validate_tool_path(path: string, allow_empty: bool) -> map {
                             }
                         }
                         if map_bool(result, "ok", false) {
-                            if component.length > 255 {
+                            if utf8_len(component) > 255 {
                                 result = deny_path("path component exceeds the hard bound");
                             }
                         }

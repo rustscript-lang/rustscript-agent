@@ -1185,6 +1185,78 @@ fn search_match_file_dir_and_scan_caps_match_native() {
     assert_exact_envelope(&native, &rss.result);
 }
 
+fn write_search_files(fixture: &Fixture, relative_paths: &[&str]) {
+    for name in relative_paths {
+        let path = fixture.root.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, "needle\n").unwrap();
+    }
+}
+
+fn assert_search_exam_budget_eq(
+    label: &str,
+    max_search_files: usize,
+    files: &[&str],
+    arguments: Value,
+) {
+    let fixture = Fixture::new(label);
+    write_search_files(&fixture, files);
+    let mut config = fixture.config();
+    config.max_search_files = max_search_files;
+    config.artifact_store.root = fixture.parent.join(format!("artifacts-{label}"));
+    let native = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::SearchFiles,
+        &arguments,
+    );
+    let rss = run_rss_search(&fixture, &config, arguments);
+    assert_exact_envelope(&native, &rss.result);
+}
+
+#[test]
+fn search_enumeration_budget_counts_dot_slots_like_native() {
+    let content = json!({"pattern": "needle"});
+    let files_target = json!({"pattern": "*.txt", "target": "files"});
+
+    // Budget N with N-1 and N real entries: native counts `.` and `..` first.
+    assert_search_exam_budget_eq(
+        "exam-n-minus-1",
+        4,
+        &["a.txt", "b.txt", "c.txt"],
+        content.clone(),
+    );
+    assert_search_exam_budget_eq(
+        "exam-n",
+        4,
+        &["a.txt", "b.txt", "c.txt", "d.txt"],
+        content.clone(),
+    );
+    assert_search_exam_budget_eq("exam-n-pass", 4, &["a.txt", "b.txt"], content.clone());
+    assert_search_exam_budget_eq(
+        "exam-n-files-target",
+        4,
+        &["a.txt", "b.txt", "c.txt"],
+        files_target.clone(),
+    );
+
+    // remaining <= 2 at the search root, including empty directories.
+    assert_search_exam_budget_eq("exam-rem-1-file", 1, &["a.txt"], content.clone());
+    assert_search_exam_budget_eq("exam-rem-1-empty", 1, &[], content.clone());
+    assert_search_exam_budget_eq("exam-rem-2-one", 2, &["a.txt"], content.clone());
+    assert_search_exam_budget_eq("exam-rem-2-two", 2, &["a.txt", "b.txt"], content.clone());
+    assert_search_exam_budget_eq("exam-rem-2-empty", 2, &[], content.clone());
+
+    // Sibling directory entered with remaining == 2 after a prior tree consumed files.
+    assert_search_exam_budget_eq(
+        "exam-nested-rem-2",
+        5,
+        &["adir/f0.txt", "adir/f1.txt", "adir/f2.txt", "zdir/late.txt"],
+        content,
+    );
+}
+
 fn assert_policy_denied_before_prepare(
     module: &'static str,
     tool_name: &'static str,
@@ -1230,6 +1302,7 @@ fn read_path_policy_is_rejected_before_prepare() {
         json!({"path": "notes.txt."}),
         json!({"path": "notes.txt", "offset": 0}),
         json!({"path": "notes.txt", "offset": -1}),
+        json!({"path": "你".repeat(100)}),
     ] {
         assert_policy_denied_before_prepare(
             "read_file.rss",
@@ -1255,6 +1328,7 @@ fn search_path_policy_is_rejected_before_prepare() {
         json!({"pattern": "alpha", "path": "a:b"}),
         json!({"pattern": "alpha", "path": "a\\b"}),
         json!({"pattern": "alpha", "offset": -1}),
+        json!({"pattern": "alpha", "path": "你".repeat(100)}),
     ] {
         assert_policy_denied_before_prepare(
             "search_files.rss",
@@ -1264,6 +1338,30 @@ fn search_path_policy_is_rejected_before_prepare() {
             arguments,
         );
     }
+}
+
+#[test]
+fn cjk_component_byte_limit_is_rejected_before_prepare_like_native() {
+    let fixture = Fixture::new("cjk-component-bytes");
+    fs::write(fixture.root.join("notes.txt"), "alpha\n").unwrap();
+    let component = "你".repeat(100);
+    assert_eq!(component.len(), 300);
+    assert_eq!(component.chars().count(), 100);
+    assert!(component.chars().count() < 255);
+    assert_policy_denied_before_prepare(
+        "read_file.rss",
+        "read_file",
+        NativeToolExecutor::ReadFile,
+        &fixture,
+        json!({"path": component.clone()}),
+    );
+    assert_policy_denied_before_prepare(
+        "search_files.rss",
+        "search_files",
+        NativeToolExecutor::SearchFiles,
+        &fixture,
+        json!({"pattern": "alpha", "path": component}),
+    );
 }
 
 #[test]
@@ -1286,7 +1384,7 @@ fn search_one_nanosecond_budget_ceils_to_one_ms_and_matches_native() {
 
     let arguments = json!({"pattern": "alpha"});
     let native = native_execute(
-        &fixture.tools(),
+        &fixture.tools_with_config(config.clone()),
         NativeToolExecutor::SearchFiles,
         &arguments,
     );
@@ -1300,7 +1398,7 @@ fn search_one_nanosecond_budget_ceils_to_one_ms_and_matches_native() {
             durable: MemoryDurable::new(),
             approval: Arc::new(AllowAll),
             cancellation: Arc::new(NeverCancelled),
-            clock: JumpClock::new(1_000, u64::MAX, 1_000),
+            clock: JumpClock::new(1_000, 1, 1_001),
             deadline_ms: 1_000_000,
             install_artifacts: false,
             artifact_limits: default_artifact_limits(),
@@ -1309,7 +1407,6 @@ fn search_one_nanosecond_budget_ceils_to_one_ms_and_matches_native() {
     );
     assert_exact_envelope(&native, &rss.result);
     assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
-    assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
     assert!(rss.started > 0);
 }
 
@@ -1689,9 +1786,10 @@ fn search_glob_question_mark_matches_one_utf8_byte_like_native() {
     let fixture = Fixture::new("glob-byte-q");
     fs::write(fixture.root.join("a.rs"), "keep\n").unwrap();
     fs::write(fixture.root.join("你.rs"), "cjk\n").unwrap();
-    assert_search_eq(&fixture, json!({"target": "files", "file_glob": "?.rs"}));
-    assert_search_eq(&fixture, json!({"target": "files", "file_glob": "???.rs"}));
+    assert_search_eq(&fixture, json!({"pattern": "?.rs", "target": "files"}));
+    assert_search_eq(&fixture, json!({"pattern": "???.rs", "target": "files"}));
     assert_search_eq(&fixture, json!({"pattern": "keep", "file_glob": "?.rs"}));
+    assert_search_eq(&fixture, json!({"pattern": "cjk", "file_glob": "???.rs"}));
 }
 
 #[cfg(unix)]
@@ -1707,7 +1805,7 @@ fn search_skips_non_utf8_names_like_native() {
         .join(OsString::from_vec(vec![0xff, b'x', 0x80]));
     fs::write(&bad, "secret alpha\n").unwrap();
     assert_search_eq(&fixture, json!({"pattern": "alpha"}));
-    assert_search_eq(&fixture, json!({"target": "files", "file_glob": "*"}));
+    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
 }
 
 #[test]
@@ -1717,7 +1815,7 @@ fn search_directory_order_is_byte_lexicographic_including_multibyte() {
         fs::write(fixture.root.join(name), "needle\n").unwrap();
     }
     assert_search_eq(&fixture, json!({"pattern": "needle"}));
-    assert_search_eq(&fixture, json!({"target": "files"}));
+    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
 }
 
 #[test]
@@ -1727,7 +1825,7 @@ fn search_high_entry_directory_order_matches_native() {
         fs::write(fixture.root.join(format!("f-{i:03}.txt")), "needle\n").unwrap();
     }
     assert_search_eq(&fixture, json!({"pattern": "needle"}));
-    assert_search_eq(&fixture, json!({"target": "files"}));
+    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
 }
 
 #[test]
