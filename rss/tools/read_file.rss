@@ -324,7 +324,7 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
         let data: map = types::map_map(current, "data");
         if content.length > 0 {
             let payload: bytes = bytes::from_utf8(content);
-            let put: map = cap::artifact_put(token, payload, { purpose: "result" });
+            let put: map = cap::artifact_put_result(token, payload, {});
             if map_bool(put, "ok", false) {
                 let id: string = types::map_string(put, "id", "");
                 let len: int = map_int(put, "len", content.length);
@@ -363,19 +363,21 @@ pub fn descriptor() -> map {
 pub fn validate(arguments: map) -> map {
     let mut result: map = { ok: true, code: "", message: "" };
     if arguments.has("path") == false {
-        result = { ok: false, code: "invalid_arguments", message: "path is required" };
+        result = { ok: false, code: "invalid_arguments", message: "read_file requires path" };
     } else {
         if type(arguments.path) != "string" {
-            result = { ok: false, code: "invalid_arguments", message: "path must be a string" };
+            result = { ok: false, code: "invalid_arguments", message: "read_file requires path" };
+        } else {
+            result = validate_tool_path(arguments.path, false);
         }
     }
     if map_bool(result, "ok", false) {
         if arguments.has("offset") {
             if type(arguments.offset) != "int" {
-                result = { ok: false, code: "invalid_arguments", message: "offset must be an integer" };
+                result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
             } else {
                 if arguments.offset < 0 {
-                    result = { ok: false, code: "invalid_arguments", message: "offset must be an integer" };
+                    result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
                 } else {
                     if arguments.offset == 0 {
                         result = { ok: false, code: "invalid_offset", message: "read_file offset is 1-based" };
@@ -387,10 +389,10 @@ pub fn validate(arguments: map) -> map {
     if map_bool(result, "ok", false) {
         if arguments.has("limit") {
             if type(arguments.limit) != "int" {
-                result = { ok: false, code: "invalid_arguments", message: "limit must be an integer" };
+                result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
             } else {
                 if arguments.limit < 0 {
-                    result = { ok: false, code: "invalid_arguments", message: "limit must be an integer" };
+                    result = { ok: false, code: "invalid_arguments", message: "numeric argument is invalid" };
                 }
             }
         }

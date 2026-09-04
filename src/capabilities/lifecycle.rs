@@ -315,6 +315,13 @@ impl CapabilityLifecycle {
         &self.inner.workspace
     }
 
+    /// Monotonic milliseconds from the admitted clock. Callers cannot forge
+    /// this value; they must present an authorized execution token via the
+    /// generic host primitive.
+    pub fn now_ms(&self) -> u64 {
+        self.inner.clock.now_ms()
+    }
+
     pub fn prepare(
         &self,
         owner: &CapabilityOwner,
