@@ -140,6 +140,7 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
                     HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
                 ),
                 HostParamSchema::value("limits", HostTypeSchema::Unknown),
+                HostParamSchema::value("stdin", HostTypeSchema::Unknown),
             ],
             response.clone(),
         ));
@@ -168,6 +169,7 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
                 token.clone(),
                 handle.clone(),
                 HostParamSchema::value("bytes", HostTypeSchema::Unknown),
+                HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
             ],
             response.clone(),
         ));
@@ -461,11 +463,17 @@ impl AgentHostState {
         cwd: String,
         env_names: Vec<String>,
         limits: ProcessLimits,
+        stdin: Vec<u8>,
     ) -> JsonValue {
         let Some(processes) = self.processes.as_ref() else {
             return Self::missing_capability("process");
         };
-        match processes.spawn(&token, &argv, &cwd, &env_names, limits) {
+        let stdin = if stdin.is_empty() {
+            None
+        } else {
+            Some(stdin.as_slice())
+        };
+        match processes.spawn_with(&token, &argv, &cwd, &env_names, limits, stdin) {
             Ok(spawned) => json!({
                 "ok": true,
                 "kind": "process_spawn",
@@ -523,11 +531,17 @@ impl AgentHostState {
         }
     }
 
-    fn cap_process_write(&self, token: String, handle: String, bytes: Vec<u8>) -> JsonValue {
+    fn cap_process_write(
+        &self,
+        token: String,
+        handle: String,
+        bytes: Vec<u8>,
+        timeout_ms: Option<u64>,
+    ) -> JsonValue {
         let Some(processes) = self.processes.as_ref() else {
             return Self::missing_capability("process");
         };
-        match processes.write_stdin(&token, &handle, &bytes) {
+        match processes.write_stdin(&token, &handle, &bytes, timeout_ms) {
             Ok(wrote_bytes) => {
                 json!({"ok": true, "kind": "process_write", "wrote_bytes": wrote_bytes})
             }
@@ -889,7 +903,7 @@ pub fn register_agent_host_functions(
         registry,
         catalog,
         CAP_PROCESS_SPAWN,
-        5,
+        6,
         cap_process_spawn_adapter,
     )?;
     register_named(
@@ -917,7 +931,7 @@ pub fn register_agent_host_functions(
         registry,
         catalog,
         CAP_PROCESS_WRITE,
-        3,
+        4,
         cap_process_write_adapter,
     )?;
     register_named(
@@ -1107,10 +1121,11 @@ fn cap_process_spawn_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
                 arg_string(args, 2, "cwd")?,
                 arg_string_list(args, 3, "env_names")?,
                 arg_process_limits(args.get(4))?,
+                arg_bytes(args, 5, "stdin")?,
             ))
         },
-        |(token, argv, cwd, env_names, limits)| {
-            return_json(state.cap_process_spawn(token, argv, cwd, env_names, limits))
+        |(token, argv, cwd, env_names, limits, stdin)| {
+            return_json(state.cap_process_spawn(token, argv, cwd, env_names, limits, stdin))
         },
     )
 }
@@ -1173,9 +1188,12 @@ fn cap_process_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
                 arg_string(args, 0, "execution_token")?,
                 arg_string(args, 1, "handle")?,
                 arg_bytes(args, 2, "bytes")?,
+                arg_timeout(args, 3, "timeout_ms")?.filter(|ms| *ms > 0),
             ))
         },
-        |(token, handle, bytes)| return_json(state.cap_process_write(token, handle, bytes)),
+        |(token, handle, bytes, timeout_ms)| {
+            return_json(state.cap_process_write(token, handle, bytes, timeout_ms))
+        },
     )
 }
 

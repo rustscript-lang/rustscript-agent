@@ -55,7 +55,7 @@ fn fail(code: string, message: string, data: map) -> map {
 fn fail_with(code: string, message: string, content: string, data: map, truncated: bool) -> map {
     let mut mapped: string = message;
     if code == "cancelled" {
-        mapped = "tool execution was cancelled";
+        mapped = "process was cancelled";
     }
     if code == "deadline_elapsed" {
         mapped = "process deadline elapsed";
@@ -101,6 +101,58 @@ fn config_int(config: map, name: string, fallback: int) -> int {
     map_int(config, name, fallback)
 }
 
+fn timeout_exceeds_max(timeout_ms: int, max_timeout: int) -> bool {
+    let mut exceeds: bool = false;
+    if max_timeout > 0 {
+        if timeout_ms > max_timeout {
+            exceeds = true;
+        }
+    }
+    exceeds
+}
+
+fn validate_timeout_value(arguments: map, config: map) -> map {
+    let mut result: map = {ok: true, code: "", message: ""};
+    if arguments.has("timeout_ms") {
+        let max_timeout: int = config_int(config, "max_timeout_ms", 3600000);
+        let timeout_type: string = type(arguments["timeout_ms"].copy());
+        if timeout_type == "int" {
+            let timeout_ms: int = arguments["timeout_ms"];
+            if timeout_ms < 0 {
+                result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
+            } else {
+                if timeout_ms == 0 {
+                    result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be positive"};
+                } else {
+                    if timeout_exceeds_max(timeout_ms, max_timeout) {
+                        result = {ok: false, code: "invalid_timeout", message: "timeout exceeds the configured bound"};
+                    }
+                }
+            }
+        } else {
+            if timeout_type == "float" {
+                let timeout_float: float = arguments["timeout_ms"];
+                if timeout_float < 0.0 {
+                    result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
+                } else {
+                    if timeout_float == 0.0 {
+                        result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be positive"};
+                    } else {
+                        if timeout_float > 1000000000.0 {
+                            result = {ok: false, code: "invalid_timeout", message: "timeout exceeds the configured bound"};
+                        } else {
+                            result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
+                        }
+                    }
+                }
+            } else {
+                result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
+            }
+        }
+    }
+    result
+}
+
 fn action_allowed(action: string) -> bool {
     let mut allowed: bool = false;
     if action == "poll" {
@@ -139,23 +191,9 @@ fn validate(arguments: map, config: map) -> map {
         }
     }
     if map_bool(result, "ok", false) {
-        if arguments.has("timeout_ms") {
-            if type(arguments["timeout_ms"].copy()) != "int" {
-                result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
-            } else {
-                let timeout_ms: int = arguments["timeout_ms"];
-                if timeout_ms < 0 {
-                    result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be a non-negative integer"};
-                } else {
-                    if timeout_ms == 0 {
-                        result = {ok: false, code: "invalid_timeout", message: "timeout_ms must be positive"};
-                    } else {
-                        if timeout_ms > 3600000 {
-                            result = {ok: false, code: "invalid_timeout", message: "timeout exceeds the configured bound"};
-                        }
-                    }
-                }
-            }
+        let timeout_check: map = validate_timeout_value(arguments, config);
+        if map_bool(timeout_check, "ok", false) == false {
+            result = timeout_check;
         }
     }
     if map_bool(result, "ok", false) {
@@ -230,40 +268,138 @@ fn snapshot_data(envelope: map) -> map {
     data
 }
 
-fn apply_output_bounds(result: map, token: string, max_output_bytes: int) -> map {
+fn char_at(value: string, index: int) -> string {
+    value[index:(index + 1)]
+}
+
+fn truncate_to_bytes(text: string, limit: int) -> string {
+    let mut end: int = 0;
+    let mut used: int = 0;
+    let mut walking: bool = true;
+    while walking && end < text.length {
+        let ch: string = char_at(text, end);
+        let ch_bytes: int = utf8_len(ch);
+        if used + ch_bytes > limit {
+            walking = false;
+        } else {
+            used = used + ch_bytes;
+            end = end + 1;
+        }
+    }
+    text[0:end]
+}
+
+fn overflow_artifact_cap(config: map) -> int {
+    let stream: int = config_int(config, "max_stream_bytes", 256);
+    stream * 2 + 17
+}
+
+fn overflow_payload(stdout: string, stderr: string, cap: int) -> string {
+    truncate_to_bytes("stdout:\n" + stdout + "\n" + "stderr:\n" + stderr, cap)
+}
+
+fn compact_overflow_envelope(result: map) -> map {
+    let mut compacted: map = result;
+    compacted.content = "";
+    let mut data: map = types::map_map(compacted, "data");
+    data.stdout = "";
+    data.stderr = "";
+    compacted.data = data;
+    compacted
+}
+
+fn enforce_serialized_cap(result: map, cap: int) -> map {
     let mut bounded: map = result;
-    if encoded_len(bounded) > max_output_bytes {
+    if encoded_len(bounded) > cap {
         bounded.truncated = true;
-        let stdout: string = types::map_string(types::map_map(bounded, "data"), "stdout", "");
-        let stderr: string = types::map_string(types::map_map(bounded, "data"), "stderr", "");
-        let labeled: string = "stdout:\n" + stdout + "\nstderr:\n" + stderr;
-        let payload: bytes = bytes::from_utf8(labeled);
-        let stored: map = cap::artifact_put(token, payload, {kind: "process_output", encoding: "labeled-utf8"});
-        let mut data: map = types::map_map(bounded, "data");
-        if map_bool(stored, "ok", false) {
-            data.stdout = "";
-            data.stderr = "";
-            data.stdout_truncated = true;
-            data.stderr_truncated = true;
-            data.truncated = true;
-            data.overflow = true;
-            data.overflow_reason = "compacted";
-            data.overflow_artifact = types::map_string(stored, "id", "");
-            data.overflow_encoding = "labeled-utf8";
-            data.overflow_stdout_bytes = utf8_len(stdout);
-            data.overflow_stderr_bytes = utf8_len(stderr);
+        let original_content: string = types::map_string(bounded, "content", "");
+        let original_data: map = types::map_map(bounded, "data");
+        let original_stdout: string = types::map_string(original_data, "stdout", "");
+        let original_stderr: string = types::map_string(original_data, "stderr", "");
+        bounded.content = "";
+        let mut data: map = original_data;
+        data.stdout = "";
+        data.stderr = "";
+        bounded.data = data;
+        if encoded_len(bounded) > cap {
+            bounded = fail_with("output_truncated", "tool result exceeds the configured bound", "", unpublished(), true);
+        } else {
+            let budget: int = cap - encoded_len(bounded);
+            bounded.content = truncate_to_bytes(original_content, budget);
+            data = types::map_map(bounded, "data");
+            data.stdout = truncate_to_bytes(original_stdout, budget);
+            data.stderr = truncate_to_bytes(original_stderr, budget);
+            let stdout_now: string = types::map_string(data, "stdout", "");
+            let stderr_now: string = types::map_string(data, "stderr", "");
+            if utf8_len(stdout_now) < utf8_len(original_stdout) {
+                data.stdout_truncated = true;
+            }
+            if utf8_len(stderr_now) < utf8_len(original_stderr) {
+                data.stderr_truncated = true;
+            }
             bounded.data = data;
             bounded.truncated = true;
+            if encoded_len(bounded) > cap {
+                bounded.content = "";
+                data = types::map_map(bounded, "data");
+                data.stdout = "";
+                data.stderr = "";
+                bounded.data = data;
+                if encoded_len(bounded) > cap {
+                    bounded = fail_with("output_truncated", "tool result exceeds the configured bound", "", unpublished(), true);
+                    if encoded_len(bounded) > cap {
+                        bounded = fail_with("output_truncated", "bounded", "", unpublished(), true);
+                        if encoded_len(bounded) > cap {
+                            bounded = fail_with("output_truncated", "", "", unpublished(), true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bounded
+}
+
+fn apply_output_bounds(result: map, token: string, config: map) -> map {
+    let max_output_bytes: int = config_int(config, "max_output_bytes", 65536);
+    let mut bounded: map = result;
+    let mut data: map = types::map_map(bounded, "data");
+    let mut ring_truncated: bool = map_bool(bounded, "truncated", false);
+    if map_bool(data, "stdout_truncated", false) {
+        ring_truncated = true;
+    }
+    if map_bool(data, "stderr_truncated", false) {
+        ring_truncated = true;
+    }
+    bounded.truncated = ring_truncated;
+    if encoded_len(bounded) > max_output_bytes {
+        bounded.truncated = true;
+        let stdout: string = types::map_string(data, "stdout", "");
+        let stderr: string = types::map_string(data, "stderr", "");
+        let labeled: string = overflow_payload(stdout, stderr, overflow_artifact_cap(config));
+        let payload: bytes = bytes::from_utf8(labeled);
+        data.overflow_encoding = "labeled-utf8";
+        data.overflow_stdout_bytes = utf8_len(stdout);
+        data.overflow_stderr_bytes = utf8_len(stderr);
+        bounded.data = data;
+        let stored: map = cap::artifact_put(token, payload, {kind: "process_output", encoding: "labeled-utf8"});
+        let mut stored_artifact: bool = false;
+        if map_bool(stored, "ok", false) {
+            stored_artifact = true;
             let mut artifacts: array = [];
             artifacts[0] = types::map_string(stored, "id", "");
             bounded.artifacts = artifacts;
-        } else {
-            data = unpublished();
-            data.overflow = true;
-            data.overflow_reason = "artifact_unavailable";
-            bounded.data = data;
-            bounded.content = "";
-            bounded.truncated = true;
+            bounded = compact_overflow_envelope(bounded);
+        }
+        if encoded_len(bounded) > max_output_bytes {
+            if stored_artifact == false {
+                data = types::map_map(bounded, "data");
+                data.overflow = true;
+                data.overflow_reason = "artifact_unavailable";
+                data.retained_bytes = payload.length;
+                bounded.data = data;
+            }
+            bounded = enforce_serialized_cap(bounded, max_output_bytes);
         }
     }
     bounded
@@ -298,27 +434,38 @@ fn execute(context: map) -> map {
     let arguments: map = types::map_map(context, "arguments");
     let config: map = types::map_map(context, "config");
     let token: string = types::map_string(context, "execution_token", "");
-    let max_output: int = config_int(config, "max_output_bytes", 65536);
     let stream_limit: int = config_int(config, "max_stream_bytes", 1048576);
     let action: string = types::map_string(arguments, "action", "");
     let handle: string = handle_id(arguments);
     let control: map = agent::control_check();
-    let mut outcome: map = fail("cancelled", "tool execution was cancelled", unpublished());
+    let mut outcome: map = fail("cancelled", "process was cancelled", unpublished());
     if map_bool(control, "ok", false) == false {
         let error: map = types::map_map(control, "error");
-        outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "tool execution was cancelled"), unpublished());
+        outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), unpublished());
     } else {
         if action == "poll" {
             let snap: map = cap::process_poll(token, handle, 0, stream_limit);
             if map_bool(snap, "ok", false) == false {
                 outcome = host_fail(snap);
             } else {
-                outcome = view_success(snap);
+                if map_bool(snap, "cancelled", false) {
+                    outcome = view_failure("cancelled", "process was cancelled", snap);
+                } else {
+                    if map_bool(snap, "deadline_elapsed", false) {
+                        outcome = view_failure("deadline_elapsed", "process deadline elapsed", snap);
+                    } else {
+                        outcome = view_success(snap);
+                    }
+                }
             }
         } else {
             if action == "log" {
                 let offset: int = map_int(arguments, "offset", 0);
-                let snap: map = cap::process_log(token, handle, offset, stream_limit);
+                let mut log_limit: int = stream_limit;
+                if arguments.has("limit") {
+                    log_limit = map_int(arguments, "limit", stream_limit);
+                }
+                let snap: map = cap::process_log(token, handle, offset, log_limit);
                 if map_bool(snap, "ok", false) == false {
                     outcome = host_fail(snap);
                 } else {
@@ -329,12 +476,20 @@ fn execute(context: map) -> map {
                     let mut payload: string = "";
                     if arguments.has("data") {
                         if type(arguments["data"].copy()) == "string" {
-                            payload = arguments["data"];
+                            payload = arguments["data"].copy();
                         }
                     }
-                    let written: map = cap::process_write(token, handle, bytes::from_utf8(payload));
+                    let written: map = cap::process_write(token, handle, bytes::from_utf8(payload), map_int(arguments, "timeout_ms", 0));
                     if map_bool(written, "ok", false) == false {
-                        outcome = host_fail(written);
+                        let error: map = types::map_map(written, "error");
+                        let code: string = types::map_string(error, "code", "process_failed");
+                        let message: string = types::map_string(error, "message", "process failed");
+                        let snap: map = cap::process_poll(token, handle, 0, stream_limit);
+                        if map_bool(snap, "ok", false) == false {
+                            outcome = fail(code, message, unpublished());
+                        } else {
+                            outcome = view_failure(code, message, snap);
+                        }
                     } else {
                         let mut data: map = {};
                         data.wrote_bytes = map_int(written, "wrote_bytes", utf8_len(payload));
@@ -391,7 +546,7 @@ fn execute(context: map) -> map {
                                     if map_bool(again, "ok", false) == false {
                                         let snap: map = cap::process_poll(token, handle, 0, stream_limit);
                                         let error: map = types::map_map(again, "error");
-                                        outcome = view_failure(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "tool execution was cancelled"), snap);
+                                        outcome = view_failure(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), snap);
                                         finished = true;
                                     } else {
                                         if has_timeout {
@@ -424,7 +579,7 @@ fn execute(context: map) -> map {
                                                     finished = true;
                                                 } else {
                                                     if map_bool(snap, "cancelled", false) {
-                                                        outcome = view_failure("cancelled", "tool execution was cancelled", snap);
+                                                        outcome = view_failure("cancelled", "process was cancelled", snap);
                                                         finished = true;
                                                     } else {
                                                         if map_bool(snap, "running", true) == false {
@@ -446,7 +601,7 @@ fn execute(context: map) -> map {
             }
         }
     }
-    apply_output_bounds(outcome, token, max_output)
+    apply_output_bounds(outcome, token, config)
 }
 
 pub fn descriptor() -> map {
