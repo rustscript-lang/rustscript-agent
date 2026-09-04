@@ -520,7 +520,15 @@ impl AgentHostState {
         let Some(artifacts) = self.artifacts.as_ref() else {
             return Self::missing_capability("artifact");
         };
-        match artifacts.put(&token, &bytes, &vm_value_to_json(&metadata)) {
+        let json_meta = vm_value_to_json(&metadata);
+        let result_publication =
+            json_meta.get("purpose").and_then(JsonValue::as_str) == Some("result");
+        let put = if result_publication {
+            artifacts.put_result(&token, &bytes, &json_meta)
+        } else {
+            artifacts.put(&token, &bytes, &json_meta)
+        };
+        match put {
             Ok(refer) => json!({
                 "ok": true,
                 "kind": "artifact_put",

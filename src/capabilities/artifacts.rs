@@ -86,13 +86,40 @@ impl ArtifactCapability {
     }
 
     /// Stores bytes under a new opaque id.
+    ///
+    /// Workspace-mutating callers must still present a Write token. Read-only
+    /// tools publish oversized envelopes through [`Self::put_result`].
     pub fn put(
         &self,
         token: &str,
         bytes: &[u8],
         metadata: &Value,
     ) -> Result<ArtifactRef, CapabilityError> {
-        let claims = self.authorize(token, CapabilityRisk::Write)?;
+        self.put_with_risk(token, bytes, metadata, CapabilityRisk::Write)
+    }
+
+    /// Publishes a bounded tool-result blob without Write authority.
+    ///
+    /// This is a tool-name-agnostic result-publication primitive: it does not
+    /// mutate the workspace, does not raise a tool's public risk class, and
+    /// still consumes the caller's execution token plus artifact quotas.
+    pub fn put_result(
+        &self,
+        token: &str,
+        bytes: &[u8],
+        metadata: &Value,
+    ) -> Result<ArtifactRef, CapabilityError> {
+        self.put_with_risk(token, bytes, metadata, CapabilityRisk::Read)
+    }
+
+    fn put_with_risk(
+        &self,
+        token: &str,
+        bytes: &[u8],
+        metadata: &Value,
+        risk: CapabilityRisk,
+    ) -> Result<ArtifactRef, CapabilityError> {
+        let claims = self.authorize(token, risk)?;
         if bytes.len() > self.inner.limits.max_object_bytes {
             return Err(CapabilityError::new(
                 "artifact_too_large",
