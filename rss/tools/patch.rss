@@ -87,7 +87,16 @@ fn fail_host(envelope: map) -> map {
     if code == "wrong_type" {
         code = "path_denied";
     }
-    fail(code, message, unpublished())
+    if code == "budget_exceeded" {
+        if message == "requested write exceeds the configured bound" {
+            message = "write budget exceeded";
+        }
+    }
+    let mut data: map = unpublished();
+    if code == "publication_indeterminate" {
+        data = { publication: "indeterminate" };
+    }
+    fail(code, message, data)
 }
 
 fn deny_path(message: string) -> map {
@@ -410,6 +419,21 @@ fn fit_content_to_budget(result: map, cap: int) -> map {
     fitted
 }
 
+fn artifact_summary(id: string, bytes: int, max_output_bytes: int) -> string {
+    let full: string = "artifact " + id + " (" + int_to_string(bytes) + " bytes)";
+    let mut summary: string = full;
+    if utf8_len(full) > max_output_bytes {
+        summary = "artifact " + id;
+        if utf8_len(summary) > max_output_bytes {
+            summary = "artifact";
+            if utf8_len(summary) > max_output_bytes {
+                summary = truncate_to_utf8_bytes("artifact", max_output_bytes);
+            }
+        }
+    }
+    summary
+}
+
 fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
     let mut current: map = result;
     if encoded_len(current) > max_output_bytes {
@@ -423,14 +447,7 @@ fn shrink_result(result: map, max_output_bytes: int, token: string) -> map {
                 let len: int = map_int(put, "len", utf8_len(content));
                 let mut artifacts: array = [];
                 artifacts[0] = id;
-                let mut summary: string = "artifact " + id + " (" + int_to_string(len) + " bytes)";
-                current = succeed(summary, data, true, artifacts);
-                if encoded_len(current) > max_output_bytes {
-                    current = succeed("artifact " + id, data, true, artifacts);
-                }
-                if encoded_len(current) > max_output_bytes {
-                    current = succeed("artifact", data, true, artifacts);
-                }
+                current = succeed(artifact_summary(id, len, max_output_bytes), data, true, artifacts);
             }
         }
         if encoded_len(current) > max_output_bytes {

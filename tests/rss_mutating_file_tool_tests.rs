@@ -7,19 +7,22 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_agent::capabilities::{
-    ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
-    CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle, FilesystemCapability,
-    FilesystemLimits, LifecycleClock, LifecycleError, LifecycleLimits, NeverCancelled,
-    PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
+    ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityError,
+    CapabilityLifecycle, CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle,
+    FilesystemCapability, FilesystemLimits, LifecycleClock, LifecycleError, LifecycleLimits,
+    NeverCancelled, PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
 use rustscript_agent::config::FileToolConfig;
 use rustscript_agent::tools::{ArtifactOwner, FileTools, NativeToolExecutor, ToolResult};
-use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolRegistry};
-use rustscript_vm::Value as VmValue;
+use rustscript_agent::{
+    AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolRegistry,
+};
+use rustscript_vm::{CancellationReason, Value as VmValue};
 use serde_json::{Value, json};
 
 fn json_to_vm_value(value: &Value) -> VmValue {
@@ -131,6 +134,7 @@ impl Drop for Fixture {
 struct MemoryDurable {
     started: Mutex<Vec<DurableStarted>>,
     results: Mutex<std::collections::HashMap<String, Value>>,
+    interrupted: Mutex<Vec<String>>,
     parent_ok: Mutex<bool>,
     active: Mutex<bool>,
     fail_next_commit: AtomicBool,
@@ -141,6 +145,7 @@ impl MemoryDurable {
         Arc::new(Self {
             started: Mutex::new(Vec::new()),
             results: Mutex::new(std::collections::HashMap::new()),
+            interrupted: Mutex::new(Vec::new()),
             parent_ok: Mutex::new(true),
             active: Mutex::new(true),
             fail_next_commit: AtomicBool::new(false),
@@ -149,6 +154,24 @@ impl MemoryDurable {
 
     fn started_len(&self) -> usize {
         self.started.lock().expect("started").len()
+    }
+
+    fn started_call_ids(&self) -> Vec<String> {
+        self.started
+            .lock()
+            .expect("started")
+            .iter()
+            .map(|record| record.call_id.clone())
+            .collect()
+    }
+
+    fn stored_result(&self, call_id: &str) -> Option<Value> {
+        self.results.lock().expect("results").get(call_id).cloned()
+    }
+
+    #[allow(dead_code)]
+    fn interrupted_call_ids(&self) -> Vec<String> {
+        self.interrupted.lock().expect("interrupted").clone()
     }
 
     fn fail_next_commit(&self) {
@@ -217,7 +240,11 @@ impl DurableToolLifecycle for MemoryDurable {
         }))
     }
 
-    fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
+    fn interrupt(&self, call_id: &str) -> Result<(), LifecycleError> {
+        self.interrupted
+            .lock()
+            .expect("interrupted")
+            .push(call_id.to_string());
         Ok(())
     }
 }
@@ -290,7 +317,18 @@ fn rss_path(name: &str) -> PathBuf {
 }
 
 fn compile_rss(name: &str) -> AgentRunner {
-    AgentRunner::from_file(rss_path(name), AgentConfig::default()).unwrap_or_else(|error| {
+    compile_rss_with_fuel(name, AgentConfig::default().fuel)
+}
+
+fn compile_rss_with_fuel(name: &str, fuel: Option<u64>) -> AgentRunner {
+    AgentRunner::from_file(
+        rss_path(name),
+        AgentConfig {
+            fuel,
+            ..AgentConfig::default()
+        },
+    )
+    .unwrap_or_else(|error| {
         panic!("compile {name}: {error}");
     })
 }
@@ -422,8 +460,8 @@ struct RssRun {
     result: Value,
     started: usize,
     artifacts: Option<Arc<ArtifactCapability>>,
-    #[allow(dead_code)]
     durable: Arc<MemoryDurable>,
+    call_id: String,
 }
 
 struct RssExec {
@@ -438,6 +476,11 @@ struct RssExec {
     install_artifacts: bool,
     artifact_limits: ArtifactLimits,
     call_id: String,
+    unlimited_fuel: bool,
+    run_cancellation: Option<RunCancellation>,
+    control_hook: Option<ControlCheckHook>,
+    shared_lifecycle: Option<Arc<CapabilityLifecycle>>,
+    shared_filesystem: Option<Arc<FilesystemCapability>>,
 }
 
 fn default_artifact_limits() -> ArtifactLimits {
@@ -449,20 +492,28 @@ fn default_artifact_limits() -> ArtifactLimits {
 }
 
 fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> RssRun {
-    let lifecycle = Arc::new(build_lifecycle(
-        &fixture.root,
-        Arc::clone(&exec.durable),
-        exec.approval,
-        exec.cancellation,
-        exec.clock,
-        exec.deadline_ms,
-    ));
-    let fs_cap = FilesystemCapability::new(
-        lifecycle.as_ref().clone(),
-        owner(),
-        filesystem_limits(config),
-    )
-    .expect("filesystem capability");
+    let lifecycle = match exec.shared_lifecycle.clone() {
+        Some(lifecycle) => lifecycle,
+        None => Arc::new(build_lifecycle(
+            &fixture.root,
+            Arc::clone(&exec.durable),
+            Arc::clone(&exec.approval),
+            Arc::clone(&exec.cancellation),
+            Arc::clone(&exec.clock),
+            exec.deadline_ms,
+        )),
+    };
+    let fs_cap = match exec.shared_filesystem.clone() {
+        Some(fs_cap) => fs_cap,
+        None => Arc::new(
+            FilesystemCapability::new(
+                lifecycle.as_ref().clone(),
+                owner(),
+                filesystem_limits(config),
+            )
+            .expect("filesystem capability"),
+        ),
+    };
     let artifacts = if exec.install_artifacts {
         Some(Arc::new(
             ArtifactCapability::new(lifecycle.as_ref().clone(), owner(), exec.artifact_limits)
@@ -474,8 +525,10 @@ fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> Rs
     let host = AgentHostBridges {
         lifecycle: Some(Arc::clone(&lifecycle)),
         capability_owner: Some(owner()),
-        filesystem: Some(Arc::new(fs_cap)),
+        filesystem: Some(fs_cap),
         artifacts: artifacts.clone(),
+        cancellation: exec.run_cancellation.clone(),
+        control_hook: exec.control_hook.clone(),
         ..AgentHostBridges::default()
     };
     let context = json!({
@@ -492,7 +545,11 @@ fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> Rs
         },
         "config": rss_config_json(config),
     });
-    let runner = compile_rss(exec.module);
+    let runner = if exec.unlimited_fuel {
+        compile_rss_with_fuel(exec.module, None)
+    } else {
+        compile_rss(exec.module)
+    };
     let output = runner
         .with_host(host)
         .run_with_context(json_to_vm_value(&context))
@@ -501,7 +558,8 @@ fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> Rs
         result: unwrap_committed(vm_value_to_json(&output)),
         started: exec.durable.started_len(),
         artifacts,
-        durable: exec.durable,
+        durable: Arc::clone(&exec.durable),
+        call_id: exec.call_id.clone(),
     }
 }
 
@@ -534,8 +592,42 @@ fn run_rss_tool(
             install_artifacts,
             artifact_limits: default_artifact_limits(),
             call_id: format!("call-{}", NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)),
+            unlimited_fuel: false,
+            run_cancellation: None,
+            control_hook: None,
+            shared_lifecycle: None,
+            shared_filesystem: None,
         },
     )
+}
+
+fn mutation_exec(
+    module: &'static str,
+    tool_name: &'static str,
+    arguments: Value,
+    durable: Arc<MemoryDurable>,
+    call_id: impl Into<String>,
+) -> RssExec {
+    let clock = Arc::new(SystemClock);
+    let deadline_ms = clock.now_ms() + 60_000;
+    RssExec {
+        module,
+        tool_name,
+        arguments,
+        durable,
+        approval: Arc::new(AllowAll),
+        cancellation: Arc::new(NeverCancelled),
+        clock,
+        deadline_ms,
+        install_artifacts: false,
+        artifact_limits: default_artifact_limits(),
+        call_id: call_id.into(),
+        unlimited_fuel: false,
+        run_cancellation: None,
+        control_hook: None,
+        shared_lifecycle: None,
+        shared_filesystem: None,
+    }
 }
 
 fn unwrap_committed(value: Value) -> Value {
@@ -1322,6 +1414,11 @@ fn deadline_during_write_and_patch_has_no_later_effects() {
             install_artifacts: false,
             artifact_limits: default_artifact_limits(),
             call_id: "call-deadline-write".to_string(),
+            unlimited_fuel: false,
+            run_cancellation: None,
+            control_hook: None,
+            shared_lifecycle: None,
+            shared_filesystem: None,
         },
     );
     assert_eq!(
@@ -1351,6 +1448,11 @@ fn deadline_during_write_and_patch_has_no_later_effects() {
             install_artifacts: false,
             artifact_limits: default_artifact_limits(),
             call_id: "call-deadline-patch".to_string(),
+            unlimited_fuel: false,
+            run_cancellation: None,
+            control_hook: None,
+            shared_lifecycle: None,
+            shared_filesystem: None,
         },
     );
     assert_eq!(
@@ -1399,6 +1501,11 @@ fn durable_replay_skips_write_effects() {
             install_artifacts: false,
             artifact_limits: default_artifact_limits(),
             call_id: "call-replay".to_string(),
+            unlimited_fuel: false,
+            run_cancellation: None,
+            control_hook: None,
+            shared_lifecycle: None,
+            shared_filesystem: None,
         },
     );
     assert_eq!(rss.result, stored);
@@ -1415,21 +1522,63 @@ fn commit_failure_after_write_does_not_publish_false_completed_result() {
     fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
     let durable = MemoryDurable::new();
     durable.fail_next_commit();
-    let rss = run_rss_tool(
+    let mut first = mutation_exec(
         "write_file.rss",
-        &fixture,
-        &fixture.config(),
         "write_file",
         json!({"path": "keep.txt", "content": "changed\n"}),
         Arc::clone(&durable),
-        Arc::new(AllowAll),
-        Arc::new(NeverCancelled),
-        false,
+        "call-commit-fail",
     );
+    let lifecycle = Arc::new(build_lifecycle(
+        &fixture.root,
+        Arc::clone(&durable),
+        first.approval.clone(),
+        first.cancellation.clone(),
+        first.clock.clone(),
+        first.deadline_ms,
+    ));
+    first.shared_lifecycle = Some(Arc::clone(&lifecycle));
+    let rss = run_rss_exec(&fixture, &fixture.config(), first);
     assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
     assert_eq!(rss.result["error"]["code"], json!("result_commit_failed"));
     assert!(rss.started > 0);
-    assert_eq!(durable.results.lock().expect("results").get("unused"), None);
+    assert!(
+        rss.durable.started_call_ids().contains(&rss.call_id),
+        "started={:?}",
+        rss.durable.started_call_ids()
+    );
+    assert_eq!(
+        rss.durable.stored_result(&rss.call_id),
+        None,
+        "commit failure must not store a completed result"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "changed\n",
+        "published write effect remains after commit failure"
+    );
+    assert_ne!(rss.result["ok"], json!(true));
+    let mut second = mutation_exec(
+        "write_file.rss",
+        "write_file",
+        json!({"path": "keep.txt", "content": "again\n"}),
+        Arc::clone(&durable),
+        "call-commit-fail",
+    );
+    second.shared_lifecycle = Some(lifecycle);
+    let replay = run_rss_exec(&fixture, &fixture.config(), second);
+    assert_eq!(
+        replay.result["ok"],
+        json!(false),
+        "replay={}",
+        replay.result
+    );
+    assert_eq!(replay.result["error"]["code"], json!("unresolved_call"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "changed\n",
+        "same call_id must not rewrite after commit failure"
+    );
 }
 
 #[test]
@@ -1441,9 +1590,8 @@ fn oversized_patch_preview_artifact_publication_matches_native_with_owner() {
     )
     .unwrap();
     let mut config = fixture.config();
-    // Keep the cap large enough that both serde_json and RSS json::encode keep
-    // the full `artifact {id} ({bytes} bytes)` summary. A 256-byte cap is
-    // encoder-sensitive and truncates native content mid-summary.
+    // Full summary fits as content at this cap; encoder-sensitive envelope
+    // truncation is covered separately at content-length thresholds.
     config.max_output_bytes = 1024;
     config.max_search_output_bytes = 1024;
     config.max_patch_preview_bytes = 8192;
@@ -1560,5 +1708,726 @@ fn write_deadline_before_prepare_has_no_started_record() {
     assert_eq!(
         fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
         "keep\n"
+    );
+}
+
+#[test]
+fn patch_default_write_budget_boundary_matches_native_envelope() {
+    let fixture = Fixture::new("patch-default-write-budget");
+    let mut config = fixture.config();
+    let max_write = config.max_write_bytes;
+    let max_patch = config.max_patch_bytes;
+    assert!(
+        max_write < max_patch,
+        "default write budget must sit below the patch budget"
+    );
+    // Keep default write/patch byte bounds. Shrink only the preview budget so
+    // RSS bounded_diff does not walk a 1MiB string character-by-character.
+    config.max_patch_preview_bytes = 32;
+
+    let old = "needle";
+    let exact = format!("{old}{}", "x".repeat(max_write - old.len()));
+    assert_eq!(exact.len(), max_write);
+    let over_new = format!("{exact}Y");
+    assert_eq!(over_new.len(), max_write + 1);
+    assert!(over_new.len() <= max_patch);
+
+    fs::write(fixture.root.join("cap.txt"), old).unwrap();
+    let exact_args = json!({
+        "path": "cap.txt",
+        "old_string": old,
+        "new_string": exact,
+        "replace_all": false
+    });
+    let native_exact = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::Patch,
+        &exact_args,
+    );
+    fs::write(fixture.root.join("cap.txt"), old).unwrap();
+    let rss_exact = {
+        let mut exec = mutation_exec(
+            "patch.rss",
+            "patch",
+            exact_args.clone(),
+            MemoryDurable::new(),
+            "call-budget-exact",
+        );
+        exec.unlimited_fuel = true;
+        run_rss_exec(&fixture, &config, exec)
+    };
+    assert_exact_envelope(&native_exact, &rss_exact.result);
+    assert!(native_exact.ok, "native={native_exact:?}");
+    assert_eq!(
+        fs::read(fixture.root.join("cap.txt")).unwrap().len(),
+        max_write
+    );
+
+    fs::write(fixture.root.join("cap.txt"), old).unwrap();
+    let over_args = json!({
+        "path": "cap.txt",
+        "old_string": old,
+        "new_string": over_new,
+        "replace_all": false
+    });
+    let native_over = native_execute(
+        &fixture.tools_with_config(config.clone()),
+        NativeToolExecutor::Patch,
+        &over_args,
+    );
+    fs::write(fixture.root.join("cap.txt"), old).unwrap();
+    let rss_over = {
+        let mut exec = mutation_exec(
+            "patch.rss",
+            "patch",
+            over_args.clone(),
+            MemoryDurable::new(),
+            "call-budget-over",
+        );
+        exec.unlimited_fuel = true;
+        run_rss_exec(&fixture, &config, exec)
+    };
+    assert_exact_envelope(&native_over, &rss_over.result);
+    assert!(!native_over.ok);
+    assert_eq!(
+        native_over.error.as_ref().map(|error| error.code.as_str()),
+        Some("budget_exceeded")
+    );
+    assert_eq!(
+        native_over
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some("write budget exceeded")
+    );
+    assert_eq!(rss_over.result["error"]["code"], json!("budget_exceeded"));
+    assert_eq!(
+        rss_over.result["error"]["message"],
+        json!("write budget exceeded")
+    );
+    assert_eq!(
+        rss_over.result["data"]["publication"],
+        json!("not_published")
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("cap.txt")).unwrap(),
+        old
+    );
+    assert!(leftover_temps(&fixture.root).is_empty());
+}
+
+fn native_like_artifact_summary(id: &str, bytes: usize, cap: usize) -> String {
+    let full = format!("artifact {id} ({bytes} bytes)");
+    if full.len() <= cap {
+        return full;
+    }
+    let short = format!("artifact {id}");
+    if short.len() <= cap {
+        return short;
+    }
+    if "artifact".len() <= cap {
+        return "artifact".to_string();
+    }
+    "artifact".chars().take(cap).collect()
+}
+
+fn cancel_on_nth(
+    n: u64,
+    reason: CancellationReason,
+) -> (RunCancellation, ControlCheckHook, Arc<AtomicU64>) {
+    let seen = Arc::new(AtomicU64::new(0));
+    let seen_hook = Arc::clone(&seen);
+    let hook = Arc::new(move |cancellation: &RunCancellation| {
+        let count = seen_hook.fetch_add(1, Ordering::SeqCst) + 1;
+        if count == n {
+            cancellation.request(reason);
+        }
+    });
+    (RunCancellation::new(), hook, seen)
+}
+
+fn assert_rss_artifact_matches_native(native: &ToolResult, native_tools: &FileTools, rss: &RssRun) {
+    if native.artifacts.is_empty() {
+        return;
+    }
+    let native_id = native.artifacts.first().expect("native artifact");
+    let rss_id = rss.result["artifacts"][0].as_str().expect("rss artifact");
+    let native_bytes = native_tools
+        .artifact_store()
+        .retrieve(&artifact_owner(), native_id)
+        .expect("native bytes");
+    let (rss_bytes, rss_meta) = rss
+        .artifacts
+        .as_ref()
+        .expect("rss store")
+        .stored(rss_id)
+        .expect("rss stored");
+    assert_eq!(native_bytes, rss_bytes);
+    assert_eq!(rss_meta["run"], json!("run-test"));
+    assert_eq!(rss_meta["owner"], json!(owner().key()));
+    assert_eq!(rss_meta["call_id"], json!(rss.call_id));
+}
+
+fn with_output_cap(mut config: FileToolConfig, cap: usize) -> FileToolConfig {
+    config.max_output_bytes = cap;
+    config.max_search_output_bytes = cap.min(config.max_search_output_bytes);
+    config.artifact_store.max_object_bytes = config.max_read_bytes.max(cap);
+    config.artifact_store.max_total_bytes =
+        config.artifact_store.max_object_bytes.saturating_mul(2);
+    config
+}
+
+fn write_artifact_thresholds(bytes: usize) -> Vec<usize> {
+    let id = "0".repeat(36);
+    let full = native_like_artifact_summary(&id, bytes, usize::MAX);
+    let short = format!("artifact {id}");
+    vec![
+        1024,
+        full.len(),
+        full.len() - 1,
+        short.len(),
+        short.len() - 1,
+        8,
+        7,
+    ]
+}
+
+#[test]
+fn write_file_artifact_summary_forms_match_native_at_content_thresholds() {
+    let fixture = Fixture::new("write-summary-forms");
+    let content = format!("lead{}", "你".repeat(500));
+    let bytes = content.len();
+    let arguments = json!({"path": "wide.txt", "content": content.clone()});
+    for cap in write_artifact_thresholds(bytes) {
+        let config = with_output_cap(fixture.config(), cap);
+        let native_tools = fixture
+            .tools_with_config(config.clone())
+            .with_owner(artifact_owner());
+        let native = native_execute(&native_tools, NativeToolExecutor::WriteFile, &arguments);
+        let mut exec = mutation_exec(
+            "write_file.rss",
+            "write_file",
+            arguments.clone(),
+            MemoryDurable::new(),
+            format!("call-write-form-{cap}"),
+        );
+        exec.install_artifacts = true;
+        let rss = run_rss_exec(&fixture, &config, exec);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("wide.txt")).unwrap(),
+            content,
+            "cap={cap}"
+        );
+        assert_summary_cap_parity(cap, bytes, &native, &native_tools, &rss);
+    }
+}
+
+#[test]
+fn patch_artifact_summary_forms_match_native_at_content_thresholds() {
+    let fixture = Fixture::new("patch-summary-forms");
+    let source = format!("needle {}", "你".repeat(500));
+    let arguments = json!({
+        "path": "wide.txt",
+        "old_string": "needle",
+        "new_string": "replaced",
+        "replace_all": false
+    });
+    let probe_config = {
+        let mut config = with_output_cap(fixture.config(), 1024);
+        config.max_patch_preview_bytes = 8192;
+        config
+    };
+    fs::write(fixture.root.join("wide.txt"), &source).unwrap();
+    let probe_tools = fixture
+        .tools_with_config(probe_config.clone())
+        .with_owner(artifact_owner());
+    let probe = native_execute(&probe_tools, NativeToolExecutor::Patch, &arguments);
+    let bytes = probe
+        .artifacts
+        .first()
+        .and_then(|id| {
+            probe_tools
+                .artifact_store()
+                .retrieve(&artifact_owner(), id)
+                .ok()
+        })
+        .map(|payload| payload.len())
+        .unwrap_or_else(|| probe.content.len());
+    for cap in write_artifact_thresholds(bytes) {
+        let mut config = with_output_cap(fixture.config(), cap);
+        config.max_patch_preview_bytes = 8192;
+        fs::write(fixture.root.join("wide.txt"), &source).unwrap();
+        let native_tools = fixture
+            .tools_with_config(config.clone())
+            .with_owner(artifact_owner());
+        let native = native_execute(&native_tools, NativeToolExecutor::Patch, &arguments);
+        fs::write(fixture.root.join("wide.txt"), &source).unwrap();
+        let mut exec = mutation_exec(
+            "patch.rss",
+            "patch",
+            arguments.clone(),
+            MemoryDurable::new(),
+            format!("call-patch-form-{cap}"),
+        );
+        exec.install_artifacts = true;
+        let rss = run_rss_exec(&fixture, &config, exec);
+        assert_summary_cap_parity(cap, bytes, &native, &native_tools, &rss);
+    }
+}
+
+fn assert_summary_cap_parity(
+    cap: usize,
+    bytes: usize,
+    native: &ToolResult,
+    native_tools: &FileTools,
+    rss: &RssRun,
+) {
+    let rss_has_artifact = rss
+        .result
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| !entries.is_empty());
+    if native.ok
+        && rss.result["ok"] == json!(true)
+        && native.artifacts.is_empty()
+        && !rss_has_artifact
+    {
+        assert_exact_envelope(native, &rss.result);
+        return;
+    }
+    if native.artifacts.is_empty() || !rss_has_artifact {
+        assert!(!native.ok, "cap={cap} native={native:?}");
+        assert_eq!(
+            rss.result["ok"],
+            json!(false),
+            "cap={cap} rss={}",
+            rss.result
+        );
+        assert_eq!(
+            rss.result["error"]["code"],
+            json!(native.error.as_ref().expect("native error").code),
+            "cap={cap}"
+        );
+        return;
+    }
+    assert_exact_envelope(native, &rss.result);
+    assert_rss_artifact_matches_native(native, native_tools, rss);
+    let id = rss.result["artifacts"][0]
+        .as_str()
+        .expect("rss artifact id");
+    let expected = native_like_artifact_summary(id, bytes, cap);
+    let content = rss.result["content"].as_str().unwrap_or("");
+    assert!(
+        content == expected || expected.starts_with(content) || content.starts_with("artifact"),
+        "cap={cap} content={content:?} expected={expected:?}"
+    );
+    if cap >= 1024 {
+        assert_eq!(
+            content, expected,
+            "fitting cap must keep the full summary form"
+        );
+    }
+}
+
+#[test]
+fn run_cancellation_is_observed_by_control_check_before_publish() {
+    let fixture = Fixture::new("run-cancel-control");
+    fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
+    for (module, tool_name, arguments, nth, reason, code, message) in [
+        (
+            "write_file.rss",
+            "write_file",
+            json!({"path": "keep.txt", "content": "changed\n"}),
+            2_u64,
+            CancellationReason::Requested,
+            "cancelled",
+            "tool execution was cancelled",
+        ),
+        (
+            "patch.rss",
+            "patch",
+            json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
+            2_u64,
+            CancellationReason::Requested,
+            "cancelled",
+            "tool execution was cancelled",
+        ),
+        (
+            "patch.rss",
+            "patch",
+            json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
+            2_u64,
+            CancellationReason::Deadline,
+            "deadline_elapsed",
+            "tool deadline elapsed",
+        ),
+    ] {
+        let (cancel, hook, seen) = cancel_on_nth(nth, reason);
+        let mut exec = mutation_exec(
+            module,
+            tool_name,
+            arguments,
+            MemoryDurable::new(),
+            format!("call-control-{tool_name}-{code}"),
+        );
+        exec.run_cancellation = Some(cancel);
+        exec.control_hook = Some(hook);
+        let rss = run_rss_exec(&fixture, &fixture.config(), exec);
+        assert!(
+            seen.load(Ordering::SeqCst) >= nth,
+            "{tool_name} control_check was not observed"
+        );
+        assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
+        assert_eq!(rss.result["error"]["code"], json!(code));
+        assert_eq!(rss.result["error"]["message"], json!(message));
+        assert_eq!(rss.result["data"]["publication"], json!("not_published"));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(leftover_temps(&fixture.root).is_empty());
+    }
+}
+
+#[test]
+fn patch_pre_publish_hook_cancel_and_deadline_leave_target_and_temps_clean() {
+    let fixture = Fixture::new("patch-pre-publish-hook");
+    fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
+    let durable = MemoryDurable::new();
+    let lifecycle = Arc::new(build_lifecycle(
+        &fixture.root,
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        Arc::new(SystemClock),
+        SystemClock.now_ms() + 60_000,
+    ));
+    let fs_cap = Arc::new(
+        FilesystemCapability::new(
+            lifecycle.as_ref().clone(),
+            owner(),
+            filesystem_limits(&fixture.config()),
+        )
+        .expect("fs"),
+    );
+    let entered = Arc::new(AtomicU64::new(0));
+    let entered_hook = Arc::clone(&entered);
+    fs_cap.inject_before_write(Arc::new(move |_, _| {
+        entered_hook.fetch_add(1, Ordering::SeqCst);
+        Err(CapabilityError::new("cancelled", "run was cancelled"))
+    }));
+    let mut exec = mutation_exec(
+        "patch.rss",
+        "patch",
+        json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
+        Arc::clone(&durable),
+        "call-pre-publish-cancel",
+    );
+    exec.shared_lifecycle = Some(Arc::clone(&lifecycle));
+    exec.shared_filesystem = Some(Arc::clone(&fs_cap));
+    let rss = run_rss_exec(&fixture, &fixture.config(), exec);
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        1,
+        "hook must run after transform"
+    );
+    assert_eq!(rss.result["error"]["code"], json!("cancelled"));
+    assert_eq!(
+        rss.result["error"]["message"],
+        json!("tool execution was cancelled")
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(leftover_temps(&fixture.root).is_empty());
+
+    fs_cap.inject_before_write(Arc::new(|_, _| {
+        Err(CapabilityError::new(
+            "deadline_elapsed",
+            "run deadline elapsed",
+        ))
+    }));
+    let mut exec = mutation_exec(
+        "patch.rss",
+        "patch",
+        json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
+        MemoryDurable::new(),
+        "call-pre-publish-deadline",
+    );
+    exec.shared_lifecycle = Some(lifecycle);
+    exec.shared_filesystem = Some(fs_cap);
+    let rss = run_rss_exec(&fixture, &fixture.config(), exec);
+    assert_eq!(rss.result["error"]["code"], json!("deadline_elapsed"));
+    assert_eq!(
+        rss.result["error"]["message"],
+        json!("tool deadline elapsed")
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(leftover_temps(&fixture.root).is_empty());
+}
+
+#[test]
+fn publication_indeterminate_maps_to_native_publication_status() {
+    let fixture = Fixture::new("pub-indeterminate");
+    fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
+    let durable = MemoryDurable::new();
+    let lifecycle = Arc::new(build_lifecycle(
+        &fixture.root,
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        Arc::new(SystemClock),
+        SystemClock.now_ms() + 60_000,
+    ));
+    let fs_cap = Arc::new(
+        FilesystemCapability::new(
+            lifecycle.as_ref().clone(),
+            owner(),
+            filesystem_limits(&fixture.config()),
+        )
+        .expect("fs"),
+    );
+    fs_cap.inject_before_write(Arc::new(|_, _| {
+        Err(CapabilityError::new(
+            "publication_indeterminate",
+            "write publication could not be classified",
+        ))
+    }));
+    for (module, tool_name, arguments, call_id) in [
+        (
+            "write_file.rss",
+            "write_file",
+            json!({"path": "keep.txt", "content": "changed\n"}),
+            "call-pub-write",
+        ),
+        (
+            "patch.rss",
+            "patch",
+            json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
+            "call-pub-patch",
+        ),
+    ] {
+        let mut exec = mutation_exec(module, tool_name, arguments, MemoryDurable::new(), call_id);
+        exec.shared_lifecycle = Some(Arc::clone(&lifecycle));
+        exec.shared_filesystem = Some(Arc::clone(&fs_cap));
+        let rss = run_rss_exec(&fixture, &fixture.config(), exec);
+        assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
+        assert_eq!(
+            rss.result["error"]["code"],
+            json!("publication_indeterminate")
+        );
+        assert_eq!(rss.result["data"]["publication"], json!("indeterminate"));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(leftover_temps(&fixture.root).is_empty());
+    }
+}
+
+#[test]
+fn interrupted_reopen_durable_replay_does_not_rewrite() {
+    let fixture = Fixture::new("interrupt-reopen");
+    fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
+    let durable = MemoryDurable::new();
+    let (cancel, hook, seen) = cancel_on_nth(2, CancellationReason::Requested);
+    let mut first = mutation_exec(
+        "write_file.rss",
+        "write_file",
+        json!({"path": "keep.txt", "content": "changed\n"}),
+        Arc::clone(&durable),
+        "call-interrupt-reopen",
+    );
+    first.run_cancellation = Some(cancel);
+    first.control_hook = Some(hook);
+    let first_run = run_rss_exec(&fixture, &fixture.config(), first);
+    assert!(seen.load(Ordering::SeqCst) >= 2);
+    assert_eq!(first_run.result["error"]["code"], json!("cancelled"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    let stored = durable
+        .stored_result("call-interrupt-reopen")
+        .expect("cancelled result must be committed for replay");
+    assert_eq!(stored["ok"], json!(false));
+
+    let second = mutation_exec(
+        "write_file.rss",
+        "write_file",
+        json!({"path": "keep.txt", "content": "second\n"}),
+        Arc::clone(&durable),
+        "call-interrupt-reopen",
+    );
+    let replay = run_rss_exec(&fixture, &fixture.config(), second);
+    assert_eq!(replay.result, stored);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+}
+
+#[test]
+fn completed_call_reopen_replays_without_rewriting() {
+    let fixture = Fixture::new("reopen-completed");
+    fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
+    let durable = MemoryDurable::new();
+    let first = mutation_exec(
+        "write_file.rss",
+        "write_file",
+        json!({"path": "keep.txt", "content": "first\n"}),
+        Arc::clone(&durable),
+        "call-completed-reopen",
+    );
+    let first_run = run_rss_exec(&fixture, &fixture.config(), first);
+    assert_eq!(first_run.result["ok"], json!(true));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "first\n"
+    );
+    let second = mutation_exec(
+        "write_file.rss",
+        "write_file",
+        json!({"path": "keep.txt", "content": "second\n"}),
+        durable,
+        "call-completed-reopen",
+    );
+    let replay = run_rss_exec(&fixture, &fixture.config(), second);
+    assert_eq!(replay.result, first_run.result);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
+        "first\n"
+    );
+}
+
+#[test]
+fn concurrent_patch_cas_has_one_winner_and_no_torn_content() {
+    let fixture = Fixture::new("concurrent-cas");
+    fs::write(fixture.root.join("race.txt"), "alpha\n").unwrap();
+    let durable = MemoryDurable::new();
+    let lifecycle = Arc::new(build_lifecycle(
+        &fixture.root,
+        Arc::clone(&durable),
+        Arc::new(AllowAll),
+        Arc::new(NeverCancelled),
+        Arc::new(SystemClock),
+        SystemClock.now_ms() + 60_000,
+    ));
+    let fs_cap = Arc::new(
+        FilesystemCapability::new(
+            lifecycle.as_ref().clone(),
+            owner(),
+            filesystem_limits(&fixture.config()),
+        )
+        .expect("fs"),
+    );
+    let barrier = Arc::new(Barrier::new(2));
+    let hook_barrier = Arc::clone(&barrier);
+    let control_hook: ControlCheckHook = Arc::new(move |_: &RunCancellation| {
+        hook_barrier.wait();
+    });
+    let config = fixture.config();
+    let make_exec = |new_string: &'static str, call_id: &'static str| {
+        let mut exec = mutation_exec(
+            "patch.rss",
+            "patch",
+            json!({
+                "path": "race.txt",
+                "old_string": "alpha",
+                "new_string": new_string,
+                "replace_all": false
+            }),
+            Arc::clone(&durable),
+            call_id,
+        );
+        exec.shared_lifecycle = Some(Arc::clone(&lifecycle));
+        exec.shared_filesystem = Some(Arc::clone(&fs_cap));
+        exec.control_hook = Some(Arc::clone(&control_hook));
+        exec
+    };
+    let left = make_exec("beta", "call-cas-left");
+    let right = make_exec("gamma", "call-cas-right");
+    let (left_run, right_run) = thread::scope(|scope| {
+        let left_handle = scope.spawn(|| run_rss_exec(&fixture, &config, left));
+        let right_handle = scope.spawn(|| run_rss_exec(&fixture, &config, right));
+        (
+            left_handle.join().expect("left thread"),
+            right_handle.join().expect("right thread"),
+        )
+    });
+    let outcomes = [&left_run.result, &right_run.result];
+    let wins = outcomes
+        .iter()
+        .filter(|result| result["ok"] == json!(true))
+        .count();
+    let conflicts = outcomes
+        .iter()
+        .filter(|result| result["error"]["code"] == json!("cas_mismatch"))
+        .count();
+    assert_eq!(
+        wins, 1,
+        "left={} right={}",
+        left_run.result, right_run.result
+    );
+    assert_eq!(
+        conflicts, 1,
+        "left={} right={}",
+        left_run.result, right_run.result
+    );
+    let body = fs::read_to_string(fixture.root.join("race.txt")).unwrap();
+    assert!(
+        body == "beta\n" || body == "gamma\n",
+        "torn content: {body:?}"
+    );
+    assert!(leftover_temps(&fixture.root).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_and_swapped_parent_symlink_race_does_not_touch_outside_secret() {
+    let fixture = Fixture::new("nested-symlink-race");
+    let outside_dir = fixture.parent.join("nested-outside-dir");
+    fs::create_dir_all(&outside_dir).unwrap();
+    fs::write(outside_dir.join("secret.txt"), "outside-secret\n").unwrap();
+    fs::create_dir_all(fixture.root.join("nested/real")).unwrap();
+    fs::write(fixture.root.join("nested/real/leaf.txt"), "inside\n").unwrap();
+    symlink(&outside_dir, fixture.root.join("nested/swapped")).unwrap();
+    symlink(
+        outside_dir.join("secret.txt"),
+        fixture.root.join("nested/real/link.txt"),
+    )
+    .unwrap();
+
+    assert_write_eq(
+        &fixture,
+        || {},
+        json!({"path": "nested/swapped/secret.txt", "content": "changed\n"}),
+    );
+    assert_write_eq(
+        &fixture,
+        || {},
+        json!({"path": "nested/real/link.txt", "content": "changed\n"}),
+    );
+    assert_patch_eq(
+        &fixture,
+        || {},
+        json!({
+            "path": "nested/real/link.txt",
+            "old_string": "outside-secret",
+            "new_string": "changed",
+            "replace_all": false
+        }),
+    );
+    assert_eq!(
+        fs::read_to_string(outside_dir.join("secret.txt")).unwrap(),
+        "outside-secret\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("nested/real/leaf.txt")).unwrap(),
+        "inside\n"
     );
 }
