@@ -1,5 +1,7 @@
 //! Task 9: real service worker, unified cancellation/deadline, zero-residue cleanup.
 
+mod common;
+
 use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -14,11 +16,6 @@ use rustscript_agent::{
     LlmContentBlock, ScriptedProvider, ToolCall,
 };
 use serde_json::{Value as JsonValue, json};
-
-fn agent_loop_source() -> String {
-    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"))
-        .expect("bundled rss/agent/main.rss should be readable")
-}
 
 fn text_response(text: &str) -> JsonValue {
     json!({
@@ -137,8 +134,9 @@ fn failed_error_code(service: &AgentService, run_id: &str) -> String {
 }
 
 fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> AgentGatewayState {
-    let state = AgentGatewayState::with_agent_source(config, agent_loop_source())
-        .expect("bundled agent loop should compile");
+    let state =
+        AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
+            .expect("bundled agent loop should compile");
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
@@ -162,8 +160,12 @@ fn loop_service_sqlite(
     provider: &ScriptedProvider,
     path: &std::path::Path,
 ) -> AgentGatewayState {
-    let state = AgentGatewayState::with_agent_source_and_sqlite(config, agent_loop_source(), path)
-        .expect("bundled agent loop should compile against sqlite");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        config,
+        rustscript_agent::bundled_agent_main_path(),
+        path,
+    )
+    .expect("bundled agent loop should compile against sqlite");
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
@@ -376,8 +378,8 @@ async fn scripted_real_worker_completes_with_provider_answer() {
         "completed output should carry the scripted answer: {rendered}"
     );
     assert_eq!(provider.call_count(), 1);
-    assert!(!service.native_dispatch_retained(&admitted.run_id));
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(!service.capability_host_retained(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
 }
 
@@ -410,7 +412,7 @@ async fn stop_hanging_provider_cancels_once() {
         vec!["run.cancelled".to_string()]
     );
     assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
 }
 
@@ -457,7 +459,7 @@ async fn stop_terminates_child_process_without_residue() {
     for pid in pids {
         assert!(!pid_alive(pid), "PID {pid} should be dead after cleanup");
     }
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -484,7 +486,7 @@ async fn deadline_terminates_child_process_without_residue() {
     );
     assert_eq!(cancel_reason(&service, &admitted.run_id), "deadline");
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
     assert!(
         elapsed < Duration::from_secs(2),
         "deadline should not wait for the child sleep: {elapsed:?}"
@@ -558,7 +560,7 @@ async fn race_stop_and_completion_commits_exactly_one_terminal() {
         terminals[0] == "run.completed" || terminals[0] == "run.cancelled",
         "race must commit exactly one terminal: {terminals:?}"
     );
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -649,7 +651,7 @@ async fn worker_accounts_success_multi_turn_and_prometheus_matches_snapshot() {
     assert_prometheus_matches_snapshot(&service);
     assert_frozen_prompt_exactly_once(&service, &admitted.run_id, &provider);
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -826,8 +828,7 @@ async fn durable_tool_replay_does_not_increment_activity() {
     );
     let before = activity_values(&service);
     assert_eq!(before, [1, 1, 1, 1, 0]);
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("durable replay");
     assert_eq!(replayed.len(), 1);
     assert!(!replayed[0].ok);
@@ -883,7 +884,7 @@ async fn uncooperative_dispatcher_cleanup_is_bounded_and_fail_closed() {
         elapsed < Duration::from_secs(2),
         "uncooperative dispatcher must not block cleanup indefinitely: {elapsed:?}"
     );
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -921,8 +922,9 @@ async fn gateway_runner_uses_http_sqlite_and_fuel_and_rejects_stale_cache() {
     config.http.allowed_hosts = vec!["example.test".to_string()];
     config.sqlite.database_root = Some("/tmp/agent-sqlite-task9".to_string());
     config.fuel = Some(12_345);
-    let state = AgentGatewayState::with_agent_source(config, agent_loop_source())
-        .expect("compile gateway agent");
+    let state =
+        AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
+            .expect("compile gateway agent");
     let service = state.service();
     let installed = service
         .cached_runner_config()
@@ -934,8 +936,11 @@ async fn gateway_runner_uses_http_sqlite_and_fuel_and_rejects_stale_cache() {
     );
     assert_eq!(installed.fuel, Some(12_345));
 
-    let stale = AgentRunner::from_source(&agent_loop_source(), AgentConfig::default())
-        .expect("compile default runner");
+    let stale = AgentRunner::from_file(
+        rustscript_agent::bundled_agent_main_path(),
+        AgentConfig::default(),
+    )
+    .expect("compile default runner");
     service.install_agent_runner(stale);
     assert_ne!(
         service.cached_runner_config().expect("stale cache").fuel,
@@ -985,9 +990,11 @@ async fn injected_provider_is_one_shot_and_second_run_uses_default() {
     hang.push_hang();
     let ok = ScriptedProvider::new();
     ok.push_ok(text_response("second-ok"));
-    let state =
-        AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), agent_loop_source())
-            .expect("compile");
+    let state = AgentGatewayState::with_agent_file(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+    )
+    .expect("compile");
     let service = state.service();
     service.inject_provider_host(Arc::new(hang.clone()));
     service.inject_provider_host(Arc::new(ok.clone()));
@@ -1118,8 +1125,9 @@ async fn hanging_http_adapter_stop_cancels() {
     config.http.allowed_schemes = vec!["http".to_string()];
     config.http.allowed_ports = vec![port];
     config.http.allow_private_ips = true;
-    let state = AgentGatewayState::with_agent_source(config, agent_loop_source())
-        .expect("compile adapter run");
+    let state =
+        AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
+            .expect("compile adapter run");
     let service = state.service();
     service.upsert_provider_profile(
         ProviderProfile::new(
@@ -1789,9 +1797,9 @@ async fn unsafe_pending_request_fails_closed_without_inner() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancels_once() {
+async fn capability_host_init_panic_does_not_overwrite_closed_and_redrive_cancels_once() {
     // Empty restore after init panic is covered by
-    // `native_dispatch_init_panic_wakes_waiters_and_allows_retry`. This test
+    // `capability_host_init_panic_wakes_waiters_and_allows_retry`. This test
     // pins the stop+close-before-panic contract: the guard must not overwrite
     // Closed, occupancy must unwind, and redrive commits exactly one cancel.
     let provider = ScriptedProvider::new();
@@ -1819,11 +1827,11 @@ async fn native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancel
     let observer_entered = Arc::clone(&entered);
     let observer_gate = Arc::clone(&panic_gate);
     let observer_panic = Arc::clone(&panic_once);
-    service.inject_native_dispatch_init_entered_observer(Arc::new(move || {
+    service.inject_capability_host_init_entered_observer(Arc::new(move || {
         if observer_panic.swap(false, Ordering::SeqCst) {
             observer_entered.wait();
             observer_gate.wait();
-            panic!("injected native dispatch init panic");
+            panic!("injected capability host init panic");
         }
     }));
 
@@ -1836,9 +1844,9 @@ async fn native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancel
     });
     entered.wait();
     assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
-    service.cleanup_session_native_dispatch(&admitted.session_id);
+    service.cleanup_session_capability_host(&admitted.session_id);
     assert!(
-        service.native_dispatch_closed(&admitted.run_id),
+        service.capability_host_closed(&admitted.run_id),
         "stop/cleanup must sticky-close before the init panic"
     );
 
@@ -1851,10 +1859,10 @@ async fn native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancel
         "run_worker must propagate the injected init panic"
     );
     assert!(
-        service.native_dispatch_closed(&admitted.run_id),
+        service.capability_host_closed(&admitted.run_id),
         "init panic guard must not overwrite Closed"
     );
-    assert!(!service.native_dispatch_retained(&admitted.run_id));
+    assert!(!service.capability_host_retained(&admitted.run_id));
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     assert!(
         terminal_events(&service, &admitted.run_id).is_empty(),
@@ -1873,7 +1881,7 @@ async fn native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancel
         service.run_events(&admitted.run_id)
     );
     assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     assert_eq!(provider.call_count(), 0);
     drop(service);

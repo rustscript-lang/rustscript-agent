@@ -10,6 +10,8 @@ pub mod types;
 mod confined_io;
 mod hash;
 
+pub(crate) use hash::sha256_hex;
+
 pub use artifacts::{ArtifactCapability, ArtifactLimits, ArtifactRef};
 pub use filesystem::{
     FilesystemCapability, FilesystemLimits, FsDirEntry, FsList, FsMetadata, FsRead, FsWrite,

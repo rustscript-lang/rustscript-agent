@@ -537,7 +537,7 @@ fn loop_host_with(
     }
 }
 
-fn native_dispatcher(max_tool_calls: u64) -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
+fn capability_hoster(max_tool_calls: u64) -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
         "loop-{}-{}",
@@ -567,7 +567,7 @@ fn optional_tool() -> JsonValue {
 }
 
 fn optional_tool_dispatcher() -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
-    native_dispatcher(8)
+    capability_hoster(8)
 }
 
 struct CancelAfterEffect {
@@ -671,7 +671,7 @@ fn loop_one_serial_tool_call_then_final() {
         json!([{"id": "call-1", "name": "read_file", "arguments": {"path": "note.txt"}}]),
     ));
     provider.push_ok(text_response("after tool"));
-    let (dispatcher, executor, root) = native_dispatcher(8);
+    let (dispatcher, executor, root) = capability_hoster(8);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
@@ -742,7 +742,7 @@ fn loop_multiple_serial_calls_in_order_exactly_once() {
         ]),
     ));
     provider.push_ok(text_response("both done"));
-    let (dispatcher, executor, root) = native_dispatcher(8);
+    let (dispatcher, executor, root) = capability_hoster(8);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
@@ -874,7 +874,7 @@ fn loop_max_turns_is_enforced() {
         "",
         json!([{"id": "c2", "name": "read_file", "arguments": {"path": "note.txt"}}]),
     ));
-    let (dispatcher, executor, root) = native_dispatcher(8);
+    let (dispatcher, executor, root) = capability_hoster(8);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
@@ -897,7 +897,7 @@ fn loop_max_tool_calls_composes_with_task5_budget() {
             {"id": "c2", "name": "read_file", "arguments": {"path": "b.txt"}}
         ]),
     ));
-    let (dispatcher, executor, root) = native_dispatcher(1);
+    let (dispatcher, executor, root) = capability_hoster(1);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
@@ -1032,7 +1032,7 @@ fn loop_completed_tool_effects_are_not_retried() {
     ));
     provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
     provider.push_ok(text_response("after retry"));
-    let (dispatcher, executor, root) = native_dispatcher(8);
+    let (dispatcher, executor, root) = capability_hoster(8);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
@@ -1074,7 +1074,7 @@ fn loop_frozen_coding_prompt_stays_exactly_one_on_tool_follow_up_and_retry() {
     ));
     provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
     provider.push_ok(text_response("after retry"));
-    let (dispatcher, executor, root) = native_dispatcher(8);
+    let (dispatcher, executor, root) = capability_hoster(8);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let context =
         reconstruct_run_context(&frozen_run_context(Some(FROZEN_CODING_PROMPT), echo_tool()));
@@ -2139,7 +2139,7 @@ fn loop_tool_cycles_consume_turn_budget_and_terminate() {
         "t",
         json!([{"id": "c2", "name": "read_file", "arguments": {"path": "note.txt"}}]),
     ));
-    let (dispatcher, executor, root) = native_dispatcher(8);
+    let (dispatcher, executor, root) = capability_hoster(8);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
@@ -2163,7 +2163,7 @@ fn loop_multi_call_response_pins_tool_call_count() {
         ]),
     ));
     provider.push_ok(text_response("done"));
-    let (dispatcher, executor, root) = native_dispatcher(8);
+    let (dispatcher, executor, root) = capability_hoster(8);
     let runner = loop_runner_with(provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
@@ -2334,9 +2334,12 @@ fn loop_post_effect_cancel_keeps_tool_result_and_skips_next_effect() {
 fn loop_post_effect_cancel_probe_returns_real_tool_result() {
     let cancellation = RunCancellation::new();
     let (dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
-    let runner = rustscript_agent::bundled_dispatch_runner()
-        .expect("dispatch entry should compile")
-        .with_host(dispatcher);
+    let runner = AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/tools/dispatch_entry.rss"),
+        AgentConfig::default(),
+    )
+    .expect("dispatch entry should compile")
+    .with_host(dispatcher);
     let mut sink = VecSink::default();
     let result = runner.run_with_context_and_events(
         json_to_vm(&json!({

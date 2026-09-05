@@ -193,12 +193,11 @@ page bounds.
 ## Coding tools and serial loop
 
 The library `AgentService` worker compiles bundled `rss/agent/main.rss` and
-drives a **serial** native tool loop. RSS builds canonical provider requests
-and dispatches tools only through the native host bridges
-(`agent::provider_call`, `agent::tool_dispatch`). This is not an
-OpenAI-compatible inference path.
+drives a **serial** RSS `tools::dispatch` loop over the generic capability
+host (`agent::provider_call`, filesystem/process/artifact adapters). This is
+not an OpenAI-compatible inference path.
 
-Built-in native tools, in registry order:
+Built-in RSS registry tools, in registry order:
 
 | Name | Toolset | Risk | Notes |
 | --- | --- | --- | --- |

@@ -583,6 +583,106 @@ fn dispatch_does_not_eval_user_names() {
     assert_eq!(started, 0);
 }
 
+#[test]
+fn dispatch_raw_arguments_json_object_succeeds() {
+    let fixture = Fixture::new("json-empty");
+    let durable = MemoryDurable::new();
+    let input = dispatch_input(
+        json!({
+            "id": "call-empty-object",
+            "name": "read_file",
+            "arguments_json": "{}",
+        }),
+        registry_snapshot(),
+        REGISTRY_IDENTITY,
+        json!({}),
+    );
+    let (envelope, started) = run_dispatch(&fixture, durable, input);
+    assert_eq!(
+        error_code(&envelope),
+        "invalid_arguments",
+        "valid empty object must parse then fail tool validation: {envelope}"
+    );
+    assert_eq!(started, 0);
+}
+
+#[test]
+fn dispatch_raw_malformed_arguments_json_is_malformed_payload() {
+    let fixture = Fixture::new("json-malformed");
+    let durable = MemoryDurable::new();
+    for raw in [
+        "{not json}",
+        "[1]",
+        "\"x\"",
+        "null",
+        "1",
+        "{\"a\":1} extra",
+        "",
+    ] {
+        let input = dispatch_input(
+            json!({
+                "id": "call-malformed",
+                "name": "read_file",
+                "arguments_json": raw,
+            }),
+            registry_snapshot(),
+            REGISTRY_IDENTITY,
+            json!({}),
+        );
+        let (envelope, started) = run_dispatch(&fixture, durable.clone(), input);
+        assert_eq!(
+            error_code(&envelope),
+            "malformed_payload",
+            "raw={raw:?} envelope={envelope}"
+        );
+        assert_eq!(started, 0, "raw={raw:?}");
+        assert_eq!(envelope["ok"], json!(false));
+    }
+}
+
+#[test]
+fn dispatch_duplicate_scan_accepts_exact_max_and_rejects_one_over() {
+    let fixture = Fixture::new("dup-bound");
+    let mut entries = Vec::new();
+    for i in 0..64 {
+        let mut entry = registry_snapshot()[0].clone();
+        entry["name"] = json!(format!("tool_{i}"));
+        entries.push(entry);
+    }
+    let input = dispatch_input(
+        json!({
+            "id": "call-unknown",
+            "name": "missing",
+            "arguments": {},
+        }),
+        json!(entries.clone()),
+        REGISTRY_IDENTITY,
+        json!({}),
+    );
+    let (envelope, started) = run_dispatch(&fixture, MemoryDurable::new(), input);
+    assert_eq!(error_code(&envelope), "unknown_tool", "envelope={envelope}");
+    assert_eq!(started, 0);
+
+    entries.push(registry_snapshot()[0].clone());
+    let input = dispatch_input(
+        json!({
+            "id": "call-over",
+            "name": "missing",
+            "arguments": {},
+        }),
+        json!(entries),
+        REGISTRY_IDENTITY,
+        json!({}),
+    );
+    let (envelope, started) = run_dispatch(&fixture, MemoryDurable::new(), input);
+    assert_eq!(
+        error_code(&envelope),
+        "duplicate_tool",
+        "envelope={envelope}"
+    );
+    assert_eq!(started, 0);
+}
+
 #[allow(dead_code)]
 fn _instant_marker() -> Instant {
     Instant::now()

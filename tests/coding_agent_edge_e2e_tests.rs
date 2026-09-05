@@ -136,11 +136,6 @@ impl Drop for Fixture {
     }
 }
 
-fn agent_loop_source() -> String {
-    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"))
-        .expect("bundled rss/agent/main.rss should be readable")
-}
-
 fn text_response(text: &str) -> JsonValue {
     json!({
         "text": text,
@@ -170,8 +165,9 @@ fn admit_request() -> AdmitRunRequest {
 }
 
 fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> AgentGatewayState {
-    let state = AgentGatewayState::with_agent_source(config, agent_loop_source())
-        .expect("bundled agent loop should compile");
+    let state =
+        AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
+            .expect("bundled agent loop should compile");
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
@@ -183,8 +179,12 @@ fn loop_service_sqlite(
     provider: &ScriptedProvider,
     db: &Path,
 ) -> AgentGatewayState {
-    let state = AgentGatewayState::with_agent_source_and_sqlite(config, agent_loop_source(), db)
-        .expect("bundled agent loop with sqlite should compile");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        config,
+        rustscript_agent::bundled_agent_main_path(),
+        db,
+    )
+    .expect("bundled agent loop with sqlite should compile");
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
@@ -631,8 +631,8 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         0,
         "ProcessTable owner count is the portable PID fallback"
     );
-    assert!(service.native_dispatch_closed(&admitted.run_id));
-    assert!(!service.native_dispatch_retained(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
+    assert!(!service.capability_host_retained(&admitted.run_id));
     let leftover = live_ids.map(|ids| ids.len()).unwrap_or(0);
     assert_eq!(
         leftover, 0,
@@ -671,9 +671,11 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     provider.push_ok(text_response("bounded-summary"));
     let gate = SecondCallGate::new(provider.clone());
 
-    let state =
-        AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), agent_loop_source())
-            .expect("bundled agent loop should compile");
+    let state = AgentGatewayState::with_agent_file(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+    )
+    .expect("bundled agent loop should compile");
     let service = state.service();
     service.inject_provider_host(Arc::new(gate.clone()));
     apply_workspace_limits(&service, &fixture.workspace, OUTPUT_CAP);
@@ -865,7 +867,7 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     );
     assert_eq!(provider.call_count(), 2);
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
-    assert!(service.native_dispatch_closed(&admitted.run_id));
+    assert!(service.capability_host_closed(&admitted.run_id));
     assert_eq!(
         service
             .native_artifact_ids(&admitted.run_id)

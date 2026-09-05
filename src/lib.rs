@@ -38,7 +38,7 @@ pub use registry::{
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
-    RunnerPrepareFault, bundled_dispatch_runner, bundled_tool_entries, bundled_tool_registry,
+    RunnerPrepareFault, bundled_agent_main_path, bundled_tool_entries, bundled_tool_registry,
 };
 pub use runtime::{
     AgentHostBridges, AgentProviderHost, ControlCheckHook, ScriptedProvider, agent_host_catalog,

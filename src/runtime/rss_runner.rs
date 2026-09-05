@@ -14,10 +14,10 @@
 //! and a watcher thread jumps the epoch so pure CPU work is interrupted within
 //! the configured epoch bound (surfacing as a typed deadline failure).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -39,124 +39,261 @@ use super::agent_host::{
     AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog,
     register_agent_host_functions,
 };
+use crate::capabilities::sha256_hex;
 use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::registry::ToolRegistry;
 use crate::tool_schema::ToolDescriptor;
 use serde_json::json;
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
+pub const COMPILE_CACHE_CAP: usize = 8;
+const MAX_TREE_FILES: usize = 256;
+const MAX_TREE_DEPTH: usize = 16;
+const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
+const COMPILE_TREE_RETRIES: usize = 4;
 
-fn compile_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+struct ProgramLru {
+    entries: HashMap<String, rustscript_vm::Program>,
+    order: VecDeque<String>,
+}
+
+impl ProgramLru {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
+        let program = self.entries.get(digest)?.clone();
+        if let Some(index) = self.order.iter().position(|key| key == digest) {
+            self.order.remove(index);
+        }
+        self.order.push_back(digest.to_string());
+        Some(program)
+    }
+
+    fn insert(&mut self, digest: String, program: rustscript_vm::Program) {
+        if self.entries.contains_key(&digest) {
+            self.entries.insert(digest.clone(), program);
+            if let Some(index) = self.order.iter().position(|key| key == &digest) {
+                self.order.remove(index);
+            }
+            self.order.push_back(digest);
+            return;
+        }
+        while self.order.len() >= COMPILE_CACHE_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.order.push_back(digest.clone());
+        self.entries.insert(digest, program);
+    }
+}
+
+fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
+    static CACHE: OnceLock<Mutex<ProgramLru>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(ProgramLru::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-struct CachedFileProgram {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-    tree_len: u64,
-    tree_modified: Option<std::time::SystemTime>,
-    program: rustscript_vm::Program,
+fn tree_error(message: &'static str) -> AgentError {
+    AgentError::Compile(message.to_string())
 }
 
-fn rss_source_stamp() -> (u64, Option<std::time::SystemTime>) {
-    fn walk(dir: &Path, len: &mut u64, modified: &mut Option<std::time::SystemTime>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, len, modified);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rss") {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            *len = len.saturating_add(metadata.len());
-            if let Ok(mtime) = metadata.modified() {
-                *modified = Some(modified.map_or(mtime, |prev| prev.max(mtime)));
-            }
+fn module_tree_root(entry: &Path) -> Result<PathBuf> {
+    let parent = entry
+        .parent()
+        .ok_or_else(|| tree_error("module tree walk failed"))?;
+    let mut current = parent;
+    loop {
+        if current.file_name().and_then(|name| name.to_str()) == Some("rss") {
+            return Ok(current.to_path_buf());
+        }
+        match current.parent() {
+            Some(next) if next != current => current = next,
+            _ => return Ok(parent.to_path_buf()),
         }
     }
-    let mut len = 0;
-    let mut modified = None;
-    walk(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("rss"),
-        &mut len,
-        &mut modified,
-    );
-    (len, modified)
 }
 
-fn compiled_file_program(path: &Path) -> Result<rustscript_vm::Program> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFileProgram>>> = OnceLock::new();
-    let metadata = std::fs::metadata(path)?;
-    if metadata.len() as usize > MAX_AGENT_SOURCE_BYTES {
+fn relative_posix(root: &Path, file: &Path) -> Result<String> {
+    let relative = file
+        .strip_prefix(root)
+        .map_err(|_| tree_error("module tree walk failed"))?;
+    let mut out = String::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| tree_error("module tree file is not valid UTF-8"))?;
+                if !out.is_empty() {
+                    out.push('/');
+                }
+                out.push_str(part);
+            }
+            _ => return Err(tree_error("module tree walk failed")),
+        }
+    }
+    Ok(out)
+}
+
+struct TreeFile {
+    rel: String,
+    bytes: Vec<u8>,
+}
+
+fn snapshot_module_tree(entry: &Path) -> Result<String> {
+    let root = module_tree_root(entry)?;
+    let mut files = Vec::new();
+    let mut total_bytes = 0_usize;
+    walk_module_tree(&root, &root, 0, &mut files, &mut total_bytes)?;
+    files.sort_by(|left, right| left.rel.as_bytes().cmp(right.rel.as_bytes()));
+    let entry_rel = relative_posix(&root, entry)?;
+    let mut material = Vec::new();
+    for file in &files {
+        material.extend_from_slice(&(file.rel.len() as u64).to_le_bytes());
+        material.extend_from_slice(file.rel.as_bytes());
+        material.extend_from_slice(&(file.bytes.len() as u64).to_le_bytes());
+        material.extend_from_slice(&file.bytes);
+    }
+    material.extend_from_slice(&(entry_rel.len() as u64).to_le_bytes());
+    material.extend_from_slice(entry_rel.as_bytes());
+    Ok(sha256_hex(&material))
+}
+
+fn walk_module_tree(
+    root: &Path,
+    path: &Path,
+    depth: usize,
+    files: &mut Vec<TreeFile>,
+    total_bytes: &mut usize,
+) -> Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(tree_error("module tree exceeds the depth bound"));
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| tree_error("module tree walk failed"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(tree_error("module tree contains a symlink"));
+    }
+    if metadata.is_dir() {
+        let entries = std::fs::read_dir(path).map_err(|_| tree_error("module tree walk failed"))?;
+        let mut children = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| tree_error("module tree walk failed"))?;
+            children.push(entry.path());
+        }
+        children.sort();
+        for child in children {
+            walk_module_tree(root, &child, depth.saturating_add(1), files, total_bytes)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(tree_error("module tree walk failed"));
+    }
+    if path.extension().and_then(|ext| ext.to_str()) != Some("rss") {
+        return Ok(());
+    }
+    if files.len() >= MAX_TREE_FILES {
+        return Err(tree_error("module tree exceeds the file count bound"));
+    }
+    let len = metadata.len() as usize;
+    if len > MAX_AGENT_SOURCE_BYTES {
         return Err(AgentError::Compile(format!(
             "agent source exceeds {} bytes",
             MAX_AGENT_SOURCE_BYTES
         )));
     }
-    let len = metadata.len();
-    let modified = metadata.modified().ok();
-    let (tree_len, tree_modified) = rss_source_stamp();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache_hit = |hit: &CachedFileProgram| {
-        hit.len == len
-            && hit.modified == modified
-            && hit.tree_len == tree_len
-            && hit.tree_modified == tree_modified
-    };
+    *total_bytes = total_bytes
+        .checked_add(len)
+        .ok_or_else(|| tree_error("module tree exceeds the byte bound"))?;
+    if *total_bytes > MAX_TREE_BYTES {
+        return Err(tree_error("module tree exceeds the byte bound"));
+    }
+    let bytes = std::fs::read(path).map_err(|_| tree_error("module tree walk failed"))?;
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(tree_error("module tree file is not valid UTF-8"));
+    }
+    files.push(TreeFile {
+        rel: relative_posix(root, path)?,
+        bytes,
+    });
+    Ok(())
+}
+
+fn compiled_source_program(source: &str) -> Result<rustscript_vm::Program> {
+    if source.len() > MAX_AGENT_SOURCE_BYTES {
+        return Err(AgentError::Compile(format!(
+            "agent source exceeds {} bytes",
+            MAX_AGENT_SOURCE_BYTES
+        )));
+    }
+    let digest = sha256_hex(source.as_bytes());
     {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(hit) = guard.get(path)
-            && cache_hit(hit)
-        {
-            return Ok(hit.program.clone());
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok(program);
         }
     }
-    let _compile = compile_lock();
-    {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(hit) = guard.get(path)
-            && cache_hit(hit)
-        {
-            return Ok(hit.program.clone());
-        }
-    }
-    let program = compile_source_file_with_options(path, compile_options())
-        .map_err(|error| AgentError::Compile(error.to_string()))?
-        .program;
-    cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
-            path.to_path_buf(),
-            CachedFileProgram {
-                len,
-                modified,
-                tree_len,
-                tree_modified,
-                program: program.clone(),
-            },
-        );
+    let program =
+        compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
+            .map_err(|error| AgentError::Compile(error.to_string()))?
+            .program;
+    program_cache().insert(digest, program.clone());
     Ok(program)
+}
+
+fn compiled_file_program(path: &Path) -> Result<rustscript_vm::Program> {
+    let mut last_error = tree_error("module tree changed during compile");
+    for _ in 0..COMPILE_TREE_RETRIES {
+        let digest = snapshot_module_tree(path)?;
+        {
+            let mut cache = program_cache();
+            if let Some(program) = cache.get(&digest) {
+                let verify = snapshot_module_tree(path)?;
+                if verify == digest {
+                    return Ok(program);
+                }
+                last_error = tree_error("module tree changed during compile");
+                continue;
+            }
+        }
+        let program = compile_source_file_with_options(path, compile_options())
+            .map_err(|error| AgentError::Compile(error.to_string()))?
+            .program;
+        let verify = snapshot_module_tree(path)?;
+        if verify == digest {
+            program_cache().insert(digest, program.clone());
+            return Ok(program);
+        }
+        last_error = tree_error("module tree changed during compile");
+    }
+    Err(last_error)
+}
+
+fn rss_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("rss")
+}
+
+/// Production bundled coding-agent entry (`rss/agent/main.rss`).
+pub fn bundled_agent_main_path() -> PathBuf {
+    rss_root().join("agent/main.rss")
+}
+
+pub(crate) fn module_tree_digest(path: impl AsRef<Path>) -> Result<String> {
+    snapshot_module_tree(path.as_ref())
 }
 
 /// Admits the production RSS tool-registry descriptors after generic bounds.
 pub fn bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
-    static CACHED: OnceLock<std::result::Result<ToolRegistry, String>> = OnceLock::new();
-    CACHED.get_or_init(load_bundled_tool_registry).clone()
+    load_bundled_tool_registry()
 }
 
 fn load_bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
@@ -188,18 +325,6 @@ pub fn bundled_tool_entries() -> Vec<crate::registry::ToolRegistryEntry> {
         .snapshot()
         .entries()
         .to_vec()
-}
-
-/// Compiles the production RSS tool dispatcher used by service tests and
-/// production `main.rss` static calls.
-pub fn bundled_dispatch_runner() -> std::result::Result<AgentRunner, String> {
-    static CACHED: OnceLock<std::result::Result<AgentRunner, String>> = OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/tools/dispatch_entry.rss");
-            AgentRunner::from_file(&path, AgentConfig::default()).map_err(|error| error.to_string())
-        })
-        .clone()
 }
 
 /// Epoch ticks granted to one cancellable run. The cancellation watcher jumps
@@ -420,7 +545,7 @@ struct RunCancellationInner {
     epoch: Arc<Mutex<Option<EpochHandle>>>,
     watcher: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     stop: Arc<AtomicBool>,
-    /// Native/process token linked to this root. `request` and deadline fire cancel it.
+    /// Process token linked to this root. `request` and deadline fire cancel it.
     token: CancellationToken,
     /// Set when a timeout/deadline cannot be represented as `Instant`.
     deadline_overflow: AtomicBool,
@@ -627,27 +752,7 @@ pub struct AgentRunner {
 
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
-        if source.contains("use super::tools::dispatch") {
-            let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss");
-            if bundled.is_file() {
-                return Self::from_file(bundled, config);
-            }
-        }
-        if source.len() > MAX_AGENT_SOURCE_BYTES {
-            return Err(AgentError::Compile(format!(
-                "agent source exceeds {} bytes",
-                MAX_AGENT_SOURCE_BYTES
-            )));
-        }
-        let _compile = compile_lock();
-        let program = compile_source_with_flavor_and_options(
-            source,
-            SourceFlavor::RustScript,
-            compile_options(),
-        )
-        .map_err(|error| AgentError::Compile(error.to_string()))?
-        .program;
-        Self::from_program(program, config)
+        Self::from_program(compiled_source_program(source)?, config)
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {

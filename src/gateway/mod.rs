@@ -110,6 +110,94 @@ impl AgentGatewayState {
         })
     }
 
+    pub fn with_agent_file(
+        config: AgentGatewayConfig,
+        path: impl AsRef<FsPath>,
+    ) -> Result<Self, String> {
+        config
+            .validate()
+            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let path = path.as_ref().to_path_buf();
+        let agent_config = AgentConfig {
+            http: config.http.clone(),
+            sqlite: config.sqlite.clone(),
+            fuel: config.fuel,
+        };
+        let runner = AgentRunner::from_file(&path, agent_config)
+            .map_err(|error| format!("compile RSS agent entry: {error}"))?;
+        let http_config = config.http.clone();
+        let store = Arc::new(RwLock::new(store::GatewayStore::default()));
+        let metrics = Arc::new(Metrics::default());
+        let service = Arc::new(AgentService::new(
+            Arc::new(config),
+            Arc::clone(&store),
+            None,
+            None,
+            http_config.clone(),
+            Arc::clone(&metrics),
+        ));
+        service.install_agent_entry(path);
+        service.install_agent_runner(runner);
+        Ok(Self {
+            config: Arc::clone(service.config()),
+            store,
+            service,
+            agent_source: None,
+            http_config,
+            metrics,
+        })
+    }
+
+    pub fn with_agent_file_and_sqlite(
+        config: AgentGatewayConfig,
+        path: impl AsRef<FsPath>,
+        sqlite_path: impl AsRef<FsPath>,
+    ) -> Result<Self, String> {
+        config
+            .validate()
+            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
+        let path = path.as_ref().to_path_buf();
+        let agent_config = AgentConfig {
+            http: config.http.clone(),
+            sqlite: config.sqlite.clone(),
+            fuel: config.fuel,
+        };
+        let runner = AgentRunner::from_file(&path, agent_config)
+            .map_err(|error| format!("compile RSS agent entry: {error}"))?;
+        let http_config = config.http.clone();
+        let metrics = Arc::new(Metrics::default());
+        let persistence = Arc::new(
+            store::GatewayPersistence::open_with_metrics(
+                &config,
+                sqlite_path.as_ref(),
+                Arc::clone(&metrics),
+            )
+            .map_err(|error| format!("open gateway SQLite state: {error}"))?,
+        );
+        let loaded_store = persistence
+            .load()
+            .map_err(|error| format!("load gateway SQLite state: {error}"))?;
+        let store = Arc::new(RwLock::new(loaded_store));
+        let service = Arc::new(AgentService::new(
+            Arc::new(config),
+            Arc::clone(&store),
+            Some(persistence),
+            None,
+            http_config.clone(),
+            Arc::clone(&metrics),
+        ));
+        service.install_agent_entry(path);
+        service.install_agent_runner(runner);
+        Ok(Self {
+            config: Arc::clone(service.config()),
+            store,
+            service,
+            agent_source: None,
+            http_config,
+            metrics,
+        })
+    }
+
     pub fn with_agent_source_and_sqlite(
         config: AgentGatewayConfig,
         source: impl Into<String>,

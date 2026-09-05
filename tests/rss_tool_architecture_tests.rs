@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rustscript_agent::{AgentConfig, AgentRunner, agent_host_catalog};
+use rustscript_agent::{AgentConfig, AgentRunner, agent_host_catalog, bundled_tool_entries};
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -187,4 +187,23 @@ fn production_agent_compiles_dispatch_and_tool_modules_from_file() {
     AgentRunner::from_file(&path, AgentConfig::default()).unwrap_or_else(|error| {
         panic!("production agent must compile dispatch + tool modules from file: {error}");
     });
+}
+
+#[test]
+fn production_registry_exposes_six_public_tools() {
+    let names: Vec<String> = bundled_tool_entries()
+        .into_iter()
+        .map(|entry| entry.descriptor.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "read_file",
+            "search_files",
+            "write_file",
+            "patch",
+            "terminal",
+            "process"
+        ]
+    );
 }

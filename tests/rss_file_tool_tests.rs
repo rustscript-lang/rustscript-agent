@@ -17,9 +17,7 @@ use rustscript_agent::capabilities::{
     PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
 use rustscript_agent::config::FileToolConfig;
-use rustscript_agent::{
-    AgentConfig, AgentHostBridges, AgentRunner, ToolResult, bundled_tool_registry,
-};
+use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolResult};
 use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
 
@@ -595,17 +593,45 @@ fn assert_search_eq(fixture: &Fixture, arguments: Value) {
     }
 }
 
-fn native_descriptor(name: &str) -> Value {
-    bundled_tool_registry()
-        .expect("RSS registry")
-        .snapshot()
-        .schemas()
-        .as_array()
-        .expect("descriptor array")
-        .iter()
-        .find(|value| value["name"] == name)
-        .cloned()
-        .unwrap_or_else(|| panic!("missing native descriptor {name}"))
+fn frozen_read_file_descriptor() -> Value {
+    json!({
+        "name": "read_file",
+        "description": "Read bounded text from a workspace file",
+        "toolset": "coding",
+        "risk_class": "read",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 1 },
+                "limit": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn frozen_search_files_descriptor() -> Value {
+    json!({
+        "name": "search_files",
+        "description": "Search workspace files with bounded results",
+        "toolset": "coding",
+        "risk_class": "read",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string" },
+                "target": { "type": "string", "enum": ["content", "files"] },
+                "file_glob": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1 },
+                "offset": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }
+    })
 }
 
 #[test]
@@ -615,7 +641,7 @@ fn rss_read_file_descriptor_matches_native() {
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, native_descriptor("read_file"));
+    assert_eq!(rss, frozen_read_file_descriptor());
 }
 
 #[test]
@@ -625,7 +651,7 @@ fn rss_search_files_descriptor_matches_native() {
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, native_descriptor("search_files"));
+    assert_eq!(rss, frozen_search_files_descriptor());
 }
 
 #[test]

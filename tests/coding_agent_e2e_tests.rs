@@ -187,11 +187,6 @@ fn run_targeted_test(sh: &Path, workspace: &Path) -> std::process::ExitStatus {
         .expect("targeted test should spawn")
 }
 
-fn agent_loop_source() -> String {
-    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"))
-        .expect("bundled rss/agent/main.rss should be readable")
-}
-
 fn text_response(text: &str) -> JsonValue {
     json!({
         "text": text,
@@ -317,14 +312,11 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
     };
     let sh_arg = sh.to_str().expect("sh path should be utf-8").to_string();
     let mut fixture = WorkspaceFixture::new(&sh);
-    let source = agent_loop_source();
-    assert!(
-        source.contains("agent::provider_call") && source.contains("tools::dispatch"),
-        "E2E must compile the real bundled RSS loop"
-    );
-
-    let state = AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), source)
-        .expect("bundled RSS agent should compile");
+    let state = AgentGatewayState::with_agent_file(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+    )
+    .expect("bundled RSS agent should compile");
     let service = state.service();
     assert_eq!(service.config().provider.as_deref(), Some("local-agent"));
 

@@ -1,3 +1,4 @@
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -1775,8 +1776,7 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
             None,
         )
         .expect("assistant tool-call parent must be durable first");
-    let first = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let first = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("first dispatch should run");
     assert_eq!(first.len(), 1);
     assert!(!first[0].ok);
@@ -1786,8 +1786,7 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
         .filter(|event| event["event"] == "tool.failed")
         .count();
     assert_eq!(tool_failed, 1, "first dispatch commits one tool.failed");
-    let second = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let second = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("replay should succeed");
     assert_eq!(second.len(), 1);
     assert_eq!(
@@ -1848,8 +1847,7 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
         .persistence()
         .expect("sqlite persistence")
         .inject_persist_failure();
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("dispatch should return persist failure");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
@@ -1978,8 +1976,7 @@ async fn missing_tool_result_parent_fails_typed_before_durable_result() {
         name: "read_file".to_string(),
         arguments: json!({"path": "missing-no-such.txt"}),
     };
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("dispatch should return typed missing parent");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
@@ -2035,8 +2032,7 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
         )
         .expect("assistant tool-call parent");
     let parent_id = parent.message_id();
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("dispatch with parent");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
@@ -2571,19 +2567,19 @@ async fn corrupt_tool_event_without_canonical_result_fails_closed() {
             json!({"tool_call_id": "c-corrupt", "error_code": "tool_failed"}),
         )
         .expect("orphan tool event");
-    let results = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[ToolCall {
-                id: "c-corrupt".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({"path": "a.rs"}),
-            }],
-        )
-        .expect("corrupt replay must dispatch");
+    let results = common::dispatch_rss(
+        &service,
+        &admitted.run_id,
+        &[ToolCall {
+            id: "c-corrupt".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "a.rs"}),
+        }],
+    )
+    .expect("corrupt replay must dispatch");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
-        Some("corrupt_tool_result")
+        Some("missing_tool_parent")
     );
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
@@ -2640,8 +2636,7 @@ async fn completed_durable_tool_replay_returns_canonical_result_without_reexecut
         arguments: json!({"path": "note.txt"}),
     };
     commit_tool_parent(&service, &admitted.run_id, &call);
-    let first = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let first = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("first dispatch should run");
     assert_eq!(first.len(), 1);
     assert!(first[0].ok, "first read should succeed: {:?}", first[0]);
@@ -2650,8 +2645,7 @@ async fn completed_durable_tool_replay_returns_canonical_result_without_reexecut
     let first_events = service.run_events(&admitted.run_id);
     assert_eq!(event_type_count(&first_events, "tool.started"), 1);
     assert_eq!(event_type_count(&first_events, "tool.completed"), 1);
-    let second = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let second = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("replay should succeed");
     assert_eq!(second.len(), 1);
     assert!(second[0].ok);
@@ -2691,8 +2685,7 @@ async fn failed_durable_tool_replay_returns_canonical_result_without_reexecution
         arguments: json!({"path": "missing.txt"}),
     };
     commit_tool_parent(&service, &admitted.run_id, &call);
-    let first = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let first = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("first dispatch should run");
     assert_eq!(first.len(), 1);
     assert!(!first[0].ok);
@@ -2703,8 +2696,7 @@ async fn failed_durable_tool_replay_returns_canonical_result_without_reexecution
     let first_metrics = service.metrics().snapshot();
     let first_events = service.run_events(&admitted.run_id);
     assert_eq!(event_type_count(&first_events, "tool.failed"), 1);
-    let second = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let second = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("replay should succeed");
     assert_eq!(
         second[0].error.as_ref().map(|error| error.code.as_str()),
@@ -2752,8 +2744,7 @@ async fn interrupted_durable_tool_replay_returns_canonical_result_without_native
         )
         .expect("interrupted event");
     let first_metrics = service.metrics().snapshot();
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("interrupted replay must dispatch");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
@@ -3298,8 +3289,7 @@ async fn production_lifecycle_commit_result_replays_after_restart_without_corrup
         .expect("production commit_result should persist");
     let first_events = service.run_events(&admitted.run_id);
     assert_eq!(event_type_count(&first_events, "tool.completed"), 1);
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("restart replay must dispatch");
     assert_eq!(replayed.len(), 1);
     assert!(
@@ -3410,8 +3400,7 @@ async fn production_lifecycle_commit_failure_replays_as_tool_failed_without_corr
         event_type_count(&service.run_events(&admitted.run_id), "tool.completed"),
         0
     );
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("failure replay must dispatch");
     assert_eq!(
         replayed[0].error.as_ref().map(|error| error.code.as_str()),
@@ -3482,8 +3471,7 @@ async fn production_lifecycle_interrupt_replays_interrupted_effect_without_corru
         .find(|event| event["event"] == "tool.failed")
         .expect("interrupt must persist tool.failed");
     assert_eq!(failed["data"]["error_code"], json!("interrupted_effect"));
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("interrupted replay must dispatch");
     assert_eq!(
         replayed[0].error.as_ref().map(|error| error.code.as_str()),
@@ -3551,8 +3539,7 @@ async fn production_stop_recovers_open_capability_tokens() {
         .find(|event| event["event"] == "tool.failed")
         .expect("stop must persist interrupted_effect");
     assert_eq!(failed["data"]["error_code"], json!("interrupted_effect"));
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("stop recovery must dispatch");
     assert_eq!(
         replayed[0].error.as_ref().map(|error| error.code.as_str()),

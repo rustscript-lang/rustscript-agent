@@ -2589,3 +2589,93 @@ fn process_write_close_race_joins_stdin_worker() {
     assert_stdin_workers_joined(&processes);
     processes.kill(&token, &spawned.handle).expect("kill");
 }
+
+#[test]
+fn process_shutdown_all_refuses_spawn_before_os_create() {
+    let fixture = Fixture::new("proc-close-before");
+    let processes = fixture.processes();
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    processes.set_before_os_spawn_hook({
+        let ready = Arc::clone(&ready);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            ready.wait();
+            release.wait();
+        })
+    });
+    let spawned = {
+        let processes = processes.clone();
+        let token = fixture.token(CapabilityRisk::Execute);
+        thread::spawn(move || {
+            processes.spawn(
+                &token,
+                &["/bin/sleep".to_string(), "30".to_string()],
+                "",
+                &[],
+                ProcessLimits {
+                    timeout_ms: 5_000,
+                    ..ProcessLimits::default()
+                },
+            )
+        })
+    };
+    ready.wait();
+    processes.shutdown_all();
+    release.wait();
+    let error = spawned
+        .join()
+        .expect("spawn thread")
+        .expect_err("closing fence must refuse spawn");
+    assert_eq!(error_code(&error), "capability_unavailable");
+    assert_eq!(processes.table_len(), 0);
+}
+
+#[test]
+fn process_shutdown_all_terminates_uncommitted_os_process() {
+    let fixture = Fixture::new("proc-close-after");
+    let processes = fixture.processes();
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    processes.set_after_os_spawn_hook({
+        let ready = Arc::clone(&ready);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            ready.wait();
+            release.wait();
+        })
+    });
+    let spawned = {
+        let processes = processes.clone();
+        let token = fixture.token(CapabilityRisk::Execute);
+        thread::spawn(move || {
+            processes.spawn(
+                &token,
+                &["/bin/sleep".to_string(), "30".to_string()],
+                "",
+                &[],
+                ProcessLimits {
+                    timeout_ms: 5_000,
+                    ..ProcessLimits::default()
+                },
+            )
+        })
+    };
+    ready.wait();
+    processes.shutdown_all();
+    release.wait();
+    let error = spawned
+        .join()
+        .expect("spawn thread")
+        .expect_err("uncommitted handle must not insert after close");
+    assert_eq!(error_code(&error), "capability_unavailable");
+    assert_eq!(processes.table_len(), 0);
+    let later = processes.spawn(
+        &fixture.token(CapabilityRisk::Execute),
+        &["/bin/echo".to_string(), "late".to_string()],
+        "",
+        &[],
+        ProcessLimits::default(),
+    );
+    assert!(later.is_err(), "closing is irreversible");
+}

@@ -4,10 +4,11 @@ use serde_json::Value;
 /// Version of the effect-free executor contract included in registry identity.
 const MAX_POLICY_ERROR_BYTES: usize = 128;
 
-/// The public, provider-facing description of one native tool.
+/// The public, provider-facing description of one RSS registry tool.
 ///
 /// This type intentionally contains no executor or operating-system state. It
-/// is the stable descriptor used by provider adapters and domain contracts.
+/// is the stable descriptor admitted from the RSS registry and used by
+/// provider adapters and domain contracts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
     pub name: String,

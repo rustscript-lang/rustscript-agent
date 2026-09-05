@@ -46,6 +46,8 @@ const CAP_ARTIFACT_PUT_RESULT: &str = "cap::artifact_put_result";
 const CAP_ARTIFACT_GET: &str = "cap::artifact_get";
 const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
 const CAP_CLOCK_MONOTONIC_MS: &str = "cap::clock_monotonic_ms";
+const PARSE_JSON_OBJECT: &str = "agent::parse_json_object";
+const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
 
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
@@ -213,6 +215,11 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         builder.function(HostFunctionSchema::with_return(
             CAP_CLOCK_MONOTONIC_MS,
             vec![token],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            PARSE_JSON_OBJECT,
+            vec![HostParamSchema::value("text", HostTypeSchema::String)],
             response,
         ));
         Arc::new(builder.build().expect("agent host catalog must build"))
@@ -924,6 +931,13 @@ pub fn register_agent_host_functions(
         1,
         cap_clock_monotonic_ms_adapter,
     )?;
+    register_named(
+        registry,
+        catalog,
+        PARSE_JSON_OBJECT,
+        1,
+        parse_json_object_adapter,
+    )?;
     Ok(())
 }
 
@@ -965,6 +979,38 @@ fn control_check_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> 
         .control_error()
         .unwrap_or_else(|| json!({"ok": true, "error": {}}));
     return_json(result)
+}
+
+fn parse_json_object_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => return return_json(malformed_json_object()),
+    };
+    return_json(parse_json_object(text))
+}
+
+fn malformed_json_object() -> JsonValue {
+    json!({
+        "ok": false,
+        "code": "malformed_payload",
+        "message": "payload is not a JSON object",
+        "value": {},
+    })
+}
+
+fn parse_json_object(text: &str) -> JsonValue {
+    if text.len() > PARSE_JSON_OBJECT_MAX_BYTES || !text.is_char_boundary(text.len()) {
+        return malformed_json_object();
+    }
+    match serde_json::from_str::<JsonValue>(text) {
+        Ok(JsonValue::Object(map)) => json!({
+            "ok": true,
+            "code": "",
+            "message": "",
+            "value": JsonValue::Object(map),
+        }),
+        _ => malformed_json_object(),
+    }
 }
 
 fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {

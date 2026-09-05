@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread,
@@ -146,9 +146,13 @@ struct ProcessInner {
     host_limits: ProcessLimits,
     root: ConfinedFsRoot,
     table: Mutex<HashMap<String, OwnedProcess>>,
+    closing: AtomicBool,
+    generation: AtomicU64,
     after_running_poll_hook: Mutex<Option<ProcessOpHook>>,
     write_blocked_hook: Mutex<Option<ProcessOpHook>>,
     before_write_cycle_hook: Mutex<Option<ProcessOpHook>>,
+    before_os_spawn_hook: Mutex<Option<ProcessOpHook>>,
+    after_os_spawn_hook: Mutex<Option<ProcessOpHook>>,
     stdin_workers: AtomicUsize,
 }
 
@@ -208,9 +212,13 @@ impl ProcessCapability {
                 host_limits,
                 root,
                 table: Mutex::new(HashMap::new()),
+                closing: AtomicBool::new(false),
+                generation: AtomicU64::new(1),
                 after_running_poll_hook: Mutex::new(None),
                 write_blocked_hook: Mutex::new(None),
                 before_write_cycle_hook: Mutex::new(None),
+                before_os_spawn_hook: Mutex::new(None),
+                after_os_spawn_hook: Mutex::new(None),
                 stdin_workers: AtomicUsize::new(0),
             }),
         })
@@ -239,6 +247,9 @@ impl ProcessCapability {
         stdin: Option<&[u8]>,
     ) -> Result<ProcessSpawn, CapabilityError> {
         let claims = self.authorize(token, CapabilityRisk::Execute)?;
+        if self.is_closing() {
+            return Err(closing_error());
+        }
         if argv.is_empty() {
             return Err(CapabilityError::new(
                 "invalid_request",
@@ -281,16 +292,32 @@ impl ProcessCapability {
         {
             request = request.with_stdin(stdin.to_vec());
         }
+        if self.is_closing() {
+            return Err(closing_error());
+        }
+        fire_hook(&self.inner.before_os_spawn_hook);
+        if self.is_closing() {
+            return Err(closing_error());
+        }
+        let fence = self.inner.generation.load(Ordering::SeqCst);
         let process = BoundedProcess::spawn(request).map_err(map_process_error)?;
+        fire_hook(&self.inner.after_os_spawn_hook);
         let handle = process.lifecycle_handle();
         let write_handle = handle.clone();
         let pid = handle.pid();
         let id = uuid::Uuid::new_v4().simple().to_string();
-        self.inner
-            .table
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
+        {
+            let mut table = self
+                .inner
+                .table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.is_closing() || self.inner.generation.load(Ordering::SeqCst) != fence {
+                drop(table);
+                let _ = handle.shutdown();
+                return Err(closing_error());
+            }
+            table.insert(
                 id.clone(),
                 OwnedProcess {
                     owner_key: claims.owner.key(),
@@ -299,6 +326,7 @@ impl ProcessCapability {
                     cancel: cancel.clone(),
                 },
             );
+        }
         let reaper = Arc::new(ProcessReaper {
             inner: Arc::downgrade(&self.inner),
             id: id.clone(),
@@ -466,6 +494,24 @@ impl ProcessCapability {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
+    /// Test barrier: fires immediately before the OS spawn syscall.
+    pub fn set_before_os_spawn_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .before_os_spawn_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Test barrier: fires after OS spawn and before table insert.
+    pub fn set_after_os_spawn_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .after_os_spawn_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
     /// Returns a bounded log window.
     pub fn log(
         &self,
@@ -550,9 +596,13 @@ impl ProcessCapability {
 
     /// Terminates every owned child and drops table entries.
     ///
-    /// Run cleanup must drain committed background residue; `cancel_all`
-    /// kills the process tree but leaves handles observable in the table.
+    /// Closing is irreversible: later spawns refuse insert and terminate any
+    /// OS process created after the fence. Run cleanup must drain committed
+    /// background residue; `cancel_all` kills the process tree but leaves
+    /// handles observable in the table.
     pub fn shutdown_all(&self) {
+        self.inner.closing.store(true, Ordering::SeqCst);
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
         let owned: Vec<OwnedProcess> = {
             let mut table = self
                 .inner
@@ -564,6 +614,11 @@ impl ProcessCapability {
         for process in owned {
             terminate_owned(&process);
         }
+    }
+
+    /// True after [`Self::shutdown_all`] has started. The fence is irreversible.
+    pub fn is_closing(&self) -> bool {
+        self.inner.closing.load(Ordering::SeqCst)
     }
 
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
@@ -578,6 +633,9 @@ impl ProcessCapability {
     }
 
     fn lookup(&self, token: &str, handle: &str) -> Result<OwnedProcess, CapabilityError> {
+        if self.is_closing() {
+            return Err(closing_error());
+        }
         let claims = self.authorize(token, CapabilityRisk::Execute)?;
         let table = self
             .inner
@@ -710,6 +768,10 @@ fn fire_hook(slot: &Mutex<Option<ProcessOpHook>>) {
     {
         hook();
     }
+}
+
+fn closing_error() -> CapabilityError {
+    CapabilityError::new("capability_unavailable", "process capability is closing")
 }
 
 fn interrupt_write_worker(

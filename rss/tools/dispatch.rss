@@ -59,21 +59,6 @@ fn call_id(call: map) -> string {
     id
 }
 
-fn json_object_text(text: string) -> bool {
-    let mut ok: bool = false;
-    if text.length >= 2 {
-        if text[0:1] == "{" {
-            let second: string = text[1:2];
-            if second == "\"" || second == "}" || second == " " || second == "\n" || second == "\t" {
-                if text[(text.length - 1):text.length] == "}" {
-                    ok = true;
-                }
-            }
-        }
-    }
-    ok
-}
-
 fn parse_call_arguments(call: map) -> map {
     let mut out: map = {
         ok: true,
@@ -93,19 +78,24 @@ fn parse_call_arguments(call: map) -> map {
         if call.has("arguments_json") {
             if type(call.arguments_json) == "string" {
                 let text: string = call.arguments_json;
-                if text.length > 0 {
-                    if json_object_text(text) {
-                        let decoded: map = json::decode(text);
-                        out.arguments = decoded;
-                    } else {
-                        out = {
-                            ok: false,
-                            arguments: {},
-                            code: "malformed_payload",
-                            message: "tool arguments must be a JSON object"
-                        };
-                    }
+                let parsed: map = agent::parse_json_object(text);
+                if map_bool(parsed, "ok", false) {
+                    out.arguments = types::map_map(parsed, "value");
+                } else {
+                    out = {
+                        ok: false,
+                        arguments: {},
+                        code: "malformed_payload",
+                        message: "tool arguments must be a JSON object"
+                    };
                 }
+            } else {
+                out = {
+                    ok: false,
+                    arguments: {},
+                    code: "malformed_payload",
+                    message: "tool arguments must be a JSON object"
+                };
             }
         }
     }
@@ -128,7 +118,18 @@ fn find_named(registry: array, name: string) -> map {
     let mut found: map = {};
     let mut matches: int = 0;
     let mut i: int = 0;
+    let mut scans: int = 0;
     while i < registry.length {
+        if i < 0 {
+            break;
+        }
+        scans = scans + 1;
+        if scans > 64 {
+            break;
+        }
+        if registry.has(i) == false {
+            break;
+        }
         let mut entry: map = {};
         if type(registry[i]) == "map" {
             let coerced: map = registry[i];
@@ -146,23 +147,57 @@ fn find_named(registry: array, name: string) -> map {
     }
 }
 
+// Duplicate scan is O(n^2) with a hard n<=64 bound. The comparison
+// counter is n*(n-1)/2 worst case; 64 is exact-max, 65 fails closed.
 fn has_duplicate_names(registry: array) -> bool {
     let mut dup: bool = false;
-    let mut i: int = 0;
-    while i < registry.length {
-        let mut entry: map = {};
-        if type(registry[i]) == "map" {
-            let coerced: map = registry[i];
-            entry = coerced;
-        }
-        let name: string = types::map_string(entry, "name", "");
-        if name.length > 0 {
-            let counted: map = find_named(registry, name);
-            if counted.matches > 1 {
+    if registry.length > 64 {
+        dup = true;
+    } else {
+        let mut comparisons: int = 0;
+        let mut i: int = 0;
+        while i < registry.length {
+            if i < 0 {
                 dup = true;
+                break;
             }
+            if registry.has(i) == false {
+                break;
+            }
+            let mut left: map = {};
+            if type(registry[i]) == "map" {
+                let coerced: map = registry[i];
+                left = coerced;
+            }
+            let name: string = types::map_string(left, "name", "");
+            if name.length > 0 {
+                let mut j: int = i + 1;
+                while j < registry.length {
+                    if j < 0 {
+                        dup = true;
+                        break;
+                    }
+                    comparisons = comparisons + 1;
+                    if comparisons > 64 * 64 {
+                        dup = true;
+                        break;
+                    }
+                    if registry.has(j) == false {
+                        break;
+                    }
+                    let mut right: map = {};
+                    if type(registry[j]) == "map" {
+                        let other: map = registry[j];
+                        right = other;
+                    }
+                    if types::map_string(right, "name", "") == name {
+                        dup = true;
+                    }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
         }
-        i = i + 1;
     }
     dup
 }
