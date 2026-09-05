@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::config_file::{
-    BoundedReadError, YamlBoundsError, read_bounded_bytes, validate_yaml_bounds,
+    BoundedReadError, YamlBoundsError, YamlPreflightError, parse_yaml_value, preflight_yaml,
+    read_bounded_bytes,
 };
 
 /// Maximum bytes read from `auth.yaml` before parsing is attempted.
@@ -118,19 +119,17 @@ impl AuthConfig {
     }
 
     fn from_yaml_bytes(path: &Path, bytes: &[u8]) -> Result<Self, AuthConfigError> {
-        let value: Value =
-            serde_yaml::from_slice(bytes).map_err(|error| AuthConfigError::MalformedYaml {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-        validate_yaml_bounds(&value)
-            .map_err(|error| AuthConfigError::from_yaml_bounds(path, error))?;
+        preflight_yaml(bytes).map_err(|error| AuthConfigError::from_yaml_preflight(path, error))?;
+        let value: Value = parse_yaml_value(bytes).map_err(|_| AuthConfigError::MalformedYaml {
+            path: path.to_path_buf(),
+            message: "invalid YAML syntax".to_string(),
+        })?;
         validate_auth_shape(path, &value)?;
         let config: Self =
-            serde_yaml::from_value(value).map_err(|error| AuthConfigError::InvalidValue {
+            serde_yaml::from_value(value).map_err(|_| AuthConfigError::InvalidValue {
                 path: path.to_path_buf(),
                 field: "document".to_string(),
-                message: error.to_string(),
+                message: "document does not match the auth schema".to_string(),
             })?;
         config.validate(path)?;
         Ok(config)
@@ -376,6 +375,9 @@ pub enum AuthConfigError {
         path: String,
         max_nodes: usize,
     },
+    MultipleDocuments {
+        path: PathBuf,
+    },
     InvalidRoot {
         path: PathBuf,
     },
@@ -407,6 +409,19 @@ impl AuthConfigError {
             BoundedReadError::FileTooLarge { path, max_bytes } => {
                 Self::FileTooLarge { path, max_bytes }
             }
+        }
+    }
+
+    fn from_yaml_preflight(path: &Path, error: YamlPreflightError) -> Self {
+        match error {
+            YamlPreflightError::Malformed => Self::MalformedYaml {
+                path: path.to_path_buf(),
+                message: "invalid YAML syntax".to_string(),
+            },
+            YamlPreflightError::MultipleDocuments => Self::MultipleDocuments {
+                path: path.to_path_buf(),
+            },
+            YamlPreflightError::Bounds(error) => Self::from_yaml_bounds(path, error),
         }
     }
 
@@ -462,6 +477,11 @@ impl fmt::Display for AuthConfigError {
             Self::YamlTooComplex { path, max_nodes } => write!(
                 formatter,
                 "YAML path {path} exceeds the {max_nodes}-node limit"
+            ),
+            Self::MultipleDocuments { path } => write!(
+                formatter,
+                "auth file {} contains multiple YAML documents",
+                path.display()
             ),
             Self::InvalidRoot { path } => {
                 write!(

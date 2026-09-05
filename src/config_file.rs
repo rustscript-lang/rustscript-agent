@@ -4,7 +4,7 @@
 //! material is deliberately kept in [`crate::auth::config`]; the two schemas
 //! are parsed and validated independently before their references are joined.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use url::Url;
+use yaml_rust2::parser::{Event, Parser};
 
 use crate::auth::config::{AuthConfig, AuthConfigError};
 
@@ -347,20 +348,18 @@ impl ConfigFile {
     }
 
     fn from_yaml_bytes(path: &Path, bytes: &[u8]) -> Result<Self, ConfigFileError> {
-        let value: Value =
-            serde_yaml::from_slice(bytes).map_err(|error| ConfigFileError::MalformedYaml {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-        validate_yaml_bounds(&value)
-            .map_err(|error| ConfigFileError::from_yaml_bounds(path, error))?;
+        preflight_yaml(bytes).map_err(|error| ConfigFileError::from_yaml_preflight(path, error))?;
+        let value: Value = parse_yaml_value(bytes).map_err(|_| ConfigFileError::MalformedYaml {
+            path: path.to_path_buf(),
+            message: "invalid YAML syntax".to_string(),
+        })?;
         reject_secret_keys_recursive(path, &value, "root")?;
         validate_config_shape(path, &value)?;
         let config: Self =
-            serde_yaml::from_value(value).map_err(|error| ConfigFileError::InvalidValue {
+            serde_yaml::from_value(value).map_err(|_| ConfigFileError::InvalidValue {
                 path: path.to_path_buf(),
                 field: "document".to_string(),
-                message: error.to_string(),
+                message: "document does not match the config schema".to_string(),
             })?;
         config.validate(path)?;
         Ok(config)
@@ -419,10 +418,12 @@ impl ConfigFile {
                     "must not be blank",
                 ));
             }
-            validate_https_url(
+            validate_provider_url(
                 &provider.base_url,
                 source,
                 &format!("providers.{provider_name}.base_url"),
+                provider_name,
+                ProviderUrlKind::Base,
                 false,
             )?;
             if let Some(auth) = provider.auth.as_deref() {
@@ -505,21 +506,46 @@ fn validate_oauth(
     if let Some(client_id) = oauth.client_id.as_deref() {
         validate_visible(client_id, source, &format!("{prefix}.client_id"))?;
     }
-    for (field, value) in [
-        ("issuer", oauth.issuer.as_deref()),
-        ("token_endpoint", oauth.token_endpoint.as_deref()),
+    for (field, kind, value) in [
+        ("issuer", ProviderUrlKind::Issuer, oauth.issuer.as_deref()),
+        (
+            "token_endpoint",
+            ProviderUrlKind::TokenEndpoint,
+            oauth.token_endpoint.as_deref(),
+        ),
     ] {
         if let Some(value) = value {
-            validate_https_url(value, source, &format!("{prefix}.{field}"), false)?;
+            validate_provider_url(
+                value,
+                source,
+                &format!("{prefix}.{field}"),
+                provider_name,
+                kind,
+                false,
+            )?;
         }
     }
     if let Some(redirect_uri) = oauth.redirect_uri.as_deref() {
-        validate_https_url(
+        validate_provider_url(
             redirect_uri,
             source,
             &format!("{prefix}.redirect_uri"),
+            provider_name,
+            ProviderUrlKind::RedirectUri,
             true,
         )?;
+    }
+    for (field, value) in [
+        (
+            "device_user_code_path",
+            oauth.device_user_code_path.as_deref(),
+        ),
+        ("device_poll_path", oauth.device_poll_path.as_deref()),
+        ("authorization_path", oauth.authorization_path.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_relative_endpoint(value, source, &format!("{prefix}.{field}"))?;
+        }
     }
     if oauth.refresh_skew_seconds > 86_400 {
         return Err(invalid_value(
@@ -531,27 +557,23 @@ fn validate_oauth(
     Ok(())
 }
 
-fn validate_https_url(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderUrlKind {
+    Base,
+    Issuer,
+    TokenEndpoint,
+    RedirectUri,
+}
+
+fn validate_provider_url(
     value: &str,
     source: &Path,
     field: &str,
+    provider_name: &str,
+    kind: ProviderUrlKind,
     allow_loopback_http: bool,
 ) -> Result<(), ConfigFileError> {
-    let url = Url::parse(value).map_err(|error| ConfigFileError::InvalidValue {
-        path: source.to_path_buf(),
-        field: field.to_string(),
-        message: format!("invalid URL: {error}"),
-    })?;
-    let loopback = url
-        .host_str()
-        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
-    let http_allowed = allow_loopback_http && url.scheme() == "http" && loopback;
-    if url.scheme() != "https" && !http_allowed {
-        return Err(ConfigFileError::HttpsRequired {
-            path: field.to_string(),
-            scheme: url.scheme().to_string(),
-        });
-    }
+    let url = Url::parse(value).map_err(|_| invalid_value(source, field, "invalid URL"))?;
     if url.username() != "" || url.password().is_some() {
         return Err(invalid_value(
             source,
@@ -566,10 +588,114 @@ fn validate_https_url(
             "URL must not contain a query or fragment",
         ));
     }
-    if url.host_str().is_none() {
-        return Err(invalid_value(source, field, "URL must contain a host"));
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid_value(source, field, "URL must contain a host"))?;
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+    if url.scheme() == "http" && allow_loopback_http && loopback {
+        if url.port().is_none_or(|port| port == 0) {
+            return Err(invalid_value(
+                source,
+                field,
+                "loopback callback must specify a nonzero listener port",
+            ));
+        }
+        return Ok(());
+    }
+    if url.scheme() != "https" {
+        return Err(ConfigFileError::HttpsRequired {
+            path: field.to_string(),
+            scheme: url.scheme().to_string(),
+        });
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| invalid_value(source, field, "URL must use a known HTTPS port"))?;
+
+    // Task 1 treats YAML as the operator-selected static authority. Built-in
+    // Codex authorities are fixed here; custom provider names retain their
+    // explicitly configured HTTPS authority. Every later runtime request must
+    // enforce the same policy again instead of accepting an RSS-supplied URL.
+    if let Some((expected_host, expected_port)) = provider_authority(provider_name, kind)
+        && (host != expected_host || port != expected_port)
+    {
+        return Err(ConfigFileError::ProviderAuthorityNotAllowed {
+            path: field.to_string(),
+            provider: provider_name.to_string(),
+            authority: format!("{host}:{port}"),
+            expected: format!("{expected_host}:{expected_port}"),
+        });
     }
     Ok(())
+}
+
+fn provider_authority(provider_name: &str, kind: ProviderUrlKind) -> Option<(&'static str, u16)> {
+    if provider_name != "openai-codex" {
+        return None;
+    }
+    Some(match kind {
+        ProviderUrlKind::Base => ("chatgpt.com", 443),
+        ProviderUrlKind::Issuer | ProviderUrlKind::TokenEndpoint | ProviderUrlKind::RedirectUri => {
+            ("auth.openai.com", 443)
+        }
+    })
+}
+
+fn validate_relative_endpoint(
+    value: &str,
+    source: &Path,
+    field: &str,
+) -> Result<(), ConfigFileError> {
+    let invalid = || invalid_value(source, field, "must be a strict relative endpoint path");
+    if value.is_empty()
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains('\\')
+        || value.contains('?')
+        || value.contains('#')
+        || value.contains("//")
+        || value
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."))
+        || has_forbidden_percent_escape(value)
+    {
+        return Err(invalid());
+    }
+    validate_visible(value, source, field).map_err(|_| invalid())?;
+    let base = Url::parse("https://endpoint.invalid/").map_err(|_| invalid())?;
+    let joined = base.join(value).map_err(|_| invalid())?;
+    if joined.host_str() != Some("endpoint.invalid")
+        || joined.query().is_some()
+        || joined.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn has_forbidden_percent_escape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return true;
+        }
+        let Some(high) = (bytes[index + 1] as char).to_digit(16) else {
+            return true;
+        };
+        let Some(low) = (bytes[index + 2] as char).to_digit(16) else {
+            return true;
+        };
+        if matches!((high * 16 + low) as u8, b'.' | b'/' | b'\\' | b'?' | b'#') {
+            return true;
+        }
+        index += 3;
+    }
+    false
 }
 
 fn validate_absolute_workspace(
@@ -895,48 +1021,295 @@ pub(crate) enum YamlBoundsError {
     },
 }
 
-pub(crate) fn validate_yaml_bounds(value: &Value) -> Result<(), YamlBoundsError> {
-    let mut nodes = 0;
-    visit_yaml(value, "root", 0, &mut nodes)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum YamlPreflightError {
+    Malformed,
+    MultipleDocuments,
+    Bounds(YamlBoundsError),
 }
 
-fn visit_yaml(
-    value: &Value,
-    path: &str,
-    depth: usize,
-    nodes: &mut usize,
-) -> Result<(), YamlBoundsError> {
-    if depth > MAX_YAML_DEPTH {
-        return Err(YamlBoundsError::TooDeep {
-            path: path.to_string(),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct YamlSummary {
+    nodes: usize,
+    max_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YamlContainer {
+    Sequence,
+    Mapping,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct YamlFrame {
+    container: YamlContainer,
+    anchor: usize,
+    tagged: bool,
+    summary: YamlSummary,
+}
+
+struct YamlEventBudget {
+    documents: usize,
+    in_document: bool,
+    root: Option<YamlSummary>,
+    frames: Vec<YamlFrame>,
+    anchors: HashMap<usize, YamlSummary>,
+    nodes: usize,
+}
+
+impl YamlEventBudget {
+    fn new() -> Self {
+        Self {
+            documents: 0,
+            in_document: false,
+            root: None,
+            frames: Vec::new(),
+            anchors: HashMap::new(),
+            nodes: 0,
+        }
+    }
+
+    fn observe(&mut self, event: Event) -> Result<(), YamlPreflightError> {
+        match event {
+            Event::StreamStart => {
+                if self.documents != 0 || self.in_document || self.root.is_some() {
+                    return Err(YamlPreflightError::Malformed);
+                }
+            }
+            Event::DocumentStart => {
+                if self.in_document {
+                    return Err(YamlPreflightError::Malformed);
+                }
+                if self.documents != 0 {
+                    return Err(YamlPreflightError::MultipleDocuments);
+                }
+                self.documents = 1;
+                self.in_document = true;
+                self.root = None;
+                self.frames.clear();
+                self.anchors.clear();
+            }
+            Event::DocumentEnd => {
+                if !self.in_document || !self.frames.is_empty() || self.root.is_none() {
+                    return Err(YamlPreflightError::Malformed);
+                }
+                self.in_document = false;
+            }
+            Event::StreamEnd => {
+                if self.in_document || !self.frames.is_empty() || self.documents != 1 {
+                    return Err(YamlPreflightError::Malformed);
+                }
+            }
+            Event::Scalar(_, _, anchor, tag) => {
+                self.ensure_in_document()?;
+                let summary = Self::tagged_summary(tag.is_some())?;
+                self.reserve(summary.nodes)?;
+                self.ensure_depth(summary.max_depth)?;
+                self.complete_node(summary)?;
+                if anchor != 0 {
+                    self.anchors.insert(anchor, summary);
+                }
+            }
+            Event::Alias(anchor) => {
+                self.ensure_in_document()?;
+                let summary = *self
+                    .anchors
+                    .get(&anchor)
+                    .ok_or(YamlPreflightError::Malformed)?;
+                self.reserve(summary.nodes)?;
+                self.ensure_depth(summary.max_depth)?;
+                self.complete_node(summary)?;
+            }
+            Event::SequenceStart(anchor, tag) => {
+                self.start_container(YamlContainer::Sequence, anchor, tag.is_some())?;
+            }
+            Event::MappingStart(anchor, tag) => {
+                self.start_container(YamlContainer::Mapping, anchor, tag.is_some())?;
+            }
+            Event::SequenceEnd => self.end_container(YamlContainer::Sequence)?,
+            Event::MappingEnd => self.end_container(YamlContainer::Mapping)?,
+            Event::Nothing => return Err(YamlPreflightError::Malformed),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), YamlPreflightError> {
+        if self.in_document || !self.frames.is_empty() || self.documents != 1 {
+            return Err(YamlPreflightError::Malformed);
+        }
+        Ok(())
+    }
+
+    fn ensure_in_document(&self) -> Result<(), YamlPreflightError> {
+        if self.in_document {
+            Ok(())
+        } else {
+            Err(YamlPreflightError::Malformed)
+        }
+    }
+
+    fn start_container(
+        &mut self,
+        container: YamlContainer,
+        anchor: usize,
+        tagged: bool,
+    ) -> Result<(), YamlPreflightError> {
+        self.ensure_in_document()?;
+        let summary_depth = usize::from(tagged);
+        self.ensure_depth(summary_depth)?;
+        let base_nodes = if tagged { 2 } else { 1 };
+        self.reserve(base_nodes)?;
+        self.frames.push(YamlFrame {
+            container,
+            anchor,
+            tagged,
+            summary: YamlSummary {
+                nodes: 1,
+                max_depth: 0,
+            },
+        });
+        Ok(())
+    }
+
+    fn end_container(&mut self, expected: YamlContainer) -> Result<(), YamlPreflightError> {
+        self.ensure_in_document()?;
+        let frame = self.frames.pop().ok_or(YamlPreflightError::Malformed)?;
+        if frame.container != expected {
+            return Err(YamlPreflightError::Malformed);
+        }
+        let summary = if frame.tagged {
+            YamlSummary {
+                nodes: frame
+                    .summary
+                    .nodes
+                    .checked_add(1)
+                    .ok_or_else(|| self.too_many_nodes())?,
+                max_depth: frame
+                    .summary
+                    .max_depth
+                    .checked_add(1)
+                    .ok_or_else(|| self.too_deep())?,
+            }
+        } else {
+            frame.summary
+        };
+        self.ensure_depth(summary.max_depth)?;
+        if frame.anchor != 0 {
+            self.anchors.insert(frame.anchor, summary);
+        }
+        self.complete_node(summary)
+    }
+
+    fn complete_node(&mut self, summary: YamlSummary) -> Result<(), YamlPreflightError> {
+        if let Some(frame) = self.frames.last() {
+            let nodes = frame
+                .summary
+                .nodes
+                .checked_add(summary.nodes)
+                .ok_or_else(|| self.too_many_nodes())?;
+            let max_depth = frame
+                .summary
+                .max_depth
+                .max(summary.max_depth.saturating_add(1));
+            if max_depth > MAX_YAML_DEPTH {
+                return Err(self.too_deep());
+            }
+            let Some(frame) = self.frames.last_mut() else {
+                return Err(YamlPreflightError::Malformed);
+            };
+            frame.summary.nodes = nodes;
+            frame.summary.max_depth = max_depth;
+        } else if self.root.replace(summary).is_some() {
+            return Err(YamlPreflightError::Malformed);
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self, nodes: usize) -> Result<(), YamlPreflightError> {
+        self.nodes = self
+            .nodes
+            .checked_add(nodes)
+            .ok_or_else(|| self.too_many_nodes())?;
+        if self.nodes > MAX_YAML_NODES {
+            return Err(self.too_many_nodes());
+        }
+        Ok(())
+    }
+
+    fn ensure_depth(&self, relative_depth: usize) -> Result<(), YamlPreflightError> {
+        let depth = self
+            .frames
+            .len()
+            .checked_add(relative_depth)
+            .ok_or_else(|| self.too_deep())?;
+        if depth > MAX_YAML_DEPTH {
+            return Err(self.too_deep_at(depth));
+        }
+        Ok(())
+    }
+
+    fn tagged_summary(tagged: bool) -> Result<YamlSummary, YamlPreflightError> {
+        if tagged {
+            Ok(YamlSummary {
+                nodes: 2,
+                max_depth: 1,
+            })
+        } else {
+            Ok(YamlSummary {
+                nodes: 1,
+                max_depth: 0,
+            })
+        }
+    }
+
+    fn too_many_nodes(&self) -> YamlPreflightError {
+        YamlPreflightError::Bounds(YamlBoundsError::TooManyNodes {
+            path: "root".to_string(),
+            max_nodes: MAX_YAML_NODES,
+        })
+    }
+
+    fn too_deep(&self) -> YamlPreflightError {
+        self.too_deep_at(self.frames.len())
+    }
+
+    fn too_deep_at(&self, depth: usize) -> YamlPreflightError {
+        YamlPreflightError::Bounds(YamlBoundsError::TooDeep {
+            path: "root".to_string(),
             depth,
             max_depth: MAX_YAML_DEPTH,
-        });
+        })
     }
-    *nodes = nodes.saturating_add(1);
-    if *nodes > MAX_YAML_NODES {
-        return Err(YamlBoundsError::TooManyNodes {
-            path: path.to_string(),
-            max_nodes: MAX_YAML_NODES,
-        });
-    }
-    match value {
-        Value::Mapping(mapping) => {
-            for (key, value) in mapping {
-                visit_yaml(key, path, depth + 1, nodes)?;
-                let key = key.as_str().unwrap_or("<non-string-key>");
-                visit_yaml(value, &format!("{path}.{key}"), depth + 1, nodes)?;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct YamlValueParseError;
+
+pub(crate) fn parse_yaml_value(bytes: &[u8]) -> Result<Value, YamlValueParseError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        serde_yaml::from_slice::<Value>(bytes)
+    }))
+    .map_err(|_| YamlValueParseError)?
+    .map_err(|_| YamlValueParseError)
+}
+
+pub(crate) fn preflight_yaml(bytes: &[u8]) -> Result<(), YamlPreflightError> {
+    let source = std::str::from_utf8(bytes).map_err(|_| YamlPreflightError::Malformed)?;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut parser = Parser::new_from_str(source);
+        let mut budget = YamlEventBudget::new();
+        loop {
+            let (event, _) = parser
+                .next_token()
+                .map_err(|_| YamlPreflightError::Malformed)?;
+            let stream_end = matches!(event, Event::StreamEnd);
+            budget.observe(event)?;
+            if stream_end {
+                return budget.finish();
             }
         }
-        Value::Sequence(sequence) => {
-            for (index, value) in sequence.iter().enumerate() {
-                visit_yaml(value, &format!("{path}[{index}]"), depth + 1, nodes)?;
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-        _ => {}
-    }
-    Ok(())
+    }))
+    .unwrap_or(Err(YamlPreflightError::Malformed))
 }
 
 /// A successful pair load is the only operation in this task that combines
@@ -968,6 +1341,9 @@ pub enum ConfigFileError {
         path: String,
         max_nodes: usize,
     },
+    MultipleDocuments {
+        path: PathBuf,
+    },
     InvalidRoot {
         path: PathBuf,
     },
@@ -991,6 +1367,12 @@ pub enum ConfigFileError {
     HttpsRequired {
         path: String,
         scheme: String,
+    },
+    ProviderAuthorityNotAllowed {
+        path: String,
+        provider: String,
+        authority: String,
+        expected: String,
     },
     InvalidProviderReference {
         path: String,
@@ -1018,6 +1400,19 @@ impl ConfigFileError {
             BoundedReadError::FileTooLarge { path, max_bytes } => {
                 Self::FileTooLarge { path, max_bytes }
             }
+        }
+    }
+
+    fn from_yaml_preflight(path: &Path, error: YamlPreflightError) -> Self {
+        match error {
+            YamlPreflightError::Malformed => Self::MalformedYaml {
+                path: path.to_path_buf(),
+                message: "invalid YAML syntax".to_string(),
+            },
+            YamlPreflightError::MultipleDocuments => Self::MultipleDocuments {
+                path: path.to_path_buf(),
+            },
+            YamlPreflightError::Bounds(error) => Self::from_yaml_bounds(path, error),
         }
     }
 
@@ -1074,6 +1469,11 @@ impl fmt::Display for ConfigFileError {
                 formatter,
                 "YAML path {path} exceeds the {max_nodes}-node limit"
             ),
+            Self::MultipleDocuments { path } => write!(
+                formatter,
+                "config file {} contains multiple YAML documents",
+                path.display()
+            ),
             Self::InvalidRoot { path } => write!(
                 formatter,
                 "config document root must be a mapping: {}",
@@ -1103,6 +1503,15 @@ impl fmt::Display for ConfigFileError {
             Self::HttpsRequired { path, scheme } => {
                 write!(formatter, "config URL {path} must use HTTPS (got {scheme})")
             }
+            Self::ProviderAuthorityNotAllowed {
+                path,
+                provider,
+                authority,
+                expected,
+            } => write!(
+                formatter,
+                "provider authority for {provider:?} at {path} is not allowed: {authority:?}; expected {expected:?}"
+            ),
             Self::InvalidProviderReference { path, provider } => write!(
                 formatter,
                 "config field {path} references unknown provider {provider:?}"
