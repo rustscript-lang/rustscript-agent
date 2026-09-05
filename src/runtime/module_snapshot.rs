@@ -1227,7 +1227,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn run_fifo_case(case: &str, root: &Path) {
-        let _ = fs::remove_dir_all(root);
         fs::create_dir_all(root).expect("fifo case root");
         match case {
             "irrelevant-tree" => {
@@ -1309,39 +1308,69 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "run by fifo_special_files_are_bounded in an isolated child"]
+    fn fifo_irrelevant_tree_child() {
+        let root = std::env::current_dir().expect("FIFO case root");
+        run_fifo_case("irrelevant-tree", &root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by fifo_special_files_are_bounded in an isolated child"]
+    fn fifo_rss_entry_child() {
+        let root = std::env::current_dir().expect("FIFO case root");
+        run_fifo_case("rss-fifo", &root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by fifo_special_files_are_bounded in an isolated child"]
+    fn fifo_ancestor_child() {
+        let root = std::env::current_dir().expect("FIFO case root");
+        run_fifo_case("ancestor-fifo", &root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by fifo_special_files_are_bounded in an isolated child"]
+    fn fifo_cleanup_child() {
+        let root = std::env::current_dir().expect("FIFO case root");
+        run_fifo_case("cleanup-fifo", &root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn fifo_special_files_are_bounded() {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
-        const CASE_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_CASE";
-        const ROOT_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_ROOT";
-        const CASES: [&str; 4] = [
-            "irrelevant-tree",
-            "rss-fifo",
-            "ancestor-fifo",
-            "cleanup-fifo",
+        const CASES: [(&str, &str); 4] = [
+            (
+                "irrelevant-tree",
+                "runtime::module_snapshot::tests::fifo_irrelevant_tree_child",
+            ),
+            (
+                "rss-fifo",
+                "runtime::module_snapshot::tests::fifo_rss_entry_child",
+            ),
+            (
+                "ancestor-fifo",
+                "runtime::module_snapshot::tests::fifo_ancestor_child",
+            ),
+            (
+                "cleanup-fifo",
+                "runtime::module_snapshot::tests::fifo_cleanup_child",
+            ),
         ];
 
-        if let Some(case) = std::env::var_os(CASE_ENV) {
-            let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("FIFO case root"));
-            run_fifo_case(&case.to_string_lossy(), &root);
-            return;
-        }
-
-        for case in CASES {
+        for (case, child_test) in CASES {
             let root = test_root(&format!("fifo-{case}"));
-            let _ = fs::remove_dir_all(&root);
             let mut child = Command::new(std::env::current_exe().expect("test executable path"))
-                .args([
-                    "--exact",
-                    "runtime::module_snapshot::tests::fifo_special_files_are_bounded",
-                    "--nocapture",
-                ])
-                .env(CASE_ENV, case)
-                .env(ROOT_ENV, &root)
+                .args(["--exact", child_test, "--nocapture", "--ignored"])
+                .current_dir(&root)
                 .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
                 .expect("FIFO child should start");
             let deadline = Instant::now() + Duration::from_secs(3);
