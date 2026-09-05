@@ -1,5 +1,5 @@
-//! Task 10 edge E2E: stop-during-terminal, output-limit, and durable provider
-//! recovery through production AgentService + bundled RSS + native tools.
+//! Edge E2E: stop-during-terminal, output-limit, and durable provider
+//! recovery through production AgentService + bundled RSS + RSS tools.
 //!
 //! `ScriptedProvider` is injected as the inner model transport. Production
 //! `DurableProviderHost` commits provider steps, replays completed turns, and

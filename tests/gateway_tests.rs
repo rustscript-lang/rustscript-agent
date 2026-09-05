@@ -210,13 +210,29 @@ async fn run_returns_202_and_sse_contains_terminal_events() {
         .await
         .expect("SSE body should be readable");
     let text = String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8");
-    assert!(text.contains("message.delta"));
-    assert!(text.contains("run.completed"));
-    assert!(text.contains("\"delta\""));
-    assert!(text.contains("\"output\""));
-    assert!(text.contains("\"usage\""));
-    assert!(!text.contains("\"data\":{\"delta\""));
-    assert!(text.contains(run_id));
+    let events: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("event: "))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "run.started",
+            "model.requested",
+            "model.failed",
+            "run.failed"
+        ],
+        "default bundled main.rss SSE events: {text}"
+    );
+    assert!(text.contains("\"error_code\":\"adapter_failed\""), "{text}");
+    assert!(text.contains("\"error_code\":\"agent_failed\""), "{text}");
+    assert!(
+        text.contains(
+            "\"error_message\":\"run host failure: invalid HTTP URL: relative URL without a base\""
+        ),
+        "{text}"
+    );
+    assert!(text.contains(run_id), "{text}");
 }
 
 #[tokio::test]

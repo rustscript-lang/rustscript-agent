@@ -2,6 +2,7 @@
 
 pub(crate) mod agent_host;
 pub(crate) mod delivery;
+pub(crate) mod module_snapshot;
 pub mod rss_runner;
 
 pub use agent_host::{

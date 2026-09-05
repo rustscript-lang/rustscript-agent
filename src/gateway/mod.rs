@@ -42,28 +42,7 @@ pub struct AgentGatewayState {
 
 impl AgentGatewayState {
     pub fn new(config: AgentGatewayConfig) -> Result<Self, String> {
-        let http_config = config.http.clone();
-        config
-            .validate()
-            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
-        let store = Arc::new(RwLock::new(store::GatewayStore::default()));
-        let metrics = Arc::new(Metrics::default());
-        let service = Arc::new(AgentService::new(
-            Arc::new(config),
-            Arc::clone(&store),
-            None,
-            None,
-            http_config.clone(),
-            Arc::clone(&metrics),
-        ));
-        Ok(Self {
-            config: Arc::clone(service.config()),
-            store,
-            service,
-            agent_source: None,
-            http_config,
-            metrics,
-        })
+        Self::with_agent_file(config, crate::bundled_agent_main_path())
     }
 
     pub fn with_agent_source(
@@ -258,39 +237,7 @@ impl AgentGatewayState {
         config: AgentGatewayConfig,
         path: impl AsRef<FsPath>,
     ) -> Result<Self, String> {
-        let http_config = config.http.clone();
-        config
-            .validate()
-            .map_err(|error| format!("invalid gateway configuration: {error}"))?;
-        let metrics = Arc::new(Metrics::default());
-        let persistence = Arc::new(
-            store::GatewayPersistence::open_with_metrics(
-                &config,
-                path.as_ref(),
-                Arc::clone(&metrics),
-            )
-            .map_err(|error| format!("open gateway SQLite state: {error}"))?,
-        );
-        let loaded_store = persistence
-            .load()
-            .map_err(|error| format!("load gateway SQLite state: {error}"))?;
-        let store = Arc::new(RwLock::new(loaded_store));
-        let service = Arc::new(AgentService::new(
-            Arc::new(config),
-            Arc::clone(&store),
-            Some(persistence),
-            None,
-            http_config.clone(),
-            Arc::clone(&metrics),
-        ));
-        Ok(Self {
-            config: Arc::clone(service.config()),
-            store,
-            service,
-            agent_source: None,
-            http_config,
-            metrics,
-        })
+        Self::with_agent_file_and_sqlite(config, crate::bundled_agent_main_path(), path)
     }
 
     pub fn service(&self) -> Arc<AgentService> {

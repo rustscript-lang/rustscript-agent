@@ -17,7 +17,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -47,9 +47,6 @@ use serde_json::json;
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
 pub const COMPILE_CACHE_CAP: usize = 8;
-const MAX_TREE_FILES: usize = 256;
-const MAX_TREE_DEPTH: usize = 16;
-const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
 const COMPILE_TREE_RETRIES: usize = 4;
 
 struct ProgramLru {
@@ -105,127 +102,10 @@ fn tree_error(message: &'static str) -> AgentError {
     AgentError::Compile(message.to_string())
 }
 
-fn module_tree_root(entry: &Path) -> Result<PathBuf> {
-    let parent = entry
-        .parent()
-        .ok_or_else(|| tree_error("module tree walk failed"))?;
-    let mut current = parent;
-    loop {
-        if current.file_name().and_then(|name| name.to_str()) == Some("rss") {
-            return Ok(current.to_path_buf());
-        }
-        match current.parent() {
-            Some(next) if next != current => current = next,
-            _ => return Ok(parent.to_path_buf()),
-        }
-    }
-}
-
-fn relative_posix(root: &Path, file: &Path) -> Result<String> {
-    let relative = file
-        .strip_prefix(root)
-        .map_err(|_| tree_error("module tree walk failed"))?;
-    let mut out = String::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(part) => {
-                let part = part
-                    .to_str()
-                    .ok_or_else(|| tree_error("module tree file is not valid UTF-8"))?;
-                if !out.is_empty() {
-                    out.push('/');
-                }
-                out.push_str(part);
-            }
-            _ => return Err(tree_error("module tree walk failed")),
-        }
-    }
-    Ok(out)
-}
-
-struct TreeFile {
-    rel: String,
-    bytes: Vec<u8>,
-}
-
 fn snapshot_module_tree(entry: &Path) -> Result<String> {
-    let root = module_tree_root(entry)?;
-    let mut files = Vec::new();
-    let mut total_bytes = 0_usize;
-    walk_module_tree(&root, &root, 0, &mut files, &mut total_bytes)?;
-    files.sort_by(|left, right| left.rel.as_bytes().cmp(right.rel.as_bytes()));
-    let entry_rel = relative_posix(&root, entry)?;
-    let mut material = Vec::new();
-    for file in &files {
-        material.extend_from_slice(&(file.rel.len() as u64).to_le_bytes());
-        material.extend_from_slice(file.rel.as_bytes());
-        material.extend_from_slice(&(file.bytes.len() as u64).to_le_bytes());
-        material.extend_from_slice(&file.bytes);
-    }
-    material.extend_from_slice(&(entry_rel.len() as u64).to_le_bytes());
-    material.extend_from_slice(entry_rel.as_bytes());
-    Ok(sha256_hex(&material))
-}
-
-fn walk_module_tree(
-    root: &Path,
-    path: &Path,
-    depth: usize,
-    files: &mut Vec<TreeFile>,
-    total_bytes: &mut usize,
-) -> Result<()> {
-    if depth > MAX_TREE_DEPTH {
-        return Err(tree_error("module tree exceeds the depth bound"));
-    }
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|_| tree_error("module tree walk failed"))?;
-    if metadata.file_type().is_symlink() {
-        return Err(tree_error("module tree contains a symlink"));
-    }
-    if metadata.is_dir() {
-        let entries = std::fs::read_dir(path).map_err(|_| tree_error("module tree walk failed"))?;
-        let mut children = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|_| tree_error("module tree walk failed"))?;
-            children.push(entry.path());
-        }
-        children.sort();
-        for child in children {
-            walk_module_tree(root, &child, depth.saturating_add(1), files, total_bytes)?;
-        }
-        return Ok(());
-    }
-    if !metadata.is_file() {
-        return Err(tree_error("module tree walk failed"));
-    }
-    if path.extension().and_then(|ext| ext.to_str()) != Some("rss") {
-        return Ok(());
-    }
-    if files.len() >= MAX_TREE_FILES {
-        return Err(tree_error("module tree exceeds the file count bound"));
-    }
-    let len = metadata.len() as usize;
-    if len > MAX_AGENT_SOURCE_BYTES {
-        return Err(AgentError::Compile(format!(
-            "agent source exceeds {} bytes",
-            MAX_AGENT_SOURCE_BYTES
-        )));
-    }
-    *total_bytes = total_bytes
-        .checked_add(len)
-        .ok_or_else(|| tree_error("module tree exceeds the byte bound"))?;
-    if *total_bytes > MAX_TREE_BYTES {
-        return Err(tree_error("module tree exceeds the byte bound"));
-    }
-    let bytes = std::fs::read(path).map_err(|_| tree_error("module tree walk failed"))?;
-    if std::str::from_utf8(&bytes).is_err() {
-        return Err(tree_error("module tree file is not valid UTF-8"));
-    }
-    files.push(TreeFile {
-        rel: relative_posix(root, path)?,
-        bytes,
-    });
-    Ok(())
+    // Whole allowed-root digest: compiler resolution is restricted to that
+    // root, so this includes exactly all possible compiler inputs.
+    super::module_snapshot::module_tree_digest(entry)
 }
 
 fn compiled_source_program(source: &str) -> Result<rustscript_vm::Program> {

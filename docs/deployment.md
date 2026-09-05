@@ -88,8 +88,10 @@ Startup failure modes (all exit non-zero before serving):
 - a blank `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN` or an invalid
   `RUSTSCRIPT_AGENT_TELEGRAM_API_BASE` (non-https remote origin, embedded
   credentials, query, fragment, or path);
-- unreadable `RUSTSCRIPT_AGENT_SCRIPT` or a source over 1 MiB / failing to
-  compile;
+- unreadable `RUSTSCRIPT_AGENT_SCRIPT` entry file, a module tree that cannot
+  be snapshotted (symlink, oversize, import that escapes the allowed root),
+  or a tree that fails to compile; when unset the bundled `rss/agent/main.rss`
+  is installed;
 - an unwritable or invalid `RUSTSCRIPT_AGENT_STATE_DB` path.
 
 The legacy `PD_EDGE_AGENT_*` aliases still work but print a deprecation

@@ -77,8 +77,8 @@ use crate::runtime::rss_runner::{AgentConfig, AgentRunner, bundled_tool_registry
 use crate::tool_result::ToolResult;
 use crate::{AgentHostBridges, AgentProviderHost, RunCancellation, RunError};
 
-/// Typed outcome of bounded native-host cleanup. Never claims success when
-/// dispatcher or process residue could not be confirmed stopped.
+/// Typed outcome of bounded capability-host cleanup. Never claims success when
+/// process residue could not be confirmed stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupOutcome {
     Clean,
@@ -87,16 +87,13 @@ pub enum CleanupOutcome {
 }
 
 struct CachedAgentRunner {
-    source_digest: u64,
+    source_digest: String,
     config: AgentConfig,
     runner: AgentRunner,
 }
 
-fn agent_source_digest(source: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut hasher);
-    hasher.finish()
+fn agent_source_digest(source: &str) -> String {
+    crate::capabilities::sha256_hex(source.as_bytes())
 }
 
 fn failed_payload_with_code(code: &str, error: String) -> JsonValue {
@@ -1930,12 +1927,7 @@ impl AgentService {
             .clone()
         {
             let digest = crate::runtime::rss_runner::module_tree_digest(&entry)
-                .map(|hex| {
-                    hex.as_bytes().iter().fold(0u64, |acc, byte| {
-                        acc.wrapping_mul(16777619) ^ u64::from(*byte)
-                    })
-                })
-                .unwrap_or(0);
+                .map_err(|error| error.to_string())?;
             let mut cache = self.inner.runner.lock().expect("runner cache lock");
             if let Some(cached) = cache.as_ref()
                 && cached.source_digest == digest
@@ -1944,6 +1936,8 @@ impl AgentService {
                 return Ok(cached.runner.clone());
             }
             let runner = AgentRunner::from_file(&entry, expected.clone())
+                .map_err(|error| error.to_string())?;
+            let digest = crate::runtime::rss_runner::module_tree_digest(&entry)
                 .map_err(|error| error.to_string())?;
             *cache = Some(CachedAgentRunner {
                 source_digest: digest,
@@ -1980,13 +1974,29 @@ impl AgentService {
     }
 
     /// Install a precompiled runner so workers do not recompile the agent source.
+    /// Only a successful SHA-256 digest is stored; digest failure leaves the
+    /// cache empty so a later refresh cannot hit a stale runner.
     pub fn install_agent_runner(&self, runner: AgentRunner) {
-        let digest = self
+        let digest = if let Some(entry) = self
             .inner
-            .agent_source
-            .as_ref()
-            .map(|source| agent_source_digest(source))
-            .unwrap_or(0);
+            .agent_entry
+            .lock()
+            .expect("agent entry lock")
+            .clone()
+        {
+            match crate::runtime::rss_runner::module_tree_digest(&entry) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    *self.inner.runner.lock().expect("runner cache lock") = None;
+                    return;
+                }
+            }
+        } else if let Some(source) = self.inner.agent_source.as_ref() {
+            agent_source_digest(source)
+        } else {
+            *self.inner.runner.lock().expect("runner cache lock") = None;
+            return;
+        };
         *self.inner.runner.lock().expect("runner cache lock") = Some(CachedAgentRunner {
             source_digest: digest,
             config: runner.config().clone(),
@@ -2092,7 +2102,7 @@ impl AgentService {
             .expect("capability host init observer lock") = Some(observer);
     }
 
-    /// Test seam: later native `search_files` walks invoke `observer` when they
+    /// Test seam: later `search_files` walks invoke `observer` when they
     /// begin, so service tests can prove stop overlaps an in-flight search.
     pub fn inject_file_search_entered_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
         *self
@@ -2102,7 +2112,7 @@ impl AgentService {
             .expect("file search observer lock") = Some(observer);
     }
 
-    /// Test seam: later native-dispatch shutdown invokes `observer` before
+    /// Test seam: later capability-host shutdown invokes `observer` before
     /// process/artifact teardown, so service tests can overlap handle/stop/admit
     /// with an in-flight close.
     pub fn inject_capability_host_shutdown_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {

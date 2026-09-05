@@ -402,7 +402,6 @@ struct RssRun {
     result: Value,
     started: usize,
     artifacts: Option<Arc<ArtifactCapability>>,
-    durable: Arc<MemoryDurable>,
 }
 
 struct RssExec {
@@ -480,7 +479,6 @@ fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> Rs
         result: unwrap_committed(vm_value_to_json(&output)),
         started: exec.durable.started_len(),
         artifacts,
-        durable: exec.durable,
     }
 }
 
@@ -575,21 +573,113 @@ fn run_rss_search(fixture: &Fixture, config: &FileToolConfig, arguments: Value) 
     )
 }
 
-fn assert_read_eq(fixture: &Fixture, arguments: Value) {
+fn assert_read_eq(
+    fixture: &Fixture,
+    arguments: Value,
+    expected_ok: bool,
+    expected_content: &str,
+    expected_truncated: bool,
+    expected_error: Option<&str>,
+    expected_started: usize,
+) {
     let config = fixture.config();
-    let rss = run_rss_read(fixture, &config, arguments);
+    let rss = run_rss_read(fixture, &config, arguments.clone());
     assert_canonical_envelope(&rss.result);
-    if rss.result.get("ok") == Some(&json!(true)) {
-        assert!(rss.started > 0, "successful read must prepare");
+    assert_eq!(
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
+    );
+    assert_eq!(
+        rss.result["content"],
+        json!(expected_content),
+        "content arguments={arguments} rss={}",
+        rss.result
+    );
+    assert_eq!(
+        rss.result["truncated"],
+        json!(expected_truncated),
+        "truncated arguments={arguments} rss={}",
+        rss.result
+    );
+    match expected_error {
+        None => {
+            assert_eq!(
+                rss.result["error"],
+                Value::Null,
+                "error arguments={arguments} rss={}",
+                rss.result
+            );
+        }
+        Some(code) => {
+            assert_eq!(
+                rss.result["error"]["code"],
+                json!(code),
+                "error.code arguments={arguments} rss={}",
+                rss.result
+            );
+        }
     }
+    assert_eq!(
+        rss.started, expected_started,
+        "started arguments={arguments}"
+    );
 }
 
-fn assert_search_eq(fixture: &Fixture, arguments: Value) {
+fn assert_search_eq(
+    fixture: &Fixture,
+    arguments: Value,
+    expected_ok: bool,
+    expected_match_count: i64,
+    expected_files_visited: i64,
+    expected_truncated: bool,
+    expected_error: Option<&str>,
+) {
     let config = fixture.config();
     let rss = run_rss_search(fixture, &config, arguments.clone());
     assert_canonical_envelope(&rss.result);
-    if rss.result.get("ok") == Some(&json!(true)) {
-        assert!(rss.started > 0, "successful search must prepare");
+    assert_eq!(
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
+    );
+    assert_eq!(
+        rss.result["truncated"],
+        json!(expected_truncated),
+        "truncated arguments={arguments} rss={}",
+        rss.result
+    );
+    match expected_error {
+        None => {
+            assert_eq!(
+                rss.result["error"],
+                Value::Null,
+                "error arguments={arguments} rss={}",
+                rss.result
+            );
+            assert_eq!(
+                rss.result["data"]["match_count"],
+                json!(expected_match_count),
+                "match_count arguments={arguments} rss={}",
+                rss.result
+            );
+            assert_eq!(
+                rss.result["data"]["files_visited"],
+                json!(expected_files_visited),
+                "files_visited arguments={arguments} rss={}",
+                rss.result
+            );
+        }
+        Some(code) => {
+            assert_eq!(
+                rss.result["error"]["code"],
+                json!(code),
+                "error.code arguments={arguments} rss={}",
+                rss.result
+            );
+        }
     }
 }
 
@@ -662,18 +752,60 @@ fn read_defaults_offset_limit_empty_eof_and_multibyte_match_native() {
     fs::write(fixture.root.join("utf8.txt"), "你好\n世界\n").unwrap();
     fs::write(fixture.root.join("no-nl.txt"), "tail").unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "notes.txt"}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "notes.txt"}),
+        true,
+        "alpha\nbeta\ngamma\n",
+        false,
+        None,
+        1,
+    );
     assert_read_eq(
         &fixture,
         json!({"path": "notes.txt", "offset": 2, "limit": 1}),
+        true,
+        "beta\n",
+        false,
+        None,
+        1,
     );
     assert_read_eq(
         &fixture,
         json!({"path": "notes.txt", "offset": 4, "limit": 10}),
+        true,
+        "",
+        false,
+        None,
+        1,
     );
-    assert_read_eq(&fixture, json!({"path": "empty.txt"}));
-    assert_read_eq(&fixture, json!({"path": "utf8.txt"}));
-    assert_read_eq(&fixture, json!({"path": "no-nl.txt"}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "empty.txt"}),
+        true,
+        "",
+        false,
+        None,
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "utf8.txt"}),
+        true,
+        "你好\n世界\n",
+        false,
+        None,
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "no-nl.txt"}),
+        true,
+        "tail",
+        false,
+        None,
+        1,
+    );
 }
 
 #[test]
@@ -684,13 +816,69 @@ fn read_invalid_utf8_binary_missing_and_denied_paths_match_native() {
     fs::write(fixture.root.join("nul.bin"), [b'a', 0, b'b']).unwrap();
     fs::create_dir(fixture.root.join("dir")).unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "bad.bin"}));
-    assert_read_eq(&fixture, json!({"path": "nul.bin"}));
-    assert_read_eq(&fixture, json!({"path": "missing.txt"}));
-    assert_read_eq(&fixture, json!({"path": "dir"}));
-    assert_read_eq(&fixture, json!({"path": "../outside.txt"}));
-    assert_read_eq(&fixture, json!({"path": "/tmp/outside.txt"}));
-    assert_read_eq(&fixture, json!({"path": ""}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "bad.bin"}),
+        false,
+        "",
+        false,
+        Some("invalid_utf8"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "nul.bin"}),
+        false,
+        "",
+        false,
+        Some("binary_file"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "missing.txt"}),
+        false,
+        "",
+        false,
+        Some("not_found"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "dir"}),
+        false,
+        "",
+        false,
+        Some("wrong_type"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "../outside.txt"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "/tmp/outside.txt"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": ""}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
 }
 
 #[test]
@@ -706,8 +894,24 @@ fn read_symlink_leaf_and_intermediate_match_native() {
     symlink(fixture.root.join("nested"), fixture.root.join("dir-link")).unwrap();
     fs::write(fixture.root.join("nested/inner.txt"), "inner\n").unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "leaf-link"}));
-    assert_read_eq(&fixture, json!({"path": "dir-link/inner.txt"}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "leaf-link"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "dir-link/inner.txt"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        1,
+    );
 }
 
 #[test]
@@ -821,16 +1025,53 @@ fn search_content_glob_filename_hidden_and_order_match_native() {
     fs::write(fixture.root.join(".hidden/secret.rs"), "fn alpha() {}\n").unwrap();
     fs::write(fixture.root.join("z.md"), "alpha doc\n").unwrap();
 
-    assert_search_eq(&fixture, json!({"pattern": "alpha"}));
-    assert_search_eq(&fixture, json!({"pattern": "fn ", "file_glob": "*.rs"}));
-    assert_search_eq(&fixture, json!({"pattern": "*.rs", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha"}),
+        true,
+        4,
+        5,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "fn ", "file_glob": "*.rs"}),
+        true,
+        4,
+        5,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*.rs", "target": "files"}),
+        true,
+        3,
+        5,
+        false,
+        None,
+    );
     assert_search_eq(
         &fixture,
         json!({"pattern": "alpha", "path": "src", "limit": 1, "offset": 1}),
+        true,
+        1,
+        3,
+        false,
+        None,
     );
     // Frozen quirk: native content search is substring, not regex.
-    assert_search_eq(&fixture, json!({"pattern": "a.rs"}));
-    assert_search_eq(&fixture, json!({"pattern": "a.c"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "a.rs"}),
+        true,
+        0,
+        5,
+        false,
+        None,
+    );
+    assert_search_eq(&fixture, json!({"pattern": "a.c"}), true, 0, 5, false, None);
 }
 
 #[test]
@@ -846,14 +1087,48 @@ fn search_caps_invalid_paths_and_symlinks_match_native() {
     )
     .unwrap();
 
-    assert_search_eq(&fixture, json!({"pattern": ""}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "../outside"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "/tmp"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "missing"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": ""}),
+        false,
+        0,
+        0,
+        false,
+        Some("invalid_arguments"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "../outside"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "/tmp"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "missing"}),
+        false,
+        0,
+        0,
+        false,
+        Some("not_found"),
+    );
 
     let leaf_link_arguments = json!({"pattern": "alpha", "path": "leaf-link"});
     let rss_leaf_link = run_rss_search(&fixture, &fixture.config(), leaf_link_arguments);
     assert_canonical_envelope(&rss_leaf_link.result);
+    assert_eq!(rss_leaf_link.result["ok"], json!(false));
+    assert_eq!(rss_leaf_link.result["error"]["code"], json!("wrong_type"));
 
     let mut config = fixture.config();
     config.max_search_matches = 1;
@@ -954,13 +1229,37 @@ fn search_regex_metacharacters_are_literal_substrings() {
     .unwrap();
 
     // Frozen quirk: native content search is substring, not regex.
-    assert_search_eq(&fixture, json!({"pattern": "^alpha"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha$"}));
-    assert_search_eq(&fixture, json!({"pattern": "a.c"}));
-    assert_search_eq(&fixture, json!({"pattern": "a.*"}));
-    assert_search_eq(&fixture, json!({"pattern": "[ab]"}));
-    assert_search_eq(&fixture, json!({"pattern": "a+"}));
-    assert_search_eq(&fixture, json!({"pattern": "(?P"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "^alpha"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha$"}),
+        true,
+        0,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(&fixture, json!({"pattern": "a.c"}), true, 1, 2, false, None);
+    assert_search_eq(&fixture, json!({"pattern": "a.*"}), true, 0, 2, false, None);
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "[ab]"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(&fixture, json!({"pattern": "a+"}), true, 1, 2, false, None);
+    assert_search_eq(&fixture, json!({"pattern": "(?P"}), true, 1, 2, false, None);
 }
 
 #[test]
@@ -972,16 +1271,50 @@ fn search_glob_question_path_empty_and_filename_file_glob_match_native() {
     fs::write(fixture.root.join("src/c.txt"), "alpha text\n").unwrap();
     fs::write(fixture.root.join("ab.rs"), "fn ab() {}\n").unwrap();
 
-    assert_search_eq(&fixture, json!({"pattern": "?.rs", "target": "files"}));
-    assert_search_eq(&fixture, json!({"pattern": "src/*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "?.rs", "target": "files"}),
+        true,
+        2,
+        4,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "src/*", "target": "files"}),
+        true,
+        3,
+        4,
+        false,
+        None,
+    );
     assert_search_eq(
         &fixture,
         json!({"pattern": "*", "target": "files", "file_glob": "*.rs"}),
+        true,
+        3,
+        4,
+        false,
+        None,
     );
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": ""}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": ""}),
+        true,
+        0,
+        4,
+        false,
+        None,
+    );
     assert_search_eq(
         &fixture,
         json!({"pattern": "bogus-target", "target": "bogus"}),
+        true,
+        0,
+        4,
+        false,
+        None,
     );
 }
 
@@ -993,11 +1326,48 @@ fn search_nul_colon_backslash_and_limit_zero_match_native() {
     assert_search_eq(
         &fixture,
         json!({"pattern": "alpha", "path": "bad\u{0000}name"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
     );
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "a:b"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "a\\b"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "limit": 0}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "a.txt"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "a:b"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "a\\b"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "limit": 0}),
+        true,
+        0,
+        1,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "a.txt"}),
+        false,
+        0,
+        0,
+        false,
+        Some("wrong_type"),
+    );
 }
 
 #[test]
@@ -1005,12 +1375,41 @@ fn read_nul_colon_backslash_and_offset_zero_match_native() {
     let fixture = Fixture::new("read-paths");
     fs::write(fixture.root.join("notes.txt"), "alpha\nbeta\n").unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "bad\u{0000}name"}));
-    assert_read_eq(&fixture, json!({"path": "a:b"}));
-    assert_read_eq(&fixture, json!({"path": "notes.txt."}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "bad\u{0000}name"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "a:b"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "notes.txt."}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
     assert_read_eq(
         &fixture,
         json!({"path": "notes.txt", "offset": 1, "limit": 0}),
+        true,
+        "",
+        false,
+        None,
+        1,
     );
 }
 
@@ -1644,9 +2043,13 @@ fn oversized_read_and_search_artifact_publication_matches_native_with_owner() {
         .expect("rss stored");
     assert!(!rss_bytes.is_empty(), "overflow artifact must store bytes");
     assert_eq!(rss_meta["run"], json!("run-test"));
-    assert_eq!(
-        rss_meta["call_id"],
-        json!(rss.durable.started.lock().expect("started")[0].call_id)
+    assert!(
+        rss_meta["call_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("call-"),
+        "call_id={}",
+        rss_meta["call_id"]
     );
 
     let arguments = json!({"pattern": "needle"});
@@ -1662,28 +2065,14 @@ fn oversized_read_and_search_artifact_publication_matches_native_with_owner() {
         true,
     );
     assert_canonical_envelope(&rss.result);
-    if let Some(rss_id) = rss.result["artifacts"]
-        .as_array()
-        .and_then(|items| items.first().and_then(Value::as_str).map(str::to_string))
-    {
-        let (rss_bytes, _) = rss
-            .artifacts
-            .as_ref()
-            .expect("rss store")
-            .stored(&rss_id)
-            .expect("rss search stored");
-        assert!(!rss_bytes.is_empty());
-    } else {
-        assert_eq!(rss.result["ok"], json!(true));
-        assert!(
-            rss.result["truncated"] == json!(true)
-                || rss.result["data"]["matches"]
-                    .as_array()
-                    .is_some_and(|matches| !matches.is_empty()),
-            "search should truncate or return matches: {}",
-            rss.result
-        );
-    }
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(
+        rss.result["artifacts"],
+        json!([]),
+        "search overflow frozen artifact list rss={}",
+        rss.result
+    );
 }
 
 #[test]
@@ -1734,12 +2123,60 @@ fn search_file_glob_non_string_is_ignored_like_native() {
     let fixture = Fixture::new("glob-types");
     fs::write(fixture.root.join("keep.rs"), "alpha\n").unwrap();
     fs::write(fixture.root.join("skip.txt"), "alpha\n").unwrap();
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": 1}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": true}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": {}}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": []}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": null}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": "*.rs"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": 1}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": true}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": {}}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": []}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": null}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": "*.rs"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
 }
 
 #[test]
@@ -1747,10 +2184,42 @@ fn search_glob_question_mark_matches_one_utf8_byte_like_native() {
     let fixture = Fixture::new("glob-byte-q");
     fs::write(fixture.root.join("a.rs"), "keep\n").unwrap();
     fs::write(fixture.root.join("你.rs"), "cjk\n").unwrap();
-    assert_search_eq(&fixture, json!({"pattern": "?.rs", "target": "files"}));
-    assert_search_eq(&fixture, json!({"pattern": "???.rs", "target": "files"}));
-    assert_search_eq(&fixture, json!({"pattern": "keep", "file_glob": "?.rs"}));
-    assert_search_eq(&fixture, json!({"pattern": "cjk", "file_glob": "???.rs"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "?.rs", "target": "files"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "???.rs", "target": "files"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "keep", "file_glob": "?.rs"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "cjk", "file_glob": "???.rs"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
 }
 
 #[cfg(unix)]
@@ -1765,8 +2234,24 @@ fn search_skips_non_utf8_names_like_native() {
         .root
         .join(OsString::from_vec(vec![0xff, b'x', 0x80]));
     fs::write(&bad, "secret alpha\n").unwrap();
-    assert_search_eq(&fixture, json!({"pattern": "alpha"}));
-    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha"}),
+        true,
+        1,
+        1,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*", "target": "files"}),
+        true,
+        1,
+        1,
+        false,
+        None,
+    );
 }
 
 #[cfg(unix)]
@@ -1980,8 +2465,24 @@ fn search_directory_order_is_byte_lexicographic_including_multibyte() {
     for name in ["z.txt", "a.txt", "m.txt", "中.txt", "あ.txt", "A.txt"] {
         fs::write(fixture.root.join(name), "needle\n").unwrap();
     }
-    assert_search_eq(&fixture, json!({"pattern": "needle"}));
-    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "needle"}),
+        true,
+        6,
+        6,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*", "target": "files"}),
+        true,
+        6,
+        6,
+        false,
+        None,
+    );
 }
 
 #[test]
@@ -1990,8 +2491,24 @@ fn search_high_entry_directory_order_matches_native() {
     for i in (0..80).rev() {
         fs::write(fixture.root.join(format!("f-{i:03}.txt")), "needle\n").unwrap();
     }
-    assert_search_eq(&fixture, json!({"pattern": "needle"}));
-    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "needle"}),
+        true,
+        80,
+        80,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*", "target": "files"}),
+        true,
+        80,
+        80,
+        false,
+        None,
+    );
 }
 
 #[test]

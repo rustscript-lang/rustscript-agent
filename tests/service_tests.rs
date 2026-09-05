@@ -3551,3 +3551,176 @@ async fn production_stop_recovers_open_capability_tokens() {
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
     let _ = std::fs::remove_dir_all(&workspace);
 }
+
+fn cache_script(tag: &str) -> String {
+    format!("pub fn run(context: map) -> map {{ {{status: \"completed\", output: \"{tag}\"}}; }}")
+}
+
+fn wait_completed(service: &rustscript_agent::AgentService, run_id: &str) -> Value {
+    for _ in 0..200 {
+        let events = service.run_events(run_id);
+        if let Some(event) = events
+            .iter()
+            .find(|event| event["event"] == "run.completed")
+        {
+            return event.clone();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("run did not complete: {:?}", service.run_events(run_id));
+}
+
+fn stub_completed_output(service: &rustscript_agent::AgentService, run_id: &str) -> Value {
+    let events = service.run_events(run_id);
+    let delta = events
+        .iter()
+        .find(|event| event["event"] == "message.delta")
+        .and_then(|event| event["data"]["delta"].as_str())
+        .unwrap_or_else(|| panic!("missing message.delta: {events:?}"));
+    serde_json::from_str(delta).expect("message.delta should be JSON")
+}
+
+#[tokio::test]
+async fn agent_file_cache_same_len_mutation_refreshes_runner() {
+    let dir = std::env::temp_dir().join(format!(
+        "svc-cache-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("main.rss");
+    let first = cache_script("AAAA");
+    let second = cache_script("BBBB");
+    assert_eq!(first.len(), second.len());
+    std::fs::write(&path, &first).expect("write");
+    let state = AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path)
+        .expect("compile first");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit first");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let completed = wait_completed(&service, &admitted.run_id);
+    assert_eq!(completed["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &admitted.run_id),
+        json!({"status": "completed", "output": "AAAA"})
+    );
+    std::fs::write(&path, &second).expect("rewrite");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit second");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let completed = wait_completed(&service, &admitted.run_id);
+    assert_eq!(completed["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &admitted.run_id),
+        json!({"status": "completed", "output": "BBBB"})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_file_cache_invalid_tree_after_install_does_not_hit_stale() {
+    let dir = std::env::temp_dir().join(format!(
+        "svc-stale-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("main.rss");
+    std::fs::write(&path, cache_script("STALE")).expect("write");
+    let state =
+        AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path).expect("compile");
+    let service = state.service();
+    let admitted = service.admit(admit_request(None)).await.expect("admit");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let completed = wait_completed(&service, &admitted.run_id);
+    assert_eq!(completed["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &admitted.run_id),
+        json!({"status": "completed", "output": "STALE"})
+    );
+    let backup = dir.join("backup.rss");
+    std::fs::rename(&path, &backup).expect("rename");
+    std::os::unix::fs::symlink(&backup, &path).expect("symlink");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit after");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    let failed = events.iter().any(|event| {
+        event["event"] == "run.failed"
+            || event["data"]["status"] == json!("failed")
+            || (event["event"] == "run.completed" && event["data"]["status"] == json!("failed"))
+    });
+    assert!(failed, "invalid tree should fail closed: {events:?}");
+    assert!(
+        events.iter().all(|event| event["event"] != "run.completed"),
+        "invalid tree must not complete: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_file_cache_concurrent_refresh_sees_new_bytes() {
+    let dir = std::env::temp_dir().join(format!(
+        "svc-conc-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("main.rss");
+    let first = cache_script("CCCC");
+    let second = cache_script("DDDD");
+    assert_eq!(first.len(), second.len());
+    std::fs::write(&path, &first).expect("write");
+    let state =
+        AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path).expect("compile");
+    let service = state.service();
+    let admitted = service.admit(admit_request(None)).await.expect("warm");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    wait_completed(&service, &admitted.run_id);
+    std::fs::write(&path, &second).expect("rewrite");
+    let left = service.admit(admit_request(None)).await.expect("left");
+    let right = service.admit(admit_request(None)).await.expect("right");
+    let left_worker = service.clone();
+    let right_worker = service.clone();
+    let left_id = left.run_id.clone();
+    let right_id = right.run_id.clone();
+    let _ = tokio::join!(
+        left_worker.run_worker(left_id.clone(), "ignored".to_string()),
+        right_worker.run_worker(right_id.clone(), "ignored".to_string())
+    );
+    let left_done = wait_completed(&service, &left_id);
+    let right_done = wait_completed(&service, &right_id);
+    assert_eq!(left_done["event"], json!("run.completed"));
+    assert_eq!(right_done["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &left_id),
+        json!({"status": "completed", "output": "DDDD"})
+    );
+    assert_eq!(
+        stub_completed_output(&service, &right_id),
+        json!({"status": "completed", "output": "DDDD"})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

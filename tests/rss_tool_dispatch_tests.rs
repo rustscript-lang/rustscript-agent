@@ -313,16 +313,6 @@ fn error_code(envelope: &Value) -> &str {
     envelope
         .pointer("/error/code")
         .and_then(Value::as_str)
-        .or_else(|| {
-            envelope
-                .pointer("/content_block/error/code")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            envelope
-                .pointer("/content_block/result/error/code")
-                .and_then(Value::as_str)
-        })
         .unwrap_or("")
 }
 
@@ -362,12 +352,10 @@ fn dispatch_routes_read_file_without_double_prepare() {
         json!("call-read")
     );
     assert_eq!(envelope["content_block"]["is_error"], json!(false));
-    let content = envelope["content_block"]["content"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        content.contains("hello from dispatch"),
-        "content={content:?} envelope={envelope}"
+    assert_eq!(
+        envelope["content_block"]["content"],
+        json!("hello from dispatch\n"),
+        "envelope={envelope}"
     );
     assert_eq!(started, 1, "lifecycle must prepare exactly once");
 }
@@ -389,7 +377,7 @@ fn dispatch_routes_all_six_public_names() {
         let durable = MemoryDurable::new();
         let arguments = match name {
             "read_file" => json!({"path": "a.txt"}),
-            "search_files" => json!({"pattern": "alpha", "path": "."}),
+            "search_files" => json!({"pattern": "alpha"}),
             "write_file" => json!({"path": "written.txt", "content": "ok\n"}),
             "patch" => json!({
                 "path": "a.txt",
@@ -434,10 +422,44 @@ fn dispatch_routes_all_six_public_names() {
             json!("tool_result"),
             "name={name}"
         );
-        assert!(
-            envelope.get("ok").is_some(),
-            "missing ok for {name}: {envelope}"
-        );
+        match name {
+            "read_file" => {
+                assert_eq!(envelope["ok"], json!(true), "envelope={envelope}");
+                assert_eq!(
+                    envelope["content_block"]["content"],
+                    json!("alpha\n"),
+                    "envelope={envelope}"
+                );
+                assert_eq!(envelope["content_block"]["is_error"], json!(false));
+            }
+            "search_files" => {
+                assert_eq!(envelope["ok"], json!(true), "envelope={envelope}");
+                assert_eq!(envelope["content_block"]["is_error"], json!(false));
+            }
+            "write_file" => {
+                assert_eq!(envelope["ok"], json!(true), "envelope={envelope}");
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join("written.txt")).unwrap(),
+                    "ok\n"
+                );
+            }
+            "patch" => {
+                assert_eq!(envelope["ok"], json!(true), "envelope={envelope}");
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join("a.txt")).unwrap(),
+                    "beta\n"
+                );
+            }
+            "terminal" => {
+                assert_eq!(envelope["ok"], json!(false), "envelope={envelope}");
+                assert_eq!(error_code(&envelope), "invalid_argv");
+            }
+            "process" => {
+                assert_eq!(envelope["ok"], json!(false), "envelope={envelope}");
+                assert_eq!(error_code(&envelope), "invalid_action");
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

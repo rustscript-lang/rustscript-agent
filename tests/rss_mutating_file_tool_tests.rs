@@ -84,7 +84,7 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 fn unique_temp_parent(label: &str) -> PathBuf {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0d-rss-mutation-c115da2b",
+        "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0f-rss-dispatch-fdee5b8a",
     )
     .join(format!(
         "rss-mut-{}-{}-{}",
@@ -699,38 +699,110 @@ fn run_rss_patch(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -
     )
 }
 
-fn assert_write_eq(fixture: &Fixture, setup: impl Fn(), arguments: Value) {
+fn assert_write_eq(
+    fixture: &Fixture,
+    setup: impl Fn(),
+    arguments: Value,
+    expected_ok: bool,
+    expected_error: Option<&str>,
+    expected_file: Option<&str>,
+    expected_started: usize,
+) {
     let config = fixture.config();
     let path = arguments["path"].as_str().unwrap_or("").to_string();
     setup();
-    let rss = run_rss_write(fixture, &config, arguments);
+    let rss = run_rss_write(fixture, &config, arguments.clone());
     assert_canonical_envelope(&rss.result);
-    let _ = path;
+    assert_eq!(
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
+    );
+    match expected_error {
+        None => assert_eq!(rss.result["error"], Value::Null, "rss={}", rss.result),
+        Some(code) => assert_eq!(
+            rss.result["error"]["code"],
+            json!(code),
+            "rss={}",
+            rss.result
+        ),
+    }
+    assert_eq!(
+        rss.started, expected_started,
+        "started arguments={arguments}"
+    );
+    if let Some(expected) = expected_file {
+        let actual = fs::read(fixture.root.join(&path)).unwrap_or_default();
+        assert_eq!(
+            actual,
+            expected.as_bytes(),
+            "file bytes path={path} rss={}",
+            rss.result
+        );
+        if expected_ok {
+            assert_eq!(
+                rss.result["data"]["bytes"],
+                json!(expected.len()),
+                "bytes rss={}",
+                rss.result
+            );
+        }
+    }
     assert!(
         leftover_temps(&fixture.root).is_empty(),
         "write must not leave temps: {:?}",
         leftover_temps(&fixture.root)
     );
-    if rss.result["ok"] == json!(true) {
-        assert!(rss.started > 0, "successful write must prepare");
-    }
 }
 
-fn assert_patch_eq(fixture: &Fixture, setup: impl Fn(), arguments: Value) {
+fn assert_patch_eq(
+    fixture: &Fixture,
+    setup: impl Fn(),
+    arguments: Value,
+    expected_ok: bool,
+    expected_error: Option<&str>,
+    expected_file: Option<&str>,
+    expected_started: usize,
+) {
     let config = fixture.config();
     let path = arguments["path"].as_str().unwrap_or("").to_string();
     setup();
-    let rss = run_rss_patch(fixture, &config, arguments);
+    let rss = run_rss_patch(fixture, &config, arguments.clone());
     assert_canonical_envelope(&rss.result);
-    let _ = path;
+    assert_eq!(
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
+    );
+    match expected_error {
+        None => assert_eq!(rss.result["error"], Value::Null, "rss={}", rss.result),
+        Some(code) => assert_eq!(
+            rss.result["error"]["code"],
+            json!(code),
+            "rss={}",
+            rss.result
+        ),
+    }
+    assert_eq!(
+        rss.started, expected_started,
+        "started arguments={arguments}"
+    );
+    if let Some(expected) = expected_file {
+        let actual = fs::read(fixture.root.join(&path)).unwrap_or_default();
+        assert_eq!(
+            actual,
+            expected.as_bytes(),
+            "file bytes path={path} rss={}",
+            rss.result
+        );
+    }
     assert!(
         leftover_temps(&fixture.root).is_empty(),
         "patch must not leave temps: {:?}",
         leftover_temps(&fixture.root)
     );
-    if rss.result["ok"] == json!(true) {
-        assert!(rss.started > 0, "successful patch must prepare");
-    }
 }
 
 fn rss_descriptor(name: &str) -> Value {
@@ -776,6 +848,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             let _ = fs::remove_file(root.join("new.txt"));
         },
         json!({"path": "new.txt", "content": "hello\n"}),
+        true,
+        None,
+        Some("hello\n"),
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -783,6 +859,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             fs::write(root.join("old.txt"), "old\n").unwrap();
         },
         json!({"path": "old.txt", "content": "new\n"}),
+        true,
+        None,
+        Some("new\n"),
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -790,6 +870,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             let _ = fs::remove_file(root.join("empty.txt"));
         },
         json!({"path": "empty.txt", "content": ""}),
+        true,
+        None,
+        Some(""),
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -797,6 +881,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             let _ = fs::remove_file(root.join("utf8.txt"));
         },
         json!({"path": "utf8.txt", "content": "你好🦀\n"}),
+        true,
+        None,
+        Some("你好🦀\n"),
+        1,
     );
 }
 
@@ -811,11 +899,19 @@ fn write_nested_parent_and_missing_parent_match_native() {
             let _ = fs::remove_file(root.join("nested/dir/leaf.txt"));
         },
         json!({"path": "nested/dir/leaf.txt", "content": "nested-bytes\n"}),
+        true,
+        None,
+        Some("nested-bytes\n"),
+        1,
     );
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "missing/dir/leaf.txt", "content": "nope\n"}),
+        false,
+        Some("not_found"),
+        None,
+        1,
     );
 }
 
@@ -864,6 +960,10 @@ fn write_preserves_native_mode_contract() {
             fs::set_permissions(root.join("mode.txt"), fs::Permissions::from_mode(0o640)).unwrap();
         },
         json!({"path": "mode.txt", "content": "new\n"}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -871,6 +971,10 @@ fn write_preserves_native_mode_contract() {
             let _ = fs::remove_file(root.join("fresh.txt"));
         },
         json!({"path": "fresh.txt", "content": "fresh\n"}),
+        true,
+        None,
+        None,
+        1,
     );
 }
 
@@ -968,17 +1072,29 @@ fn write_symlink_hardlink_and_directory_match_native() {
         &fixture,
         || {},
         json!({"path": "leaf-link", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_eq!(fs::read_to_string(&outside).unwrap(), "outside-secret\n");
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "dir-link/inner.txt", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "dir", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -988,7 +1104,12 @@ fn write_symlink_hardlink_and_directory_match_native() {
             fs::hard_link(root.join("hard.txt"), root.join("hard-link")).unwrap();
         },
         json!({"path": "hard-link", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        Some("hard\n"),
+        1,
     );
+    assert_eq!(fs::read_to_string(root.join("hard.txt")).unwrap(), "hard\n");
 }
 
 #[cfg(unix)]
@@ -1008,6 +1129,10 @@ fn patch_leaf_and_intermediate_symlink_match_native_without_touching_outside() {
         &fixture,
         || {},
         json!({"path": "leaf-link", "old_string": "outside-secret", "new_string": "changed", "replace_all": false}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert!(
         fixture
@@ -1025,6 +1150,10 @@ fn patch_leaf_and_intermediate_symlink_match_native_without_touching_outside() {
         &fixture,
         || {},
         json!({"path": "dir-link/inner.txt", "old_string": "inner-needle", "new_string": "changed", "replace_all": false}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("nested/inner.txt")).unwrap(),
@@ -1036,6 +1165,10 @@ fn patch_leaf_and_intermediate_symlink_match_native_without_touching_outside() {
         &fixture,
         || {},
         json!({"path": "dir", "old_string": "x", "new_string": "y", "replace_all": false}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
 }
 
@@ -1050,21 +1183,37 @@ fn patch_zero_one_multiple_and_replace_all_match_native() {
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "missing", "new_string": "x", "replace_all": false}),
+        false,
+        Some("patch_no_match"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "b", "new_string": "x", "replace_all": false}),
+        true,
+        None,
+        Some("a\nx\na\n"),
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x", "replace_all": false}),
+        false,
+        Some("patch_multiple_matches"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x", "replace_all": true}),
+        true,
+        None,
+        Some("x\nb\nx\n"),
+        1,
     );
 }
 
@@ -1076,31 +1225,55 @@ fn patch_overlapping_replacement_containing_search_and_newlines_match_native() {
         &fixture,
         || fs::write(root.join("aaa.txt"), "aaaa").unwrap(),
         json!({"path": "aaa.txt", "old_string": "aa", "new_string": "b", "replace_all": true}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("loop.txt"), "a").unwrap(),
         json!({"path": "loop.txt", "old_string": "a", "new_string": "aa", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("nl.txt"), "keep\nneedle\nkeep\n").unwrap(),
         json!({"path": "nl.txt", "old_string": "needle", "new_string": "replaced", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("nonew.txt"), "keep needle keep").unwrap(),
         json!({"path": "nonew.txt", "old_string": "needle", "new_string": "replaced", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("cjk.txt"), "keep\n旧文字行\nkeep\n").unwrap(),
         json!({"path": "cjk.txt", "old_string": "旧文字行", "new_string": "新文字行", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("del.txt"), "keep needle keep").unwrap(),
         json!({"path": "del.txt", "old_string": "needle", "new_string": "", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
 }
 
@@ -1119,6 +1292,10 @@ fn patch_high_match_count_stays_in_budget_and_matches_native() {
             "new_string": "b",
             "replace_all": true
         }),
+        true,
+        None,
+        None,
+        1,
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("many.txt")).unwrap(),
@@ -1138,21 +1315,37 @@ fn patch_binary_nul_invalid_utf8_and_empty_old_match_native() {
         &fixture,
         || {},
         json!({"path": "invalid.txt", "old_string": "a", "new_string": "b"}),
+        false,
+        Some("invalid_utf8"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || {},
         json!({"path": "binary.bin", "old_string": "a", "new_string": "b"}),
+        false,
+        Some("binary_file"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("ok.txt"), "needle\n").unwrap(),
         json!({"path": "ok.txt", "old_string": "", "new_string": "x"}),
+        false,
+        Some("invalid_arguments"),
+        None,
+        0,
     );
     assert_patch_eq(
         &fixture,
         || {},
         json!({"path": "missing.txt", "old_string": "a", "new_string": "b"}),
+        false,
+        Some("not_found"),
+        None,
+        1,
     );
 }
 
@@ -1199,11 +1392,19 @@ fn patch_replace_all_non_bool_defaults_like_native() {
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x", "replace_all": 1}),
+        false,
+        Some("patch_multiple_matches"),
+        Some("a\nb\na\n"),
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x"}),
+        false,
+        Some("patch_multiple_matches"),
+        Some("a\nb\na\n"),
+        1,
     );
 }
 
@@ -1547,18 +1748,24 @@ fn oversized_patch_preview_artifact_publication_matches_native_with_owner() {
         }),
     );
     assert_canonical_envelope(&rss.result);
-    if rss.result["ok"] == json!(true)
-        && let Some(rss_id) = rss.result["artifacts"][0].as_str()
-    {
-        let (rss_bytes, rss_meta) = rss
-            .artifacts
-            .as_ref()
-            .expect("rss store")
-            .stored(rss_id)
-            .expect("rss stored");
-        assert!(!rss_bytes.is_empty());
-        assert_eq!(rss_meta["run"], json!("run-test"));
-    }
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["artifacts"], json!([]), "rss={}", rss.result);
+    assert_eq!(rss.result["error"], json!(null));
+    assert_eq!(rss.result["data"]["publication"], json!("published"));
+    assert_eq!(rss.result["data"]["replacements"], json!(1));
+    assert_eq!(rss.result["data"]["bytes"], json!(4010));
+    assert_eq!(rss.result["data"]["durable"], json!(true));
+    assert_eq!(rss.result["data"]["staging_cleaned"], json!(true));
+    let content = rss.result["content"].as_str().expect("content");
+    assert_eq!(
+        &content[..std::cmp::min(content.len(), 33)],
+        "diff --git a/wide.txt b/wide.txt\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("wide.txt")).unwrap(),
+        format!("replaced {}\n", "x".repeat(4000))
+    );
 }
 
 #[test]
@@ -1821,32 +2028,45 @@ fn patch_artifact_summary_forms_match_native_at_content_thresholds() {
 }
 
 fn assert_summary_cap_parity(cap: usize, bytes: usize, rss: &RssRun) {
-    let rss_has_artifact = rss
-        .result
-        .get("artifacts")
-        .and_then(Value::as_array)
-        .is_some_and(|entries| !entries.is_empty());
-    if rss.result["ok"] != json!(true) {
-        return;
-    }
-    if !rss_has_artifact {
-        assert_canonical_envelope(&rss.result);
-        return;
-    }
     assert_canonical_envelope(&rss.result);
-    let id = rss.result["artifacts"][0]
-        .as_str()
-        .expect("rss artifact id");
-    let expected = native_like_artifact_summary(id, bytes, cap);
-    let content = rss.result["content"].as_str().unwrap_or("");
-    assert!(
-        content == expected || expected.starts_with(content) || content.starts_with("artifact"),
-        "cap={cap} content={content:?} expected={expected:?}"
-    );
-    if cap >= 1024 {
+    if rss.result["ok"] == json!(true) {
+        let artifacts = rss
+            .result
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let content = rss.result["content"].as_str().expect("content");
+        if artifacts.is_empty() {
+            assert_eq!(
+                content,
+                format!("wrote {bytes} bytes"),
+                "cap={cap} rss={}",
+                rss.result
+            );
+        } else {
+            let id = artifacts[0].as_str().expect("rss artifact id");
+            assert_eq!(
+                content,
+                native_like_artifact_summary(id, bytes, cap),
+                "cap={cap} rss={}",
+                rss.result
+            );
+            let (stored, meta) = rss
+                .artifacts
+                .as_ref()
+                .expect("rss artifact store")
+                .stored(id)
+                .expect("stored artifact");
+            assert!(!stored.is_empty(), "cap={cap} id={id}");
+            assert_eq!(meta["run"], json!("run-test"), "cap={cap} id={id}");
+        }
+    } else {
         assert_eq!(
-            content, expected,
-            "fitting cap must keep the full summary form"
+            rss.result["error"]["code"],
+            json!("output_truncated"),
+            "cap={cap} rss={}",
+            rss.result
         );
     }
 }
@@ -2311,6 +2531,10 @@ fn nested_and_swapped_parent_symlink_race_does_not_touch_outside_secret() {
             "new_string": "changed",
             "replace_all": false
         }),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert!(
         fixture
@@ -2331,11 +2555,19 @@ fn nested_and_swapped_parent_symlink_race_does_not_touch_outside_secret() {
         &fixture,
         || {},
         json!({"path": "nested/swapped/secret.txt", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "nested/real/link.txt", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_eq!(
         fs::read_to_string(outside_dir.join("secret.txt")).unwrap(),

@@ -1,12 +1,12 @@
 // Serial provider/tool agent loop.
 //
-// `run(context)` drives canonical LlmRequest construction, the bounded native
-// host provider bridge, serial RSS tool dispatch, and retry/backoff until a
+// `run(context)` drives canonical LlmRequest construction, the bounded host
+// provider bridge, serial RSS tool dispatch, and retry/backoff until a
 // typed terminal decision. Follow-up assistant `tool_call` parts use
 // `arguments_json` strings; tool results stay user-role `tool_result` parts so
 // adapters see one contract. Parallel/task execution is rejected.
 // Provider/network errors consume the retry budget; completed tool effects are
-// never retried. Durability of messages/events is left to Task 7.
+// never retried. Durability of messages/events is owned by AgentService.
 
 use agent;
 use json;

@@ -1,8 +1,9 @@
-//! Task 10: production `AgentService` worker + bundled RSS loop + real native tools.
+//! Production `AgentService` worker + bundled RSS loop + RSS tools.
 //!
 //! `ScriptedProvider` is injected as the inner model transport. Production
 //! `DurableProviderHost` owns provider-step durability, replay, and recovery.
-//! Native tools execute against a generated git workspace.
+//! Tools execute through `rss/agent/main.rss` → `tools::dispatch` against a
+//! generated git workspace. A source-string stub does not satisfy this path.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -743,4 +744,138 @@ fn docs_name_the_local_coding_e2e_command() {
             "{relative} must not claim stop-during-output is uncovered"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_gateway_file_path_dispatches_read_file_through_main() {
+    let workspace = test_temp_root().join(format!(
+        "arch-file-{}-{}",
+        std::process::id(),
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("notes.txt"), "alpha-e2e\n").expect("notes");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+        .expect("default gateway must compile bundled main.rss");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 64 * 1024, &workspace).expect("limits"))
+        .expect("limits");
+    service
+        .set_provider_profile(ProviderProfile::builtin("local-agent").expect("profile"))
+        .expect("profile");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "reading notes",
+        json!([{
+            "id": "call-arch-read",
+            "name": "read_file",
+            "arguments": {"path": "notes.txt"}
+        }]),
+    ));
+    provider.push_ok(text_response("read complete"));
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "Read notes.txt"}),
+            platform: "architecture_e2e".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit");
+    service.inject_provider_host(Arc::new(provider.clone()));
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            service.run_events(&admitted.run_id).iter().any(|event| {
+                event.get("event").and_then(JsonValue::as_str) == Some("run.completed")
+            })
+        })
+        .await,
+        "run must complete: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        event_types_for(&events, "call-arch-read"),
+        [
+            "tool.requested".to_string(),
+            "tool.started".to_string(),
+            "tool.output".to_string(),
+            "tool.completed".to_string()
+        ],
+        "exact tool lifecycle: {events:?}"
+    );
+    let messages = service.session_messages(&admitted.session_id);
+    let tool_result = messages
+        .iter()
+        .find(|message| {
+            json_str(message, "role") == "user"
+                && message.get("tool_call_id").and_then(JsonValue::as_str) == Some("call-arch-read")
+        })
+        .expect("read_file tool_result must be durable");
+    let text = format!("{tool_result}");
+    assert!(
+        text.contains("alpha-e2e"),
+        "durable read result must contain file bytes: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_string_stub_does_not_dispatch_tools() {
+    let workspace = test_temp_root().join(format!(
+        "arch-stub-{}-{}",
+        std::process::id(),
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&workspace).expect("workspace");
+    let stub =
+        r#"pub fn run(context: map) -> map { {status: "completed", output: "stub-no-tools"}; }"#;
+    let state = AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), stub)
+        .expect("source stub should compile");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 64 * 1024, &workspace).expect("limits"))
+        .expect("limits");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(tool_response(
+        "would-read",
+        json!([{
+            "id": "call-stub-read",
+            "name": "read_file",
+            "arguments": {"path": "notes.txt"}
+        }]),
+    ));
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "Read notes.txt"}),
+            platform: "architecture_e2e".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit");
+    service.inject_provider_host(Arc::new(provider));
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            service.run_events(&admitted.run_id).iter().any(|event| {
+                event.get("event").and_then(JsonValue::as_str) == Some("run.completed")
+            })
+        })
+        .await,
+        "stub run must complete: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    let events = service.run_events(&admitted.run_id);
+    assert!(
+        event_types_for(&events, "call-stub-read").is_empty(),
+        "source-string stub must not dispatch tools: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
 }

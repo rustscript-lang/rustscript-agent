@@ -533,21 +533,93 @@ fn assert_canonical_envelope(rss: &Value) {
     );
 }
 
-fn assert_terminal_eq(fixture: &Fixture, arguments: Value) {
+#[allow(clippy::too_many_arguments)]
+fn assert_terminal_eq(
+    fixture: &Fixture,
+    arguments: Value,
+    expected_ok: bool,
+    expected_stdout: &str,
+    expected_stderr: &str,
+    expected_exit: Option<i64>,
+    expected_timed_out: bool,
+    expected_error: Option<&str>,
+    expected_started: usize,
+) {
     let config = fixture.config();
     let rss = run_rss_exec(
         fixture,
         &config,
-        default_exec("terminal.rss", "terminal", arguments),
+        default_exec("terminal.rss", "terminal", arguments.clone()),
     );
     assert_canonical_envelope(&rss.result);
-    if rss.result["ok"] != json!(true)
-        && matches!(
-            rss.result["error"]["code"].as_str().unwrap_or(""),
-            "invalid_argv" | "invalid_timeout" | "invalid_stdin" | "invalid_output_limit"
-        )
-    {
-        assert_eq!(rss.started, 0, "invalid args must not prepare");
+    assert_eq!(
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
+    );
+    match expected_error {
+        None => assert_eq!(rss.result["error"], Value::Null, "rss={}", rss.result),
+        Some(code) => assert_eq!(
+            rss.result["error"]["code"],
+            json!(code),
+            "rss={}",
+            rss.result
+        ),
+    }
+    assert_eq!(
+        rss.started, expected_started,
+        "started arguments={arguments}"
+    );
+    if expected_ok {
+        assert_eq!(
+            rss.result["content"],
+            json!(if expected_stdout.is_empty() {
+                expected_stderr
+            } else {
+                expected_stdout
+            }),
+            "content arguments={arguments} rss={}",
+            rss.result
+        );
+        assert_eq!(
+            rss.result["data"]["stdout"],
+            json!(expected_stdout),
+            "data.stdout arguments={arguments} rss={}",
+            rss.result
+        );
+        assert_eq!(
+            rss.result["data"]["stderr"],
+            json!(expected_stderr),
+            "stderr arguments={arguments} rss={}",
+            rss.result
+        );
+        if let Some(exit) = expected_exit {
+            assert_eq!(
+                rss.result["data"]["exit_code"],
+                json!(exit),
+                "exit_code arguments={arguments} rss={}",
+                rss.result
+            );
+        }
+        if expected_timed_out {
+            assert_eq!(
+                rss.result["data"]["timed_out"],
+                json!(true),
+                "timed_out arguments={arguments} rss={}",
+                rss.result
+            );
+        } else {
+            assert_eq!(
+                rss.result["data"]
+                    .get("timed_out")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                Value::Null,
+                "timed_out must be absent arguments={arguments} rss={}",
+                rss.result
+            );
+        }
     }
 }
 
@@ -631,45 +703,197 @@ fn foreground_echo_stdout_stderr_exit_empty_multibyte_and_nul_match_native() {
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/echo", "hello-rss-process"]}),
+        true,
+        "hello-rss-process\n",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
     );
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/echo", "-n"]}));
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/echo", "-n"]}),
+        true,
+        "",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
+    );
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/sh", "-c", "printf '你好\\n'"]}),
+        true,
+        "你好\n",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
     );
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/sh", "-c", "printf 'a\\0b'"]}),
+        true,
+        "a\u{0000}b",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
     );
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/sh", "-c", "printf 'err' 1>&2; exit 3"]}),
+        true,
+        "",
+        "err",
+        Some(3),
+        false,
+        None,
+        1,
     );
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/true"]}));
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/false"]}));
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/true"]}),
+        true,
+        "",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
+    );
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/false"]}),
+        true,
+        "",
+        "",
+        Some(1),
+        false,
+        None,
+        1,
+    );
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn invalid_argument_types_extra_fields_and_bounds_match_native_without_prepare() {
     let fixture = Fixture::new("invalid");
-    let cases = [
-        json!({}),
-        json!({"argv": []}),
-        json!({"argv": "/bin/echo"}),
-        json!({"argv": [1, 2]}),
-        json!({"argv": ["/bin/echo"], "timeout_ms": 0}),
-        json!({"argv": ["/bin/echo"], "timeout_ms": "1"}),
-        json!({"argv": ["/bin/echo"], "timeout_ms": -1}),
-        json!({"argv": ["/bin/echo"], "timeout_ms": 3_600_001}),
-        json!({"argv": ["/bin/echo"], "max_output_bytes": 0}),
-        json!({"argv": ["/bin/echo"], "max_output_bytes": "8"}),
-        json!({"argv": ["/bin/echo"], "stdin": 12}),
-        json!({"argv": ["/bin/echo"], "extra": true}),
-        json!({"argv": ["/bin/echo"], "cwd": 1}),
-        json!({"argv": ["/bin/echo"], "background": "yes"}),
+    let cases: [(Value, bool, &str, Option<i64>, Option<&str>, usize); 14] = [
+        (json!({}), false, "", None, Some("invalid_argv"), 0),
+        (
+            json!({"argv": []}),
+            false,
+            "",
+            None,
+            Some("invalid_argv"),
+            0,
+        ),
+        (
+            json!({"argv": "/bin/echo"}),
+            false,
+            "",
+            None,
+            Some("invalid_argv"),
+            0,
+        ),
+        (
+            json!({"argv": [1, 2]}),
+            false,
+            "",
+            None,
+            Some("invalid_argv"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "timeout_ms": 0}),
+            false,
+            "",
+            None,
+            Some("invalid_timeout"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "timeout_ms": "1"}),
+            false,
+            "",
+            None,
+            Some("invalid_timeout"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "timeout_ms": -1}),
+            false,
+            "",
+            None,
+            Some("invalid_timeout"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "timeout_ms": 3_600_001}),
+            false,
+            "",
+            None,
+            Some("invalid_timeout"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "max_output_bytes": 0}),
+            false,
+            "",
+            None,
+            Some("invalid_output_limit"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "max_output_bytes": "8"}),
+            false,
+            "",
+            None,
+            Some("invalid_output_limit"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "stdin": 12}),
+            false,
+            "",
+            None,
+            Some("invalid_stdin"),
+            0,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "extra": true}),
+            true,
+            "\n",
+            Some(0),
+            None,
+            1,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "cwd": 1}),
+            true,
+            "\n",
+            Some(0),
+            None,
+            1,
+        ),
+        (
+            json!({"argv": ["/bin/echo"], "background": "yes"}),
+            true,
+            "\n",
+            Some(0),
+            None,
+            1,
+        ),
     ];
-    for arguments in cases {
-        assert_terminal_eq(&fixture, arguments);
+    for (arguments, ok, stdout, exit, error, started) in cases {
+        assert_terminal_eq(
+            &fixture, arguments, ok, stdout, "", exit, false, error, started,
+        );
     }
 }
 
@@ -679,16 +903,84 @@ fn cwd_missing_file_symlink_traversal_and_absolute_match_native() {
     fs::create_dir(fixture.root.join("sub")).unwrap();
     fs::write(fixture.root.join("file.txt"), "x").unwrap();
     symlink(fixture.root.join("sub"), fixture.root.join("link-dir")).unwrap();
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/pwd"], "cwd": "sub"}));
+    let sub = fixture.root.join("sub").canonicalize().unwrap();
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/pwd"], "cwd": "sub"}),
+        true,
+        &format!("{}\n", sub.display()),
+        "",
+        Some(0),
+        false,
+        None,
+        1,
+    );
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/pwd"], "cwd": "missing-dir"}),
+        false,
+        "",
+        "",
+        None,
+        false,
+        Some("invalid_cwd"),
+        1,
     );
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/pwd"], "cwd": "file.txt"}));
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/pwd"], "cwd": "link-dir"}));
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/pwd"], "cwd": "../"}));
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/pwd"], "cwd": "/"}));
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/pwd"], "cwd": "/etc"}));
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/pwd"], "cwd": "file.txt"}),
+        false,
+        "",
+        "",
+        None,
+        false,
+        Some("invalid_cwd"),
+        1,
+    );
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/pwd"], "cwd": "link-dir"}),
+        false,
+        "",
+        "",
+        None,
+        false,
+        Some("invalid_cwd"),
+        1,
+    );
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/pwd"], "cwd": "../"}),
+        false,
+        "",
+        "",
+        None,
+        false,
+        Some("invalid_cwd"),
+        1,
+    );
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/pwd"], "cwd": "/"}),
+        false,
+        "",
+        "",
+        None,
+        false,
+        Some("invalid_cwd"),
+        1,
+    );
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/pwd"], "cwd": "/etc"}),
+        false,
+        "",
+        "",
+        None,
+        false,
+        Some("invalid_cwd"),
+        1,
+    );
 }
 
 #[test]
@@ -697,7 +989,17 @@ fn host_environment_secrets_are_not_inherited() {
     unsafe {
         std::env::set_var("RUSTSCRIPT_AGENT_SHOULD_NOT_LEAK", "secret-host-env");
     }
-    assert_terminal_eq(&fixture, json!({"argv": ["/usr/bin/env"]}));
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/usr/bin/env"]}),
+        true,
+        "",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
+    );
     unsafe {
         std::env::remove_var("RUSTSCRIPT_AGENT_SHOULD_NOT_LEAK");
     }
@@ -709,6 +1011,13 @@ fn foreground_stdin_is_written_and_closed() {
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/cat"], "stdin": "from-stdin\n"}),
+        true,
+        "from-stdin\n",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
     );
 }
 
@@ -874,30 +1183,66 @@ fn background_spawn_poll_log_write_close_wait_and_kill_match_native() {
 fn process_action_validation_forged_handle_and_cursor_semantics_match_native() {
     let fixture = Fixture::new("actions");
     let config = fixture.config();
-    for arguments in [
-        json!({}),
-        json!({"action": 1}),
-        json!({"action": "list"}),
-        json!({"action": "submit", "process_id": "abc"}),
-        json!({"action": "poll", "process_id": "deadbeefdeadbeefdeadbeefdeadbeef"}),
-        json!({"action": "wait", "process_id": "x", "timeout_ms": 0}),
-        json!({"action": "wait", "process_id": "x", "timeout_ms": "1"}),
-        json!({"action": "log", "process_id": "x", "offset": -1}),
-        json!({"action": "log", "process_id": "x", "limit": 0}),
-        json!({"action": "write", "process_id": "x", "data": 1}),
-    ] {
+    let cases: [(Value, &str, usize); 10] = [
+        (json!({}), "invalid_action", 0),
+        (json!({"action": 1}), "invalid_action", 0),
+        (json!({"action": "list"}), "invalid_action", 0),
+        (
+            json!({"action": "submit", "process_id": "abc"}),
+            "invalid_action",
+            0,
+        ),
+        (
+            json!({"action": "poll", "process_id": "deadbeefdeadbeefdeadbeefdeadbeef"}),
+            "process_not_found",
+            1,
+        ),
+        (
+            json!({"action": "wait", "process_id": "x", "timeout_ms": 0}),
+            "invalid_timeout",
+            0,
+        ),
+        (
+            json!({"action": "wait", "process_id": "x", "timeout_ms": "1"}),
+            "invalid_timeout",
+            0,
+        ),
+        (
+            json!({"action": "log", "process_id": "x", "offset": -1}),
+            "invalid_output_limit",
+            0,
+        ),
+        (
+            json!({"action": "log", "process_id": "x", "limit": 0}),
+            "invalid_output_limit",
+            0,
+        ),
+        (
+            json!({"action": "write", "process_id": "x", "data": 1}),
+            "process_not_found",
+            1,
+        ),
+    ];
+    for (arguments, code, started) in cases {
         let rss = run_rss_exec(
             &fixture,
             &config,
-            default_exec("process.rss", "process", arguments),
+            default_exec("process.rss", "process", arguments.clone()),
         );
         assert_canonical_envelope(&rss.result);
-        if rss.result["error"]["code"]
-            .as_str()
-            .is_some_and(|code| code.starts_with("invalid_"))
-        {
-            assert_eq!(rss.started, 0, "invalid process args must not prepare");
-        }
+        assert_eq!(
+            rss.result["ok"],
+            json!(false),
+            "ok arguments={arguments} rss={}",
+            rss.result
+        );
+        assert_eq!(
+            rss.result["error"]["code"],
+            json!(code),
+            "code arguments={arguments} rss={}",
+            rss.result
+        );
+        assert_eq!(rss.started, started, "started arguments={arguments}");
     }
 }
 
@@ -1283,7 +1628,11 @@ fn overflow_artifact_bytes_and_no_sink_match_native() {
         .and_then(Value::as_str)
     {
         let rss_bytes = artifact_bytes(&rss, id);
-        assert_eq!(rss_bytes, rss_bytes);
+        assert_overflow_payload_shape("overflow-bytes", &rss_bytes, false);
+        assert!(
+            rss_bytes.starts_with(b"stdout:\n"),
+            "overflow artifact must start with stdout header: {rss_bytes:?}"
+        );
     }
     let rss_no_sink = run_rss_exec(
         &fixture,
@@ -1448,18 +1797,49 @@ fn process_fixture_roots_live_under_std_temp_dir() {
 #[test]
 fn foreground_stdin_empty_multibyte_large_and_child_exit_match_native() {
     let fixture = Fixture::new("stdin-matrix");
-    assert_terminal_eq(&fixture, json!({"argv": ["/bin/cat"], "stdin": ""}));
+    assert_terminal_eq(
+        &fixture,
+        json!({"argv": ["/bin/cat"], "stdin": ""}),
+        true,
+        "",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
+    );
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/cat"], "stdin": "多字节\u{1F980}\n"}),
+        true,
+        "多字节\u{1F980}\n",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
     );
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/cat"], "stdin": "x".repeat(8 * 1024)}),
+        true,
+        &"x".repeat(8 * 1024),
+        "",
+        Some(0),
+        false,
+        None,
+        1,
     );
     assert_terminal_eq(
         &fixture,
         json!({"argv": ["/bin/true"], "stdin": "unused-stdin\n"}),
+        true,
+        "",
+        "",
+        Some(0),
+        false,
+        None,
+        1,
     );
     let spawn_fail = rss_terminal(
         &fixture,
