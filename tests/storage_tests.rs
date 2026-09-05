@@ -1253,7 +1253,7 @@ fn concurrent_idempotency_claims_acquire_exactly_once() {
             let result = handle.join().expect("idempotency thread should finish");
             let row = first_query_row(&result);
             assert_eq!(row["state"], json!("claimed"));
-            acquired += row["acquired"].as_i64().expect("acquired flag") as i64;
+            acquired += row["acquired"].as_i64().expect("acquired flag");
         }
     });
     assert_eq!(acquired, 1, "exactly one concurrent claim must acquire");
