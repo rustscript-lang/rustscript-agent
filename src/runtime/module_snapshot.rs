@@ -491,7 +491,7 @@ fn open_root_directory() -> io::Result<File> {
     let fd = unsafe {
         libc::open(
             path.as_ptr().cast(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -504,12 +504,21 @@ fn open_root_directory() -> io::Result<File> {
 
 #[cfg(target_os = "linux")]
 fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    let directory = open_at(
+    let directory = match open_at(
         parent,
         name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
-    )?;
+    ) {
+        Ok(directory) => directory,
+        Err(error)
+            if error.raw_os_error() == Some(libc::ENOTDIR)
+                && entry_is_symlink_at(parent, name).unwrap_or(false) =>
+        {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        Err(error) => return Err(error),
+    };
     let metadata = directory.metadata()?;
     if !metadata.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -522,7 +531,7 @@ fn open_readonly_at(parent: &File, name: &OsStr) -> io::Result<File> {
     open_at(
         parent,
         name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
     )
 }
@@ -553,6 +562,29 @@ fn open_at(parent: &File, name: &OsStr, flags: i32, mode: libc::mode_t) -> io::R
 }
 
 #[cfg(target_os = "linux")]
+fn entry_is_symlink_at(parent: &File, name: &OsStr) -> io::Result<bool> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: name is NUL terminated, parent owns a live directory fd, and
+    // metadata points to writable storage for the kernel result.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat initialized metadata after returning success.
+    let metadata = unsafe { metadata.assume_init() };
+    Ok((metadata.st_mode & libc::S_IFMT) == libc::S_IFLNK)
+}
+
+#[cfg(target_os = "linux")]
 fn create_directory_at(parent: &File, name: &OsStr) -> io::Result<()> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))?;
@@ -569,7 +601,7 @@ fn read_dir_names(dir: &File) -> Result<Vec<OsString>> {
     let independent = open_at(
         dir,
         OsStr::new("."),
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
         0,
     )
     .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))?;
@@ -1174,6 +1206,160 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp root");
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn make_fifo(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+        // SAFETY: name is NUL terminated and points to a valid output path.
+        let result = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_fifo_case(case: &str, root: &Path) {
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root).expect("fifo case root");
+        match case {
+            "irrelevant-tree" => {
+                let rss = root.join("rss");
+                let agent = rss.join("agent");
+                let nested = rss.join("nested");
+                fs::create_dir_all(&agent).expect("agent dir");
+                fs::create_dir_all(&nested).expect("nested dir");
+                let entry = agent.join("main.rss");
+                fs::write(
+                    &entry,
+                    "pub fn run(input: map) -> string { \"fifo-tree\"; }\n",
+                )
+                .expect("entry");
+                fs::write(
+                    nested.join("helper.rss"),
+                    "pub fn helper() -> string { \"helper\"; }\n",
+                )
+                .expect("helper");
+                make_fifo(&rss.join("irrelevant.pipe"));
+
+                let error = capture_module_snapshot(&entry).expect_err("irrelevant FIFO");
+                assert_eq!(
+                    error.to_string(),
+                    "RustScript compile error: module tree walk failed"
+                );
+                assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+                fs::remove_file(rss.join("irrelevant.pipe")).expect("remove FIFO");
+                let snapshot = capture_module_snapshot(&entry).expect("regular tree");
+                assert_eq!(snapshot.files().len(), 2);
+                assert_eq!(snapshot.entry_rel(), "agent/main.rss");
+            }
+            "rss-fifo" => {
+                let rss = root.join("rss");
+                fs::create_dir_all(&rss).expect("rss dir");
+                let entry = rss.join("main.rss");
+                make_fifo(&entry);
+
+                let error = module_tree_digest(&entry).expect_err("FIFO .rss entry");
+                assert_eq!(
+                    error.to_string(),
+                    "RustScript compile error: module tree walk failed"
+                );
+                assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+            }
+            "ancestor-fifo" => {
+                let ancestor = root.join("fifo");
+                fs::create_dir_all(root).expect("ancestor root");
+                make_fifo(&ancestor);
+                let entry = ancestor.join("rss").join("agent").join("main.rss");
+
+                let error = module_tree_digest(&entry).expect_err("FIFO ancestor");
+                assert_eq!(
+                    error.to_string(),
+                    "RustScript compile error: module tree walk failed"
+                );
+                assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+            }
+            "cleanup-fifo" => {
+                let rss = root.join("rss");
+                fs::create_dir_all(&rss).expect("rss dir");
+                let entry = rss.join("main.rss");
+                fs::write(
+                    &entry,
+                    "pub fn run(input: map) -> string { \"cleanup\"; }\n",
+                )
+                .expect("entry");
+                let snapshot = capture_module_snapshot(&entry).expect("snapshot");
+                let materialized = snapshot.materialize().expect("materialize");
+                let sandbox = materialized.sandbox().to_path_buf();
+                make_fifo(&sandbox.join("leftover.pipe"));
+                drop(materialized);
+                assert!(!sandbox.exists(), "FIFO cleanup must remove the sandbox");
+            }
+            _ => panic!("unknown FIFO test case: {case}"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_special_files_are_bounded() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CASE_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_CASE";
+        const ROOT_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_ROOT";
+        const CASES: [&str; 4] = [
+            "irrelevant-tree",
+            "rss-fifo",
+            "ancestor-fifo",
+            "cleanup-fifo",
+        ];
+
+        if let Some(case) = std::env::var_os(CASE_ENV) {
+            let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("FIFO case root"));
+            run_fifo_case(&case.to_string_lossy(), &root);
+            return;
+        }
+
+        for case in CASES {
+            let root = test_root(&format!("fifo-{case}"));
+            let _ = fs::remove_dir_all(&root);
+            let mut child = Command::new(std::env::current_exe().expect("test executable path"))
+                .args([
+                    "--exact",
+                    "runtime::module_snapshot::tests::fifo_special_files_are_bounded",
+                    "--nocapture",
+                ])
+                .env(CASE_ENV, case)
+                .env(ROOT_ENV, &root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("FIFO child should start");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("FIFO child status") {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let status = child.wait().expect("FIFO child must be reaped");
+                    let _ = fs::remove_dir_all(&root);
+                    panic!("FIFO case {case} blocked beyond the bound; child status {status:?}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let _ = fs::remove_dir_all(&root);
+            assert!(status.success(), "FIFO case {case} failed with {status:?}");
+        }
     }
 
     #[test]
