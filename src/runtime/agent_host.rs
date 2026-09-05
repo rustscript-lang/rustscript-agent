@@ -22,12 +22,10 @@ use crate::capabilities::{
     ExecutionLease, FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
     ProcessSnapshot, capability_error_envelope, parse_prepare_metadata, tool_commit, tool_prepare,
 };
-use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
+use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
-use crate::tools::{DispatchContext, ToolResult};
 
 const PROVIDER_CALL: &str = "agent::provider_call";
-const TOOL_DISPATCH: &str = "agent::tool_dispatch";
 const SLEEP_MS: &str = "agent::sleep_ms";
 const CONTROL_CHECK: &str = "agent::control_check";
 const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
@@ -65,11 +63,6 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         builder.function(HostFunctionSchema::with_return(
             PROVIDER_CALL,
             vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            TOOL_DISPATCH,
-            vec![HostParamSchema::value("call", HostTypeSchema::Unknown)],
             response.clone(),
         ));
         builder.function(HostFunctionSchema::with_return(
@@ -266,11 +259,11 @@ pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct AgentHostBridges {
     pub provider: Option<Arc<dyn AgentProviderHost>>,
-    pub dispatcher: Option<Arc<DispatchContext>>,
     /// Shared with the runner invocation; never an independent cancellation root.
     pub cancellation: Option<RunCancellation>,
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
+    #[allow(dead_code)]
     pub metrics: Option<Arc<Metrics>>,
     pub lifecycle: Option<Arc<CapabilityLifecycle>>,
     pub capability_owner: Option<CapabilityOwner>,
@@ -286,10 +279,10 @@ pub struct AgentHostBridges {
 #[derive(Clone)]
 pub struct AgentHostState {
     pub provider: Arc<dyn AgentProviderHost>,
-    pub dispatcher: Option<Arc<DispatchContext>>,
     pub cancellation: RunCancellation,
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
+    #[allow(dead_code)]
     pub metrics: Option<Arc<Metrics>>,
     pub lifecycle: Option<Arc<CapabilityLifecycle>>,
     pub capability_owner: Option<CapabilityOwner>,
@@ -658,40 +651,6 @@ impl AgentHostState {
         }
     }
 
-    fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
-        if let Some(error) = self.control_error() {
-            return error_with_block(error, call, None);
-        }
-        let parsed = match parse_tool_call(call) {
-            Ok(parsed) => parsed,
-            Err(message) => {
-                return error_with_block(typed_fail("malformed_payload", &message), call, None);
-            }
-        };
-        let Some(dispatcher) = self.dispatcher.as_ref() else {
-            return error_with_block(
-                typed_fail(
-                    "dispatcher_missing",
-                    "native tool dispatcher is not configured",
-                ),
-                call,
-                Some(&parsed),
-            );
-        };
-        let result = dispatcher.dispatch_one(&parsed);
-        if let Some(metrics) = &self.metrics
-            && !result.replayed
-        {
-            metrics.account_tool_attempt(!result.ok, result.truncated);
-        }
-        let mut envelope = tool_result_envelope(&parsed, result);
-        if let Some(error) = self.control_error() {
-            envelope["terminal"] = json!(true);
-            envelope["control"] = error.get("error").cloned().unwrap_or(error);
-        }
-        envelope
-    }
-
     fn sleep_ms(&self, delay_ms: i64) -> i64 {
         let requested = delay_ms.max(0);
         let capped = u64::try_from(requested)
@@ -855,7 +814,6 @@ pub fn register_agent_host_functions(
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
     register_named(registry, catalog, PROVIDER_CALL, 1, provider_call_adapter)?;
-    register_named(registry, catalog, TOOL_DISPATCH, 1, tool_dispatch_adapter)?;
     register_named(registry, catalog, SLEEP_MS, 1, sleep_ms_adapter)?;
     register_named(registry, catalog, CONTROL_CHECK, 0, control_check_adapter)?;
     register_named(registry, catalog, TOOL_PREPARE, 1, tool_prepare_adapter)?;
@@ -989,13 +947,6 @@ fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     let json = vm_value_to_json(&request);
     return_json(state.provider_call(&json))
-}
-
-fn tool_dispatch_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let call = args.first().cloned().unwrap_or(Value::Null);
-    let state = installed_state(vm)?;
-    let json = vm_value_to_json(&call);
-    return_json(state.tool_dispatch(&json))
 }
 
 fn sleep_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -1563,7 +1514,6 @@ const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
     "scripted_exhausted",
     "cancelled",
     "deadline_elapsed",
-    "dispatcher_missing",
     "adapter_failed",
     "unsupported_parallel",
     "unsupported_task",
@@ -1648,114 +1598,4 @@ fn normalize_provider_envelope(result: JsonValue) -> JsonValue {
         return typed_fail("malformed_payload", "provider tool_calls is not an array");
     }
     result
-}
-
-fn parse_tool_call(value: &JsonValue) -> Result<ToolCall, String> {
-    let id = value
-        .get("id")
-        .or_else(|| value.get("tool_call_id"))
-        .and_then(JsonValue::as_str)
-        .unwrap_or("")
-        .to_string();
-    let name = value
-        .get("name")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("")
-        .to_string();
-    if id.is_empty() || name.is_empty() {
-        return Err("tool call is missing id or name".to_string());
-    }
-    let arguments = if let Some(arguments) = value.get("arguments") {
-        if !arguments.is_object() {
-            return Err("tool call arguments must be an object".to_string());
-        }
-        arguments.clone()
-    } else if let Some(raw) = value.get("arguments_json") {
-        let text = raw
-            .as_str()
-            .ok_or_else(|| "arguments_json must be a string".to_string())?;
-        let parsed: JsonValue = serde_json::from_str(text)
-            .map_err(|error| format!("malformed arguments_json: {error}"))?;
-        if !parsed.is_object() {
-            return Err("arguments_json must decode to an object".to_string());
-        }
-        parsed
-    } else {
-        json!({})
-    };
-    Ok(ToolCall {
-        id,
-        name,
-        arguments,
-    })
-}
-
-fn tool_result_envelope(call: &ToolCall, result: ToolResult) -> JsonValue {
-    let code = result
-        .error
-        .as_ref()
-        .map(|error| error.code.as_str())
-        .unwrap_or("");
-    let terminal = matches!(
-        code,
-        "cancelled" | "deadline_elapsed" | "max_tool_calls" | "event_persist_failed"
-    );
-    let error = result
-        .error
-        .as_ref()
-        .map(|error| json!({"code": error.code, "message": error.message}))
-        .unwrap_or_else(|| json!({}));
-    json!({
-        "ok": result.ok,
-        "terminal": terminal,
-        "error": if result.ok { json!({}) } else { error.clone() },
-        "content_block": {
-            "type": "tool_result",
-            "tool_call_id": call.id,
-            "name": call.name,
-            "content": result.content,
-            "is_error": !result.ok,
-            "result": result,
-            "error": error,
-            "artifact": result.artifacts,
-            "truncated": result.truncated
-        }
-    })
-}
-
-fn error_with_block(fail: JsonValue, call: &JsonValue, parsed: Option<&ToolCall>) -> JsonValue {
-    let id = parsed
-        .map(|call| call.id.clone())
-        .or_else(|| {
-            call.get("id")
-                .or_else(|| call.get("tool_call_id"))
-                .and_then(JsonValue::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let name = parsed
-        .map(|call| call.name.clone())
-        .or_else(|| {
-            call.get("name")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let error = fail.get("error").cloned().unwrap_or_else(|| json!({}));
-    json!({
-        "ok": false,
-        "terminal": true,
-        "error": error.clone(),
-        "content_block": {
-            "type": "tool_result",
-            "tool_call_id": id,
-            "name": name,
-            "content": "",
-            "is_error": true,
-            "result": {},
-            "error": error,
-            "artifact": [],
-            "truncated": false
-        }
-    })
 }

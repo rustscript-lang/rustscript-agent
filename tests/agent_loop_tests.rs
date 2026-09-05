@@ -12,16 +12,18 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use rustscript_agent::tools::{
-    DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError, NativeToolExecutor,
-    ToolExecutorBoundary, ToolOwner, ToolResult,
+use rustscript_agent::capabilities::{
+    AllowAllApproval, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
+    CapabilityOwner, DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
+    LifecycleClock, LifecycleError, LifecycleLimits, NeverCancelled, ProcessCapability,
+    ProcessLimits, SystemClock, TokenIssuer, UuidIssuer,
 };
 use rustscript_agent::{
-    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentProviderHost,
-    AgentRunner, RunCancellation, RunContext, RunError, ScriptedProvider, ToolDescriptor,
-    ToolRegistry, ToolRegistryEntry, builtin_entries,
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentHostBridges,
+    AgentProviderHost, AgentRunner, RunCancellation, RunContext, RunError, ScriptedProvider,
+    ToolRegistry, bundled_tool_entries, bundled_tool_registry,
 };
-use rustscript_vm::{CancellationReason, CancellationToken, InvocationError, Value};
+use rustscript_vm::{CancellationReason, InvocationError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 fn agent_root() -> PathBuf {
@@ -47,17 +49,24 @@ fn loop_runner() -> AgentRunner {
         .expect("production loop policy should compile")
 }
 
-fn loop_runner_with(
-    provider: ScriptedProvider,
-    dispatcher: Option<Arc<DispatchContext>>,
-) -> AgentRunner {
-    let mut runner = loop_runner()
-        .with_provider(Arc::new(provider))
-        .with_skip_sleep(true);
-    if let Some(dispatcher) = dispatcher {
-        runner = runner.with_dispatcher(dispatcher);
+fn loop_runner_with(provider: ScriptedProvider, host: Option<AgentHostBridges>) -> AgentRunner {
+    let mut runner = loop_runner().with_skip_sleep(true);
+    if let Some(mut host) = host {
+        host.provider = Some(Arc::new(provider));
+        host.skip_sleep = true;
+        runner = runner.with_host(host);
+    } else {
+        runner = runner.with_provider(Arc::new(provider));
     }
     runner
+}
+
+thread_local! {
+    static LOOP_WORKSPACE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn set_loop_workspace(root: PathBuf) {
+    LOOP_WORKSPACE.with(|slot| *slot.borrow_mut() = Some(root));
 }
 
 fn compact_runner() -> AgentRunner {
@@ -209,7 +218,19 @@ fn run_context(
         "provider_options": {},
         "limits": {
             "max_turns": max_turns,
-            "max_tool_calls": max_tool_calls
+            "max_tool_calls": max_tool_calls,
+            "workspace_root": LOOP_WORKSPACE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+        },
+        "metadata": {
+            "registry_identity": bundled_tool_registry()
+                .ok()
+                .map(|registry| registry.identity().to_string())
+                .unwrap_or_default()
         },
         "config": config
     })
@@ -245,9 +266,20 @@ fn frozen_run_context(prompt: Option<&str>, tool_schemas: JsonValue) -> RunConte
         tool_schemas,
         limits: json!({
             "max_turns": 4,
-            "max_tool_calls": 8
+            "max_tool_calls": 8,
+            "workspace_root": LOOP_WORKSPACE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
         }),
-        metadata: json!({}),
+        metadata: json!({
+            "registry_identity": bundled_tool_registry()
+                .ok()
+                .map(|registry| registry.identity().to_string())
+                .unwrap_or_default()
+        }),
         coding_system_prompt: prompt.map(str::to_string),
     }
 }
@@ -327,35 +359,6 @@ fn assert_decision_does_not_leak_prompt(decision: &JsonValue, prompt: &str) {
     );
 }
 
-struct MemoryEvents {
-    events: Mutex<Vec<(String, JsonValue)>>,
-    terminal: AtomicU64,
-}
-
-impl MemoryEvents {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            events: Mutex::new(Vec::new()),
-            terminal: AtomicU64::new(0),
-        })
-    }
-}
-
-impl DurableEventCommitter for MemoryEvents {
-    fn is_terminal(&self) -> bool {
-        self.terminal.load(Ordering::SeqCst) != 0
-    }
-
-    fn stop_requested(&self) -> bool {
-        false
-    }
-
-    fn commit(&self, event_type: &str, data: JsonValue) -> Result<(), EventCommitError> {
-        self.events.lock().push((event_type.to_string(), data));
-        Ok(())
-    }
-}
-
 struct CountingExecutor {
     count: AtomicU64,
     names: Mutex<Vec<String>>,
@@ -370,178 +373,228 @@ impl CountingExecutor {
     }
 }
 
-impl ToolExecutorBoundary for CountingExecutor {
-    fn execute(
-        &self,
-        executor: &NativeToolExecutor,
-        arguments: &JsonValue,
-        _cancellation: &CancellationToken,
-        _deadline: Instant,
-    ) -> ToolResult {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        self.names.lock().push(executor.tool_name().to_string());
-        ToolResult::success(
-            format!("ran {}", executor.tool_name()),
-            json!({"ok": true, "arguments": arguments}),
-        )
+struct LoopDurable {
+    executor: Arc<CountingExecutor>,
+    cancel_after: Option<RunCancellation>,
+    results: Mutex<std::collections::HashMap<String, JsonValue>>,
+}
+
+impl LoopDurable {
+    fn new(executor: Arc<CountingExecutor>, cancel_after: Option<RunCancellation>) -> Arc<Self> {
+        Arc::new(Self {
+            executor,
+            cancel_after,
+            results: Mutex::new(std::collections::HashMap::new()),
+        })
     }
 }
 
-fn native_dispatcher(
+impl DurableToolLifecycle for LoopDurable {
+    fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn prepare_parent(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn replay_result(
+        &self,
+        _run_id: &str,
+        call_id: &str,
+        _tool_name: &str,
+    ) -> Result<Option<JsonValue>, LifecycleError> {
+        Ok(self.results.lock().get(call_id).cloned())
+    }
+
+    fn commit_started(&self, record: &DurableStarted) -> Result<(), LifecycleError> {
+        self.executor.count.fetch_add(1, Ordering::SeqCst);
+        self.executor.names.lock().push(record.tool_name.clone());
+        Ok(())
+    }
+
+    fn commit_result(
+        &self,
+        call_id: &str,
+        result: &JsonValue,
+    ) -> Result<JsonValue, LifecycleError> {
+        self.results
+            .lock()
+            .insert(call_id.to_string(), result.clone());
+        if let Some(cancellation) = &self.cancel_after {
+            cancellation.request(CancellationReason::Requested);
+        }
+        Ok(json!({
+            "ok": true,
+            "kind": "committed",
+            "call_id": call_id,
+            "result": result,
+        }))
+    }
+
+    fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+}
+
+struct RunCancelFlag(RunCancellation);
+
+impl CancellationFlag for RunCancelFlag {
+    fn is_cancelled(&self) -> bool {
+        self.0.requested().is_some()
+    }
+}
+
+fn loop_owner() -> CapabilityOwner {
+    CapabilityOwner::new("profile-loop", "session-loop", "run-loop").expect("owner")
+}
+
+fn seed_loop_workspace(root: &PathBuf) {
+    fs::create_dir_all(root).expect("loop workspace");
+    for name in ["note.txt", "a.txt", "b.txt"] {
+        fs::write(root.join(name), format!("{name} body\n")).expect("seed loop file");
+    }
+    set_loop_workspace(root.clone());
+}
+
+fn loop_host_with(
     max_tool_calls: u64,
-) -> (Arc<DispatchContext>, Arc<CountingExecutor>, PathBuf) {
+    executor: Arc<CountingExecutor>,
+    cancellation: Option<RunCancellation>,
+    root: PathBuf,
+) -> AgentHostBridges {
+    seed_loop_workspace(&root);
+    let identity = bundled_tool_registry()
+        .expect("RSS registry")
+        .identity()
+        .to_string();
+    let durable = LoopDurable::new(Arc::clone(&executor), cancellation.clone());
+    let clock = Arc::new(SystemClock);
+    let deadline_ms = clock.now_ms() + 30_000;
+    let lifecycle = Arc::new(
+        CapabilityLifecycle::builder()
+            .owner(loop_owner())
+            .registry_identity(identity)
+            .workspace(&root)
+            .limits(LifecycleLimits {
+                max_tool_calls: max_tool_calls.max(1),
+                max_output_bytes: 64 * 1024,
+                max_summary_bytes: 256,
+            })
+            .deadline_ms(deadline_ms)
+            .clock(clock)
+            .tokens(Arc::new(UuidIssuer) as Arc<dyn TokenIssuer>)
+            .durable(durable)
+            .approval(Arc::new(AllowAllApproval))
+            .cancellation(
+                cancellation
+                    .map(|item| Arc::new(RunCancelFlag(item)) as Arc<dyn CancellationFlag>)
+                    .unwrap_or_else(|| Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>),
+            )
+            .build()
+            .expect("loop lifecycle"),
+    );
+    let filesystem = Arc::new(
+        FilesystemCapability::new(
+            lifecycle.as_ref().clone(),
+            loop_owner(),
+            FilesystemLimits::default(),
+        )
+        .expect("loop filesystem"),
+    );
+    let processes = Arc::new(
+        ProcessCapability::new(
+            lifecycle.as_ref().clone(),
+            loop_owner(),
+            ProcessLimits::default(),
+        )
+        .expect("loop processes"),
+    );
+    let artifacts = Arc::new(
+        ArtifactCapability::new(
+            lifecycle.as_ref().clone(),
+            loop_owner(),
+            ArtifactLimits {
+                max_object_bytes: 8 * 1024 * 1024,
+                max_total_bytes: 64 * 1024 * 1024,
+                max_objects: 64,
+            },
+        )
+        .expect("loop artifacts"),
+    );
+    AgentHostBridges {
+        lifecycle: Some(lifecycle),
+        capability_owner: Some(loop_owner()),
+        filesystem: Some(filesystem),
+        processes: Some(processes),
+        artifacts: Some(artifacts),
+        ..AgentHostBridges::default()
+    }
+}
+
+fn native_dispatcher(max_tool_calls: u64) -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
         "loop-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir_all(&root).expect("loop dispatcher workspace");
     let executor = CountingExecutor::new();
-    let snapshot = ToolRegistry::builtin()
-        .expect("builtin registry")
-        .snapshot();
-    let identity = snapshot.identity().to_string();
-    let dispatcher = DispatchContext::new(
-        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
-        root.clone(),
-        CancellationToken::new(),
-        Instant::now() + Duration::from_secs(30),
-        snapshot,
-        identity.clone(),
-        identity,
-        DispatchLimits {
-            max_tool_calls,
-            max_tool_output_bytes: 64 * 1024,
-            max_event_bytes: 32 * 1024,
-        },
-        MemoryEvents::new(),
-        executor.clone(),
-    )
-    .expect("dispatch context");
-    (Arc::new(dispatcher), executor, root)
+    let host = loop_host_with(max_tool_calls, Arc::clone(&executor), None, root.clone());
+    (host, executor, root)
 }
 
 fn echo_tool() -> JsonValue {
-    json!([{
-        "name": "read_file",
-        "description": "Read bounded text from a workspace file",
-        "schema_json": "{\"type\":\"object\"}"
-    }])
+    bundled_tool_registry()
+        .expect("RSS registry")
+        .snapshot()
+        .schemas()
 }
 
 fn optional_tool() -> JsonValue {
     json!([{
         "name": "optional_tool",
         "description": "all arguments optional",
-        "schema_json": "{\"type\":\"object\"}"
+        "toolset": "coding",
+        "risk_class": "read",
+        "schema": { "type": "object" }
     }])
 }
 
-fn optional_tool_dispatcher() -> (Arc<DispatchContext>, Arc<CountingExecutor>, PathBuf) {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
-        "optional-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&root).expect("optional tool workspace");
-    let executor = CountingExecutor::new();
-    let registry = ToolRegistry::new([ToolRegistryEntry::new(
-        ToolDescriptor::new(
-            "optional_tool",
-            "all arguments optional",
-            "coding",
-            "read",
-            json!({
-                "type": "object",
-                "properties": { "hint": { "type": "string" } },
-                "additionalProperties": false
-            }),
-        ),
-        NativeToolExecutor::placeholder("optional_tool"),
-    )])
-    .expect("optional tool registry");
-    let snapshot = registry.snapshot();
-    let identity = snapshot.identity().to_string();
-    let dispatcher = DispatchContext::new(
-        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
-        root.clone(),
-        CancellationToken::new(),
-        Instant::now() + Duration::from_secs(30),
-        snapshot,
-        identity.clone(),
-        identity,
-        DispatchLimits {
-            max_tool_calls: 8,
-            max_tool_output_bytes: 64 * 1024,
-            max_event_bytes: 32 * 1024,
-        },
-        MemoryEvents::new(),
-        executor.clone(),
-    )
-    .expect("optional dispatch context");
-    (Arc::new(dispatcher), executor, root)
+fn optional_tool_dispatcher() -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
+    native_dispatcher(8)
 }
 
 struct CancelAfterEffect {
-    cancellation: RunCancellation,
-    count: AtomicU64,
+    _count: AtomicU64,
 }
 
-impl ToolExecutorBoundary for CancelAfterEffect {
-    fn execute(
-        &self,
-        executor: &NativeToolExecutor,
-        arguments: &JsonValue,
-        _cancellation: &CancellationToken,
-        _deadline: Instant,
-    ) -> ToolResult {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        self.cancellation.request(CancellationReason::Requested);
-        ToolResult::success(
-            format!("ran {}", executor.tool_name()),
-            json!({"ok": true, "arguments": arguments}),
-        )
+impl CancelAfterEffect {
+    fn from_executor(executor: &CountingExecutor) -> Self {
+        Self {
+            _count: AtomicU64::new(executor.count.load(Ordering::SeqCst)),
+        }
     }
 }
 
 fn cancel_after_effect_dispatcher(
     cancellation: RunCancellation,
-) -> (Arc<DispatchContext>, Arc<CancelAfterEffect>, PathBuf) {
+) -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
         "cancel-after-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir_all(&root).expect("cancel-after workspace");
-    let executor = Arc::new(CancelAfterEffect {
-        cancellation,
-        count: AtomicU64::new(0),
-    });
-    let snapshot = ToolRegistry::builtin()
-        .expect("builtin registry")
-        .snapshot();
-    let identity = snapshot.identity().to_string();
-    let dispatcher = DispatchContext::new(
-        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
-        root.clone(),
-        CancellationToken::new(),
-        Instant::now() + Duration::from_secs(30),
-        snapshot,
-        identity.clone(),
-        identity,
-        DispatchLimits {
-            max_tool_calls: 8,
-            max_tool_output_bytes: 64 * 1024,
-            max_event_bytes: 32 * 1024,
-        },
-        MemoryEvents::new(),
-        executor.clone(),
-    )
-    .expect("cancel-after dispatch context");
-    (Arc::new(dispatcher), executor, root)
+    let executor = CountingExecutor::new();
+    let host = loop_host_with(8, Arc::clone(&executor), Some(cancellation), root.clone());
+    let _ = CancelAfterEffect::from_executor(&executor);
+    (host, executor, root)
 }
 
 fn assert_typed_cancelled(result: std::result::Result<Value, RunError>) -> Option<JsonValue> {
@@ -2261,11 +2314,10 @@ fn loop_post_effect_cancel_keeps_tool_result_and_skips_next_effect() {
     ));
     provider.push_ok(text_response("should not run"));
     let cancellation = RunCancellation::new();
-    let (dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
-    let runner = loop_runner()
-        .with_provider(Arc::new(provider.clone()))
-        .with_dispatcher(dispatcher)
-        .with_skip_sleep(true);
+    let (mut dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
+    dispatcher.provider = Some(Arc::new(provider.clone()));
+    dispatcher.skip_sleep = true;
+    let runner = loop_runner().with_host(dispatcher).with_skip_sleep(true);
     let mut sink = VecSink::default();
     let result = runner.run_with_context_and_events(
         json_to_vm(&run_context(4, 8, loop_config(false, false), echo_tool())),
@@ -2282,23 +2334,24 @@ fn loop_post_effect_cancel_keeps_tool_result_and_skips_next_effect() {
 fn loop_post_effect_cancel_probe_returns_real_tool_result() {
     let cancellation = RunCancellation::new();
     let (dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
-    let runner = AgentRunner::from_source(
-        r#"
-use agent;
-pub fn run(context: map) -> map {
-    agent::tool_dispatch(context)
-}
-"#,
-        AgentConfig::default(),
-    )
-    .expect("dispatch probe should compile")
-    .with_dispatcher(dispatcher);
+    let runner = rustscript_agent::bundled_dispatch_runner()
+        .expect("dispatch entry should compile")
+        .with_host(dispatcher);
     let mut sink = VecSink::default();
     let result = runner.run_with_context_and_events(
         json_to_vm(&json!({
-            "id": "c1",
-            "name": "read_file",
-            "arguments": {"path": "a.txt"}
+            "call": {
+                "id": "c1",
+                "name": "read_file",
+                "arguments": {"path": "a.txt"}
+            },
+            "registry": bundled_tool_registry().expect("RSS registry").snapshot().schemas(),
+            "registry_identity": bundled_tool_registry().expect("RSS registry").identity(),
+            "admitted_registry_identity": bundled_tool_registry().expect("RSS registry").identity(),
+            "run_id": "run-loop",
+            "config": {
+                "workspace_root": root.to_string_lossy(),
+            }
         })),
         &mut sink,
         &cancellation,
@@ -2311,7 +2364,6 @@ pub fn run(context: map) -> map {
             assert_eq!(envelope["ok"], json!(true));
             assert_eq!(envelope["content_block"]["type"], json!("tool_result"));
             assert_eq!(envelope["content_block"]["tool_call_id"], json!("c1"));
-            assert_eq!(envelope["content_block"]["content"], json!("ran read_file"));
             assert_eq!(envelope["content_block"]["is_error"], json!(false));
         }
         Err(RunError::Invocation(InvocationError::Cancelled(CancellationReason::Requested))) => {}
@@ -3319,7 +3371,7 @@ async fn registry_mismatch_is_observed_as_durable_failure_before_rss_source() {
         })
         .await
         .expect("admission should succeed");
-    let changed_registry = ToolRegistry::new(builtin_entries().into_iter().take(1))
+    let changed_registry = ToolRegistry::new(bundled_tool_entries().into_iter().take(1))
         .expect("a one-tool registry should validate");
     service
         .set_tool_registry(changed_registry)

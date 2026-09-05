@@ -1098,7 +1098,6 @@ fn host_catalog_registers_cap_functions_with_typed_bounds() {
         "cap::artifact_get",
         "cap::artifact_reference",
         "cap::clock_monotonic_ms",
-        "agent::tool_dispatch",
     ] {
         assert!(
             names.contains(&required),

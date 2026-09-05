@@ -1,0 +1,5 @@
+use self::terminal::{invoke};
+
+pub fn run(context: map) -> map {
+    invoke(context)
+}

@@ -319,7 +319,7 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
     let mut fixture = WorkspaceFixture::new(&sh);
     let source = agent_loop_source();
     assert!(
-        source.contains("agent::provider_call") && source.contains("agent::tool_dispatch"),
+        source.contains("agent::provider_call") && source.contains("tools::dispatch"),
         "E2E must compile the real bundled RSS loop"
     );
 

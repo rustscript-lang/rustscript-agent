@@ -7,7 +7,7 @@ use rustscript_vm::{
 use serde_json::{Map, Value, json};
 
 use crate::config::RunLimits;
-use crate::tools::ToolDescriptor;
+use crate::tool_schema::ToolDescriptor;
 
 /// Root-level guidance files, highest priority first.
 pub const GUIDANCE_FILE_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];

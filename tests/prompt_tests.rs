@@ -11,8 +11,8 @@ use rustscript_agent::prompt::{
     LoadedGuidance, PromptBuildError, TRUNCATION_MARKER, UNTRUSTED_FILE_HEADER,
     build_coding_prompt, render_coding_prompt,
 };
-use rustscript_agent::tools::{ToolDescriptor, ToolRegistry, Toolset};
 use rustscript_agent::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentService};
+use rustscript_agent::{ToolDescriptor, ToolRegistry, Toolset};
 use serde_json::{Value, json};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -984,7 +984,7 @@ async fn same_run_freezes_prompt_after_guidance_schema_and_date_mutation() {
 
     fixture.write("AGENTS.md", "mutated-guidance\n");
     service.set_date_source(Arc::new(FixedDateSource::new("2030-01-01")));
-    let mut later = rustscript_agent::builtin_entries()
+    let mut later = rustscript_agent::bundled_tool_entries()
         .into_iter()
         .next()
         .expect("builtin tool");

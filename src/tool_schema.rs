@@ -2,7 +2,6 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 /// Version of the effect-free executor contract included in registry identity.
-pub const NATIVE_EXECUTOR_CONTRACT_VERSION: &str = "native-tool-executor-v1";
 const MAX_POLICY_ERROR_BYTES: usize = 128;
 
 /// The public, provider-facing description of one native tool.
@@ -209,95 +208,4 @@ fn bounded_policy_value(value: &str) -> String {
         end -= 1;
     }
     value[..end].to_string()
-}
-
-/// Native execution slots reserved for the registry.
-///
-/// These variants are contracts only. They deliberately do not contain
-/// closures, process handles, or filesystem capabilities; effects are added by
-/// the later dispatch tasks. The enum is non-exhaustive so adding a real
-/// executor slot does not break downstream matches.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NativeToolExecutor {
-    ReadFile,
-    SearchFiles,
-    WriteFile,
-    Patch,
-    Terminal,
-    Process,
-    Placeholder(String),
-}
-
-impl NativeToolExecutor {
-    /// Returns the no-effects executor slot for a tool name.
-    pub fn placeholder(name: impl Into<String>) -> Self {
-        let name = name.into();
-        match name.as_str() {
-            "read_file" => Self::ReadFile,
-            "search_files" => Self::SearchFiles,
-            "write_file" => Self::WriteFile,
-            "patch" => Self::Patch,
-            "terminal" => Self::Terminal,
-            "process" => Self::Process,
-            _ => Self::Placeholder(name),
-        }
-    }
-
-    /// Returns the descriptor name represented by this executor slot.
-    pub fn tool_name(&self) -> &str {
-        match self {
-            Self::ReadFile => "read_file",
-            Self::SearchFiles => "search_files",
-            Self::WriteFile => "write_file",
-            Self::Patch => "patch",
-            Self::Terminal => "terminal",
-            Self::Process => "process",
-            Self::Placeholder(name) => name,
-        }
-    }
-
-    /// Returns the stable, effect-free contract for this executor slot.
-    ///
-    /// The contract identifies the native implementation slot and its policy
-    /// labels. It is metadata for dispatch and resume identity, not an
-    /// authentication or authorization decision; those checks remain owned by
-    /// the service and native policy layers.
-    pub fn contract(&self) -> NativeExecutorContract {
-        match self {
-            Self::ReadFile => NativeExecutorContract::known("read_file", "coding", "read"),
-            Self::SearchFiles => NativeExecutorContract::known("search_files", "coding", "read"),
-            Self::WriteFile => NativeExecutorContract::known("write_file", "coding", "write"),
-            Self::Patch => NativeExecutorContract::known("patch", "coding", "write"),
-            Self::Terminal => NativeExecutorContract::known("terminal", "process", "execute"),
-            Self::Process => NativeExecutorContract::known("process", "process", "execute"),
-            Self::Placeholder(name) => NativeExecutorContract {
-                tool_name: name.clone(),
-                toolset: None,
-                risk_class: None,
-                version: NATIVE_EXECUTOR_CONTRACT_VERSION,
-            },
-        }
-    }
-}
-
-/// Effect-free metadata for a future native executor implementation.
-#[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct NativeExecutorContract {
-    pub tool_name: String,
-    pub toolset: Option<&'static str>,
-    pub risk_class: Option<&'static str>,
-    pub version: &'static str,
-}
-
-impl NativeExecutorContract {
-    fn known(tool_name: &'static str, toolset: &'static str, risk_class: &'static str) -> Self {
-        Self {
-            tool_name: tool_name.to_string(),
-            toolset: Some(toolset),
-            risk_class: Some(risk_class),
-            version: NATIVE_EXECUTOR_CONTRACT_VERSION,
-        }
-    }
 }

@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use rustscript_agent::ToolResult;
 use rustscript_agent::capabilities::{CapabilityRisk, PrepareMetadata, PrepareOutcome};
 use rustscript_agent::config::{
     ADMISSION_QUERY_RESULT_LIMIT_BYTES, ADMISSION_RUN_COL_INPUT_JSON, AdmissionSqliteCellLens,
@@ -11,7 +12,6 @@ use rustscript_agent::config::{
     MAX_PROVIDER_OPTIONS_BYTES, MAX_RUN_CONTEXT_STORAGE_BYTES, ProviderProfile, RunLimits,
     estimate_admission_query_bytes,
 };
-use rustscript_agent::tools::ToolResult;
 use rustscript_agent::{
     AdmitError, AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, LlmContentBlock,
     ProviderPendingDecision, ScriptedProvider, ToolCall, ToolDescriptor, ToolRegistry,
@@ -109,7 +109,7 @@ fn custom_registry() -> ToolRegistry {
 }
 
 fn custom_registry_with_description(description: &str) -> ToolRegistry {
-    let mut entry = rustscript_agent::builtin_entries()
+    let mut entry = rustscript_agent::bundled_tool_entries()
         .into_iter()
         .next()
         .expect("the built-in registry has a read tool");
@@ -1754,8 +1754,8 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-echo".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
     service
         .commit_provider_step(
@@ -1765,7 +1765,7 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -1823,8 +1823,8 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-fail".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
     service
         .commit_provider_step(
@@ -1834,7 +1834,7 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -1975,8 +1975,8 @@ async fn missing_tool_result_parent_fails_typed_before_durable_result() {
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-orphan".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
     let results = service
         .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
@@ -2013,8 +2013,8 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-parent".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({"secret": "nope"}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
     let parent = service
         .commit_provider_step(
@@ -2024,7 +2024,7 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
-                arguments_json: Some(r#"{"secret":"nope"}"#.to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -2040,7 +2040,7 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
         .expect("dispatch with parent");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
-        Some("unknown_tool")
+        Some("not_found")
     );
     assert_ne!(parent_id, "");
     let events = service.run_events(&admitted.run_id);
@@ -2085,7 +2085,7 @@ async fn in_txn_failpoint_rolls_back_provider_step_on_reopen() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some("c-fail".to_string()),
                 name: Some("read_file".to_string()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -2146,7 +2146,7 @@ async fn post_commit_failpoint_is_replayable_and_publishes_once_on_recovery() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some("c-crash".to_string()),
                 name: Some("read_file".to_string()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -2190,7 +2190,7 @@ async fn post_commit_failpoint_is_replayable_and_publishes_once_on_recovery() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some("c-crash".to_string()),
                 name: Some("read_file".to_string()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,

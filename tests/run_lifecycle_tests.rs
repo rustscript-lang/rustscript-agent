@@ -794,7 +794,7 @@ async fn durable_tool_replay_does_not_increment_activity() {
     let provider = ScriptedProvider::new();
     let call = ToolCall {
         id: "call-replay".to_string(),
-        name: "not_a_real_tool".to_string(),
+        name: "read_file".to_string(),
         arguments: json!({"path": "a.txt"}),
     };
     provider.push_ok(tool_response(

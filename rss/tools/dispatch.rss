@@ -1,0 +1,347 @@
+// Bounded static dispatch for the six public coding tools.
+//
+// Routes by exact public name to the RSS tool modules. Unknown, disabled,
+// duplicate, and registry-mismatch paths return typed canonical envelopes
+// without invoking a tool or lifecycle. Tool modules own prepare/commit
+// after syntactic validation. No dynamic eval, import, or path from user data.
+
+use self::types as types;
+use self::read_file::{invoke as read_file_run};
+use self::search_files::{invoke as search_files_run};
+use self::write_file::{invoke as write_file_run};
+use self::patch::{invoke as patch_run};
+use self::terminal::{invoke as terminal_run};
+use self::process::{invoke as process_run};
+use json;
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn call_from_input(input: map) -> map {
+    let nested: map = types::map_map(input, "call");
+    let mut call: map = nested;
+    if nested.has("name") == false {
+        if input.has("name") {
+            call = input;
+        }
+    }
+    call
+}
+
+fn call_name(call: map) -> string {
+    types::map_string(call, "name", "")
+}
+
+fn call_id(call: map) -> string {
+    let mut id: string = types::map_string(call, "id", "");
+    if id.length == 0 {
+        id = types::map_string(call, "tool_call_id", "");
+    }
+    id
+}
+
+fn json_object_text(text: string) -> bool {
+    let mut ok: bool = false;
+    if text.length >= 2 {
+        if text[0:1] == "{" {
+            let second: string = text[1:2];
+            if second == "\"" || second == "}" || second == " " || second == "\n" || second == "\t" {
+                if text[(text.length - 1):text.length] == "}" {
+                    ok = true;
+                }
+            }
+        }
+    }
+    ok
+}
+
+fn parse_call_arguments(call: map) -> map {
+    let mut out: map = {
+        ok: true,
+        arguments: types::map_map(call, "arguments"),
+        code: "",
+        message: ""
+    };
+    let existing: map = types::map_map(call, "arguments");
+    let mut has_existing: bool = false;
+    if call.has("arguments") {
+        if type(call.arguments) == "map" {
+            has_existing = true;
+            out.arguments = existing;
+        }
+    }
+    if has_existing == false {
+        if call.has("arguments_json") {
+            if type(call.arguments_json) == "string" {
+                let text: string = call.arguments_json;
+                if text.length > 0 {
+                    if json_object_text(text) {
+                        let decoded: map = json::decode(text);
+                        out.arguments = decoded;
+                    } else {
+                        out = {
+                            ok: false,
+                            arguments: {},
+                            code: "malformed_payload",
+                            message: "tool arguments must be a JSON object"
+                        };
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn call_arguments(call: map) -> map {
+    types::map_map(parse_call_arguments(call), "arguments")
+}
+
+fn registry_from_input(input: map) -> array {
+    let mut registry: array = types::map_array(input, "registry");
+    if registry.length == 0 {
+        registry = types::map_array(input, "tool_schemas");
+    }
+    registry
+}
+
+fn find_named(registry: array, name: string) -> map {
+    let mut found: map = {};
+    let mut matches: int = 0;
+    let mut i: int = 0;
+    while i < registry.length {
+        let mut entry: map = {};
+        if type(registry[i]) == "map" {
+            let coerced: map = registry[i];
+            entry = coerced;
+        }
+        if types::map_string(entry, "name", "") == name {
+            matches = matches + 1;
+            found = entry;
+        }
+        i = i + 1;
+    }
+    {
+        matches: matches,
+        descriptor: found
+    }
+}
+
+fn has_duplicate_names(registry: array) -> bool {
+    let mut dup: bool = false;
+    let mut i: int = 0;
+    while i < registry.length {
+        let mut entry: map = {};
+        if type(registry[i]) == "map" {
+            let coerced: map = registry[i];
+            entry = coerced;
+        }
+        let name: string = types::map_string(entry, "name", "");
+        if name.length > 0 {
+            let counted: map = find_named(registry, name);
+            if counted.matches > 1 {
+                dup = true;
+            }
+        }
+        i = i + 1;
+    }
+    dup
+}
+
+fn is_terminal_code(code: string) -> bool {
+    code == "cancelled" || code == "deadline_elapsed" || code == "max_tool_calls" || code == "event_persist_failed" || code == "malformed_payload"
+}
+
+fn public_error_code(code: string) -> string {
+    let mut mapped: string = code;
+    if code == "missing_parent" {
+        mapped = "missing_tool_parent";
+    } else {
+        if code == "started_commit_failed" {
+            mapped = "event_persist_failed";
+        } else {
+            if code == "result_commit_failed" {
+                mapped = "event_persist_failed";
+            }
+        }
+    }
+    mapped
+}
+
+fn error_map(code: string, message: string) -> map {
+    {
+        code: code,
+        message: message
+    }
+}
+
+fn fail_result(code: string, message: string) -> map {
+    {
+        ok: false,
+        content: "",
+        data: {},
+        error: error_map(code, message),
+        truncated: false,
+        artifacts: []
+    }
+}
+
+fn tool_payload(result: map) -> map {
+    let kind: string = types::map_string(result, "kind", "");
+    let nested: map = types::map_map(result, "result");
+    let mut payload: map = result;
+    if kind == "committed" || kind == "replay" {
+        payload = nested;
+    }
+    payload
+}
+
+fn envelope(call: map, result: map, _terminal: bool) -> map {
+    let mut payload: map = tool_payload(result);
+    let ok: bool = map_bool(payload, "ok", false);
+    let content: string = types::map_string(payload, "content", "");
+    let truncated: bool = map_bool(payload, "truncated", false);
+    let error: map = types::map_map(payload, "error");
+    let code: string = public_error_code(types::map_string(error, "code", ""));
+    let message: string = types::map_string(error, "message", "");
+    let terminal_flag: bool = is_terminal_code(code);
+    let mut error_out: map = {};
+    if ok == false {
+        error_out = error_map(code, message);
+        payload.error = error_out;
+    }
+    let tool_call_id: string = call_id(call);
+    let name: string = call_name(call);
+    {
+        ok: ok,
+        terminal: terminal_flag,
+        error: error_out,
+        content_block: {
+            type: "tool_result",
+            tool_call_id: tool_call_id,
+            name: name,
+            content: content,
+            is_error: ok == false,
+            result: payload,
+            error: error_out,
+            truncated: truncated
+        }
+    }
+}
+
+fn fail_envelope(call: map, code: string, message: string, terminal: bool) -> map {
+    envelope(call, fail_result(code, message), terminal)
+}
+
+fn tool_context(input: map, call: map, descriptor: map) -> map {
+    let args: map = call_arguments(call);
+    let digest: string = json::encode(args);
+    let name: string = call_name(call);
+    let identity: string = types::map_string(input, "registry_identity", "");
+    let mut config: map = types::map_map(input, "config");
+    if config.has("max_output_bytes") == false {
+        config.max_output_bytes = map_int(config, "max_tool_output_bytes", 65536);
+    }
+    {
+        kind: "execute",
+        arguments: args,
+        prepare: {
+            run_id: types::map_string(input, "run_id", ""),
+            call_id: call_id(call),
+            name: name,
+            argument_digest: digest,
+            registry_identity: identity,
+            risk_class: types::map_string(descriptor, "risk_class", ""),
+            summary: name
+        },
+        config: config
+    }
+}
+
+fn route(name: string, context: map) -> map {
+    let mut result: map = fail_result("unknown_tool", "unknown tool: " + name);
+    if name == "read_file" {
+        result = read_file_run(context);
+    } else {
+        if name == "search_files" {
+            result = search_files_run(context);
+        } else {
+            if name == "write_file" {
+                result = write_file_run(context);
+            } else {
+                if name == "patch" {
+                    result = patch_run(context);
+                } else {
+                    if name == "terminal" {
+                        result = terminal_run(context);
+                    } else {
+                        if name == "process" {
+                            result = process_run(context);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+pub fn dispatch(input: map) -> map {
+    let call: map = call_from_input(input);
+    let name: string = call_name(call);
+    let mut out: map = fail_envelope(call, "malformed_payload", "missing tool name", true);
+    if name.length > 0 {
+        let admitted: string = types::map_string(input, "admitted_registry_identity", "");
+        let claimed: string = types::map_string(input, "registry_identity", "");
+        if admitted.length > 0 && claimed != admitted {
+            out = fail_envelope(call, "registry_mismatch", "registry identity mismatch", false);
+        } else {
+            let registry: array = registry_from_input(input);
+            if has_duplicate_names(registry) {
+                out = fail_envelope(call, "duplicate_tool", "duplicate tool name in registry snapshot", false);
+            } else {
+                let found: map = find_named(registry, name);
+                let matches: int = found.matches;
+                if matches != 1 {
+                    out = fail_envelope(call, "unknown_tool", "unknown tool: " + name, false);
+                } else {
+                    let descriptor: map = found.descriptor;
+                    let parsed: map = parse_call_arguments(call);
+                    if map_bool(parsed, "ok", false) == false {
+                        out = fail_envelope(
+                            call,
+                            types::map_string(parsed, "code", "malformed_payload"),
+                            types::map_string(parsed, "message", "tool arguments are malformed"),
+                            true
+                        );
+                    } else {
+                        let mut routed: map = call;
+                        routed.arguments = types::map_map(parsed, "arguments");
+                        let result: map = route(name, tool_context(input, routed, descriptor));
+                        out = envelope(call, result, false);
+                    }
+                }
+            }
+        }
+    }
+    out
+}

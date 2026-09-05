@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -40,6 +40,9 @@ use super::agent_host::{
     register_agent_host_functions,
 };
 use crate::domain::{json_to_vm_value, vm_value_to_json};
+use crate::registry::ToolRegistry;
+use crate::tool_schema::ToolDescriptor;
+use serde_json::json;
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -48,6 +51,155 @@ fn compile_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct CachedFileProgram {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    tree_len: u64,
+    tree_modified: Option<std::time::SystemTime>,
+    program: rustscript_vm::Program,
+}
+
+fn rss_source_stamp() -> (u64, Option<std::time::SystemTime>) {
+    fn walk(dir: &Path, len: &mut u64, modified: &mut Option<std::time::SystemTime>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, len, modified);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rss") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            *len = len.saturating_add(metadata.len());
+            if let Ok(mtime) = metadata.modified() {
+                *modified = Some(modified.map_or(mtime, |prev| prev.max(mtime)));
+            }
+        }
+    }
+    let mut len = 0;
+    let mut modified = None;
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("rss"),
+        &mut len,
+        &mut modified,
+    );
+    (len, modified)
+}
+
+fn compiled_file_program(path: &Path) -> Result<rustscript_vm::Program> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFileProgram>>> = OnceLock::new();
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() as usize > MAX_AGENT_SOURCE_BYTES {
+        return Err(AgentError::Compile(format!(
+            "agent source exceeds {} bytes",
+            MAX_AGENT_SOURCE_BYTES
+        )));
+    }
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+    let (tree_len, tree_modified) = rss_source_stamp();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_hit = |hit: &CachedFileProgram| {
+        hit.len == len
+            && hit.modified == modified
+            && hit.tree_len == tree_len
+            && hit.tree_modified == tree_modified
+    };
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = guard.get(path)
+            && cache_hit(hit)
+        {
+            return Ok(hit.program.clone());
+        }
+    }
+    let _compile = compile_lock();
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = guard.get(path)
+            && cache_hit(hit)
+        {
+            return Ok(hit.program.clone());
+        }
+    }
+    let program = compile_source_file_with_options(path, compile_options())
+        .map_err(|error| AgentError::Compile(error.to_string()))?
+        .program;
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            path.to_path_buf(),
+            CachedFileProgram {
+                len,
+                modified,
+                tree_len,
+                tree_modified,
+                program: program.clone(),
+            },
+        );
+    Ok(program)
+}
+
+/// Admits the production RSS tool-registry descriptors after generic bounds.
+pub fn bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
+    static CACHED: OnceLock<std::result::Result<ToolRegistry, String>> = OnceLock::new();
+    CACHED.get_or_init(load_bundled_tool_registry).clone()
+}
+
+fn load_bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/tools/registry.rss");
+    let runner =
+        AgentRunner::from_file(&path, AgentConfig::default()).map_err(|error| error.to_string())?;
+    let result = runner
+        .run_with_context(json_to_vm_value(
+            &json!({"kind": "descriptors", "config": {}}),
+        ))
+        .map_err(|error| format!("run RSS registry: {error}"))?;
+    let json = vm_value_to_json(&result);
+    if json.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("RSS registry failed: {json}"));
+    }
+    let descriptors = json
+        .get("descriptors")
+        .cloned()
+        .ok_or_else(|| "RSS registry missing descriptors".to_string())?;
+    let parsed: Vec<ToolDescriptor> =
+        serde_json::from_value(descriptors).map_err(|error| error.to_string())?;
+    ToolRegistry::from_descriptors(parsed).map_err(|error| error.to_string())
+}
+
+/// Admitted production RSS registry entries for tests that mutate a snapshot.
+pub fn bundled_tool_entries() -> Vec<crate::registry::ToolRegistryEntry> {
+    bundled_tool_registry()
+        .expect("RSS tool registry validates")
+        .snapshot()
+        .entries()
+        .to_vec()
+}
+
+/// Compiles the production RSS tool dispatcher used by service tests and
+/// production `main.rss` static calls.
+pub fn bundled_dispatch_runner() -> std::result::Result<AgentRunner, String> {
+    static CACHED: OnceLock<std::result::Result<AgentRunner, String>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/tools/dispatch_entry.rss");
+            AgentRunner::from_file(&path, AgentConfig::default()).map_err(|error| error.to_string())
+        })
+        .clone()
 }
 
 /// Epoch ticks granted to one cancellable run. The cancellation watcher jumps
@@ -475,6 +627,12 @@ pub struct AgentRunner {
 
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
+        if source.contains("use super::tools::dispatch") {
+            let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss");
+            if bundled.is_file() {
+                return Self::from_file(bundled, config);
+            }
+        }
         if source.len() > MAX_AGENT_SOURCE_BYTES {
             return Err(AgentError::Compile(format!(
                 "agent source exceeds {} bytes",
@@ -493,19 +651,7 @@ impl AgentRunner {
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let source_bytes = std::fs::metadata(&path)?.len() as usize;
-        if source_bytes > MAX_AGENT_SOURCE_BYTES {
-            return Err(AgentError::Compile(format!(
-                "agent source exceeds {} bytes",
-                MAX_AGENT_SOURCE_BYTES
-            )));
-        }
-        let _compile = compile_lock();
-        let program = compile_source_file_with_options(&path, compile_options())
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
-        Self::from_program(program, config)
+        Self::from_program(compiled_file_program(path.as_ref())?, config)
     }
 
     fn from_program(program: rustscript_vm::Program, config: AgentConfig) -> Result<Self> {
@@ -534,12 +680,6 @@ impl AgentRunner {
     /// Installs a scripted or custom provider for the serial loop host bridge.
     pub fn with_provider(mut self, provider: Arc<dyn AgentProviderHost>) -> Self {
         self.host.provider = Some(provider);
-        self
-    }
-
-    /// Installs the Task 5 dispatcher used by `agent::tool_dispatch`.
-    pub fn with_dispatcher(mut self, dispatcher: Arc<crate::tools::DispatchContext>) -> Self {
-        self.host.dispatcher = Some(dispatcher);
         self
     }
 
@@ -614,7 +754,6 @@ impl AgentRunner {
             .unwrap_or_else(|| Arc::new(RssAdapterProvider));
         vm.host_context().set_module_state(AgentHostState {
             provider,
-            dispatcher: self.host.dispatcher.clone(),
             cancellation: cancellation
                 .cloned()
                 .or_else(|| self.host.cancellation.clone())

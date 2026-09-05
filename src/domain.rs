@@ -256,7 +256,7 @@ pub struct ProviderError {
 }
 
 /// Compatibility re-export of the single public tool descriptor contract.
-pub use crate::tools::types::ToolDescriptor;
+pub use crate::tool_schema::ToolDescriptor;
 
 /// Canonical event envelope attached to one run (gateway-api plan section
 /// 4.3): AgentService assigns the durable event identity, the monotonic

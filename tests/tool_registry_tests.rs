@@ -2,17 +2,16 @@ use std::collections::BTreeSet;
 
 use std::process::Command;
 
-use rustscript_agent::tools::{
-    NativeToolExecutor, RiskClass, ToolDescriptor, ToolRegistry, ToolRegistryEntry,
-    ToolRegistryError, Toolset,
-    registry::{MAX_SCHEMA_BYTES, MAX_SCHEMA_DEPTH},
-    validate_json_schema,
+use rustscript_agent::registry::{MAX_SCHEMA_BYTES, MAX_SCHEMA_DEPTH};
+use rustscript_agent::{
+    RiskClass, ToolDescriptor, ToolRegistry, ToolRegistryEntry, ToolRegistryError, Toolset,
+    bundled_tool_registry, validate_json_schema,
 };
 use serde_json::{Map, Value, json};
 
 #[test]
 fn builtin_registry_exposes_the_canonical_tool_order() {
-    let registry = ToolRegistry::builtin().expect("built-in registry should be valid");
+    let registry = bundled_tool_registry().expect("RSS registry");
     let snapshot = registry.snapshot();
 
     assert_eq!(
@@ -44,7 +43,7 @@ fn descriptor_constructor_accepts_typed_policy_labels() {
 
 #[test]
 fn builtin_registry_descriptors_freeze_toolsets_risks_schemas_and_executors() {
-    let registry = ToolRegistry::builtin().expect("built-in registry should be valid");
+    let registry = bundled_tool_registry().expect("RSS registry");
     let snapshot = registry.snapshot();
 
     assert_eq!(snapshot.descriptors().len(), 6);
@@ -109,10 +108,6 @@ fn builtin_registry_descriptors_freeze_toolsets_risks_schemas_and_executors() {
         assert_eq!(descriptor.schema["type"], json!("object"));
         assert!(descriptor.schema["required"].is_array());
         assert_eq!(entry.descriptor(), descriptor);
-        assert_eq!(entry.executor().tool_name(), name);
-        let contract = entry.executor().contract();
-        assert_eq!(contract.tool_name, name);
-        assert_eq!(contract.version, "native-tool-executor-v1");
     }
 
     assert_eq!(
@@ -225,22 +220,6 @@ fn builtin_registry_descriptors_freeze_toolsets_risks_schemas_and_executors() {
             }
         ])
     );
-
-    let expected_contracts = [
-        ("read_file", "coding", "read"),
-        ("search_files", "coding", "read"),
-        ("write_file", "coding", "write"),
-        ("patch", "coding", "write"),
-        ("terminal", "process", "execute"),
-        ("process", "process", "execute"),
-    ];
-    for (entry, (name, toolset, risk_class)) in snapshot.entries().iter().zip(expected_contracts) {
-        let contract = entry.executor().contract();
-        assert_eq!(contract.tool_name, name);
-        assert_eq!(contract.toolset, Some(toolset));
-        assert_eq!(contract.risk_class, Some(risk_class));
-        assert_eq!(contract.version, "native-tool-executor-v1");
-    }
 }
 
 #[test]
@@ -491,37 +470,11 @@ fn schema_validation_accepts_boolean_and_tuple_schemas() {
 fn registry_rejects_toolsets_outside_the_initial_coding_process_pair() {
     let mut descriptor = entry("read_file", valid_schema()).descriptor;
     descriptor.toolset = "browser".to_string();
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        descriptor,
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect_err("the initial registry must reject unregistered toolsets");
+    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(descriptor)])
+        .expect_err("the initial registry must reject unregistered toolsets");
     assert!(matches!(
         error,
         ToolRegistryError::UnsupportedToolset { ref toolset, .. } if toolset == "browser"
-    ));
-}
-
-#[test]
-fn registry_rejects_executor_descriptor_name_mismatches() {
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        ToolDescriptor::new(
-            "read_file",
-            "Read bounded text from a workspace file",
-            Toolset::Coding,
-            RiskClass::Read,
-            valid_schema(),
-        ),
-        NativeToolExecutor::Process,
-    )])
-    .expect_err("an executor slot must correspond to its descriptor");
-
-    assert!(matches!(
-        error,
-        ToolRegistryError::ExecutorNameMismatch {
-            ref name,
-            ref executor_name
-        } if name == "read_file" && executor_name == "process"
     ));
 }
 
@@ -540,40 +493,14 @@ fn registry_snapshot_identity_is_order_independent_and_immutable() {
 
     let forward_snapshot = forward.snapshot();
     let reverse_snapshot = reverse.snapshot();
-    assert_eq!(forward_snapshot.names(), ["read_file", "process"]);
-    assert_eq!(
+    assert_eq!(forward_snapshot.names(), ["process", "read_file"]);
+    assert_eq!(reverse_snapshot.names(), ["read_file", "process"]);
+    assert_ne!(
         forward_snapshot.identity(),
         reverse_snapshot.identity(),
-        "registry identity must not depend on registration order"
+        "admitted descriptor order is part of the resume identity"
     );
     assert_eq!(forward_snapshot, forward.snapshot());
-}
-
-#[test]
-fn registry_identity_includes_the_executor_contract_not_only_the_descriptor() {
-    let descriptor = ToolDescriptor::new(
-        "read_file",
-        "Read bounded text from a workspace file",
-        Toolset::Coding,
-        RiskClass::Read,
-        valid_schema(),
-    );
-    let native = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        descriptor.clone(),
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect("native executor contract should be valid");
-    let placeholder = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        descriptor,
-        NativeToolExecutor::Placeholder("read_file".to_string()),
-    )])
-    .expect("placeholder executor slot should be valid");
-
-    assert_ne!(
-        native.identity(),
-        placeholder.identity(),
-        "resume identity must include executor contract metadata"
-    );
 }
 
 fn valid_schema() -> Value {
@@ -591,63 +518,25 @@ fn entry(name: &str, schema: Value) -> ToolRegistryEntry {
         "write_file" | "patch" => ("coding", "write"),
         _ => ("coding", "read"),
     };
-    ToolRegistryEntry::new(
-        ToolDescriptor {
-            name: name.to_string(),
-            description: format!("{name} description"),
-            toolset: toolset.to_string(),
-            risk_class: risk_class.to_string(),
-            schema,
-        },
-        NativeToolExecutor::placeholder(name),
-    )
+    ToolRegistryEntry::new(ToolDescriptor {
+        name: name.to_string(),
+        description: format!("{name} description"),
+        toolset: toolset.to_string(),
+        risk_class: risk_class.to_string(),
+        schema,
+    })
 }
 
 #[test]
 fn registry_rejects_unsupported_risk_labels_with_a_typed_error() {
     let mut descriptor = entry("read_file", valid_schema()).descriptor;
     descriptor.risk_class = "admin".to_string();
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        descriptor,
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect_err("unsupported risk labels must fail construction");
+    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(descriptor)])
+        .expect_err("unsupported risk labels must fail construction");
 
     assert!(
         format!("{error:?}").contains("UnsupportedRiskClass"),
         "risk validation should have a dedicated typed error: {error:?}"
-    );
-}
-
-#[test]
-fn registry_rejects_executor_toolset_mismatches_with_a_typed_error() {
-    let mut descriptor = entry("read_file", valid_schema()).descriptor;
-    descriptor.toolset = "process".to_string();
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        descriptor,
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect_err("executor toolset mismatches must fail construction");
-
-    assert!(
-        format!("{error:?}").contains("ExecutorToolsetMismatch"),
-        "toolset mismatches should have a dedicated typed error: {error:?}"
-    );
-}
-
-#[test]
-fn registry_rejects_executor_risk_mismatches_with_a_typed_error() {
-    let mut descriptor = entry("read_file", valid_schema()).descriptor;
-    descriptor.risk_class = "write".to_string();
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        descriptor,
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect_err("executor risk mismatches must fail construction");
-
-    assert!(
-        format!("{error:?}").contains("ExecutorRiskClassMismatch"),
-        "risk mismatches should have a dedicated typed error: {error:?}"
     );
 }
 
@@ -688,7 +577,7 @@ fn schema_validation_rejects_noncanonical_dialect_uris() {
             .expect_err("noncanonical schema dialects must fail closed");
         assert_eq!(
             error.kind,
-            rustscript_agent::tools::SchemaValidationErrorKind::UnsupportedSchemaDialect,
+            rustscript_agent::SchemaValidationErrorKind::UnsupportedSchemaDialect,
             "unexpected error for dialect {uri:?}: {error}"
         );
     }
@@ -719,7 +608,7 @@ fn schema_validation_rejects_legacy_tuple_items_outside_the_root() {
             .expect_err("legacy tuple syntax is only compatible at the root");
         assert_eq!(
             error.kind,
-            rustscript_agent::tools::SchemaValidationErrorKind::MetaSchema,
+            rustscript_agent::SchemaValidationErrorKind::MetaSchema,
             "unexpected error for nested tuple under {location}: {error}"
         );
     }
@@ -737,7 +626,7 @@ fn schema_validation_validates_every_root_legacy_tuple_member() {
             .expect_err("root tuple items must be a non-empty Draft 7 schema array");
         assert_eq!(
             error.kind,
-            rustscript_agent::tools::SchemaValidationErrorKind::MetaSchema,
+            rustscript_agent::SchemaValidationErrorKind::MetaSchema,
             "unexpected root tuple error: {error}"
         );
     }
@@ -807,11 +696,8 @@ fn registry_enforces_description_length_at_the_boundary() {
         "read",
         valid_schema(),
     );
-    ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        accepted,
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect("a 4096-byte description is within the limit");
+    ToolRegistry::from_entries(vec![ToolRegistryEntry::new(accepted)])
+        .expect("a 4096-byte description is within the limit");
 
     let rejected = ToolDescriptor::new(
         "read_file",
@@ -820,11 +706,8 @@ fn registry_enforces_description_length_at_the_boundary() {
         "read",
         valid_schema(),
     );
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        rejected,
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect_err("a 4097-byte description exceeds the limit");
+    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(rejected)])
+        .expect_err("a 4097-byte description exceeds the limit");
     assert!(format!("{error:?}").contains("DescriptionTooLong"));
 }
 
@@ -839,17 +722,15 @@ fn registry_checks_field_byte_limits_before_whitespace_scans() {
     ));
 
     let overlong_description = " ".repeat(4097);
-    let description_error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        ToolDescriptor::new(
+    let description_error =
+        ToolRegistry::from_entries(vec![ToolRegistryEntry::new(ToolDescriptor::new(
             "read_file",
             overlong_description,
             "coding",
             "read",
             valid_schema(),
-        ),
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect_err("an over-limit whitespace-only description must hit the byte limit first");
+        ))])
+        .expect_err("an over-limit whitespace-only description must hit the byte limit first");
     assert!(matches!(
         description_error,
         ToolRegistryError::DescriptionTooLong { limit: 4096, .. }
@@ -859,29 +740,23 @@ fn registry_checks_field_byte_limits_before_whitespace_scans() {
 #[test]
 fn registry_enforces_utf8_byte_limits_without_splitting_diagnostics() {
     let accepted_description = "é".repeat(2048);
-    ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        ToolDescriptor::new(
-            "read_file",
-            accepted_description,
-            "coding",
-            "read",
-            valid_schema(),
-        ),
-        NativeToolExecutor::ReadFile,
-    )])
+    ToolRegistry::from_entries(vec![ToolRegistryEntry::new(ToolDescriptor::new(
+        "read_file",
+        accepted_description,
+        "coding",
+        "read",
+        valid_schema(),
+    ))])
     .expect("a 4096-byte UTF-8 description is within the limit");
 
     let rejected_description = "é".repeat(2049);
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        ToolDescriptor::new(
-            "read_file",
-            rejected_description,
-            "coding",
-            "read",
-            valid_schema(),
-        ),
-        NativeToolExecutor::ReadFile,
-    )])
+    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(ToolDescriptor::new(
+        "read_file",
+        rejected_description,
+        "coding",
+        "read",
+        valid_schema(),
+    ))])
     .expect_err("a 4098-byte UTF-8 description exceeds the limit");
     assert!(matches!(
         error,
@@ -901,11 +776,8 @@ fn registry_enforces_utf8_byte_limits_without_splitting_diagnostics() {
 fn registry_rejects_unbounded_risk_values_before_parsing_them() {
     let mut descriptor = entry("read_file", valid_schema()).descriptor;
     descriptor.risk_class = "risk-marker".repeat(10_000);
-    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(
-        descriptor,
-        NativeToolExecutor::ReadFile,
-    )])
-    .expect_err("oversized risk labels must fail as unsupported values");
+    let error = ToolRegistry::from_entries(vec![ToolRegistryEntry::new(descriptor)])
+        .expect_err("oversized risk labels must fail as unsupported values");
     assert!(matches!(
         error,
         ToolRegistryError::UnsupportedRiskClass { ref risk_class, .. }
@@ -1007,7 +879,7 @@ fn registry_rejects_schema_too_deep_before_recursive_serialization() {
             .expect_err("a deeply nested schema must be rejected by the bounded preflight");
         assert_eq!(
             error.kind,
-            rustscript_agent::tools::SchemaValidationErrorKind::SchemaTooDeep
+            rustscript_agent::SchemaValidationErrorKind::SchemaTooDeep
         );
         std::process::exit(0);
     }
@@ -1080,12 +952,9 @@ fn invalid_schema_diagnostics_are_bounded_and_redacted() {
 
 #[test]
 fn snapshot_identity_uses_a_digest_with_executor_contract_metadata() {
-    let snapshot = ToolRegistry::builtin()
-        .expect("built-in registry should be valid")
-        .snapshot();
+    let snapshot = bundled_tool_registry().expect("RSS registry").snapshot();
     assert!(snapshot.identity().starts_with("sha256:"));
     assert_eq!(snapshot.identity().len(), 71);
-    assert!(format!("{:?}", snapshot.entries()[0].executor().contract()).contains("version"));
 }
 
 fn schema_with_serialized_size(target: usize) -> Value {

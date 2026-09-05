@@ -1,0 +1,6 @@
+// Standalone entry for compiling RSS tool dispatch as a program.
+use self::dispatch::{dispatch};
+
+pub fn run(context: map) -> map {
+    dispatch(context)
+}

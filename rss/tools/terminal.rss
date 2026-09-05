@@ -616,7 +616,7 @@ pub fn descriptor() -> map {
     types::terminal_descriptor()
 }
 
-pub fn run(context: map) -> map {
+pub fn invoke(context: map) -> map {
     let kind: string = types::map_string(context, "kind", "");
     let mut result: map = descriptor();
     if kind != "descriptor" {

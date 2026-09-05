@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use rustscript_agent::{AgentConfig, AgentRunner, ToolRegistry};
+use rustscript_agent::{AgentConfig, AgentRunner, bundled_tool_registry};
 use rustscript_vm::Value;
 use serde_json::{Value as JsonValue, json};
 
@@ -107,8 +107,8 @@ fn rss_registry_preserves_the_current_public_descriptor_contract() {
     let descriptors = result["descriptors"]
         .as_array()
         .expect("RSS registry should return descriptors");
-    let current = ToolRegistry::builtin()
-        .expect("built-in registry should be valid")
+    let current = bundled_tool_registry()
+        .expect("RSS registry")
         .snapshot()
         .schemas();
 

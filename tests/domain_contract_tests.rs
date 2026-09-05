@@ -1,6 +1,6 @@
 use rustscript_agent::RunContext;
+use rustscript_agent::ToolDescriptor;
 use rustscript_agent::domain::{self, LlmContentBlock, LlmMessage, LlmRequest, Sampling};
-use rustscript_agent::tools::ToolDescriptor;
 use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
 

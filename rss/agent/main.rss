@@ -1,15 +1,16 @@
 // Serial provider/tool agent loop.
 //
 // `run(context)` drives canonical LlmRequest construction, the bounded native
-// host provider bridge, serial tool dispatch, and retry/backoff until a typed
-// terminal decision. Follow-up assistant `tool_call` parts use `arguments_json`
-// strings; tool results stay user-role `tool_result` parts so adapters see one
-// contract. Parallel/task execution is rejected. Provider/network errors
-// consume the retry budget; completed tool effects are never retried.
-// Durability of messages/events is left to Task 7.
+// host provider bridge, serial RSS tool dispatch, and retry/backoff until a
+// typed terminal decision. Follow-up assistant `tool_call` parts use
+// `arguments_json` strings; tool results stay user-role `tool_result` parts so
+// adapters see one contract. Parallel/task execution is rejected.
+// Provider/network errors consume the retry budget; completed tool effects are
+// never retried. Durability of messages/events is left to Task 7.
 
 use agent;
 use json;
+use super::tools::dispatch as tools;
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -375,7 +376,7 @@ fn response_is_malformed(response: map) -> bool {
     malformed
 }
 
-fn dispatch_serial(calls: array, max_tool_calls: int, tool_calls_used: int) -> map {
+fn dispatch_serial(context: map, calls: array, max_tool_calls: int, tool_calls_used: int) -> map {
     let mut messages: array = [];
     let mut used: int = tool_calls_used;
     let mut i = 0;
@@ -399,7 +400,14 @@ fn dispatch_serial(calls: array, max_tool_calls: int, tool_calls_used: int) -> m
                     stopped = true;
                 } else {
                     let call: map = array_map(calls, i);
-                    let dispatched: map = agent::tool_dispatch(call);
+                    let dispatched: map = tools::dispatch({
+                        call: call,
+                        registry: tools_from_context(context),
+                        registry_identity: ctx_string(ctx_map(context, "metadata"), "registry_identity", ""),
+                        admitted_registry_identity: ctx_string(ctx_map(context, "metadata"), "registry_identity", ""),
+                        run_id: ctx_string(context, "run_id", ""),
+                        config: ctx_map(context, "limits")
+                    });
                     let after: map = agent::control_check();
                     messages[messages.length] = tool_result_message(ctx_map(dispatched, "content_block"));
                     used += 1;
@@ -539,7 +547,7 @@ fn run_serial_loop(context: map) -> map {
                         running = false;
                     } else {
                         messages[messages.length] = assistant_message(text, calls);
-                        let dispatched: map = dispatch_serial(calls, max_tool_calls, tool_calls_used);
+                        let dispatched: map = dispatch_serial(context, calls, max_tool_calls, tool_calls_used);
                         let produced: array = ctx_array(dispatched, "messages");
                         let mut j = 0;
                         while j < produced.length {

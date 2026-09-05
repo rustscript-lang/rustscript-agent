@@ -548,6 +548,24 @@ impl ProcessCapability {
         }
     }
 
+    /// Terminates every owned child and drops table entries.
+    ///
+    /// Run cleanup must drain committed background residue; `cancel_all`
+    /// kills the process tree but leaves handles observable in the table.
+    pub fn shutdown_all(&self) {
+        let owned: Vec<OwnedProcess> = {
+            let mut table = self
+                .inner
+                .table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table.drain().map(|(_, process)| process).collect()
+        };
+        for process in owned {
+            terminate_owned(&process);
+        }
+    }
+
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
         match self
             .inner
