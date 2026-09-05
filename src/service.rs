@@ -654,6 +654,10 @@ struct AgentServiceInner {
     provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
     runner: Mutex<Option<CachedAgentRunner>>,
+    /// Test seam: invoked after file-agent lookup digest and before compile.
+    agent_compile_lookup_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test seam: invoked after file-agent compile and before postcheck digest.
+    agent_compile_postcheck_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// When set, the next capability host holds its serial mutex until released.
     uncooperative_dispatch: Mutex<Option<Arc<AtomicBool>>>,
     /// Serializes durable event/message commits so seq/ordinal reservation
@@ -728,6 +732,8 @@ impl AgentService {
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
             runner: Mutex::new(None),
+            agent_compile_lookup_entered: Mutex::new(None),
+            agent_compile_postcheck_entered: Mutex::new(None),
             uncooperative_dispatch: Mutex::new(None),
             commit_gate: Arc::new(ParkingMutex::new(())),
             crash_after_provider_commit: AtomicBool::new(false),
@@ -1917,6 +1923,8 @@ impl AgentService {
         }
     }
 
+    const COMPILE_DIGEST_RETRIES: usize = 4;
+
     fn cached_agent_runner(&self, source: Option<&str>) -> Result<AgentRunner, String> {
         let expected = self.effective_agent_config();
         if let Some(entry) = self
@@ -1926,25 +1934,55 @@ impl AgentService {
             .expect("agent entry lock")
             .clone()
         {
-            let digest = crate::runtime::rss_runner::module_tree_digest(&entry)
-                .map_err(|error| error.to_string())?;
-            let mut cache = self.inner.runner.lock().expect("runner cache lock");
-            if let Some(cached) = cache.as_ref()
-                && cached.source_digest == digest
-                && cached.config == expected
-            {
-                return Ok(cached.runner.clone());
+            let mut last_error = "module tree changed during compile".to_string();
+            for _ in 0..Self::COMPILE_DIGEST_RETRIES {
+                if let Some(hook) = self
+                    .inner
+                    .agent_compile_lookup_entered
+                    .lock()
+                    .expect("agent compile lookup observer lock")
+                    .clone()
+                {
+                    hook();
+                }
+                let live_a = crate::runtime::rss_runner::module_tree_digest(&entry)
+                    .map_err(|error| error.to_string())?;
+                {
+                    let cache = self.inner.runner.lock().expect("runner cache lock");
+                    if let Some(cached) = cache.as_ref()
+                        && cached.source_digest == live_a
+                        && cached.config == expected
+                        && cached.runner.snapshot_digest() == live_a
+                    {
+                        return Ok(cached.runner.clone());
+                    }
+                }
+                let runner = AgentRunner::from_file(&entry, expected.clone())
+                    .map_err(|error| error.to_string())?;
+                if let Some(hook) = self
+                    .inner
+                    .agent_compile_postcheck_entered
+                    .lock()
+                    .expect("agent compile postcheck observer lock")
+                    .clone()
+                {
+                    hook();
+                }
+                let compiled_b = runner.snapshot_digest().to_string();
+                let live_c = crate::runtime::rss_runner::module_tree_digest(&entry)
+                    .map_err(|error| error.to_string())?;
+                if live_c == compiled_b {
+                    let mut cache = self.inner.runner.lock().expect("runner cache lock");
+                    *cache = Some(CachedAgentRunner {
+                        source_digest: compiled_b,
+                        config: expected,
+                        runner: runner.clone(),
+                    });
+                    return Ok(runner);
+                }
+                last_error = "module tree changed during compile".to_string();
             }
-            let runner = AgentRunner::from_file(&entry, expected.clone())
-                .map_err(|error| error.to_string())?;
-            let digest = crate::runtime::rss_runner::module_tree_digest(&entry)
-                .map_err(|error| error.to_string())?;
-            *cache = Some(CachedAgentRunner {
-                source_digest: digest,
-                config: expected,
-                runner: runner.clone(),
-            });
-            return Ok(runner);
+            return Err(format!("RustScript compile error: {last_error}"));
         }
         let source = source.ok_or_else(|| "RSS agent source is not configured".to_string())?;
         let digest = agent_source_digest(source);
@@ -1952,13 +1990,14 @@ impl AgentService {
         if let Some(cached) = cache.as_ref()
             && cached.source_digest == digest
             && cached.config == expected
+            && cached.runner.snapshot_digest() == digest
         {
             return Ok(cached.runner.clone());
         }
         let runner = AgentRunner::from_source(source, expected.clone())
             .map_err(|error| error.to_string())?;
         *cache = Some(CachedAgentRunner {
-            source_digest: digest,
+            source_digest: runner.snapshot_digest().to_string(),
             config: expected,
             runner: runner.clone(),
         });
@@ -1974,29 +2013,10 @@ impl AgentService {
     }
 
     /// Install a precompiled runner so workers do not recompile the agent source.
-    /// Only a successful SHA-256 digest is stored; digest failure leaves the
-    /// cache empty so a later refresh cannot hit a stale runner.
+    /// The cache key is the digest the runner actually compiled, never a later
+    /// live-tree digest.
     pub fn install_agent_runner(&self, runner: AgentRunner) {
-        let digest = if let Some(entry) = self
-            .inner
-            .agent_entry
-            .lock()
-            .expect("agent entry lock")
-            .clone()
-        {
-            match crate::runtime::rss_runner::module_tree_digest(&entry) {
-                Ok(digest) => digest,
-                Err(_) => {
-                    *self.inner.runner.lock().expect("runner cache lock") = None;
-                    return;
-                }
-            }
-        } else if let Some(source) = self.inner.agent_source.as_ref() {
-            agent_source_digest(source)
-        } else {
-            *self.inner.runner.lock().expect("runner cache lock") = None;
-            return;
-        };
+        let digest = runner.snapshot_digest().to_string();
         *self.inner.runner.lock().expect("runner cache lock") = Some(CachedAgentRunner {
             source_digest: digest,
             config: runner.config().clone(),
@@ -2132,6 +2152,24 @@ impl AgentService {
             .prompt_read_entered
             .lock()
             .expect("prompt read observer lock") = Some(observer);
+    }
+
+    /// Test seam: invoked after each file-agent lookup digest and before compile.
+    pub fn inject_agent_compile_lookup_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .agent_compile_lookup_entered
+            .lock()
+            .expect("agent compile lookup observer lock") = Some(observer);
+    }
+
+    /// Test seam: invoked after each file-agent compile and before postcheck digest.
+    pub fn inject_agent_compile_postcheck_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .agent_compile_postcheck_entered
+            .lock()
+            .expect("agent compile postcheck observer lock") = Some(observer);
     }
 
     /// Drops capability host state and cleans processes/artifacts for every

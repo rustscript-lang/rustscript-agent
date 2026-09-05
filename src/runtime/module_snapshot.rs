@@ -1,15 +1,16 @@
-//! Safe module-tree snapshot and digest for RSS `from_file` compilation.
+//! Immutable module-tree snapshot for RSS `from_file` compilation.
 //!
-//! The digest covers every regular `.rss` file under the allowed module root
+//! The snapshot owns every regular `.rss` file under the allowed module root
 //! (the nearest ancestor directory named `rss`, or the entry file's parent)
-//! plus the entry's relative path. Compiler file resolution for `use` /
-//! `super::` is restricted to that root, so the tree digest includes exactly
-//! all possible compiler inputs. Relpaths and file bytes are length-prefixed
-//! into SHA-256.
+//! plus the entry's relative path and digest. Relpaths and file bytes are
+//! length-prefixed into SHA-256. Compilation materializes this owned snapshot
+//! into an isolated sandbox; the compiler never re-reads the original live
+//! files.
 
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -21,6 +22,67 @@ use super::rss_runner::{AgentError, MAX_AGENT_SOURCE_BYTES, Result};
 const MAX_TREE_FILES: usize = 256;
 const MAX_TREE_DEPTH: usize = 16;
 const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
+const COMPILE_SANDBOX_PREFIX: &str = "rss-compile-sandbox-";
+const SANDBOX_TREE_DIR: &str = "tree";
+static SANDBOX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Owned module-tree bytes used for digesting and isolated compilation.
+pub struct ModuleSnapshot {
+    files: Vec<(String, Vec<u8>)>,
+    entry_rel: String,
+    digest: String,
+}
+
+impl ModuleSnapshot {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    #[cfg(test)]
+    pub fn entry_rel(&self) -> &str {
+        &self.entry_rel
+    }
+
+    #[cfg(test)]
+    pub fn files(&self) -> &[(String, Vec<u8>)] {
+        &self.files
+    }
+
+    /// Copies snapshot bytes into a unique mode-0700 sandbox. Dropping the
+    /// returned guard deletes the tree on success, error, and panic.
+    pub fn materialize(&self) -> Result<MaterializedSnapshot> {
+        materialize_snapshot(self)
+    }
+}
+
+/// Private sandbox holding one materialized snapshot. Removes the directory
+/// in `Drop`.
+pub struct MaterializedSnapshot {
+    sandbox: PathBuf,
+    allowed_root: PathBuf,
+    entry: PathBuf,
+}
+
+impl MaterializedSnapshot {
+    pub fn sandbox(&self) -> &Path {
+        &self.sandbox
+    }
+
+    #[cfg(test)]
+    pub fn allowed_root(&self) -> &Path {
+        &self.allowed_root
+    }
+
+    pub fn entry(&self) -> &Path {
+        &self.entry
+    }
+}
+
+impl Drop for MaterializedSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.sandbox);
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -35,6 +97,10 @@ pub fn set_after_open_hook(hook: Option<fn(&Path)>) {
 }
 
 pub fn module_tree_digest(entry: &Path) -> Result<String> {
+    Ok(capture_module_snapshot(entry)?.digest)
+}
+
+pub fn capture_module_snapshot(entry: &Path) -> Result<ModuleSnapshot> {
     let root = module_tree_root(entry)?;
     let mut files = Vec::new();
     let mut total_bytes = 0usize;
@@ -42,6 +108,10 @@ pub fn module_tree_digest(entry: &Path) -> Result<String> {
     files.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     assert_imports_stay_in_root(&root, &files)?;
     let entry_rel = relative_posix(&root, entry)?;
+    assert_safe_rel(&entry_rel)?;
+    for (rel, _) in &files {
+        assert_safe_rel(rel)?;
+    }
     let mut material = Vec::new();
     for (rel, bytes) in &files {
         material.extend_from_slice(&(rel.len() as u64).to_le_bytes());
@@ -51,7 +121,11 @@ pub fn module_tree_digest(entry: &Path) -> Result<String> {
     }
     material.extend_from_slice(&(entry_rel.len() as u64).to_le_bytes());
     material.extend_from_slice(entry_rel.as_bytes());
-    Ok(sha256_hex(&material))
+    Ok(ModuleSnapshot {
+        files,
+        entry_rel,
+        digest: sha256_hex(&material),
+    })
 }
 
 pub fn module_tree_root(path: &Path) -> Result<PathBuf> {
@@ -396,6 +470,159 @@ fn tree_error(message: &'static str) -> AgentError {
     AgentError::Compile(message.to_string())
 }
 
+fn assert_safe_rel(rel: &str) -> Result<()> {
+    if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') || rel.contains('\0') {
+        return Err(tree_error("module tree walk failed"));
+    }
+    for part in rel.split(['/', '\\']) {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(tree_error("module tree walk failed"));
+        }
+    }
+    Ok(())
+}
+
+fn compile_temp_root() -> PathBuf {
+    std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn create_dir_0700(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn create_exclusive_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| tree_error("module compile sandbox failed"))?;
+        file.write_all(bytes)
+            .map_err(|_| tree_error("module compile sandbox failed"))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| tree_error("module compile sandbox failed"))?;
+        file.write_all(bytes)
+            .map_err(|_| tree_error("module compile sandbox failed"))?;
+        Ok(())
+    }
+}
+
+fn ensure_dir_0700(path: &Path) -> Result<()> {
+    if path.exists() {
+        reject_symlink(path)?;
+        let meta =
+            fs::symlink_metadata(path).map_err(|_| tree_error("module compile sandbox failed"))?;
+        if !meta.is_dir() {
+            return Err(tree_error("module compile sandbox failed"));
+        }
+        return Ok(());
+    }
+    create_dir_0700(path).map_err(|_| tree_error("module compile sandbox failed"))
+}
+
+fn ensure_parents_0700(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    for component in parent.components() {
+        current.push(component);
+        ensure_dir_0700(&current)?;
+    }
+    Ok(())
+}
+
+fn create_private_sandbox() -> Result<PathBuf> {
+    let root = compile_temp_root();
+    ensure_dir_0700(&root).or_else(|_| {
+        fs::create_dir_all(&root).map_err(|_| tree_error("module compile sandbox failed"))
+    })?;
+    for _ in 0..64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let name = format!(
+            "{}{}-{}-{}",
+            COMPILE_SANDBOX_PREFIX,
+            std::process::id(),
+            SANDBOX_SEQ.fetch_add(1, Ordering::Relaxed),
+            nanos
+        );
+        let path = root.join(name);
+        match create_dir_0700(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(tree_error("module compile sandbox failed")),
+        }
+    }
+    Err(tree_error("module compile sandbox failed"))
+}
+
+fn materialize_snapshot(snapshot: &ModuleSnapshot) -> Result<MaterializedSnapshot> {
+    let sandbox = create_private_sandbox()?;
+    let materialized = MaterializedSnapshot {
+        sandbox: sandbox.clone(),
+        allowed_root: sandbox.join(SANDBOX_TREE_DIR),
+        entry: sandbox.join(SANDBOX_TREE_DIR).join(
+            snapshot
+                .entry_rel
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        ),
+    };
+    if let Err(error) = write_snapshot_into(&materialized, snapshot) {
+        drop(materialized);
+        return Err(error);
+    }
+    Ok(materialized)
+}
+
+fn write_snapshot_into(
+    materialized: &MaterializedSnapshot,
+    snapshot: &ModuleSnapshot,
+) -> Result<()> {
+    ensure_dir_0700(&materialized.allowed_root)?;
+    for (rel, bytes) in &snapshot.files {
+        assert_safe_rel(rel)?;
+        let dest = materialized
+            .allowed_root
+            .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if !dest.starts_with(&materialized.allowed_root) {
+            return Err(tree_error("module compile sandbox failed"));
+        }
+        ensure_parents_0700(&dest)?;
+        create_exclusive_file(&dest, bytes)?;
+    }
+    if !materialized.entry.starts_with(&materialized.allowed_root) {
+        return Err(tree_error("module compile sandbox failed"));
+    }
+    if !materialized.entry.is_file() {
+        return Err(tree_error("module compile sandbox failed"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +789,111 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "RustScript compile error: module tree contains a symlink"
+        );
+        assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_owns_bytes_after_live_files_change() {
+        let root = test_root("owned-bytes");
+        let path = root.join("main.rss");
+        let original = "pub fn run(input: map) -> string { \"aaaa\"; }\n";
+        fs::write(&path, original).expect("write");
+        let snapshot = capture_module_snapshot(&path).expect("snapshot");
+        assert_eq!(snapshot.entry_rel(), "main.rss");
+        assert_eq!(snapshot.files().len(), 1);
+        assert_eq!(snapshot.files()[0].0, "main.rss");
+        assert_eq!(snapshot.files()[0].1, original.as_bytes());
+        let digest = snapshot.digest().to_string();
+        fs::write(&path, "pub fn run(input: map) -> string { \"bbbb\"; }\n").expect("mutate");
+        assert_eq!(snapshot.files()[0].1, original.as_bytes());
+        assert_eq!(snapshot.digest(), digest);
+        assert_ne!(module_tree_digest(&path).expect("live"), digest);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_creates_0700_sandbox_without_symlinks_and_cleans_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_root("materialize");
+        let path = root.join("main.rss");
+        fs::write(&path, "pub fn run(input: map) -> string { \"ok\"; }\n").expect("write");
+        let snapshot = capture_module_snapshot(&path).expect("snapshot");
+        let sandbox_path;
+        {
+            let materialized = snapshot.materialize().expect("materialize");
+            sandbox_path = materialized.sandbox().to_path_buf();
+            assert!(sandbox_path.starts_with(compile_temp_root()));
+            let mode = fs::symlink_metadata(&sandbox_path)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+            assert!(materialized.allowed_root().starts_with(&sandbox_path));
+            assert!(
+                materialized
+                    .entry()
+                    .starts_with(materialized.allowed_root())
+            );
+            assert_ne!(materialized.entry(), path.as_path());
+            assert_eq!(
+                fs::read(materialized.entry()).expect("read copy"),
+                snapshot.files()[0].1
+            );
+            assert!(
+                !fs::symlink_metadata(materialized.entry())
+                    .expect("entry meta")
+                    .file_type()
+                    .is_symlink()
+            );
+            fs::write(&path, "mutated").expect("mutate original");
+            assert_eq!(
+                fs::read(materialized.entry()).expect("copy unchanged"),
+                snapshot.files()[0].1
+            );
+        }
+        assert!(!sandbox_path.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_cleans_sandbox_on_panic() {
+        let root = test_root("materialize-panic");
+        let path = root.join("main.rss");
+        fs::write(&path, "pub fn run(input: map) -> string { \"ok\"; }\n").expect("write");
+        let snapshot = capture_module_snapshot(&path).expect("snapshot");
+        let sandbox_path = std::sync::Mutex::new(None);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let materialized = snapshot.materialize().expect("materialize");
+            *sandbox_path.lock().expect("lock") = Some(materialized.sandbox().to_path_buf());
+            panic!("forced compile panic");
+        }));
+        assert!(panicked.is_err());
+        let sandbox_path = sandbox_path.lock().expect("lock").clone().expect("path");
+        assert!(!sandbox_path.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_rejects_absolute_import() {
+        let root = test_root("absolute-import");
+        let path = root.join("main.rss");
+        fs::write(
+            &path,
+            "use /tmp/evil.rss;\npub fn run(input: map) -> string { \"ok\"; }\n",
+        )
+        .expect("write");
+        let error = match capture_module_snapshot(&path) {
+            Ok(_) => panic!("absolute import must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "RustScript compile error: module import escapes the allowed root"
         );
         assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
         let _ = fs::remove_dir_all(&root);

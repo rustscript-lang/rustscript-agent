@@ -1,7 +1,7 @@
-//! Native-equivalence tests for RSS `write_file` and `patch`.
+//! RSS `write_file` and `patch` behavioral tests.
 //!
 //! These tests compile the real RSS modules and run them through the RSS VM
-//! with generic capability host functions. Native `FileTools` is the oracle.
+//! with generic capability host functions.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -20,7 +20,6 @@ use rustscript_agent::capabilities::{
 use rustscript_agent::config::FileToolConfig;
 use rustscript_agent::{
     AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolResult,
-    bundled_tool_registry,
 };
 use rustscript_vm::{CancellationReason, Value as VmValue};
 use serde_json::{Value, json};
@@ -81,12 +80,15 @@ const REGISTRY_IDENTITY: &str = "rss-mutating-file-tool-equivalence";
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+fn test_temp_dir() -> PathBuf {
+    std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn unique_temp_parent(label: &str) -> PathBuf {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0f-rss-dispatch-fdee5b8a",
-    )
-    .join(format!(
+    test_temp_dir().join(format!(
         "rss-mut-{}-{}-{}",
         label.replace('/', "-"),
         std::process::id(),
@@ -646,10 +648,9 @@ fn assert_canonical_envelope(rss: &Value) {
 }
 
 fn message_leaks_temp_root(message: &str) -> bool {
-    std::env::temp_dir()
+    test_temp_dir()
         .to_str()
         .is_some_and(|tmp| message.contains(tmp))
-        || message.contains("/mnt/TEMP/workspace/rustscript-agent/tmp")
 }
 
 fn leftover_temps(root: &Path) -> Vec<String> {
@@ -805,17 +806,42 @@ fn assert_patch_eq(
     );
 }
 
-fn rss_descriptor(name: &str) -> Value {
-    bundled_tool_registry()
-        .expect("RSS registry")
-        .snapshot()
-        .schemas()
-        .as_array()
-        .expect("descriptor array")
-        .iter()
-        .find(|value| value["name"] == name)
-        .cloned()
-        .expect("descriptor")
+fn frozen_write_file_descriptor() -> Value {
+    json!({
+        "name": "write_file",
+        "description": "Write complete workspace file contents",
+        "toolset": "coding",
+        "risk_class": "write",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn frozen_patch_descriptor() -> Value {
+    json!({
+        "name": "patch",
+        "description": "Apply a bounded workspace text patch",
+        "toolset": "coding",
+        "risk_class": "write",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "old_string": { "type": "string" },
+                "new_string": { "type": "string" },
+                "replace_all": { "type": "boolean" }
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
+        }
+    })
 }
 
 #[test]
@@ -825,7 +851,15 @@ fn rss_write_file_descriptor_matches_native() {
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, rss_descriptor("write_file"));
+    assert_eq!(rss["name"], json!("write_file"));
+    assert_eq!(
+        rss["description"],
+        json!("Write complete workspace file contents")
+    );
+    assert_eq!(rss["toolset"], json!("coding"));
+    assert_eq!(rss["risk_class"], json!("write"));
+    assert_eq!(rss["schema"], frozen_write_file_descriptor()["schema"]);
+    assert_eq!(rss, frozen_write_file_descriptor());
 }
 
 #[test]
@@ -835,7 +869,15 @@ fn rss_patch_descriptor_matches_native() {
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, rss_descriptor("patch"));
+    assert_eq!(rss["name"], json!("patch"));
+    assert_eq!(
+        rss["description"],
+        json!("Apply a bounded workspace text patch")
+    );
+    assert_eq!(rss["toolset"], json!("coding"));
+    assert_eq!(rss["risk_class"], json!("write"));
+    assert_eq!(rss["schema"], frozen_patch_descriptor()["schema"]);
+    assert_eq!(rss, frozen_patch_descriptor());
 }
 
 #[test]

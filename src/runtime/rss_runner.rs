@@ -14,6 +14,7 @@
 //! and a watcher thread jumps the epoch so pure CPU work is interrupted within
 //! the configured epoch bound (surfacing as a typed deadline failure).
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -47,7 +48,24 @@ use serde_json::json;
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
 pub const COMPILE_CACHE_CAP: usize = 8;
-const COMPILE_TREE_RETRIES: usize = 4;
+
+thread_local! {
+    static AFTER_SNAPSHOT_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+}
+
+/// Test seam: invoked after `from_file` captures an immutable snapshot and
+/// before the compiler reads the materialized sandbox copy.
+pub fn set_after_snapshot_hook(hook: Option<fn(&Path)>) {
+    AFTER_SNAPSHOT_HOOK.with(|cell| cell.set(hook));
+}
+
+fn invoke_after_snapshot(path: &Path) {
+    AFTER_SNAPSHOT_HOOK.with(|cell| {
+        if let Some(hook) = cell.get() {
+            hook(path);
+        }
+    });
+}
 
 struct ProgramLru {
     entries: HashMap<String, rustscript_vm::Program>,
@@ -98,17 +116,32 @@ fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn tree_error(message: &'static str) -> AgentError {
-    AgentError::Compile(message.to_string())
-}
-
 fn snapshot_module_tree(entry: &Path) -> Result<String> {
-    // Whole allowed-root digest: compiler resolution is restricted to that
-    // root, so this includes exactly all possible compiler inputs.
     super::module_snapshot::module_tree_digest(entry)
 }
 
-fn compiled_source_program(source: &str) -> Result<rustscript_vm::Program> {
+fn redact_compile_error(error: impl Display, sandbox: &Path) -> AgentError {
+    let mut text = error.to_string();
+    if let Some(root) = sandbox.to_str()
+        && !root.is_empty()
+    {
+        text = text.replace(root, "");
+    }
+    if let Some(tmp) = compile_temp_root().to_str()
+        && !tmp.is_empty()
+    {
+        text = text.replace(tmp, "");
+    }
+    AgentError::Compile(text)
+}
+
+fn compile_temp_root() -> PathBuf {
+    std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn compiled_source_program(source: &str) -> Result<(rustscript_vm::Program, String)> {
     if source.len() > MAX_AGENT_SOURCE_BYTES {
         return Err(AgentError::Compile(format!(
             "agent source exceeds {} bytes",
@@ -119,43 +152,34 @@ fn compiled_source_program(source: &str) -> Result<rustscript_vm::Program> {
     {
         let mut cache = program_cache();
         if let Some(program) = cache.get(&digest) {
-            return Ok(program);
+            return Ok((program, digest));
         }
     }
     let program =
         compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
-    program_cache().insert(digest, program.clone());
-    Ok(program)
+    program_cache().insert(digest.clone(), program.clone());
+    Ok((program, digest))
 }
 
-fn compiled_file_program(path: &Path) -> Result<rustscript_vm::Program> {
-    let mut last_error = tree_error("module tree changed during compile");
-    for _ in 0..COMPILE_TREE_RETRIES {
-        let digest = snapshot_module_tree(path)?;
-        {
-            let mut cache = program_cache();
-            if let Some(program) = cache.get(&digest) {
-                let verify = snapshot_module_tree(path)?;
-                if verify == digest {
-                    return Ok(program);
-                }
-                last_error = tree_error("module tree changed during compile");
-                continue;
-            }
+fn compiled_file_program(path: &Path) -> Result<(rustscript_vm::Program, String)> {
+    let snapshot = super::module_snapshot::capture_module_snapshot(path)?;
+    invoke_after_snapshot(path);
+    let digest = snapshot.digest().to_string();
+    {
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok((program, digest));
         }
-        let program = compile_source_file_with_options(path, compile_options())
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
-        let verify = snapshot_module_tree(path)?;
-        if verify == digest {
-            program_cache().insert(digest, program.clone());
-            return Ok(program);
-        }
-        last_error = tree_error("module tree changed during compile");
     }
-    Err(last_error)
+    let sandbox = snapshot.materialize()?;
+    let program = compile_source_file_with_options(sandbox.entry(), compile_options())
+        .map_err(|error| redact_compile_error(error, sandbox.sandbox()))?
+        .program;
+    drop(sandbox);
+    program_cache().insert(digest.clone(), program.clone());
+    Ok((program, digest))
 }
 
 fn rss_root() -> PathBuf {
@@ -628,18 +652,25 @@ pub struct AgentRunner {
     registry: Arc<HostFunctionRegistry>,
     host: AgentHostBridges,
     prepare_fault: RunnerPrepareFault,
+    snapshot_digest: String,
 }
 
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
-        Self::from_program(compiled_source_program(source)?, config)
+        let (program, digest) = compiled_source_program(source)?;
+        Self::from_program(program, config, digest)
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
-        Self::from_program(compiled_file_program(path.as_ref())?, config)
+        let (program, digest) = compiled_file_program(path.as_ref())?;
+        Self::from_program(program, config, digest)
     }
 
-    fn from_program(program: rustscript_vm::Program, config: AgentConfig) -> Result<Self> {
+    fn from_program(
+        program: rustscript_vm::Program,
+        config: AgentConfig,
+        snapshot_digest: String,
+    ) -> Result<Self> {
         let registry = build_restricted_registry()
             .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
         Ok(Self {
@@ -648,7 +679,13 @@ impl AgentRunner {
             registry: Arc::new(registry),
             host: AgentHostBridges::default(),
             prepare_fault: RunnerPrepareFault::None,
+            snapshot_digest,
         })
+    }
+
+    /// Digest of the snapshot or source bytes this runner compiled.
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
     }
 
     /// Effective HTTP/SQLite/fuel policy compiled into this runner.

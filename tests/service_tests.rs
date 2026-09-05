@@ -3570,6 +3570,17 @@ fn wait_completed(service: &rustscript_agent::AgentService, run_id: &str) -> Val
     panic!("run did not complete: {:?}", service.run_events(run_id));
 }
 
+fn wait_failed(service: &rustscript_agent::AgentService, run_id: &str) -> Value {
+    for _ in 0..200 {
+        let events = service.run_events(run_id);
+        if let Some(event) = events.iter().find(|event| event["event"] == "run.failed") {
+            return event.clone();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("run did not fail: {:?}", service.run_events(run_id));
+}
+
 fn stub_completed_output(service: &rustscript_agent::AgentService, run_id: &str) -> Value {
     let events = service.run_events(run_id);
     let delta = events
@@ -3721,6 +3732,99 @@ async fn agent_file_cache_concurrent_refresh_sees_new_bytes() {
     assert_eq!(
         stub_completed_output(&service, &right_id),
         json!({"status": "completed", "output": "DDDD"})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_file_cache_retries_until_postcheck_matches_compiled_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-service-digest-retry-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    let path = agent.join("main.rss");
+    std::fs::write(&path, cache_script("AAAA")).expect("write AAAA");
+    let state = AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path)
+        .expect("compile AAAA");
+    let service = state.service();
+    let mutated = path.clone();
+    let lookup_once = std::sync::atomic::AtomicBool::new(false);
+    let postcheck_once = std::sync::atomic::AtomicBool::new(false);
+    service.inject_agent_compile_lookup_observer(std::sync::Arc::new(move || {
+        if !lookup_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::fs::write(&mutated, cache_script("BBBB")).expect("mutate after lookup");
+        }
+    }));
+    let mutated = path.clone();
+    service.inject_agent_compile_postcheck_observer(std::sync::Arc::new(move || {
+        if !postcheck_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::fs::write(&mutated, cache_script("CCCC")).expect("mutate after compile");
+        }
+    }));
+    let admitted = service.admit(admit_request(None)).await.expect("admit");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    wait_completed(&service, &admitted.run_id);
+    assert_eq!(
+        stub_completed_output(&service, &admitted.run_id),
+        json!({"status": "completed", "output": "CCCC"})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_file_cache_fails_typed_when_digest_never_stabilizes() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-service-digest-unstable-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    let path = agent.join("main.rss");
+    std::fs::write(&path, cache_script("AAAA")).expect("write AAAA");
+    let state = AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path)
+        .expect("compile AAAA");
+    let service = state.service();
+    let mutated = path.clone();
+    service.inject_agent_compile_lookup_observer(std::sync::Arc::new(move || {
+        std::fs::write(&mutated, cache_script("XXXX")).expect("mutate after lookup");
+    }));
+    let mutated = path.clone();
+    service.inject_agent_compile_postcheck_observer(std::sync::Arc::new(move || {
+        std::fs::write(&mutated, cache_script("YYYY")).expect("mutate after compile");
+    }));
+    let admitted = service.admit(admit_request(None)).await.expect("admit");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let failed = wait_failed(&service, &admitted.run_id);
+    assert_eq!(failed["event"], json!("run.failed"));
+    assert_eq!(failed["data"]["error_code"], json!("agent_failed"));
+    let message = failed["data"]["error_message"]
+        .as_str()
+        .expect("error_message");
+    assert_eq!(
+        message,
+        "compile RSS run source: RustScript compile error: module tree changed during compile"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "failure must not leak host path: {message}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

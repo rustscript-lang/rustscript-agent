@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use rustscript_agent::{
     AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
-    RunnerPrepareFault,
+    RunnerPrepareFault, set_after_snapshot_hook,
 };
 use rustscript_vm::{CancellationReason, InvocationError, Value};
 
@@ -744,13 +744,141 @@ fn from_file_rejects_import_that_escapes_allowed_root() {
         Err(error) => error,
     };
     let message = error.to_string();
-    assert!(
-        message.contains("escapes the allowed root") || message.contains("escapes"),
-        "expected escape rejection, got {message}"
+    assert_eq!(
+        message,
+        "RustScript compile error: module import escapes the allowed root"
     );
     assert!(
         !message.contains(dir.to_string_lossy().as_ref()),
         "error must not leak host path: {message}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_absolute_import_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-runner-abs-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("main.rss"),
+        "use /tmp/evil.rss;\npub fn run(context: map) -> map { { ok: true } }\n",
+    )
+    .expect("write entry");
+    let error = match AgentRunner::from_file(agent.join("main.rss"), AgentConfig::default()) {
+        Ok(_) => panic!("absolute import must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert_eq!(
+        message,
+        "RustScript compile error: module import escapes the allowed root"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    assert!(
+        !message.contains("/tmp/evil.rss"),
+        "error must not leak import path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_stores_snapshot_digest_and_ignores_live_mutation_after_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-runner-snapshot-compile-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    let path = agent.join("main.rss");
+    let original = "pub fn run(input: map) -> string { \"snapshot-aaaa\"; }\n";
+    let mutated = "pub fn run(input: map) -> string { \"snapshot-bbbb\"; }\n";
+    std::fs::write(&path, original).expect("write original");
+    set_after_snapshot_hook(Some(|entry| {
+        std::fs::write(
+            entry,
+            "pub fn run(input: map) -> string { \"snapshot-bbbb\"; }\n",
+        )
+        .expect("mutate after snapshot");
+    }));
+    let runner = match AgentRunner::from_file(&path, AgentConfig::default()) {
+        Ok(runner) => runner,
+        Err(error) => {
+            set_after_snapshot_hook(None);
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("from_file should compile the snapshot, got {error}");
+        }
+    };
+    set_after_snapshot_hook(None);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read mutated"),
+        mutated
+    );
+    assert_eq!(runner.snapshot_digest().len(), 64);
+    let output = runner
+        .run_with_context(Value::map(vec![]))
+        .expect("run snapshot program");
+    assert_eq!(output, Value::string("snapshot-aaaa"));
+    let later = AgentRunner::from_file(&path, AgentConfig::default()).expect("compile mutated");
+    assert_ne!(later.snapshot_digest(), runner.snapshot_digest());
+    assert_eq!(
+        later
+            .run_with_context(Value::map(vec![]))
+            .expect("run mutated program"),
+        Value::string("snapshot-bbbb")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_cleans_compile_sandbox_after_success() {
+    let tmp = std::env::var_os("TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let prefix = format!("rss-compile-sandbox-{}-", std::process::id());
+    let leftovers = |root: &std::path::Path, prefix: &str| -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(prefix))
+            .collect()
+    };
+    let before = leftovers(&tmp, &prefix);
+    let dir = tmp.join(format!(
+        "rss-runner-sandbox-cleanup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    let path = agent.join("main.rss");
+    std::fs::write(&path, "pub fn run(context: map) -> map { { ok: true } }\n")
+        .expect("write entry");
+    AgentRunner::from_file(&path, AgentConfig::default()).expect("compile from snapshot");
+    let after = leftovers(&tmp, &prefix);
+    assert_eq!(after, before, "compile sandbox must be removed");
     let _ = std::fs::remove_dir_all(&dir);
 }

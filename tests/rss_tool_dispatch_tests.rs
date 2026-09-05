@@ -434,7 +434,22 @@ fn dispatch_routes_all_six_public_names() {
             }
             "search_files" => {
                 assert_eq!(envelope["ok"], json!(true), "envelope={envelope}");
+                assert_eq!(envelope["terminal"], json!(false));
                 assert_eq!(envelope["content_block"]["is_error"], json!(false));
+                assert_eq!(
+                    envelope["content_block"]["content"],
+                    json!("a.txt:1:alpha"),
+                    "envelope={envelope}"
+                );
+                let result = &envelope["content_block"]["result"];
+                assert_eq!(result["ok"], json!(true), "result={result}");
+                assert_eq!(result["content"], json!("a.txt:1:alpha"));
+                assert_eq!(result["data"]["match_count"], json!(1));
+                assert_eq!(result["data"]["files_visited"], json!(1));
+                assert_eq!(result["data"]["dirs_visited"], json!(1));
+                assert_eq!(result["truncated"], json!(false));
+                assert_eq!(result["error"], Value::Null);
+                assert_eq!(result["artifacts"], json!([]));
             }
             "write_file" => {
                 assert_eq!(envelope["ok"], json!(true), "envelope={envelope}");
@@ -553,10 +568,17 @@ fn dispatch_duplicate_registry_names_fail_closed() {
     );
     let (envelope, started) = run_dispatch(&fixture, durable, input);
     assert_eq!(envelope["ok"], json!(false), "envelope={envelope}");
-    let code = error_code(&envelope);
-    assert!(
-        code == "registry_mismatch" || code == "duplicate_tool",
-        "unexpected code {code}: {envelope}"
+    assert_eq!(envelope["terminal"], json!(false), "envelope={envelope}");
+    assert_eq!(
+        error_code(&envelope),
+        "duplicate_tool",
+        "envelope={envelope}"
+    );
+    assert_eq!(envelope["content_block"]["name"], json!("read_file"));
+    assert_eq!(envelope["content_block"]["is_error"], json!(true));
+    assert_eq!(
+        envelope["error"]["message"],
+        json!("duplicate tool name in registry snapshot")
     );
     assert_eq!(started, 0);
 }
@@ -577,12 +599,14 @@ fn dispatch_malformed_args_are_bounded() {
     );
     let (envelope, started) = run_dispatch(&fixture, durable, input);
     assert_eq!(envelope["ok"], json!(false), "envelope={envelope}");
-    assert!(
-        envelope["terminal"] == json!(true)
-            || error_code(&envelope) == "unknown_tool"
-            || error_code(&envelope) == "malformed_payload",
+    assert_eq!(envelope["terminal"], json!(true), "envelope={envelope}");
+    assert_eq!(
+        error_code(&envelope),
+        "malformed_payload",
         "envelope={envelope}"
     );
+    assert_eq!(envelope["content_block"]["name"], json!(""));
+    assert_eq!(envelope["content_block"]["is_error"], json!(true));
     assert_eq!(started, 0);
 }
 
