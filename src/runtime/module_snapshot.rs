@@ -1311,10 +1311,12 @@ mod tests {
         fs::remove_dir_all(root).expect("FIFO child root cleanup");
     }
 
+    // Harness-only child IPC controls stay outside the public
+    // `RUSTSCRIPT_AGENT_*` configuration namespace.
     #[cfg(target_os = "linux")]
-    const FIFO_COMPLETION_PATH_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_COMPLETION_PATH";
+    const FIFO_COMPLETION_PATH_ENV: &str = "RUSTSCRIPT_TEST_FIFO_COMPLETION_PATH";
     #[cfg(target_os = "linux")]
-    const FIFO_COMPLETION_TOKEN_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_COMPLETION_TOKEN";
+    const FIFO_COMPLETION_TOKEN_ENV: &str = "RUSTSCRIPT_TEST_FIFO_COMPLETION_TOKEN";
 
     #[cfg(target_os = "linux")]
     fn fifo_completion_token() -> String {
@@ -1643,7 +1645,7 @@ mod tests {
     #[ignore = "run by fifo_child_error_preserves_diagnostics_and_cleans_after_reap"]
     fn fifo_error_child() {
         eprintln!("fifo-error-child-diagnostic");
-        let marker = std::env::var_os("RUSTSCRIPT_AGENT_FIFO_EXPECT_ERROR");
+        let marker = std::env::var_os("RUSTSCRIPT_TEST_FIFO_EXPECT_ERROR");
         assert!(marker.is_some(), "fifo-error-child assertion failure");
     }
 
