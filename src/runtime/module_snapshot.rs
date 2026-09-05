@@ -7,26 +7,80 @@
 //! into an isolated sandbox; the compiler never re-reads the original live
 //! files.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use std::cell::Cell;
 
+use rustscript_vm::{
+    ParserDialect, SharedParserOptions, UsePathSegment, parse_source_with_dialect,
+};
+
 use crate::capabilities::sha256_hex;
 
+use super::agent_host::agent_host_catalog;
 use super::rss_runner::{AgentError, MAX_AGENT_SOURCE_BYTES, Result};
 
 const MAX_TREE_FILES: usize = 256;
 const MAX_TREE_DEPTH: usize = 16;
 const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TREE_NODES: usize = 1024;
 const COMPILE_SANDBOX_PREFIX: &str = "rss-compile-sandbox-";
 const SANDBOX_TREE_DIR: &str = "tree";
+const SANDBOX_PAD_DIR: &str = "p";
+const SANDBOX_PAD_DEPTH: usize = MAX_TREE_DEPTH + 1;
 static SANDBOX_SEQ: AtomicU64 = AtomicU64::new(0);
 
+struct SnapshotParserDialect;
+
+impl ParserDialect for SnapshotParserDialect {
+    fn allow_let_mut_binding(&self) -> bool {
+        true
+    }
+
+    fn allow_macro_calls(&self) -> bool {
+        true
+    }
+
+    fn allow_plus_equal_operator(&self) -> bool {
+        true
+    }
+
+    fn allow_for_in_loop(&self) -> bool {
+        true
+    }
+}
+
+static SNAPSHOT_PARSER_DIALECT: SnapshotParserDialect = SnapshotParserDialect;
+
+fn snapshot_parser_prelude() -> &'static str {
+    static PRELUDE: OnceLock<String> = OnceLock::new();
+    PRELUDE
+        .get_or_init(|| {
+            let mut namespaces = BTreeSet::new();
+            for function in agent_host_catalog().functions() {
+                if let Some((namespace, _)) = function.name.split_once("::") {
+                    namespaces.insert(namespace.to_string());
+                }
+            }
+            let mut prelude = String::new();
+            for namespace in namespaces {
+                prelude.push_str("use ");
+                prelude.push_str(&namespace);
+                prelude.push_str(";\n");
+            }
+            prelude
+        })
+        .as_str()
+}
+
 /// Owned module-tree bytes used for digesting and isolated compilation.
+#[derive(Debug)]
 pub struct ModuleSnapshot {
     files: Vec<(String, Vec<u8>)>,
     entry_rel: String,
@@ -39,13 +93,26 @@ impl ModuleSnapshot {
     }
 
     #[cfg(test)]
-    pub fn entry_rel(&self) -> &str {
+    pub(crate) fn entry_rel(&self) -> &str {
         &self.entry_rel
     }
 
-    #[cfg(test)]
-    pub fn files(&self) -> &[(String, Vec<u8>)] {
+    pub(crate) fn files(&self) -> &[(String, Vec<u8>)] {
         &self.files
+    }
+
+    pub(crate) fn total_source_bytes(&self) -> usize {
+        self.files.iter().map(|(_, bytes)| bytes.len()).sum()
+    }
+
+    pub(crate) fn entry_source(&self) -> Result<&str> {
+        let bytes = self
+            .files
+            .iter()
+            .find(|(rel, _)| rel == &self.entry_rel)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| tree_error("module compile sandbox failed"))?;
+        std::str::from_utf8(bytes).map_err(|_| tree_error("module tree file is not valid UTF-8"))
     }
 
     /// Copies snapshot bytes into a unique mode-0700 sandbox. Dropping the
@@ -69,12 +136,26 @@ impl MaterializedSnapshot {
     }
 
     #[cfg(test)]
-    pub fn allowed_root(&self) -> &Path {
+    pub(crate) fn allowed_root(&self) -> &Path {
         &self.allowed_root
     }
 
     pub fn entry(&self) -> &Path {
         &self.entry
+    }
+
+    pub(crate) fn override_source_keys(&self, rel: &str) -> Vec<String> {
+        let dest = self
+            .allowed_root
+            .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let mut keys = vec![
+            dest.to_string_lossy().replace('\\', "/"),
+            rel.replace('\\', "/"),
+        ];
+        if let Ok(canonical) = dest.canonicalize() {
+            keys.push(canonical.to_string_lossy().replace('\\', "/"));
+        }
+        keys
     }
 }
 
@@ -104,7 +185,8 @@ pub fn capture_module_snapshot(entry: &Path) -> Result<ModuleSnapshot> {
     let root = module_tree_root(entry)?;
     let mut files = Vec::new();
     let mut total_bytes = 0usize;
-    walk_dir(&root, &root, 0, &mut files, &mut total_bytes)?;
+    let mut nodes = 1usize;
+    walk_dir(&root, &root, 0, &mut files, &mut total_bytes, &mut nodes)?;
     files.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     assert_imports_stay_in_root(&root, &files)?;
     let entry_rel = relative_posix(&root, entry)?;
@@ -172,6 +254,7 @@ fn walk_dir(
     depth: usize,
     files: &mut Vec<(String, Vec<u8>)>,
     total_bytes: &mut usize,
+    nodes: &mut usize,
 ) -> Result<()> {
     if depth > MAX_TREE_DEPTH {
         return Err(tree_error("module tree exceeds the depth bound"));
@@ -184,12 +267,25 @@ fn walk_dir(
         let mut children = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|_| tree_error("module tree walk failed"))?;
+            *nodes = nodes
+                .checked_add(1)
+                .ok_or_else(|| tree_error("module tree exceeds the entry count bound"))?;
+            if *nodes > MAX_TREE_NODES {
+                return Err(tree_error("module tree exceeds the entry count bound"));
+            }
             children.push(entry.path());
         }
         children.sort();
         reject_symlink(path)?;
         for child in children {
-            walk_dir(root, &child, depth.saturating_add(1), files, total_bytes)?;
+            walk_dir(
+                root,
+                &child,
+                depth.saturating_add(1),
+                files,
+                total_bytes,
+                nodes,
+            )?;
         }
         return Ok(());
     }
@@ -269,7 +365,28 @@ fn open_regular_nofollow(path: &Path) -> Result<File> {
         }
         Ok(file)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(map_open_error)?;
+        let meta = file
+            .metadata()
+            .map_err(|_| tree_error("module tree walk failed"))?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(tree_error("module tree contains a symlink"));
+        }
+        if !meta.is_file() {
+            return Err(tree_error("module tree walk failed"));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         reject_symlink(path)?;
         let file = File::open(path).map_err(|_| tree_error("module tree walk failed"))?;
@@ -295,7 +412,29 @@ fn open_directory_nofollow(path: &Path) -> Result<()> {
             .map_err(map_open_error)?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(map_open_error)?;
+        let meta = file
+            .metadata()
+            .map_err(|_| tree_error("module tree walk failed"))?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(tree_error("module tree contains a symlink"));
+        }
+        if !meta.is_dir() {
+            return Err(tree_error("module tree walk failed"));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         reject_symlink(path)?;
         let meta = fs::metadata(path).map_err(|_| tree_error("module tree walk failed"))?;
@@ -338,132 +477,136 @@ fn invoke_after_open(path: &Path) {
 #[cfg(not(test))]
 fn invoke_after_open(_path: &Path) {}
 
-fn assert_imports_stay_in_root(root: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+fn assert_imports_stay_in_root(_root: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
     for (rel, bytes) in files {
         let source = std::str::from_utf8(bytes)
             .map_err(|_| tree_error("module tree file is not valid UTF-8"))?;
-        let file_abs = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let parent = file_abs
-            .parent()
-            .ok_or_else(|| tree_error("module tree walk failed"))?;
-        for spec in parse_use_specs(source) {
-            if let Some(target) = resolve_use_spec(parent, &spec)
-                && !path_is_under(root, &target)
-            {
-                return Err(tree_error("module import escapes the allowed root"));
+        let declarations = scan_use_declarations(source)?;
+        let parent = parent_rel(rel);
+        for declaration in declarations {
+            match resolve_use_path(parent, &declaration)? {
+                ResolvedImport::File => {}
+                ResolvedImport::Escape => {
+                    return Err(tree_error("module import escapes the allowed root"));
+                }
             }
         }
     }
     Ok(())
 }
 
-fn parse_use_specs(source: &str) -> Vec<String> {
-    let mut specs = Vec::new();
-    let mut rest = source;
-    while let Some(idx) = rest.find("use ") {
-        let before = &rest[..idx];
-        let boundary = before
-            .chars()
-            .rev()
-            .find(|ch| !ch.is_whitespace())
-            .map(|ch| ch == ';' || ch == '{' || ch == '}' || ch == '\n')
-            .unwrap_or(true);
-        let after = &rest[idx + 4..];
-        if boundary && let Some(end) = after.find(';') {
-            let raw = after[..end].trim();
-            let without_alias = raw.split(" as ").next().unwrap_or(raw).trim();
-            let spec = without_alias
-                .split('{')
-                .next()
-                .unwrap_or(without_alias)
-                .trim()
-                .trim_end_matches("::")
-                .trim();
-            if !spec.is_empty() {
-                specs.push(spec.to_string());
-            }
-            rest = &after[end + 1..];
-            continue;
-        }
-        rest = after;
-    }
-    specs
+fn scan_use_declarations(source: &str) -> Result<Vec<Vec<UsePathSegment>>> {
+    let mut scan_source = String::with_capacity(snapshot_parser_prelude().len() + source.len());
+    scan_source.push_str(snapshot_parser_prelude());
+    scan_source.push_str(source);
+    let ir = parse_source_with_dialect(
+        &scan_source,
+        &SNAPSHOT_PARSER_DIALECT,
+        SharedParserOptions {
+            source_id: 0,
+            allow_implicit_externs: true,
+            allow_implicit_semicolons: false,
+            enforce_mutable_bindings: false,
+            import_scan_mode: true,
+        },
+    )
+    .map_err(|error| AgentError::Compile(error.to_string()))?;
+    Ok(ir
+        .use_declarations
+        .into_iter()
+        .map(|declaration| declaration.path)
+        .collect())
 }
 
-fn resolve_use_spec(parent: &Path, spec: &str) -> Option<PathBuf> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return None;
+enum ResolvedImport {
+    File,
+    Escape,
+}
+
+fn parent_rel(file_rel: &str) -> &str {
+    match file_rel.rfind('/') {
+        Some(index) => &file_rel[..index],
+        None => "",
     }
+}
+
+fn resolve_use_path(parent: &str, segments: &[UsePathSegment]) -> Result<ResolvedImport> {
+    let spec = use_segments_to_spec(segments)?;
     if spec.starts_with('/') || spec.starts_with('\\') {
-        return Some(PathBuf::from(spec));
+        return Ok(ResolvedImport::Escape);
     }
-    let path_like = spec.starts_with('.')
-        || spec.starts_with("super")
-        || spec.starts_with("self")
-        || spec.contains('/')
-        || spec.contains('\\')
-        || spec.ends_with(".rss");
-    let module_like = spec.contains("::");
-    if !path_like && !module_like {
-        return None;
+    match join_rel(parent, &spec) {
+        None => Ok(ResolvedImport::Escape),
+        Some(_) => Ok(ResolvedImport::File),
     }
-    let mut path = PathBuf::new();
-    if spec.contains("::") {
-        let mut segments = spec.split("::").peekable();
-        while let Some(segment) = segments.peek().copied() {
-            match segment {
-                "self" => {
-                    segments.next();
-                }
-                "super" => {
-                    path.push("..");
-                    segments.next();
-                }
-                "crate" => return Some(parent.join("__escape_crate__")),
-                _ => break,
+}
+
+/// Mirrors the pinned compiler's `use_path_to_spec` rules after the real
+/// parser has produced structured path segments. Leading `self`/`super`
+/// segments are qualifiers; later occurrences are literal file segments.
+fn use_segments_to_spec(segments: &[UsePathSegment]) -> Result<String> {
+    if segments.is_empty() {
+        return Err(tree_error("module import is malformed"));
+    }
+    let mut prefix = Vec::<&str>::new();
+    let mut cursor = 0usize;
+    let mut explicit_self = false;
+    while cursor < segments.len() {
+        match &segments[cursor] {
+            UsePathSegment::Self_ => {
+                explicit_self = true;
+                cursor += 1;
             }
-        }
-        for segment in segments {
-            if segment.is_empty() {
-                continue;
+            UsePathSegment::Super => {
+                prefix.push("..");
+                cursor += 1;
             }
-            path.push(segment);
+            UsePathSegment::Ident(name) if name == "crate" => {
+                return Err(tree_error("crate imports are not supported"));
+            }
+            UsePathSegment::Ident(_) => break,
         }
+    }
+    if cursor >= segments.len() {
+        return Err(tree_error("module import is malformed"));
+    }
+    for segment in &segments[cursor..] {
+        match segment {
+            UsePathSegment::Ident(name) => prefix.push(name.as_str()),
+            UsePathSegment::Self_ => prefix.push("self"),
+            UsePathSegment::Super => prefix.push("super"),
+        }
+    }
+    let mut spec = prefix.join("/");
+    if spec.is_empty() {
+        return Err(tree_error("module import is malformed"));
+    }
+    if explicit_self && !spec.starts_with("../") {
+        spec = format!("./{spec}");
+    }
+    if !spec.ends_with(".rss") {
+        spec.push_str(".rss");
+    }
+    Ok(spec)
+}
+
+fn join_rel(parent: &str, spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if parent.is_empty() {
+        Vec::new()
     } else {
-        path.push(spec);
-    }
-    if path.as_os_str().is_empty() {
-        return None;
-    }
-    if path.extension().is_none() {
-        path.set_extension("rss");
-    }
-    Some(parent.join(path))
-}
-
-fn path_is_under(root: &Path, path: &Path) -> bool {
-    let normalized = normalize_components(path);
-    let root = normalize_components(root);
-    normalized.starts_with(&root)
-}
-
-fn normalize_components(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(component),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
+        parent.split('/').collect()
+    };
+    let spec = spec.replace('\\', "/");
+    for part in spec.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
             }
-            Component::Normal(name) => out.push(name),
+            other => parts.push(other),
         }
     }
-    out
+    Some(parts.join("/"))
 }
 
 fn tree_error(message: &'static str) -> AgentError {
@@ -482,10 +625,30 @@ fn assert_safe_rel(rel: &str) -> Result<()> {
     Ok(())
 }
 
-fn compile_temp_root() -> PathBuf {
-    std::env::var_os("TEST_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+fn compile_temp_root() -> Result<PathBuf> {
+    select_trusted_temp_root(
+        std::env::var_os("TEST_TMPDIR").as_deref().map(Path::new),
+        &std::env::temp_dir(),
+    )
+}
+
+fn is_trusted_existing_dir(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink(),
+        Err(_) => false,
+    }
+}
+
+fn select_trusted_temp_root(test_tmpdir: Option<&Path>, fallback: &Path) -> Result<PathBuf> {
+    if let Some(dir) = test_tmpdir
+        && is_trusted_existing_dir(dir)
+    {
+        return Ok(dir.to_path_buf());
+    }
+    if is_trusted_existing_dir(fallback) {
+        return Ok(fallback.to_path_buf());
+    }
+    Err(tree_error("module compile sandbox failed"))
 }
 
 fn create_dir_0700(path: &Path) -> io::Result<()> {
@@ -515,7 +678,28 @@ fn create_exclusive_file(path: &Path, bytes: &[u8]) -> Result<()> {
             .map_err(|_| tree_error("module compile sandbox failed"))?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| tree_error("module compile sandbox failed"))?;
+        let meta = file
+            .metadata()
+            .map_err(|_| tree_error("module compile sandbox failed"))?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(tree_error("module compile sandbox failed"));
+        }
+        file.write_all(bytes)
+            .map_err(|_| tree_error("module compile sandbox failed"))?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -529,35 +713,46 @@ fn create_exclusive_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn ensure_dir_0700(path: &Path) -> Result<()> {
-    if path.exists() {
-        reject_symlink(path)?;
-        let meta =
-            fs::symlink_metadata(path).map_err(|_| tree_error("module compile sandbox failed"))?;
-        if !meta.is_dir() {
-            return Err(tree_error("module compile sandbox failed"));
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(tree_error("module compile sandbox failed"));
+            }
+            Ok(())
         }
-        return Ok(());
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_dir_0700(path).map_err(|_| tree_error("module compile sandbox failed"))?;
+            match fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
+                _ => Err(tree_error("module compile sandbox failed")),
+            }
+        }
+        Err(_) => Err(tree_error("module compile sandbox failed")),
     }
-    create_dir_0700(path).map_err(|_| tree_error("module compile sandbox failed"))
 }
 
-fn ensure_parents_0700(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    let Some(parent) = path.parent() else {
+fn ensure_parents_under_sandbox(path: &Path, sandbox: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(sandbox)
+        .map_err(|_| tree_error("module compile sandbox failed"))?;
+    let mut current = sandbox.to_path_buf();
+    let Some(parent) = relative.parent() else {
         return Ok(());
     };
     for component in parent.components() {
-        current.push(component);
-        ensure_dir_0700(&current)?;
+        match component {
+            Component::Normal(_) => {
+                current.push(component);
+                ensure_dir_0700(&current)?;
+            }
+            _ => return Err(tree_error("module compile sandbox failed")),
+        }
     }
     Ok(())
 }
 
 fn create_private_sandbox() -> Result<PathBuf> {
-    let root = compile_temp_root();
-    ensure_dir_0700(&root).or_else(|_| {
-        fs::create_dir_all(&root).map_err(|_| tree_error("module compile sandbox failed"))
-    })?;
+    let root = compile_temp_root()?;
     for _ in 0..64 {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -572,7 +767,16 @@ fn create_private_sandbox() -> Result<PathBuf> {
         );
         let path = root.join(name);
         match create_dir_0700(&path) {
-            Ok(()) => return Ok(path),
+            Ok(()) => {
+                if fs::symlink_metadata(&path)
+                    .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return Ok(path);
+                }
+                let _ = fs::remove_dir_all(&path);
+                return Err(tree_error("module compile sandbox failed"));
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Err(tree_error("module compile sandbox failed")),
         }
@@ -580,12 +784,22 @@ fn create_private_sandbox() -> Result<PathBuf> {
     Err(tree_error("module compile sandbox failed"))
 }
 
+fn padded_allowed_root(sandbox: &Path) -> PathBuf {
+    let mut allowed = sandbox.to_path_buf();
+    for _ in 0..SANDBOX_PAD_DEPTH {
+        allowed.push(SANDBOX_PAD_DIR);
+    }
+    allowed.push(SANDBOX_TREE_DIR);
+    allowed
+}
+
 fn materialize_snapshot(snapshot: &ModuleSnapshot) -> Result<MaterializedSnapshot> {
     let sandbox = create_private_sandbox()?;
+    let allowed_root = padded_allowed_root(&sandbox);
     let materialized = MaterializedSnapshot {
         sandbox: sandbox.clone(),
-        allowed_root: sandbox.join(SANDBOX_TREE_DIR),
-        entry: sandbox.join(SANDBOX_TREE_DIR).join(
+        allowed_root: allowed_root.clone(),
+        entry: allowed_root.join(
             snapshot
                 .entry_rel
                 .replace('/', std::path::MAIN_SEPARATOR_STR),
@@ -602,6 +816,11 @@ fn write_snapshot_into(
     materialized: &MaterializedSnapshot,
     snapshot: &ModuleSnapshot,
 ) -> Result<()> {
+    let mut pad = materialized.sandbox.clone();
+    for _ in 0..SANDBOX_PAD_DEPTH {
+        pad.push(SANDBOX_PAD_DIR);
+        ensure_dir_0700(&pad)?;
+    }
     ensure_dir_0700(&materialized.allowed_root)?;
     for (rel, bytes) in &snapshot.files {
         assert_safe_rel(rel)?;
@@ -611,7 +830,7 @@ fn write_snapshot_into(
         if !dest.starts_with(&materialized.allowed_root) {
             return Err(tree_error("module compile sandbox failed"));
         }
-        ensure_parents_0700(&dest)?;
+        ensure_parents_under_sandbox(&dest, &materialized.sandbox)?;
         create_exclusive_file(&dest, bytes)?;
     }
     if !materialized.entry.starts_with(&materialized.allowed_root) {
@@ -825,7 +1044,7 @@ mod tests {
         {
             let materialized = snapshot.materialize().expect("materialize");
             sandbox_path = materialized.sandbox().to_path_buf();
-            assert!(sandbox_path.starts_with(compile_temp_root()));
+            assert!(sandbox_path.starts_with(compile_temp_root().expect("tmp")));
             let mode = fs::symlink_metadata(&sandbox_path)
                 .expect("meta")
                 .permissions()
@@ -891,11 +1110,194 @@ mod tests {
             Ok(_) => panic!("absolute import must fail"),
             Err(error) => error,
         };
+        let message = error.to_string();
+        assert!(
+            message.contains("malformed")
+                || message.contains("unsupported")
+                || message.contains("escapes")
+                || message.contains("expected"),
+            "absolute import must fail closed, got {message}"
+        );
+        assert!(!message.contains(root.to_string_lossy().as_ref()));
+        assert!(!message.contains("/tmp/evil.rss"), "{message}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_ignores_fake_use_in_comments_and_strings() {
+        let root = test_root("fake-use");
+        let path = root.join("main.rss");
+        fs::write(
+            &path,
+            "// use super::evil;\n/* use super::evil; */\npub fn run(input: map) -> string {\n    let s: string = \"use super::evil;\";\n    \"ok\";\n}\n",
+        )
+        .expect("write");
+        capture_module_snapshot(&path).expect("comments and strings must not look like imports");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_discovers_use_with_whitespace_and_comments_between_tokens() {
+        let root = test_root("spaced-use");
+        let rss = root.join("rss");
+        fs::create_dir_all(rss.join("agent")).expect("agent dir");
+        fs::write(root.join("evil.rss"), "pub fn x() -> int { 1; }\n").expect("evil");
+        let path = rss.join("agent").join("main.rss");
+        fs::write(
+            &path,
+            "use\n\t/* comments between tokens */\n\t\u{2003}super::super::evil;\npub fn run(input: map) -> string { \"ok\"; }\n",
+        )
+        .expect("write");
+        let error = capture_module_snapshot(&path).expect_err("escape");
         assert_eq!(
             error.to_string(),
             "RustScript compile error: module import escapes the allowed root"
         );
-        assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_rejects_crate_import_explicitly() {
+        let root = test_root("crate-import");
+        let path = root.join("main.rss");
+        fs::write(
+            &path,
+            "use crate::evil;\npub fn run(input: map) -> string { \"ok\"; }\n",
+        )
+        .expect("write");
+        let error = capture_module_snapshot(&path).expect_err("crate");
+        let message = error.to_string();
+        assert!(
+            message.contains("crate"),
+            "crate import must be rejected explicitly, got {message}"
+        );
+        assert!(!message.contains("escapes the allowed root"), "{message}");
+        assert!(!message.contains(root.to_string_lossy().as_ref()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_rejects_pub_use_as_unsupported() {
+        let root = test_root("pub-use");
+        let path = root.join("main.rss");
+        fs::write(
+            &path,
+            "pub use helper;\npub fn run(input: map) -> string { \"ok\"; }\n",
+        )
+        .expect("write");
+        let error = capture_module_snapshot(&path).expect_err("pub use");
+        let message = error.to_string();
+        assert!(
+            message.contains("malformed")
+                || message.contains("unsupported")
+                || message.contains("expected"),
+            "pub use must fail closed, got {message}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_accepts_grouped_imports_aliases_and_self() {
+        let root = test_root("grouped");
+        let rss = root.join("rss");
+        fs::create_dir_all(rss.join("agent")).expect("agent dir");
+        fs::write(
+            rss.join("agent").join("helper.rss"),
+            "pub fn value() -> int { 1; }\n",
+        )
+        .expect("helper");
+        let path = rss.join("agent").join("main.rss");
+        fs::write(
+            &path,
+            "use self::helper::{value as answer};\nuse helper as h;\npub fn run(input: map) -> string { \"ok\"; }\n",
+        )
+        .expect("write");
+        capture_module_snapshot(&path).expect("grouped and alias imports stay in root");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_rejects_unterminated_comment_and_string() {
+        let root = test_root("unterminated");
+        let comment = root.join("comment.rss");
+        fs::write(
+            &comment,
+            "/* unterminated\npub fn run(input: map) -> string { \"ok\"; }\n",
+        )
+        .expect("write");
+        let error = capture_module_snapshot(&comment).expect_err("comment");
+        assert!(
+            error.to_string().contains("malformed") || error.to_string().contains("unterminated"),
+            "{}",
+            error
+        );
+        let string_path = root.join("string.rss");
+        fs::write(
+            &string_path,
+            "pub fn run(input: map) -> string { \"unterminated\n",
+        )
+        .expect("write");
+        let error = capture_module_snapshot(&string_path).expect_err("string");
+        assert!(
+            error.to_string().contains("malformed") || error.to_string().contains("unterminated"),
+            "{}",
+            error
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_non_nesting_block_comment_matches_parser() {
+        let root = test_root("nested-comment");
+        let rss = root.join("rss");
+        fs::create_dir_all(rss.join("agent")).expect("agent dir");
+        fs::write(root.join("evil.rss"), "pub fn x() -> int { 1; }\n").expect("evil");
+        let path = rss.join("agent").join("main.rss");
+        fs::write(
+            &path,
+            "/* outer /* inner */ use super::super::evil;\npub fn run(input: map) -> string { \"ok\"; }\n",
+        )
+        .expect("write");
+        let error = capture_module_snapshot(&path).expect_err("inner close ends comment");
+        assert_eq!(
+            error.to_string(),
+            "RustScript compile error: module import escapes the allowed root"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_rejects_one_over_tree_node_bound_for_junk_files() {
+        let root = test_root("junk-nodes");
+        let path = root.join("main.rss");
+        fs::write(&path, "pub fn run(input: map) -> string { \"ok\"; }\n").expect("main");
+        for i in 0..MAX_TREE_NODES {
+            fs::write(root.join(format!("junk-{i}.txt")), "x").expect("junk");
+        }
+        let error = capture_module_snapshot(&path).expect_err("nodes");
+        assert_eq!(
+            error.to_string(),
+            "RustScript compile error: module tree exceeds the entry count bound"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_compile_temp_root_skips_symlink_tmpdir() {
+        let root = test_root("symlink-tmpdir");
+        let real = root.join("real");
+        fs::create_dir(&real).expect("real");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let fallback = root.join("fallback");
+        fs::create_dir(&fallback).expect("fallback");
+        let chosen = select_trusted_temp_root(Some(link.as_path()), &fallback).expect("choose");
+        assert_eq!(chosen, fallback);
+        assert!(
+            select_trusted_temp_root(Some(link.as_path()), &link).is_err(),
+            "symlink-only roots must fail closed"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

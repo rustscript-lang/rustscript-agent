@@ -62,19 +62,22 @@ fn call_id(call: map) -> string {
 fn parse_call_arguments(call: map) -> map {
     let mut out: map = {
         ok: true,
-        arguments: types::map_map(call, "arguments"),
+        arguments: {},
         code: "",
         message: ""
     };
-    let existing: map = types::map_map(call, "arguments");
-    let mut has_existing: bool = false;
     if call.has("arguments") {
         if type(call.arguments) == "map" {
-            has_existing = true;
-            out.arguments = existing;
+            out.arguments = call.arguments;
+        } else {
+            out = {
+                ok: false,
+                arguments: {},
+                code: "malformed_payload",
+                message: "tool arguments must be a JSON object"
+            };
         }
-    }
-    if has_existing == false {
+    } else {
         if call.has("arguments_json") {
             if type(call.arguments_json) == "string" {
                 let text: string = call.arguments_json;

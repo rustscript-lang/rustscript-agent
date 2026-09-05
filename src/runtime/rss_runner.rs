@@ -31,9 +31,9 @@ use rustscript_vm::{
     CallReturn, CancellationReason, CancellationToken, CompileSourceFileOptions, EpochHandle,
     HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt,
     InvocationError, InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy,
-    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason, compile_source_file_with_options,
-    compile_source_with_flavor_and_options, register_http_builtin_module_from_catalog,
-    register_sqlite_builtin_module_from_catalog,
+    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
+    register_http_builtin_module_from_catalog, register_sqlite_builtin_module_from_catalog,
 };
 
 use super::agent_host::{
@@ -48,6 +48,7 @@ use serde_json::json;
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
 pub const COMPILE_CACHE_CAP: usize = 8;
+pub const COMPILE_CACHE_WEIGHT_CAP: usize = COMPILE_CACHE_CAP * MAX_AGENT_SOURCE_BYTES;
 
 thread_local! {
     static AFTER_SNAPSHOT_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
@@ -67,9 +68,15 @@ fn invoke_after_snapshot(path: &Path) {
     });
 }
 
+struct CachedProgram {
+    program: rustscript_vm::Program,
+    weight: usize,
+}
+
 struct ProgramLru {
-    entries: HashMap<String, rustscript_vm::Program>,
+    entries: HashMap<String, CachedProgram>,
     order: VecDeque<String>,
+    total_weight: usize,
 }
 
 impl ProgramLru {
@@ -77,34 +84,46 @@ impl ProgramLru {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
+            total_weight: 0,
         }
     }
 
     fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
-        let program = self.entries.get(digest)?.clone();
+        if !self.entries.contains_key(digest) {
+            return None;
+        }
         if let Some(index) = self.order.iter().position(|key| key == digest) {
             self.order.remove(index);
         }
         self.order.push_back(digest.to_string());
-        Some(program)
+        self.entries.get(digest).map(|entry| entry.program.clone())
     }
 
-    fn insert(&mut self, digest: String, program: rustscript_vm::Program) {
+    fn insert(&mut self, digest: String, program: rustscript_vm::Program, weight: usize) {
         if self.entries.contains_key(&digest) {
-            self.entries.insert(digest.clone(), program);
             if let Some(index) = self.order.iter().position(|key| key == &digest) {
                 self.order.remove(index);
             }
             self.order.push_back(digest);
             return;
         }
-        while self.order.len() >= COMPILE_CACHE_CAP {
-            if let Some(old) = self.order.pop_front() {
-                self.entries.remove(&old);
+        if weight > COMPILE_CACHE_WEIGHT_CAP {
+            return;
+        }
+        while !self.order.is_empty()
+            && (self.order.len() >= COMPILE_CACHE_CAP
+                || self.total_weight.saturating_add(weight) > COMPILE_CACHE_WEIGHT_CAP)
+        {
+            if let Some(old) = self.order.pop_front()
+                && let Some(entry) = self.entries.remove(&old)
+            {
+                self.total_weight = self.total_weight.saturating_sub(entry.weight);
             }
         }
-        self.order.push_back(digest.clone());
-        self.entries.insert(digest, program);
+        self.total_weight = self.total_weight.saturating_add(weight);
+        self.entries
+            .insert(digest.clone(), CachedProgram { program, weight });
+        self.order.push_back(digest);
     }
 }
 
@@ -128,6 +147,11 @@ fn redact_compile_error(error: impl Display, sandbox: &Path) -> AgentError {
         text = text.replace(root, "");
     }
     if let Some(tmp) = compile_temp_root().to_str()
+        && !tmp.is_empty()
+    {
+        text = text.replace(tmp, "");
+    }
+    if let Some(tmp) = std::env::temp_dir().to_str()
         && !tmp.is_empty()
     {
         text = text.replace(tmp, "");
@@ -159,7 +183,13 @@ fn compiled_source_program(source: &str) -> Result<(rustscript_vm::Program, Stri
         compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
-    program_cache().insert(digest.clone(), program.clone());
+    {
+        let mut cache = program_cache();
+        if let Some(cached) = cache.get(&digest) {
+            return Ok((cached, digest));
+        }
+        cache.insert(digest.clone(), program.clone(), source.len());
+    }
     Ok((program, digest))
 }
 
@@ -174,11 +204,34 @@ fn compiled_file_program(path: &Path) -> Result<(rustscript_vm::Program, String)
         }
     }
     let sandbox = snapshot.materialize()?;
-    let program = compile_source_file_with_options(sandbox.entry(), compile_options())
-        .map_err(|error| redact_compile_error(error, sandbox.sandbox()))?
-        .program;
+    let mut options = compile_options();
+    for (rel, bytes) in snapshot.files() {
+        let source = std::str::from_utf8(bytes)
+            .map_err(|_| AgentError::Compile("module tree file is not valid UTF-8".to_string()))?;
+        for key in sandbox.override_source_keys(rel) {
+            options = options.with_module_override_source(key, source);
+        }
+    }
+    let program = compile_source_at_path_with_flavor_and_options(
+        sandbox.entry(),
+        snapshot.entry_source()?,
+        SourceFlavor::RustScript,
+        options,
+    )
+    .map_err(|error| redact_compile_error(error, sandbox.sandbox()))?
+    .program;
     drop(sandbox);
-    program_cache().insert(digest.clone(), program.clone());
+    {
+        let mut cache = program_cache();
+        if let Some(cached) = cache.get(&digest) {
+            return Ok((cached, digest));
+        }
+        cache.insert(
+            digest.clone(),
+            program.clone(),
+            snapshot.total_source_bytes(),
+        );
+    }
     Ok((program, digest))
 }
 
@@ -1203,5 +1256,76 @@ impl HostAsyncBridge for AgentAsyncBridge {
 
     fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
         self.futures.remove(&op_id);
+    }
+}
+
+#[cfg(test)]
+mod compile_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn tiny_source(tag: &str) -> String {
+        format!(
+            "pub fn run(context: map) -> map {{ let _x: string = \"{tag}\"; {{ ok: true }} }}\n"
+        )
+    }
+
+    #[test]
+    fn compile_cache_recovers_from_poison_and_compiles_outside_lock() {
+        let _ = thread::spawn(|| {
+            let _guard = program_cache();
+            panic!("poison cache");
+        })
+        .join();
+        compiled_source_program(&tiny_source("poison")).expect("poison recovery");
+    }
+
+    #[test]
+    fn compile_cache_bounds_entries_and_weight() {
+        let program = compiled_source_program(&tiny_source("seed"))
+            .expect("compile")
+            .0;
+        let mut cache = ProgramLru::new();
+        for i in 0..COMPILE_CACHE_CAP {
+            cache.insert(format!("d{i}"), program.clone(), MAX_AGENT_SOURCE_BYTES);
+        }
+        assert_eq!(cache.entries.len(), COMPILE_CACHE_CAP);
+        assert_eq!(cache.total_weight, COMPILE_CACHE_WEIGHT_CAP);
+        cache.insert(
+            "overflow".to_string(),
+            program.clone(),
+            MAX_AGENT_SOURCE_BYTES,
+        );
+        assert_eq!(cache.entries.len(), COMPILE_CACHE_CAP);
+        assert!(!cache.entries.contains_key("d0"));
+        assert!(cache.entries.contains_key("overflow"));
+        cache.insert(
+            "too-heavy".to_string(),
+            program,
+            COMPILE_CACHE_WEIGHT_CAP + 1,
+        );
+        assert!(!cache.entries.contains_key("too-heavy"));
+    }
+
+    #[test]
+    fn compile_cache_concurrent_same_digest_is_safe() {
+        let source = tiny_source("concurrent");
+        let source = Arc::new(source);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let source = Arc::clone(&source);
+            handles.push(thread::spawn(move || compiled_source_program(&source)));
+        }
+        let mut digests = Vec::new();
+        for handle in handles {
+            let (_, digest) = handle.join().expect("thread").expect("compile");
+            digests.push(digest);
+        }
+        assert!(digests.iter().all(|digest| digest == &digests[0]));
+        {
+            let cache = program_cache();
+            assert!(cache.entries.contains_key(&digests[0]));
+        }
     }
 }

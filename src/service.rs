@@ -1948,7 +1948,11 @@ impl AgentService {
                 let live_a = crate::runtime::rss_runner::module_tree_digest(&entry)
                     .map_err(|error| error.to_string())?;
                 {
-                    let cache = self.inner.runner.lock().expect("runner cache lock");
+                    let cache = self
+                        .inner
+                        .runner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(cached) = cache.as_ref()
                         && cached.source_digest == live_a
                         && cached.config == expected
@@ -1972,7 +1976,11 @@ impl AgentService {
                 let live_c = crate::runtime::rss_runner::module_tree_digest(&entry)
                     .map_err(|error| error.to_string())?;
                 if live_c == compiled_b {
-                    let mut cache = self.inner.runner.lock().expect("runner cache lock");
+                    let mut cache = self
+                        .inner
+                        .runner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *cache = Some(CachedAgentRunner {
                         source_digest: compiled_b,
                         config: expected,
@@ -1986,7 +1994,28 @@ impl AgentService {
         }
         let source = source.ok_or_else(|| "RSS agent source is not configured".to_string())?;
         let digest = agent_source_digest(source);
-        let mut cache = self.inner.runner.lock().expect("runner cache lock");
+        {
+            let cache = self
+                .inner
+                .runner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = cache.as_ref()
+                && cached.source_digest == digest
+                && cached.config == expected
+                && cached.runner.snapshot_digest() == digest
+            {
+                return Ok(cached.runner.clone());
+            }
+        }
+        let runner = AgentRunner::from_source(source, expected.clone())
+            .map_err(|error| error.to_string())?;
+        let compiled_digest = runner.snapshot_digest().to_string();
+        let mut cache = self
+            .inner
+            .runner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = cache.as_ref()
             && cached.source_digest == digest
             && cached.config == expected
@@ -1994,10 +2023,8 @@ impl AgentService {
         {
             return Ok(cached.runner.clone());
         }
-        let runner = AgentRunner::from_source(source, expected.clone())
-            .map_err(|error| error.to_string())?;
         *cache = Some(CachedAgentRunner {
-            source_digest: runner.snapshot_digest().to_string(),
+            source_digest: compiled_digest,
             config: expected,
             runner: runner.clone(),
         });
@@ -2017,7 +2044,11 @@ impl AgentService {
     /// live-tree digest.
     pub fn install_agent_runner(&self, runner: AgentRunner) {
         let digest = runner.snapshot_digest().to_string();
-        *self.inner.runner.lock().expect("runner cache lock") = Some(CachedAgentRunner {
+        *self
+            .inner
+            .runner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedAgentRunner {
             source_digest: digest,
             config: runner.config().clone(),
             runner,

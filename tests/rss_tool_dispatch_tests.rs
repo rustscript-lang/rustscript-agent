@@ -7,7 +7,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
 use rustscript_agent::capabilities::{
     ApprovalGate, CancellationFlag, CapabilityLifecycle, CapabilityOwner, CapabilityRisk,
@@ -548,6 +547,41 @@ fn dispatch_registry_mismatch_preserves_typed_envelope() {
 }
 
 #[test]
+fn dispatch_structured_non_map_arguments_are_malformed_before_prepare() {
+    let fixture = Fixture::new("non-map-args");
+    for (label, arguments) in [
+        ("array", json!([])),
+        ("scalar", json!(1)),
+        ("null", json!(null)),
+    ] {
+        let durable = MemoryDurable::new();
+        let input = dispatch_input(
+            json!({
+                "id": format!("call-{label}"),
+                "name": "read_file",
+                "arguments": arguments,
+            }),
+            registry_snapshot(),
+            REGISTRY_IDENTITY,
+            json!({}),
+        );
+        let (envelope, started) = run_dispatch(&fixture, durable, input);
+        assert_eq!(envelope["ok"], json!(false), "{label} envelope={envelope}");
+        assert_eq!(
+            envelope["terminal"],
+            json!(true),
+            "{label} envelope={envelope}"
+        );
+        assert_eq!(
+            error_code(&envelope),
+            "malformed_payload",
+            "{label} envelope={envelope}"
+        );
+        assert_eq!(started, 0, "{label}");
+    }
+}
+
+#[test]
 fn dispatch_duplicate_registry_names_fail_closed() {
     let fixture = Fixture::new("duplicate");
     let durable = MemoryDurable::new();
@@ -727,9 +761,4 @@ fn dispatch_duplicate_scan_accepts_exact_max_and_rejects_one_over() {
         "envelope={envelope}"
     );
     assert_eq!(started, 0);
-}
-
-#[allow(dead_code)]
-fn _instant_marker() -> Instant {
-    Instant::now()
 }

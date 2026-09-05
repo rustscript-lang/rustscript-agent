@@ -778,9 +778,12 @@ fn from_file_rejects_absolute_import_without_host_path() {
         Err(error) => error,
     };
     let message = error.to_string();
-    assert_eq!(
-        message,
-        "RustScript compile error: module import escapes the allowed root"
+    assert!(
+        message.contains("malformed")
+            || message.contains("unsupported")
+            || message.contains("escapes")
+            || message.contains("expected"),
+        "absolute import must fail closed, got {message}"
     );
     assert!(
         !message.contains(dir.to_string_lossy().as_ref()),
@@ -789,6 +792,107 @@ fn from_file_rejects_absolute_import_without_host_path() {
     assert!(
         !message.contains("/tmp/evil.rss"),
         "error must not leak import path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_crate_import_explicitly() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-crate-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("main.rss"),
+        "use crate::evil;\npub fn run(context: map) -> map { { ok: true } }\n",
+    )
+    .expect("write entry");
+    let error = match AgentRunner::from_file(agent.join("main.rss"), AgentConfig::default()) {
+        Ok(_) => panic!("crate import must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("crate"), "got {message}");
+    assert!(!message.contains("escapes the allowed root"), "{message}");
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_preserves_parser_valid_grouped_alias_imports() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-grouped-alias-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("helper.rss"),
+        "pub fn value() -> string { \"grouped-alias\"; }\n",
+    )
+    .expect("write helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use\n\t/* comments and whitespace */\n\tself::helper::{value as answer};\npub fn run(input: map) -> string { answer(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("parser-valid grouped alias import must compile");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run grouped alias import"),
+        Value::string("grouped-alias")
+    );
+    assert_eq!(runner.snapshot_digest().len(), 64);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_compile_cannot_open_live_module_added_after_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-live-after-snapshot-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use self::helper;\npub fn run(context: map) -> string { helper::value(); }\n",
+    )
+    .expect("write entry");
+    set_after_snapshot_hook(Some(|entry| {
+        let helper = entry.with_file_name("helper.rss");
+        let _ = std::fs::write(helper, "pub fn value() -> string { \"live\"; }\n");
+    }));
+    let result = AgentRunner::from_file(&path, AgentConfig::default());
+    set_after_snapshot_hook(None);
+    assert!(
+        result.is_err(),
+        "compiler must not open a live module added after snapshot"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -968,7 +968,7 @@ impl ToolRegistrySnapshot {
         self.entry(name).map(ToolRegistryEntry::descriptor)
     }
 
-    /// Frozen registry entry for `name`, including its native executor slot.
+    /// Frozen registry entry for `name`, including its validated descriptor.
     pub fn entry(&self, name: &str) -> Option<&ToolRegistryEntry> {
         self.entries
             .iter()
@@ -997,7 +997,7 @@ impl ToolRegistrySnapshot {
         self.entries.is_empty()
     }
 
-    /// Validates `arguments` against the frozen compiled schema for `name`.
+    /// Frozen JSON Schema validator for `name` from the admitted snapshot, if present.
     pub fn validate_arguments(&self, name: &str, arguments: &Value) -> Result<(), String> {
         let index = self
             .entries
