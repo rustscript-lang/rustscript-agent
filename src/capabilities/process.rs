@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread,
@@ -149,6 +149,7 @@ struct ProcessInner {
     after_running_poll_hook: Mutex<Option<ProcessOpHook>>,
     write_blocked_hook: Mutex<Option<ProcessOpHook>>,
     before_write_cycle_hook: Mutex<Option<ProcessOpHook>>,
+    stdin_workers: AtomicUsize,
 }
 
 impl Drop for ProcessInner {
@@ -210,6 +211,7 @@ impl ProcessCapability {
                 after_running_poll_hook: Mutex::new(None),
                 write_blocked_hook: Mutex::new(None),
                 before_write_cycle_hook: Mutex::new(None),
+                stdin_workers: AtomicUsize::new(0),
             }),
         })
     }
@@ -421,6 +423,11 @@ impl ProcessCapability {
             .len()
     }
 
+    /// Test-only count of stdin write workers spawned but not joined.
+    pub fn active_stdin_workers(&self) -> usize {
+        self.inner.stdin_workers.load(Ordering::SeqCst)
+    }
+
     /// PIDs currently recorded in the process table. Used by lifecycle tests.
     pub fn live_pids(&self) -> Vec<u32> {
         self.inner
@@ -610,36 +617,45 @@ impl ProcessCapability {
             .map_err(|_| {
                 CapabilityError::new("process_failed", "stdin write worker failed to start")
             })?;
-        let outcome = loop {
+        self.inner.stdin_workers.fetch_add(1, Ordering::SeqCst);
+        let workers = &self.inner.stdin_workers;
+        loop {
             fire_hook(&self.inner.before_write_cycle_hook);
             if let Err(error) = self.authorize(token, CapabilityRisk::Execute) {
-                break interrupt_write_worker(handle, &rx, error);
+                return interrupt_write_worker(handle, worker, &rx, error, workers);
             }
             let now = Instant::now();
             if now >= deadline {
-                break interrupt_write_worker(
+                return interrupt_write_worker(
                     handle,
+                    worker,
                     &rx,
                     CapabilityError::new("deadline_elapsed", "process deadline elapsed"),
+                    workers,
                 );
             }
             let slice = WRITE_POLL_SLICE.min(deadline.saturating_duration_since(now));
             match rx.recv_timeout(slice) {
-                Ok(Ok(wrote)) => break Ok(wrote),
-                Ok(Err(error)) => break Err(map_process_error(error)),
+                Ok(Ok(wrote)) => {
+                    join_write_worker(worker, workers);
+                    return Ok(wrote);
+                }
+                Ok(Err(error)) => {
+                    join_write_worker(worker, workers);
+                    return Err(map_process_error(error));
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     fire_hook(&self.inner.write_blocked_hook);
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    break Err(CapabilityError::new(
+                    join_write_worker(worker, workers);
+                    return Err(CapabilityError::new(
                         "process_failed",
                         "stdin write worker ended",
                     ));
                 }
             }
-        };
-        drop(worker);
-        outcome
+        }
     }
 
     fn clamp_limits(&self, caller: ProcessLimits, claims: &TokenClaims) -> ProcessLimits {
@@ -680,14 +696,23 @@ fn fire_hook(slot: &Mutex<Option<ProcessOpHook>>) {
 
 fn interrupt_write_worker(
     handle: &BoundedProcessHandle,
+    worker: thread::JoinHandle<()>,
     rx: &mpsc::Receiver<Result<usize, BoundedProcessError>>,
     interrupt: CapabilityError,
+    workers: &AtomicUsize,
 ) -> Result<usize, CapabilityError> {
     let _ = handle.close_stdin();
-    match rx.recv_timeout(WRITE_CLEANUP_TIMEOUT) {
+    let outcome = match rx.recv_timeout(WRITE_CLEANUP_TIMEOUT) {
         Ok(Ok(wrote)) => Ok(wrote),
         Ok(Err(_)) | Err(_) => Err(interrupt),
-    }
+    };
+    join_write_worker(worker, workers);
+    outcome
+}
+
+fn join_write_worker(worker: thread::JoinHandle<()>, workers: &AtomicUsize) {
+    let _ = worker.join();
+    workers.fetch_sub(1, Ordering::SeqCst);
 }
 
 fn terminate_owned(owned: &OwnedProcess) {
