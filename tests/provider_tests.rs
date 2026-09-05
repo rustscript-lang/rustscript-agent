@@ -694,8 +694,50 @@ fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
     );
 }
 
-const LOOP_TEMP_ROOT: &str =
-    "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t6-agent-loop-9d82a388";
+fn loop_temp_root() -> PathBuf {
+    let root = std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "rustscript-agent-provider-loop-{}",
+                std::process::id()
+            ))
+        });
+    fs::create_dir_all(&root).expect("loop temp root should exist");
+    assert_temp_path_is_lease_safe(&root);
+    root
+}
+
+fn unique_loop_workspace(label: &str, sequence: u64) -> PathBuf {
+    loop_temp_root().join(format!("{}-{}-{}", label, std::process::id(), sequence))
+}
+
+fn assert_temp_path_is_lease_safe(path: &std::path::Path) {
+    if let Some(test_tmpdir) = std::env::var_os("TEST_TMPDIR") {
+        let root = PathBuf::from(test_tmpdir);
+        assert!(
+            path.starts_with(&root),
+            "loop temp paths must stay under TEST_TMPDIR ({}); got {}",
+            root.display(),
+            path.display()
+        );
+        return;
+    }
+    let rendered = path.to_string_lossy();
+    assert!(
+        path.starts_with(std::env::temp_dir()),
+        "loop temp paths must use std::env::temp_dir when TEST_TMPDIR is unset: {rendered}"
+    );
+    let worktrees = format!("/{}s/", "worktree");
+    let lease_tmp = format!("/mnt/{}/workspace/rustscript-agent/tmp/", "TEMP");
+    let prod_tmp = format!("/tmp/{}-agent-", "prod");
+    assert!(
+        !rendered.contains(&worktrees)
+            && !rendered.contains(&lease_tmp)
+            && !rendered.contains(&prod_tmp),
+        "loop temp paths must not write into a hardcoded sibling lease path: {rendered}"
+    );
+}
 
 thread_local! {
     static LOOP_WORKSPACE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -744,11 +786,7 @@ fn loop_owner() -> CapabilityOwner {
 
 fn loop_dispatcher(max_tool_calls: u64) -> (AgentHostBridges, PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
-        "adapter-loop-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = unique_loop_workspace("adapter-loop", NEXT.fetch_add(1, Ordering::Relaxed));
     fs::create_dir_all(&root).expect("loop dispatcher workspace");
     fs::write(root.join("文档.txt"), "ran read_file").expect("seed");
     fs::write(root.join(r#"a"b.md"#), "ran read_file").expect("seed");

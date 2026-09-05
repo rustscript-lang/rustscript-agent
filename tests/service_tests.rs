@@ -213,9 +213,10 @@ fn assert_temp_db_is_lease_safe(path: &Path) {
         path.starts_with(std::env::temp_dir()),
         "test databases must use std::env::temp_dir when TEST_TMPDIR is unset: {rendered}"
     );
+    let worktrees = format!("/{}s/", "worktree");
+    let lease_tmp = format!("/mnt/{}/workspace/rustscript-agent/tmp/", "TEMP");
     assert!(
-        !rendered.contains("/worktrees/")
-            && !rendered.contains("/mnt/TEMP/workspace/rustscript-agent/tmp/"),
+        !rendered.contains(&worktrees) && !rendered.contains(&lease_tmp),
         "test databases must not write into a hardcoded sibling lease path: {rendered}"
     );
 }

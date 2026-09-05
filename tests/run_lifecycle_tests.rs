@@ -143,16 +143,58 @@ fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> Agen
     state
 }
 
-fn temporary_db_path() -> PathBuf {
+fn test_temp_root() -> PathBuf {
     let root = std::env::var_os("TEST_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(
-                "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-tools-agent-integration-c77be280",
-            )
+            std::env::temp_dir().join(format!(
+                "rustscript-agent-run-lifecycle-{}",
+                std::process::id()
+            ))
         });
-    fs::create_dir_all(&root).expect("test database directory should exist");
-    root.join(format!("{}.db", uuid::Uuid::new_v4()))
+    fs::create_dir_all(&root).expect("test temp root should exist");
+    assert_temp_path_is_lease_safe(&root);
+    root
+}
+
+fn unique_temp_dir(label: &str) -> PathBuf {
+    test_temp_root().join(format!(
+        "{}-{}-{}",
+        label,
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn assert_temp_path_is_lease_safe(path: &std::path::Path) {
+    if let Some(test_tmpdir) = std::env::var_os("TEST_TMPDIR") {
+        let root = PathBuf::from(test_tmpdir);
+        assert!(
+            path.starts_with(&root),
+            "run-lifecycle temp paths must stay under TEST_TMPDIR ({}); got {}",
+            root.display(),
+            path.display()
+        );
+        return;
+    }
+    let rendered = path.to_string_lossy();
+    assert!(
+        path.starts_with(std::env::temp_dir()),
+        "run-lifecycle temp paths must use std::env::temp_dir when TEST_TMPDIR is unset: {rendered}"
+    );
+    let worktrees = format!("/{}s/", "worktree");
+    let lease_tmp = format!("/mnt/{}/workspace/rustscript-agent/tmp/", "TEMP");
+    let prod_tmp = format!("/tmp/{}-agent-", "prod");
+    assert!(
+        !rendered.contains(&worktrees)
+            && !rendered.contains(&lease_tmp)
+            && !rendered.contains(&prod_tmp),
+        "run-lifecycle temp paths must not write into a hardcoded sibling lease path: {rendered}"
+    );
+}
+
+fn temporary_db_path() -> PathBuf {
+    test_temp_root().join(format!("{}.db", uuid::Uuid::new_v4()))
 }
 
 fn loop_service_sqlite(
@@ -744,10 +786,7 @@ async fn worker_accounts_retry_exhaustion_without_turns() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_accounts_truncated_tool_result_once() {
-    let root = PathBuf::from(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-tools-agent-integration-c77be280",
-    )
-    .join(format!("trunc-{}", std::process::id()));
+    let root = unique_temp_dir("trunc");
     fs::create_dir_all(&root).expect("truncation workspace");
     fs::write(root.join("big.txt"), "x".repeat(4096)).expect("truncated fixture");
     let provider = ScriptedProvider::new();
@@ -1806,14 +1845,7 @@ async fn capability_host_init_panic_does_not_overwrite_closed_and_redrive_cancel
     provider.push_ok(text_response("after-init-panic"));
     let state = loop_service(AgentGatewayConfig::default(), &provider);
     let service = state.service();
-    let parent = PathBuf::from(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-final-test-hygiene-fix-09acaf18",
-    )
-    .join(format!(
-        "init-panic-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let parent = unique_temp_dir("init-panic");
     let workspace = parent.join("workspace");
     fs::create_dir_all(&workspace).expect("isolated workspace");
     service
@@ -1887,4 +1919,48 @@ async fn capability_host_init_panic_does_not_overwrite_closed_and_redrive_cancel
     drop(service);
     drop(state);
     fs::remove_dir_all(&parent).expect("isolated init-panic workspace should be removed");
+}
+
+fn collect_test_rs_files(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory).expect("tests directory should be readable") {
+        let path = entry.expect("directory entry should be readable").path();
+        if path.is_dir() {
+            collect_test_rs_files(&path, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn test_sources_do_not_hardcode_sibling_lease_temp_roots() {
+    let tests_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut sources = Vec::new();
+    collect_test_rs_files(&tests_root, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "tests/ must contain Rust sources to audit"
+    );
+
+    let forbidden = [
+        format!("/mnt/{}/workspace/", "TEMP"),
+        format!("{}-t", "coding"),
+        ["prod", "agent", "task"].join("-"),
+        format!("/{}s/", "worktree"),
+        format!("/tmp/{}-agent-", "prod"),
+    ];
+
+    let mut violations = Vec::new();
+    for path in &sources {
+        let source = fs::read_to_string(path).expect("test source should be readable");
+        for fragment in &forbidden {
+            if source.contains(fragment.as_str()) {
+                violations.push(format!("{} contains {fragment}", path.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "test sources must not hardcode sibling lease temp roots: {violations:?}"
+    );
 }
