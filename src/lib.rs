@@ -6,8 +6,10 @@
 //! of stream. The structured run context is the sole callable argument; the
 //! script-visible event builtin is `stream::emit(value)`.
 
+pub mod auth;
 pub mod capabilities;
 pub mod config;
+pub mod config_file;
 pub mod domain;
 pub mod events;
 pub mod gateway;
@@ -21,7 +23,11 @@ pub mod tool_schema;
 
 mod durable_provider;
 
+pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
 pub use config::{AgentGatewayConfig, TelegramConfig};
+pub use config_file::{
+    AgentPaths, ConfigFile, ConfigFileError, ConfigPaths, LoadedConfig, RuntimeConfig, load_config,
+};
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
     LlmResponse, ProviderError, RunContext, Sampling, ToolCall, Usage, decode_message_blocks,
