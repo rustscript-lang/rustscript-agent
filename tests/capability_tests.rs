@@ -299,6 +299,14 @@ fn error_code(error: &CapabilityError) -> &str {
     error.code()
 }
 
+fn assert_stdin_workers_joined(processes: &ProcessCapability) {
+    assert_eq!(
+        processes.active_stdin_workers(),
+        0,
+        "stdin write worker must be joined before the capability API returns"
+    );
+}
+
 fn run_cap_source(
     fixture: &Fixture,
     filesystem: Option<Arc<FilesystemCapability>>,
@@ -743,6 +751,7 @@ fn process_spawn_stdin_and_log_cursors_are_owner_scoped() {
     let wrote = processes
         .write_stdin(&token, &spawned.handle, b"hello-cursor\n", None)
         .expect("write");
+    assert_stdin_workers_joined(&processes);
     assert_eq!(wrote, 13);
     processes
         .close_stdin(&token, &spawned.handle)
@@ -840,6 +849,7 @@ fn process_write_timeout_caps_a_full_pipe() {
     let error = processes
         .write_stdin(&token, &spawned.handle, &vec![b'x'; 1024 * 1024], Some(80))
         .expect_err("full pipe write");
+    assert_stdin_workers_joined(&processes);
     let elapsed = started.elapsed();
     assert_eq!(error_code(&error), "deadline_elapsed");
     assert!(
@@ -873,6 +883,7 @@ fn process_spawn_with_stdin_writes_before_return() {
             Some(b"from-spawn\n"),
         )
         .expect("spawn_with");
+    assert_stdin_workers_joined(&processes);
     processes
         .close_stdin(&token, &spawned.handle)
         .expect("close");
@@ -2389,6 +2400,7 @@ fn process_write_completion_wins_when_cancelled_after_worker_finishes() {
     let wrote = processes
         .write_stdin(&token, &spawned.handle, b"hello\n", Some(2_000))
         .expect("completed write should win at cancel");
+    assert_stdin_workers_joined(&processes);
     assert_eq!(wrote, 6);
     processes.cancel_all();
 }
@@ -2414,6 +2426,7 @@ fn process_write_to_exited_child_is_stdin_closed() {
     let error = processes
         .write_stdin(&token, &spawned.handle, b"late\n", Some(1_000))
         .expect_err("write after exit");
+    assert_stdin_workers_joined(&processes);
     assert!(
         error_code(&error) == "stdin_closed" || error_code(&error) == "process_failed",
         "EPIPE after exit, got {}",
@@ -2447,6 +2460,7 @@ fn process_write_full_pipe_timeout_returns_within_cleanup_timeout() {
     let error = processes
         .write_stdin(&token, &spawned.handle, &vec![b'x'; 1024 * 1024], Some(50))
         .expect_err("full pipe timeout");
+    assert_stdin_workers_joined(&processes);
     let elapsed = started.elapsed();
     assert_eq!(error_code(&error), "deadline_elapsed");
     assert!(
@@ -2488,10 +2502,91 @@ fn process_spawn_close_after_initial_delivers_slow_reader_payload() {
             Some(&payload),
         )
         .expect("spawn");
+    assert_stdin_workers_joined(&processes);
     let snapshot = processes
         .wait(&token, &spawned.handle, Some(15_000))
         .expect("wait");
     assert!(!snapshot.running);
     assert_eq!(snapshot.exit_code, Some(0));
     assert_eq!(snapshot.stdout, payload.len().to_string());
+}
+
+#[test]
+fn process_write_cancel_during_full_pipe_joins_stdin_worker() {
+    let fixture = Fixture::new("proc-write-cancel-join");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdin_limit: 2 * 1024 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 2 * 1024 * 1024,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    processes.set_write_blocked_hook(Arc::new({
+        let cancel = Arc::clone(&fixture.cancel);
+        move || cancel.cancel()
+    }));
+    let error = processes
+        .write_stdin(
+            &token,
+            &spawned.handle,
+            &vec![b'x'; 1024 * 1024],
+            Some(2_000),
+        )
+        .expect_err("cancelled write");
+    assert_stdin_workers_joined(&processes);
+    assert_eq!(error_code(&error), "cancelled");
+    assert!(pid_alive(spawned.pid), "cancel must not kill the child");
+    processes.cancel_all();
+}
+
+#[test]
+fn process_write_close_race_joins_stdin_worker() {
+    let fixture = Fixture::new("proc-write-close-race");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdin_limit: 2 * 1024 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 2 * 1024 * 1024,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    processes.set_write_blocked_hook(Arc::new({
+        let processes = processes.clone();
+        let token = token.clone();
+        let handle = spawned.handle.clone();
+        move || {
+            let _ = processes.close_stdin(&token, &handle);
+        }
+    }));
+    let _ = processes.write_stdin(
+        &token,
+        &spawned.handle,
+        &vec![b'x'; 1024 * 1024],
+        Some(2_000),
+    );
+    assert_stdin_workers_joined(&processes);
+    processes.kill(&token, &spawned.handle).expect("kill");
 }
