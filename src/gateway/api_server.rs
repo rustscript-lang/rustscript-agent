@@ -640,7 +640,8 @@ async fn delete_session_handler(
     State(state): State<AgentGatewayState>,
     Path(session_id): Path<String>,
 ) -> Response {
-    store_mutation(state.clone(), move |store, persistence| {
+    let session_id_for_cleanup = session_id.clone();
+    let response = store_mutation(state.clone(), move |store, persistence| {
         let Some(session) = store.sessions.remove(&session_id) else {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -681,7 +682,18 @@ async fn delete_session_handler(
             json!({"object":"hermes.session.deleted", "id":session_id, "deleted":true}),
         )
     })
-    .await
+    .await;
+    if !state
+        .store
+        .read()
+        .sessions
+        .contains_key(&session_id_for_cleanup)
+    {
+        state
+            .service()
+            .cleanup_session_native_dispatch(&session_id_for_cleanup);
+    }
+    response
 }
 
 async fn session_messages_handler(

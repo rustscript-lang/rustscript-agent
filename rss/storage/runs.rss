@@ -219,8 +219,13 @@ pub fn storage_run_link_child(db_id: resource<sqlite.connection>, payload_json: 
 /// Sequence numbers are allocated transactionally as `max(seq) + 1` per run;
 /// the returned rows let the caller reconcile in-memory sequences.
 pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let raw_payload: map = json::decode(payload_json);
     let input: RunTerminalInput = json::decode::<RunTerminalInput>(payload_json);
     assert(storage_run_status_allowed(input.to_status.copy()));
+    let mut reserved_ordinal: int = 0;
+    if raw_payload.has("message_ordinal") {
+        reserved_ordinal = raw_payload["message_ordinal"].copy();
+    }
     let mut statements = [];
     if input.event_count.copy() >= 1 {
         statements[statements.length] = {
@@ -236,8 +241,8 @@ pub fn storage_run_terminal(db_id: resource<sqlite.connection>, payload_json: st
     }
     if input.message_id.copy() != "" {
         statements[statements.length] = {
-            sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, ?, ?, '{}', ?, ?, ? FROM messages WHERE session_id = ? AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running') AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-            params: [&input.message_id, &input.message_session_id, &input.message_role, &input.message_content_json, &input.message_run_id, &input.message_finish_reason, input.now_ms.copy(), &input.message_session_id, &input.run_id, &input.message_id, &input.message_session_id]
+            sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE(MAX(ordinal), 0) + 1 END, ?, ?, '{}', ?, ?, ? FROM messages WHERE session_id = ? AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND status = 'running') AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
+            params: [&input.message_id, &input.message_session_id, reserved_ordinal.copy(), reserved_ordinal.copy(), &input.message_role, &input.message_content_json, &input.message_run_id, &input.message_finish_reason, input.now_ms.copy(), &input.message_session_id, &input.run_id, &input.message_id, &input.message_session_id]
         };
         statements[statements.length] = {
             sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ?",

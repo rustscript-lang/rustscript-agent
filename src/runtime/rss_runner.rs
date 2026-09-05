@@ -19,7 +19,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
@@ -27,13 +27,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallReturn, CancellationReason, EpochHandle, HostAsyncBridge, HostFunctionRegistry, HostFuture,
-    HostFutureOutput, HttpConfig, HttpHostExt, InvocationError, InvocationItem, InvocationPoll,
-    SqliteHostExt, SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source, register_http_builtin_module, register_sqlite_builtin_module,
+    CallReturn, CancellationReason, CancellationToken, CompileSourceFileOptions, EpochHandle,
+    HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt,
+    InvocationError, InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy,
+    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason, compile_source_file_with_options,
+    compile_source_with_flavor_and_options, register_http_builtin_module_from_catalog,
+    register_sqlite_builtin_module_from_catalog,
 };
 
+use super::agent_host::{
+    AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog,
+    register_agent_host_functions,
+};
+use crate::domain::{json_to_vm_value, vm_value_to_json};
+
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
+
+fn compile_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Epoch ticks granted to one cancellable run. The cancellation watcher jumps
 /// the epoch past this deadline, so the interpreter's next epoch check
@@ -101,7 +116,7 @@ impl From<std::io::Error> for AgentError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
@@ -253,7 +268,34 @@ struct RunCancellationInner {
     epoch: Arc<Mutex<Option<EpochHandle>>>,
     watcher: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     stop: Arc<AtomicBool>,
+    /// Native/process token linked to this root. `request` and deadline fire cancel it.
+    token: CancellationToken,
+    /// Set when a timeout/deadline cannot be represented as `Instant`.
+    deadline_overflow: AtomicBool,
 }
+
+/// RAII guard that disarms the epoch watcher on every exit path, including panic.
+struct EpochWatcherGuard<'a> {
+    cancellation: &'a RunCancellation,
+}
+
+impl Drop for EpochWatcherGuard<'_> {
+    fn drop(&mut self) {
+        self.cancellation.disarm();
+    }
+}
+
+/// Injected runner fault used to prove watcher cleanup on error/panic paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunnerPrepareFault {
+    #[default]
+    None,
+    PanicAfterArm,
+    ErrorAfterArm,
+    PanicDuringDrive,
+}
+
+pub const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl RunCancellation {
     pub fn new() -> Self {
@@ -264,15 +306,61 @@ impl RunCancellation {
                 epoch: Arc::new(Mutex::new(None)),
                 watcher: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
+                token: CancellationToken::new(),
+                deadline_overflow: AtomicBool::new(false),
             }),
         }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
+        if timeout > MAX_RUN_TIMEOUT {
+            let cancellation = Self::new();
+            cancellation
+                .inner
+                .deadline_overflow
+                .store(true, Ordering::SeqCst);
+            return cancellation;
+        }
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => Self::with_deadline(deadline),
+            None => {
+                let cancellation = Self::new();
+                cancellation
+                    .inner
+                    .deadline_overflow
+                    .store(true, Ordering::SeqCst);
+                cancellation
+            }
+        }
+    }
+
+    pub fn with_deadline(deadline: Instant) -> Self {
         let cancellation = Self::new();
-        *cancellation.inner.deadline.lock().expect("deadline lock") =
-            Some(Instant::now() + timeout);
+        *cancellation.inner.deadline.lock().expect("deadline lock") = Some(deadline);
         cancellation
+    }
+
+    /// Rebuilds cancellation from a persisted wall-clock deadline. Expired
+    /// deadlines fail immediately and never grant a fresh full timeout.
+    /// Enormous remaining durations never panic; they mark overflow instead.
+    pub fn from_wall_deadline_ms(deadline_at_ms: u64, now_ms: u64) -> Self {
+        if now_ms >= deadline_at_ms {
+            let cancellation = Self::new();
+            cancellation.request(CancellationReason::Deadline);
+            cancellation
+        } else {
+            Self::with_timeout(Duration::from_millis(deadline_at_ms - now_ms))
+        }
+    }
+
+    /// True when a timeout or persisted deadline could not be converted to Instant.
+    pub fn has_deadline_overflow(&self) -> bool {
+        self.inner.deadline_overflow.load(Ordering::SeqCst)
+    }
+
+    /// True while an epoch watcher thread is armed.
+    pub fn watcher_is_armed(&self) -> bool {
+        self.inner.watcher.lock().expect("watcher lock").is_some()
     }
 
     pub fn request(&self, reason: CancellationReason) {
@@ -280,18 +368,49 @@ impl RunCancellation {
         if requested.is_none() {
             *requested = Some(reason);
         }
+        drop(requested);
+        self.inner.token.cancel();
     }
 
     pub fn requested(&self) -> Option<CancellationReason> {
         *self.inner.requested.lock().expect("requested lock")
     }
 
-    pub(crate) fn deadline_passed(&self) -> bool {
-        self.inner
-            .deadline
-            .lock()
-            .expect("deadline lock")
+    /// Native dispatcher parent token linked to this cancellation root.
+    pub fn token(&self) -> CancellationToken {
+        self.inner.token.clone()
+    }
+
+    pub fn deadline_passed(&self) -> bool {
+        self.deadline_instant()
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub fn deadline_instant(&self) -> Option<Instant> {
+        *self.inner.deadline.lock().expect("deadline lock")
+    }
+
+    pub fn remaining_deadline(&self) -> Option<Duration> {
+        self.deadline_instant()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Nested adapter runs share request/deadline/token flags but own their epoch
+    /// watcher so the parent run is not disarmed when the nested invocation ends.
+    pub(crate) fn child(&self) -> Self {
+        Self {
+            inner: Arc::new(RunCancellationInner {
+                requested: Arc::clone(&self.inner.requested),
+                deadline: Arc::clone(&self.inner.deadline),
+                epoch: Arc::new(Mutex::new(None)),
+                watcher: Arc::new(Mutex::new(None)),
+                stop: Arc::new(AtomicBool::new(false)),
+                token: self.inner.token.clone(),
+                deadline_overflow: AtomicBool::new(
+                    self.inner.deadline_overflow.load(Ordering::SeqCst),
+                ),
+            }),
+        }
     }
 
     /// Spawns the epoch watcher once the VM (and its epoch handle) exists.
@@ -307,20 +426,25 @@ impl RunCancellation {
             .expect("armed epoch");
         let requested = Arc::clone(&self.inner.requested);
         let deadline = Arc::clone(&self.inner.deadline);
-        let watcher = thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                let fire = requested.lock().expect("requested lock").is_some()
-                    || deadline
-                        .lock()
-                        .expect("deadline lock")
-                        .is_some_and(|deadline| Instant::now() >= deadline);
-                if fire {
-                    epoch.increment_by(RUN_EPOCH_DEADLINE_TICKS);
-                    return;
+        let token = self.inner.token.clone();
+        let watcher = thread::Builder::new()
+            .name("run-epoch-watcher".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let fire = requested.lock().expect("requested lock").is_some()
+                        || deadline
+                            .lock()
+                            .expect("deadline lock")
+                            .is_some_and(|deadline| Instant::now() >= deadline);
+                    if fire {
+                        token.cancel();
+                        epoch.increment_by(RUN_EPOCH_DEADLINE_TICKS);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
                 }
-                thread::sleep(Duration::from_millis(1));
-            }
-        });
+            })
+            .expect("spawn run-epoch-watcher");
         *self.inner.watcher.lock().expect("watcher lock") = Some(watcher);
     }
 
@@ -345,6 +469,8 @@ pub struct AgentRunner {
     program: rustscript_vm::Program,
     config: AgentConfig,
     registry: Arc<HostFunctionRegistry>,
+    host: AgentHostBridges,
+    prepare_fault: RunnerPrepareFault,
 }
 
 impl AgentRunner {
@@ -355,16 +481,15 @@ impl AgentRunner {
                 MAX_AGENT_SOURCE_BYTES
             )));
         }
-        let program = compile_source(source)
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
-        let registry = build_restricted_registry()
-            .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
-        Ok(Self {
-            program,
-            config,
-            registry: Arc::new(registry),
-        })
+        let _compile = compile_lock();
+        let program = compile_source_with_flavor_and_options(
+            source,
+            SourceFlavor::RustScript,
+            compile_options(),
+        )
+        .map_err(|error| AgentError::Compile(error.to_string()))?
+        .program;
+        Self::from_program(program, config)
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
@@ -376,16 +501,74 @@ impl AgentRunner {
                 MAX_AGENT_SOURCE_BYTES
             )));
         }
-        let program = rustscript_vm::compile_source_file(&path)
+        let _compile = compile_lock();
+        let program = compile_source_file_with_options(&path, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
+        Self::from_program(program, config)
+    }
+
+    fn from_program(program: rustscript_vm::Program, config: AgentConfig) -> Result<Self> {
         let registry = build_restricted_registry()
             .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
         Ok(Self {
             program,
             config,
             registry: Arc::new(registry),
+            host: AgentHostBridges::default(),
+            prepare_fault: RunnerPrepareFault::None,
         })
+    }
+
+    /// Effective HTTP/SQLite/fuel policy compiled into this runner.
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
+    /// Injects a prepare/drive fault for watcher RAII tests.
+    pub fn with_prepare_fault(mut self, fault: RunnerPrepareFault) -> Self {
+        self.prepare_fault = fault;
+        self
+    }
+
+    /// Installs a scripted or custom provider for the serial loop host bridge.
+    pub fn with_provider(mut self, provider: Arc<dyn AgentProviderHost>) -> Self {
+        self.host.provider = Some(provider);
+        self
+    }
+
+    /// Installs the Task 5 dispatcher used by `agent::tool_dispatch`.
+    pub fn with_dispatcher(mut self, dispatcher: Arc<crate::tools::DispatchContext>) -> Self {
+        self.host.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Replaces the full host-bridge bundle for one run.
+    pub fn with_host(mut self, host: AgentHostBridges) -> Self {
+        self.host = host;
+        self
+    }
+
+    /// Installs the sole run cancellation root onto the host bridges.
+    pub fn with_cancellation(mut self, cancellation: RunCancellation) -> Self {
+        self.host.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Records backoff delays without sleeping (loop tests).
+    pub fn with_skip_sleep(mut self, skip: bool) -> Self {
+        self.host.skip_sleep = skip;
+        self
+    }
+
+    /// Backoff delays requested by the RSS loop, in milliseconds.
+    pub fn recorded_sleeps(&self) -> Vec<i64> {
+        self.host.sleeps.lock().expect("sleep log lock").requested()
+    }
+
+    /// Number of backoff records dropped after the bounded sleep ring filled.
+    pub fn recorded_sleep_dropped(&self) -> u64 {
+        self.host.sleeps.lock().expect("sleep log lock").dropped()
     }
 
     /// Runs the exported `run(context)` entry with no event sink and no
@@ -404,7 +587,11 @@ impl AgentRunner {
         sink: &mut dyn RunEventSink,
         cancellation: &RunCancellation,
     ) -> std::result::Result<Value, RunError> {
+        let _watcher_guard = EpochWatcherGuard { cancellation };
         let (mut vm, callable) = self.prepare_vm(Some(cancellation))?;
+        if self.prepare_fault == RunnerPrepareFault::PanicDuringDrive {
+            panic!("injected drive panic");
+        }
         self.run_invocation(&mut vm, callable, context, Some(sink), Some(cancellation))
     }
 
@@ -420,12 +607,44 @@ impl AgentRunner {
         self.registry
             .bind_vm_cached(&mut vm)
             .map_err(RunError::Setup)?;
+        let provider: Arc<dyn AgentProviderHost> = self
+            .host
+            .provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(RssAdapterProvider));
+        vm.host_context().set_module_state(AgentHostState {
+            provider,
+            dispatcher: self.host.dispatcher.clone(),
+            cancellation: cancellation
+                .cloned()
+                .or_else(|| self.host.cancellation.clone())
+                .unwrap_or_default(),
+            sleeps: Arc::clone(&self.host.sleeps),
+            skip_sleep: self.host.skip_sleep,
+            metrics: self.host.metrics.clone(),
+            lifecycle: self.host.lifecycle.clone(),
+            capability_owner: self.host.capability_owner.clone(),
+            filesystem: self.host.filesystem.clone(),
+            processes: self.host.processes.clone(),
+            artifacts: self.host.artifacts.clone(),
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            control_hook: self.host.control_hook.clone(),
+        });
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
                 .map_err(RunError::Setup)?;
             vm.set_epoch_deadline(RUN_EPOCH_DEADLINE_TICKS)
                 .map_err(RunError::Setup)?;
             cancellation.arm(vm.epoch_handle());
+            match self.prepare_fault {
+                RunnerPrepareFault::PanicAfterArm => panic!("injected prepare panic"),
+                RunnerPrepareFault::ErrorAfterArm => {
+                    return Err(RunError::Setup(VmError::HostError(
+                        "injected prepare error".to_string(),
+                    )));
+                }
+                RunnerPrepareFault::None | RunnerPrepareFault::PanicDuringDrive => {}
+            }
         } else if let Some(fuel) = self.config.fuel {
             vm.set_fuel(fuel);
         }
@@ -513,6 +732,9 @@ impl AgentRunner {
         mut sink: Option<&mut dyn RunEventSink>,
         cancellation: Option<&RunCancellation>,
     ) -> std::result::Result<Value, RunError> {
+        if matches!(self.prepare_fault, RunnerPrepareFault::PanicDuringDrive) {
+            panic!("injected drive panic");
+        }
         let result = (|| {
             let mut invocation = vm
                 .start_invocation(callable, vec![context])
@@ -534,9 +756,6 @@ impl AgentRunner {
                 drop(guard);
                 match poll? {
                     InvocationPoll::Pending => {
-                        // The VM is paused on an outstanding host operation.
-                        // Polling drives the operation; the cancellation
-                        // checks above cancel it with the typed reason.
                         thread::sleep(Duration::from_millis(1));
                     }
                     InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) => {
@@ -567,20 +786,23 @@ impl AgentRunner {
 }
 
 /// Binds the restricted capability registry: JSON, bytes conversion, the
-/// invocation stream emit builtin, generic SQLite, and the HTTP client
-/// (buffered request plus the callable SSE stream, consumed by the
-/// `openai_chat` streaming adapter since core revision fd4b570; see
-/// plans/2026-08-14_a3-rustscript-core-unblock.md). Ambient runtime
-/// input/emit builtins are intentionally absent from agent execution.
+/// invocation stream emit builtin, generic SQLite, the HTTP client, and the
+/// bounded agent provider/tool host bridges. Ambient runtime input/emit
+/// builtins are intentionally absent from agent execution.
 fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmError> {
+    let catalog = agent_host_catalog();
     let mut registry = HostFunctionRegistry::restricted();
-    register_sqlite_builtin_module(&mut registry)?;
-    register_http_builtin_module(&mut registry)?;
+    register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    register_agent_host_functions(&mut registry, catalog.as_ref())?;
     for name in [
         "json::encode",
         "json::decode",
         "stream::emit",
         "bytes::to_utf8",
+        "bytes::to_utf8_lossy",
+        "bytes::to_array_u8",
+        "bytes::from_utf8",
         "sqlite::open",
         "sqlite::execute",
         "sqlite::query",
@@ -595,6 +817,147 @@ fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmEr
         registry.allow_builtin(name)?;
     }
     Ok(registry)
+}
+
+fn compile_options() -> CompileSourceFileOptions {
+    CompileSourceFileOptions::default().with_host_api_catalog(agent_host_catalog())
+}
+
+/// Default production provider: invoke the existing RSS adapter harness.
+pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
+    Arc::new(RssAdapterProvider)
+}
+
+struct RssAdapterProvider;
+
+impl AgentProviderHost for RssAdapterProvider {
+    fn call(
+        &self,
+        request: &serde_json::Value,
+        cancellation: &RunCancellation,
+    ) -> serde_json::Value {
+        invoke_existing_adapter(request, cancellation)
+    }
+}
+
+fn invoke_existing_adapter(
+    request: &serde_json::Value,
+    cancellation: &RunCancellation,
+) -> serde_json::Value {
+    let provider = request
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("openai");
+    let kind = adapter_kind(provider);
+    let mut config = AgentConfig::default();
+    if let Some(base_url) = request
+        .pointer("/provider_options/base_url")
+        .and_then(serde_json::Value::as_str)
+    {
+        match adapter_http_config(base_url) {
+            Ok(parsed) => config = parsed,
+            Err(error) => return error,
+        }
+    }
+    let harness_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss");
+    let runner = match AgentRunner::from_file(harness_path, config) {
+        Ok(runner) => runner,
+        Err(error) => {
+            return adapter_fail("adapter_unavailable", &error.to_string());
+        }
+    };
+    let mut forwarded = request.clone();
+    if let Some(object) = forwarded.as_object_mut() {
+        object.remove("provider");
+    }
+    let profile = serde_json::json!({
+        "provider": provider,
+        "base_url": request.pointer("/provider_options/base_url").cloned().unwrap_or(serde_json::Value::Null),
+        "api_key": request.pointer("/provider_options/api_key").cloned().unwrap_or(serde_json::Value::Null),
+        "model": request.get("model").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    let context = json_to_vm_value(&serde_json::json!({
+        "kind": kind,
+        "request": forwarded,
+        "profile": profile,
+    }));
+    let child = cancellation.child();
+    match runner.run_with_context_and_events(context, &mut DiscardSink, &child) {
+        Ok(value) => vm_value_to_json(&value),
+        Err(RunError::Invocation(InvocationError::Cancelled(reason))) => {
+            if matches!(reason, CancellationReason::Deadline) {
+                adapter_fail("deadline_elapsed", "run deadline elapsed")
+            } else {
+                adapter_fail("cancelled", "run was cancelled")
+            }
+        }
+        Err(RunError::Invocation(InvocationError::DeadlineReached { .. })) => {
+            adapter_fail("deadline_elapsed", "run deadline elapsed")
+        }
+        Err(error) => adapter_fail("adapter_failed", &error.to_string()),
+    }
+}
+
+fn adapter_http_config(base_url: &str) -> std::result::Result<AgentConfig, serde_json::Value> {
+    let url = url::Url::parse(base_url)
+        .map_err(|error| adapter_fail("config", &format!("invalid provider base_url: {error}")))?;
+    let Some(host) = url.host_str() else {
+        return Err(adapter_fail("config", "provider base_url has no host"));
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return Err(adapter_fail(
+            "config",
+            &format!(
+                "provider base_url scheme '{}' has no known default port",
+                url.scheme()
+            ),
+        ));
+    };
+    let mut config = AgentConfig::for_hosts([host]);
+    config.http.allowed_schemes = vec![url.scheme().to_string()];
+    config.http.allowed_ports = vec![port];
+    if host == "127.0.0.1" || host == "localhost" {
+        config.http.allow_private_ips = true;
+    }
+    Ok(config)
+}
+
+struct DiscardSink;
+
+impl RunEventSink for DiscardSink {
+    fn deliver(&mut self, _value: Value) -> std::result::Result<(), RunDeliveryError> {
+        Ok(())
+    }
+}
+
+fn adapter_kind(provider: &str) -> &'static str {
+    match provider {
+        "openai_responses" | "responses" => "openai_responses",
+        "anthropic" | "anthropic_messages" => "anthropic_messages",
+        "profile:openrouter" => "profile:openrouter",
+        "profile:deepseek" => "profile:deepseek",
+        "profile:opencode_zen" => "profile:opencode_zen",
+        "profile:opencode_go" => "profile:opencode_go",
+        "profile:custom" => "profile:custom",
+        _ => "openai_chat",
+    }
+}
+
+fn adapter_fail(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "response": {},
+        "error": {
+            "status": 0,
+            "type": "api_error",
+            "code": code,
+            "message": message,
+            "param": "",
+            "request_id": "",
+            "retryable": false
+        }
+    })
 }
 
 /// Drives futures submitted by async host builtins (for example the HTTP

@@ -184,7 +184,7 @@ impl StorageOp {
             "session.touch" => Self::SessionTouch,
             "session.delete" => Self::SessionDelete,
             "message.append" => Self::MessageAppend,
-            "event.append" => Self::EventAppend,
+            "event.append" | "step.commit" => Self::EventAppend,
             "run.terminal" => Self::RunTerminal,
             "run.transition" => Self::RunTransition,
             "run.get" => Self::RunGet,
@@ -202,7 +202,7 @@ impl StorageOp {
             "compaction.commit" => Self::CompactionCommit,
             "compaction.fail" => Self::CompactionFail,
             "migrate" => Self::Migrate,
-            "recovery.recover_active" => Self::RecoveryRecoverActive,
+            "recovery.recover_active" | "recovery.reconcile_effects" => Self::RecoveryRecoverActive,
             "load.all" => Self::LoadAll,
             "session.get" => Self::SessionGet,
             "delivery.get" => Self::DeliveryGet,
@@ -273,6 +273,11 @@ pub struct MetricsSnapshot {
     pub terminal_retries: [u64; TERMINAL_RETRY_OUTCOME_COUNT],
     pub terminal_persist_backoffs: u64,
     pub sse_subscribers: i64,
+    pub model_calls: u64,
+    pub tool_calls: u64,
+    pub tool_failures: u64,
+    pub turns: u64,
+    pub truncations: u64,
     pub run_duration: RunDurationSnapshot,
 }
 
@@ -323,6 +328,11 @@ pub struct Metrics {
     terminal_retries: [AtomicU64; TERMINAL_RETRY_OUTCOME_COUNT],
     terminal_persist_backoffs: AtomicU64,
     sse_subscribers: AtomicI64,
+    model_calls: AtomicU64,
+    tool_calls: AtomicU64,
+    tool_failures: AtomicU64,
+    turns: AtomicU64,
+    truncations: AtomicU64,
     run_duration: RunDurationHistogram,
 }
 
@@ -409,6 +419,100 @@ impl Metrics {
         self.sse_subscribers.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Records one coding-agent model call. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_model_call(&self) {
+        self.record_model_calls(1);
+    }
+
+    /// Records `count` coding-agent model calls. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_model_calls(&self, count: u64) {
+        saturating_add_counter(&self.model_calls, count);
+    }
+
+    /// Records one coding-agent tool call. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_tool_call(&self) {
+        self.record_tool_calls(1);
+    }
+
+    /// Records `count` coding-agent tool calls. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_tool_calls(&self, count: u64) {
+        saturating_add_counter(&self.tool_calls, count);
+    }
+
+    /// Records one coding-agent tool failure. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_tool_failure(&self) {
+        self.record_tool_failures(1);
+    }
+
+    /// Records `count` coding-agent tool failures. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_tool_failures(&self, count: u64) {
+        saturating_add_counter(&self.tool_failures, count);
+    }
+
+    /// Records one coding-agent turn. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_turn(&self) {
+        self.record_turns(1);
+    }
+
+    /// Records `count` coding-agent turns. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_turns(&self, count: u64) {
+        saturating_add_counter(&self.turns, count);
+    }
+
+    /// Records one coding-agent truncation. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_truncation(&self) {
+        self.record_truncations(1);
+    }
+
+    /// Records `count` coding-agent truncations. Saturates at `u64::MAX`.
+    #[inline]
+    pub fn record_truncations(&self, count: u64) {
+        saturating_add_counter(&self.truncations, count);
+    }
+
+    /// Accounts one actual `AgentProviderHost::call` attempt.
+    ///
+    /// Callers pass only deltas/booleans: never raw args, paths, prompts,
+    /// outputs, provider errors, or identifiers. `successful_turn` is true
+    /// only for a successfully normalized `ok: true` envelope. `truncated`
+    /// is true only when that envelope carries a typed `response.truncated`
+    /// flag.
+    #[inline]
+    pub fn account_model_attempt(&self, successful_turn: bool, truncated: bool) {
+        self.record_model_call();
+        if successful_turn {
+            self.record_turn();
+        }
+        if truncated {
+            self.record_truncation();
+        }
+    }
+
+    /// Accounts one freshly executed or failed tool dispatch.
+    ///
+    /// Replay of an already durable `ToolResult` must not call this.
+    /// `failed` maps to canonical `ToolResult.ok == false`. `truncated`
+    /// maps to the typed `ToolResult.truncated` flag.
+    #[inline]
+    pub fn account_tool_attempt(&self, failed: bool, truncated: bool) {
+        self.record_tool_call();
+        if failed {
+            self.record_tool_failure();
+        }
+        if truncated {
+            self.record_truncation();
+        }
+    }
+
     /// Records one run duration (seconds) into the fixed histogram buckets.
     pub fn record_run_duration(&self, seconds: f64) {
         let bucket = RUN_DURATION_BUCKETS_SECONDS
@@ -456,6 +560,11 @@ impl Metrics {
             terminal_retries: load_array(&self.terminal_retries),
             terminal_persist_backoffs: self.terminal_persist_backoffs.load(Ordering::Relaxed),
             sse_subscribers: self.sse_subscribers.load(Ordering::Relaxed),
+            model_calls: self.model_calls.load(Ordering::Relaxed),
+            tool_calls: self.tool_calls.load(Ordering::Relaxed),
+            tool_failures: self.tool_failures.load(Ordering::Relaxed),
+            turns: self.turns.load(Ordering::Relaxed),
+            truncations: self.truncations.load(Ordering::Relaxed),
             run_duration: RunDurationSnapshot {
                 buckets: load_array(&self.run_duration.buckets),
                 sum_micros: self.run_duration.sum_micros.load(Ordering::Relaxed),
@@ -551,6 +660,31 @@ impl Metrics {
             &[],
             snapshot.sse_subscribers,
         );
+        counter(
+            &mut samples,
+            "agent_model_calls_total",
+            &[],
+            snapshot.model_calls,
+        );
+        counter(
+            &mut samples,
+            "agent_tool_calls_total",
+            &[],
+            snapshot.tool_calls,
+        );
+        counter(
+            &mut samples,
+            "agent_tool_failures_total",
+            &[],
+            snapshot.tool_failures,
+        );
+        counter(&mut samples, "agent_turns_total", &[], snapshot.turns);
+        counter(
+            &mut samples,
+            "agent_truncations_total",
+            &[],
+            snapshot.truncations,
+        );
 
         // Histogram: cumulative buckets, then sum and count.
         let mut cumulative = 0_u64;
@@ -643,6 +777,25 @@ fn load_array<const N: usize>(values: &[AtomicU64; N]) -> [u64; N] {
     out
 }
 
+/// Adds `delta` to `target`, saturating at `u64::MAX` instead of wrapping.
+/// A CAS/update loop keeps concurrent increments lossless until saturation.
+fn saturating_add_counter(target: &AtomicU64, delta: u64) {
+    if delta == 0 {
+        return;
+    }
+    let mut current = target.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(delta);
+        if next == current {
+            return;
+        }
+        match target.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn counter(
     samples: &mut Vec<(String, String, String)>,
     name: &str,
@@ -719,6 +872,27 @@ const METRIC_DEFS: &[(&str, &str, &str)] = &[
         "counter",
     ),
     ("agent_sse_subscribers", "Live SSE subscribers.", "gauge"),
+    (
+        "agent_model_calls_total",
+        "Coding agent model calls.",
+        "counter",
+    ),
+    (
+        "agent_tool_calls_total",
+        "Coding agent tool calls.",
+        "counter",
+    ),
+    (
+        "agent_tool_failures_total",
+        "Coding agent tool call failures.",
+        "counter",
+    ),
+    ("agent_turns_total", "Coding agent turns.", "counter"),
+    (
+        "agent_truncations_total",
+        "Coding agent truncations.",
+        "counter",
+    ),
     (
         "agent_run_duration_seconds",
         "Run duration from admission to terminal, fixed buckets.",

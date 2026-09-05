@@ -2,17 +2,19 @@
 //!
 //! The worker sends script events through one bounded mpsc channel; the
 //! delivery task validates each `Event(Value)` against the canonical agent
-//! event schema, assigns the monotonic per-run sequence, appends it durably
-//! (typed `event.append` while the store write lock is held on a blocking
-//! thread), and only then publishes it to live subscribers. `blocking_send`
-//! pauses the worker (and therefore invocation polling) while the delivery
-//! task is busy, so core execution cannot outrun delivery. Nothing is
-//! published after the run commits a terminal state, and a failed append is
-//! rolled back so no unpersisted event is ever visible.
+//! event schema, assigns the monotonic per-run sequence, persists it
+//! durably without holding the GatewayStore lock across SQLite/worker IO,
+//! applies it to memory only after durable success, and only then broadcasts
+//! to live subscribers. `blocking_send` pauses the worker (and therefore
+//! invocation polling) while the delivery task is busy, so core execution
+//! cannot outrun delivery. Nothing is published after the run commits a
+//! terminal state. Persist failure leaves memory unchanged. Live subscribers
+//! observe at-least-once delivery of durable events; exactly-once is not
+//! guaranteed across an unacknowledged external receiver crash window.
 
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -32,6 +34,7 @@ pub(crate) struct DeliveryContext {
     pub(crate) persistence: Option<Arc<GatewayPersistence>>,
     pub(crate) config: Arc<AgentGatewayConfig>,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) commit_gate: Arc<ParkingMutex<()>>,
 }
 
 /// Bounded channel delivery sink: `blocking_send` pauses the worker (and
@@ -70,7 +73,7 @@ pub struct DeliveryOutcome {
 
 /// Outcome of one delivery critical section: the event was durably appended
 /// and may be published, the run ended (stop the stream), or the durable
-/// append failed (roll back in memory, report persist failure).
+/// append failed (memory is unchanged; no rollback).
 enum DeliverOutcome {
     Published(GatewayEvent, broadcast::Sender<GatewayEvent>),
     RunEnded,
@@ -82,8 +85,8 @@ enum DeliverOutcome {
 /// For every script event: validate against the agent event schema, assign
 /// the monotonic per-run sequence, append durably (persist) and only then
 /// publish to live subscribers. Nothing is published after the run commits a
-/// terminal state, and a failed append is rolled back so no unpersisted event
-/// is ever visible.
+/// terminal state. Persist failure leaves memory unchanged, so no unpersisted
+/// event is ever visible.
 pub(crate) async fn run_delivery_task(
     context: DeliveryContext,
     run_id: String,
@@ -110,13 +113,15 @@ pub(crate) async fn run_delivery_task(
             persistence: context.persistence.clone(),
             config: Arc::clone(&context.config),
             metrics: Arc::clone(&context.metrics),
+            commit_gate: Arc::clone(&context.commit_gate),
         };
         let run_id_for_block = run_id.clone();
         let event_type_for_block = event_type.clone();
         let data_for_block = data.clone();
         let delivered = tokio::task::spawn_blocking(move || {
-            let mut store = context_for_block.store.write();
-            let Some(run) = store.runs.get_mut(&run_id_for_block) else {
+            let _serial = context_for_block.commit_gate.lock();
+            let store = context_for_block.store.read();
+            let Some(run) = store.runs.get(&run_id_for_block) else {
                 return DeliverOutcome::RunEnded;
             };
             if matches!(
@@ -125,17 +130,14 @@ pub(crate) async fn run_delivery_task(
             ) {
                 return DeliverOutcome::RunEnded;
             }
-            let event = append_event_locked(
+            let event = event_candidate(
                 run,
                 &event_type_for_block,
                 data_for_block,
                 context_for_block.config.max_event_bytes,
-                context_for_block.config.max_events_per_run,
             );
-            // Durable before visible: the event row is committed through the
-            // typed `event.append` transaction while the write lock is held;
-            // on failure the in-memory append is rolled back so no
-            // unpersisted event is ever visible.
+            // Durable before visible: persist without holding the store lock
+            // across SQLite/worker IO. Memory is applied only after success.
             let durable = match context_for_block.persistence.as_ref() {
                 Some(persistence) => {
                     let payload = json!({
@@ -146,24 +148,32 @@ pub(crate) async fn run_delivery_task(
                             .unwrap_or_else(|_| "{}".to_string()),
                         "now_ms": timestamp(),
                         "max_events": context_for_block.config.max_events_per_run,
+                        "seq": event.seq,
                     });
+                    drop(store);
                     persistence.event_append(&payload).map(|_| ())
                 }
-                None => Ok(()),
+                None => {
+                    drop(store);
+                    Ok(())
+                }
             };
             match durable {
-                Ok(()) => DeliverOutcome::Published(
-                    event,
-                    run.sender
-                        .as_ref()
-                        .cloned()
-                        .expect("the delivery channel exists while the run is active"),
-                ),
-                Err(error) => {
-                    run.events
-                        .retain(|existing| existing.event_id != event.event_id);
-                    DeliverOutcome::PersistFailed(error.to_string())
+                Ok(()) => {
+                    let mut store = context_for_block.store.write();
+                    let Some(run) = store.runs.get_mut(&run_id_for_block) else {
+                        return DeliverOutcome::RunEnded;
+                    };
+                    apply_event_locked(run, &event, context_for_block.config.max_events_per_run);
+                    DeliverOutcome::Published(
+                        event,
+                        run.sender
+                            .as_ref()
+                            .cloned()
+                            .expect("the delivery channel exists while the run is active"),
+                    )
                 }
+                Err(error) => DeliverOutcome::PersistFailed(error.to_string()),
             }
         })
         .await
@@ -190,15 +200,13 @@ pub(crate) async fn run_delivery_task(
     outcome
 }
 
-/// Appends one event to the run's retained history and returns it with the
-/// live delivery sender. Sequence and timestamps are AgentService-owned;
-/// retention and byte bounds come from the validated configuration.
-pub(crate) fn append_event_locked(
-    run: &mut RunRecord,
+/// Builds one immutable event candidate with the next sequence. Does not
+/// mutate the run; callers persist first, then [`apply_event_locked`].
+pub(crate) fn event_candidate(
+    run: &RunRecord,
     event_type: &str,
     mut data: Value,
     max_event_bytes: usize,
-    max_events_per_run: usize,
 ) -> GatewayEvent {
     if serde_json::to_vec(&data)
         .map(|payload| payload.len() > max_event_bytes)
@@ -207,20 +215,34 @@ pub(crate) fn append_event_locked(
         data = json!({"truncated":true,"original_bytes":"over_limit"});
     }
     let seq = run.events.last().map(|event| event.seq + 1).unwrap_or(1);
-    let event = GatewayEvent {
+    GatewayEvent {
         event_id: Uuid::new_v4().to_string(),
         seq,
         event: event_type.to_string(),
         run_id: run.run_id.clone(),
         timestamp: timestamp(),
         data,
-    };
+    }
+}
+
+/// Idempotently applies a reserved event after durable success.
+pub(crate) fn apply_event_locked(
+    run: &mut RunRecord,
+    event: &GatewayEvent,
+    max_events_per_run: usize,
+) {
+    if run
+        .events
+        .iter()
+        .any(|existing| existing.event_id == event.event_id)
+    {
+        return;
+    }
     run.events.push(event.clone());
     if run.events.len() > max_events_per_run {
         let excess = run.events.len() - max_events_per_run;
         run.events.drain(0..excess);
     }
-    event
 }
 
 #[cfg(test)]

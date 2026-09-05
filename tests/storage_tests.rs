@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustscript_agent::{AgentConfig, AgentRunner};
+use rustscript_agent::{
+    AgentConfig, AgentRunner, LlmContentBlock, decode_message_blocks, encode_message_content,
+};
 use rustscript_vm::Value;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
@@ -1152,8 +1154,8 @@ fn duplicate_event_sequence_is_rejected_and_leaves_no_partial_state() {
         5,
     );
 
-    // Same event_id again: UNIQUE(event_id) violation aborts the transaction.
-    let duplicate = run_storage_result(
+    // Same event_id again: stable-id retry is a no-op (Task7 idempotency).
+    let duplicate = run_storage(
         &runner,
         db_name,
         "event-append-dup",
@@ -1161,12 +1163,13 @@ fn duplicate_event_sequence_is_rejected_and_leaves_no_partial_state() {
         event_payload("run-1", "event-1", "model.delta", 6, 128),
         6,
     );
-    assert!(
-        duplicate.is_err(),
-        "duplicate event_id must be rejected, got {duplicate:?}"
+    assert_eq!(
+        duplicate["ok"],
+        json!(true),
+        "duplicate event_id must be idempotent, got {duplicate:?}"
     );
 
-    // No partial state: exactly two events (transition + first append), and
+    // No extra state: exactly two events (transition + first append), and
     // the retention high-water did not advance.
     let replay = run_storage(
         &runner,
@@ -3165,4 +3168,1079 @@ fn delivery_set_is_monotonic_and_unvalidated() {
         "delivery.set must be monotonic: 7 then 5 must leave 42"
     );
     fs::remove_dir_all(root).expect("temporary root should be removed");
+}
+
+fn parse_content_json(row: &JsonMap<String, JsonValue>) -> JsonValue {
+    match &row["content_json"] {
+        JsonValue::String(raw) => serde_json::from_str(raw).unwrap_or_else(|_| json!(raw.clone())),
+        other => other.clone(),
+    }
+}
+
+fn seed_session_and_run(
+    runner: &AgentRunner,
+    db_name: &str,
+    session_id: &str,
+    run_id: &str,
+    now_ms: i64,
+) {
+    let mut session = session_payload(session_id, now_ms);
+    // Natural key is (profile, platform, account, chat, thread); unique chat
+    // per session id so Task7 recovery can seed two sessions in one database.
+    session["chat_id"] = json!(session_id);
+    let created = run_storage(
+        runner,
+        db_name,
+        &format!("session-{session_id}"),
+        "session.create",
+        session,
+        now_ms,
+    );
+    assert_eq!(
+        created["ok"],
+        json!(true),
+        "session.create {session_id}: {created}"
+    );
+    let run = run_storage(
+        runner,
+        db_name,
+        &format!("run-{run_id}"),
+        "run.create",
+        run_payload(run_id, session_id, now_ms + 1),
+        now_ms + 1,
+    );
+    assert_eq!(run["ok"], json!(true), "run.create {run_id}: {run}");
+    let transition = run_storage(
+        runner,
+        db_name,
+        &format!("run-running-{run_id}"),
+        "run.transition",
+        transition_payload(run_id, "queued", "running", now_ms + 2),
+        now_ms + 2,
+    );
+    assert_eq!(
+        transition["ok"],
+        json!(true),
+        "run.transition {run_id}: {transition}"
+    );
+}
+
+fn assistant_tool_call_content() -> String {
+    json!([{
+        "type": "tool_call",
+        "tool_call_id": "call-1",
+        "name": "read_file",
+        "arguments_json": "{\"path\":\"notes.txt\"}"
+    }])
+    .to_string()
+}
+
+fn user_tool_result_content(call_id: &str, body: &str, is_error: bool) -> String {
+    json!([{
+        "type": "tool_result",
+        "tool_call_id": call_id,
+        "name": "read_file",
+        "content": body,
+        "is_error": is_error,
+        "truncated": false
+    }])
+    .to_string()
+}
+
+/// Canonical assistant tool-call and user-role tool_result blocks round-trip
+/// losslessly, including usage/finish/parent metadata.
+#[test]
+fn durable_messages_roundtrip_tool_calls_results_and_usage() {
+    let root = temporary_root("durable-roundtrip");
+    let runner = storage_runner(&root);
+    let db_name = "durable.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+
+    let assistant = run_storage(
+        &runner,
+        db_name,
+        "append-assistant",
+        "message.append",
+        json!({
+            "id": "run-1:turn:0:assistant",
+            "session_id": "session-1",
+            "role": "assistant",
+            "content_json": assistant_tool_call_content(),
+            "name": "",
+            "tool_call_id": "",
+            "parent_message_id": "user-seed",
+            "token_estimate": 12,
+            "metadata_json": json!({
+                "usage": {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13},
+                "finish_reason": "tool_calls",
+                "provider": "test-provider",
+                "model": "test-model",
+                "ordinal": 0
+            }).to_string(),
+            "run_id": "run-1",
+            "finish_reason": "tool_calls",
+            "now_ms": 20,
+        }),
+        20,
+    );
+    assert_eq!(assistant["ok"], json!(true), "{assistant}");
+    let assistant_row = first_query_row(&assistant);
+    let assistant_content = parse_content_json(&assistant_row);
+    assert_eq!(assistant_content[0]["type"], json!("tool_call"));
+    assert_eq!(assistant_content[0]["tool_call_id"], json!("call-1"));
+    assert_eq!(assistant_content[0]["name"], json!("read_file"));
+    assert_eq!(
+        assistant_content[0]["arguments_json"],
+        json!("{\"path\":\"notes.txt\"}")
+    );
+    assert_eq!(assistant_row["parent_message_id"], json!("user-seed"));
+    assert_eq!(assistant_row["finish_reason"], json!("tool_calls"));
+    assert_eq!(assistant_row["run_id"], json!("run-1"));
+    let metadata: JsonValue = serde_json::from_str(
+        assistant_row["metadata_json"]
+            .as_str()
+            .expect("metadata_json text"),
+    )
+    .expect("metadata json");
+    assert_eq!(metadata["usage"]["total_tokens"], json!(13));
+    assert_eq!(metadata["provider"], json!("test-provider"));
+
+    let result = run_storage(
+        &runner,
+        db_name,
+        "append-result",
+        "message.append",
+        json!({
+            "id": "run-1:call:call-1:result",
+            "session_id": "session-1",
+            "role": "user",
+            "content_json": user_tool_result_content("call-1", "file body", false),
+            "name": "read_file",
+            "tool_call_id": "call-1",
+            "parent_message_id": "run-1:turn:0:assistant",
+            "token_estimate": 3,
+            "metadata_json": "{\"artifact_ids\":[]}",
+            "run_id": "run-1",
+            "finish_reason": "",
+            "now_ms": 21,
+        }),
+        21,
+    );
+    assert_eq!(result["ok"], json!(true), "{result}");
+    let result_row = first_query_row(&result);
+    let result_content = parse_content_json(&result_row);
+    assert_eq!(result_content[0]["type"], json!("tool_result"));
+    assert_eq!(result_content[0]["tool_call_id"], json!("call-1"));
+    assert_eq!(result_content[0]["content"], json!("file body"));
+    assert_eq!(result_content[0]["is_error"], json!(false));
+    assert_eq!(result_row["role"], json!("user"));
+    assert_eq!(
+        result_row["parent_message_id"],
+        json!("run-1:turn:0:assistant")
+    );
+
+    let listed = run_storage(
+        &runner,
+        db_name,
+        "list-1",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        22,
+    );
+    let rows = query_rows(&listed);
+    assert_eq!(rows.len(), 2, "assistant tool-call then user tool_result");
+    assert_eq!(rows[0]["id"], json!("run-1:turn:0:assistant"));
+    assert_eq!(rows[1]["id"], json!("run-1:call:call-1:result"));
+    assert_eq!(rows[0]["ordinal"], json!(1));
+    assert_eq!(rows[1]["ordinal"], json!(2));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Existing text-shaped content_json values migrate to the canonical block
+/// array on read without rewriting history as a different schema version.
+#[test]
+fn durable_messages_decode_legacy_text_shapes() {
+    let root = temporary_root("durable-legacy");
+    let runner = storage_runner(&root);
+    let db_name = "legacy.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    run_storage(
+        &runner,
+        db_name,
+        "session-1",
+        "session.create",
+        session_payload("session-1", 1),
+        1,
+    );
+
+    let object_shape = run_storage(
+        &runner,
+        db_name,
+        "append-object",
+        "message.append",
+        message_payload("msg-object", "session-1", 1, 2),
+        2,
+    );
+    assert_eq!(object_shape["ok"], json!(true));
+    let object_row = first_query_row(&object_shape);
+    let object_content = parse_content_json(&object_row);
+    assert_eq!(object_content[0]["type"], json!("text"));
+    assert_eq!(object_content[0]["text"], json!("hello"));
+
+    let raw_text = run_storage(
+        &runner,
+        db_name,
+        "append-raw",
+        "message.append",
+        json!({
+            "id": "msg-raw",
+            "session_id": "session-1",
+            "role": "user",
+            "content_json": "plain legacy text",
+            "name": "",
+            "tool_call_id": "",
+            "parent_message_id": "",
+            "token_estimate": 0,
+            "metadata_json": "{}",
+            "run_id": "",
+            "finish_reason": "",
+            "now_ms": 3,
+        }),
+        3,
+    );
+    assert_eq!(raw_text["ok"], json!(true), "{raw_text}");
+    let raw_row = first_query_row(&raw_text);
+    let raw_content = parse_content_json(&raw_row);
+    assert_eq!(raw_content[0]["type"], json!("text"));
+    assert_eq!(raw_content[0]["text"], json!("plain legacy text"));
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// UTF-8-safe truncation keeps the stored payload inside the schema bound
+/// and never splits a multi-byte character.
+#[test]
+fn durable_messages_truncate_utf8_safely() {
+    let oversized = "界".repeat(70_000);
+    let (truncated, cut) = rustscript_agent::truncate_utf8_chars(
+        &oversized,
+        rustscript_agent::domain::MAX_DURABLE_TEXT_CHARS,
+    );
+    assert!(cut, "70k CJK chars must exceed the durable field bound");
+    assert_eq!(
+        truncated.chars().count(),
+        rustscript_agent::domain::MAX_DURABLE_TEXT_CHARS
+    );
+    assert!(
+        truncated.ends_with('界'),
+        "truncation must land on a character boundary"
+    );
+    let encoded = rustscript_agent::encode_message_content(&[LlmContentBlock {
+        block_type: "text".to_string(),
+        text: Some(oversized),
+        ..LlmContentBlock::default()
+    }]);
+    assert_eq!(encoded[0]["truncated"], json!(true));
+    assert_eq!(
+        encoded[0]["text"].as_str().unwrap().chars().count(),
+        rustscript_agent::domain::MAX_DURABLE_TEXT_CHARS
+    );
+}
+
+/// Duplicate event_id retries append once; a second write is a no-op.
+#[test]
+fn event_append_is_idempotent_on_stable_event_id() {
+    let root = temporary_root("event-idempotent");
+    let runner = storage_runner(&root);
+    let db_name = "events.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 1);
+
+    let first = run_storage(
+        &runner,
+        db_name,
+        "event-1",
+        "event.append",
+        event_payload(
+            "run-1",
+            "run-1:turn:0:model.completed",
+            "model.completed",
+            10,
+            128,
+        ),
+        10,
+    );
+    assert_eq!(first["ok"], json!(true), "{first}");
+    let second = run_storage(
+        &runner,
+        db_name,
+        "event-1-retry",
+        "event.append",
+        event_payload(
+            "run-1",
+            "run-1:turn:0:model.completed",
+            "model.completed",
+            11,
+            128,
+        ),
+        11,
+    );
+    assert_eq!(
+        second["ok"],
+        json!(true),
+        "duplicate event_id must not fail: {second}"
+    );
+
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-1",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        12,
+    );
+    let rows = query_rows(&replay);
+    let completed = rows
+        .iter()
+        .filter(|row| row["event_id"] == json!("run-1:turn:0:model.completed"))
+        .count();
+    assert_eq!(completed, 1, "retries must append the stable event once");
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Provider/tool steps persist message+event in one transaction; a CHECK
+/// failure rolls both back.
+#[test]
+fn step_commit_is_atomic_and_rolls_back() {
+    let root = temporary_root("step-commit");
+    let runner = storage_runner(&root);
+    let db_name = "step.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 1);
+
+    let committed = run_storage(
+        &runner,
+        db_name,
+        "step-ok",
+        "step.commit",
+        json!({
+            "run_id": "run-1",
+            "session_id": "session-1",
+            "event_id": "run-1:turn:0:model.completed",
+            "event_type": "model.completed",
+            "payload_json": "{\"status\":\"completed\",\"turn\":0}",
+            "now_ms": 20,
+            "max_events": 128,
+            "message_id": "run-1:turn:0:assistant",
+            "role": "assistant",
+            "content_json": assistant_tool_call_content(),
+            "name": "",
+            "tool_call_id": "",
+            "parent_message_id": "",
+            "token_estimate": 4,
+            "metadata_json": "{\"ordinal\":0}",
+            "finish_reason": "tool_calls",
+        }),
+        20,
+    );
+    assert_eq!(committed["ok"], json!(true), "{committed}");
+
+    let listed = run_storage(
+        &runner,
+        db_name,
+        "list-ok",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        21,
+    );
+    assert_eq!(query_rows(&listed).len(), 1);
+
+    let oversized = format!("{{\"blob\":\"{}\"}}", "y".repeat(1024 * 1024));
+    let rolled = run_storage_result(
+        &runner,
+        db_name,
+        "step-fail",
+        "step.commit",
+        json!({
+            "run_id": "run-1",
+            "session_id": "session-1",
+            "event_id": "run-1:turn:1:model.completed",
+            "event_type": "model.completed",
+            "payload_json": oversized,
+            "now_ms": 22,
+            "max_events": 128,
+            "message_id": "run-1:turn:1:assistant",
+            "role": "assistant",
+            "content_json": "{\"text\":\"should-not-commit\"}",
+            "name": "",
+            "tool_call_id": "",
+            "parent_message_id": "",
+            "token_estimate": 0,
+            "metadata_json": "{}",
+            "finish_reason": "",
+        }),
+        22,
+    )
+    .expect("oversized step.commit should return a typed failure");
+    assert_eq!(rolled["ok"], json!(false), "{rolled}");
+    assert_eq!(rolled["code"], json!("payload_too_large"));
+
+    let listed_after = run_storage(
+        &runner,
+        db_name,
+        "list-after",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        23,
+    );
+    assert_eq!(
+        query_rows(&listed_after).len(),
+        1,
+        "failed step.commit must not leave the assistant message"
+    );
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-after",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        24,
+    );
+    let completed = query_rows(&replay)
+        .iter()
+        .filter(|row| row["event_id"] == json!("run-1:turn:1:model.completed"))
+        .count();
+    assert_eq!(completed, 0, "failed step.commit must not leave the event");
+
+    let retry = run_storage(
+        &runner,
+        db_name,
+        "step-ok-retry",
+        "step.commit",
+        json!({
+            "run_id": "run-1",
+            "session_id": "session-1",
+            "event_id": "run-1:turn:0:model.completed",
+            "event_type": "model.completed",
+            "payload_json": "{\"status\":\"completed\",\"turn\":0}",
+            "now_ms": 25,
+            "max_events": 128,
+            "message_id": "run-1:turn:0:assistant",
+            "role": "assistant",
+            "content_json": assistant_tool_call_content(),
+            "name": "",
+            "tool_call_id": "",
+            "parent_message_id": "",
+            "token_estimate": 4,
+            "metadata_json": "{\"ordinal\":0}",
+            "finish_reason": "tool_calls",
+        }),
+        25,
+    );
+    assert_eq!(
+        retry["ok"],
+        json!(true),
+        "duplicate step.commit is idempotent: {retry}"
+    );
+    assert_eq!(
+        query_rows(&run_storage(
+            &runner,
+            db_name,
+            "list-retry",
+            "message.list",
+            json!({"session_id": "session-1", "after_ordinal": 0}),
+            26,
+        ))
+        .len(),
+        1
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Completed effects survive restart without re-execution or interrupted
+/// failure. Started-but-unfinished effects become one interrupted_effect.
+#[test]
+fn restart_reconciles_incomplete_effects_and_replays_completed() {
+    let root = temporary_root("effect-recovery");
+    let runner = storage_runner(&root);
+    let db_name = "recovery.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-complete", 1);
+    seed_session_and_run(&runner, db_name, "session-2", "run-started", 10);
+
+    run_storage(
+        &runner,
+        db_name,
+        "started-complete",
+        "event.append",
+        json!({
+            "run_id": "run-complete",
+            "event_id": "run-complete:call:c-done:tool.started",
+            "event_type": "tool.started",
+            "payload_json": "{\"tool_call_id\":\"c-done\",\"status\":\"started\"}",
+            "now_ms": 20,
+            "max_events": 128,
+        }),
+        20,
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "output-complete",
+        "step.commit",
+        json!({
+            "run_id": "run-complete",
+            "session_id": "session-1",
+            "event_id": "run-complete:call:c-done:tool.completed",
+            "event_type": "tool.completed",
+            "payload_json": "{\"tool_call_id\":\"c-done\",\"status\":\"completed\"}",
+            "now_ms": 21,
+            "max_events": 128,
+            "message_id": "run-complete:call:c-done:result",
+            "role": "user",
+            "content_json": user_tool_result_content("c-done", "ok", false),
+            "name": "read_file",
+            "tool_call_id": "c-done",
+            "parent_message_id": "",
+            "token_estimate": 1,
+            "metadata_json": "{}",
+            "finish_reason": "",
+        }),
+        21,
+    );
+
+    let started_only = run_storage(
+        &runner,
+        db_name,
+        "started-only",
+        "event.append",
+        json!({
+            "run_id": "run-started",
+            "event_id": "run-started:call:c-open:tool.started",
+            "event_type": "tool.started",
+            "payload_json": "{\"tool_call_id\":\"c-open\",\"status\":\"started\"}",
+            "now_ms": 30,
+            "max_events": 128,
+        }),
+        30,
+    );
+    assert_eq!(
+        started_only["ok"],
+        json!(true),
+        "started-only append: {started_only}"
+    );
+    run_storage(
+        &runner,
+        db_name,
+        "requested-second",
+        "event.append",
+        json!({
+            "run_id": "run-started",
+            "event_id": "run-started:call:c-req:tool.requested",
+            "event_type": "tool.requested",
+            "payload_json": "{\"tool_call_id\":\"c-req\",\"status\":\"requested\"}",
+            "now_ms": 31,
+            "max_events": 128,
+        }),
+        31,
+    );
+
+    let before_result = run_storage(
+        &runner,
+        db_name,
+        "replay-before",
+        "event.replay",
+        json!({
+            "run_id": "run-started",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        32,
+    );
+    let before = query_rows(&before_result);
+    assert!(
+        before
+            .iter()
+            .any(|row| row["event_type"] == json!("tool.started")),
+        "incomplete effect must be durable before recovery, got {before:?}"
+    );
+
+    let recovery = run_storage(
+        &runner,
+        db_name,
+        "recovery-1",
+        "recovery.recover_active",
+        json!({
+            "reason": "gateway_restart",
+            "details_json": "{}",
+            "now_ms": 40,
+            "max_rows": 128,
+            "max_bytes": 65_536,
+            "max_events": 128,
+        }),
+        40,
+    );
+    assert_eq!(recovery["ok"], json!(true), "{recovery}");
+    let reconciled = run_storage(
+        &runner,
+        db_name,
+        "reconcile-1",
+        "recovery.reconcile_effects",
+        json!({
+            "now_ms": 41,
+            "max_rows": 128,
+        }),
+        41,
+    );
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+
+    let complete_replay = query_rows(&run_storage(
+        &runner,
+        db_name,
+        "replay-complete",
+        "event.replay",
+        json!({
+            "run_id": "run-complete",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        42,
+    ));
+    assert!(
+        complete_replay
+            .iter()
+            .any(|row| row["event_type"] == json!("tool.completed")),
+        "completed effect must remain replayable"
+    );
+    assert!(
+        complete_replay.iter().all(|row| {
+            row["event_type"] != json!("tool.failed")
+                || !row["payload_json"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("interrupted_effect")
+        }),
+        "completed effects must never be marked interrupted"
+    );
+
+    let started_replay = query_rows(&run_storage(
+        &runner,
+        db_name,
+        "replay-started",
+        "event.replay",
+        json!({
+            "run_id": "run-started",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        43,
+    ));
+    let interrupted: Vec<_> = started_replay
+        .iter()
+        .filter(|row| row["event_type"] == json!("tool.failed"))
+        .collect();
+    assert_eq!(
+        interrupted.len(),
+        2,
+        "each incomplete call becomes one interrupted failure, got {started_replay:?}"
+    );
+    for row in &interrupted {
+        let payload: JsonValue = match &row["payload_json"] {
+            JsonValue::String(raw) => serde_json::from_str(raw).expect("payload"),
+            other => other.clone(),
+        };
+        assert_eq!(payload["error_code"], json!("interrupted_effect"));
+        assert_eq!(payload["status"], json!("failed"));
+    }
+
+    let messages = query_rows(&run_storage(
+        &runner,
+        db_name,
+        "list-started",
+        "message.list",
+        json!({"session_id": "session-2", "after_ordinal": 0}),
+        44,
+    ));
+    assert_eq!(
+        messages.len(),
+        2,
+        "each interrupted effect gets one user-role tool_result"
+    );
+    assert_eq!(messages[0]["ordinal"], json!(1));
+    assert_eq!(messages[1]["ordinal"], json!(2));
+    for row in &messages {
+        assert_eq!(row["role"], json!("user"));
+        let content = parse_content_json(row);
+        assert_eq!(content[0]["type"], json!("tool_result"));
+        assert_eq!(content[0]["is_error"], json!(true));
+        assert_eq!(content[0]["error"]["code"], json!("interrupted_effect"));
+    }
+
+    let second = run_storage(
+        &runner,
+        db_name,
+        "reconcile-2",
+        "recovery.reconcile_effects",
+        json!({
+            "now_ms": 45,
+            "max_rows": 128,
+        }),
+        45,
+    );
+    assert_eq!(second["ok"], json!(true));
+    let started_again = query_rows(&run_storage(
+        &runner,
+        db_name,
+        "replay-started-2",
+        "event.replay",
+        json!({
+            "run_id": "run-started",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        46,
+    ));
+    assert_eq!(
+        started_again
+            .iter()
+            .filter(|row| row["event_type"] == json!("tool.failed"))
+            .count(),
+        2,
+        "reconciliation is idempotent"
+    );
+    assert_eq!(
+        query_rows(&run_storage(
+            &runner,
+            db_name,
+            "list-started-2",
+            "message.list",
+            json!({"session_id": "session-2", "after_ordinal": 0}),
+            47,
+        ))
+        .len(),
+        2
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+fn canonical_tool_result_content() -> String {
+    json!([{
+        "type": "tool_result",
+        "tool_call_id": "call-1",
+        "name": "read_file",
+        "content": "notes",
+        "is_error": true,
+        "result": "notes",
+        "error": {"code": "too_large", "message": "truncated output"},
+        "artifact": {"id": "art-1"},
+        "truncated": true
+    }])
+    .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_commit_payload(
+    run_id: &str,
+    session_id: &str,
+    event_id: &str,
+    message_id: &str,
+    role: &str,
+    content_json: String,
+    failpoint: &str,
+    now_ms: i64,
+) -> JsonValue {
+    let mut payload = json!({
+        "run_id": run_id,
+        "session_id": session_id,
+        "event_id": event_id,
+        "event_type": "model.completed",
+        "payload_json": "{\"status\":\"completed\",\"turn\":0}",
+        "now_ms": now_ms,
+        "max_events": 128,
+        "message_id": message_id,
+        "role": role,
+        "content_json": content_json,
+        "name": "read_file",
+        "tool_call_id": "call-1",
+        "parent_message_id": "parent-1",
+        "token_estimate": 4,
+        "metadata_json": "{\"provider\":\"test\",\"model\":\"m\",\"usage\":{\"total_tokens\":3}}",
+        "finish_reason": "tool_calls",
+    });
+    if !failpoint.is_empty() {
+        payload["failpoint"] = json!(failpoint);
+    }
+    payload
+}
+
+/// In-transaction failpoint after partial writes rolls back; reopen sees nothing.
+#[test]
+fn step_commit_failpoint_after_partial_write_rolls_back_on_reopen() {
+    let root = temporary_root("failpoint-partial");
+    let db_name = "failpoint.db";
+    {
+        let runner = storage_runner(&root);
+        run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+        seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+        let failed = run_storage_result(
+            &runner,
+            db_name,
+            "step-fail",
+            "step.commit",
+            step_commit_payload(
+                "run-1",
+                "session-1",
+                "run-1:turn:0:model.completed",
+                "run-1:turn:0:assistant",
+                "assistant",
+                assistant_tool_call_content(),
+                "after_partial_write",
+                20,
+            ),
+            20,
+        );
+        assert!(
+            failed.is_err()
+                || failed
+                    .as_ref()
+                    .is_ok_and(|value| value["ok"] == json!(false)),
+            "in-txn failpoint must fail: {failed:?}"
+        );
+    }
+    let runner = storage_runner(&root);
+    let listed = run_storage(
+        &runner,
+        db_name,
+        "list-reopen",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        21,
+    );
+    assert_eq!(
+        query_rows(&listed).len(),
+        0,
+        "rollback must leave no durable message after reopen: {listed}"
+    );
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-reopen",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        22,
+    );
+    assert!(
+        query_rows(&replay)
+            .iter()
+            .all(|row| row["event_id"] != json!("run-1:turn:0:model.completed")),
+        "rollback must leave no durable event after reopen: {replay}"
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Post-commit failpoint leaves durable rows; reopen is replayable once.
+#[test]
+fn step_commit_failpoint_after_commit_is_replayable_on_reopen() {
+    let root = temporary_root("failpoint-after-commit");
+    let db_name = "failpoint.db";
+    {
+        let runner = storage_runner(&root);
+        run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+        seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+        let crashed = run_storage_result(
+            &runner,
+            db_name,
+            "step-crash",
+            "step.commit",
+            step_commit_payload(
+                "run-1",
+                "session-1",
+                "run-1:turn:0:model.completed",
+                "run-1:turn:0:assistant",
+                "assistant",
+                assistant_tool_call_content(),
+                "after_commit_before_publish",
+                20,
+            ),
+            20,
+        )
+        .expect("typed failpoint after durable commit");
+        assert_eq!(crashed["ok"], json!(false), "{crashed}");
+        assert_eq!(
+            crashed["code"],
+            json!("failpoint_after_commit_before_publish")
+        );
+    }
+    let runner = storage_runner(&root);
+    let listed = run_storage(
+        &runner,
+        db_name,
+        "list-reopen",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        21,
+    );
+    let messages = query_rows(&listed);
+    assert_eq!(
+        messages.len(),
+        1,
+        "durable commit must survive crash: {listed}"
+    );
+    assert_eq!(messages[0]["ordinal"], json!(1));
+    let replayed = run_storage(
+        &runner,
+        db_name,
+        "step-replay",
+        "step.commit",
+        step_commit_payload(
+            "run-1",
+            "session-1",
+            "run-1:turn:0:model.completed",
+            "run-1:turn:0:assistant",
+            "assistant",
+            assistant_tool_call_content(),
+            "",
+            22,
+        ),
+        22,
+    );
+    assert_eq!(replayed["ok"], json!(true), "{replayed}");
+    let listed_again = run_storage(
+        &runner,
+        db_name,
+        "list-replay",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        23,
+    );
+    assert_eq!(query_rows(&listed_again).len(), 1);
+    let events = query_rows(&run_storage(
+        &runner,
+        db_name,
+        "replay-events",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        24,
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|row| row["event_id"] == json!("run-1:turn:0:model.completed"))
+            .count(),
+        1
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Canonical write shape is lossless; `artifacts`/`arguments` aliases are read-only.
+#[test]
+fn lossless_canonical_tool_payload_roundtrips_and_read_aliases() {
+    let encoded = encode_message_content(&[LlmContentBlock {
+        block_type: "tool_call".to_string(),
+        tool_call_id: Some("call-1".to_string()),
+        name: Some("read_file".to_string()),
+        arguments: Some(json!({"path": "notes.txt"})),
+        artifact: Some(json!([{"id": "art-1"}])),
+        truncated: Some(true),
+        ..LlmContentBlock::default()
+    }]);
+    let written = encoded[0].as_object().expect("canonical block");
+    assert_eq!(
+        written.get("arguments_json").and_then(JsonValue::as_str),
+        Some("{\"path\":\"notes.txt\"}")
+    );
+    assert!(
+        !written.contains_key("arguments"),
+        "canonical write must not emit arguments map: {written:?}"
+    );
+    assert_eq!(written.get("artifact"), Some(&json!({"id": "art-1"})));
+    assert!(
+        !written.contains_key("artifacts"),
+        "canonical write must not emit artifacts: {written:?}"
+    );
+    assert_eq!(written.get("truncated"), Some(&json!(true)));
+
+    let aliased = decode_message_blocks(&json!([{
+        "type": "tool_call",
+        "tool_call_id": "call-1",
+        "name": "read_file",
+        "arguments": {"path": "notes.txt"},
+        "artifacts": [{"id": "art-legacy"}],
+        "truncated": true
+    }]));
+    assert_eq!(
+        aliased[0].arguments_json.as_deref(),
+        Some("{\"path\":\"notes.txt\"}")
+    );
+    assert_eq!(aliased[0].arguments, None);
+    assert_eq!(aliased[0].artifact, Some(json!({"id": "art-legacy"})));
+
+    let root = temporary_root("lossless-canonical");
+    let runner = storage_runner(&root);
+    let db_name = "lossless.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+    let committed = run_storage(
+        &runner,
+        db_name,
+        "step-lossless",
+        "step.commit",
+        step_commit_payload(
+            "run-1",
+            "session-1",
+            "run-1:turn:0:model.completed",
+            "run-1:turn:0:user",
+            "user",
+            canonical_tool_result_content(),
+            "",
+            20,
+        ),
+        20,
+    );
+    assert_eq!(committed["ok"], json!(true), "{committed}");
+    let listed = run_storage(
+        &runner,
+        db_name,
+        "list-lossless",
+        "message.list",
+        json!({"session_id": "session-1", "after_ordinal": 0}),
+        21,
+    );
+    let content = parse_content_json(&query_rows(&listed)[0]);
+    assert_eq!(content[0]["type"], json!("tool_result"));
+    assert_eq!(content[0]["result"], json!("notes"));
+    assert_eq!(content[0]["error"]["code"], json!("too_large"));
+    assert_eq!(content[0]["artifact"], json!({"id": "art-1"}));
+    assert!(content[0].get("artifacts").is_none());
+    assert_eq!(content[0]["truncated"], json!(true));
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
