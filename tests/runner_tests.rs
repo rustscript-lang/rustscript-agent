@@ -630,6 +630,150 @@ fn from_file_rejects_symlink_without_host_path() {
 }
 
 #[test]
+fn from_file_does_not_use_root_helper_for_missing_nested_helper() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-root-helper-shadow-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        rss.join("helper.rss"),
+        "pub fn value() -> string { \"ROOT_HELPER\"; }\n",
+    )
+    .expect("write root helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use helper;\npub fn run(context: map) -> string { helper::value(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("missing nested helper should not block root compilation");
+    if let Ok(value) = runner.run_with_context(Value::map(vec![])) {
+        assert_ne!(
+            value,
+            Value::string("ROOT_HELPER"),
+            "the root helper source must not be compiled under the nested identity"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_binds_same_named_helpers_to_their_nested_identity() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-nested-helper-identity-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        rss.join("helper.rss"),
+        "pub fn value() -> string { \"ROOT_HELPER\"; }\n",
+    )
+    .expect("write root helper");
+    std::fs::write(
+        agent.join("helper.rss"),
+        "pub fn value() -> string { \"NESTED_HELPER\"; }\n",
+    )
+    .expect("write nested helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use helper;\npub fn run(context: map) -> string { helper::value(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default()).expect("compile nested");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run nested helper"),
+        Value::string("NESTED_HELPER")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_preserves_same_name_host_namespace_for_module_identity() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-host-namespace-identity-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    std::fs::create_dir_all(&rss).expect("create rss dir");
+    let path = rss.join("agent.rss");
+    std::fs::write(
+        &path,
+        "use agent;\npub fn run(context: map) -> string { \"HOST_NAMESPACE\"; }\n",
+    )
+    .expect("write agent module");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("use agent must remain a host namespace in agent.rss");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run host namespace module"),
+        Value::string("HOST_NAMESPACE")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn from_file_rejects_an_ancestor_symlink_before_reading_outside() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-ancestor-symlink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let outside = dir.join("outside");
+    let input = dir.join("input");
+    let outside_agent = outside.join("agent");
+    std::fs::create_dir_all(&outside_agent).expect("create outside agent dir");
+    std::fs::create_dir_all(&input).expect("create input dir");
+    let outside_entry = outside_agent.join("main.rss");
+    std::fs::write(
+        &outside_entry,
+        "pub fn run(context: map) -> string { \"OUTSIDE\"; }\n",
+    )
+    .expect("write outside entry");
+    std::os::unix::fs::symlink(&outside, input.join("link")).expect("ancestor symlink");
+    let entry = input.join("link").join("agent").join("main.rss");
+
+    let result = AgentRunner::from_file(&entry, AgentConfig::default());
+    let error = match result {
+        Ok(_) => panic!("an ancestor symlink must not expose outside source bytes"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "RustScript compile error: module tree contains a symlink"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn from_file_content_digest_invalidates_when_bytes_change() {
     let dir = std::env::temp_dir().join(format!(
         "rss-digest-{}-{}",
@@ -862,6 +1006,47 @@ fn from_file_preserves_parser_valid_grouped_alias_imports() {
         Value::string("grouped-alias")
     );
     assert_eq!(runner.snapshot_digest().len(), 64);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_supports_nested_self_super_grouped_and_alias_imports() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-nested-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        rss.join("shared.rss"),
+        "pub fn super_value() -> string { \"SUPER_SHARED\"; }\n",
+    )
+    .expect("write shared");
+    std::fs::write(
+        agent.join("helper.rss"),
+        "use super::shared as parent_shared;\npub fn value() -> string { parent_shared::super_value(); }\n",
+    )
+    .expect("write helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use self::helper::{value as answer};\npub fn run(input: map) -> string { answer(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("nested self/super grouped alias import must compile");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run nested self/super import"),
+        Value::string("SUPER_SHARED")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

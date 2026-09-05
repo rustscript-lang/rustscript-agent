@@ -8,11 +8,26 @@
 //! files.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_os = "linux")]
+use std::ffi::{CStr, CString, OsStr, OsString};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -34,7 +49,31 @@ const COMPILE_SANDBOX_PREFIX: &str = "rss-compile-sandbox-";
 const SANDBOX_TREE_DIR: &str = "tree";
 const SANDBOX_PAD_DIR: &str = "p";
 const SANDBOX_PAD_DEPTH: usize = MAX_TREE_DEPTH + 1;
+const ERR_SECURE_OPERATION_UNSUPPORTED: &str = "secure module tree operation unsupported";
+const ERR_MODULE_TREE_SYMLINK: &str = "module tree contains a symlink";
+const ERR_MODULE_TREE_WALK: &str = "module tree walk failed";
+const ERR_SANDBOX: &str = "module compile sandbox failed";
+const ERR_AMBIGUOUS_PATH: &str = "module tree contains an ambiguous path component";
+const ERR_AMBIGUOUS_IDENTITY: &str = "module tree contains ambiguous module identities";
+#[cfg(target_os = "linux")]
 static SANDBOX_SEQ: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static SANDBOX_CLEANUP_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+struct SandboxCleanup {
+    temp_root: File,
+    sandbox_dir: File,
+    sandbox_name: OsString,
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateSandbox {
+    path: PathBuf,
+    name: OsString,
+    temp_root: File,
+    dir: File,
+}
 
 struct SnapshotParserDialect;
 
@@ -123,11 +162,15 @@ impl ModuleSnapshot {
 }
 
 /// Private sandbox holding one materialized snapshot. Removes the directory
-/// in `Drop`.
+/// through the trusted temporary-root handle in `Drop`.
 pub struct MaterializedSnapshot {
     sandbox: PathBuf,
     allowed_root: PathBuf,
     entry: PathBuf,
+    #[cfg(target_os = "linux")]
+    allowed_root_dir: File,
+    #[cfg(target_os = "linux")]
+    cleanup: SandboxCleanup,
 }
 
 impl MaterializedSnapshot {
@@ -148,26 +191,24 @@ impl MaterializedSnapshot {
         let dest = self
             .allowed_root
             .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let mut keys = vec![
-            dest.to_string_lossy().replace('\\', "/"),
-            rel.replace('\\', "/"),
-        ];
-        if let Ok(canonical) = dest.canonicalize() {
-            keys.push(canonical.to_string_lossy().replace('\\', "/"));
-        }
-        keys
+        vec![dest.to_string_lossy().replace('\\', "/")]
     }
 }
 
 impl Drop for MaterializedSnapshot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.sandbox);
+        #[cfg(target_os = "linux")]
+        if cleanup_sandbox(&self.cleanup).is_err() {
+            SANDBOX_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
 #[cfg(test)]
 thread_local! {
     static AFTER_OPEN_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+    static AFTER_DIRECTORY_OPEN_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+    static AFTER_SANDBOX_DIR_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
 }
 
 /// Test-only hook invoked after a regular file is opened and before its bytes
@@ -177,23 +218,48 @@ pub fn set_after_open_hook(hook: Option<fn(&Path)>) {
     AFTER_OPEN_HOOK.with(|cell| cell.set(hook));
 }
 
+/// Test-only hook invoked after a directory is opened and before its children
+/// are enumerated, so an ancestor replacement race can be driven
+/// deterministically.
+#[cfg(test)]
+pub fn set_after_directory_open_hook(hook: Option<fn(&Path)>) {
+    AFTER_DIRECTORY_OPEN_HOOK.with(|cell| cell.set(hook));
+}
+
+/// Test-only hook invoked after the sandbox tree directory is prepared and
+/// before snapshot files are written.
+#[cfg(test)]
+pub fn set_after_sandbox_dir_hook(hook: Option<fn(&Path)>) {
+    AFTER_SANDBOX_DIR_HOOK.with(|cell| cell.set(hook));
+}
+
 pub fn module_tree_digest(entry: &Path) -> Result<String> {
     Ok(capture_module_snapshot(entry)?.digest)
 }
 
 pub fn capture_module_snapshot(entry: &Path) -> Result<ModuleSnapshot> {
     let root = module_tree_root(entry)?;
+    let entry_rel = relative_posix(&root, entry)?;
+    assert_safe_rel(&entry_rel)?;
     let mut files = Vec::new();
     let mut total_bytes = 0usize;
     let mut nodes = 1usize;
-    walk_dir(&root, &root, 0, &mut files, &mut total_bytes, &mut nodes)?;
+    let root_dir = open_module_root(&root)?;
+    walk_dir(
+        &root,
+        &root_dir,
+        &root,
+        0,
+        &mut files,
+        &mut total_bytes,
+        &mut nodes,
+    )?;
     files.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-    assert_imports_stay_in_root(&root, &files)?;
-    let entry_rel = relative_posix(&root, entry)?;
-    assert_safe_rel(&entry_rel)?;
-    for (rel, _) in &files {
-        assert_safe_rel(rel)?;
+    assert_unique_rel_identities(&files)?;
+    if !files.iter().any(|(rel, _)| rel == &entry_rel) {
+        return Err(tree_error(ERR_MODULE_TREE_WALK));
     }
+    assert_imports_stay_in_root(&root, &files)?;
     let mut material = Vec::new();
     for (rel, bytes) in &files {
         material.extend_from_slice(&(rel.len() as u64).to_le_bytes());
@@ -248,8 +314,10 @@ fn relative_posix(root: &Path, file: &Path) -> Result<String> {
     Ok(out)
 }
 
+#[cfg(target_os = "linux")]
 fn walk_dir(
     root: &Path,
+    dir: &File,
     path: &Path,
     depth: usize,
     files: &mut Vec<(String, Vec<u8>)>,
@@ -259,65 +327,80 @@ fn walk_dir(
     if depth > MAX_TREE_DEPTH {
         return Err(tree_error("module tree exceeds the depth bound"));
     }
-    reject_symlink(path)?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| tree_error("module tree walk failed"))?;
-    if metadata.is_dir() {
-        open_directory_nofollow(path)?;
-        let entries = fs::read_dir(path).map_err(|_| tree_error("module tree walk failed"))?;
-        let mut children = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|_| tree_error("module tree walk failed"))?;
-            *nodes = nodes
-                .checked_add(1)
-                .ok_or_else(|| tree_error("module tree exceeds the entry count bound"))?;
-            if *nodes > MAX_TREE_NODES {
-                return Err(tree_error("module tree exceeds the entry count bound"));
-            }
-            children.push(entry.path());
+    invoke_after_directory_open(path);
+    let mut children = read_dir_names(dir)?;
+    children.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    for name in children {
+        *nodes = nodes
+            .checked_add(1)
+            .ok_or_else(|| tree_error("module tree exceeds the entry count bound"))?;
+        if *nodes > MAX_TREE_NODES {
+            return Err(tree_error("module tree exceeds the entry count bound"));
         }
-        children.sort();
-        reject_symlink(path)?;
-        for child in children {
+        let child_path = path.join(&name);
+        let child = open_readonly_at(dir, &name).map_err(map_source_open_error)?;
+        let metadata = child
+            .metadata()
+            .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))?;
+        if metadata.is_dir() {
             walk_dir(
                 root,
                 &child,
+                &child_path,
                 depth.saturating_add(1),
                 files,
                 total_bytes,
                 nodes,
             )?;
+            continue;
         }
-        return Ok(());
+        if !metadata.is_file() {
+            return Err(tree_error(ERR_MODULE_TREE_WALK));
+        }
+        if child_path.extension().and_then(|ext| ext.to_str()) != Some("rss") {
+            continue;
+        }
+        if files.len() >= MAX_TREE_FILES {
+            return Err(tree_error("module tree exceeds the file count bound"));
+        }
+        let bytes = read_regular_file_capped(&child, dir, &name, &child_path)?;
+        let next_total = total_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| tree_error("module tree exceeds the byte bound"))?;
+        if next_total > MAX_TREE_BYTES {
+            return Err(tree_error("module tree exceeds the byte bound"));
+        }
+        *total_bytes = next_total;
+        files.push((relative_posix(root, &child_path)?, bytes));
     }
-    if !metadata.is_file() {
-        return Err(tree_error("module tree walk failed"));
-    }
-    if path.extension().and_then(|ext| ext.to_str()) != Some("rss") {
-        return Ok(());
-    }
-    if files.len() >= MAX_TREE_FILES {
-        return Err(tree_error("module tree exceeds the file count bound"));
-    }
-    let bytes = read_regular_file_capped(path)?;
-    let next_total = total_bytes
-        .checked_add(bytes.len())
-        .ok_or_else(|| tree_error("module tree exceeds the byte bound"))?;
-    if next_total > MAX_TREE_BYTES {
-        return Err(tree_error("module tree exceeds the byte bound"));
-    }
-    *total_bytes = next_total;
-    files.push((relative_posix(root, path)?, bytes));
     Ok(())
 }
 
-fn read_regular_file_capped(path: &Path) -> Result<Vec<u8>> {
-    reject_symlink(path)?;
-    let mut file = open_regular_nofollow(path)?;
+#[cfg(not(target_os = "linux"))]
+fn walk_dir(
+    _root: &Path,
+    _dir: &File,
+    _path: &Path,
+    _depth: usize,
+    _files: &mut Vec<(String, Vec<u8>)>,
+    _total_bytes: &mut usize,
+    _nodes: &mut usize,
+) -> Result<()> {
+    Err(tree_error(ERR_SECURE_OPERATION_UNSUPPORTED))
+}
+
+#[cfg(target_os = "linux")]
+fn read_regular_file_capped(
+    file: &File,
+    parent: &File,
+    name: &OsStr,
+    path: &Path,
+) -> Result<Vec<u8>> {
     let meta = file
         .metadata()
-        .map_err(|_| tree_error("module tree walk failed"))?;
+        .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))?;
     if !meta.is_file() {
-        return Err(tree_error("module tree walk failed"));
+        return Err(tree_error(ERR_MODULE_TREE_WALK));
     }
     let limit = meta.len();
     if limit > MAX_AGENT_SOURCE_BYTES as u64 {
@@ -327,142 +410,221 @@ fn read_regular_file_capped(path: &Path) -> Result<Vec<u8>> {
         )));
     }
     invoke_after_open(path);
-    let mut reader = Read::take(&mut file, limit.saturating_add(1));
+    let mut reader = Read::take(file, limit.saturating_add(1));
     let mut bytes = Vec::new();
     reader
         .read_to_end(&mut bytes)
-        .map_err(|_| tree_error("module tree walk failed"))?;
+        .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))?;
     if bytes.len() as u64 != limit {
         return Err(tree_error("module file size changed during snapshot"));
     }
     let after = file
         .metadata()
-        .map_err(|_| tree_error("module tree walk failed"))?;
-    if after.len() != limit || !after.is_file() {
+        .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))?;
+    if after.len() != limit
+        || !after.is_file()
+        || after.ino() != meta.ino()
+        || after.dev() != meta.dev()
+    {
         return Err(tree_error("module file size changed during snapshot"));
     }
-    reject_symlink(path)?;
+    let current = open_readonly_at(parent, name).map_err(map_source_open_error)?;
+    let current_meta = current
+        .metadata()
+        .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))?;
+    if !current_meta.is_file()
+        || current_meta.ino() != meta.ino()
+        || current_meta.dev() != meta.dev()
+        || current_meta.len() != limit
+    {
+        return Err(tree_error("module file size changed during snapshot"));
+    }
     if std::str::from_utf8(&bytes).is_err() {
         return Err(tree_error("module tree file is not valid UTF-8"));
     }
     Ok(bytes)
 }
 
-fn open_regular_nofollow(path: &Path) -> Result<File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(map_open_error)?;
-        let meta = file
-            .metadata()
-            .map_err(|_| tree_error("module tree walk failed"))?;
-        if !meta.is_file() {
-            return Err(tree_error("module tree walk failed"));
-        }
-        Ok(file)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .map_err(map_open_error)?;
-        let meta = file
-            .metadata()
-            .map_err(|_| tree_error("module tree walk failed"))?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(tree_error("module tree contains a symlink"));
-        }
-        if !meta.is_file() {
-            return Err(tree_error("module tree walk failed"));
-        }
-        Ok(file)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        reject_symlink(path)?;
-        let file = File::open(path).map_err(|_| tree_error("module tree walk failed"))?;
-        let meta = file
-            .metadata()
-            .map_err(|_| tree_error("module tree walk failed"))?;
-        if !meta.is_file() {
-            return Err(tree_error("module tree walk failed"));
-        }
-        reject_symlink(path)?;
-        Ok(file)
-    }
+#[cfg(target_os = "linux")]
+fn open_module_root(path: &Path) -> Result<File> {
+    let absolute = absolute_path(path)?;
+    open_directory_absolute(&absolute).map_err(map_source_open_error)
 }
 
-fn open_directory_nofollow(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let _file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(map_open_error)?;
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .map_err(map_open_error)?;
-        let meta = file
-            .metadata()
-            .map_err(|_| tree_error("module tree walk failed"))?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(tree_error("module tree contains a symlink"));
-        }
-        if !meta.is_dir() {
-            return Err(tree_error("module tree walk failed"));
-        }
-        Ok(())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        reject_symlink(path)?;
-        let meta = fs::metadata(path).map_err(|_| tree_error("module tree walk failed"))?;
-        if !meta.is_dir() {
-            return Err(tree_error("module tree walk failed"));
-        }
-        reject_symlink(path)?;
-        Ok(())
-    }
+#[cfg(not(target_os = "linux"))]
+fn open_module_root(_path: &Path) -> Result<File> {
+    Err(tree_error(ERR_SECURE_OPERATION_UNSUPPORTED))
 }
 
-fn map_open_error(error: io::Error) -> AgentError {
-    #[cfg(unix)]
-    {
-        if error.raw_os_error() == Some(libc::ELOOP) {
-            return tree_error("module tree contains a symlink");
-        }
+#[cfg(target_os = "linux")]
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
     }
-    let _ = error;
-    tree_error("module tree walk failed")
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))
 }
 
-fn reject_symlink(path: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(path).map_err(|_| tree_error("module tree walk failed"))?;
-    if meta.file_type().is_symlink() {
-        return Err(tree_error("module tree contains a symlink"));
+#[cfg(target_os = "linux")]
+fn open_directory_absolute(path: &Path) -> io::Result<File> {
+    let mut current = open_root_directory()?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                current = open_directory_at(&current, name)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "parent path"));
+            }
+        }
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn open_root_directory() -> io::Result<File> {
+    let path = b"/\0";
+    // SAFETY: the byte string is NUL terminated and the returned descriptor is
+    // owned by the File created below.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr().cast(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a newly acquired descriptor and is transferred exactly
+    // once to File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    let directory = open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn open_readonly_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_write_exclusive_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    open_at(
+        parent,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_at(parent: &File, name: &OsStr, flags: i32, mode: libc::mode_t) -> io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))?;
+    // SAFETY: name is NUL terminated, parent owns a live directory fd, and
+    // the descriptor is transferred to File only on success.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a newly acquired descriptor and is transferred exactly
+    // once to File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn create_directory_at(parent: &File, name: &OsStr) -> io::Result<()> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))?;
+    // SAFETY: name is NUL terminated and parent owns a live directory fd.
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_dir_names(dir: &File) -> Result<Vec<OsString>> {
+    let independent = open_at(
+        dir,
+        OsStr::new("."),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| tree_error(ERR_MODULE_TREE_WALK))?;
+    // SAFETY: dup creates a descriptor owned by the directory stream, leaving
+    // both the File's descriptor and the independent open description intact.
+    let duplicate = unsafe { libc::dup(independent.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(tree_error(ERR_MODULE_TREE_WALK));
+    }
+    // SAFETY: fdopendir takes ownership of duplicate on success.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not take ownership on failure.
+        unsafe { libc::close(duplicate) };
+        return Err(tree_error(ERR_MODULE_TREE_WALK));
+    }
+    let mut names = Vec::new();
+    let mut read_error = None;
+    loop {
+        // SAFETY: stream is a valid directory stream and errno is thread-local.
+        let entry = unsafe {
+            *libc::__errno_location() = 0;
+            libc::readdir(stream)
+        };
+        if entry.is_null() {
+            // SAFETY: errno is thread-local and the stream remains valid.
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != 0 {
+                read_error = Some(io::Error::from_raw_os_error(errno));
+            }
+            break;
+        }
+        // SAFETY: d_name is NUL terminated by readdir for a valid dirent.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+    }
+    // SAFETY: stream is closed exactly once here.
+    let close_error = unsafe { libc::closedir(stream) };
+    if read_error.is_some() || close_error != 0 {
+        return Err(tree_error(ERR_MODULE_TREE_WALK));
+    }
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn map_source_open_error(error: io::Error) -> AgentError {
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return tree_error(ERR_MODULE_TREE_SYMLINK);
+    }
+    if error.raw_os_error() == Some(libc::ENOSYS) {
+        return tree_error(ERR_SECURE_OPERATION_UNSUPPORTED);
+    }
+    tree_error(ERR_MODULE_TREE_WALK)
 }
 
 #[cfg(test)]
@@ -474,8 +636,32 @@ fn invoke_after_open(path: &Path) {
     });
 }
 
+#[cfg(test)]
+fn invoke_after_directory_open(path: &Path) {
+    AFTER_DIRECTORY_OPEN_HOOK.with(|cell| {
+        if let Some(hook) = cell.get() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn invoke_after_sandbox_dir(path: &Path) {
+    AFTER_SANDBOX_DIR_HOOK.with(|cell| {
+        if let Some(hook) = cell.get() {
+            hook(path);
+        }
+    });
+}
+
 #[cfg(not(test))]
 fn invoke_after_open(_path: &Path) {}
+
+#[cfg(not(test))]
+fn invoke_after_directory_open(_path: &Path) {}
+
+#[cfg(not(test))]
+fn invoke_after_sandbox_dir(_path: &Path) {}
 
 fn assert_imports_stay_in_root(_root: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
     for (rel, bytes) in files {
@@ -534,6 +720,9 @@ fn resolve_use_path(parent: &str, segments: &[UsePathSegment]) -> Result<Resolve
     let spec = use_segments_to_spec(segments)?;
     if spec.starts_with('/') || spec.starts_with('\\') {
         return Ok(ResolvedImport::Escape);
+    }
+    if spec.contains('\\') {
+        return Err(tree_error(ERR_AMBIGUOUS_PATH));
     }
     match join_rel(parent, &spec) {
         None => Ok(ResolvedImport::Escape),
@@ -613,13 +802,31 @@ fn tree_error(message: &'static str) -> AgentError {
     AgentError::Compile(message.to_string())
 }
 
-fn assert_safe_rel(rel: &str) -> Result<()> {
-    if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') || rel.contains('\0') {
-        return Err(tree_error("module tree walk failed"));
+fn assert_unique_rel_identities(files: &[(String, Vec<u8>)]) -> Result<()> {
+    let mut normalized = BTreeSet::new();
+    for (rel, _) in files {
+        assert_safe_rel(rel)?;
+        // This key is for collision detection only. It is never registered as
+        // a compiler override, so no lossy alias can affect module loading.
+        let key = rel.replace('\\', "/");
+        if !normalized.insert(key) {
+            return Err(tree_error(ERR_AMBIGUOUS_IDENTITY));
+        }
     }
-    for part in rel.split(['/', '\\']) {
+    Ok(())
+}
+
+fn assert_safe_rel(rel: &str) -> Result<()> {
+    if rel.is_empty() || rel.starts_with('/') || rel.contains('\0') {
+        return Err(tree_error(ERR_MODULE_TREE_WALK));
+    }
+    #[cfg(unix)]
+    if rel.contains('\\') {
+        return Err(tree_error(ERR_AMBIGUOUS_PATH));
+    }
+    for part in rel.split('/') {
         if part.is_empty() || part == "." || part == ".." {
-            return Err(tree_error("module tree walk failed"));
+            return Err(tree_error(ERR_MODULE_TREE_WALK));
         }
     }
     Ok(())
@@ -632,156 +839,166 @@ fn compile_temp_root() -> Result<PathBuf> {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn is_trusted_existing_dir(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink(),
-        Err(_) => false,
-    }
+    let Ok(absolute) = absolute_path(path) else {
+        return false;
+    };
+    open_directory_absolute(&absolute).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_trusted_existing_dir(_path: &Path) -> bool {
+    false
 }
 
 fn select_trusted_temp_root(test_tmpdir: Option<&Path>, fallback: &Path) -> Result<PathBuf> {
-    if let Some(dir) = test_tmpdir
-        && is_trusted_existing_dir(dir)
+    #[cfg(target_os = "linux")]
     {
-        return Ok(dir.to_path_buf());
+        if let Some(dir) = test_tmpdir
+            && is_trusted_existing_dir(dir)
+        {
+            return absolute_path(dir);
+        }
+        if is_trusted_existing_dir(fallback) {
+            return absolute_path(fallback);
+        }
+        Err(tree_error(ERR_SANDBOX))
     }
-    if is_trusted_existing_dir(fallback) {
-        return Ok(fallback.to_path_buf());
-    }
-    Err(tree_error("module compile sandbox failed"))
-}
-
-fn create_dir_0700(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(not(target_os = "linux"))]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir(path)
+        let _ = (test_tmpdir, fallback);
+        Err(tree_error(ERR_SECURE_OPERATION_UNSUPPORTED))
     }
 }
 
-fn create_exclusive_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|_| tree_error("module compile sandbox failed"))?;
-        file.write_all(bytes)
-            .map_err(|_| tree_error("module compile sandbox failed"))?;
-        Ok(())
+#[cfg(target_os = "linux")]
+fn map_sandbox_open_error(error: io::Error) -> AgentError {
+    if error.raw_os_error() == Some(libc::ENOSYS) {
+        return tree_error(ERR_SECURE_OPERATION_UNSUPPORTED);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .map_err(|_| tree_error("module compile sandbox failed"))?;
-        let meta = file
-            .metadata()
-            .map_err(|_| tree_error("module compile sandbox failed"))?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(tree_error("module compile sandbox failed"));
-        }
-        file.write_all(bytes)
-            .map_err(|_| tree_error("module compile sandbox failed"))?;
-        Ok(())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|_| tree_error("module compile sandbox failed"))?;
-        file.write_all(bytes)
-            .map_err(|_| tree_error("module compile sandbox failed"))?;
-        Ok(())
-    }
+    tree_error(ERR_SANDBOX)
 }
 
-fn ensure_dir_0700(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(tree_error("module compile sandbox failed"));
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create_dir_0700(path).map_err(|_| tree_error("module compile sandbox failed"))?;
-            match fs::symlink_metadata(path) {
-                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
-                _ => Err(tree_error("module compile sandbox failed")),
-            }
-        }
-        Err(_) => Err(tree_error("module compile sandbox failed")),
+#[cfg(target_os = "linux")]
+fn ensure_directory_at(parent: &File, name: &OsStr) -> Result<File> {
+    match create_directory_at(parent, name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(tree_error(ERR_SANDBOX)),
     }
+    let directory = open_directory_at(parent, name).map_err(map_sandbox_open_error)?;
+    let metadata = directory.metadata().map_err(|_| tree_error(ERR_SANDBOX))?;
+    if !metadata.is_dir() {
+        return Err(tree_error(ERR_SANDBOX));
+    }
+    Ok(directory)
 }
 
-fn ensure_parents_under_sandbox(path: &Path, sandbox: &Path) -> Result<()> {
-    let relative = path
-        .strip_prefix(sandbox)
-        .map_err(|_| tree_error("module compile sandbox failed"))?;
-    let mut current = sandbox.to_path_buf();
-    let Some(parent) = relative.parent() else {
-        return Ok(());
-    };
-    for component in parent.components() {
-        match component {
-            Component::Normal(_) => {
-                current.push(component);
-                ensure_dir_0700(&current)?;
-            }
-            _ => return Err(tree_error("module compile sandbox failed")),
+#[cfg(target_os = "linux")]
+fn open_relative_directory(root: &File, relative: &str) -> Result<File> {
+    let mut current = root.try_clone().map_err(|_| tree_error(ERR_SANDBOX))?;
+    if relative.is_empty() {
+        return Ok(current);
+    }
+    for component in relative.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(tree_error(ERR_SANDBOX));
         }
+        current =
+            open_directory_at(&current, OsStr::new(component)).map_err(map_sandbox_open_error)?;
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_parents_at(root: &File, relative_file: &str) -> Result<File> {
+    let parent = relative_file
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    let mut current = root.try_clone().map_err(|_| tree_error(ERR_SANDBOX))?;
+    if parent.is_empty() {
+        return Ok(current);
+    }
+    for component in parent.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(tree_error(ERR_SANDBOX));
+        }
+        current = ensure_directory_at(&current, OsStr::new(component))?;
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_parent_directory(root: &File, relative_file: &str, expected: &File) -> Result<()> {
+    let parent = relative_file
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    let current = open_relative_directory(root, parent)?;
+    let expected_meta = expected.metadata().map_err(|_| tree_error(ERR_SANDBOX))?;
+    let current_meta = current.metadata().map_err(|_| tree_error(ERR_SANDBOX))?;
+    if !current_meta.is_dir()
+        || current_meta.dev() != expected_meta.dev()
+        || current_meta.ino() != expected_meta.ino()
+    {
+        return Err(tree_error(ERR_SANDBOX));
     }
     Ok(())
 }
 
-fn create_private_sandbox() -> Result<PathBuf> {
+#[cfg(target_os = "linux")]
+fn open_relative_file(root: &File, relative_file: &str) -> Result<File> {
+    let (parent, name) = relative_file
+        .rsplit_once('/')
+        .unwrap_or(("", relative_file));
+    let directory = open_relative_directory(root, parent)?;
+    open_readonly_at(&directory, OsStr::new(name)).map_err(map_sandbox_open_error)
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_sandbox() -> Result<PrivateSandbox> {
     let root = compile_temp_root()?;
+    let temp_root = open_directory_absolute(&root).map_err(map_sandbox_open_error)?;
     for _ in 0..64 {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        let name = format!(
+        let name = OsString::from(format!(
             "{}{}-{}-{}",
             COMPILE_SANDBOX_PREFIX,
             std::process::id(),
             SANDBOX_SEQ.fetch_add(1, Ordering::Relaxed),
             nanos
-        );
-        let path = root.join(name);
-        match create_dir_0700(&path) {
+        ));
+        match create_directory_at(&temp_root, &name) {
             Ok(()) => {
-                if fs::symlink_metadata(&path)
-                    .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
-                    .unwrap_or(false)
-                {
-                    return Ok(path);
-                }
-                let _ = fs::remove_dir_all(&path);
-                return Err(tree_error("module compile sandbox failed"));
+                let dir = match open_directory_at(&temp_root, &name) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        let _ = unlink_at(&temp_root, &name, libc::AT_REMOVEDIR);
+                        return Err(map_sandbox_open_error(error));
+                    }
+                };
+                return Ok(PrivateSandbox {
+                    path: root.join(&name),
+                    name,
+                    temp_root,
+                    dir,
+                });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(tree_error("module compile sandbox failed")),
+            Err(_) => return Err(tree_error(ERR_SANDBOX)),
         }
     }
-    Err(tree_error("module compile sandbox failed"))
+    Err(tree_error(ERR_SANDBOX))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_private_sandbox() -> Result<()> {
+    Err(tree_error(ERR_SECURE_OPERATION_UNSUPPORTED))
 }
 
 fn padded_allowed_root(sandbox: &Path) -> PathBuf {
@@ -793,17 +1010,57 @@ fn padded_allowed_root(sandbox: &Path) -> PathBuf {
     allowed
 }
 
+#[cfg(target_os = "linux")]
+fn setup_sandbox_dirs(sandbox: &File) -> Result<File> {
+    let mut current = sandbox.try_clone().map_err(|_| tree_error(ERR_SANDBOX))?;
+    for _ in 0..SANDBOX_PAD_DEPTH {
+        current = ensure_directory_at(&current, OsStr::new(SANDBOX_PAD_DIR))?;
+    }
+    ensure_directory_at(&current, OsStr::new(SANDBOX_TREE_DIR))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_with_counter(cleanup: &SandboxCleanup) {
+    if cleanup_sandbox(cleanup).is_err() {
+        SANDBOX_CLEANUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn materialize_snapshot(snapshot: &ModuleSnapshot) -> Result<MaterializedSnapshot> {
-    let sandbox = create_private_sandbox()?;
+    let private = create_private_sandbox()?;
+    let cleanup = SandboxCleanup {
+        temp_root: private.temp_root,
+        sandbox_dir: private.dir,
+        sandbox_name: private.name,
+    };
+    let sandbox_dir = match cleanup.sandbox_dir.try_clone() {
+        Ok(dir) => dir,
+        Err(_) => {
+            cleanup_with_counter(&cleanup);
+            return Err(tree_error(ERR_SANDBOX));
+        }
+    };
+    let allowed_root_dir = match setup_sandbox_dirs(&sandbox_dir) {
+        Ok(dir) => dir,
+        Err(error) => {
+            cleanup_with_counter(&cleanup);
+            return Err(error);
+        }
+    };
+    let sandbox = private.path;
     let allowed_root = padded_allowed_root(&sandbox);
+    let entry = allowed_root.join(
+        snapshot
+            .entry_rel
+            .replace('/', std::path::MAIN_SEPARATOR_STR),
+    );
     let materialized = MaterializedSnapshot {
-        sandbox: sandbox.clone(),
-        allowed_root: allowed_root.clone(),
-        entry: allowed_root.join(
-            snapshot
-                .entry_rel
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        ),
+        sandbox,
+        allowed_root,
+        entry,
+        allowed_root_dir,
+        cleanup,
     };
     if let Err(error) = write_snapshot_into(&materialized, snapshot) {
         drop(materialized);
@@ -812,34 +1069,89 @@ fn materialize_snapshot(snapshot: &ModuleSnapshot) -> Result<MaterializedSnapsho
     Ok(materialized)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn materialize_snapshot(_snapshot: &ModuleSnapshot) -> Result<MaterializedSnapshot> {
+    Err(tree_error(ERR_SECURE_OPERATION_UNSUPPORTED))
+}
+
+#[cfg(target_os = "linux")]
 fn write_snapshot_into(
     materialized: &MaterializedSnapshot,
     snapshot: &ModuleSnapshot,
 ) -> Result<()> {
-    let mut pad = materialized.sandbox.clone();
-    for _ in 0..SANDBOX_PAD_DEPTH {
-        pad.push(SANDBOX_PAD_DIR);
-        ensure_dir_0700(&pad)?;
-    }
-    ensure_dir_0700(&materialized.allowed_root)?;
     for (rel, bytes) in &snapshot.files {
         assert_safe_rel(rel)?;
-        let dest = materialized
-            .allowed_root
-            .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if !dest.starts_with(&materialized.allowed_root) {
-            return Err(tree_error("module compile sandbox failed"));
+        let parent = ensure_parents_at(&materialized.allowed_root_dir, rel)?;
+        invoke_after_sandbox_dir(&materialized.allowed_root);
+        verify_parent_directory(&materialized.allowed_root_dir, rel, &parent)?;
+        let name = rel.rsplit_once('/').map(|(_, name)| name).unwrap_or(rel);
+        let mut file = open_write_exclusive_at(&parent, OsStr::new(name))
+            .map_err(|_| tree_error(ERR_SANDBOX))?;
+        file.write_all(bytes).map_err(|_| tree_error(ERR_SANDBOX))?;
+        let metadata = file.metadata().map_err(|_| tree_error(ERR_SANDBOX))?;
+        if !metadata.is_file() || metadata.len() != bytes.len() as u64 {
+            return Err(tree_error(ERR_SANDBOX));
         }
-        ensure_parents_under_sandbox(&dest, &materialized.sandbox)?;
-        create_exclusive_file(&dest, bytes)?;
+        verify_parent_directory(&materialized.allowed_root_dir, rel, &parent)?;
     }
-    if !materialized.entry.starts_with(&materialized.allowed_root) {
-        return Err(tree_error("module compile sandbox failed"));
-    }
-    if !materialized.entry.is_file() {
-        return Err(tree_error("module compile sandbox failed"));
+    let entry = open_relative_file(&materialized.allowed_root_dir, &snapshot.entry_rel)?;
+    let metadata = entry.metadata().map_err(|_| tree_error(ERR_SANDBOX))?;
+    if !metadata.is_file() {
+        return Err(tree_error(ERR_SANDBOX));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_at(parent: &File, name: &OsStr, flags: i32) -> io::Result<()> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))?;
+    // SAFETY: name is NUL terminated and parent owns a live directory fd.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_directory_contents(dir: &File) -> io::Result<()> {
+    let names = read_dir_names(dir)
+        .map_err(|_| io::Error::other("sandbox directory enumeration failed"))?;
+    for name in names {
+        match open_directory_at(dir, &name) {
+            Ok(child) => {
+                cleanup_directory_contents(&child)?;
+                match unlink_at(dir, &name, libc::AT_REMOVEDIR) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                        ) =>
+                    {
+                        unlink_at(dir, &name, 0)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                unlink_at(dir, &name, 0)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_sandbox(cleanup: &SandboxCleanup) -> io::Result<()> {
+    cleanup_directory_contents(&cleanup.sandbox_dir)?;
+    unlink_at(
+        &cleanup.temp_root,
+        &cleanup.sandbox_name,
+        libc::AT_REMOVEDIR,
+    )
 }
 
 #[cfg(test)]
@@ -1010,6 +1322,141 @@ mod tests {
             "RustScript compile error: module tree contains a symlink"
         );
         assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_literal_backslash_path_identity_collision() {
+        let root = test_root("backslash-collision");
+        let rss = root.join("rss");
+        fs::create_dir_all(rss.join("a")).expect("a dir");
+        let slash_path = rss.join("a").join("b.rss");
+        let backslash_path = rss.join("a\\b.rss");
+        fs::write(
+            &slash_path,
+            "pub fn run(input: map) -> string { \"SLASH\"; }\n",
+        )
+        .expect("slash module");
+        fs::write(
+            &backslash_path,
+            "pub fn value() -> string { \"BACKSLASH\"; }\n",
+        )
+        .expect("literal backslash module");
+
+        let error = capture_module_snapshot(&slash_path)
+            .expect_err("native path identities that normalize to one import key must fail");
+        assert!(
+            error.to_string().contains("ambiguous"),
+            "ambiguous native identity must fail with a bounded diagnostic: {error}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_directory_handle_survives_ancestor_replacement() {
+        static SWAPPED: AtomicBool = AtomicBool::new(false);
+        let root = test_root("ancestor-replacement");
+        let input = root.join("input");
+        let outside = root.join("outside");
+        let inside_agent = input.join("link").join("agent");
+        let outside_agent = outside.join("agent");
+        fs::create_dir_all(&inside_agent).expect("inside agent");
+        fs::create_dir_all(&outside_agent).expect("outside agent");
+        let entry = inside_agent.join("main.rss");
+        fs::write(&entry, "pub fn run(input: map) -> string { \"INSIDE\"; }\n")
+            .expect("inside source");
+        fs::write(
+            outside_agent.join("main.rss"),
+            "pub fn run(input: map) -> string { \"OUTSIDE\"; }\n",
+        )
+        .expect("outside source");
+        SWAPPED.store(false, Ordering::SeqCst);
+        set_after_directory_open_hook(Some(|path| {
+            if SWAPPED.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let link = path.parent().expect("link");
+            let input = link.parent().expect("input");
+            let root = input.parent().expect("root");
+            fs::rename(link, root.join("link-original")).expect("rename original link");
+            std::os::unix::fs::symlink(root.join("outside"), link).expect("replace link");
+        }));
+        let snapshot = capture_module_snapshot(&entry);
+        set_after_directory_open_hook(None);
+        let snapshot = snapshot.expect("opened directory handle must remain inside");
+        assert_eq!(
+            snapshot.files()[0].1,
+            b"pub fn run(input: map) -> string { \"INSIDE\"; }\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rejects_sandbox_ancestor_replacement_without_outside_write() {
+        static SWAPPED: AtomicBool = AtomicBool::new(false);
+        static OUTSIDE: OnceLock<std::sync::Mutex<Option<PathBuf>>> = OnceLock::new();
+        let root = test_root("sandbox-replacement");
+        let path = root.join("rss").join("agent").join("main.rss");
+        fs::create_dir_all(path.parent().expect("source parent")).expect("source parent");
+        fs::write(&path, "pub fn run(input: map) -> string { \"ok\"; }\n").expect("source");
+        let snapshot = capture_module_snapshot(&path).expect("snapshot");
+        SWAPPED.store(false, Ordering::SeqCst);
+        *OUTSIDE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("outside lock") = None;
+        set_after_sandbox_dir_hook(Some(|allowed_root| {
+            if SWAPPED.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let parent = allowed_root.join("agent");
+            let parent_dir = parent.parent().expect("allowed parent");
+            let original = parent_dir.join("agent-original");
+            let outside = parent_dir.join("agent-outside");
+            fs::rename(&parent, &original).expect("rename parent");
+            fs::create_dir(&outside).expect("outside tree");
+            std::os::unix::fs::symlink(&outside, &parent).expect("replace parent");
+            *OUTSIDE
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .expect("outside lock") = Some(outside);
+        }));
+        let result = snapshot.materialize();
+        set_after_sandbox_dir_hook(None);
+        let (succeeded, error) = match result {
+            Ok(materialized) => {
+                drop(materialized);
+                (true, None)
+            }
+            Err(error) => (false, Some(error.to_string())),
+        };
+        let outside = OUTSIDE
+            .get()
+            .and_then(|slot| slot.lock().expect("outside lock").clone())
+            .expect("race target");
+        let allowed_root = outside.parent().expect("allowed root").to_path_buf();
+        let replaced_parent = allowed_root.join("agent");
+        let original_parent = allowed_root.join("agent-original");
+        let mut sandbox = allowed_root.clone();
+        for _ in 0..(SANDBOX_PAD_DEPTH + 1) {
+            sandbox.pop();
+        }
+        assert!(!succeeded, "sandbox path replacement must fail closed");
+        assert_eq!(
+            error.as_deref(),
+            Some("RustScript compile error: module compile sandbox failed")
+        );
+        assert!(
+            !outside.join("main.rss").exists(),
+            "sandbox replacement must never write outside the allowed tree"
+        );
+        let _ = fs::remove_file(&replaced_parent);
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&original_parent);
+        let _ = fs::remove_dir_all(&sandbox);
         let _ = fs::remove_dir_all(&root);
     }
 

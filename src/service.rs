@@ -799,7 +799,7 @@ impl AgentService {
         self.inner
             .runner
             .lock()
-            .expect("runner cache lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|cached| cached.config.clone())
     }
