@@ -28,6 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "f9ca4143f8ba2f486e270347504c49f5ea846097", default-features = false, features = ["runtime", "http-client", "sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 # Meta-schema validation only; resolver features stay disabled.
 jsonschema = { version = "0.52.1", default-features = false }
 libc = "0.2.189"

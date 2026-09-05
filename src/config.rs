@@ -14,6 +14,8 @@ use rustscript_vm::{
 };
 use serde_json::{Map, Value, json};
 
+pub use crate::config_file::{AgentPaths, ConfigPaths};
+
 /// Hard upper bounds for the coding file-tool budgets.
 ///
 /// These ceilings prevent configuration from turning a bounded tool into an
