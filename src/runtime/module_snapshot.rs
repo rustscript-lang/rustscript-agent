@@ -1191,7 +1191,7 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use std::process::{Child, Command, ExitStatus, Stdio};
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
