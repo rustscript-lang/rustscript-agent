@@ -1189,7 +1189,12 @@ fn cleanup_sandbox(cleanup: &SandboxCleanup) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
 
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::var_os("TEST_TMPDIR")
@@ -1303,7 +1308,237 @@ mod tests {
             }
             _ => panic!("unknown FIFO test case: {case}"),
         }
-        let _ = fs::remove_dir_all(root);
+        fs::remove_dir_all(root).expect("FIFO child root cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    const FIFO_COMPLETION_PATH_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_COMPLETION_PATH";
+    #[cfg(target_os = "linux")]
+    const FIFO_COMPLETION_TOKEN_ENV: &str = "RUSTSCRIPT_AGENT_FIFO_COMPLETION_TOKEN";
+
+    #[cfg(target_os = "linux")]
+    fn fifo_completion_token() -> String {
+        format!("fifo-completion-{}", uuid::Uuid::new_v4())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fifo_cleanup(root: &Path, sentinel: &Path) -> std::result::Result<(), String> {
+        let mut failures = Vec::new();
+        for (path, directory) in [(sentinel, false), (root, true)] {
+            let result = if directory {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            };
+            if let Err(error) = result
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                failures.push(format!("remove {}: {error}", path.display()));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fifo_unreaped_failure(case: &str, reason: &str, root: &Path) -> String {
+        format!(
+            "FIFO case {case} failed before child reap confirmation: {reason}; child stdout/stderr were inherited; root retained at {}",
+            root.display()
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_fifo_child_until(
+        child: &mut Child,
+        deadline: Instant,
+    ) -> std::result::Result<Option<ExitStatus>, String> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(Some(status)),
+                Ok(None) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(deadline.duration_since(now).min(Duration::from_millis(10)));
+                }
+                Err(error) => return Err(format!("FIFO child status check failed: {error}")),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn terminate_and_reap_fifo_child(
+        child: &mut Child,
+    ) -> std::result::Result<(ExitStatus, String), String> {
+        const TERM_GRACE: Duration = Duration::from_millis(100);
+        const KILL_GRACE: Duration = Duration::from_secs(1);
+
+        let mut notes = Vec::new();
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, "child exited before termination".to_string())),
+            Ok(None) => {}
+            Err(error) => notes.push(format!("pre-termination status check failed: {error}")),
+        }
+
+        let pid = child.id();
+        // SAFETY: the PID belongs to the still-owned child process. Races with
+        // child exit are handled by the bounded try_wait loop below.
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result == 0 {
+            notes.push("sent SIGTERM".to_string());
+        } else {
+            notes.push(format!(
+                "SIGTERM for FIFO child {pid} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        match poll_fifo_child_until(child, Instant::now() + TERM_GRACE) {
+            Ok(Some(status)) => return Ok((status, notes.join("; "))),
+            Ok(None) => {}
+            Err(error) => notes.push(error),
+        }
+
+        match child.kill() {
+            Ok(()) => notes.push("sent SIGKILL via Child::kill".to_string()),
+            Err(error) => notes.push(format!("SIGKILL via Child::kill failed: {error}")),
+        }
+        match poll_fifo_child_until(child, Instant::now() + KILL_GRACE) {
+            Ok(Some(status)) => Ok((status, notes.join("; "))),
+            Ok(None) => Err(format!(
+                "unable to confirm FIFO child termination/reaping within bounded escalation: {}",
+                notes.join("; ")
+            )),
+            Err(error) => Err(format!(
+                "unable to confirm FIFO child termination/reaping within bounded escalation: {}; {error}",
+                notes.join("; ")
+            )),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_fifo_completion_sentinel() {
+        let path = std::env::var_os(FIFO_COMPLETION_PATH_ENV).expect("FIFO sentinel path");
+        let token = std::env::var(FIFO_COMPLETION_TOKEN_ENV).expect("FIFO sentinel token");
+        fs::write(path, token.as_bytes()).expect("FIFO completion sentinel");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fifo_spawn_failure(case: &str, reason: String, root: &Path, sentinel: &Path) -> String {
+        let cleanup = match fifo_cleanup(root, sentinel) {
+            Ok(()) => String::new(),
+            Err(error) => format!("; cleanup failed: {error}"),
+        };
+        format!("FIFO case {case} failed to spawn: {reason}{cleanup}")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_fifo_child(
+        case: &str,
+        child_test: &str,
+        root: &Path,
+        timeout: Duration,
+    ) -> std::result::Result<(), String> {
+        let token = fifo_completion_token();
+        let root_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fifo-case");
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let sentinel = parent.join(format!(".{root_name}-{case}-{token}-completion"));
+        let executable = std::env::current_exe().map_err(|error| {
+            fifo_spawn_failure(
+                case,
+                format!("test executable path unavailable: {error}"),
+                root,
+                &sentinel,
+            )
+        })?;
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg(child_test)
+            .arg("--nocapture")
+            .arg("--ignored")
+            .current_dir(root)
+            .env(FIFO_COMPLETION_PATH_ENV, &sentinel)
+            .env(FIFO_COMPLETION_TOKEN_ENV, &token)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| {
+                fifo_spawn_failure(
+                    case,
+                    format!("child spawn failed: {error}"),
+                    root,
+                    &sentinel,
+                )
+            })?;
+
+        let mut lifecycle_reason = None;
+        let status = match poll_fifo_child_until(&mut child, Instant::now() + timeout) {
+            Ok(Some(status)) => status,
+            Ok(None) => match terminate_and_reap_fifo_child(&mut child) {
+                Ok((status, detail)) => {
+                    lifecycle_reason = Some(format!("timed out after {timeout:?}; {detail}"));
+                    status
+                }
+                Err(error) => {
+                    return Err(fifo_unreaped_failure(
+                        case,
+                        &format!("timed out after {timeout:?}; {error}"),
+                        root,
+                    ));
+                }
+            },
+            Err(error) => match terminate_and_reap_fifo_child(&mut child) {
+                Ok((status, detail)) => {
+                    lifecycle_reason = Some(format!("{error}; {detail}"));
+                    status
+                }
+                Err(termination_error) => {
+                    return Err(fifo_unreaped_failure(
+                        case,
+                        &format!("{error}; {termination_error}"),
+                        root,
+                    ));
+                }
+            },
+        };
+
+        let mut failures = Vec::new();
+        if let Some(reason) = lifecycle_reason {
+            failures.push(reason);
+        }
+        if !status.success() {
+            failures.push(format!("child exited with status {status:?}"));
+        }
+        match fs::read(&sentinel) {
+            Ok(bytes) if bytes == token.as_bytes() => {}
+            Ok(bytes) => failures.push(format!(
+                "completion sentinel mismatch ({} bytes)",
+                bytes.len()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                failures.push("completion sentinel missing".to_string())
+            }
+            Err(error) => failures.push(format!("completion sentinel read failed: {error}")),
+        }
+        let success = failures.is_empty();
+        let failure = if success {
+            format!("FIFO case {case} child succeeded")
+        } else {
+            format!("FIFO case {case} failed: {}", failures.join("; "))
+        };
+        match fifo_cleanup(root, &sentinel) {
+            Ok(()) if success => Ok(()),
+            Ok(()) => Err(failure),
+            Err(error) => Err(format!("{failure}; cleanup failed: {error}")),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1312,6 +1547,7 @@ mod tests {
     fn fifo_irrelevant_tree_child() {
         let root = std::env::current_dir().expect("FIFO case root");
         run_fifo_case("irrelevant-tree", &root);
+        write_fifo_completion_sentinel();
     }
 
     #[cfg(target_os = "linux")]
@@ -1320,6 +1556,7 @@ mod tests {
     fn fifo_rss_entry_child() {
         let root = std::env::current_dir().expect("FIFO case root");
         run_fifo_case("rss-fifo", &root);
+        write_fifo_completion_sentinel();
     }
 
     #[cfg(target_os = "linux")]
@@ -1328,6 +1565,7 @@ mod tests {
     fn fifo_ancestor_child() {
         let root = std::env::current_dir().expect("FIFO case root");
         run_fifo_case("ancestor-fifo", &root);
+        write_fifo_completion_sentinel();
     }
 
     #[cfg(target_os = "linux")]
@@ -1336,14 +1574,82 @@ mod tests {
     fn fifo_cleanup_child() {
         let root = std::env::current_dir().expect("FIFO case root");
         run_fifo_case("cleanup-fifo", &root);
+        write_fifo_completion_sentinel();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_zero_selection_is_rejected() {
+        let root = test_root("fifo-zero-selection");
+        let error = run_fifo_child(
+            "zero-selection",
+            "runtime::module_snapshot::tests::fifo_child_name_typo",
+            &root,
+            std::time::Duration::from_secs(3),
+        )
+        .expect_err("an exact filter that selects zero tests must fail");
+        assert!(error.contains("completion sentinel missing"), "{error}");
+        assert!(!root.exists(), "zero-selection root should be cleaned");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_timeout_is_bounded_and_cleans_after_reap() {
+        let root = test_root("fifo-timeout");
+        let error = run_fifo_child(
+            "timeout",
+            "runtime::module_snapshot::tests::fifo_timeout_child",
+            &root,
+            std::time::Duration::from_millis(100),
+        )
+        .expect_err("a timed out FIFO child must fail");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(error.contains("SIGKILL"), "{error}");
+        assert!(!root.exists(), "timeout root should be cleaned after reap");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_child_error_preserves_diagnostics_and_cleans_after_reap() {
+        let root = test_root("fifo-child-error");
+        let error = run_fifo_child(
+            "child-error",
+            "runtime::module_snapshot::tests::fifo_error_child",
+            &root,
+            std::time::Duration::from_secs(3),
+        )
+        .expect_err("a child assertion failure must fail the parent case");
+        assert!(error.contains("child exited with status"), "{error}");
+        assert!(error.contains("completion sentinel missing"), "{error}");
+        assert!(
+            !root.exists(),
+            "child-error root should be cleaned after reap"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by fifo_timeout_is_bounded_and_cleans_after_reap"]
+    fn fifo_timeout_child() {
+        // Ignore the graceful signal so the parent must exercise its bounded
+        // SIGKILL escalation before confirming the child was reaped.
+        let result = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+        assert_ne!(result, libc::SIG_ERR, "install SIGTERM handler");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by fifo_child_error_preserves_diagnostics_and_cleans_after_reap"]
+    fn fifo_error_child() {
+        eprintln!("fifo-error-child-diagnostic");
+        let marker = std::env::var_os("RUSTSCRIPT_AGENT_FIFO_EXPECT_ERROR");
+        assert!(marker.is_some(), "fifo-error-child assertion failure");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn fifo_special_files_are_bounded() {
-        use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
-
         const CASES: [(&str, &str); 4] = [
             (
                 "irrelevant-tree",
@@ -1365,29 +1671,10 @@ mod tests {
 
         for (case, child_test) in CASES {
             let root = test_root(&format!("fifo-{case}"));
-            let mut child = Command::new(std::env::current_exe().expect("test executable path"))
-                .args(["--exact", child_test, "--nocapture", "--ignored"])
-                .current_dir(&root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("FIFO child should start");
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let status = loop {
-                if let Some(status) = child.try_wait().expect("FIFO child status") {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let status = child.wait().expect("FIFO child must be reaped");
-                    let _ = fs::remove_dir_all(&root);
-                    panic!("FIFO case {case} blocked beyond the bound; child status {status:?}");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            let _ = fs::remove_dir_all(&root);
-            assert!(status.success(), "FIFO case {case} failed with {status:?}");
+            let result = run_fifo_child(case, child_test, &root, Duration::from_secs(3));
+            if let Err(error) = result {
+                panic!("{error}");
+            }
         }
     }
 
