@@ -4,13 +4,15 @@
 //! material is deliberately kept in [`crate::auth::config`]; the two schemas
 //! are parsed and validated independently before their references are joined.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+#[cfg(feature = "config-fixture")]
+use std::sync::Arc;
+#[cfg(feature = "config-fixture")]
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
@@ -18,7 +20,8 @@ use url::Url;
 use yaml_rust2::parser::{Event, Parser, Tag};
 
 use crate::auth::config::{AuthConfig, AuthConfigError};
-use crate::host_opaque::OpaqueHostValue;
+#[cfg(feature = "config-fixture")]
+use crate::host_opaque::{OpaqueError, OpaqueHostValue, OpaqueRegistry};
 
 /// Persistent home directory name used when no override is configured.
 pub const DEFAULT_AGENT_HOME_DIR: &str = ".rustscript-agent";
@@ -1539,6 +1542,11 @@ pub enum ConfigFileError {
     PolicyOverreach {
         operation: String,
     },
+    #[cfg(feature = "config-fixture")]
+    HandleLimit {
+        resource: &'static str,
+        max: usize,
+    },
     HomeUnavailable {
         variable: String,
     },
@@ -1691,6 +1699,10 @@ impl fmt::Display for ConfigFileError {
                 formatter,
                 "RSS cannot expand trusted policy via {operation}"
             ),
+            #[cfg(feature = "config-fixture")]
+            Self::HandleLimit { resource, max } => {
+                write!(formatter, "{resource} live handle limit {max} reached")
+            }
             Self::HomeUnavailable { variable } => write!(
                 formatter,
                 "cannot resolve agent home; {variable} is unavailable"
@@ -1717,6 +1729,8 @@ impl ConfigFileError {
             Self::PolicyStaleGeneration { .. } => "policy_stale_generation",
             Self::PolicyExpired => "policy_expired",
             Self::PolicyOverreach { .. } => "policy_overreach",
+            #[cfg(feature = "config-fixture")]
+            Self::HandleLimit { .. } => "handle_limit",
             Self::InvalidAuthReference { .. } => "invalid_auth_reference",
             Self::HttpsRequired { .. } => "https_required",
             Self::HomeUnavailable { .. } | Self::HomeInvalid { .. } => "home_invalid",
@@ -1748,320 +1762,394 @@ impl ConfigFileError {
     }
 }
 
-const POLICY_HANDLE_CLASS: &str = "OpaquePolicyHandle";
-const POLICY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(feature = "config-fixture")]
+mod fixture_policy {
+    use super::*;
+    use std::collections::BTreeSet;
 
-/// Host-minted policy capability. RSS may copy it but cannot construct, forge,
-/// stringify, or expand a trusted policy from it. The VM representation is a
-/// host-native callable identity, not a map or string token.
-#[derive(Clone)]
-pub struct OpaquePolicyHandle {
-    token: OpaqueHostValue,
-}
+    const POLICY_HANDLE_CLASS: &str = "OpaquePolicyHandle";
+    /// Plan-aligned live policy-entry ceiling (`max_tool_calls: 128`).
+    pub(crate) const MAX_LIVE_POLICY_ENTRIES: usize = 128;
 
-impl PartialEq for OpaquePolicyHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.token.ptr_eq(&other.token)
-    }
-}
-
-impl Eq for OpaquePolicyHandle {}
-
-impl fmt::Debug for OpaquePolicyHandle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpaquePolicyHandle")
-            .field("class", &self.class())
-            .finish()
-    }
-}
-
-impl OpaquePolicyHandle {
-    pub fn class(&self) -> &'static str {
-        POLICY_HANDLE_CLASS
+    /// Host-minted policy capability. RSS may copy it but cannot construct, forge,
+    /// stringify, or expand a trusted policy from it. The VM representation is a
+    /// host-native callable identity, not a map or string token.
+    #[derive(Clone)]
+    pub struct OpaquePolicyHandle {
+        token: OpaqueHostValue,
     }
 
-    pub(crate) fn to_vm_value(&self) -> rustscript_vm::Value {
-        self.token.to_vm_value()
-    }
-
-    pub(crate) fn from_vm_value(value: &rustscript_vm::Value) -> Option<Self> {
-        let token = OpaqueHostValue::from_vm_value(value)?;
-        if token.class() != POLICY_HANDLE_CLASS {
-            return None;
-        }
-        Some(Self { token })
-    }
-
-    fn mint() -> Self {
-        Self {
-            token: OpaqueHostValue::mint(POLICY_HANDLE_CLASS, ()),
+    impl PartialEq for OpaquePolicyHandle {
+        fn eq(&self, other: &Self) -> bool {
+            self.token.ptr_eq(&other.token)
         }
     }
-}
 
-/// Sanitized, RSS-visible policy summary. It never includes tokens, raw
-/// authorities that RSS could replay, or handle internals.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct SanitizedPolicySummary {
-    pub providers: Vec<String>,
-    pub workspace_root_count: usize,
-    pub approval_read: String,
-    pub approval_write: String,
-    pub approval_process: String,
-    pub policy_generation: u64,
-    pub max_turns: u64,
-    pub max_tool_calls: u64,
-    pub max_tool_output_bytes: usize,
-}
+    impl Eq for OpaquePolicyHandle {}
 
-/// Canonical Stage A snapshot envelope returned by [`load_snapshot`].
-#[derive(Clone, Debug)]
-pub struct ConfigSnapshotEnvelope {
-    pub public_config: BoundedPublicConfig,
-    pub credential_refs: Vec<String>,
-    pub policy_handle: OpaquePolicyHandle,
-    pub policy_generation: u64,
-    pub policy_summary: SanitizedPolicySummary,
-}
-
-/// Fixture/host policy probe intent. Production workspace/OAuth surfaces later
-/// replace these operations; Stage A only proves the handle cannot expand.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PolicyIntent {
-    pub op: String,
-    pub path: Option<String>,
-    pub write: Option<String>,
-    pub name: Option<String>,
-    pub policy_generation: Option<u64>,
-}
-
-/// Successful policy probe result.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PolicyProbe {
-    pub ok: bool,
-}
-
-#[derive(Clone, Debug)]
-struct TrustedPolicySnapshot {
-    home: PathBuf,
-    generation: u64,
-    workspace_roots: Vec<PathBuf>,
-    #[allow(dead_code)]
-    approval_read: String,
-    approval_write: String,
-    #[allow(dead_code)]
-    approval_process: String,
-    allowed_header_names: BTreeSet<String>,
-    #[allow(dead_code)]
-    provider_authorities: Vec<String>,
-    #[allow(dead_code)]
-    providers: Vec<String>,
-    #[allow(dead_code)]
-    max_turns: u64,
-    #[allow(dead_code)]
-    max_tool_calls: u64,
-    #[allow(dead_code)]
-    max_tool_output_bytes: usize,
-}
-
-#[derive(Clone, Debug)]
-struct PolicyLease {
-    snapshot: TrustedPolicySnapshot,
-    expires_at: Instant,
-    revoked: bool,
-    expired: bool,
-}
-
-#[derive(Default)]
-struct PolicyTable {
-    entries: HashMap<usize, PolicyLease>,
-    generations: HashMap<PathBuf, u64>,
-}
-
-fn policy_table() -> &'static Mutex<PolicyTable> {
-    static TABLE: OnceLock<Mutex<PolicyTable>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(PolicyTable::default()))
-}
-
-fn lock_policy_table() -> std::sync::MutexGuard<'static, PolicyTable> {
-    policy_table()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn freeze_provider_authorities(config: &ConfigFile) -> Vec<String> {
-    let mut authorities = Vec::new();
-    for provider in config.providers.values() {
-        let Ok(url) = Url::parse(&provider.base_url) else {
-            continue;
-        };
-        let Some(host) = url.host_str() else {
-            continue;
-        };
-        authorities.push(match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        });
-    }
-    authorities
-}
-
-fn workspace_root_admitted(snapshot: &TrustedPolicySnapshot, path: &str) -> bool {
-    snapshot
-        .workspace_roots
-        .iter()
-        .any(|root| root == Path::new(path))
-}
-
-fn approval_rank(value: &str) -> u8 {
-    match value {
-        "deny" => 0,
-        "ask" => 1,
-        "allow" => 2,
-        _ => 3,
-    }
-}
-
-fn header_admitted(snapshot: &TrustedPolicySnapshot, name: &str) -> bool {
-    snapshot
-        .allowed_header_names
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(name))
-}
-
-fn frozen_blocks_widening(snapshot: &TrustedPolicySnapshot, intent: &PolicyIntent) -> bool {
-    match intent.op.as_str() {
-        "add_workspace_root" => {
-            let requested = intent.path.as_deref().unwrap_or("");
-            let admitted = workspace_root_admitted(snapshot, requested);
-            let _ = admitted;
-            true
-        }
-        "raise_approval" => {
-            let requested = intent.write.as_deref().unwrap_or("");
-            let exceeds = approval_rank(requested) > approval_rank(&snapshot.approval_write);
-            let _ = exceeds;
-            true
-        }
-        "add_header" => {
-            let name = intent.name.as_deref().unwrap_or("");
-            let admitted = header_admitted(snapshot, name);
-            let _ = admitted;
-            true
-        }
-        _ => false,
-    }
-}
-
-/// Loads `config.yaml` + `auth.yaml` for a host-resolved home and injects a
-/// trusted policy handle. Raw tokens stay host-side.
-pub fn load_snapshot(
-    host_home: impl AsRef<Path>,
-) -> Result<ConfigSnapshotEnvelope, ConfigFileError> {
-    let paths = AgentPaths::from_home(host_home)?;
-    let loaded = ConfigFile::load_pair(&paths)?;
-    let credential_refs = loaded.auth.credentials.keys().cloned().collect::<Vec<_>>();
-    let mut table = lock_policy_table();
-    let generation = table
-        .generations
-        .get(&paths.home)
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1);
-    table.generations.insert(paths.home.clone(), generation);
-    for entry in table.entries.values_mut() {
-        if entry.snapshot.home == paths.home {
-            entry.revoked = true;
+    impl fmt::Debug for OpaquePolicyHandle {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("OpaquePolicyHandle")
+                .field("class", &self.class())
+                .finish()
         }
     }
-    let summary = SanitizedPolicySummary {
-        providers: loaded.config.providers.keys().cloned().collect(),
-        workspace_root_count: loaded.config.workspaces.allowed_roots.len(),
-        approval_read: loaded.config.approvals.read.clone(),
-        approval_write: loaded.config.approvals.write.clone(),
-        approval_process: loaded.config.approvals.process.clone(),
-        policy_generation: generation,
-        max_turns: loaded.config.agent.max_turns,
-        max_tool_calls: loaded.config.agent.max_tool_calls,
-        max_tool_output_bytes: loaded.config.agent.max_tool_output_bytes,
-    };
-    let handle = OpaquePolicyHandle::mint();
-    table.entries.insert(
-        handle.token.ptr(),
-        PolicyLease {
-            snapshot: TrustedPolicySnapshot {
-                home: paths.home,
-                generation,
-                workspace_roots: loaded.config.workspaces.allowed_roots.clone(),
-                approval_read: summary.approval_read.clone(),
-                approval_write: summary.approval_write.clone(),
-                approval_process: summary.approval_process.clone(),
-                allowed_header_names: BTreeSet::new(),
-                provider_authorities: freeze_provider_authorities(&loaded.config),
-                providers: summary.providers.clone(),
-                max_turns: summary.max_turns,
-                max_tool_calls: summary.max_tool_calls,
-                max_tool_output_bytes: summary.max_tool_output_bytes,
-            },
-            expires_at: Instant::now() + POLICY_TTL,
-            revoked: false,
-            expired: false,
-        },
-    );
-    Ok(ConfigSnapshotEnvelope {
-        public_config: loaded.config,
-        credential_refs,
-        policy_handle: handle,
-        policy_generation: generation,
-        policy_summary: summary,
-    })
-}
 
-/// Fixture host probe: copies alias the same entry; forged, stale, expired, or
-/// expanding intents fail closed. Overreach checks consume the frozen snapshot.
-pub fn check_policy(
-    handle: &OpaquePolicyHandle,
-    intent: &PolicyIntent,
-) -> Result<PolicyProbe, ConfigFileError> {
-    let mut table = lock_policy_table();
-    let entry = table
-        .entries
-        .get_mut(&handle.token.ptr())
-        .ok_or(ConfigFileError::PolicyHandleInvalid)?;
-    if entry.revoked {
-        return Err(ConfigFileError::PolicyStaleGeneration {
-            expected: entry.snapshot.generation,
-            actual: intent.policy_generation.unwrap_or(0),
-        });
-    }
-    if entry.expired || Instant::now() >= entry.expires_at {
-        return Err(ConfigFileError::PolicyExpired);
-    }
-    if let Some(claimed) = intent.policy_generation
-        && claimed != entry.snapshot.generation
-    {
-        return Err(ConfigFileError::PolicyStaleGeneration {
-            expected: entry.snapshot.generation,
-            actual: claimed,
-        });
-    }
-    match intent.op.as_str() {
-        "inspect" => Ok(PolicyProbe { ok: true }),
-        "expire" => {
-            entry.expired = true;
-            entry.expires_at = Instant::now();
-            Ok(PolicyProbe { ok: true })
+    impl OpaquePolicyHandle {
+        pub fn class(&self) -> &'static str {
+            POLICY_HANDLE_CLASS
         }
-        "add_workspace_root" | "raise_approval" | "add_header" => {
-            let _blocked = frozen_blocks_widening(&entry.snapshot, intent);
-            Err(ConfigFileError::PolicyOverreach {
-                operation: intent.op.clone(),
+
+        pub(crate) fn to_vm_value(&self) -> rustscript_vm::Value {
+            self.token.to_vm_value()
+        }
+
+        pub(crate) fn from_vm_value(
+            opaques: &Arc<OpaqueRegistry>,
+            value: &rustscript_vm::Value,
+        ) -> Option<Self> {
+            let token = opaques.from_vm_value(value)?;
+            if token.class() != POLICY_HANDLE_CLASS {
+                return None;
+            }
+            Some(Self { token })
+        }
+
+        fn mint(opaques: &Arc<OpaqueRegistry>) -> Result<Self, ConfigFileError> {
+            match opaques.mint(POLICY_HANDLE_CLASS, ()) {
+                Ok(token) => Ok(Self { token }),
+                Err(OpaqueError::LiveHandleLimit) => Err(ConfigFileError::HandleLimit {
+                    resource: "opaque",
+                    max: crate::host_opaque::MAX_LIVE_OPAQUE_HANDLES,
+                }),
+                Err(OpaqueError::PrototypeIdSpaceExhausted) => Err(ConfigFileError::HandleLimit {
+                    resource: "opaque-id",
+                    max: crate::host_opaque::MAX_LIVE_OPAQUE_HANDLES,
+                }),
+            }
+        }
+
+        fn prototype_id(&self) -> u32 {
+            self.token.prototype_id()
+        }
+    }
+
+    /// Sanitized, RSS-visible policy summary. It never includes tokens, raw
+    /// authorities that RSS could replay, or handle internals.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub struct SanitizedPolicySummary {
+        pub providers: Vec<String>,
+        pub workspace_root_count: usize,
+        pub approval_read: String,
+        pub approval_write: String,
+        pub approval_process: String,
+        pub policy_generation: u64,
+        pub max_turns: u64,
+        pub max_tool_calls: u64,
+        pub max_tool_output_bytes: usize,
+    }
+
+    /// Canonical Stage A snapshot envelope returned by the fixture host.
+    #[derive(Clone, Debug)]
+    pub struct ConfigSnapshotEnvelope {
+        pub public_config: BoundedPublicConfig,
+        pub credential_refs: Vec<String>,
+        pub policy_handle: OpaquePolicyHandle,
+        pub policy_generation: u64,
+        pub policy_summary: SanitizedPolicySummary,
+    }
+
+    /// Fixture/host policy probe intent. Production workspace/OAuth surfaces later
+    /// replace these operations; Stage A only proves the handle cannot expand.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct PolicyIntent {
+        pub op: String,
+        pub path: Option<String>,
+        pub write: Option<String>,
+        pub name: Option<String>,
+        pub policy_generation: Option<u64>,
+    }
+
+    /// Successful policy probe result.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct PolicyProbe {
+        pub ok: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct TrustedPolicySnapshot {
+        #[allow(dead_code)]
+        home: PathBuf,
+        generation: u64,
+        workspace_roots: Vec<PathBuf>,
+        #[allow(dead_code)]
+        approval_read: String,
+        approval_write: String,
+        #[allow(dead_code)]
+        approval_process: String,
+        allowed_header_names: BTreeSet<String>,
+        #[allow(dead_code)]
+        provider_authorities: Vec<String>,
+        #[allow(dead_code)]
+        providers: Vec<String>,
+        #[allow(dead_code)]
+        max_turns: u64,
+        #[allow(dead_code)]
+        max_tool_calls: u64,
+        #[allow(dead_code)]
+        max_tool_output_bytes: usize,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PolicyLease {
+        snapshot: TrustedPolicySnapshot,
+        expires_at: Instant,
+    }
+
+    struct PolicyTable {
+        entries: HashMap<u32, PolicyLease>,
+        generation: u64,
+    }
+
+    /// Owner-scoped policy table bound to a fixture run deadline.
+    pub(crate) struct PolicyOwner {
+        inner: parking_lot::Mutex<PolicyTable>,
+        opaques: Arc<OpaqueRegistry>,
+        deadline: Instant,
+    }
+
+    impl PolicyOwner {
+        pub(crate) fn new(opaques: Arc<OpaqueRegistry>, deadline: Instant) -> Arc<Self> {
+            Arc::new(Self {
+                inner: parking_lot::Mutex::new(PolicyTable {
+                    entries: HashMap::new(),
+                    generation: 0,
+                }),
+                opaques,
+                deadline,
             })
         }
-        _ => Err(ConfigFileError::PolicyHandleInvalid),
+
+        pub(crate) fn opaques(&self) -> &Arc<OpaqueRegistry> {
+            &self.opaques
+        }
+
+        pub(crate) fn clear(&self) {
+            let mut table = self.inner.lock();
+            let ids: Vec<u32> = table.entries.keys().copied().collect();
+            table.entries.clear();
+            drop(table);
+            for id in ids {
+                self.opaques.revoke(id);
+            }
+        }
+
+        fn sweep_expired(table: &mut PolicyTable, opaques: &OpaqueRegistry, now: Instant) {
+            let expired: Vec<u32> = table
+                .entries
+                .iter()
+                .filter(|(_, lease)| now >= lease.expires_at)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in expired {
+                table.entries.remove(&id);
+                opaques.revoke(id);
+            }
+        }
+
+        /// Loads `config.yaml` + `auth.yaml` for a host-resolved home and injects a
+        /// trusted policy handle. Raw tokens stay host-side.
+        pub(crate) fn load_snapshot(
+            &self,
+            host_home: impl AsRef<Path>,
+        ) -> Result<ConfigSnapshotEnvelope, ConfigFileError> {
+            let paths = AgentPaths::from_home(host_home)?;
+            let loaded = ConfigFile::load_pair(&paths)?;
+            let credential_refs = loaded.auth.credentials.keys().cloned().collect::<Vec<_>>();
+            let mut table = self.inner.lock();
+            Self::sweep_expired(&mut table, &self.opaques, Instant::now());
+            let revoked: Vec<u32> = table.entries.keys().copied().collect();
+            table.entries.clear();
+            drop(table);
+            for id in revoked {
+                self.opaques.revoke(id);
+            }
+            let mut table = self.inner.lock();
+            if table.entries.len() >= MAX_LIVE_POLICY_ENTRIES {
+                return Err(ConfigFileError::HandleLimit {
+                    resource: "policy",
+                    max: MAX_LIVE_POLICY_ENTRIES,
+                });
+            }
+            table.generation = table.generation.saturating_add(1);
+            let generation = table.generation;
+            let summary = SanitizedPolicySummary {
+                providers: loaded.config.providers.keys().cloned().collect(),
+                workspace_root_count: loaded.config.workspaces.allowed_roots.len(),
+                approval_read: loaded.config.approvals.read.clone(),
+                approval_write: loaded.config.approvals.write.clone(),
+                approval_process: loaded.config.approvals.process.clone(),
+                policy_generation: generation,
+                max_turns: loaded.config.agent.max_turns,
+                max_tool_calls: loaded.config.agent.max_tool_calls,
+                max_tool_output_bytes: loaded.config.agent.max_tool_output_bytes,
+            };
+            drop(table);
+            let handle = OpaquePolicyHandle::mint(&self.opaques)?;
+            let mut table = self.inner.lock();
+            table.entries.insert(
+                handle.prototype_id(),
+                PolicyLease {
+                    snapshot: TrustedPolicySnapshot {
+                        home: paths.home,
+                        generation,
+                        workspace_roots: loaded.config.workspaces.allowed_roots.clone(),
+                        approval_read: summary.approval_read.clone(),
+                        approval_write: summary.approval_write.clone(),
+                        approval_process: summary.approval_process.clone(),
+                        allowed_header_names: BTreeSet::new(),
+                        provider_authorities: freeze_provider_authorities(&loaded.config),
+                        providers: summary.providers.clone(),
+                        max_turns: summary.max_turns,
+                        max_tool_calls: summary.max_tool_calls,
+                        max_tool_output_bytes: summary.max_tool_output_bytes,
+                    },
+                    expires_at: self.deadline,
+                },
+            );
+            Ok(ConfigSnapshotEnvelope {
+                public_config: loaded.config,
+                credential_refs,
+                policy_handle: handle,
+                policy_generation: generation,
+                policy_summary: summary,
+            })
+        }
+
+        /// Fixture host probe: copies alias the same entry; forged, stale, expired, or
+        /// expanding intents fail closed. Expire/revoke delete the live entry.
+        pub(crate) fn check_policy(
+            &self,
+            handle: &OpaquePolicyHandle,
+            intent: &PolicyIntent,
+        ) -> Result<PolicyProbe, ConfigFileError> {
+            let id = handle.prototype_id();
+            let mut table = self.inner.lock();
+            Self::sweep_expired(&mut table, &self.opaques, Instant::now());
+            let Some(entry) = table.entries.get(&id).cloned() else {
+                return Err(ConfigFileError::PolicyHandleInvalid);
+            };
+            if Instant::now() >= entry.expires_at {
+                table.entries.remove(&id);
+                drop(table);
+                self.opaques.revoke(id);
+                return Err(ConfigFileError::PolicyExpired);
+            }
+            if let Some(claimed) = intent.policy_generation
+                && claimed != entry.snapshot.generation
+            {
+                return Err(ConfigFileError::PolicyStaleGeneration {
+                    expected: entry.snapshot.generation,
+                    actual: claimed,
+                });
+            }
+            match intent.op.as_str() {
+                "inspect" => Ok(PolicyProbe { ok: true }),
+                "expire" => {
+                    table.entries.remove(&id);
+                    drop(table);
+                    self.opaques.revoke(id);
+                    Err(ConfigFileError::PolicyExpired)
+                }
+                "add_workspace_root" | "raise_approval" | "add_header" => {
+                    let _blocked = frozen_blocks_widening(&entry.snapshot, intent);
+                    Err(ConfigFileError::PolicyOverreach {
+                        operation: intent.op.clone(),
+                    })
+                }
+                _ => Err(ConfigFileError::PolicyHandleInvalid),
+            }
+        }
+    }
+
+    impl Drop for PolicyOwner {
+        fn drop(&mut self) {
+            self.clear();
+        }
+    }
+
+    fn freeze_provider_authorities(config: &ConfigFile) -> Vec<String> {
+        let mut authorities = Vec::new();
+        for provider in config.providers.values() {
+            let Ok(url) = Url::parse(&provider.base_url) else {
+                continue;
+            };
+            let Some(host) = url.host_str() else {
+                continue;
+            };
+            authorities.push(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            });
+        }
+        authorities
+    }
+
+    fn workspace_root_admitted(snapshot: &TrustedPolicySnapshot, path: &str) -> bool {
+        snapshot
+            .workspace_roots
+            .iter()
+            .any(|root| root == Path::new(path))
+    }
+
+    fn approval_rank(value: &str) -> u8 {
+        match value {
+            "deny" => 0,
+            "ask" => 1,
+            "allow" => 2,
+            _ => 3,
+        }
+    }
+
+    fn header_admitted(snapshot: &TrustedPolicySnapshot, name: &str) -> bool {
+        snapshot
+            .allowed_header_names
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(name))
+    }
+
+    fn frozen_blocks_widening(snapshot: &TrustedPolicySnapshot, intent: &PolicyIntent) -> bool {
+        match intent.op.as_str() {
+            "add_workspace_root" => {
+                let requested = intent.path.as_deref().unwrap_or("");
+                let admitted = workspace_root_admitted(snapshot, requested);
+                let _ = admitted;
+                true
+            }
+            "raise_approval" => {
+                let requested = intent.write.as_deref().unwrap_or("");
+                let exceeds = approval_rank(requested) > approval_rank(&snapshot.approval_write);
+                let _ = exceeds;
+                true
+            }
+            "add_header" => {
+                let name = intent.name.as_deref().unwrap_or("");
+                let admitted = header_admitted(snapshot, name);
+                let _ = admitted;
+                true
+            }
+            _ => false,
+        }
     }
 }
+
+#[cfg(feature = "config-fixture")]
+pub(crate) use fixture_policy::PolicyOwner;
+#[cfg(feature = "config-fixture")]
+pub use fixture_policy::{
+    ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyProbe, SanitizedPolicySummary,
+};
 
 /// Convenience function for callers that do not need the associated method.
 pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigFile, ConfigFileError> {
