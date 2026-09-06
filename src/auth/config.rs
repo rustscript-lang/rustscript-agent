@@ -375,6 +375,10 @@ pub enum AuthConfigError {
         path: String,
         max_nodes: usize,
     },
+    YamlTooLarge {
+        path: String,
+        max_bytes: usize,
+    },
     MultipleDocuments {
         path: PathBuf,
     },
@@ -443,6 +447,13 @@ impl AuthConfigError {
                 path: format!("{}:{yaml_path}", path.display()),
                 max_nodes,
             },
+            YamlBoundsError::ExpandedBytes {
+                path: yaml_path,
+                max_bytes,
+            } => Self::YamlTooLarge {
+                path: format!("{}:{yaml_path}", path.display()),
+                max_bytes,
+            },
         }
     }
 }
@@ -477,6 +488,10 @@ impl fmt::Display for AuthConfigError {
             Self::YamlTooComplex { path, max_nodes } => write!(
                 formatter,
                 "YAML path {path} exceeds the {max_nodes}-node limit"
+            ),
+            Self::YamlTooLarge { path, max_bytes } => write!(
+                formatter,
+                "YAML path {path} exceeds the {max_bytes}-byte expanded allocation limit"
             ),
             Self::MultipleDocuments { path } => write!(
                 formatter,
