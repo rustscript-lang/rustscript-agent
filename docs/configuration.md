@@ -28,6 +28,24 @@ through the typed command envelope.
 
 ## Environment variables (gateway binary)
 
+`RUSTSCRIPT_AGENT_HOME` is a Task 1 bootstrap input read by the library
+config/auth path resolver. It is not consumed by the current gateway binary
+and does not add a gateway CLI startup setting. When set, it must be a
+non-empty absolute path without parent-directory components and takes
+precedence over `$HOME` (or `$USERPROFILE`). When unset, the resolver uses
+`$HOME/.rustscript-agent` (or `$USERPROFILE/.rustscript-agent`). The selected
+home derives these paths:
+
+- `<home>/config.yaml`
+- `<home>/auth.yaml`
+- `<home>/auth.yaml.lock`
+- `<home>/state.db`
+
+The Task 1 path resolver does not derive a `skills/` path. Job `skills` values
+are stored as job data and do not select files below this home. The gateway's
+existing `RUSTSCRIPT_AGENT_STATE_DB` remains its separate state-database
+selector.
+
 Every `RUSTSCRIPT_AGENT_*` variable has a deprecated prototype alias
 `PD_EDGE_AGENT_*`. When the primary variable is unset, the legacy name is
 read and a deprecation warning is printed to stderr; the primary name always
