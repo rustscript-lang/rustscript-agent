@@ -251,20 +251,15 @@ fn invalid_auth_reference_is_rejected_when_loading_a_pair() {
 }
 
 #[test]
-fn model_provider_references_reject_unknowns_but_allow_builtin_and_defined_names() {
+fn unknown_provider_names_are_not_rejected_by_generic_loader() {
     let empty_auth = AuthConfig::from_str("version: 1\n").expect("empty auth document");
     let empty_providers = ConfigFile::from_str(
         "version: 1\nmodel:\n  provider: unknown-empty\n  model: local-agent\n",
     )
     .expect("config with no provider map");
-    let error = empty_providers
+    empty_providers
         .validate_auth_references(&empty_auth)
-        .expect_err("an unknown provider must fail without a provider map");
-    assert!(matches!(
-        error,
-        ConfigFileError::InvalidProviderReference { path, provider }
-            if path == "model.provider" && provider == "unknown-empty"
-    ));
+        .expect("unknown provider names are RSS selection data");
 
     let populated_providers = ConfigFile::from_str(&valid_config("codex-primary").replacen(
         "  provider: openai-codex",
@@ -273,31 +268,16 @@ fn model_provider_references_reject_unknowns_but_allow_builtin_and_defined_names
     ))
     .expect("config with a populated provider map");
     let auth = AuthConfig::from_str(&valid_auth("codex-primary")).expect("matching auth document");
-    let error = populated_providers
+    populated_providers
         .validate_auth_references(&auth)
-        .expect_err("an unknown provider must fail with a provider map");
-    assert!(matches!(
-        error,
-        ConfigFileError::InvalidProviderReference { path, provider }
-            if path == "model.provider" && provider == "unknown-populated"
-    ));
+        .expect("unknown model.provider names are not rejected by the generic loader");
 
-    let builtin_without_map =
+    let unnamed_local =
         ConfigFile::from_str("version: 1\nmodel:\n  provider: local-agent\n  model: local-agent\n")
-            .expect("builtin config without a provider map");
-    builtin_without_map
+            .expect("local-agent config without a provider map");
+    unnamed_local
         .validate_auth_references(&empty_auth)
-        .expect("local-agent remains valid without a provider map");
-
-    let builtin_with_map = ConfigFile::from_str(&valid_config("codex-primary").replacen(
-        "  provider: openai-codex",
-        "  provider: local-agent",
-        1,
-    ))
-    .expect("builtin config with a populated provider map");
-    builtin_with_map
-        .validate_auth_references(&auth)
-        .expect("local-agent remains valid with a provider map");
+        .expect("local-agent is not a Rust builtin special case");
 
     let defined_provider =
         ConfigFile::from_str(&valid_config("codex-primary")).expect("defined provider config");
@@ -307,16 +287,21 @@ fn model_provider_references_reject_unknowns_but_allow_builtin_and_defined_names
 }
 
 #[test]
-fn provider_auth_references_still_require_a_matching_credential() {
+fn provider_auth_references_require_existing_credential_ids_not_provider_matching() {
     let config = ConfigFile::from_str(&valid_config("codex-primary")).expect("valid config");
     let mismatched_auth = AuthConfig::from_str(
         &valid_auth("codex-primary").replace("provider: openai-codex", "provider: other-provider"),
     )
     .expect("valid auth with a different provider");
 
-    let error = config
+    config
         .validate_auth_references(&mismatched_auth)
-        .expect_err("provider auth references must remain type-checked");
+        .expect("credential.provider matching is RSS policy, not a generic loader check");
+
+    let empty_auth = AuthConfig::from_str("version: 1\n").expect("empty auth document");
+    let error = config
+        .validate_auth_references(&empty_auth)
+        .expect_err("missing credential IDs remain a generic integrity failure");
     assert!(matches!(
         error,
         ConfigFileError::InvalidAuthReference { path, credential_id, .. }
@@ -490,7 +475,7 @@ fn config_rejects_duplicate_and_unknown_keys_at_each_schema_level() {
 }
 
 #[test]
-fn openai_codex_authority_and_port_are_allowlisted_without_rejecting_custom_https() {
+fn generic_https_and_loopback_urls_do_not_use_provider_name_authority_mapping() {
     let cases = [
         (
             "base-host",
@@ -508,29 +493,14 @@ fn openai_codex_authority_and_port_are_allowlisted_without_rejecting_custom_http
             "issuer: https://accounts.openai.com",
         ),
         (
-            "issuer-port",
-            "issuer: https://auth.openai.com",
-            "issuer: https://auth.openai.com:8443",
-        ),
-        (
             "token-host",
             "token_endpoint: https://auth.openai.com/oauth/token",
             "token_endpoint: https://evil.example/oauth/token",
         ),
         (
-            "token-port",
-            "token_endpoint: https://auth.openai.com/oauth/token",
-            "token_endpoint: https://auth.openai.com:8443/oauth/token",
-        ),
-        (
             "redirect-host",
             "redirect_uri: https://auth.openai.com/deviceauth/callback",
             "redirect_uri: https://evil.example/deviceauth/callback",
-        ),
-        (
-            "redirect-port",
-            "redirect_uri: https://auth.openai.com/deviceauth/callback",
-            "redirect_uri: https://auth.openai.com:8443/deviceauth/callback",
         ),
     ];
 
@@ -541,11 +511,8 @@ fn openai_codex_authority_and_port_are_allowlisted_without_rejecting_custom_http
             &path,
             &valid_config("codex-primary").replace(needle, replacement),
         );
-        let error = load_config(&path).expect_err("untrusted provider authority must fail");
-        assert!(
-            error.to_string().contains("provider authority"),
-            "authority rejection should be explicit: {error}"
-        );
+        load_config(&path)
+            .expect("provider-name authority mapping must not live in the generic loader");
     }
 
     let root = temp_root("custom-provider");

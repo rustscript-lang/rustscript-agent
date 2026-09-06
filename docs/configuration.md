@@ -27,6 +27,17 @@ through validated native configuration (`AgentConfig`/`HttpConfig`/
 `SqlitePolicy`), and the storage program receives its per-command limits
 through the typed command envelope.
 
+Persistent `config.yaml` / `auth.yaml` are loaded by the host as
+`config::load_snapshot(host_home)`. The generic loader keeps bounded YAML,
+HTTPS-or-loopback URL syntax, secret-key rejection, and credential-ID
+reference integrity. Provider-name authority mapping, provider defaults,
+OAuth field interpretation, and local-agent special cases are RSS policy:
+an unknown provider name is not rejected merely because it is unknown, and
+explicit custom HTTPS providers remain configurable. The snapshot exposed
+to RSS is `BoundedPublicConfig`, opaque credential IDs, a sanitized policy
+summary, and an `OpaquePolicyHandle` minted host-side. Raw tokens never
+cross into RSS, events, logs, or durable output.
+
 ## Environment variables (gateway binary)
 
 ### Library bootstrap input (library only)

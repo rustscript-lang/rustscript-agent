@@ -10,6 +10,7 @@ pub mod auth;
 pub mod capabilities;
 pub mod config;
 pub mod config_file;
+mod config_host;
 pub mod domain;
 pub mod events;
 pub mod gateway;
@@ -26,7 +27,9 @@ mod durable_provider;
 pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
 pub use config::{AgentGatewayConfig, TelegramConfig};
 pub use config_file::{
-    AgentPaths, ConfigFile, ConfigFileError, ConfigPaths, LoadedConfig, RuntimeConfig, load_config,
+    AgentPaths, ConfigFile, ConfigFileError, ConfigPaths, ConfigSnapshotEnvelope, LoadedConfig,
+    OpaquePolicyHandle, PolicyIntent, PolicyProbe, RuntimeConfig, SanitizedPolicySummary,
+    check_policy, load_config, load_snapshot,
 };
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,

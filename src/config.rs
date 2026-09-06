@@ -14,7 +14,10 @@ use rustscript_vm::{
 };
 use serde_json::{Map, Value, json};
 
-pub use crate::config_file::{AgentPaths, ConfigPaths};
+pub use crate::config_file::{
+    AgentPaths, ConfigPaths, ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyProbe,
+    SanitizedPolicySummary, check_policy, load_snapshot,
+};
 
 /// Hard upper bounds for the coding file-tool budgets.
 ///

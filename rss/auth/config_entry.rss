@@ -1,0 +1,209 @@
+// Stage A config/auth entry. RSS owns provider/model selection and user-facing
+// snapshot shaping. The host injects BoundedPublicConfig, opaque credential
+// references, and an OpaquePolicyHandle that this module cannot forge or expand.
+use config;
+
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn sanitize_load(snapshot: map) -> map {
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
+        let public_config: map = map_map(snapshot, "public_config");
+        let model: map = map_map(public_config, "model");
+        let agent: map = map_map(public_config, "agent");
+        {
+            ok: true,
+            public_config: public_config,
+            credential_refs: map_array(snapshot, "credential_refs"),
+            policy_generation: map_int(snapshot, "policy_generation", 0),
+            policy_summary: map_map(snapshot, "policy_summary"),
+            policy_handle_class: "OpaquePolicyHandle",
+            selected_provider: map_string(model, "provider", ""),
+            selected_model: map_string(model, "model", ""),
+            selected_source: map_string(agent, "source", "")
+        }
+    } else => {
+        {
+            ok: false,
+            error: map_map(snapshot, "error")
+        }
+    }
+}
+
+fn wrap_probe(probed: map) -> map {
+    let ok: bool = map_bool(probed, "ok", false);
+    if ok => {
+        {
+            ok: true,
+            policy_handle_class: "OpaquePolicyHandle"
+        }
+    } else => {
+        {
+            ok: false,
+            error: map_map(probed, "error")
+        }
+    }
+}
+
+fn snapshot_or_error(snapshot: map) -> map {
+    sanitize_load(snapshot)
+}
+
+fn with_live_handle(host_home: string, intent: map) -> map {
+    let snapshot: map = config::load_snapshot(host_home);
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
+        let handle: map = map_map(snapshot, "policy_handle");
+        wrap_probe(config::check_policy(handle, intent))
+    } else => {
+        snapshot_or_error(snapshot)
+    }
+}
+
+fn probe_forged(host_home: string) -> map {
+    let snapshot: map = config::load_snapshot(host_home);
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
+        let forged: map = {
+            class: "OpaquePolicyHandle",
+            id: "forged"
+        };
+        wrap_probe(config::check_policy(forged, { op: "inspect" }))
+    } else => {
+        snapshot_or_error(snapshot)
+    }
+}
+
+fn probe_copy(host_home: string) -> map {
+    let snapshot: map = config::load_snapshot(host_home);
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
+        let handle: map = map_map(snapshot, "policy_handle");
+        let copied: map = handle.copy();
+        wrap_probe(config::check_policy(copied, { op: "inspect" }))
+    } else => {
+        snapshot_or_error(snapshot)
+    }
+}
+
+fn probe_stale(host_home: string) -> map {
+    let snapshot: map = config::load_snapshot(host_home);
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
+        let handle: map = map_map(snapshot, "policy_handle");
+        let generation: int = map_int(snapshot, "policy_generation", 0);
+        wrap_probe(config::check_policy(handle, {
+            op: "inspect",
+            policy_generation: generation + 1
+        }))
+    } else => {
+        snapshot_or_error(snapshot)
+    }
+}
+
+fn probe_expire(host_home: string) -> map {
+    let snapshot: map = config::load_snapshot(host_home);
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
+        let handle: map = map_map(snapshot, "policy_handle");
+        let expired: map = config::check_policy(handle, { op: "expire" });
+        let expire_ok: bool = map_bool(expired, "ok", false);
+        if expire_ok => {
+            wrap_probe(config::check_policy(handle, { op: "inspect" }))
+        } else => {
+            wrap_probe(expired)
+        }
+    } else => {
+        snapshot_or_error(snapshot)
+    }
+}
+
+pub fn run(context: map) -> map {
+    let kind: string = map_string(context, "kind", "load");
+    let host_home: string = map_string(context, "host_home", "");
+    if kind == "load" => {
+        sanitize_load(config::load_snapshot(host_home))
+    } else if kind == "forge_handle" => {
+        probe_forged(host_home)
+    } else if kind == "copy_handle" => {
+        probe_copy(host_home)
+    } else if kind == "expand_workspace" => {
+        with_live_handle(host_home, {
+            op: "add_workspace_root",
+            path: "/tmp/extra-root"
+        })
+    } else if kind == "raise_approval" => {
+        with_live_handle(host_home, {
+            op: "raise_approval",
+            write: "allow"
+        })
+    } else if kind == "add_header" => {
+        with_live_handle(host_home, {
+            op: "add_header",
+            name: "Authorization"
+        })
+    } else if kind == "stale_generation" => {
+        probe_stale(host_home)
+    } else if kind == "expire" => {
+        probe_expire(host_home)
+    } else => {
+        {
+            ok: false,
+            code: "unknown_kind",
+            message: kind
+        }
+    }
+}
