@@ -9,6 +9,8 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
@@ -327,32 +329,14 @@ impl ConfigFile {
     }
 
     pub fn validate_auth_references(&self, auth: &AuthConfig) -> Result<(), ConfigFileError> {
-        if self.model.provider != "local-agent"
-            && !self.providers.contains_key(&self.model.provider)
-        {
-            return Err(ConfigFileError::InvalidProviderReference {
-                path: "model.provider".to_string(),
-                provider: self.model.provider.clone(),
-            });
-        }
         for (provider_name, provider) in &self.providers {
             if let Some(credential_id) = provider.auth.as_deref() {
                 let path = format!("providers.{provider_name}.auth");
-                let credential = auth.credentials.get(credential_id).ok_or_else(|| {
-                    ConfigFileError::InvalidAuthReference {
-                        path: path.clone(),
-                        credential_id: credential_id.to_string(),
-                        reason: "credential ID is not present in auth.yaml".to_string(),
-                    }
-                })?;
-                if credential.provider != *provider_name {
+                if !auth.credentials.contains_key(credential_id) {
                     return Err(ConfigFileError::InvalidAuthReference {
                         path,
                         credential_id: credential_id.to_string(),
-                        reason: format!(
-                            "credential belongs to provider {:?}, not {:?}",
-                            credential.provider, provider_name
-                        ),
+                        reason: "credential ID is not present in auth.yaml".to_string(),
                     });
                 }
             }
@@ -435,8 +419,6 @@ impl ConfigFile {
                 &provider.base_url,
                 source,
                 &format!("providers.{provider_name}.base_url"),
-                provider_name,
-                ProviderUrlKind::Base,
                 false,
             )?;
             if let Some(auth) = provider.auth.as_deref() {
@@ -519,23 +501,12 @@ fn validate_oauth(
     if let Some(client_id) = oauth.client_id.as_deref() {
         validate_visible(client_id, source, &format!("{prefix}.client_id"))?;
     }
-    for (field, kind, value) in [
-        ("issuer", ProviderUrlKind::Issuer, oauth.issuer.as_deref()),
-        (
-            "token_endpoint",
-            ProviderUrlKind::TokenEndpoint,
-            oauth.token_endpoint.as_deref(),
-        ),
+    for (field, value) in [
+        ("issuer", oauth.issuer.as_deref()),
+        ("token_endpoint", oauth.token_endpoint.as_deref()),
     ] {
         if let Some(value) = value {
-            validate_provider_url(
-                value,
-                source,
-                &format!("{prefix}.{field}"),
-                provider_name,
-                kind,
-                false,
-            )?;
+            validate_provider_url(value, source, &format!("{prefix}.{field}"), false)?;
         }
     }
     if let Some(redirect_uri) = oauth.redirect_uri.as_deref() {
@@ -543,8 +514,6 @@ fn validate_oauth(
             redirect_uri,
             source,
             &format!("{prefix}.redirect_uri"),
-            provider_name,
-            ProviderUrlKind::RedirectUri,
             true,
         )?;
     }
@@ -570,20 +539,10 @@ fn validate_oauth(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderUrlKind {
-    Base,
-    Issuer,
-    TokenEndpoint,
-    RedirectUri,
-}
-
 fn validate_provider_url(
     value: &str,
     source: &Path,
     field: &str,
-    provider_name: &str,
-    kind: ProviderUrlKind,
     allow_loopback_http: bool,
 ) -> Result<(), ConfigFileError> {
     let url = Url::parse(value).map_err(|_| invalid_value(source, field, "invalid URL"))?;
@@ -621,37 +580,14 @@ fn validate_provider_url(
             scheme: url.scheme().to_string(),
         });
     }
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| invalid_value(source, field, "URL must use a known HTTPS port"))?;
-
-    // Task 1 treats YAML as the operator-selected static authority. Built-in
-    // Codex authorities are fixed here; custom provider names retain their
-    // explicitly configured HTTPS authority. Every later runtime request must
-    // enforce the same policy again instead of accepting an RSS-supplied URL.
-    if let Some((expected_host, expected_port)) = provider_authority(provider_name, kind)
-        && (host != expected_host || port != expected_port)
-    {
-        return Err(ConfigFileError::ProviderAuthorityNotAllowed {
-            path: field.to_string(),
-            provider: provider_name.to_string(),
-            authority: format!("{host}:{port}"),
-            expected: format!("{expected_host}:{expected_port}"),
-        });
+    if url.port_or_known_default().is_none() {
+        return Err(invalid_value(
+            source,
+            field,
+            "URL must use a known HTTPS port",
+        ));
     }
     Ok(())
-}
-
-fn provider_authority(provider_name: &str, kind: ProviderUrlKind) -> Option<(&'static str, u16)> {
-    if provider_name != "openai-codex" {
-        return None;
-    }
-    Some(match kind {
-        ProviderUrlKind::Base => ("chatgpt.com", 443),
-        ProviderUrlKind::Issuer | ProviderUrlKind::TokenEndpoint | ProviderUrlKind::RedirectUri => {
-            ("auth.openai.com", 443)
-        }
-    })
 }
 
 fn validate_relative_endpoint(
@@ -1579,20 +1515,19 @@ pub enum ConfigFileError {
         path: String,
         scheme: String,
     },
-    ProviderAuthorityNotAllowed {
-        path: String,
-        provider: String,
-        authority: String,
-        expected: String,
-    },
-    InvalidProviderReference {
-        path: String,
-        provider: String,
-    },
     InvalidAuthReference {
         path: String,
         credential_id: String,
         reason: String,
+    },
+    PolicyHandleInvalid,
+    PolicyStaleGeneration {
+        expected: u64,
+        actual: u64,
+    },
+    PolicyExpired,
+    PolicyOverreach {
+        operation: String,
     },
     HomeUnavailable {
         variable: String,
@@ -1725,19 +1660,6 @@ impl fmt::Display for ConfigFileError {
             Self::HttpsRequired { path, scheme } => {
                 write!(formatter, "config URL {path} must use HTTPS (got {scheme})")
             }
-            Self::ProviderAuthorityNotAllowed {
-                path,
-                provider,
-                authority,
-                expected,
-            } => write!(
-                formatter,
-                "provider authority for {provider:?} at {path} is not allowed: {authority:?}; expected {expected:?}"
-            ),
-            Self::InvalidProviderReference { path, provider } => write!(
-                formatter,
-                "config field {path} references unknown provider {provider:?}"
-            ),
             Self::InvalidAuthReference {
                 path,
                 credential_id,
@@ -1745,6 +1667,18 @@ impl fmt::Display for ConfigFileError {
             } => write!(
                 formatter,
                 "invalid auth reference {path} -> {credential_id:?}: {reason}"
+            ),
+            Self::PolicyHandleInvalid => {
+                write!(formatter, "policy handle is missing, forged, or unusable")
+            }
+            Self::PolicyStaleGeneration { expected, actual } => write!(
+                formatter,
+                "policy generation {actual} is stale; expected {expected}"
+            ),
+            Self::PolicyExpired => write!(formatter, "policy handle has expired"),
+            Self::PolicyOverreach { operation } => write!(
+                formatter,
+                "RSS cannot expand trusted policy via {operation}"
             ),
             Self::HomeUnavailable { variable } => write!(
                 formatter,
@@ -1762,6 +1696,248 @@ impl std::error::Error for ConfigFileError {
             Self::Auth(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl ConfigFileError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::PolicyHandleInvalid => "policy_handle_invalid",
+            Self::PolicyStaleGeneration { .. } => "policy_stale_generation",
+            Self::PolicyExpired => "policy_expired",
+            Self::PolicyOverreach { .. } => "policy_overreach",
+            Self::InvalidAuthReference { .. } => "invalid_auth_reference",
+            Self::HttpsRequired { .. } => "https_required",
+            Self::HomeUnavailable { .. } | Self::HomeInvalid { .. } => "home_invalid",
+            _ => "config_invalid",
+        }
+    }
+
+    pub fn path(&self) -> Option<String> {
+        match self {
+            Self::MissingFile { path }
+            | Self::FileRead { path, .. }
+            | Self::FileTooLarge { path, .. }
+            | Self::MalformedYaml { path, .. }
+            | Self::MultipleDocuments { path }
+            | Self::InvalidRoot { path }
+            | Self::InvalidVersion { path, .. }
+            | Self::InvalidValue { path, .. } => Some(path.display().to_string()),
+            Self::YamlTooDeep { path, .. }
+            | Self::YamlTooComplex { path, .. }
+            | Self::YamlTooLarge { path, .. }
+            | Self::UnknownKey { path, .. }
+            | Self::SecretKey { path, .. }
+            | Self::HttpsRequired { path, .. }
+            | Self::InvalidAuthReference { path, .. } => Some(path.clone()),
+            Self::Auth(error) => Some(error.to_string()),
+            _ => None,
+        }
+    }
+}
+
+const POLICY_HANDLE_CLASS: &str = "OpaquePolicyHandle";
+const POLICY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Host-minted policy capability. RSS may copy it but cannot construct, forge,
+/// stringify, or expand a trusted policy from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpaquePolicyHandle {
+    id: String,
+}
+
+impl OpaquePolicyHandle {
+    pub fn class(&self) -> &'static str {
+        POLICY_HANDLE_CLASS
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn from_id(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+
+/// Sanitized, RSS-visible policy summary. It never includes tokens, raw
+/// authorities that RSS could replay, or handle internals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SanitizedPolicySummary {
+    pub providers: Vec<String>,
+    pub workspace_root_count: usize,
+    pub approval_read: String,
+    pub approval_write: String,
+    pub approval_process: String,
+    pub policy_generation: u64,
+    pub max_turns: u64,
+    pub max_tool_calls: u64,
+    pub max_tool_output_bytes: usize,
+}
+
+/// Canonical Stage A snapshot envelope returned by [`load_snapshot`].
+#[derive(Clone, Debug)]
+pub struct ConfigSnapshotEnvelope {
+    pub public_config: ConfigFile,
+    pub credential_refs: Vec<String>,
+    pub policy_handle: OpaquePolicyHandle,
+    pub policy_generation: u64,
+    pub policy_summary: SanitizedPolicySummary,
+}
+
+/// Fixture/host policy probe intent. Production workspace/OAuth surfaces later
+/// replace these operations; Stage A only proves the handle cannot expand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PolicyIntent {
+    pub op: String,
+    pub path: Option<String>,
+    pub write: Option<String>,
+    pub name: Option<String>,
+    pub policy_generation: Option<u64>,
+}
+
+/// Successful policy probe result.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PolicyProbe {
+    pub ok: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct TrustedPolicySnapshot {
+    home: PathBuf,
+    generation: u64,
+    expires_at: Instant,
+    revoked: bool,
+    expired: bool,
+    providers: Vec<String>,
+    workspace_root_count: usize,
+    approval_read: String,
+    approval_write: String,
+    approval_process: String,
+    max_turns: u64,
+    max_tool_calls: u64,
+    max_tool_output_bytes: usize,
+}
+
+#[derive(Default)]
+struct PolicyTable {
+    entries: HashMap<String, TrustedPolicySnapshot>,
+    generations: HashMap<PathBuf, u64>,
+}
+
+fn policy_table() -> &'static Mutex<PolicyTable> {
+    static TABLE: OnceLock<Mutex<PolicyTable>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(PolicyTable::default()))
+}
+
+fn lock_policy_table() -> std::sync::MutexGuard<'static, PolicyTable> {
+    policy_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Loads `config.yaml` + `auth.yaml` for a host-resolved home and injects a
+/// trusted policy handle. Raw tokens stay host-side.
+pub fn load_snapshot(
+    host_home: impl AsRef<Path>,
+) -> Result<ConfigSnapshotEnvelope, ConfigFileError> {
+    let paths = AgentPaths::from_home(host_home)?;
+    let loaded = ConfigFile::load_pair(&paths)?;
+    let credential_refs = loaded.auth.credentials.keys().cloned().collect::<Vec<_>>();
+    let mut table = lock_policy_table();
+    let generation = table
+        .generations
+        .get(&paths.home)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
+    table.generations.insert(paths.home.clone(), generation);
+    for entry in table.entries.values_mut() {
+        if entry.home == paths.home {
+            entry.revoked = true;
+        }
+    }
+    let summary = SanitizedPolicySummary {
+        providers: loaded.config.providers.keys().cloned().collect(),
+        workspace_root_count: loaded.config.workspaces.allowed_roots.len(),
+        approval_read: loaded.config.approvals.read.clone(),
+        approval_write: loaded.config.approvals.write.clone(),
+        approval_process: loaded.config.approvals.process.clone(),
+        policy_generation: generation,
+        max_turns: loaded.config.agent.max_turns,
+        max_tool_calls: loaded.config.agent.max_tool_calls,
+        max_tool_output_bytes: loaded.config.agent.max_tool_output_bytes,
+    };
+    let handle = OpaquePolicyHandle::from_id(format!("oph_{}", uuid::Uuid::new_v4().simple()));
+    table.entries.insert(
+        handle.id().to_string(),
+        TrustedPolicySnapshot {
+            home: paths.home,
+            generation,
+            expires_at: Instant::now() + POLICY_TTL,
+            revoked: false,
+            expired: false,
+            providers: summary.providers.clone(),
+            workspace_root_count: summary.workspace_root_count,
+            approval_read: summary.approval_read.clone(),
+            approval_write: summary.approval_write.clone(),
+            approval_process: summary.approval_process.clone(),
+            max_turns: summary.max_turns,
+            max_tool_calls: summary.max_tool_calls,
+            max_tool_output_bytes: summary.max_tool_output_bytes,
+        },
+    );
+    Ok(ConfigSnapshotEnvelope {
+        public_config: loaded.config,
+        credential_refs,
+        policy_handle: handle,
+        policy_generation: generation,
+        policy_summary: summary,
+    })
+}
+
+/// Fixture host probe: copies alias the same entry; forged, stale, expired, or
+/// expanding intents fail closed.
+pub fn check_policy(
+    handle: &OpaquePolicyHandle,
+    intent: &PolicyIntent,
+) -> Result<PolicyProbe, ConfigFileError> {
+    let mut table = lock_policy_table();
+    let entry = table
+        .entries
+        .get_mut(handle.id())
+        .ok_or(ConfigFileError::PolicyHandleInvalid)?;
+    if entry.revoked {
+        return Err(ConfigFileError::PolicyStaleGeneration {
+            expected: entry.generation,
+            actual: intent.policy_generation.unwrap_or(0),
+        });
+    }
+    if entry.expired || Instant::now() >= entry.expires_at {
+        return Err(ConfigFileError::PolicyExpired);
+    }
+    if let Some(claimed) = intent.policy_generation
+        && claimed != entry.generation
+    {
+        return Err(ConfigFileError::PolicyStaleGeneration {
+            expected: entry.generation,
+            actual: claimed,
+        });
+    }
+    match intent.op.as_str() {
+        "inspect" => Ok(PolicyProbe { ok: true }),
+        "expire" => {
+            entry.expired = true;
+            entry.expires_at = Instant::now();
+            Ok(PolicyProbe { ok: true })
+        }
+        "add_workspace_root" | "raise_approval" | "add_header" => {
+            Err(ConfigFileError::PolicyOverreach {
+                operation: intent.op.clone(),
+            })
+        }
+        _ => Err(ConfigFileError::PolicyHandleInvalid),
     }
 }
 
