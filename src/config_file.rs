@@ -316,7 +316,9 @@ impl ConfigFile {
     }
 
     pub fn validate_auth_references(&self, auth: &AuthConfig) -> Result<(), ConfigFileError> {
-        if !self.providers.is_empty() && !self.providers.contains_key(&self.model.provider) {
+        if self.model.provider != "local-agent"
+            && !self.providers.contains_key(&self.model.provider)
+        {
             return Err(ConfigFileError::InvalidProviderReference {
                 path: "model.provider".to_string(),
                 provider: self.model.provider.clone(),

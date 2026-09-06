@@ -199,6 +199,80 @@ fn invalid_auth_reference_is_rejected_when_loading_a_pair() {
 }
 
 #[test]
+fn model_provider_references_reject_unknowns_but_allow_builtin_and_defined_names() {
+    let empty_auth = AuthConfig::from_str("version: 1\n").expect("empty auth document");
+    let empty_providers = ConfigFile::from_str(
+        "version: 1\nmodel:\n  provider: unknown-empty\n  model: local-agent\n",
+    )
+    .expect("config with no provider map");
+    let error = empty_providers
+        .validate_auth_references(&empty_auth)
+        .expect_err("an unknown provider must fail without a provider map");
+    assert!(matches!(
+        error,
+        ConfigFileError::InvalidProviderReference { path, provider }
+            if path == "model.provider" && provider == "unknown-empty"
+    ));
+
+    let populated_providers = ConfigFile::from_str(&valid_config("codex-primary").replacen(
+        "  provider: openai-codex",
+        "  provider: unknown-populated",
+        1,
+    ))
+    .expect("config with a populated provider map");
+    let auth = AuthConfig::from_str(&valid_auth("codex-primary")).expect("matching auth document");
+    let error = populated_providers
+        .validate_auth_references(&auth)
+        .expect_err("an unknown provider must fail with a provider map");
+    assert!(matches!(
+        error,
+        ConfigFileError::InvalidProviderReference { path, provider }
+            if path == "model.provider" && provider == "unknown-populated"
+    ));
+
+    let builtin_without_map =
+        ConfigFile::from_str("version: 1\nmodel:\n  provider: local-agent\n  model: local-agent\n")
+            .expect("builtin config without a provider map");
+    builtin_without_map
+        .validate_auth_references(&empty_auth)
+        .expect("local-agent remains valid without a provider map");
+
+    let builtin_with_map = ConfigFile::from_str(&valid_config("codex-primary").replacen(
+        "  provider: openai-codex",
+        "  provider: local-agent",
+        1,
+    ))
+    .expect("builtin config with a populated provider map");
+    builtin_with_map
+        .validate_auth_references(&auth)
+        .expect("local-agent remains valid with a provider map");
+
+    let defined_provider =
+        ConfigFile::from_str(&valid_config("codex-primary")).expect("defined provider config");
+    defined_provider
+        .validate_auth_references(&auth)
+        .expect("a provider defined in the map remains valid");
+}
+
+#[test]
+fn provider_auth_references_still_require_a_matching_credential() {
+    let config = ConfigFile::from_str(&valid_config("codex-primary")).expect("valid config");
+    let mismatched_auth = AuthConfig::from_str(
+        &valid_auth("codex-primary").replace("provider: openai-codex", "provider: other-provider"),
+    )
+    .expect("valid auth with a different provider");
+
+    let error = config
+        .validate_auth_references(&mismatched_auth)
+        .expect_err("provider auth references must remain type-checked");
+    assert!(matches!(
+        error,
+        ConfigFileError::InvalidAuthReference { path, credential_id, .. }
+            if path == "providers.openai-codex.auth" && credential_id == "codex-primary"
+    ));
+}
+
+#[test]
 fn provider_endpoints_require_https_except_loopback_callback() {
     let root = temp_root("https-policy");
     let path = root.join("config.yaml");
