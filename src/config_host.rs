@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use rustscript_vm::{
     CallOutcome, CallReturn, CompileSourceFileOptions, HostApiBuilder, HostApiCatalog,
@@ -17,24 +18,26 @@ use rustscript_vm::{
 use serde_json::{Value as JsonValue, json};
 
 use crate::config_file::{
-    ConfigFileError, ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, check_policy,
-    load_snapshot,
+    ConfigFileError, ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyOwner,
+    PolicyProbe,
 };
 use crate::domain::{json_to_vm_value, vm_value_to_json};
-use crate::host_opaque::OpaqueHostValue;
+use crate::host_opaque::{OpaqueError, OpaqueRegistry};
 
 const CONFIG_LOAD_SNAPSHOT: &str = "config::load_snapshot";
 const CONFIG_CHECK_POLICY: &str = "config::check_policy";
 const HOST_HOME_CLASS: &str = "HostHome";
+const FIXTURE_RUN_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 struct BoundHostHome {
     path: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ConfigFixtureState {
     home: PathBuf,
+    policies: Arc<PolicyOwner>,
 }
 
 /// Test-only catalog that exposes the Stage A config bridge.
@@ -97,15 +100,37 @@ pub(crate) fn register_host_functions(
 /// surface.
 pub struct ConfigFixtureHost {
     home: PathBuf,
+    opaques: Arc<OpaqueRegistry>,
+    policies: Arc<PolicyOwner>,
 }
 
 impl ConfigFixtureHost {
     pub fn bind(home: impl Into<PathBuf>) -> Self {
-        Self { home: home.into() }
+        let home = home.into();
+        let opaques = OpaqueRegistry::new();
+        let policies =
+            PolicyOwner::new(Arc::clone(&opaques), Instant::now() + FIXTURE_RUN_DEADLINE);
+        Self {
+            home,
+            opaques,
+            policies,
+        }
     }
 
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    pub fn load_snapshot(&self) -> Result<ConfigSnapshotEnvelope, ConfigFileError> {
+        self.policies.load_snapshot(&self.home)
+    }
+
+    pub fn check_policy(
+        &self,
+        handle: &OpaquePolicyHandle,
+        intent: &PolicyIntent,
+    ) -> Result<PolicyProbe, ConfigFileError> {
+        self.policies.check_policy(handle, intent)
     }
 
     pub fn run(&self, kind: &str) -> Result<Value, String> {
@@ -120,24 +145,40 @@ impl ConfigFixtureHost {
             .map_err(|error| error.to_string())?;
         vm.host_context().set_module_state(ConfigFixtureState {
             home: self.home.clone(),
+            policies: Arc::clone(&self.policies),
         });
         drive_root_frame(&mut vm)?;
         let callable = vm
             .resolve_exported_callable("run")
             .map_err(|_| "config fixture entry `run` is missing".to_string())?;
-        let host_home = OpaqueHostValue::mint(
-            HOST_HOME_CLASS,
-            BoundHostHome {
-                path: self.home.clone(),
-            },
-        )
-        .to_vm_value();
+        let host_home = self
+            .opaques
+            .mint(
+                HOST_HOME_CLASS,
+                BoundHostHome {
+                    path: self.home.clone(),
+                },
+            )
+            .map_err(|error| match error {
+                OpaqueError::LiveHandleLimit => "opaque live handle limit reached".to_string(),
+                OpaqueError::PrototypeIdSpaceExhausted => {
+                    "opaque prototype id space exhausted".to_string()
+                }
+            })?
+            .to_vm_value();
         let context = Value::map(vec![
             (Value::string("kind"), Value::string(kind)),
             (Value::string("host_home"), host_home),
         ]);
         vm.invoke_callable(callable, &[context])
             .map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for ConfigFixtureHost {
+    fn drop(&mut self) {
+        self.policies.clear();
+        self.opaques.clear();
     }
 }
 
@@ -197,13 +238,16 @@ fn register_named(
 }
 
 fn load_snapshot_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let bound_home = match vm.host_context().module_state::<ConfigFixtureState>() {
-        Some(state) => state.home.clone(),
-        None => {
-            return return_json(error_envelope(&ConfigFileError::HomeInvalid {
-                reason: "config fixture host home is not bound".to_string(),
-                path: None,
-            }));
+    let (bound_home, policies) = {
+        let context = vm.host_context();
+        match context.module_state::<ConfigFixtureState>() {
+            Some(state) => (state.home.clone(), Arc::clone(&state.policies)),
+            None => {
+                return return_json(error_envelope(&ConfigFileError::HomeInvalid {
+                    reason: "config fixture host home is not bound".to_string(),
+                    path: None,
+                }));
+            }
         }
     };
     if matches!(args.first(), Some(Value::String(_))) {
@@ -214,9 +258,10 @@ fn load_snapshot_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
     let Some(bound) = args
         .first()
-        .and_then(OpaqueHostValue::from_vm_value)
+        .and_then(|value| policies.opaques().from_vm_value(value))
         .filter(|value| value.class() == HOST_HOME_CLASS)
-        .and_then(|value| value.downcast_ref::<BoundHostHome>().cloned())
+        .and_then(|value| value.downcast_arc::<BoundHostHome>())
+        .map(|home| (*home).clone())
     else {
         return return_json(error_envelope(&ConfigFileError::HomeInvalid {
             reason: "host_home must be the host-bound HostHome".to_string(),
@@ -229,21 +274,33 @@ fn load_snapshot_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             path: Some(bound_home),
         }));
     }
-    match load_snapshot(&bound_home) {
+    match policies.load_snapshot(&bound_home) {
         Ok(snapshot) => return_value(snapshot_to_vm_value(&snapshot)),
         Err(error) => return_json(error_envelope(&error)),
     }
 }
 
-fn check_policy_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let handle = match args.first().and_then(OpaquePolicyHandle::from_vm_value) {
+fn check_policy_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let policies = {
+        let context = vm.host_context();
+        match context.module_state::<ConfigFixtureState>() {
+            Some(state) => Arc::clone(&state.policies),
+            None => {
+                return return_json(error_envelope(&ConfigFileError::PolicyHandleInvalid));
+            }
+        }
+    };
+    let handle = match args
+        .first()
+        .and_then(|value| OpaquePolicyHandle::from_vm_value(policies.opaques(), value))
+    {
         Some(handle) => handle,
         None => {
             return return_json(error_envelope(&ConfigFileError::PolicyHandleInvalid));
         }
     };
     let intent = parse_intent(args.get(1));
-    match check_policy(&handle, &intent) {
+    match policies.check_policy(&handle, &intent) {
         Ok(probe) => return_json(json!({ "ok": probe.ok })),
         Err(error) => return_json(error_envelope(&error)),
     }

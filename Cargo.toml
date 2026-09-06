@@ -43,3 +43,12 @@ webpki-roots = "1"
 
 [dev-dependencies]
 tracing-core = "0.1"
+
+[features]
+default = []
+config-fixture = []
+
+[[test]]
+name = "config_auth_rss_tests"
+path = "tests/config_auth_rss_tests.rs"
+required-features = ["config-fixture"]

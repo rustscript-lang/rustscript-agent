@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustscript_agent::config::{PolicyIntent, check_policy, load_snapshot};
+use rustscript_agent::agent_host_catalog;
 use rustscript_agent::config_file::ConfigFileError;
-use rustscript_agent::{ConfigFixtureHost, agent_host_catalog, config_fixture_catalog};
+use rustscript_agent::config_fixture::{ConfigFixtureHost, PolicyIntent, config_fixture_catalog};
 use rustscript_vm::Value;
 use serde_json::{Value as JsonValue, json};
 
@@ -107,18 +107,15 @@ fn assert_no_raw_secrets(value: &JsonValue) {
     }
 }
 
-fn run_kind(home: &Path, kind: &str) -> (JsonValue, Vec<JsonValue>) {
+fn run_kind(home: &Path, kind: &str) -> JsonValue {
     let complete = ConfigFixtureHost::bind(home)
         .run(kind)
         .unwrap_or_else(|error| panic!("RSS config/auth fixture should complete: {error}"));
-    (vm_value_to_json(&complete), Vec::new())
+    vm_value_to_json(&complete)
 }
 
-fn assert_secret_free_run(complete: &JsonValue, events: &[JsonValue]) {
+fn assert_secret_free_complete(complete: &JsonValue) {
     assert_no_raw_secrets(complete);
-    for event in events {
-        assert_no_raw_secrets(event);
-    }
 }
 
 fn assert_path_qualified_error(complete: &JsonValue, code: &str, path_needle: &str) {
@@ -138,7 +135,9 @@ fn assert_path_qualified_error(complete: &JsonValue, code: &str, path_needle: &s
 #[test]
 fn load_snapshot_exposes_opaque_credential_refs_without_raw_tokens() {
     let home = copy_fixture_home("snapshot", "config.yaml", "auth.yaml");
-    let snapshot = load_snapshot(&home).expect("fixture snapshot should load");
+    let snapshot = ConfigFixtureHost::bind(&home)
+        .load_snapshot()
+        .expect("fixture snapshot should load");
     assert_eq!(snapshot.public_config.model.provider, "openai-codex");
     assert_eq!(snapshot.credential_refs, vec!["fixture-codex".to_string()]);
     assert_eq!(snapshot.policy_handle.class(), "OpaquePolicyHandle");
@@ -159,44 +158,48 @@ fn load_snapshot_exposes_opaque_credential_refs_without_raw_tokens() {
 #[test]
 fn rust_load_snapshot_and_policy_check_match_rss_surface() {
     let home = copy_fixture_home("rust-check", "config.yaml", "auth.yaml");
-    let snapshot = load_snapshot(&home).expect("load");
-    let inspect = check_policy(
-        &snapshot.policy_handle,
-        &PolicyIntent {
-            op: "inspect".into(),
-            ..PolicyIntent::default()
-        },
-    )
-    .expect("inspect");
+    let host = ConfigFixtureHost::bind(&home);
+    let snapshot = host.load_snapshot().expect("load");
+    let inspect = host
+        .check_policy(
+            &snapshot.policy_handle,
+            &PolicyIntent {
+                op: "inspect".into(),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect("inspect");
     assert!(inspect.ok);
 
-    let overreach = check_policy(
-        &snapshot.policy_handle,
-        &PolicyIntent {
-            op: "add_workspace_root".into(),
-            path: Some("/tmp/extra-root".into()),
-            ..PolicyIntent::default()
-        },
-    )
-    .expect_err("overreach");
+    let overreach = host
+        .check_policy(
+            &snapshot.policy_handle,
+            &PolicyIntent {
+                op: "add_workspace_root".into(),
+                path: Some("/tmp/extra-root".into()),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect_err("overreach");
     assert!(matches!(overreach, ConfigFileError::PolicyOverreach { .. }));
 
-    let admitted = check_policy(
-        &snapshot.policy_handle,
-        &PolicyIntent {
-            op: "add_workspace_root".into(),
-            path: Some("/tmp/rustscript-agent-workspace".into()),
-            ..PolicyIntent::default()
-        },
-    )
-    .expect_err("frozen admitted root still cannot be added");
+    let admitted = host
+        .check_policy(
+            &snapshot.policy_handle,
+            &PolicyIntent {
+                op: "add_workspace_root".into(),
+                path: Some("/tmp/rustscript-agent-workspace".into()),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect_err("frozen admitted root still cannot be added");
     assert!(matches!(admitted, ConfigFileError::PolicyOverreach { .. }));
 }
 
 #[test]
 fn rss_config_auth_entry_loads_public_snapshot_without_secrets() {
     let home = copy_fixture_home("rss-load", "config.yaml", "auth.yaml");
-    let (complete, events) = run_kind(&home, "load");
+    let complete = run_kind(&home, "load");
     assert_eq!(complete["ok"], true);
     assert_eq!(complete["policy_handle_class"], "OpaquePolicyHandle");
     assert_eq!(
@@ -204,26 +207,26 @@ fn rss_config_auth_entry_loads_public_snapshot_without_secrets() {
         "openai-codex"
     );
     assert!(complete.get("policy_handle").is_none());
-    assert_secret_free_run(&complete, &events);
+    assert_secret_free_complete(&complete);
 }
 
 #[test]
 fn rss_config_auth_entry_rejects_forged_and_copied_handles() {
     let home = copy_fixture_home("rss-forge", "config.yaml", "auth.yaml");
-    let (forged, events) = run_kind(&home, "forge_handle");
+    let forged = run_kind(&home, "forge_handle");
     assert_eq!(forged["ok"], false);
     assert_eq!(forged["error"]["code"], "policy_handle_invalid");
-    assert_secret_free_run(&forged, &events);
+    assert_secret_free_complete(&forged);
 
-    let (copied, events) = run_kind(&home, "copy_handle");
+    let copied = run_kind(&home, "copy_handle");
     assert_eq!(copied["ok"], true);
-    assert_secret_free_run(&copied, &events);
+    assert_secret_free_complete(&copied);
 }
 
 #[test]
 fn rss_config_auth_entry_denies_stringify_serialize_and_path_supply() {
     let home = copy_fixture_home("rss-opaque", "config.yaml", "auth.yaml");
-    let (stringify, events) = run_kind(&home, "stringify_handle");
+    let stringify = run_kind(&home, "stringify_handle");
     assert_eq!(stringify["ok"], true);
     assert_eq!(stringify["handle_type"], "callable");
     let rendered = stringify["rendered"].as_str().unwrap_or_default();
@@ -237,37 +240,37 @@ fn rss_config_auth_entry_denies_stringify_serialize_and_path_supply() {
     );
     assert_eq!(stringify["reconstructed_ok"], false);
     assert_eq!(stringify["reconstructed_code"], "policy_handle_invalid");
-    assert_secret_free_run(&stringify, &events);
+    assert_secret_free_complete(&stringify);
 
-    let (serialize, events) = run_kind(&home, "serialize_handle");
+    let serialize = run_kind(&home, "serialize_handle");
     assert_eq!(serialize["ok"], true);
     assert_eq!(serialize["handle_type"], "callable");
     assert_eq!(serialize["echoed"], "<callable>");
-    assert_secret_free_run(&serialize, &events);
+    assert_secret_free_complete(&serialize);
 
-    let (supplied, events) = run_kind(&home, "supply_path");
+    let supplied = run_kind(&home, "supply_path");
     assert_path_qualified_error(&supplied, "home_invalid", home.to_string_lossy().as_ref());
-    assert_secret_free_run(&supplied, &events);
+    assert_secret_free_complete(&supplied);
 }
 
 #[test]
 fn rss_config_auth_entry_rejects_overreach_and_expired_handles() {
     let home = copy_fixture_home("rss-policy", "config.yaml", "auth.yaml");
-    let (overreach, events) = run_kind(&home, "expand_workspace");
+    let overreach = run_kind(&home, "expand_workspace");
     assert_eq!(overreach["ok"], false);
     assert_eq!(overreach["error"]["code"], "policy_overreach");
-    assert_secret_free_run(&overreach, &events);
+    assert_secret_free_complete(&overreach);
 
-    let (expired, events) = run_kind(&home, "expire");
+    let expired = run_kind(&home, "expire");
     assert_eq!(expired["ok"], false);
     assert_eq!(expired["error"]["code"], "policy_expired");
-    assert_secret_free_run(&expired, &events);
+    assert_secret_free_complete(&expired);
 }
 
 #[test]
 fn rss_config_auth_entry_reports_missing_file_path() {
     let home = temp_home("missing-file");
-    let (complete, events) = run_kind(&home, "load");
+    let complete = run_kind(&home, "load");
     assert_path_qualified_error(&complete, "config_invalid", "config.yaml");
     assert!(
         complete["error"]["path"]
@@ -275,15 +278,15 @@ fn rss_config_auth_entry_reports_missing_file_path() {
             .unwrap_or_default()
             .contains(&home.join("config.yaml").display().to_string())
     );
-    assert_secret_free_run(&complete, &events);
+    assert_secret_free_complete(&complete);
 }
 
 #[test]
 fn rss_config_auth_entry_reports_invalid_home_path() {
     let home = PathBuf::from("relative-not-absolute");
-    let (complete, events) = run_kind(&home, "load");
+    let complete = run_kind(&home, "load");
     assert_path_qualified_error(&complete, "home_invalid", "relative-not-absolute");
-    assert_secret_free_run(&complete, &events);
+    assert_secret_free_complete(&complete);
 }
 
 #[test]
@@ -298,13 +301,13 @@ fn rss_config_auth_entry_reports_https_failure_path() {
         ),
     )
     .expect("write http config");
-    let (complete, events) = run_kind(&home, "load");
+    let complete = run_kind(&home, "load");
     assert_path_qualified_error(
         &complete,
         "https_required",
         "providers.openai-codex.base_url",
     );
-    assert_secret_free_run(&complete, &events);
+    assert_secret_free_complete(&complete);
 }
 
 #[test]
@@ -316,13 +319,13 @@ fn rss_config_auth_entry_reports_invalid_auth_reference_path() {
         config.replace("auth: fixture-codex", "auth: missing-credential"),
     )
     .expect("write invalid auth ref");
-    let (complete, events) = run_kind(&home, "load");
+    let complete = run_kind(&home, "load");
     assert_path_qualified_error(
         &complete,
         "invalid_auth_reference",
         "providers.openai-codex.auth",
     );
-    assert_secret_free_run(&complete, &events);
+    assert_secret_free_complete(&complete);
 }
 
 #[test]
@@ -362,30 +365,84 @@ fn config_fixture_catalog_exposes_stage_a_bridge() {
 }
 
 #[test]
-fn rust_reload_revokes_previous_handle() {
+fn rust_reload_removes_previous_handle() {
     let home = copy_fixture_home("reload", "config.yaml", "auth.yaml");
-    let first = load_snapshot(&home).expect("first load");
-    let second = load_snapshot(&home).expect("second load");
+    let host = ConfigFixtureHost::bind(&home);
+    let first = host.load_snapshot().expect("first load");
+    let second = host.load_snapshot().expect("second load");
     assert_ne!(first.policy_generation, second.policy_generation);
-    let stale = check_policy(
-        &first.policy_handle,
-        &PolicyIntent {
-            op: "inspect".into(),
-            ..PolicyIntent::default()
-        },
-    )
-    .expect_err("revoked handle");
-    assert!(matches!(
-        stale,
-        ConfigFileError::PolicyStaleGeneration { .. }
-    ));
-    let inspect = check_policy(
-        &second.policy_handle,
-        &PolicyIntent {
-            op: "inspect".into(),
-            ..PolicyIntent::default()
-        },
-    )
-    .expect("new handle");
+    let stale = host
+        .check_policy(
+            &first.policy_handle,
+            &PolicyIntent {
+                op: "inspect".into(),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect_err("revoked handle");
+    assert!(matches!(stale, ConfigFileError::PolicyHandleInvalid));
+    let inspect = host
+        .check_policy(
+            &second.policy_handle,
+            &PolicyIntent {
+                op: "inspect".into(),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect("new handle");
     assert!(inspect.ok);
+}
+
+#[test]
+fn escaped_policy_handle_fails_after_host_drop() {
+    let home = copy_fixture_home("escape", "config.yaml", "auth.yaml");
+    let handle;
+    {
+        let host = ConfigFixtureHost::bind(&home);
+        handle = host.load_snapshot().expect("load").policy_handle;
+        host.check_policy(
+            &handle,
+            &PolicyIntent {
+                op: "inspect".into(),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect("live handle");
+    }
+    let host = ConfigFixtureHost::bind(&home);
+    let error = host
+        .check_policy(
+            &handle,
+            &PolicyIntent {
+                op: "inspect".into(),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect_err("escaped handle");
+    assert!(matches!(error, ConfigFileError::PolicyHandleInvalid));
+}
+
+#[test]
+fn production_crate_root_does_not_export_fixture_mutation_surface() {
+    let lib = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+        .expect("src/lib.rs");
+    assert!(
+        !lib.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed == "pub use config_host::{ConfigFixtureHost, config_fixture_catalog};"
+                || trimmed.contains("pub use config_file::{") && trimmed.contains("check_policy")
+        }),
+        "production crate root must not unconditionally export fixture mutation APIs:\n{lib}"
+    );
+    let opaque =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/host_opaque.rs"))
+            .expect("src/host_opaque.rs");
+    assert!(
+        !opaque.contains("unsafe"),
+        "host opaque handles must not use unsafe layout fabrication"
+    );
+    assert!(
+        !opaque.contains("transmute") && !opaque.contains("from_raw"),
+        "host opaque handles must not transmute private pd-vm types"
+    );
 }
