@@ -149,6 +149,17 @@ fn missing_config_and_auth_files_are_typed_errors() {
 
     let auth_error = AuthConfig::load(&paths.auth).expect_err("missing auth must fail");
     assert!(matches!(auth_error, AuthConfigError::MissingFile { .. }));
+
+    fs::write(&paths.config, valid_config("missing-id")).expect("write config");
+    let pair_error = ConfigFile::load_pair(&paths).expect_err("missing auth pair must fail");
+    let reported = pair_error
+        .path()
+        .expect("auth error must carry a filesystem path");
+    assert_eq!(reported, paths.auth.display().to_string());
+    assert!(
+        !reported.contains("auth file is missing"),
+        "ConfigFileError::path must be the file path, not Display prose: {reported}"
+    );
 }
 
 #[test]

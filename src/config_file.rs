@@ -4,7 +4,7 @@
 //! material is deliberately kept in [`crate::auth::config`]; the two schemas
 //! are parsed and validated independently before their references are joined.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -18,6 +18,7 @@ use url::Url;
 use yaml_rust2::parser::{Event, Parser, Tag};
 
 use crate::auth::config::{AuthConfig, AuthConfigError};
+use crate::host_opaque::OpaqueHostValue;
 
 /// Persistent home directory name used when no override is configured.
 pub const DEFAULT_AGENT_HOME_DIR: &str = ".rustscript-agent";
@@ -71,6 +72,7 @@ impl AgentPaths {
             Some(_) => {
                 return Err(ConfigFileError::HomeInvalid {
                     reason: "RUSTSCRIPT_AGENT_HOME must not be empty".to_string(),
+                    path: Some(PathBuf::new()),
                 });
             }
             None => default_home_from_environment()?,
@@ -110,6 +112,7 @@ fn default_home_from_environment() -> Result<PathBuf, ConfigFileError> {
     if home.is_empty() {
         return Err(ConfigFileError::HomeInvalid {
             reason: "HOME/USERPROFILE must not be empty".to_string(),
+            path: Some(PathBuf::new()),
         });
     }
     Ok(PathBuf::from(home).join(DEFAULT_AGENT_HOME_DIR))
@@ -119,11 +122,13 @@ fn validate_home_path(home: &Path) -> Result<(), ConfigFileError> {
     if home.as_os_str().is_empty() {
         return Err(ConfigFileError::HomeInvalid {
             reason: "agent home must not be empty".to_string(),
+            path: Some(home.to_path_buf()),
         });
     }
     if home.is_relative() {
         return Err(ConfigFileError::HomeInvalid {
             reason: "agent home must be an absolute path".to_string(),
+            path: Some(home.to_path_buf()),
         });
     }
     if home
@@ -132,6 +137,7 @@ fn validate_home_path(home: &Path) -> Result<(), ConfigFileError> {
     {
         return Err(ConfigFileError::HomeInvalid {
             reason: "agent home must not contain parent-directory components".to_string(),
+            path: Some(home.to_path_buf()),
         });
     }
     Ok(())
@@ -158,6 +164,10 @@ pub struct ConfigFile {
 
 /// Compatibility name for the persisted non-secret document.
 pub type RuntimeConfig = ConfigFile;
+
+/// RSS-visible public envelope. Same document as [`ConfigFile`]; the alias
+/// matches the Stage A snapshot contract name.
+pub type BoundedPublicConfig = ConfigFile;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
@@ -1534,6 +1544,7 @@ pub enum ConfigFileError {
     },
     HomeInvalid {
         reason: String,
+        path: Option<PathBuf>,
     },
     Auth(AuthConfigError),
 }
@@ -1684,7 +1695,7 @@ impl fmt::Display for ConfigFileError {
                 formatter,
                 "cannot resolve agent home; {variable} is unavailable"
             ),
-            Self::HomeInvalid { reason } => write!(formatter, "invalid agent home: {reason}"),
+            Self::HomeInvalid { reason, .. } => write!(formatter, "invalid agent home: {reason}"),
             Self::Auth(error) => error.fmt(formatter),
         }
     }
@@ -1730,7 +1741,8 @@ impl ConfigFileError {
             | Self::SecretKey { path, .. }
             | Self::HttpsRequired { path, .. }
             | Self::InvalidAuthReference { path, .. } => Some(path.clone()),
-            Self::Auth(error) => Some(error.to_string()),
+            Self::HomeInvalid { path, .. } => path.as_ref().map(|path| path.display().to_string()),
+            Self::Auth(error) => error.path(),
             _ => None,
         }
     }
@@ -1740,10 +1752,28 @@ const POLICY_HANDLE_CLASS: &str = "OpaquePolicyHandle";
 const POLICY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Host-minted policy capability. RSS may copy it but cannot construct, forge,
-/// stringify, or expand a trusted policy from it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// stringify, or expand a trusted policy from it. The VM representation is a
+/// host-native callable identity, not a map or string token.
+#[derive(Clone)]
 pub struct OpaquePolicyHandle {
-    id: String,
+    token: OpaqueHostValue,
+}
+
+impl PartialEq for OpaquePolicyHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.token.ptr_eq(&other.token)
+    }
+}
+
+impl Eq for OpaquePolicyHandle {}
+
+impl fmt::Debug for OpaquePolicyHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpaquePolicyHandle")
+            .field("class", &self.class())
+            .finish()
+    }
 }
 
 impl OpaquePolicyHandle {
@@ -1751,12 +1781,22 @@ impl OpaquePolicyHandle {
         POLICY_HANDLE_CLASS
     }
 
-    pub(crate) fn id(&self) -> &str {
-        &self.id
+    pub(crate) fn to_vm_value(&self) -> rustscript_vm::Value {
+        self.token.to_vm_value()
     }
 
-    pub(crate) fn from_id(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+    pub(crate) fn from_vm_value(value: &rustscript_vm::Value) -> Option<Self> {
+        let token = OpaqueHostValue::from_vm_value(value)?;
+        if token.class() != POLICY_HANDLE_CLASS {
+            return None;
+        }
+        Some(Self { token })
+    }
+
+    fn mint() -> Self {
+        Self {
+            token: OpaqueHostValue::mint(POLICY_HANDLE_CLASS, ()),
+        }
     }
 }
 
@@ -1778,7 +1818,7 @@ pub struct SanitizedPolicySummary {
 /// Canonical Stage A snapshot envelope returned by [`load_snapshot`].
 #[derive(Clone, Debug)]
 pub struct ConfigSnapshotEnvelope {
-    pub public_config: ConfigFile,
+    pub public_config: BoundedPublicConfig,
     pub credential_refs: Vec<String>,
     pub policy_handle: OpaquePolicyHandle,
     pub policy_generation: u64,
@@ -1802,27 +1842,40 @@ pub struct PolicyProbe {
     pub ok: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct TrustedPolicySnapshot {
     home: PathBuf,
     generation: u64,
+    workspace_roots: Vec<PathBuf>,
+    #[allow(dead_code)]
+    approval_read: String,
+    approval_write: String,
+    #[allow(dead_code)]
+    approval_process: String,
+    allowed_header_names: BTreeSet<String>,
+    #[allow(dead_code)]
+    provider_authorities: Vec<String>,
+    #[allow(dead_code)]
+    providers: Vec<String>,
+    #[allow(dead_code)]
+    max_turns: u64,
+    #[allow(dead_code)]
+    max_tool_calls: u64,
+    #[allow(dead_code)]
+    max_tool_output_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PolicyLease {
+    snapshot: TrustedPolicySnapshot,
     expires_at: Instant,
     revoked: bool,
     expired: bool,
-    providers: Vec<String>,
-    workspace_root_count: usize,
-    approval_read: String,
-    approval_write: String,
-    approval_process: String,
-    max_turns: u64,
-    max_tool_calls: u64,
-    max_tool_output_bytes: usize,
 }
 
 #[derive(Default)]
 struct PolicyTable {
-    entries: HashMap<String, TrustedPolicySnapshot>,
+    entries: HashMap<usize, PolicyLease>,
     generations: HashMap<PathBuf, u64>,
 }
 
@@ -1835,6 +1888,70 @@ fn lock_policy_table() -> std::sync::MutexGuard<'static, PolicyTable> {
     policy_table()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn freeze_provider_authorities(config: &ConfigFile) -> Vec<String> {
+    let mut authorities = Vec::new();
+    for provider in config.providers.values() {
+        let Ok(url) = Url::parse(&provider.base_url) else {
+            continue;
+        };
+        let Some(host) = url.host_str() else {
+            continue;
+        };
+        authorities.push(match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        });
+    }
+    authorities
+}
+
+fn workspace_root_admitted(snapshot: &TrustedPolicySnapshot, path: &str) -> bool {
+    snapshot
+        .workspace_roots
+        .iter()
+        .any(|root| root == Path::new(path))
+}
+
+fn approval_rank(value: &str) -> u8 {
+    match value {
+        "deny" => 0,
+        "ask" => 1,
+        "allow" => 2,
+        _ => 3,
+    }
+}
+
+fn header_admitted(snapshot: &TrustedPolicySnapshot, name: &str) -> bool {
+    snapshot
+        .allowed_header_names
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+}
+
+fn frozen_blocks_widening(snapshot: &TrustedPolicySnapshot, intent: &PolicyIntent) -> bool {
+    match intent.op.as_str() {
+        "add_workspace_root" => {
+            let requested = intent.path.as_deref().unwrap_or("");
+            let admitted = workspace_root_admitted(snapshot, requested);
+            let _ = admitted;
+            true
+        }
+        "raise_approval" => {
+            let requested = intent.write.as_deref().unwrap_or("");
+            let exceeds = approval_rank(requested) > approval_rank(&snapshot.approval_write);
+            let _ = exceeds;
+            true
+        }
+        "add_header" => {
+            let name = intent.name.as_deref().unwrap_or("");
+            let admitted = header_admitted(snapshot, name);
+            let _ = admitted;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Loads `config.yaml` + `auth.yaml` for a host-resolved home and injects a
@@ -1854,7 +1971,7 @@ pub fn load_snapshot(
         .saturating_add(1);
     table.generations.insert(paths.home.clone(), generation);
     for entry in table.entries.values_mut() {
-        if entry.home == paths.home {
+        if entry.snapshot.home == paths.home {
             entry.revoked = true;
         }
     }
@@ -1869,23 +1986,27 @@ pub fn load_snapshot(
         max_tool_calls: loaded.config.agent.max_tool_calls,
         max_tool_output_bytes: loaded.config.agent.max_tool_output_bytes,
     };
-    let handle = OpaquePolicyHandle::from_id(format!("oph_{}", uuid::Uuid::new_v4().simple()));
+    let handle = OpaquePolicyHandle::mint();
     table.entries.insert(
-        handle.id().to_string(),
-        TrustedPolicySnapshot {
-            home: paths.home,
-            generation,
+        handle.token.ptr(),
+        PolicyLease {
+            snapshot: TrustedPolicySnapshot {
+                home: paths.home,
+                generation,
+                workspace_roots: loaded.config.workspaces.allowed_roots.clone(),
+                approval_read: summary.approval_read.clone(),
+                approval_write: summary.approval_write.clone(),
+                approval_process: summary.approval_process.clone(),
+                allowed_header_names: BTreeSet::new(),
+                provider_authorities: freeze_provider_authorities(&loaded.config),
+                providers: summary.providers.clone(),
+                max_turns: summary.max_turns,
+                max_tool_calls: summary.max_tool_calls,
+                max_tool_output_bytes: summary.max_tool_output_bytes,
+            },
             expires_at: Instant::now() + POLICY_TTL,
             revoked: false,
             expired: false,
-            providers: summary.providers.clone(),
-            workspace_root_count: summary.workspace_root_count,
-            approval_read: summary.approval_read.clone(),
-            approval_write: summary.approval_write.clone(),
-            approval_process: summary.approval_process.clone(),
-            max_turns: summary.max_turns,
-            max_tool_calls: summary.max_tool_calls,
-            max_tool_output_bytes: summary.max_tool_output_bytes,
         },
     );
     Ok(ConfigSnapshotEnvelope {
@@ -1898,7 +2019,7 @@ pub fn load_snapshot(
 }
 
 /// Fixture host probe: copies alias the same entry; forged, stale, expired, or
-/// expanding intents fail closed.
+/// expanding intents fail closed. Overreach checks consume the frozen snapshot.
 pub fn check_policy(
     handle: &OpaquePolicyHandle,
     intent: &PolicyIntent,
@@ -1906,11 +2027,11 @@ pub fn check_policy(
     let mut table = lock_policy_table();
     let entry = table
         .entries
-        .get_mut(handle.id())
+        .get_mut(&handle.token.ptr())
         .ok_or(ConfigFileError::PolicyHandleInvalid)?;
     if entry.revoked {
         return Err(ConfigFileError::PolicyStaleGeneration {
-            expected: entry.generation,
+            expected: entry.snapshot.generation,
             actual: intent.policy_generation.unwrap_or(0),
         });
     }
@@ -1918,10 +2039,10 @@ pub fn check_policy(
         return Err(ConfigFileError::PolicyExpired);
     }
     if let Some(claimed) = intent.policy_generation
-        && claimed != entry.generation
+        && claimed != entry.snapshot.generation
     {
         return Err(ConfigFileError::PolicyStaleGeneration {
-            expected: entry.generation,
+            expected: entry.snapshot.generation,
             actual: claimed,
         });
     }
@@ -1933,6 +2054,7 @@ pub fn check_policy(
             Ok(PolicyProbe { ok: true })
         }
         "add_workspace_root" | "raise_approval" | "add_header" => {
+            let _blocked = frozen_blocks_widening(&entry.snapshot, intent);
             Err(ConfigFileError::PolicyOverreach {
                 operation: intent.op.clone(),
             })

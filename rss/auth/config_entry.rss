@@ -1,6 +1,8 @@
-// Stage A config/auth entry. RSS owns provider/model selection and user-facing
+// Stage A config/auth fixture entry. The host binds HostHome before RSS runs.
+// RSS cannot supply a filesystem path, construct a policy handle, or expand
 // snapshot shaping. The host injects BoundedPublicConfig, opaque credential
-// references, and an OpaquePolicyHandle that this module cannot forge or expand.
+// references, and a host-native OpaquePolicyHandle that this module cannot
+// forge, stringify, or serialize.
 use config;
 
 fn map_string(value: map, key: string, fallback: string) -> string {
@@ -102,19 +104,18 @@ fn snapshot_or_error(snapshot: map) -> map {
     sanitize_load(snapshot)
 }
 
-fn with_live_handle(host_home: string, intent: map) -> map {
-    let snapshot: map = config::load_snapshot(host_home);
+fn with_live_handle(context: map, intent: map) -> map {
+    let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        let handle: map = map_map(snapshot, "policy_handle");
-        wrap_probe(config::check_policy(handle, intent))
+        wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), intent))
     } else => {
         snapshot_or_error(snapshot)
     }
 }
 
-fn probe_forged(host_home: string) -> map {
-    let snapshot: map = config::load_snapshot(host_home);
+fn probe_forged(context: map) -> map {
+    let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
         let forged: map = {
@@ -127,25 +128,54 @@ fn probe_forged(host_home: string) -> map {
     }
 }
 
-fn probe_copy(host_home: string) -> map {
-    let snapshot: map = config::load_snapshot(host_home);
+fn probe_copy(context: map) -> map {
+    let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        let handle: map = map_map(snapshot, "policy_handle");
-        let copied: map = handle.copy();
-        wrap_probe(config::check_policy(copied, { op: "inspect" }))
+        wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), { op: "inspect" }))
     } else => {
         snapshot_or_error(snapshot)
     }
 }
 
-fn probe_stale(host_home: string) -> map {
-    let snapshot: map = config::load_snapshot(host_home);
+fn probe_stringify(context: map) -> map {
+    let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        let handle: map = map_map(snapshot, "policy_handle");
+        let handle_type: string = type(snapshot["policy_handle"].copy());
+        let from_text: map = wrap_probe(config::check_policy(handle_type, { op: "inspect" }));
+        {
+            ok: true,
+            handle_type: handle_type,
+            rendered: handle_type,
+            reconstructed_ok: map_bool(from_text, "ok", false),
+            reconstructed_code: map_string(map_map(from_text, "error"), "code", "")
+        }
+    } else => {
+        snapshot_or_error(snapshot)
+    }
+}
+
+fn probe_serialize(context: map) -> map {
+    let snapshot: map = config::load_snapshot(context["host_home"]);
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
+        {
+            ok: true,
+            handle_type: type(snapshot["policy_handle"].copy()),
+            echoed: snapshot["policy_handle"].copy()
+        }
+    } else => {
+        snapshot_or_error(snapshot)
+    }
+}
+
+fn probe_stale(context: map) -> map {
+    let snapshot: map = config::load_snapshot(context["host_home"]);
+    let ok: bool = map_bool(snapshot, "ok", false);
+    if ok => {
         let generation: int = map_int(snapshot, "policy_generation", 0);
-        wrap_probe(config::check_policy(handle, {
+        wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), {
             op: "inspect",
             policy_generation: generation + 1
         }))
@@ -154,15 +184,14 @@ fn probe_stale(host_home: string) -> map {
     }
 }
 
-fn probe_expire(host_home: string) -> map {
-    let snapshot: map = config::load_snapshot(host_home);
+fn probe_expire(context: map) -> map {
+    let snapshot: map = config::load_snapshot(context["host_home"]);
     let ok: bool = map_bool(snapshot, "ok", false);
     if ok => {
-        let handle: map = map_map(snapshot, "policy_handle");
-        let expired: map = config::check_policy(handle, { op: "expire" });
+        let expired: map = config::check_policy(snapshot["policy_handle"].copy(), { op: "expire" });
         let expire_ok: bool = map_bool(expired, "ok", false);
         if expire_ok => {
-            wrap_probe(config::check_policy(handle, { op: "inspect" }))
+            wrap_probe(config::check_policy(snapshot["policy_handle"].copy(), { op: "inspect" }))
         } else => {
             wrap_probe(expired)
         }
@@ -173,32 +202,37 @@ fn probe_expire(host_home: string) -> map {
 
 pub fn run(context: map) -> map {
     let kind: string = map_string(context, "kind", "load");
-    let host_home: string = map_string(context, "host_home", "");
     if kind == "load" => {
-        sanitize_load(config::load_snapshot(host_home))
+        sanitize_load(config::load_snapshot(context["host_home"]))
+    } else if kind == "supply_path" => {
+        sanitize_load(config::load_snapshot("/tmp/rss-supplied-home"))
     } else if kind == "forge_handle" => {
-        probe_forged(host_home)
+        probe_forged(context)
     } else if kind == "copy_handle" => {
-        probe_copy(host_home)
+        probe_copy(context)
+    } else if kind == "stringify_handle" => {
+        probe_stringify(context)
+    } else if kind == "serialize_handle" => {
+        probe_serialize(context)
     } else if kind == "expand_workspace" => {
-        with_live_handle(host_home, {
+        with_live_handle(context, {
             op: "add_workspace_root",
             path: "/tmp/extra-root"
         })
     } else if kind == "raise_approval" => {
-        with_live_handle(host_home, {
+        with_live_handle(context, {
             op: "raise_approval",
             write: "allow"
         })
     } else if kind == "add_header" => {
-        with_live_handle(host_home, {
+        with_live_handle(context, {
             op: "add_header",
             name: "Authorization"
         })
     } else if kind == "stale_generation" => {
-        probe_stale(host_home)
+        probe_stale(context)
     } else if kind == "expire" => {
-        probe_expire(host_home)
+        probe_expire(context)
     } else => {
         {
             ok: false,

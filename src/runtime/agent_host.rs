@@ -220,9 +220,8 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         builder.function(HostFunctionSchema::with_return(
             PARSE_JSON_OBJECT,
             vec![HostParamSchema::value("text", HostTypeSchema::String)],
-            response.clone(),
+            response,
         ));
-        crate::config_host::register_catalog_functions(&mut builder, response);
         Arc::new(builder.build().expect("agent host catalog must build"))
     }))
 }
@@ -939,7 +938,6 @@ pub fn register_agent_host_functions(
         1,
         parse_json_object_adapter,
     )?;
-    crate::config_host::register_host_functions(registry, catalog)?;
     Ok(())
 }
 

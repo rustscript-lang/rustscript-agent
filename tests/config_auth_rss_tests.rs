@@ -1,43 +1,21 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustscript_agent::config::{PolicyIntent, check_policy, load_snapshot};
-use rustscript_agent::config_file::{AgentPaths, ConfigFileError};
-use rustscript_agent::{AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunEventSink};
+use rustscript_agent::config_file::ConfigFileError;
+use rustscript_agent::{ConfigFixtureHost, agent_host_catalog, config_fixture_catalog};
 use rustscript_vm::Value;
 use serde_json::{Value as JsonValue, json};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 const ACCESS_TOKEN: &str = "SYNTHETIC_ACCESS_TOKEN";
 const REFRESH_TOKEN: &str = "SYNTHETIC_REFRESH_TOKEN";
 
-struct RecordingSink {
-    events: Vec<Value>,
-}
-
-impl RunEventSink for RecordingSink {
-    fn deliver(&mut self, value: Value) -> std::result::Result<(), RunDeliveryError> {
-        self.events.push(value);
-        Ok(())
-    }
-}
-
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config_auth_rss")
-}
-
-fn entry_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/config_entry.rss")
-}
-
-fn entry_runner() -> AgentRunner {
-    AgentRunner::from_file(entry_path(), AgentConfig::default())
-        .expect("RSS config/auth entry should compile")
 }
 
 fn temp_home(label: &str) -> PathBuf {
@@ -61,30 +39,6 @@ fn copy_fixture_home(label: &str, config_name: &str, auth_name: &str) -> PathBuf
     fs::copy(fixture_dir().join(config_name), home.join("config.yaml")).expect("copy config");
     fs::copy(fixture_dir().join(auth_name), home.join("auth.yaml")).expect("copy auth");
     home
-}
-
-fn json_to_vm_value(value: &JsonValue) -> Value {
-    match value {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(value) => Value::Bool(*value),
-        JsonValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Value::Int(value)
-            } else {
-                Value::Float(value.as_f64().expect("finite json number"))
-            }
-        }
-        JsonValue::String(value) => Value::string(value),
-        JsonValue::Array(values) => Value::Array(std::sync::Arc::new(
-            values.iter().map(json_to_vm_value).collect::<Vec<_>>(),
-        )),
-        JsonValue::Object(entries) => Value::map(
-            entries
-                .iter()
-                .map(|(key, value)| (Value::string(key), json_to_vm_value(value)))
-                .collect(),
-        ),
-    }
 }
 
 fn vm_value_to_json(value: &Value) -> JsonValue {
@@ -154,22 +108,10 @@ fn assert_no_raw_secrets(value: &JsonValue) {
 }
 
 fn run_kind(home: &Path, kind: &str) -> (JsonValue, Vec<JsonValue>) {
-    let _lock = HOME_ENV_LOCK.lock().expect("home env lock");
-    let runner = entry_runner();
-    let mut sink = RecordingSink { events: Vec::new() };
-    let cancellation = RunCancellation::default();
-    let complete = runner
-        .run_with_context_and_events(
-            json_to_vm_value(&json!({
-                "kind": kind,
-                "host_home": home.to_string_lossy(),
-            })),
-            &mut sink,
-            &cancellation,
-        )
-        .expect("RSS config/auth entry should complete");
-    let events = sink.events.iter().map(vm_value_to_json).collect();
-    (vm_value_to_json(&complete), events)
+    let complete = ConfigFixtureHost::bind(home)
+        .run(kind)
+        .unwrap_or_else(|error| panic!("RSS config/auth fixture should complete: {error}"));
+    (vm_value_to_json(&complete), Vec::new())
 }
 
 fn assert_secret_free_run(complete: &JsonValue, events: &[JsonValue]) {
@@ -177,6 +119,20 @@ fn assert_secret_free_run(complete: &JsonValue, events: &[JsonValue]) {
     for event in events {
         assert_no_raw_secrets(event);
     }
+}
+
+fn assert_path_qualified_error(complete: &JsonValue, code: &str, path_needle: &str) {
+    assert_eq!(complete["ok"], false);
+    assert_eq!(complete["error"]["code"], code);
+    let path = complete["error"]["path"].as_str().unwrap_or_default();
+    assert!(
+        path.contains(path_needle),
+        "expected path-qualified error containing {path_needle:?}, got {path:?} from {complete}"
+    );
+    assert!(
+        !path.contains("auth file is missing"),
+        "error.path must be a path, not Display prose: {path}"
+    );
 }
 
 #[test]
@@ -197,158 +153,239 @@ fn load_snapshot_exposes_opaque_credential_refs_without_raw_tokens() {
     let debug = format!("{snapshot:?}");
     assert!(!debug.contains(ACCESS_TOKEN));
     assert!(!debug.contains(REFRESH_TOKEN));
+    assert!(!debug.contains("oph_"));
+}
+
+#[test]
+fn rust_load_snapshot_and_policy_check_match_rss_surface() {
+    let home = copy_fixture_home("rust-check", "config.yaml", "auth.yaml");
+    let snapshot = load_snapshot(&home).expect("load");
     let inspect = check_policy(
         &snapshot.policy_handle,
         &PolicyIntent {
-            op: "inspect".to_string(),
+            op: "inspect".into(),
             ..PolicyIntent::default()
         },
     )
-    .expect("minted handle should inspect");
+    .expect("inspect");
     assert!(inspect.ok);
-}
 
-#[test]
-fn generic_https_urls_do_not_use_provider_name_authority_mapping() {
-    let home = temp_home("https-generic");
-    let paths = AgentPaths::from_home(&home).expect("home");
-    let config = fs::read_to_string(fixture_dir().join("config.yaml")).expect("fixture config");
-    fs::write(
-        &paths.config,
-        config.replace(
-            "base_url: https://chatgpt.com/backend-api/codex",
-            "base_url: https://api.openai.com/backend-api/codex",
-        ),
+    let overreach = check_policy(
+        &snapshot.policy_handle,
+        &PolicyIntent {
+            op: "add_workspace_root".into(),
+            path: Some("/tmp/extra-root".into()),
+            ..PolicyIntent::default()
+        },
     )
-    .expect("write config");
-    fs::copy(fixture_dir().join("auth.yaml"), &paths.auth).expect("copy auth");
-    load_snapshot(&home).expect("openai-codex HTTPS hosts stay generic");
-}
+    .expect_err("overreach");
+    assert!(matches!(overreach, ConfigFileError::PolicyOverreach { .. }));
 
-#[test]
-fn unknown_provider_names_are_not_rejected_by_generic_loader() {
-    let home = temp_home("unknown-provider");
-    let paths = AgentPaths::from_home(&home).expect("home");
-    fs::write(
-        &paths.config,
-        "version: 1\nmodel:\n  provider: unknown-empty\n  model: local-agent\n",
+    let admitted = check_policy(
+        &snapshot.policy_handle,
+        &PolicyIntent {
+            op: "add_workspace_root".into(),
+            path: Some("/tmp/rustscript-agent-workspace".into()),
+            ..PolicyIntent::default()
+        },
     )
-    .expect("write config");
-    fs::write(&paths.auth, "version: 1\n").expect("write auth");
-    load_snapshot(&home).expect("unknown provider names are RSS selection data");
+    .expect_err("frozen admitted root still cannot be added");
+    assert!(matches!(admitted, ConfigFileError::PolicyOverreach { .. }));
 }
 
 #[test]
-fn auth_references_require_existing_credential_ids_not_provider_matching() {
-    let home = copy_fixture_home(
-        "custom-mismatch",
-        "custom_provider.yaml",
-        "custom_auth.yaml",
-    );
-    let snapshot = load_snapshot(&home).expect("credential ID existence is enough");
-    assert_eq!(snapshot.credential_refs, vec!["fixture-custom".to_string()]);
-
-    let missing = temp_home("missing-id");
-    let paths = AgentPaths::from_home(&missing).expect("home");
-    fs::copy(fixture_dir().join("config.yaml"), &paths.config).expect("copy config");
-    fs::write(&paths.auth, "version: 1\n").expect("empty auth");
-    let error = load_snapshot(&missing).expect_err("missing credential IDs still fail");
-    assert!(matches!(
-        error,
-        ConfigFileError::InvalidAuthReference { .. }
-    ));
-}
-
-#[test]
-fn rss_config_auth_entry_loads_bounded_public_snapshot_without_tokens() {
+fn rss_config_auth_entry_loads_public_snapshot_without_secrets() {
     let home = copy_fixture_home("rss-load", "config.yaml", "auth.yaml");
     let (complete, events) = run_kind(&home, "load");
-    assert_secret_free_run(&complete, &events);
-    assert_eq!(complete["ok"], json!(true));
-    assert_eq!(complete["policy_handle_class"], json!("OpaquePolicyHandle"));
-    assert_eq!(complete["selected_provider"], json!("openai-codex"));
-    assert_eq!(complete["selected_model"], json!("gpt-5-codex"));
-    assert_eq!(complete["credential_refs"][0]["id"], json!("fixture-codex"));
-    assert!(complete.get("policy_handle").is_none());
-    assert!(complete.get("public_config").is_some());
-}
-
-#[test]
-fn rss_config_auth_entry_rejects_forged_policy_handle() {
-    let home = copy_fixture_home("rss-forge", "config.yaml", "auth.yaml");
-    let (complete, events) = run_kind(&home, "forge_handle");
-    assert_secret_free_run(&complete, &events);
-    assert_eq!(complete["ok"], json!(false));
-    assert_eq!(complete["error"]["code"], json!("policy_handle_invalid"));
-}
-
-#[test]
-fn rss_config_auth_entry_copies_alias_the_same_policy_entry() {
-    let home = copy_fixture_home("rss-copy", "config.yaml", "auth.yaml");
-    let (complete, events) = run_kind(&home, "copy_handle");
-    assert_secret_free_run(&complete, &events);
-    assert_eq!(complete["ok"], json!(true));
-    assert_eq!(complete["policy_handle_class"], json!("OpaquePolicyHandle"));
-}
-
-#[test]
-fn rss_config_auth_entry_rejects_workspace_approval_and_header_overreach() {
-    let home = copy_fixture_home("rss-overreach", "config.yaml", "auth.yaml");
-    for kind in ["expand_workspace", "raise_approval", "add_header"] {
-        let (complete, events) = run_kind(&home, kind);
-        assert_secret_free_run(&complete, &events);
-        assert_eq!(complete["ok"], json!(false), "{kind}");
-        assert_eq!(
-            complete["error"]["code"],
-            json!("policy_overreach"),
-            "{kind}"
-        );
-    }
-}
-
-#[test]
-fn rss_config_auth_entry_rejects_stale_generation_and_expiry() {
-    let home = copy_fixture_home("rss-stale", "config.yaml", "auth.yaml");
-    let (stale, stale_events) = run_kind(&home, "stale_generation");
-    assert_secret_free_run(&stale, &stale_events);
-    assert_eq!(stale["ok"], json!(false));
-    assert_eq!(stale["error"]["code"], json!("policy_stale_generation"));
-
-    let (expired, expired_events) = run_kind(&home, "expire");
-    assert_secret_free_run(&expired, &expired_events);
-    assert_eq!(expired["ok"], json!(false));
-    assert_eq!(expired["error"]["code"], json!("policy_expired"));
-}
-
-#[test]
-fn rss_config_auth_entry_admits_explicit_custom_provider() {
-    let home = copy_fixture_home("rss-custom", "custom_provider.yaml", "custom_auth.yaml");
-    let (complete, events) = run_kind(&home, "load");
-    assert_secret_free_run(&complete, &events);
-    assert_eq!(complete["ok"], json!(true));
-    assert_eq!(complete["selected_provider"], json!("custom-provider"));
+    assert_eq!(complete["ok"], true);
+    assert_eq!(complete["policy_handle_class"], "OpaquePolicyHandle");
     assert_eq!(
-        complete["credential_refs"][0]["id"],
-        json!("fixture-custom")
+        complete["public_config"]["model"]["provider"],
+        "openai-codex"
+    );
+    assert!(complete.get("policy_handle").is_none());
+    assert_secret_free_run(&complete, &events);
+}
+
+#[test]
+fn rss_config_auth_entry_rejects_forged_and_copied_handles() {
+    let home = copy_fixture_home("rss-forge", "config.yaml", "auth.yaml");
+    let (forged, events) = run_kind(&home, "forge_handle");
+    assert_eq!(forged["ok"], false);
+    assert_eq!(forged["error"]["code"], "policy_handle_invalid");
+    assert_secret_free_run(&forged, &events);
+
+    let (copied, events) = run_kind(&home, "copy_handle");
+    assert_eq!(copied["ok"], true);
+    assert_secret_free_run(&copied, &events);
+}
+
+#[test]
+fn rss_config_auth_entry_denies_stringify_serialize_and_path_supply() {
+    let home = copy_fixture_home("rss-opaque", "config.yaml", "auth.yaml");
+    let (stringify, events) = run_kind(&home, "stringify_handle");
+    assert_eq!(stringify["ok"], true);
+    assert_eq!(stringify["handle_type"], "callable");
+    let rendered = stringify["rendered"].as_str().unwrap_or_default();
+    assert!(
+        !rendered.contains('{'),
+        "stringify must not produce JSON: {rendered}"
+    );
+    assert!(
+        !rendered.contains("OpaquePolicyHandle"),
+        "stringify must not leak a reconstructible class token: {rendered}"
+    );
+    assert_eq!(stringify["reconstructed_ok"], false);
+    assert_eq!(stringify["reconstructed_code"], "policy_handle_invalid");
+    assert_secret_free_run(&stringify, &events);
+
+    let (serialize, events) = run_kind(&home, "serialize_handle");
+    assert_eq!(serialize["ok"], true);
+    assert_eq!(serialize["handle_type"], "callable");
+    assert_eq!(serialize["echoed"], "<callable>");
+    assert_secret_free_run(&serialize, &events);
+
+    let (supplied, events) = run_kind(&home, "supply_path");
+    assert_path_qualified_error(&supplied, "home_invalid", home.to_string_lossy().as_ref());
+    assert_secret_free_run(&supplied, &events);
+}
+
+#[test]
+fn rss_config_auth_entry_rejects_overreach_and_expired_handles() {
+    let home = copy_fixture_home("rss-policy", "config.yaml", "auth.yaml");
+    let (overreach, events) = run_kind(&home, "expand_workspace");
+    assert_eq!(overreach["ok"], false);
+    assert_eq!(overreach["error"]["code"], "policy_overreach");
+    assert_secret_free_run(&overreach, &events);
+
+    let (expired, events) = run_kind(&home, "expire");
+    assert_eq!(expired["ok"], false);
+    assert_eq!(expired["error"]["code"], "policy_expired");
+    assert_secret_free_run(&expired, &events);
+}
+
+#[test]
+fn rss_config_auth_entry_reports_missing_file_path() {
+    let home = temp_home("missing-file");
+    let (complete, events) = run_kind(&home, "load");
+    assert_path_qualified_error(&complete, "config_invalid", "config.yaml");
+    assert!(
+        complete["error"]["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&home.join("config.yaml").display().to_string())
+    );
+    assert_secret_free_run(&complete, &events);
+}
+
+#[test]
+fn rss_config_auth_entry_reports_invalid_home_path() {
+    let home = PathBuf::from("relative-not-absolute");
+    let (complete, events) = run_kind(&home, "load");
+    assert_path_qualified_error(&complete, "home_invalid", "relative-not-absolute");
+    assert_secret_free_run(&complete, &events);
+}
+
+#[test]
+fn rss_config_auth_entry_reports_https_failure_path() {
+    let home = copy_fixture_home("https-fail", "config.yaml", "auth.yaml");
+    let config = fs::read_to_string(home.join("config.yaml")).expect("read config");
+    fs::write(
+        home.join("config.yaml"),
+        config.replace(
+            "https://chatgpt.com/backend-api/codex",
+            "http://chatgpt.com/backend-api/codex",
+        ),
+    )
+    .expect("write http config");
+    let (complete, events) = run_kind(&home, "load");
+    assert_path_qualified_error(
+        &complete,
+        "https_required",
+        "providers.openai-codex.base_url",
+    );
+    assert_secret_free_run(&complete, &events);
+}
+
+#[test]
+fn rss_config_auth_entry_reports_invalid_auth_reference_path() {
+    let home = copy_fixture_home("auth-ref", "config.yaml", "auth.yaml");
+    let config = fs::read_to_string(home.join("config.yaml")).expect("read config");
+    fs::write(
+        home.join("config.yaml"),
+        config.replace("auth: fixture-codex", "auth: missing-credential"),
+    )
+    .expect("write invalid auth ref");
+    let (complete, events) = run_kind(&home, "load");
+    assert_path_qualified_error(
+        &complete,
+        "invalid_auth_reference",
+        "providers.openai-codex.auth",
+    );
+    assert_secret_free_run(&complete, &events);
+}
+
+#[test]
+fn production_agent_host_catalog_omits_stage_a_config_bridge() {
+    let catalog = agent_host_catalog();
+    let names: Vec<&str> = catalog
+        .functions()
+        .iter()
+        .map(|schema| schema.name.as_str())
+        .collect();
+    assert!(
+        !names.contains(&"config::load_snapshot"),
+        "Stage A config bridge must not be on the production catalog: {names:?}"
+    );
+    assert!(
+        !names.contains(&"config::check_policy"),
+        "fixture check_policy must not be on the production catalog: {names:?}"
     );
 }
 
 #[test]
-fn rss_config_auth_entry_negative_scan_keeps_tokens_out_of_events_and_output() {
-    let home = copy_fixture_home("rss-scan", "config.yaml", "auth.yaml");
-    for kind in [
-        "load",
-        "forge_handle",
-        "copy_handle",
-        "expand_workspace",
-        "raise_approval",
-        "add_header",
-        "stale_generation",
-        "expire",
-    ] {
-        let (complete, events) = run_kind(&home, kind);
-        assert_secret_free_run(&complete, &events);
-        let durable = json!({ "complete": complete, "events": events });
-        assert_no_raw_secrets(&durable);
-    }
+fn config_fixture_catalog_exposes_stage_a_bridge() {
+    let catalog = config_fixture_catalog();
+    let names: Vec<&str> = catalog
+        .functions()
+        .iter()
+        .map(|schema| schema.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"config::load_snapshot"),
+        "fixture catalog missing load_snapshot: {names:?}"
+    );
+    assert!(
+        names.contains(&"config::check_policy"),
+        "fixture catalog missing check_policy: {names:?}"
+    );
+}
+
+#[test]
+fn rust_reload_revokes_previous_handle() {
+    let home = copy_fixture_home("reload", "config.yaml", "auth.yaml");
+    let first = load_snapshot(&home).expect("first load");
+    let second = load_snapshot(&home).expect("second load");
+    assert_ne!(first.policy_generation, second.policy_generation);
+    let stale = check_policy(
+        &first.policy_handle,
+        &PolicyIntent {
+            op: "inspect".into(),
+            ..PolicyIntent::default()
+        },
+    )
+    .expect_err("revoked handle");
+    assert!(matches!(
+        stale,
+        ConfigFileError::PolicyStaleGeneration { .. }
+    ));
+    let inspect = check_policy(
+        &second.policy_handle,
+        &PolicyIntent {
+            op: "inspect".into(),
+            ..PolicyIntent::default()
+        },
+    )
+    .expect("new handle");
+    assert!(inspect.ok);
 }

@@ -1,25 +1,64 @@
-//! Stage A config host catalog: `config::load_snapshot` and the fixture
-//! `config::check_policy` probe. Trusted policy stays host-side.
+//! Stage A config/auth fixture host.
+//!
+//! `config::load_snapshot` / `config::check_policy` are **not** production agent
+//! host functions. They exist only on [`config_fixture_catalog`] and are bound
+//! by [`ConfigFixtureHost`], which injects a host-native `HostHome` before RSS
+//! runs. RSS cannot supply or override the home path.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use rustscript_vm::{
-    CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostFunctionRegistry,
-    HostFunctionSchema, HostParamSchema, HostTypeSchema, Value, Vm, VmResult,
-    catalog_import_schemas,
+    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiBuilder, HostApiCatalog,
+    HostFunctionRegistry, HostFunctionSchema, HostParamSchema, HostTypeSchema, Program,
+    SourceFlavor, Value, Vm, VmResult, VmStatus, catalog_import_schemas,
+    compile_source_at_path_with_flavor_and_options, standard_host_catalog,
 };
 use serde_json::{Value as JsonValue, json};
 
 use crate::config_file::{
-    ConfigFileError, OpaquePolicyHandle, PolicyIntent, check_policy, load_snapshot,
+    ConfigFileError, ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, check_policy,
+    load_snapshot,
 };
 use crate::domain::{json_to_vm_value, vm_value_to_json};
+use crate::host_opaque::OpaqueHostValue;
 
-pub const CONFIG_LOAD_SNAPSHOT: &str = "config::load_snapshot";
-pub const CONFIG_CHECK_POLICY: &str = "config::check_policy";
+const CONFIG_LOAD_SNAPSHOT: &str = "config::load_snapshot";
+const CONFIG_CHECK_POLICY: &str = "config::check_policy";
+const HOST_HOME_CLASS: &str = "HostHome";
 
-pub fn register_catalog_functions(builder: &mut HostApiBuilder, response: HostTypeSchema) {
+#[derive(Clone, Debug)]
+struct BoundHostHome {
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct ConfigFixtureState {
+    home: PathBuf,
+}
+
+/// Test-only catalog that exposes the Stage A config bridge.
+pub fn config_fixture_catalog() -> Arc<HostApiCatalog> {
+    static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+    Arc::clone(CATALOG.get_or_init(|| {
+        let standard = standard_host_catalog();
+        let mut builder = HostApiBuilder::new();
+        for resource in standard.resources() {
+            builder.resource(resource.clone());
+        }
+        for function in standard.functions() {
+            builder.function(function.clone());
+        }
+        let response = HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown));
+        register_catalog_functions(&mut builder, response);
+        Arc::new(builder.build().expect("config fixture catalog must build"))
+    }))
+}
+
+pub(crate) fn register_catalog_functions(builder: &mut HostApiBuilder, response: HostTypeSchema) {
     builder.function(HostFunctionSchema::with_return(
         CONFIG_LOAD_SNAPSHOT,
-        vec![HostParamSchema::value("host_home", HostTypeSchema::String)],
+        vec![HostParamSchema::value("host_home", HostTypeSchema::Unknown)],
         response.clone(),
     ));
     builder.function(HostFunctionSchema::with_return(
@@ -32,7 +71,7 @@ pub fn register_catalog_functions(builder: &mut HostApiBuilder, response: HostTy
     ));
 }
 
-pub fn register_host_functions(
+pub(crate) fn register_host_functions(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
@@ -53,6 +92,95 @@ pub fn register_host_functions(
     Ok(())
 }
 
+/// Compiles `rss/auth/config_entry.rss` against the fixture catalog and runs
+/// it with a host-bound home. Production [`crate::AgentRunner`] never sees this
+/// surface.
+pub struct ConfigFixtureHost {
+    home: PathBuf,
+}
+
+impl ConfigFixtureHost {
+    pub fn bind(home: impl Into<PathBuf>) -> Self {
+        Self { home: home.into() }
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn run(&self, kind: &str) -> Result<Value, String> {
+        let program = fixture_program()?;
+        let catalog = config_fixture_catalog();
+        let mut registry = HostFunctionRegistry::restricted();
+        register_host_functions(&mut registry, catalog.as_ref())
+            .map_err(|error| error.to_string())?;
+        let mut vm = Vm::try_new_shared(program).map_err(|error| error.to_string())?;
+        registry
+            .bind_vm_cached(&mut vm)
+            .map_err(|error| error.to_string())?;
+        vm.host_context().set_module_state(ConfigFixtureState {
+            home: self.home.clone(),
+        });
+        drive_root_frame(&mut vm)?;
+        let callable = vm
+            .resolve_exported_callable("run")
+            .map_err(|_| "config fixture entry `run` is missing".to_string())?;
+        let host_home = OpaqueHostValue::mint(
+            HOST_HOME_CLASS,
+            BoundHostHome {
+                path: self.home.clone(),
+            },
+        )
+        .to_vm_value();
+        let context = Value::map(vec![
+            (Value::string("kind"), Value::string(kind)),
+            (Value::string("host_home"), host_home),
+        ]);
+        vm.invoke_callable(callable, &[context])
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn fixture_program() -> Result<Arc<Program>, String> {
+    static PROGRAM: OnceLock<Result<Arc<Program>, String>> = OnceLock::new();
+    match PROGRAM.get_or_init(|| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/config_entry.rss");
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => return Err(error.to_string()),
+        };
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(config_fixture_catalog());
+        compile_source_at_path_with_flavor_and_options(
+            &path,
+            &source,
+            SourceFlavor::RustScript,
+            options,
+        )
+        .map(|compiled| Arc::new(compiled.program))
+        .map_err(|error| error.to_string())
+    }) {
+        Ok(program) => Ok(Arc::clone(program)),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn drive_root_frame(vm: &mut Vm) -> Result<(), String> {
+    loop {
+        match vm.run() {
+            Ok(VmStatus::Halted) => return Ok(()),
+            Ok(VmStatus::Waiting(_)) => {
+                vm.wait_for_host_op_blocking_with_cancel(|| false)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(VmStatus::Yielded) => {
+                return Err("config fixture root frame yielded unexpectedly".to_string());
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
 fn register_named(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
@@ -68,107 +196,130 @@ fn register_named(
     Ok(())
 }
 
-fn load_snapshot_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let host_home = match args.first() {
-        Some(Value::String(value)) => value.to_string(),
-        _ => {
+fn load_snapshot_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let bound_home = match vm.host_context().module_state::<ConfigFixtureState>() {
+        Some(state) => state.home.clone(),
+        None => {
             return return_json(error_envelope(&ConfigFileError::HomeInvalid {
-                reason: "host_home must be a string".to_string(),
+                reason: "config fixture host home is not bound".to_string(),
+                path: None,
             }));
         }
     };
-    match load_snapshot(&host_home) {
-        Ok(snapshot) => return_json(snapshot_envelope(&snapshot)),
+    if matches!(args.first(), Some(Value::String(_))) {
+        return return_json(error_envelope(&ConfigFileError::HomeInvalid {
+            reason: "RSS cannot supply or override host_home".to_string(),
+            path: Some(bound_home),
+        }));
+    }
+    let Some(bound) = args
+        .first()
+        .and_then(OpaqueHostValue::from_vm_value)
+        .filter(|value| value.class() == HOST_HOME_CLASS)
+        .and_then(|value| value.downcast_ref::<BoundHostHome>().cloned())
+    else {
+        return return_json(error_envelope(&ConfigFileError::HomeInvalid {
+            reason: "host_home must be the host-bound HostHome".to_string(),
+            path: Some(bound_home),
+        }));
+    };
+    if bound.path != bound_home {
+        return return_json(error_envelope(&ConfigFileError::HomeInvalid {
+            reason: "host_home does not match the bound home".to_string(),
+            path: Some(bound_home),
+        }));
+    }
+    match load_snapshot(&bound_home) {
+        Ok(snapshot) => return_value(snapshot_to_vm_value(&snapshot)),
         Err(error) => return_json(error_envelope(&error)),
     }
 }
 
 fn check_policy_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let handle = match parse_handle(args.first()) {
-        Ok(handle) => handle,
-        Err(error) => return return_json(error_envelope(&error)),
+    let handle = match args.first().and_then(OpaquePolicyHandle::from_vm_value) {
+        Some(handle) => handle,
+        None => {
+            return return_json(error_envelope(&ConfigFileError::PolicyHandleInvalid));
+        }
     };
     let intent = parse_intent(args.get(1));
     match check_policy(&handle, &intent) {
-        Ok(_) => return_json(json!({ "ok": true })),
+        Ok(probe) => return_json(json!({ "ok": probe.ok })),
         Err(error) => return_json(error_envelope(&error)),
     }
 }
 
-fn parse_handle(value: Option<&Value>) -> Result<OpaquePolicyHandle, ConfigFileError> {
-    let json = value.map(vm_value_to_json).unwrap_or(JsonValue::Null);
-    let class = json.get("class").and_then(JsonValue::as_str);
-    let id = json.get("id").and_then(JsonValue::as_str);
-    if class != Some("OpaquePolicyHandle") {
-        return Err(ConfigFileError::PolicyHandleInvalid);
-    }
-    let id = id.ok_or(ConfigFileError::PolicyHandleInvalid)?;
-    Ok(OpaquePolicyHandle::from_id(id))
+fn snapshot_to_vm_value(snapshot: &ConfigSnapshotEnvelope) -> Value {
+    Value::map(vec![
+        (Value::string("ok"), Value::Bool(true)),
+        (
+            Value::string("public_config"),
+            json_to_vm_value(&json!(snapshot.public_config)),
+        ),
+        (
+            Value::string("credential_refs"),
+            json_to_vm_value(&json!(snapshot.credential_refs)),
+        ),
+        (
+            Value::string("policy_summary"),
+            json_to_vm_value(&json!(snapshot.policy_summary)),
+        ),
+        (
+            Value::string("policy_handle"),
+            snapshot.policy_handle.to_vm_value(),
+        ),
+        (
+            Value::string("policy_handle_class"),
+            Value::string(snapshot.policy_handle.class()),
+        ),
+        (
+            Value::string("policy_generation"),
+            Value::Int(i64::try_from(snapshot.policy_generation).unwrap_or(i64::MAX)),
+        ),
+    ])
 }
 
 fn parse_intent(value: Option<&Value>) -> PolicyIntent {
-    let json = value.map(vm_value_to_json).unwrap_or(JsonValue::Null);
+    let JsonValue::Object(fields) = value.map(vm_value_to_json).unwrap_or(JsonValue::Null) else {
+        return PolicyIntent::default();
+    };
     PolicyIntent {
-        op: json
+        op: fields
             .get("op")
             .and_then(JsonValue::as_str)
-            .unwrap_or("")
+            .unwrap_or_default()
             .to_string(),
-        path: json
+        path: fields
             .get("path")
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned),
-        write: json
+        write: fields
             .get("write")
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned),
-        name: json
+        name: fields
             .get("name")
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned),
-        policy_generation: json.get("policy_generation").and_then(JsonValue::as_u64),
+        policy_generation: fields.get("policy_generation").and_then(JsonValue::as_u64),
     }
-}
-
-fn snapshot_envelope(snapshot: &crate::config_file::ConfigSnapshotEnvelope) -> JsonValue {
-    let public_config = serde_json::to_value(&snapshot.public_config).unwrap_or(JsonValue::Null);
-    let credential_refs = JsonValue::Array(
-        snapshot
-            .credential_refs
-            .iter()
-            .map(|id| json!({ "id": id }))
-            .collect(),
-    );
-    let summary = serde_json::to_value(&snapshot.policy_summary).unwrap_or(JsonValue::Null);
-    json!({
-        "ok": true,
-        "public_config": public_config,
-        "credential_refs": credential_refs,
-        "policy_handle": {
-            "class": snapshot.policy_handle.class(),
-            "id": snapshot.policy_handle.id(),
-        },
-        "policy_generation": snapshot.policy_generation,
-        "policy_summary": summary,
-    })
 }
 
 fn error_envelope(error: &ConfigFileError) -> JsonValue {
-    let mut error_object = json!({
-        "code": error.code(),
-        "message": error.to_string(),
-    });
-    if let Some(path) = error.path() {
-        error_object["path"] = JsonValue::String(path);
-    }
     json!({
         "ok": false,
-        "error": error_object,
+        "error": {
+            "code": error.code(),
+            "message": error.to_string(),
+            "path": error.path(),
+        }
     })
 }
 
 fn return_json(value: JsonValue) -> VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(CallReturn::One(json_to_vm_value(
-        &value,
-    ))))
+    return_value(json_to_vm_value(&value))
+}
+
+fn return_value(value: Value) -> VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::One(value)))
 }

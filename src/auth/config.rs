@@ -533,4 +533,26 @@ impl fmt::Display for AuthConfigError {
     }
 }
 
+impl AuthConfigError {
+    pub fn path(&self) -> Option<String> {
+        match self {
+            Self::MissingFile { path }
+            | Self::FileRead { path, .. }
+            | Self::FileTooLarge { path, .. }
+            | Self::MalformedYaml { path, .. }
+            | Self::MultipleDocuments { path }
+            | Self::InvalidRoot { path }
+            | Self::InvalidVersion { path, .. }
+            | Self::InvalidValue { path, .. } => Some(path.display().to_string()),
+            Self::YamlTooDeep { path, .. }
+            | Self::YamlTooComplex { path, .. }
+            | Self::YamlTooLarge { path, .. } => path
+                .split_once(':')
+                .map(|(file, _)| file.to_string())
+                .or_else(|| Some(path.clone())),
+            Self::UnknownKey { .. } | Self::BehaviorKey { .. } | Self::HomeResolution(_) => None,
+        }
+    }
+}
+
 impl std::error::Error for AuthConfigError {}
