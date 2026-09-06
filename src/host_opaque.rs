@@ -3,14 +3,39 @@
 //! pd-vm `Value` has no `opaque_nonserializable` variant. Callables are the
 //! only heap values that `json::encode` rejects and that RSS cannot rebuild
 //! from a map or string. Copy clones the `Arc` and therefore aliases the same
-//! host object. Identity is the callable pointer, never an ID, JSON field, or
-//! textual bearer token.
+//! host object. Each mint uses an invalid prototype id and a unique
+//! environment so RSS cannot dispatch or compare across handles.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::mem::{align_of, size_of};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rustscript_vm::{CallableKind, CallableValue, Value};
+use rustscript_vm::{CallableEnvironment, CallableKind, CallableValue, Value};
+
+/// pd-vm looks up prototypes with `Vec::get(prototype_id as usize)`. `u32::MAX`
+/// is in range for `usize` on this target and the lookup returns `None`, so
+/// `CallValue` fails closed as `InvalidCallablePrototype(u32::MAX)` instead of
+/// dispatching a registered or program callable.
+const OPAQUE_PROTOTYPE_ID: u32 = u32::MAX;
+
+fn unique_opaque_env() -> Arc<CallableEnvironment> {
+    #[allow(dead_code)]
+    struct MintEnv {
+        cells: Mutex<Vec<Arc<Mutex<Value>>>>,
+    }
+    const _: () = {
+        assert!(size_of::<MintEnv>() == size_of::<CallableEnvironment>());
+        assert!(align_of::<MintEnv>() == align_of::<CallableEnvironment>());
+    };
+    let env = Arc::new(MintEnv {
+        cells: Mutex::new(Vec::new()),
+    });
+    // SAFETY: `MintEnv` is a single-field twin of `CallableEnvironment`.
+    // pd-vm keeps `cells` crate-private, so this host crate cannot name the
+    // constructor; the compile-time size/align check rejects a layout drift.
+    unsafe { Arc::from_raw(Arc::into_raw(env).cast::<CallableEnvironment>()) }
+}
 
 struct Registry {
     by_ptr: HashMap<usize, Registered>,
@@ -50,9 +75,9 @@ pub struct OpaqueHostValue {
 impl OpaqueHostValue {
     pub fn mint<T: Send + Sync + 'static>(class: &'static str, payload: T) -> Self {
         let callable = Arc::new(CallableValue {
-            prototype_id: 0,
+            prototype_id: OPAQUE_PROTOTYPE_ID,
             kind: CallableKind::HostFunction,
-            env: None,
+            env: Some(unique_opaque_env()),
         });
         let payload = Arc::new(payload) as Arc<dyn Any + Send + Sync>;
         let value = Self {
@@ -127,7 +152,87 @@ impl Clone for Registered {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustscript_vm::format_value;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use rustscript_vm::{
+        SourceFlavor, Vm, VmError, VmStatus, compile_source_with_flavor, format_value,
+    };
+
+    fn drive_root_frame(vm: &mut Vm) {
+        loop {
+            match vm.run() {
+                Ok(VmStatus::Halted) => return,
+                Ok(VmStatus::Waiting(_)) => {
+                    vm.wait_for_host_op_blocking_with_cancel(|| false)
+                        .unwrap_or_else(|error| panic!("root wait failed: {error}"));
+                }
+                Ok(status) => panic!("unexpected root status: {status:?}"),
+                Err(error) => panic!("root frame failed: {error}"),
+            }
+        }
+    }
+
+    fn rss_call_handle(handle: Value) -> Result<Value, VmError> {
+        let compiled = compile_source_with_flavor(
+            r#"
+pub fn run(handle: fn() -> int) -> int {
+    let _ = handle();
+    0
+}
+"#,
+            SourceFlavor::RustScript,
+        )
+        .unwrap_or_else(|error| panic!("call probe must compile: {error}"));
+        let mut vm = Vm::try_new_shared(Arc::new(compiled.program)).expect("call probe vm");
+        drive_root_frame(&mut vm);
+        let run = vm
+            .resolve_exported_callable("run")
+            .expect("call probe exports run");
+        vm.invoke_callable(run, &[handle])
+    }
+
+    #[test]
+    fn opaque_host_home_is_not_equal_to_policy_handle() {
+        let home = OpaqueHostValue::mint("HostHome", ());
+        let policy = OpaqueHostValue::mint("OpaquePolicyHandle", ());
+        assert_ne!(home.to_vm_value(), policy.to_vm_value());
+    }
+
+    #[test]
+    fn opaque_separate_mints_are_not_equal() {
+        let first = OpaqueHostValue::mint("HostHome", 1u8);
+        let second = OpaqueHostValue::mint("HostHome", 2u8);
+        assert_ne!(first.to_vm_value(), second.to_vm_value());
+    }
+
+    #[test]
+    fn opaque_copied_alias_equals_source() {
+        let minted = OpaqueHostValue::mint("HostHome", ());
+        let value = minted.to_vm_value();
+        assert_eq!(value, value.clone());
+    }
+
+    #[test]
+    fn opaque_call_value_returns_invalid_callable_prototype_without_host_effect() {
+        let host_effect = Arc::new(AtomicBool::new(false));
+        let minted = OpaqueHostValue::mint("HostHome", Arc::clone(&host_effect));
+        let error = rss_call_handle(minted.to_vm_value()).expect_err("opaque must not dispatch");
+        assert!(
+            matches!(error, VmError::InvalidCallablePrototype(u32::MAX)),
+            "expected InvalidCallablePrototype(u32::MAX), got {error:?}"
+        );
+        assert!(
+            !host_effect.load(Ordering::SeqCst),
+            "calling an opaque host value must not run host payload"
+        );
+        let policy = OpaqueHostValue::mint("OpaquePolicyHandle", Arc::clone(&host_effect));
+        let error = rss_call_handle(policy.to_vm_value()).expect_err("policy must not dispatch");
+        assert!(
+            matches!(error, VmError::InvalidCallablePrototype(u32::MAX)),
+            "expected InvalidCallablePrototype(u32::MAX), got {error:?}"
+        );
+        assert!(!host_effect.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn opaque_value_denies_map_string_reconstruction_and_stringify_leak() {
