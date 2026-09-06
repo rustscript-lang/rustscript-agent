@@ -14,6 +14,7 @@ mod config_host;
 pub mod domain;
 pub mod events;
 pub mod gateway;
+mod host_opaque;
 pub mod metrics;
 pub mod prompt;
 pub mod registry;
@@ -27,10 +28,11 @@ mod durable_provider;
 pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
 pub use config::{AgentGatewayConfig, TelegramConfig};
 pub use config_file::{
-    AgentPaths, ConfigFile, ConfigFileError, ConfigPaths, ConfigSnapshotEnvelope, LoadedConfig,
-    OpaquePolicyHandle, PolicyIntent, PolicyProbe, RuntimeConfig, SanitizedPolicySummary,
-    check_policy, load_config, load_snapshot,
+    AgentPaths, BoundedPublicConfig, ConfigFile, ConfigFileError, ConfigPaths,
+    ConfigSnapshotEnvelope, LoadedConfig, OpaquePolicyHandle, PolicyIntent, PolicyProbe,
+    RuntimeConfig, SanitizedPolicySummary, check_policy, load_config, load_snapshot,
 };
+pub use config_host::{ConfigFixtureHost, config_fixture_catalog};
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
     LlmResponse, ProviderError, RunContext, Sampling, ToolCall, Usage, decode_message_blocks,
