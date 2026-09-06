@@ -1,7 +1,9 @@
+use std::ffi::OsString;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustscript_agent::auth::config::{AuthConfig, AuthConfigError, MAX_AUTH_YAML_BYTES};
@@ -11,6 +13,44 @@ use rustscript_agent::config_file::{
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+const HOME_ENV_NAMES: [&str; 3] = ["RUSTSCRIPT_AGENT_HOME", "HOME", "USERPROFILE"];
+
+struct HomeEnvironmentGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl HomeEnvironmentGuard {
+    fn new() -> Self {
+        let lock = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = HOME_ENV_NAMES
+            .iter()
+            .map(|&name| (name, std::env::var_os(name)))
+            .collect();
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    fn set(&self, name: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
+impl Drop for HomeEnvironmentGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.previous {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct TempRoot {
@@ -114,13 +154,9 @@ fn missing_config_and_auth_files_are_typed_errors() {
 #[test]
 fn home_override_controls_all_persistent_paths() {
     let root = temp_root("home-override");
-    let previous = std::env::var_os("RUSTSCRIPT_AGENT_HOME");
-    unsafe { std::env::set_var("RUSTSCRIPT_AGENT_HOME", &root) };
+    let environment = HomeEnvironmentGuard::new();
+    environment.set("RUSTSCRIPT_AGENT_HOME", &root);
     let paths = AgentPaths::resolve().expect("home override should resolve");
-    match previous {
-        Some(value) => unsafe { std::env::set_var("RUSTSCRIPT_AGENT_HOME", value) },
-        None => unsafe { std::env::remove_var("RUSTSCRIPT_AGENT_HOME") },
-    }
 
     assert_eq!(paths.home, root.path);
     assert_eq!(paths.config, root.join("config.yaml"));
@@ -759,11 +795,7 @@ fn invalid_home_inputs_fail_closed() {
         );
     }
 
-    let previous = std::env::var_os("RUSTSCRIPT_AGENT_HOME");
-    unsafe { std::env::set_var("RUSTSCRIPT_AGENT_HOME", "") };
+    let environment = HomeEnvironmentGuard::new();
+    environment.set("RUSTSCRIPT_AGENT_HOME", "");
     assert!(AgentPaths::resolve().is_err());
-    match previous {
-        Some(value) => unsafe { std::env::set_var("RUSTSCRIPT_AGENT_HOME", value) },
-        None => unsafe { std::env::remove_var("RUSTSCRIPT_AGENT_HOME") },
-    }
 }
