@@ -8,6 +8,17 @@
 
 ---
 
+## 0. Mandatory RSS-first boundary for Task 1 and every later task
+
+This section is normative and takes precedence over conflicting language, file lists, examples, and implementation steps elsewhere in this plan. It applies retroactively to Task 1 and to all in-progress and future Task 2+ work.
+
+- RSS is the primary implementation layer for agent business behavior: provider selection and adaptation, authentication/login/refresh workflow orchestration, retry and polling policy, model request/response shaping, session/workspace policy, approvals, compaction decisions, and user-facing business error mapping.
+- Rust supplies only necessary generic foundational capabilities and their security enforcement: bounded parsing/typed transport, filesystem confinement and permissions, cross-process locking, atomic persistence, generation compare-and-swap, cryptographic/PKCE primitives, bounded HTTP transport, callback listener mechanics, clock/cancellation, and secret-handle access. Rust may enforce mandatory trust boundaries; it must not become a parallel business workflow engine.
+- Provider-specific endpoints/defaults, protocol payload interpretation and workflow decisions belong in RSS/provider adapters. Trusted authority validation may remain a generic Rust mechanism driven by trusted configuration, without granting RSS permission to substitute an unauthorized authority. Secrets must remain confined to host-side storage/transport and opaque handles; RSS-first does not permit exposing raw credentials to model context, durable events, or logs.
+- Task 1 schema/loaders and Task 2 secure storage are permissible Rust foundations only to the extent that they implement data integrity, resource bounds, persistence and capability enforcement. Provider business rules or refresh/login decision logic embedded in those modules require explicit review and migration to RSS or a justified generic security contract.
+- Every Task 1+ implementation and review must enumerate RSS-owned behavior, necessary Rust primitives, the host bridge contract, and real RSS entry-path verification. A Rust-heavy task file list is not permission to move business behavior into Rust. Amend conflicting later task instructions before their implementation is accepted.
+- Re-review the integrated Task 1 implementation, the current Task 2 scope, and every remaining task against this boundary. Earlier review results do not establish compliance with this clarified requirement. Block further integration of Task 1+ changes until the boundary review and any required corrections pass; preserve existing commits and work in progress.
+
 ## 1. Scope and completion boundary
 
 本计划包含当前 agent 从“library/E2E 可运行”到“用户可配置并部署”的完整收尾路线：
