@@ -1468,8 +1468,10 @@ mod yaml_preflight_tests {
     #[test]
     fn injected_expanded_budget_rejects_transitive_container_aliases() {
         let source = b"base: &base [x]\nnested: &nested [*base, *base]\ncopy: [*nested, *base]\n";
-        let mut limits = YamlPreflightLimits::default();
-        limits.max_expanded_bytes = 1_000;
+        let limits = YamlPreflightLimits {
+            max_expanded_bytes: 1_000,
+            ..YamlPreflightLimits::default()
+        };
 
         let error = preflight_yaml_with_limits(source, limits)
             .expect_err("transitive aliases must charge their complete container summaries");
