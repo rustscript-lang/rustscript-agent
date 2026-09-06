@@ -83,6 +83,22 @@ fn valid_auth(credential_id: &str) -> String {
     )
 }
 
+fn large_scalar_alias_source(scalar_bytes: usize, alias_count: usize) -> String {
+    let scalar = "x".repeat(scalar_bytes);
+    let mut source = String::with_capacity(scalar_bytes + alias_count * 7 + 32);
+    source.push_str("base: &base ");
+    source.push_str(&scalar);
+    source.push_str("\ncopies: [");
+    for index in 0..alias_count {
+        if index != 0 {
+            source.push_str(", ");
+        }
+        source.push_str("*base");
+    }
+    source.push_str("]\n");
+    source
+}
+
 #[test]
 fn missing_config_and_auth_files_are_typed_errors() {
     let root = temp_root("missing");
@@ -645,6 +661,68 @@ fn auth_yaml_uses_the_same_preparse_budget_and_document_fence() {
     let error = AuthConfig::from_str("version: 1\n---\nversion: 1\n")
         .expect_err("multiple auth documents must fail closed");
     assert!(matches!(error, AuthConfigError::MultipleDocuments { .. }));
+}
+
+#[test]
+fn yaml_alias_expansion_bytes_are_rejected_before_value_materialization() {
+    let source = large_scalar_alias_source(130 * 1024, 4_000);
+    assert!(source.len() < MAX_CONFIG_YAML_BYTES);
+
+    let config_error = ConfigFile::from_str(&source)
+        .expect_err("expanded aliases must fail before serde_yaml::Value construction");
+    assert!(matches!(config_error, ConfigFileError::YamlTooLarge { .. }));
+    assert!(config_error.to_string().contains("expanded allocation"));
+
+    let auth_error = AuthConfig::from_str(&source)
+        .expect_err("auth must use the shared expanded-allocation preflight");
+    assert!(matches!(auth_error, AuthConfigError::YamlTooLarge { .. }));
+    assert!(auth_error.to_string().contains("expanded allocation"));
+}
+
+#[test]
+fn small_nested_and_reused_aliases_remain_supported_in_both_schemas() {
+    let config = r#"version: 1
+model:
+  provider: first
+  model: local-agent
+providers:
+  first: &shared_provider
+    protocol: local
+    base_url: &endpoint https://example.com/api
+  second: *shared_provider
+  third:
+    protocol: local
+    base_url: *endpoint
+"#;
+    ConfigFile::from_str(config).expect("small nested config aliases remain valid");
+
+    let auth = r#"version: 1
+credentials:
+  first: &shared_credential
+    provider: &provider openai-codex
+    kind: oauth
+    source: codex-device
+    token_type: Bearer
+    access_token: &token SYNTHETIC_ACCESS_TOKEN
+    refresh_token: *token
+    expires_at_ms: 1788440000000
+    scopes: []
+    account_id: acct_synthetic
+    status: active
+  second: *shared_credential
+  third:
+    provider: *provider
+    kind: oauth
+    source: codex-device
+    token_type: Bearer
+    access_token: *token
+    refresh_token: *token
+    expires_at_ms: 1788440000000
+    scopes: []
+    account_id: acct_synthetic
+    status: active
+"#;
+    AuthConfig::from_str(auth).expect("small nested auth aliases remain valid");
 }
 
 #[test]
