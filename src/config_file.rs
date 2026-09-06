@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use url::Url;
-use yaml_rust2::parser::{Event, Parser};
+use yaml_rust2::parser::{Event, Parser, Tag};
 
 use crate::auth::config::{AuthConfig, AuthConfigError};
 
@@ -34,6 +34,17 @@ pub const MAX_CONFIG_YAML_BYTES: usize = 256 * 1024;
 pub const MAX_YAML_DEPTH: usize = 16;
 /// Maximum number of YAML scalar and collection nodes accepted by a document.
 pub const MAX_YAML_NODES: usize = 4096;
+/// Internal finite cap on estimated expanded `serde_yaml::Value` allocation bytes.
+///
+/// This shared cap is enforced before `serde_yaml::Value` construction for both
+/// `config.yaml` and `auth.yaml`; aliases charge the complete anchored summary.
+pub(crate) const MAX_YAML_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
+
+const YAML_VALUE_BYTES: usize = std::mem::size_of::<Value>();
+const YAML_SEQUENCE_CONTAINER_BYTES: usize = YAML_VALUE_BYTES + std::mem::size_of::<Vec<Value>>();
+const YAML_MAPPING_CONTAINER_BYTES: usize = YAML_VALUE_BYTES + std::mem::size_of::<Mapping>();
+const YAML_SEQUENCE_ELEMENT_BYTES: usize = YAML_VALUE_BYTES;
+const YAML_TAGGED_VALUE_BYTES: usize = YAML_VALUE_BYTES;
 
 /// Resolved persistent paths for one agent home.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1021,6 +1032,10 @@ pub(crate) enum YamlBoundsError {
         path: String,
         max_nodes: usize,
     },
+    ExpandedBytes {
+        path: String,
+        max_bytes: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1034,6 +1049,7 @@ pub(crate) enum YamlPreflightError {
 struct YamlSummary {
     nodes: usize,
     max_depth: usize,
+    expanded_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1043,11 +1059,35 @@ enum YamlContainer {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YamlAnchor {
+    Open,
+    Complete(YamlSummary),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct YamlFrame {
     container: YamlContainer,
     anchor: usize,
     tagged: bool,
+    mapping_expects_value: bool,
     summary: YamlSummary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct YamlPreflightLimits {
+    max_depth: usize,
+    max_nodes: usize,
+    max_expanded_bytes: usize,
+}
+
+impl Default for YamlPreflightLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: MAX_YAML_DEPTH,
+            max_nodes: MAX_YAML_NODES,
+            max_expanded_bytes: MAX_YAML_EXPANDED_BYTES,
+        }
+    }
 }
 
 struct YamlEventBudget {
@@ -1055,12 +1095,14 @@ struct YamlEventBudget {
     in_document: bool,
     root: Option<YamlSummary>,
     frames: Vec<YamlFrame>,
-    anchors: HashMap<usize, YamlSummary>,
+    anchors: HashMap<usize, YamlAnchor>,
     nodes: usize,
+    expanded_bytes: usize,
+    limits: YamlPreflightLimits,
 }
 
 impl YamlEventBudget {
-    fn new() -> Self {
+    fn with_limits(limits: YamlPreflightLimits) -> Self {
         Self {
             documents: 0,
             in_document: false,
@@ -1068,6 +1110,8 @@ impl YamlEventBudget {
             frames: Vec::new(),
             anchors: HashMap::new(),
             nodes: 0,
+            expanded_bytes: 0,
+            limits,
         }
     }
 
@@ -1102,31 +1146,32 @@ impl YamlEventBudget {
                     return Err(YamlPreflightError::Malformed);
                 }
             }
-            Event::Scalar(_, _, anchor, tag) => {
+            Event::Scalar(value, _, anchor, tag) => {
                 self.ensure_in_document()?;
-                let summary = Self::tagged_summary(tag.is_some())?;
-                self.reserve(summary.nodes)?;
+                let summary = self.scalar_summary(&value, tag.as_ref())?;
+                self.reserve(summary)?;
                 self.ensure_depth(summary.max_depth)?;
                 self.complete_node(summary)?;
                 if anchor != 0 {
-                    self.anchors.insert(anchor, summary);
+                    self.anchors.insert(anchor, YamlAnchor::Complete(summary));
                 }
             }
             Event::Alias(anchor) => {
                 self.ensure_in_document()?;
-                let summary = *self
-                    .anchors
-                    .get(&anchor)
-                    .ok_or(YamlPreflightError::Malformed)?;
-                self.reserve(summary.nodes)?;
+                let summary = match self.anchors.get(&anchor).copied() {
+                    Some(YamlAnchor::Complete(summary)) => summary,
+                    Some(YamlAnchor::Open) => return Err(YamlPreflightError::Malformed),
+                    None => return Err(YamlPreflightError::Malformed),
+                };
+                self.reserve(summary)?;
                 self.ensure_depth(summary.max_depth)?;
                 self.complete_node(summary)?;
             }
             Event::SequenceStart(anchor, tag) => {
-                self.start_container(YamlContainer::Sequence, anchor, tag.is_some())?;
+                self.start_container(YamlContainer::Sequence, anchor, tag.as_ref())?;
             }
             Event::MappingStart(anchor, tag) => {
-                self.start_container(YamlContainer::Mapping, anchor, tag.is_some())?;
+                self.start_container(YamlContainer::Mapping, anchor, tag.as_ref())?;
             }
             Event::SequenceEnd => self.end_container(YamlContainer::Sequence)?,
             Event::MappingEnd => self.end_container(YamlContainer::Mapping)?,
@@ -1154,87 +1199,129 @@ impl YamlEventBudget {
         &mut self,
         container: YamlContainer,
         anchor: usize,
-        tagged: bool,
+        tag: Option<&Tag>,
     ) -> Result<(), YamlPreflightError> {
         self.ensure_in_document()?;
-        let summary_depth = usize::from(tagged);
-        self.ensure_depth(summary_depth)?;
-        let base_nodes = if tagged { 2 } else { 1 };
-        self.reserve(base_nodes)?;
+        self.ensure_depth(usize::from(tag.is_some()))?;
+        let summary = YamlSummary {
+            nodes: if tag.is_some() { 2 } else { 1 },
+            max_depth: 0,
+            expanded_bytes: self.container_bytes(container, tag)?,
+        };
+        self.reserve(summary)?;
         self.frames.push(YamlFrame {
             container,
             anchor,
-            tagged,
-            summary: YamlSummary {
-                nodes: 1,
-                max_depth: 0,
-            },
+            tagged: tag.is_some(),
+            mapping_expects_value: false,
+            summary,
         });
+        if anchor != 0 {
+            self.anchors.insert(anchor, YamlAnchor::Open);
+        }
         Ok(())
     }
 
     fn end_container(&mut self, expected: YamlContainer) -> Result<(), YamlPreflightError> {
         self.ensure_in_document()?;
         let frame = self.frames.pop().ok_or(YamlPreflightError::Malformed)?;
-        if frame.container != expected {
+        if frame.container != expected
+            || (frame.container == YamlContainer::Mapping && frame.mapping_expects_value)
+        {
             return Err(YamlPreflightError::Malformed);
         }
         let summary = if frame.tagged {
             YamlSummary {
-                nodes: frame
-                    .summary
-                    .nodes
-                    .checked_add(1)
-                    .ok_or_else(|| self.too_many_nodes())?,
                 max_depth: frame
                     .summary
                     .max_depth
                     .checked_add(1)
                     .ok_or_else(|| self.too_deep())?,
+                ..frame.summary
             }
         } else {
             frame.summary
         };
         self.ensure_depth(summary.max_depth)?;
         if frame.anchor != 0 {
-            self.anchors.insert(frame.anchor, summary);
+            self.anchors
+                .insert(frame.anchor, YamlAnchor::Complete(summary));
         }
         self.complete_node(summary)
     }
 
     fn complete_node(&mut self, summary: YamlSummary) -> Result<(), YamlPreflightError> {
-        if let Some(frame) = self.frames.last() {
-            let nodes = frame
-                .summary
-                .nodes
-                .checked_add(summary.nodes)
-                .ok_or_else(|| self.too_many_nodes())?;
-            let max_depth = frame
-                .summary
-                .max_depth
-                .max(summary.max_depth.saturating_add(1));
-            if max_depth > MAX_YAML_DEPTH {
-                return Err(self.too_deep());
-            }
-            let Some(frame) = self.frames.last_mut() else {
+        let Some(frame) = self.frames.last() else {
+            if self.root.replace(summary).is_some() {
                 return Err(YamlPreflightError::Malformed);
-            };
-            frame.summary.nodes = nodes;
-            frame.summary.max_depth = max_depth;
-        } else if self.root.replace(summary).is_some() {
-            return Err(YamlPreflightError::Malformed);
+            }
+            return Ok(());
+        };
+
+        let edge_bytes = match frame.container {
+            YamlContainer::Sequence => YAML_SEQUENCE_ELEMENT_BYTES,
+            YamlContainer::Mapping if frame.mapping_expects_value => self.mapping_entry_bytes()?,
+            YamlContainer::Mapping => 0,
+        };
+        let nodes = frame
+            .summary
+            .nodes
+            .checked_add(summary.nodes)
+            .ok_or_else(|| self.too_many_nodes())?;
+        let child_depth = summary
+            .max_depth
+            .checked_add(1)
+            .ok_or_else(|| self.too_deep())?;
+        let max_depth = frame.summary.max_depth.max(child_depth);
+        if max_depth > self.limits.max_depth {
+            return Err(self.too_deep());
         }
+        let expanded_bytes = frame
+            .summary
+            .expanded_bytes
+            .checked_add(summary.expanded_bytes)
+            .ok_or_else(|| self.too_many_bytes())?
+            .checked_add(edge_bytes)
+            .ok_or_else(|| self.too_many_bytes())?;
+        let total_expanded_bytes = self
+            .expanded_bytes
+            .checked_add(edge_bytes)
+            .ok_or_else(|| self.too_many_bytes())?;
+        if total_expanded_bytes > self.limits.max_expanded_bytes {
+            return Err(self.too_many_bytes());
+        }
+        let Some(frame) = self.frames.last_mut() else {
+            return Err(YamlPreflightError::Malformed);
+        };
+        frame.summary = YamlSummary {
+            nodes,
+            max_depth,
+            expanded_bytes,
+        };
+        if frame.container == YamlContainer::Mapping {
+            frame.mapping_expects_value = !frame.mapping_expects_value;
+        }
+        self.expanded_bytes = total_expanded_bytes;
         Ok(())
     }
 
-    fn reserve(&mut self, nodes: usize) -> Result<(), YamlPreflightError> {
-        self.nodes = self
+    fn reserve(&mut self, summary: YamlSummary) -> Result<(), YamlPreflightError> {
+        let nodes = self
             .nodes
-            .checked_add(nodes)
+            .checked_add(summary.nodes)
             .ok_or_else(|| self.too_many_nodes())?;
-        if self.nodes > MAX_YAML_NODES {
+        if nodes > self.limits.max_nodes {
             return Err(self.too_many_nodes());
         }
+        let expanded_bytes = self
+            .expanded_bytes
+            .checked_add(summary.expanded_bytes)
+            .ok_or_else(|| self.too_many_bytes())?;
+        if expanded_bytes > self.limits.max_expanded_bytes {
+            return Err(self.too_many_bytes());
+        }
+        self.nodes = nodes;
+        self.expanded_bytes = expanded_bytes;
         Ok(())
     }
 
@@ -1244,30 +1331,83 @@ impl YamlEventBudget {
             .len()
             .checked_add(relative_depth)
             .ok_or_else(|| self.too_deep())?;
-        if depth > MAX_YAML_DEPTH {
+        if depth > self.limits.max_depth {
             return Err(self.too_deep_at(depth));
         }
         Ok(())
     }
 
-    fn tagged_summary(tagged: bool) -> Result<YamlSummary, YamlPreflightError> {
-        if tagged {
-            Ok(YamlSummary {
-                nodes: 2,
-                max_depth: 1,
-            })
-        } else {
-            Ok(YamlSummary {
-                nodes: 1,
-                max_depth: 0,
-            })
+    fn scalar_summary(
+        &self,
+        value: &str,
+        tag: Option<&Tag>,
+    ) -> Result<YamlSummary, YamlPreflightError> {
+        let mut expanded_bytes = YAML_VALUE_BYTES
+            .checked_add(value.len())
+            .ok_or_else(|| self.too_many_bytes())?;
+        if let Some(tag) = tag {
+            expanded_bytes = expanded_bytes
+                .checked_add(self.tag_bytes(tag)?)
+                .ok_or_else(|| self.too_many_bytes())?;
         }
+        Ok(YamlSummary {
+            nodes: if tag.is_some() { 2 } else { 1 },
+            max_depth: usize::from(tag.is_some()),
+            expanded_bytes,
+        })
+    }
+
+    fn container_bytes(
+        &self,
+        container: YamlContainer,
+        tag: Option<&Tag>,
+    ) -> Result<usize, YamlPreflightError> {
+        let base = match container {
+            YamlContainer::Sequence => YAML_SEQUENCE_CONTAINER_BYTES,
+            YamlContainer::Mapping => YAML_MAPPING_CONTAINER_BYTES,
+        };
+        match tag {
+            Some(tag) => base
+                .checked_add(self.tag_bytes(tag)?)
+                .ok_or_else(|| self.too_many_bytes()),
+            None => Ok(base),
+        }
+    }
+
+    fn tag_bytes(&self, tag: &Tag) -> Result<usize, YamlPreflightError> {
+        let tag_text = tag
+            .handle
+            .len()
+            .checked_add(tag.suffix.len())
+            .ok_or_else(|| self.too_many_bytes())?;
+        tag_text
+            .checked_add(YAML_TAGGED_VALUE_BYTES)
+            .ok_or_else(|| self.too_many_bytes())
+    }
+
+    fn mapping_entry_bytes(&self) -> Result<usize, YamlPreflightError> {
+        let values = YAML_VALUE_BYTES
+            .checked_mul(2)
+            .ok_or_else(|| self.too_many_bytes())?;
+        let metadata = std::mem::size_of::<usize>()
+            .checked_mul(2)
+            .ok_or_else(|| self.too_many_bytes())?;
+        values
+            .checked_add(metadata)
+            .ok_or_else(|| self.too_many_bytes())
     }
 
     fn too_many_nodes(&self) -> YamlPreflightError {
         YamlPreflightError::Bounds(YamlBoundsError::TooManyNodes {
             path: "root".to_string(),
-            max_nodes: MAX_YAML_NODES,
+            max_nodes: self.limits.max_nodes,
+        })
+    }
+
+    fn too_many_bytes(&self) -> YamlPreflightError {
+        YamlPreflightError::Bounds(YamlBoundsError::ExpandedBytes {
+            path: "root".to_string(),
+            max_bytes: self.limits.max_expanded_bytes,
         })
     }
 
@@ -1279,7 +1419,7 @@ impl YamlEventBudget {
         YamlPreflightError::Bounds(YamlBoundsError::TooDeep {
             path: "root".to_string(),
             depth,
-            max_depth: MAX_YAML_DEPTH,
+            max_depth: self.limits.max_depth,
         })
     }
 }
@@ -1296,10 +1436,17 @@ pub(crate) fn parse_yaml_value(bytes: &[u8]) -> Result<Value, YamlValueParseErro
 }
 
 pub(crate) fn preflight_yaml(bytes: &[u8]) -> Result<(), YamlPreflightError> {
+    preflight_yaml_with_limits(bytes, YamlPreflightLimits::default())
+}
+
+fn preflight_yaml_with_limits(
+    bytes: &[u8],
+    limits: YamlPreflightLimits,
+) -> Result<(), YamlPreflightError> {
     let source = std::str::from_utf8(bytes).map_err(|_| YamlPreflightError::Malformed)?;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut parser = Parser::new_from_str(source);
-        let mut budget = YamlEventBudget::new();
+        let mut budget = YamlEventBudget::with_limits(limits);
         loop {
             let (event, _) = parser
                 .next_token()
@@ -1312,6 +1459,62 @@ pub(crate) fn preflight_yaml(bytes: &[u8]) -> Result<(), YamlPreflightError> {
         }
     }))
     .unwrap_or(Err(YamlPreflightError::Malformed))
+}
+
+#[cfg(test)]
+mod yaml_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn injected_expanded_budget_rejects_transitive_container_aliases() {
+        let source = b"base: &base [x]\nnested: &nested [*base, *base]\ncopy: [*nested, *base]\n";
+        let mut limits = YamlPreflightLimits::default();
+        limits.max_expanded_bytes = 1_000;
+
+        let error = preflight_yaml_with_limits(source, limits)
+            .expect_err("transitive aliases must charge their complete container summaries");
+        assert!(matches!(
+            error,
+            YamlPreflightError::Bounds(YamlBoundsError::ExpandedBytes {
+                max_bytes: 1_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn expanded_byte_arithmetic_overflow_fails_closed() {
+        let limits = YamlPreflightLimits {
+            max_depth: MAX_YAML_DEPTH,
+            max_nodes: MAX_YAML_NODES,
+            max_expanded_bytes: usize::MAX,
+        };
+        let mut budget = YamlEventBudget::with_limits(limits);
+        budget.expanded_bytes = usize::MAX;
+
+        let error = budget
+            .reserve(YamlSummary {
+                nodes: 1,
+                max_depth: 0,
+                expanded_bytes: 1,
+            })
+            .expect_err("expanded byte addition must not wrap");
+        assert!(matches!(
+            error,
+            YamlPreflightError::Bounds(YamlBoundsError::ExpandedBytes {
+                max_bytes: usize::MAX,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recursive_alias_is_rejected_without_recursing_in_preflight() {
+        assert!(matches!(
+            preflight_yaml(b"&root [*root]\n"),
+            Err(YamlPreflightError::Malformed)
+        ));
+    }
 }
 
 /// A successful pair load is the only operation in this task that combines
@@ -1342,6 +1545,10 @@ pub enum ConfigFileError {
     YamlTooComplex {
         path: String,
         max_nodes: usize,
+    },
+    YamlTooLarge {
+        path: String,
+        max_bytes: usize,
     },
     MultipleDocuments {
         path: PathBuf,
@@ -1436,6 +1643,13 @@ impl ConfigFileError {
                 path: format!("{}:{yaml_path}", path.display()),
                 max_nodes,
             },
+            YamlBoundsError::ExpandedBytes {
+                path: yaml_path,
+                max_bytes,
+            } => Self::YamlTooLarge {
+                path: format!("{}:{yaml_path}", path.display()),
+                max_bytes,
+            },
         }
     }
 }
@@ -1470,6 +1684,10 @@ impl fmt::Display for ConfigFileError {
             Self::YamlTooComplex { path, max_nodes } => write!(
                 formatter,
                 "YAML path {path} exceeds the {max_nodes}-node limit"
+            ),
+            Self::YamlTooLarge { path, max_bytes } => write!(
+                formatter,
+                "YAML path {path} exceeds the {max_bytes}-byte expanded allocation limit"
             ),
             Self::MultipleDocuments { path } => write!(
                 formatter,
