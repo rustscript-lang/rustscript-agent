@@ -25,11 +25,6 @@ env:
   # repository is required or used (tests/dependency_pin_tests.rs enforces
   # the canonical source and full revision; bump only together with a
   # Cargo.lock refresh).
-  # Integration tests place temporary SQLite state and fixture scripts
-  # here. Every suite honors this variable; without it they fall back to
-  # /mnt/TEMP/rustscript/... which is the local-development default and
-  # not writable on CI runners.
-  RUSTSCRIPT_AGENT_TEST_TMP: ${{ runner.temp }}/rustscript-agent-tests
 
 jobs:
   quality:
@@ -40,6 +35,14 @@ jobs:
         # Full-SHA pin, matching the rustscript-lang/rustscript CI policy
         # (actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5).
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      # Integration tests honor RUSTSCRIPT_AGENT_TEST_TMP for SQLite state and
+      # fixture scripts; without it they fall back to /mnt/TEMP/rustscript/...
+      # which is not writable on CI runners. `runner` is unavailable in
+      # workflow-level and job-level `env`, so export the runner default
+      # RUNNER_TEMP path from a step instead.
+      - name: Configure test temp root
+        run: echo "RUSTSCRIPT_AGENT_TEST_TMP=${RUNNER_TEMP}/rustscript-agent-tests" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         # Full-SHA pin, matching the rustscript-lang/rustscript CI policy
