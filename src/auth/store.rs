@@ -233,16 +233,32 @@ impl OpaqueSecretSlot {
     }
 }
 
-fn handle_deadline(kind: SecretSlotKind, expires_at_ms: u64) -> Instant {
+fn credential_remaining(expires_at_ms: u64) -> Duration {
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_millis(expires_at_ms))
+        .and_then(|deadline| deadline.duration_since(SystemTime::now()).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
+fn handle_deadline(kind: SecretSlotKind, expires_at_ms: u64, request_deadline: Instant) -> Instant {
+    let now = Instant::now();
     let cap = match kind {
         SecretSlotKind::Access => ACCESS_HANDLE_TTL,
         SecretSlotKind::Refresh => REFRESH_HANDLE_TTL,
     };
-    let remaining = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_millis(expires_at_ms))
-        .and_then(|deadline| deadline.duration_since(SystemTime::now()).ok())
-        .unwrap_or(Duration::ZERO);
-    Instant::now() + remaining.min(cap)
+    let capped = now + cap;
+    let request_bound = if request_deadline > now {
+        request_deadline
+    } else {
+        now
+    };
+    match kind {
+        SecretSlotKind::Access => {
+            let credential_bound = now + credential_remaining(expires_at_ms);
+            capped.min(request_bound).min(credential_bound)
+        }
+        SecretSlotKind::Refresh => capped.min(request_bound),
+    }
 }
 
 struct IssuedHandleInner {
@@ -943,11 +959,7 @@ pub trait CredentialStore {
         &self,
         request: SaveCredentialRequest,
     ) -> Result<SaveOutcome, AuthStoreError>;
-    fn delete(
-        &self,
-        credential_id: &str,
-        expected_generation: u64,
-    ) -> Result<AuthMetadata, AuthStoreError>;
+    fn delete(&self, credential_id: &str) -> Result<AuthMetadata, AuthStoreError>;
 }
 
 struct StoreInner {
@@ -1132,32 +1144,17 @@ impl AuthStore {
         result
     }
 
-    /// Removes one credential after a generation check and preserves all other
-    /// entries in the YAML document.
-    pub fn delete(
-        &self,
-        credential_id: &str,
-        expected_generation: u64,
-    ) -> Result<AuthMetadata, AuthStoreError> {
+    /// Removes one named credential after host policy checks and preserves all
+    /// other entries in the YAML document.
+    pub fn delete(&self, credential_id: &str) -> Result<AuthMetadata, AuthStoreError> {
         let credential_id = checked_credential_id(credential_id)?;
         self.with_lock(|store| {
             let mut document = store.load_locked()?;
-            let Some(current) = document.credentials.get(credential_id.as_str()) else {
+            let Some(removed) = document.credentials.remove(credential_id.as_str()) else {
                 return Err(AuthStoreError::CredentialNotFound {
                     credential_id: credential_id.to_string(),
                 });
             };
-            if current.generation != expected_generation {
-                return Err(AuthStoreError::GenerationConflict {
-                    credential_id: credential_id.to_string(),
-                    expected: expected_generation,
-                    actual: current.generation,
-                });
-            }
-            let removed = document
-                .credentials
-                .remove(credential_id.as_str())
-                .expect("credential checked immediately before removal");
             store.save_locked(&document)?;
             Ok(AuthMetadata::from_stored(credential_id.as_str(), &removed))
         })
@@ -1171,12 +1168,31 @@ impl AuthStore {
         policy_generation: u64,
         run_id: &str,
     ) -> Result<OpaqueAccessHandle, AuthStoreError> {
+        self.issue_access_handle_until(
+            credential_id,
+            generation,
+            policy_generation,
+            run_id,
+            Instant::now() + ACCESS_HANDLE_TTL,
+        )
+    }
+
+    /// Issues an access handle whose lifetime is also capped by `request_deadline`.
+    pub fn issue_access_handle_until(
+        &self,
+        credential_id: &str,
+        generation: u64,
+        policy_generation: u64,
+        run_id: &str,
+        request_deadline: Instant,
+    ) -> Result<OpaqueAccessHandle, AuthStoreError> {
         self.issue_handle(
             credential_id,
             generation,
             policy_generation,
             run_id,
             SecretSlotKind::Access,
+            request_deadline,
         )
         .map(OpaqueAccessHandle::from_inner)
     }
@@ -1189,12 +1205,31 @@ impl AuthStore {
         policy_generation: u64,
         run_id: &str,
     ) -> Result<OpaqueRefreshHandle, AuthStoreError> {
+        self.issue_refresh_handle_until(
+            credential_id,
+            generation,
+            policy_generation,
+            run_id,
+            Instant::now() + REFRESH_HANDLE_TTL,
+        )
+    }
+
+    /// Issues a refresh handle whose lifetime is also capped by `request_deadline`.
+    pub fn issue_refresh_handle_until(
+        &self,
+        credential_id: &str,
+        generation: u64,
+        policy_generation: u64,
+        run_id: &str,
+        request_deadline: Instant,
+    ) -> Result<OpaqueRefreshHandle, AuthStoreError> {
         self.issue_handle(
             credential_id,
             generation,
             policy_generation,
             run_id,
             SecretSlotKind::Refresh,
+            request_deadline,
         )
         .map(OpaqueRefreshHandle::from_inner)
     }
@@ -1206,6 +1241,7 @@ impl AuthStore {
         policy_generation: u64,
         run_id: &str,
         kind: SecretSlotKind,
+        request_deadline: Instant,
     ) -> Result<Arc<IssuedHandleInner>, AuthStoreError> {
         let credential_id = checked_credential_id(credential_id)?;
         self.with_lock(|store| {
@@ -1242,13 +1278,20 @@ impl AuthStore {
                 run_id,
                 secret.into_bytes(),
             )?;
+            let expires_at = handle_deadline(kind, expires_at_ms, request_deadline);
+            if Instant::now() >= expires_at {
+                return Err(AuthStoreError::HandleExpired {
+                    credential_id: credential_id.to_string(),
+                    kind: kind.as_str().to_string(),
+                });
+            }
             Ok(Arc::new(IssuedHandleInner {
                 kind,
                 credential_id: credential_id.to_string(),
                 generation,
                 policy_generation,
                 run_id: run_id.to_string(),
-                expires_at: handle_deadline(kind, expires_at_ms),
+                expires_at,
                 state: AtomicU8::new(HANDLE_LIVE),
                 slot,
             }))
@@ -1351,12 +1394,8 @@ impl CredentialStore for AuthStore {
         AuthStore::save_if_generation(self, request)
     }
 
-    fn delete(
-        &self,
-        credential_id: &str,
-        expected_generation: u64,
-    ) -> Result<AuthMetadata, AuthStoreError> {
-        AuthStore::delete(self, credential_id, expected_generation)
+    fn delete(&self, credential_id: &str) -> Result<AuthMetadata, AuthStoreError> {
+        AuthStore::delete(self, credential_id)
     }
 }
 

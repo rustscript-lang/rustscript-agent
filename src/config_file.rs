@@ -1779,6 +1779,13 @@ mod fixture_policy {
         token: OpaqueHostValue,
     }
 
+    #[derive(Clone, Debug)]
+    pub(crate) struct PolicyHandlePayload {
+        pub generation: u64,
+        pub run_id: String,
+        pub expires_at: Instant,
+    }
+
     impl PartialEq for OpaquePolicyHandle {
         fn eq(&self, other: &Self) -> bool {
             self.token.ptr_eq(&other.token)
@@ -1816,8 +1823,11 @@ mod fixture_policy {
             Some(Self { token })
         }
 
-        fn mint(opaques: &Arc<OpaqueRegistry>) -> Result<Self, ConfigFileError> {
-            match opaques.mint(POLICY_HANDLE_CLASS, ()) {
+        fn mint(
+            opaques: &Arc<OpaqueRegistry>,
+            payload: PolicyHandlePayload,
+        ) -> Result<Self, ConfigFileError> {
+            match opaques.mint(POLICY_HANDLE_CLASS, payload) {
                 Ok(token) => Ok(Self { token }),
                 Err(OpaqueError::LiveHandleLimit) => Err(ConfigFileError::HandleLimit {
                     resource: "opaque",
@@ -1832,6 +1842,10 @@ mod fixture_policy {
 
         fn prototype_id(&self) -> u32 {
             self.token.prototype_id()
+        }
+
+        pub(crate) fn provenance(&self) -> Option<Arc<PolicyHandlePayload>> {
+            self.token.downcast_arc::<PolicyHandlePayload>()
         }
     }
 
@@ -1917,6 +1931,7 @@ mod fixture_policy {
         inner: parking_lot::Mutex<PolicyTable>,
         opaques: Arc<OpaqueRegistry>,
         deadline: Instant,
+        run_id: String,
     }
 
     impl PolicyOwner {
@@ -1928,6 +1943,7 @@ mod fixture_policy {
                 }),
                 opaques,
                 deadline,
+                run_id: format!("policy-run-{}", std::process::id()),
             })
         }
 
@@ -1996,7 +2012,14 @@ mod fixture_policy {
                 max_tool_output_bytes: loaded.config.agent.max_tool_output_bytes,
             };
             drop(table);
-            let handle = OpaquePolicyHandle::mint(&self.opaques)?;
+            let handle = OpaquePolicyHandle::mint(
+                &self.opaques,
+                PolicyHandlePayload {
+                    generation,
+                    run_id: self.run_id.clone(),
+                    expires_at: self.deadline,
+                },
+            )?;
             let mut table = self.inner.lock();
             table.entries.insert(
                 handle.prototype_id(),
@@ -2055,7 +2078,9 @@ mod fixture_policy {
                 });
             }
             match intent.op.as_str() {
-                "inspect" => Ok(PolicyProbe { ok: true }),
+                "inspect" | "load" | "save" | "access" | "refresh" | "delete" => {
+                    Ok(PolicyProbe { ok: true })
+                }
                 "expire" => {
                     table.entries.remove(&id);
                     drop(table);

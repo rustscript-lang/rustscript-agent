@@ -166,7 +166,6 @@ fn load_request(context: map) -> map {
 fn delete_request(context: map) -> map {
     {
         credential_id: map_string(context, "credential_id", ""),
-        expected_generation: map_int(context, "expected_generation", 0),
         policy_handle: context["policy_handle"].copy()
     }
 }
@@ -174,9 +173,7 @@ fn delete_request(context: map) -> map {
 fn handle_request(context: map) -> map {
     {
         credential_id: map_string(context, "credential_id", ""),
-        generation: map_int(context, "expected_generation", 0),
-        policy_generation: map_int(context, "policy_generation", 0),
-        run_id: map_string(context, "run_id", ""),
+        expected_generation: map_int(context, "expected_generation", 0),
         policy_handle: context["policy_handle"].copy()
     }
 }
@@ -198,15 +195,11 @@ fn refresh_for(context: map, kind: string) -> map {
 fn save_request(context: map, kind: string) -> map {
     let credential_id: string = map_string(context, "credential_id", "");
     let expected_generation: int = map_int(context, "expected_generation", 0);
-    let policy_generation: int = map_int(context, "policy_generation", 0);
-    let run_id: string = map_string(context, "run_id", "");
     let metadata: map = metadata_for(context, kind);
     if kind == "save_forged" => {
         {
             credential_id: credential_id,
             expected_generation: expected_generation,
-            policy_generation: policy_generation,
-            run_id: run_id,
             policy_handle: context["policy_handle"].copy(),
             metadata: metadata,
             access_slot: {
@@ -225,8 +218,6 @@ fn save_request(context: map, kind: string) -> map {
         {
             credential_id: credential_id,
             expected_generation: expected_generation,
-            policy_generation: policy_generation,
-            run_id: run_id,
             policy_handle: context["policy_handle"].copy(),
             metadata: metadata,
             access_slot: "OpaqueSecretSlot",
@@ -239,8 +230,6 @@ fn save_request(context: map, kind: string) -> map {
         {
             credential_id: credential_id,
             expected_generation: expected_generation,
-            policy_generation: policy_generation,
-            run_id: run_id,
             policy_handle: context["policy_handle"].copy(),
             metadata: metadata,
             access_slot: context["access_slot"].copy(),

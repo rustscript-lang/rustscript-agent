@@ -48,8 +48,6 @@ struct FixtureSlotPayload {
 struct AuthFixtureState {
     store: AuthStore,
     policies: Arc<PolicyOwner>,
-    policy_generation: u64,
-    run_id: String,
 }
 
 /// Fixture-only host for the real RSS auth entry. It reuses Stage A's
@@ -61,8 +59,6 @@ pub struct AuthFixtureHost {
     opaques: Arc<OpaqueRegistry>,
     policies: Arc<PolicyOwner>,
     policy_handle: OpaquePolicyHandle,
-    policy_generation: u64,
-    run_id: String,
 }
 
 impl AuthFixtureHost {
@@ -82,8 +78,6 @@ impl AuthFixtureHost {
             opaques,
             policies,
             policy_handle: snapshot.policy_handle,
-            policy_generation: snapshot.policy_generation,
-            run_id: format!("auth-fixture-run-{}", std::process::id()),
         })
     }
 
@@ -96,11 +90,19 @@ impl AuthFixtureHost {
     }
 
     pub fn run_json(&self, kind: &str) -> Result<JsonValue, String> {
-        Ok(vm_value_to_json(&self.run_value(kind)?))
+        self.run_json_for(kind, "primary")
+    }
+
+    pub fn run_json_for(&self, kind: &str, credential_id: &str) -> Result<JsonValue, String> {
+        Ok(vm_value_to_json(&self.run_value_for(kind, credential_id)?))
     }
 
     pub fn run_value(&self, kind: &str) -> Result<Value, String> {
-        self.invoke_context(self.context(kind)?)
+        self.run_value_for(kind, "primary")
+    }
+
+    pub fn run_value_for(&self, kind: &str, credential_id: &str) -> Result<Value, String> {
+        self.invoke_context(self.context_for(kind, credential_id)?)
     }
 
     /// Runs RSS with a policy value supplied by another host. This is used
@@ -110,7 +112,7 @@ impl AuthFixtureHost {
         kind: &str,
         policy_value: Value,
     ) -> Result<JsonValue, String> {
-        let mut context = self.context(kind)?;
+        let mut context = self.context_for(kind, "primary")?;
         replace_map_value(&mut context, "policy_handle", policy_value);
         Ok(vm_value_to_json(&self.invoke_context(context)?))
     }
@@ -121,7 +123,7 @@ impl AuthFixtureHost {
         kind: &str,
         handle: Value,
     ) -> Result<JsonValue, String> {
-        let mut context = self.context(kind)?;
+        let mut context = self.context_for(kind, "primary")?;
         replace_map_value(&mut context, "injected_handle", handle);
         Ok(vm_value_to_json(&self.invoke_context(context)?))
     }
@@ -131,26 +133,43 @@ impl AuthFixtureHost {
         map_get(value, key).cloned()
     }
 
-    fn context(&self, kind: &str) -> Result<Value, String> {
-        let current = self.store.load_metadata("primary").ok();
+    /// Reloads the trusted policy snapshot. Previously issued policy handles
+    /// are revoked and fail closed on later RSS calls.
+    pub fn reload_policy(&mut self) -> Result<(), String> {
+        let snapshot = self
+            .policies
+            .load_snapshot(&self.home)
+            .map_err(|error| error.to_string())?;
+        self.policy_handle = snapshot.policy_handle;
+        Ok(())
+    }
+
+    fn context_for(&self, kind: &str, credential_id: &str) -> Result<Value, String> {
+        let credential =
+            CredentialId::new(credential_id.to_string()).map_err(|error| error.to_string())?;
+        let current = self.store.load_metadata(credential.as_str()).ok();
         let current_generation = current.as_ref().map_or(0, |metadata| metadata.generation);
         let expected_generation = match kind {
             "save_adopt" => current_generation.saturating_sub(1),
             "save_future" => current_generation.saturating_add(1),
             _ => current_generation,
         };
+        let provenance = self
+            .policy_handle
+            .provenance()
+            .ok_or_else(|| "policy handle payload is unavailable".to_string())?;
         let slot_run_id = if kind == "save_cross_run" {
             "auth-fixture-other-run"
         } else {
-            &self.run_id
+            provenance.run_id.as_str()
         };
         let access = self
             .store
             .fixture_secret_slot(
                 SecretSlotKind::Access,
-                "primary",
+                credential.as_str(),
                 expected_generation,
-                self.policy_generation,
+                provenance.generation,
                 slot_run_id,
                 "SYNTHETIC_ACCESS_HOST_ONLY",
             )
@@ -159,9 +178,9 @@ impl AuthFixtureHost {
             .store
             .fixture_secret_slot(
                 SecretSlotKind::Refresh,
-                "primary",
+                credential.as_str(),
                 expected_generation,
-                self.policy_generation,
+                provenance.generation,
                 slot_run_id,
                 "SYNTHETIC_REFRESH_HOST_ONLY",
             )
@@ -169,7 +188,7 @@ impl AuthFixtureHost {
         let access_value = self.mint_slot(access)?;
         let refresh_value = self.mint_slot(refresh)?;
         let metadata = current.unwrap_or_else(|| AuthMetadata {
-            credential_id: "primary".to_string(),
+            credential_id: credential.to_string(),
             provider: "synthetic-provider".to_string(),
             kind: "oauth".to_string(),
             source: "synthetic-test".to_string(),
@@ -184,16 +203,14 @@ impl AuthFixtureHost {
         });
         Ok(Value::map(vec![
             (Value::string("kind"), Value::string(kind)),
-            (Value::string("credential_id"), Value::string("primary")),
+            (
+                Value::string("credential_id"),
+                Value::string(credential.as_str()),
+            ),
             (
                 Value::string("expected_generation"),
                 Value::Int(i64::try_from(expected_generation).unwrap_or(i64::MAX)),
             ),
-            (
-                Value::string("policy_generation"),
-                Value::Int(i64::try_from(self.policy_generation).unwrap_or(i64::MAX)),
-            ),
-            (Value::string("run_id"), Value::string(&self.run_id)),
             (
                 Value::string("policy_handle"),
                 self.policy_handle.to_vm_value(),
@@ -256,8 +273,6 @@ impl AuthFixtureHost {
         vm.host_context().set_module_state(AuthFixtureState {
             store: self.store.clone(),
             policies: Arc::clone(&self.policies),
-            policy_generation: self.policy_generation,
-            run_id: self.run_id.clone(),
         });
         drive_root_frame(&mut vm)?;
         let callable = vm
@@ -402,7 +417,7 @@ fn load_metadata_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         Ok(value) => value,
         Err(error) => return return_json(error),
     };
-    if let Err(error) = check_policy(&state, map_get(&value, "policy_handle")) {
+    if let Err(error) = check_policy(&state, map_get(&value, "policy_handle"), "load") {
         return return_json(error);
     }
     match state.store.load_metadata(&credential_id) {
@@ -457,52 +472,44 @@ fn handle_adapter(vm: &mut Vm, args: &[Value], kind: SecretSlotKind) -> VmResult
         Ok(value) => value,
         Err(error) => return return_json(error),
     };
-    let generation = match required_u64(map_get(&value, "generation"), "generation") {
+    let expected_generation = match required_u64(
+        map_get(&value, "expected_generation"),
+        "expected_generation",
+    ) {
         Ok(value) => value,
         Err(error) => return return_json(error),
     };
-    let policy_generation =
-        match required_u64(map_get(&value, "policy_generation"), "policy_generation") {
-            Ok(value) => value,
-            Err(error) => return return_json(error),
-        };
-    let run_id = match required_string(map_get(&value, "run_id"), "run_id") {
-        Ok(value) => value,
+    let policy = match check_policy(
+        &state,
+        map_get(&value, "policy_handle"),
+        match kind {
+            SecretSlotKind::Access => "access",
+            SecretSlotKind::Refresh => "refresh",
+        },
+    ) {
+        Ok(policy) => policy,
         Err(error) => return return_json(error),
     };
-    if policy_generation != state.policy_generation {
-        return return_json(bridge_error(
-            "policy_stale_generation",
-            "policy generation does not match the host snapshot",
-        ));
-    }
-    if run_id != state.run_id {
-        return return_json(bridge_error(
-            "run_provenance",
-            "request run provenance does not match the host run",
-        ));
-    }
-    if let Err(error) = check_policy(&state, map_get(&value, "policy_handle")) {
-        return return_json(error);
-    }
     match kind {
         SecretSlotKind::Access => {
-            match state.store.issue_access_handle(
+            match state.store.issue_access_handle_until(
                 &credential_id,
-                generation,
-                policy_generation,
-                &run_id,
+                expected_generation,
+                policy.generation,
+                &policy.run_id,
+                policy.deadline,
             ) {
                 Ok(handle) => mint_access_handle(&state, handle),
                 Err(error) => return_json(store_error(&error)),
             }
         }
         SecretSlotKind::Refresh => {
-            match state.store.issue_refresh_handle(
+            match state.store.issue_refresh_handle_until(
                 &credential_id,
-                generation,
-                policy_generation,
-                &run_id,
+                expected_generation,
+                policy.generation,
+                &policy.run_id,
+                policy.deadline,
             ) {
                 Ok(handle) => mint_refresh_handle(&state, handle),
                 Err(error) => return_json(store_error(&error)),
@@ -543,17 +550,10 @@ fn delete_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         Ok(value) => value,
         Err(error) => return return_json(error),
     };
-    let expected_generation = match required_u64(
-        map_get(&value, "expected_generation"),
-        "expected_generation",
-    ) {
-        Ok(value) => value,
-        Err(error) => return return_json(error),
-    };
-    if let Err(error) = check_policy(&state, map_get(&value, "policy_handle")) {
+    if let Err(error) = check_policy(&state, map_get(&value, "policy_handle"), "delete") {
         return return_json(error);
     }
-    match state.store.delete(&credential_id, expected_generation) {
+    match state.store.delete(&credential_id) {
         Ok(metadata) => return_json(json!({
             "ok": true,
             "metadata": metadata_json(&metadata)
@@ -667,21 +667,7 @@ fn parse_request(
         .map_err(|_| bridge_error("invalid_credential", "credential ID is invalid"))?;
     let expected_generation =
         required_u64(map_get(value, "expected_generation"), "expected_generation")?;
-    let policy_generation = required_u64(map_get(value, "policy_generation"), "policy_generation")?;
-    if policy_generation != state.policy_generation {
-        return Err(bridge_error(
-            "policy_stale_generation",
-            "policy generation does not match the host snapshot",
-        ));
-    }
-    let run_id = required_string(map_get(value, "run_id"), "run_id")?;
-    if run_id != state.run_id {
-        return Err(bridge_error(
-            "run_provenance",
-            "request run provenance does not match the host run",
-        ));
-    }
-    check_policy(state, map_get(value, "policy_handle"))?;
+    let policy = check_policy(state, map_get(value, "policy_handle"), "save")?;
     let metadata = parse_metadata(map_get(value, "metadata"), &credential, expected_generation)?;
     let access_slot = parse_slot(
         state,
@@ -689,22 +675,22 @@ fn parse_request(
         SecretSlotKind::Access,
         &credential_id,
         expected_generation,
-        policy_generation,
-        &run_id,
+        policy.generation,
+        &policy.run_id,
     )?;
     let refresh = parse_refresh(
         state,
         map_get(value, "refresh"),
         &credential_id,
         expected_generation,
-        policy_generation,
-        &run_id,
+        policy.generation,
+        &policy.run_id,
     )?;
     Ok(SaveCredentialRequest::new(
         credential,
         expected_generation,
-        policy_generation,
-        run_id,
+        policy.generation,
+        policy.run_id,
         metadata,
         access_slot,
         refresh,
@@ -807,10 +793,17 @@ fn parse_slot(
     Ok(payload.slot.clone())
 }
 
+struct CheckedPolicy {
+    generation: u64,
+    run_id: String,
+    deadline: Instant,
+}
+
 fn check_policy(
     state: &AuthFixtureState,
     value: Option<&Value>,
-) -> Result<OpaquePolicyHandle, JsonValue> {
+    op: &str,
+) -> Result<CheckedPolicy, JsonValue> {
     let value =
         value.ok_or_else(|| bridge_error("policy_handle_invalid", "policy handle is missing"))?;
     let Some(handle) = OpaquePolicyHandle::from_vm_value(state.policies.opaques(), value) else {
@@ -819,18 +812,28 @@ fn check_policy(
             "policy handle is not host-owned",
         ));
     };
+    let Some(payload) = handle.provenance() else {
+        return Err(bridge_error(
+            "policy_handle_invalid",
+            "policy handle payload is unavailable",
+        ));
+    };
     state
         .policies
         .check_policy(
             &handle,
             &PolicyIntent {
-                op: "inspect".to_string(),
-                policy_generation: Some(state.policy_generation),
+                op: op.to_string(),
+                policy_generation: Some(payload.generation),
                 ..PolicyIntent::default()
             },
         )
         .map_err(|error| policy_error(&error))?;
-    Ok(handle)
+    Ok(CheckedPolicy {
+        generation: payload.generation,
+        run_id: payload.run_id.clone(),
+        deadline: payload.expires_at,
+    })
 }
 
 fn state(vm: &mut Vm) -> Result<AuthFixtureState, JsonValue> {
