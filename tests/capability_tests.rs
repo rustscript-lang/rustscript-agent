@@ -21,7 +21,8 @@ use rustscript_agent::{
         ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityError,
         CapabilityLifecycle, CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle,
         FilesystemCapability, FilesystemLimits, LifecycleClock, LifecycleError, LifecycleLimits,
-        PrepareMetadata, PrepareOutcome, ProcessCapability, ProcessLimits, TokenIssuer,
+        NeverCancelled, PrepareMetadata, PrepareOutcome, ProcessCapability, ProcessLimits,
+        SystemClock, TokenIssuer,
     },
 };
 use rustscript_vm::{HostTypeSchema, Value as VmValue};
@@ -182,20 +183,16 @@ impl Drop for Fixture {
 fn tmp_root(label: &str) -> PathBuf {
     let unique = format!(
         "cap-{}-{}-{}",
-        label,
+        label.replace('/', "-"),
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
+        NEXT_CAP_TMP.fetch_add(1, Ordering::Relaxed)
     );
-    let root = Path::new(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0c-capabilities-272f7bb4",
-    )
-    .join(unique);
+    let root = std::env::temp_dir().join(unique);
     fs::create_dir_all(&root).expect("create workspace");
     root
 }
+
+static NEXT_CAP_TMP: AtomicU64 = AtomicU64::new(0);
 
 fn owner() -> CapabilityOwner {
     CapabilityOwner::new("profile-a", "session-a", "run-a").expect("owner")
@@ -773,6 +770,100 @@ fn artifact_put_get_and_reference_enforce_quota_and_ownership() {
 }
 
 #[test]
+fn read_token_cannot_put_generic_artifact_but_can_publish_one_result() {
+    let fixture = Fixture::new("result-pub");
+    let artifacts = fixture.artifacts(ArtifactLimits {
+        max_object_bytes: 16,
+        max_total_bytes: 32,
+        max_objects: 2,
+    });
+    let read = fixture.token(CapabilityRisk::Read);
+    let denied = artifacts
+        .put(&read, b"nope", &json!({}))
+        .expect_err("read token must not use generic put");
+    assert_eq!(error_code(&denied), "approval_ceiling");
+
+    let malformed = artifacts
+        .put_result(&read, b"ok", &json!("not-an-object"))
+        .expect_err("non-object metadata");
+    assert_eq!(error_code(&malformed), "invalid_request");
+
+    let unknown = artifacts
+        .put_result(&read, b"ok", &json!({"purpose": "result"}))
+        .expect_err("unknown metadata field");
+    assert_eq!(error_code(&unknown), "invalid_request");
+
+    let mismatched = artifacts
+        .put_result(&read, b"ok", &json!({"call_id": "other-call"}))
+        .expect_err("mismatched call_id");
+    assert_eq!(error_code(&mismatched), "invalid_request");
+
+    let published = artifacts
+        .put_result(&read, b"payload", &json!({}))
+        .expect("valid result publication");
+    assert_eq!(published.len, 7);
+    assert_eq!(published.metadata["run"], json!("run-a"));
+    assert_eq!(published.metadata["call_id"], json!("call-1"));
+
+    let second = artifacts
+        .put_result(&read, b"again", &json!({}))
+        .expect_err("second result");
+    assert_eq!(error_code(&second), "artifact_already_published");
+
+    let quota = fixture.artifacts(ArtifactLimits {
+        max_object_bytes: 4,
+        max_total_bytes: 4,
+        max_objects: 1,
+    });
+    let read2 = fixture.token(CapabilityRisk::Read);
+    let exhausted = quota
+        .put_result(&read2, b"too-big", &json!({}))
+        .expect_err("quota");
+    assert_eq!(error_code(&exhausted), "artifact_too_large");
+}
+
+#[test]
+fn clock_monotonic_ms_requires_read_token_and_cannot_be_forged() {
+    let fixture = Fixture::new("clock");
+    fixture.clock.set_now_ms(4_000);
+    let read = fixture.token(CapabilityRisk::Read);
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(fixture.lifecycle.clone())),
+        capability_owner: Some(fixture.owner.clone()),
+        filesystem: Some(Arc::new(fixture.filesystem())),
+        ..AgentHostBridges::default()
+    };
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::clock_monotonic_ms("{read}")
+        }}
+    "#
+    );
+    let result = AgentRunner::from_source(&source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    let json = match result {
+        VmValue::Map(fields) => fields,
+        other => panic!("expected map, got {other:?}"),
+    };
+    match json.get(&VmValue::string("ms")) {
+        Some(VmValue::Int(ms)) => assert_eq!(*ms, 4_000),
+        other => panic!("expected host clock ms, got {other:?}"),
+    }
+
+    let forged = r#"
+        pub fn run(input: map) -> map {
+            cap::clock_monotonic_ms("forged-token")
+        }
+    "#;
+    let denied = run_cap_source(&fixture, None, None, None, forged);
+    assert_ne!(envelope_error_code(&denied), "");
+}
+
+#[test]
 fn host_catalog_registers_cap_functions_with_typed_bounds() {
     let catalog = rustscript_agent::agent_host_catalog();
     let names: Vec<&str> = catalog
@@ -793,8 +884,10 @@ fn host_catalog_registers_cap_functions_with_typed_bounds() {
         "cap::process_close",
         "cap::process_kill",
         "cap::artifact_put",
+        "cap::artifact_put_result",
         "cap::artifact_get",
         "cap::artifact_reference",
+        "cap::clock_monotonic_ms",
         "agent::tool_dispatch",
     ] {
         assert!(
@@ -1461,4 +1554,539 @@ fn zero_limit_pagination_is_invalid_and_cannot_loop() {
         }
         break;
     }
+}
+
+#[test]
+fn system_clock_monotonic_ms_is_instant_origin_not_unix_wall_clock() {
+    let clock = SystemClock;
+    let ms = clock.monotonic_ms().expect("monotonic");
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("unix")
+        .as_millis() as u64;
+    assert!(
+        ms < unix / 1_000,
+        "monotonic {ms} must not be unix wall {unix}"
+    );
+    let later = clock.monotonic_ms().expect("later");
+    assert!(later >= ms);
+}
+
+struct OverflowClock;
+
+impl LifecycleClock for OverflowClock {
+    fn now_ms(&self) -> u64 {
+        1_000
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn monotonic_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[test]
+fn cap_clock_monotonic_ms_overflow_is_fail_closed() {
+    let root = tmp_root("clock-overflow");
+    let owner = owner();
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner.clone())
+        .registry_identity("registry-a")
+        .workspace(&root)
+        .limits(LifecycleLimits {
+            max_tool_calls: 32,
+            max_output_bytes: 64 * 1024,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(60_000)
+        .clock(Arc::new(OverflowClock) as Arc<dyn LifecycleClock>)
+        .tokens(SequenceIssuer::new() as Arc<dyn TokenIssuer>)
+        .durable(MemoryDurable::new() as Arc<dyn DurableToolLifecycle>)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .cancellation(Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+    let token = token_of(
+        lifecycle
+            .prepare(&owner, metadata("call-overflow", CapabilityRisk::Read))
+            .expect("prepare"),
+    );
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::new(lifecycle)),
+        capability_owner: Some(owner),
+        ..AgentHostBridges::default()
+    };
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::clock_monotonic_ms("{token}")
+        }}
+    "#
+    );
+    let result = AgentRunner::from_source(&source, AgentConfig::default())
+        .expect("compile")
+        .with_host(host)
+        .run_with_context(VmValue::map(vec![]))
+        .expect("run");
+    assert_eq!(envelope_error_code(&result), "internal_error");
+    let _ = fs::remove_dir_all(&root);
+}
+
+struct FailCommitDurable;
+
+impl DurableToolLifecycle for FailCommitDurable {
+    fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn prepare_parent(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn replay_result(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        Ok(None)
+    }
+
+    fn commit_started(&self, _record: &DurableStarted) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn commit_result(&self, _call_id: &str, _result: &Value) -> Result<Value, LifecycleError> {
+        Err(LifecycleError::ResultCommitFailed(
+            "injected result failure".to_string(),
+        ))
+    }
+
+    fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+}
+
+fn artifact_lifecycle(
+    root: &Path,
+    durable: Arc<dyn DurableToolLifecycle>,
+) -> (CapabilityLifecycle, CapabilityOwner) {
+    let owner = owner();
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner.clone())
+        .registry_identity("registry-a")
+        .workspace(root)
+        .limits(LifecycleLimits {
+            max_tool_calls: 32,
+            max_output_bytes: 64 * 1024,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(60_000)
+        .clock(ScriptedClock::new(1_000) as Arc<dyn LifecycleClock>)
+        .tokens(SequenceIssuer::new() as Arc<dyn TokenIssuer>)
+        .durable(durable)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .cancellation(Arc::new(NeverCancelled) as Arc<dyn CancellationFlag>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+    (lifecycle, owner)
+}
+
+fn default_artifact_limits() -> ArtifactLimits {
+    ArtifactLimits {
+        max_object_bytes: 1024,
+        max_total_bytes: 4096,
+        max_objects: 8,
+    }
+}
+
+#[test]
+fn result_artifact_is_retracted_on_commit_storage_failure() {
+    let root = tmp_root("artifact-commit-fail");
+    let (lifecycle, owner) = artifact_lifecycle(&root, Arc::new(FailCommitDurable));
+    let token = token_of(
+        lifecycle
+            .prepare(&owner, metadata("call-art-fail", CapabilityRisk::Read))
+            .expect("prepare"),
+    );
+    let artifacts =
+        ArtifactCapability::new(lifecycle.clone(), owner.clone(), default_artifact_limits())
+            .expect("artifacts");
+    let published = artifacts
+        .put_result(&token, b"payload", &json!({}))
+        .expect("put");
+    assert_eq!(artifacts.stored_len(), 1);
+    let error = lifecycle
+        .commit(&owner, &token, json!({"ok": true, "content": "done"}))
+        .expect_err("commit storage");
+    assert!(matches!(error, LifecycleError::ResultCommitFailed(_)));
+    assert!(artifacts.stored(&published.id).is_none());
+    assert_eq!(artifacts.stored_len(), 0);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn result_artifact_is_retracted_on_interrupt_and_reservation_is_released() {
+    let fixture = Fixture::new("artifact-interrupt");
+    let artifacts = fixture.artifacts(default_artifact_limits());
+    let token = fixture.token(CapabilityRisk::Read);
+    let published = artifacts
+        .put_result(&token, b"payload", &json!({}))
+        .expect("put");
+    assert!(artifacts.stored(&published.id).is_some());
+    fixture.lifecycle.recover_open_tokens().expect("recover");
+    assert!(artifacts.stored(&published.id).is_none());
+    assert_eq!(artifacts.stored_len(), 0);
+    let token2 = fixture.token(CapabilityRisk::Read);
+    let again = artifacts
+        .put_result(&token2, b"again", &json!({}))
+        .expect("republish");
+    assert!(artifacts.stored(&again.id).is_some());
+}
+
+#[test]
+fn result_artifact_is_retracted_on_cancel_after_publication() {
+    let fixture = Fixture::new("artifact-cancel");
+    let artifacts = fixture.artifacts(default_artifact_limits());
+    let token = fixture.token(CapabilityRisk::Read);
+    let published = artifacts
+        .put_result(&token, b"payload", &json!({}))
+        .expect("put");
+    fixture.cancel.cancel();
+    let error = fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect_err("cancelled");
+    assert!(matches!(error, LifecycleError::Cancelled));
+    assert!(artifacts.stored(&published.id).is_none());
+    assert_eq!(artifacts.stored_len(), 0);
+}
+
+#[test]
+fn successful_commit_retains_result_artifact_for_replay() {
+    let fixture = Fixture::new("artifact-keep");
+    let artifacts = fixture.artifacts(default_artifact_limits());
+    let token = fixture.token(CapabilityRisk::Read);
+    let published = artifacts
+        .put_result(&token, b"keep-me", &json!({}))
+        .expect("put");
+    fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect("commit");
+    let (bytes, _) = artifacts.stored(&published.id).expect("retained");
+    assert_eq!(bytes, b"keep-me");
+    fixture.lifecycle.recover_open_tokens().expect("recover");
+    let (bytes, _) = artifacts.stored(&published.id).expect("still retained");
+    assert_eq!(bytes, b"keep-me");
+}
+
+#[test]
+fn concurrent_result_artifacts_rollback_only_failed_call() {
+    let fixture = Fixture::new("artifact-concurrent");
+    let artifacts = Arc::new(fixture.artifacts(default_artifact_limits()));
+    let token_ok = fixture.token(CapabilityRisk::Read);
+    let token_fail = fixture.token(CapabilityRisk::Read);
+    thread::scope(|scope| {
+        let artifacts_ok = Arc::clone(&artifacts);
+        let artifacts_fail = Arc::clone(&artifacts);
+        let token_ok = token_ok.clone();
+        let token_fail = token_fail.clone();
+        scope.spawn(move || {
+            artifacts_ok
+                .put_result(&token_ok, b"ok-payload", &json!({}))
+                .expect("put ok");
+        });
+        scope.spawn(move || {
+            artifacts_fail
+                .put_result(&token_fail, b"fail-payload", &json!({}))
+                .expect("put fail");
+        });
+    });
+    assert_eq!(artifacts.stored_len(), 2);
+    fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token_ok,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect("commit ok");
+    fixture.cancel.cancel();
+    fixture
+        .lifecycle
+        .commit(
+            &fixture.owner,
+            &token_fail,
+            json!({"ok": true, "content": "done"}),
+        )
+        .expect_err("cancelled fail call");
+    assert_eq!(artifacts.stored_len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn list_omits_non_utf8_names() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("list-non-utf8");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    fs::write(fixture.root.join("dir").join("keep.txt"), "ok").expect("keep");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x80])),
+        "secret",
+    )
+    .expect("invalid name");
+    let listed = fixture
+        .filesystem()
+        .list(&fixture.token(CapabilityRisk::Read), "dir", 0, 4)
+        .expect("list");
+    assert!(listed.entries.iter().any(|entry| entry.name == "keep.txt"));
+    assert!(
+        listed
+            .entries
+            .iter()
+            .all(|entry| !entry.name.contains('\u{FFFD}')),
+        "replacement-character names must not be listed: {:?}",
+        listed
+            .entries
+            .iter()
+            .map(|entry| &entry.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn list_examination_budget_counts_non_utf8_slots() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("list-exam-slots");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x80])),
+        "secret",
+    )
+    .expect("invalid-a");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x81])),
+        "secret",
+    )
+    .expect("invalid-b");
+    fs::write(fixture.root.join("dir").join("keep.txt"), "ok").expect("keep");
+
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let mut cursor = 0_u64;
+    let mut pages = 0_usize;
+    let mut seen_keep = false;
+    loop {
+        pages += 1;
+        assert!(pages <= 8, "pagination must not loop");
+        let page = fs_cap.list(&token, "dir", cursor, 1).expect("page");
+        let examined = page.next_cursor.saturating_sub(page.cursor);
+        assert!(
+            examined <= 1,
+            "limit must bound physical dirents examined, got examined={examined} page={page:?}"
+        );
+        assert!(
+            page.entries.len() <= 1,
+            "page must not emit more names than the examination budget"
+        );
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| !entry.name.contains('\u{FFFD}')),
+            "lossy names must not be listed: {:?}",
+            page.entries
+                .iter()
+                .map(|entry| &entry.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !page.entries.iter().any(|entry| entry.name == "secret"),
+            "invalid-byte contents must not leak through the name slot"
+        );
+        if page.entries.iter().any(|entry| entry.name == "keep.txt") {
+            seen_keep = true;
+        }
+        if page.truncated {
+            assert_ne!(
+                page.next_cursor, cursor,
+                "truncated pages must advance next_cursor"
+            );
+            cursor = page.next_cursor;
+            continue;
+        }
+        break;
+    }
+    assert!(seen_keep, "valid keep.txt must remain reachable by cursor");
+
+    let host_fs = Arc::new(fixture.filesystem());
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::fs_list("{token}", "dir", 0, 1)
+        }}
+    "#
+    );
+    let result = run_cap_source(&fixture, Some(host_fs), None, None, &source);
+    let VmValue::Map(fields) = &result else {
+        panic!("expected list envelope, got {result:?}");
+    };
+    assert_eq!(
+        fields.get(&VmValue::string("ok")),
+        Some(&VmValue::Bool(true))
+    );
+    let Some(VmValue::Int(next_cursor)) = fields.get(&VmValue::string("next_cursor")) else {
+        panic!("expected next_cursor, got {result:?}");
+    };
+    assert!(
+        *next_cursor <= 1,
+        "host list must charge examined slots, got {result:?}"
+    );
+    if let Some(VmValue::Array(entries)) = fields.get(&VmValue::string("entries")) {
+        for entry in entries.iter() {
+            let VmValue::Map(entry) = entry else {
+                panic!("expected entry map, got {entry:?}");
+            };
+            if let Some(VmValue::String(name)) = entry.get(&VmValue::string("name")) {
+                assert!(
+                    !name.contains('\u{FFFD}'),
+                    "host list must not expose lossy names: {name}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn list_consumed_non_utf8_only_page_advances_next_cursor() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("list-non-utf8-only");
+    fs::create_dir(fixture.root.join("dir")).expect("dir");
+    fs::write(
+        fixture
+            .root
+            .join("dir")
+            .join(OsString::from_vec(vec![0xff, 0x80])),
+        "secret",
+    )
+    .expect("invalid name");
+    let listed = fixture
+        .filesystem()
+        .list(&fixture.token(CapabilityRisk::Read), "dir", 0, 1)
+        .expect("list");
+    assert!(
+        listed.entries.is_empty(),
+        "omitted invalid-byte names must not appear: {:?}",
+        listed.entries
+    );
+    assert!(
+        listed.next_cursor > listed.cursor,
+        "consumed-but-omitted dirents must advance next_cursor: {listed:?}"
+    );
+    assert!(
+        !listed.truncated,
+        "a single consumed-omitted dirent must not claim leftover pages: {listed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn list_rejects_regular_hardlinks_and_preserves_dirs_and_files() {
+    let fixture = Fixture::new("list-hardlink");
+    fs::create_dir(fixture.root.join("keep-dir")).expect("dir");
+    fs::write(fixture.root.join("keep.txt"), "ok").expect("keep");
+    let outside = fixture.root.parent().unwrap().join(format!(
+        "outside-shared-{}-{}",
+        std::process::id(),
+        NEXT_CAP_TMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&outside, "shared").expect("outside");
+    fs::hard_link(&outside, fixture.root.join("linked")).expect("hard link");
+
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Read);
+    let error = fs_cap
+        .list(&token, "", 0, 4)
+        .expect_err("listing a regular hardlink must fail");
+    assert_eq!(error_code(&error), "path_denied");
+    assert_eq!(
+        error.message(),
+        "regular files with multiple hard links are not permitted"
+    );
+
+    let nested = fixture.root.join("keep-dir");
+    fs::write(nested.join("inner.txt"), "inner").expect("inner");
+    let listed = fs_cap
+        .list(&token, "keep-dir", 0, 4)
+        .expect("ordinary directory listing must succeed");
+    assert!(
+        listed
+            .entries
+            .iter()
+            .any(|entry| entry.name == "inner.txt" && entry.file_type == "file")
+    );
+    assert!(
+        listed.entries.iter().all(|entry| entry.name != "linked"),
+        "hardlinked names must not leak through a nested listing: {:?}",
+        listed.entries
+    );
+
+    let host_fs = Arc::new(fixture.filesystem());
+    let source = format!(
+        r#"
+        pub fn run(input: map) -> map {{
+            cap::fs_list("{token}", "", 0, 4)
+        }}
+    "#
+    );
+    let result = run_cap_source(&fixture, Some(host_fs), None, None, &source);
+    assert_eq!(envelope_error_code(&result), "path_denied");
+    let VmValue::Map(fields) = &result else {
+        panic!("expected map envelope, got {result:?}");
+    };
+    let Some(VmValue::Map(error)) = fields.get(&VmValue::string("error")) else {
+        panic!("expected error map, got {result:?}");
+    };
+    assert_eq!(
+        error.get(&VmValue::string("message")),
+        Some(&VmValue::string(
+            "regular files with multiple hard links are not permitted"
+        ))
+    );
+    let _ = fs::remove_file(&outside);
 }

@@ -3,13 +3,14 @@
 //! Ownership and quotas are bound to the authorizing token's owner, run, and
 //! generation. This module does not format agent-facing artifact payloads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::hash::content_hash;
-use super::lifecycle::CapabilityLifecycle;
+use super::lifecycle::{CapabilityLifecycle, TokenOwnedResource};
 use super::types::{CapabilityError, CapabilityOwner, CapabilityRisk, TokenClaims};
 
 /// Store-wide artifact ceilings.
@@ -53,6 +54,7 @@ struct ArtifactInner {
     limits: ArtifactLimits,
     objects: Mutex<HashMap<String, ArtifactRecord>>,
     total_bytes: Mutex<usize>,
+    result_calls: Mutex<HashSet<String>>,
 }
 
 /// In-memory run-scoped artifact store.
@@ -81,18 +83,98 @@ impl ArtifactCapability {
                 limits,
                 objects: Mutex::new(HashMap::new()),
                 total_bytes: Mutex::new(0),
+                result_calls: Mutex::new(HashSet::new()),
             }),
         })
     }
 
     /// Stores bytes under a new opaque id.
+    ///
+    /// Workspace-mutating callers must still present a Write token. Read-only
+    /// tools publish oversized envelopes through [`Self::put_result`].
     pub fn put(
         &self,
         token: &str,
         bytes: &[u8],
         metadata: &Value,
     ) -> Result<ArtifactRef, CapabilityError> {
-        let claims = self.authorize(token, CapabilityRisk::Write)?;
+        self.put_with_risk(token, bytes, metadata, CapabilityRisk::Write)
+    }
+
+    /// Publishes at most one result blob for the authorizing token/call.
+    ///
+    /// Metadata is allowlisted and rebound to the token's call/run/owner. This
+    /// primitive does not grant filesystem write or arbitrary multi-object
+    /// storage; generic [`Self::put`] remains Write-only.
+    pub fn put_result(
+        &self,
+        token: &str,
+        bytes: &[u8],
+        metadata: &Value,
+    ) -> Result<ArtifactRef, CapabilityError> {
+        let claims = self.authorize(token, CapabilityRisk::Read)?;
+        let bound = bind_result_metadata(metadata, &claims)?;
+        let call_key = result_call_key(&claims);
+        {
+            let mut published = self
+                .inner
+                .result_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !published.insert(call_key.clone()) {
+                return Err(CapabilityError::new(
+                    "artifact_already_published",
+                    "a result artifact was already published for this call",
+                ));
+            }
+        }
+        match self.store_bytes(&claims, bytes, &bound) {
+            Ok(refer) => {
+                let guard = Arc::new(ResultArtifactGuard {
+                    inner: Arc::clone(&self.inner),
+                    id: refer.id.clone(),
+                    call_key: call_key.clone(),
+                    len: refer.len,
+                    released: AtomicBool::new(false),
+                });
+                if let Err(error) = self
+                    .inner
+                    .lifecycle
+                    .register_resource(token, Arc::clone(&guard) as Arc<dyn TokenOwnedResource>)
+                {
+                    guard.rollback_unpublished_side_effects();
+                    return Err(CapabilityError::from(error));
+                }
+                Ok(refer)
+            }
+            Err(error) => {
+                self.inner
+                    .result_calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&call_key);
+                Err(error)
+            }
+        }
+    }
+
+    fn put_with_risk(
+        &self,
+        token: &str,
+        bytes: &[u8],
+        metadata: &Value,
+        risk: CapabilityRisk,
+    ) -> Result<ArtifactRef, CapabilityError> {
+        let claims = self.authorize(token, risk)?;
+        self.store_bytes(&claims, bytes, metadata)
+    }
+
+    fn store_bytes(
+        &self,
+        claims: &TokenClaims,
+        bytes: &[u8],
+        metadata: &Value,
+    ) -> Result<ArtifactRef, CapabilityError> {
         if bytes.len() > self.inner.limits.max_object_bytes {
             return Err(CapabilityError::new(
                 "artifact_too_large",
@@ -190,4 +272,127 @@ impl ArtifactCapability {
             metadata: record.metadata.clone(),
         })
     }
+
+    /// Inspect stored bytes and bound metadata after the execution token closes.
+    pub fn stored(&self, id: &str) -> Option<(Vec<u8>, Value)> {
+        let objects = self
+            .inner
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        objects
+            .get(id)
+            .map(|record| (record.bytes.clone(), record.metadata.clone()))
+    }
+
+    /// Count currently visible result/generic objects. Used by lifecycle tests.
+    pub fn stored_len(&self) -> usize {
+        self.inner
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+struct ResultArtifactGuard {
+    inner: Arc<ArtifactInner>,
+    id: String,
+    call_key: String,
+    len: usize,
+    released: AtomicBool,
+}
+
+impl ResultArtifactGuard {
+    fn retract(&self) {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut objects = self
+            .inner
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if objects.remove(&self.id).is_some() {
+            let mut total = self
+                .inner
+                .total_bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *total = total.saturating_sub(self.len);
+        }
+        self.inner
+            .result_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.call_key);
+    }
+}
+
+impl TokenOwnedResource for ResultArtifactGuard {
+    fn release(&self) {
+        self.retract();
+    }
+
+    fn rollback_unpublished_side_effects(&self) {
+        self.retract();
+    }
+}
+
+const MAX_RESULT_METADATA_BYTES: usize = 256;
+const MAX_RESULT_METADATA_STRING: usize = 128;
+
+fn result_call_key(claims: &TokenClaims) -> String {
+    format!("{}:{}", claims.generation, claims.call_id)
+}
+
+fn bind_result_metadata(metadata: &Value, claims: &TokenClaims) -> Result<Value, CapabilityError> {
+    let Some(map) = metadata.as_object() else {
+        return Err(CapabilityError::new(
+            "invalid_request",
+            "result metadata must be an object",
+        ));
+    };
+    let encoded = serde_json::to_vec(metadata).unwrap_or_default();
+    if encoded.len() > MAX_RESULT_METADATA_BYTES {
+        return Err(CapabilityError::new(
+            "invalid_request",
+            "result metadata exceeds the allowlisted size",
+        ));
+    }
+    for (key, value) in map {
+        match key.as_str() {
+            "call_id" => {
+                let Some(call_id) = value.as_str() else {
+                    return Err(CapabilityError::new(
+                        "invalid_request",
+                        "result metadata call_id must be a string",
+                    ));
+                };
+                if call_id.len() > MAX_RESULT_METADATA_STRING {
+                    return Err(CapabilityError::new(
+                        "invalid_request",
+                        "result metadata call_id exceeds the allowlisted size",
+                    ));
+                }
+                if call_id != claims.call_id {
+                    return Err(CapabilityError::new(
+                        "invalid_request",
+                        "result metadata call_id does not match the authorized token",
+                    ));
+                }
+            }
+            _ => {
+                return Err(CapabilityError::new(
+                    "invalid_request",
+                    "result metadata field is not allowlisted",
+                ));
+            }
+        }
+    }
+    Ok(json!({
+        "call_id": claims.call_id,
+        "run": claims.owner.run(),
+        "owner": claims.owner.key(),
+    }))
 }
