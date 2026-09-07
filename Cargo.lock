@@ -1147,6 +1147,7 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "yaml-rust2",
+ "zeroize",
 ]
 
 [[package]]
