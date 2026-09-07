@@ -83,7 +83,39 @@ fn public_intent(context: map, mode: string) -> map {
 }
 
 fn classify_status(status: int, error: string, retry_after_ms: int) -> map {
-    if status == 401 || status == 403 || error == "invalid_grant" || error == "invalid_token" => {
+    if error == "authorization_pending" => {
+        let mut wait: int = retry_after_ms;
+        if wait <= 0 {
+            wait = 5000;
+        }
+        {
+            class: "pending",
+            retry: true,
+            wait_ms: wait
+        }
+    } else if error == "slow_down" => {
+        let mut wait: int = retry_after_ms;
+        if wait <= 0 {
+            wait = 5000;
+        }
+        {
+            class: "retryable",
+            retry: true,
+            wait_ms: wait
+        }
+    } else if error == "access_denied" => {
+        {
+            class: "denied",
+            retry: false,
+            wait_ms: 0
+        }
+    } else if error == "expired_token" => {
+        {
+            class: "expired",
+            retry: false,
+            wait_ms: 0
+        }
+    } else if status == 401 || status == 403 || error == "invalid_grant" || error == "invalid_token" => {
         {
             class: "reauth_required",
             retry: false,
@@ -401,6 +433,242 @@ fn injected_callback(context: map) -> map {
     oauth::callback_wait(context["injected_handle"].copy())
 }
 
+fn device_grant_body() -> string {
+    "grant_type=urn:ietf:params:oauth:grant-type:device_code"
+}
+
+fn device_start(context: map) -> map {
+    oauth::transport(
+        token_request(context, "/oauth/device", form_headers(), "client_id=synthetic-client"),
+        {
+            kind: "none"
+        }
+    )
+}
+
+fn device_poll(context: map, started: map) -> map {
+    oauth::transport(
+        token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+        {
+            kind: "device",
+            handle: started["device_handle"].copy()
+        }
+    )
+}
+
+fn device_follow(context: map, started: map) -> map {
+    let max_attempts: int = map_int(context, "max_polls", 8);
+    let mut attempt: int = 0;
+    let mut done: bool = false;
+    let mut result: map = {
+        ok: false,
+        start: started,
+        class: "timeout"
+    };
+    while attempt < max_attempts {
+        if done == false {
+            let polled: map = device_poll(context, started);
+            if failed(polled) {
+                result = {
+                    ok: false,
+                    start: started,
+                    transport: polled,
+                    error: map_map(polled, "error"),
+                    class: error_code(polled)
+                };
+                done = true;
+            } else {
+                let classified: map = classify_response(polled);
+                let class: string = map_string(classified, "class", "");
+                if class == "success" {
+                    let saved: map = save_tokens(context, polled);
+                    result = {
+                        ok: map_bool(saved, "ok", false),
+                        start: started,
+                        transport: polled,
+                        classified: classified,
+                        saved: saved
+                    };
+                    done = true;
+                } else if class == "pending" {
+                    done = false;
+                } else if class == "retryable" {
+                    done = false;
+                } else {
+                    result = {
+                        ok: false,
+                        start: started,
+                        transport: polled,
+                        classified: classified,
+                        class: class
+                    };
+                    done = true;
+                }
+            }
+        }
+        attempt = attempt + 1;
+    }
+    result
+}
+
+fn device_login(context: map) -> map {
+    let started: map = device_start(context);
+    if failed(started) => {
+        started
+    } else => {
+        device_follow(context, started)
+    }
+}
+
+fn device_replay(context: map) -> map {
+    let started: map = device_start(context);
+    if failed(started) => {
+        started
+    } else => {
+        let first: map = device_poll(context, started);
+        let second: map = device_poll(context, started);
+        {
+            ok: true,
+            first_ok: map_bool(first, "ok", false),
+            second_ok: map_bool(second, "ok", false),
+            second_code: error_code(second),
+            start: started
+        }
+    }
+}
+
+fn forged_device(context: map) -> map {
+    let forged: map = {
+        class: "OpaqueDeviceSessionHandle",
+        id: "forged"
+    };
+    let polled: map = oauth::transport(
+        token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+        {
+            kind: "device",
+            handle: forged
+        }
+    );
+    {
+        ok: map_bool(polled, "ok", false),
+        error: map_map(polled, "error")
+    }
+}
+
+fn serialized_device(context: map) -> map {
+    let started: map = device_start(context);
+    if failed(started) => {
+        started
+    } else => {
+        let handle_type: string = type(started["device_handle"].copy());
+        let reconstructed: map = oauth::transport(
+            token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+            {
+                kind: "device",
+                handle: handle_type
+            }
+        );
+        {
+            ok: true,
+            handle_type: handle_type,
+            reconstructed_ok: map_bool(reconstructed, "ok", false),
+            reconstructed_code: error_code(reconstructed)
+        }
+    }
+}
+
+fn injected_device(context: map) -> map {
+    oauth::transport(
+        token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+        {
+            kind: "device",
+            handle: context["injected_handle"].copy()
+        }
+    )
+}
+
+fn code_replay(context: map) -> map {
+    let begin: map = begin_flow(context, "manual");
+    if failed(begin) => {
+        begin
+    } else => {
+        let waited: map = wait_callback(begin);
+        if failed(waited) => {
+            waited
+        } else => {
+            let first: map = exchange_code(context, begin, waited);
+            let second: map = exchange_code(context, begin, waited);
+            {
+                ok: true,
+                first_ok: map_bool(first, "ok", false),
+                second_ok: map_bool(second, "ok", false),
+                second_code: error_code(second)
+            }
+        }
+    }
+}
+
+fn serialized_code(context: map) -> map {
+    let begin: map = begin_flow(context, "manual");
+    if failed(begin) => {
+        begin
+    } else => {
+        let waited: map = wait_callback(begin);
+        if failed(waited) => {
+            waited
+        } else => {
+            let handle_type: string = type(waited["code_handle"].copy());
+            let reconstructed: map = oauth::transport(
+                token_request(context, "/oauth/token", form_headers(), "grant_type=authorization_code"),
+                {
+                    kind: "authorization_code",
+                    code: handle_type,
+                    verifier: handle_type
+                }
+            );
+            {
+                ok: true,
+                handle_type: handle_type,
+                reconstructed_ok: map_bool(reconstructed, "ok", false),
+                reconstructed_code: error_code(reconstructed)
+            }
+        }
+    }
+}
+
+fn refresh_save(context: map) -> map {
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
+    if failed(issued) => {
+        issued
+    } else => {
+        let response: map = oauth::transport(
+            token_request(context, "/oauth/token", form_headers(), "grant_type=refresh_token"),
+            {
+                kind: "refresh",
+                handle: issued["handle"].copy()
+            }
+        );
+        if failed(response) => {
+            {
+                ok: false,
+                transport: response,
+                error: map_map(response, "error")
+            }
+        } else => {
+            let saved: map = save_tokens(context, response);
+            {
+                ok: map_bool(saved, "ok", false),
+                transport: response,
+                saved: saved
+            }
+        }
+    }
+}
+
 pub fn run(context: map) -> map {
     let kind: string = map_string(context, "kind", "login_browser");
     if kind == "login_browser" || kind == "secrets_absent" => {
@@ -458,6 +726,24 @@ pub fn run(context: map) -> map {
         serialized_callback(context)
     } else if kind == "local_refresh_validate" => {
         local_refresh_validate(context)
+    } else if kind == "device_login" || kind == "device_pending_success" || kind == "device_slow_down" || kind == "device_timeout" || kind == "device_cancel" || kind == "device_denied" => {
+        device_login(context)
+    } else if kind == "device_start" => {
+        device_start(context)
+    } else if kind == "device_replay" => {
+        device_replay(context)
+    } else if kind == "device_forged" => {
+        forged_device(context)
+    } else if kind == "device_serialized" => {
+        serialized_device(context)
+    } else if kind == "device_injected" => {
+        injected_device(context)
+    } else if kind == "code_replay" => {
+        code_replay(context)
+    } else if kind == "code_serialized" => {
+        serialized_code(context)
+    } else if kind == "refresh_save" => {
+        refresh_save(context)
     } else => {
         {
             ok: false,

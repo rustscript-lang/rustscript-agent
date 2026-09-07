@@ -185,6 +185,10 @@ impl OAuthFixtureHost {
             ),
             (Value::string("attempt"), Value::Int(2)),
             (
+                Value::string("max_polls"),
+                Value::Int(if kind == "device_timeout" { 2 } else { 8 }),
+            ),
+            (
                 Value::string("run_id"),
                 Value::string(provenance.run_id.as_str()),
             ),
@@ -245,18 +249,75 @@ impl OAuthFixtureHost {
             }
             "transport_malformed" => self.transport.push_raw(200, "not-json{"),
             "transport_oversized" => self.transport.push_raw(200, &"x".repeat(70 * 1024)),
-            "refresh_send" => {
+            "refresh_send" | "refresh_save" | "code_replay" => {
                 self.transport.push_json(
                     200,
                     json!({
                         "token_type": "Bearer",
                         "expires_in": 3600,
-                        "access_token": "SYNTHETIC_ROTATED_ACCESS"
+                        "access_token": "SYNTHETIC_ROTATED_ACCESS",
+                        "refresh_token": "SYNTHETIC_ROTATED_REFRESH"
                     }),
                 );
             }
+            "device_login" | "device_replay" => {
+                self.queue_device_start();
+                self.queue_token_success();
+            }
+            "device_pending_success" => {
+                self.queue_device_start();
+                self.transport
+                    .push_json(400, json!({"error": "authorization_pending"}));
+                self.queue_token_success();
+            }
+            "device_slow_down" => {
+                self.queue_device_start();
+                self.transport.push_json(400, json!({"error": "slow_down"}));
+                self.queue_token_success();
+            }
+            "device_timeout" => {
+                self.queue_device_start();
+                self.transport
+                    .push_json(400, json!({"error": "authorization_pending"}));
+                self.transport
+                    .push_json(400, json!({"error": "authorization_pending"}));
+            }
+            "device_denied" => {
+                self.queue_device_start();
+                self.transport
+                    .push_json(400, json!({"error": "access_denied"}));
+            }
+            "device_cancel" | "device_serialized" | "device_start" => {
+                self.queue_device_start();
+            }
             _ => {}
         }
+    }
+
+    fn queue_device_start(&self) {
+        self.transport.push_json(
+            200,
+            json!({
+                "device_code": "SYNTHETIC_DEVICE_ID",
+                "user_code": "WDJB-MJHT",
+                "verification_uri": "https://auth.example.test/device",
+                "expires_in": 900,
+                "interval": 5
+            }),
+        );
+    }
+
+    fn queue_token_success(&self) {
+        self.transport.push_json(
+            200,
+            json!({
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "access_token": "SYNTHETIC_ROTATED_ACCESS",
+                "refresh_token": "SYNTHETIC_ROTATED_REFRESH",
+                "scope": "scope.synthetic"
+            }),
+        );
     }
 }
 
@@ -449,7 +510,12 @@ fn transport_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         Err(error) => return return_json(error),
     };
     match state.oauth.transport(&policy, request, credential_use) {
-        Ok(response) => mint_transport(&state, response),
+        Ok(response) => {
+            if state.scenario == "device_cancel" {
+                state.cancel.cancel();
+            }
+            mint_transport(&state, response)
+        }
         Err(error) => return_json(oauth_error(&error)),
     }
 }
@@ -599,7 +665,8 @@ fn check_handle_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
 fn script_callback(state: &OAuthFixtureState, handle: &OpaqueCallbackHandle) {
     match state.scenario.as_str() {
-        "login_browser" | "login_manual" | "secrets_absent" | "callback" | "callback_duplicate" => {
+        "login_browser" | "login_manual" | "secrets_absent" | "callback" | "callback_duplicate"
+        | "code_replay" | "code_serialized" => {
             let _ = state.oauth.inject_matching_callback(handle, AUTH_CODE);
         }
         "callback_mismatch" => {
@@ -701,6 +768,13 @@ fn mint_transport(
 ) -> VmResult<CallOutcome> {
     let access = mint_slot(state, response.access_slot)?;
     let refresh = mint_slot(state, response.refresh_slot)?;
+    let device = match response.device_handle {
+        Some(handle) => match state.policies.opaques().mint(DEVICE_HANDLE_CLASS, handle) {
+            Ok(value) => value.to_vm_value(),
+            Err(error) => return return_json(opaque_error_json(error)),
+        },
+        None => Value::Null,
+    };
     return_value(Value::map(vec![
         (Value::string("ok"), Value::Bool(true)),
         (
@@ -720,6 +794,7 @@ fn mint_transport(
         ),
         (Value::string("access_slot"), access),
         (Value::string("refresh_slot"), refresh),
+        (Value::string("device_handle"), device),
     ]))
 }
 

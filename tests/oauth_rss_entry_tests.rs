@@ -57,7 +57,7 @@ fn auth_yaml() -> &'static str {
 }
 
 fn config_yaml() -> &'static str {
-    "version: 1\nmodel:\n  provider: synthetic-oauth\n  model: synthetic\nproviders:\n  synthetic-oauth:\n    protocol: oauth\n    base_url: https://api.example.test/v1\n    auth: primary\n    oauth:\n      flow: authorization-code\n      issuer: https://auth.example.test\n      client_id: synthetic-client\n      authorization_path: /authorize\n      token_endpoint: https://auth.example.test/oauth/token\n      refresh_skew_seconds: 120\n"
+    "version: 1\nmodel:\n  provider: synthetic-oauth\n  model: synthetic\nproviders:\n  synthetic-oauth:\n    protocol: oauth\n    base_url: https://api.example.test/v1\n    auth: primary\n    oauth:\n      flow: authorization-code\n      issuer: https://auth.example.test\n      client_id: synthetic-client\n      authorization_path: /authorize\n      token_endpoint: https://auth.example.test/oauth/token\n      device_user_code_path: /oauth/device\n      device_poll_path: /oauth/device/token\n      refresh_skew_seconds: 120\n"
 }
 
 fn fixture(name: &str) -> (TempRoot, OAuthFixtureHost) {
@@ -239,6 +239,105 @@ fn rss_complete_and_debug_omit_raw_oauth_secrets() {
     assert_complete_safe(&result);
     let value = host.run_value("secrets_absent").expect("value");
     assert_no_secrets(&format!("{value:?}"));
+}
+
+#[test]
+fn rss_device_login_pending_slow_down_timeout_cancel_and_denied() {
+    let (_root, host) = fixture("device-login");
+    let login = host.run_json("device_login").expect("device login");
+    assert_eq!(login["ok"], true, "{login}");
+    assert_eq!(login["classified"]["class"], "success");
+    assert_eq!(login["saved"]["metadata"]["generation"], 1);
+    assert_eq!(login["start"]["device_handle"], "<callable>");
+    assert!(login["start"]["body"].get("device_code").is_none());
+    assert_eq!(login["start"]["body"]["user_code"], "WDJB-MJHT");
+    assert_complete_safe(&login);
+
+    let (_root_pending, pending_host) = fixture("device-pending");
+    let pending = pending_host
+        .run_json("device_pending_success")
+        .expect("pending then success");
+    assert_eq!(pending["ok"], true, "{pending}");
+    assert_eq!(pending["classified"]["class"], "success");
+    assert_complete_safe(&pending);
+
+    let (_root_slow, slow_host) = fixture("device-slow");
+    let slowed = slow_host.run_json("device_slow_down").expect("slow_down");
+    assert_eq!(slowed["ok"], true, "{slowed}");
+    assert_eq!(slowed["classified"]["class"], "success");
+
+    let (_root_timeout, timeout_host) = fixture("device-timeout");
+    let timeout = timeout_host.run_json("device_timeout").expect("timeout");
+    assert_eq!(timeout["ok"], false, "{timeout}");
+    assert_eq!(timeout["class"], "timeout");
+
+    let (_root_cancel, cancel_host) = fixture("device-cancel");
+    let cancel = cancel_host.run_json("device_cancel").expect("cancel");
+    assert_eq!(cancel["ok"], false, "{cancel}");
+    assert_eq!(cancel["class"], "cancelled");
+
+    let (_root_denied, denied_host) = fixture("device-denied");
+    let denied = denied_host.run_json("device_denied").expect("denied");
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["class"], "denied");
+}
+
+#[test]
+fn rss_device_and_code_opaque_lifecycle_fail_closed() {
+    let (_root, host) = fixture("device-replay");
+    let replay = host.run_json("device_replay").expect("device replay");
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["first_ok"], true);
+    assert_eq!(replay["second_ok"], false);
+    assert_eq!(replay["second_code"], "handle_replayed");
+    assert_complete_safe(&replay);
+
+    let forged = host.run_json("device_forged").expect("forged device");
+    assert_eq!(forged["ok"], false);
+    assert_eq!(forged["error"]["code"], "handle_invalid");
+
+    let serialized = host
+        .run_json("device_serialized")
+        .expect("serialized device");
+    assert_eq!(serialized["ok"], true);
+    assert_eq!(serialized["reconstructed_ok"], false);
+    assert_eq!(serialized["reconstructed_code"], "handle_invalid");
+
+    let started = host.run_value("device_start").expect("device start");
+    let handle = OAuthFixtureHost::map_field(&started, "device_handle").expect("device handle");
+    drop(host);
+    let (_root2, restarted) = fixture("device-restart");
+    let injected = restarted
+        .run_json_with_injected_handle("device_injected", handle)
+        .expect("restart device");
+    assert_eq!(injected["ok"], false);
+    assert_eq!(injected["error"]["code"], "handle_invalid");
+
+    let (_root_code, code_host) = fixture("code-replay");
+    let code_replay = code_host.run_json("code_replay").expect("code replay");
+    assert_eq!(code_replay["ok"], true, "{code_replay}");
+    assert_eq!(code_replay["first_ok"], true);
+    assert_eq!(code_replay["second_ok"], false);
+    assert_eq!(code_replay["second_code"], "handle_replayed");
+
+    let code_serialized = code_host
+        .run_json("code_serialized")
+        .expect("serialized code");
+    assert_eq!(code_serialized["ok"], true);
+    assert_eq!(code_serialized["reconstructed_ok"], false);
+    assert_eq!(code_serialized["reconstructed_code"], "handle_invalid");
+}
+
+#[test]
+fn rss_refresh_save_accepts_live_generation() {
+    let (_root, host) = fixture("refresh-generation");
+    let login = host.run_json("login_browser").expect("login");
+    assert_eq!(login["ok"], true, "{login}");
+    assert_eq!(login["saved"]["metadata"]["generation"], 1);
+    let refresh = host.run_json("refresh_save").expect("refresh save");
+    assert_eq!(refresh["ok"], true, "{refresh}");
+    assert_eq!(refresh["saved"]["metadata"]["generation"], 2);
+    assert_complete_safe(&refresh);
 }
 
 #[test]

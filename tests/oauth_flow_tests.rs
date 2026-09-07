@@ -9,15 +9,15 @@ use std::time::{Duration, Instant};
 
 use rustscript_agent::auth::oauth::{
     BoundedPublicOAuthIntent, CallbackMode, CredentialUse, OAuthClock, OAuthError, OAuthFlowKind,
-    OAuthHost, PreparedHttpsRequest, ProviderRequest, RawCallbackInput, RawHttpsResponse,
-    ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport,
-    TrustedEndpoint, TrustedTransportPolicy,
+    OAuthHost, OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle, PreparedHttpsRequest,
+    ProviderRequest, RawCallbackInput, RawHttpsResponse, ScriptedBrowser, ScriptedCallback,
+    ScriptedCancel, ScriptedClock, ScriptedHttpsTransport, TrustedEndpoint, TrustedTransportPolicy,
 };
 use rustscript_agent::auth::pkce::{self, PKCE_CHALLENGE_METHOD};
 use rustscript_agent::auth::store::AuthStore;
 use rustscript_agent::config_file::AgentPaths;
 use rustscript_agent::{
-    CredentialConfig, CredentialId, RefreshSecretAction, SaveCredentialRequest,
+    CredentialConfig, CredentialId, RefreshSecretAction, SaveCredentialRequest, SaveOutcome,
 };
 
 const ACCESS: &str = "SYNTHETIC_ACCESS_TOKEN";
@@ -41,6 +41,10 @@ fn policy() -> TrustedTransportPolicy {
             TrustedEndpoint {
                 authority: "auth.example.test".to_string(),
                 path_prefix: "/oauth/token".to_string(),
+            },
+            TrustedEndpoint {
+                authority: "auth.example.test".to_string(),
+                path_prefix: "/oauth/device".to_string(),
             },
             TrustedEndpoint {
                 authority: "api.example.test".to_string(),
@@ -110,6 +114,51 @@ fn assert_no_secrets(value: &str) {
     assert!(!value.contains(AUTH_CODE), "{value}");
     assert!(!value.contains(DEVICE_ID), "{value}");
     assert!(!value.contains("dBjftJeZ4CVP"), "{value}");
+}
+
+fn provider_request(path: &str, body: &str) -> ProviderRequest {
+    ProviderRequest {
+        method: "POST".to_string(),
+        path: path.to_string(),
+        public_headers: BTreeMap::from([(
+            "content-type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )]),
+        public_body: body.to_string(),
+        credential_id: "primary".to_string(),
+    }
+}
+
+fn device_start_json() -> serde_json::Value {
+    serde_json::json!({
+        "device_code": DEVICE_ID,
+        "user_code": "WDJB-MJHT",
+        "verification_uri": "https://auth.example.test/device",
+        "expires_in": 900,
+        "interval": 5
+    })
+}
+
+fn token_success_json() -> serde_json::Value {
+    serde_json::json!({
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "access_token": ROTATED_ACCESS,
+        "refresh_token": ROTATED_REFRESH,
+        "scope": "scope.synthetic"
+    })
+}
+
+fn begin_code_exchange(host: &OAuthHost) -> (OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle) {
+    let begun = host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("begin");
+    host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+        .expect("inject");
+    let waited = host
+        .callback_wait(&begun.callback_handle)
+        .expect("callback");
+    (waited.code_handle.expect("code"), begun.verifier_handle)
 }
 
 #[test]
@@ -506,6 +555,431 @@ fn local_refresh_validation_does_not_consume_the_handle() {
     assert_eq!(
         handle.consume().expect_err("consumed").code(),
         "handle_replayed"
+    );
+}
+
+#[test]
+fn pkce_begin_rejects_device_code_flow() {
+    let (host, _, _, _, _, _) = default_host();
+    let mut device_intent = intent(CallbackMode::None);
+    device_intent.flow = OAuthFlowKind::DeviceCode;
+    let error = host
+        .pkce_begin(&policy(), device_intent)
+        .expect_err("device pkce");
+    assert_eq!(error.code(), "invalid_intent");
+}
+
+#[test]
+fn device_start_mints_opaque_handle_and_strips_device_id() {
+    let (host, transport, _, _, _, _) = default_host();
+    transport.push_json(200, device_start_json());
+    let started = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("device start");
+    assert_eq!(started.status, 200);
+    assert_eq!(started.body_without_secret_fields["user_code"], "WDJB-MJHT");
+    assert_eq!(started.body_without_secret_fields["interval"], 5);
+    assert!(
+        started
+            .body_without_secret_fields
+            .get("device_code")
+            .is_none()
+    );
+    assert!(started.device_handle.is_some());
+    assert_no_secrets(&format!("{started:?}"));
+    assert_no_secrets(&started.body_without_secret_fields.to_string());
+}
+
+#[test]
+fn device_poll_pending_then_success_injects_device_id_and_consumes_on_authorize() {
+    let (host, transport, _, _, _, _) = default_host();
+    transport.push_json(200, device_start_json());
+    let started = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("start");
+    let handle = started.device_handle.expect("device handle");
+    let copy = handle.clone();
+    transport.push_json(400, serde_json::json!({"error": "authorization_pending"}));
+    let pending = host
+        .transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(copy),
+        )
+        .expect("pending");
+    assert_eq!(pending.status, 400);
+    assert_eq!(
+        pending.body_without_secret_fields["error"],
+        "authorization_pending"
+    );
+    assert!(pending.access_slot.is_none());
+
+    transport.push_json(200, token_success_json());
+    let authorized = host
+        .transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(handle.clone()),
+        )
+        .expect("authorized");
+    assert_eq!(authorized.status, 200);
+    assert!(authorized.access_slot.is_some());
+    assert!(
+        authorized
+            .body_without_secret_fields
+            .get("access_token")
+            .is_none()
+    );
+    assert_no_secrets(&format!("{authorized:?}"));
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 3);
+    assert!(sent[1].body.contains("device_code="));
+    assert!(sent[1].body.contains(DEVICE_ID));
+    assert!(sent[2].body.contains(DEVICE_ID));
+
+    let replay = host
+        .transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(handle),
+        )
+        .expect_err("device replay");
+    assert_eq!(replay.code(), "handle_replayed");
+}
+
+#[test]
+fn device_slow_down_keeps_session_live_until_success() {
+    let (host, transport, _, _, _, _) = default_host();
+    transport.push_json(200, device_start_json());
+    let started = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("start");
+    let handle = started.device_handle.expect("device handle");
+    transport.push_json(400, serde_json::json!({"error": "slow_down"}));
+    let slowed = host
+        .transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(handle.clone()),
+        )
+        .expect("slow_down");
+    assert_eq!(slowed.body_without_secret_fields["error"], "slow_down");
+    transport.push_json(200, token_success_json());
+    let authorized = host
+        .transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(handle),
+        )
+        .expect("authorized after slow_down");
+    assert!(authorized.access_slot.is_some());
+}
+
+#[test]
+fn device_cancel_timeout_forged_stale_and_restart_fail_closed() {
+    let (host, transport, _, _, clock, cancel) = default_host();
+    transport.push_json(200, device_start_json());
+    let started = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("start");
+    let handle = started.device_handle.expect("device handle");
+    assert_eq!(
+        host.transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(host.forged_device_handle()),
+        )
+        .expect_err("forged")
+        .code(),
+        "handle_invalid"
+    );
+    let mut stale = policy();
+    stale.generation = 99;
+    assert_eq!(
+        host.transport(
+            &stale,
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(handle.clone()),
+        )
+        .expect_err("stale policy")
+        .code(),
+        "handle_provenance"
+    );
+    cancel.cancel();
+    assert_eq!(
+        host.transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(handle.clone()),
+        )
+        .expect_err("cancel")
+        .code(),
+        "cancelled"
+    );
+    drop(host);
+    let (restarted, _, _, _, _, _) = default_host();
+    assert_eq!(
+        restarted
+            .transport(
+                &policy(),
+                provider_request(
+                    "/oauth/device/token",
+                    "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+                ),
+                CredentialUse::Device(handle),
+            )
+            .expect_err("restart")
+            .code(),
+        "handle_invalid"
+    );
+
+    let (timed_host, timed_transport, _, _, timed_clock, _) = default_host();
+    timed_transport.push_json(200, device_start_json());
+    let timed = timed_host
+        .transport(
+            &policy(),
+            provider_request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("timed start");
+    let timed_handle = timed.device_handle.expect("timed handle");
+    timed_clock.expire();
+    clock.expire();
+    let expired = timed_host
+        .transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(timed_handle),
+        )
+        .expect_err("expired");
+    assert!(
+        expired.code() == "deadline_exceeded" || expired.code() == "handle_expired",
+        "{}",
+        expired.code()
+    );
+}
+
+#[test]
+fn refresh_transport_mints_slots_bound_to_live_generation() {
+    let root = tempfile_home("refresh-generation");
+    let store = open_store(&root);
+    seed_credential(&store);
+    let metadata = store.load_metadata("primary").expect("metadata");
+    assert_eq!(metadata.generation, 1);
+    let handle = store
+        .issue_refresh_handle("primary", 1, 1, "oauth-primitive-run")
+        .expect("refresh handle");
+    let (host, transport, _, _, _, _) = default_host();
+    transport.push_json(200, token_success_json());
+    let response = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=refresh_token"),
+            CredentialUse::Refresh(handle),
+        )
+        .expect("refresh transport");
+    let access = response.access_slot.expect("access slot");
+    let refresh = response.refresh_slot.expect("refresh slot");
+    let saved = store
+        .save_if_generation(SaveCredentialRequest::new(
+            CredentialId::new("primary").expect("id"),
+            1,
+            1,
+            "oauth-primitive-run",
+            CredentialConfig {
+                provider: "synthetic-provider".to_string(),
+                kind: "oauth".to_string(),
+                source: "synthetic-test".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_at_ms: 1_900_000_000_000,
+                scopes: vec!["scope.synthetic".to_string()],
+                account_id: Some("acct.synthetic".to_string()),
+                generation: 1,
+                status: "active".to_string(),
+                last_refresh_at_ms: Some(1_900_000_000_000),
+                has_refresh_token: true,
+            },
+            access,
+            RefreshSecretAction::Replace(refresh),
+        ))
+        .expect("save generation 1");
+    match saved {
+        SaveOutcome::Committed { metadata } | SaveOutcome::Adopted { metadata } => {
+            assert_eq!(metadata.generation, 2);
+        }
+    }
+}
+
+#[test]
+fn copied_code_and_verifier_exchange_once_and_replay_fails() {
+    let (host, transport, _, _, _, _) = default_host();
+    let (code, verifier) = begin_code_exchange(&host);
+    transport.push_json(200, token_success_json());
+    let first = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: code.clone(),
+                verifier: verifier.clone(),
+            },
+        )
+        .expect("first exchange");
+    assert!(first.access_slot.is_some());
+    let replay = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode { code, verifier },
+        )
+        .expect_err("replay");
+    assert_eq!(replay.code(), "handle_replayed");
+}
+
+#[test]
+fn local_code_validation_does_not_consume_but_transport_start_does() {
+    let (host, transport, _, _, _, _) = default_host();
+    let (code, verifier) = begin_code_exchange(&host);
+    let denied = host
+        .transport(
+            &policy(),
+            provider_request("/not-admitted", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: code.clone(),
+                verifier: verifier.clone(),
+            },
+        )
+        .expect_err("local deny");
+    assert_eq!(denied.code(), "path_denied");
+    assert!(transport.take_sent().is_empty());
+
+    let missing = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: code.clone(),
+                verifier: verifier.clone(),
+            },
+        )
+        .expect_err("network missing");
+    assert_eq!(missing.code(), "transport_error");
+    let replay = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode { code, verifier },
+        )
+        .expect_err("no replay after send start");
+    assert_eq!(replay.code(), "handle_replayed");
+}
+
+#[test]
+fn forged_stale_expired_and_restart_code_handles_fail_closed() {
+    let (host, _, _, _, clock, _) = default_host();
+    let (code, verifier) = begin_code_exchange(&host);
+    assert_eq!(
+        host.transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: host.forged_code_handle(),
+                verifier: verifier.clone(),
+            },
+        )
+        .expect_err("forged code")
+        .code(),
+        "handle_invalid"
+    );
+    let mut stale = policy();
+    stale.generation = 99;
+    assert_eq!(
+        host.transport(
+            &stale,
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: code.clone(),
+                verifier: verifier.clone(),
+            },
+        )
+        .expect_err("stale")
+        .code(),
+        "handle_provenance"
+    );
+    clock.expire();
+    let expired = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: code.clone(),
+                verifier,
+            },
+        )
+        .expect_err("expired");
+    assert!(
+        expired.code() == "deadline_exceeded" || expired.code() == "handle_expired",
+        "{}",
+        expired.code()
+    );
+    drop(host);
+    let (restarted, _, _, _, _, _) = default_host();
+    assert_eq!(
+        restarted
+            .transport(
+                &policy(),
+                provider_request("/oauth/token", "grant_type=authorization_code"),
+                CredentialUse::AuthorizationCode {
+                    code,
+                    verifier: restarted.forged_verifier_handle(),
+                },
+            )
+            .expect_err("restart")
+            .code(),
+        "handle_invalid"
     );
 }
 

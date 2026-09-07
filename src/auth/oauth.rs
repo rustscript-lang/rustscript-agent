@@ -368,11 +368,8 @@ impl From<AuthStoreError> for OAuthError {
 struct FlowInner {
     id: u64,
     host: Weak<HostInner>,
-    #[allow(dead_code)]
     policy_generation: u64,
-    #[allow(dead_code)]
     run_id: String,
-    #[allow(dead_code)]
     credential_id: String,
     expires_at: Instant,
     state: String,
@@ -382,9 +379,43 @@ struct FlowInner {
     verifier_state: AtomicU8,
     code_state: AtomicU8,
     code: Mutex<Option<String>>,
+    device_code: Mutex<Zeroizing<String>>,
+    device_state: AtomicU8,
+    device_in_flight: AtomicBool,
+}
+
+struct DevicePollGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for DevicePollGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 impl FlowInner {
+    fn forged() -> Arc<Self> {
+        Arc::new(Self {
+            id: 0,
+            host: Weak::new(),
+            policy_generation: 0,
+            run_id: "forged".to_string(),
+            credential_id: "forged".to_string(),
+            expires_at: Instant::now(),
+            state: "forged".to_string(),
+            verifier: Mutex::new(Zeroizing::new(String::new())),
+            redirect_uri: String::new(),
+            callback: AtomicU8::new(HANDLE_LIVE),
+            verifier_state: AtomicU8::new(HANDLE_LIVE),
+            code_state: AtomicU8::new(HANDLE_LIVE),
+            code: Mutex::new(None),
+            device_code: Mutex::new(Zeroizing::new(String::new())),
+            device_state: AtomicU8::new(HANDLE_LIVE),
+            device_in_flight: AtomicBool::new(false),
+        })
+    }
+
     fn class_error(&self, class: &'static str, code: &'static str) -> OAuthError {
         match code {
             "handle_replayed" => OAuthError::HandleReplayed {
@@ -441,16 +472,123 @@ impl FlowInner {
         Ok(())
     }
 
+    fn check_binding(
+        &self,
+        policy: &TrustedTransportPolicy,
+        credential_id: &str,
+        class: &'static str,
+    ) -> Result<(), OAuthError> {
+        if self.policy_generation != policy.generation
+            || self.run_id != policy.run_id
+            || self.credential_id != credential_id
+        {
+            return Err(OAuthError::HandleProvenance {
+                class: class.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn consume_exchange(&self, now: Instant) -> Result<(String, Zeroizing<String>), OAuthError> {
+        self.check_flag(&self.code_state, CODE_HANDLE_CLASS, now)?;
+        self.check_flag(&self.verifier_state, VERIFIER_HANDLE_CLASS, now)?;
+        let raw_code = self
+            .code
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| OAuthError::HandleInvalid {
+                class: CODE_HANDLE_CLASS.to_string(),
+            })?;
+        let raw_verifier = self
+            .verifier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if raw_verifier.is_empty() {
+            return Err(OAuthError::HandleInvalid {
+                class: VERIFIER_HANDLE_CLASS.to_string(),
+            });
+        }
+        if self
+            .code_state
+            .compare_exchange(
+                HANDLE_LIVE,
+                HANDLE_USED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(self.class_error(CODE_HANDLE_CLASS, "handle_replayed"));
+        }
+        if self
+            .verifier_state
+            .compare_exchange(
+                HANDLE_LIVE,
+                HANDLE_USED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(self.class_error(VERIFIER_HANDLE_CLASS, "handle_replayed"));
+        }
+        if let Ok(mut code) = self.code.lock() {
+            *code = None;
+        }
+        if let Ok(mut verifier) = self.verifier.lock() {
+            verifier.clear();
+        }
+        Ok((raw_code, raw_verifier))
+    }
+
+    fn begin_device_poll(&self, now: Instant) -> Result<DevicePollGuard<'_>, OAuthError> {
+        self.check_flag(&self.device_state, DEVICE_HANDLE_CLASS, now)?;
+        if self
+            .device_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(self.class_error(DEVICE_HANDLE_CLASS, "handle_replayed"));
+        }
+        Ok(DevicePollGuard {
+            flag: &self.device_in_flight,
+        })
+    }
+
+    fn device_id(&self) -> Result<String, OAuthError> {
+        let device_code = self
+            .device_code
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if device_code.is_empty() {
+            return Err(OAuthError::HandleInvalid {
+                class: DEVICE_HANDLE_CLASS.to_string(),
+            });
+        }
+        Ok(device_code.as_str().to_string())
+    }
+
+    fn clear_device_code(&self) {
+        if let Ok(mut device_code) = self.device_code.lock() {
+            device_code.clear();
+        }
+    }
+
     fn revoke(&self) {
         self.callback.store(HANDLE_REVOKED, Ordering::Release);
         self.verifier_state.store(HANDLE_REVOKED, Ordering::Release);
         self.code_state.store(HANDLE_REVOKED, Ordering::Release);
+        self.device_state.store(HANDLE_REVOKED, Ordering::Release);
+        self.device_in_flight.store(false, Ordering::Release);
         if let Ok(mut verifier) = self.verifier.lock() {
             verifier.clear();
         }
         if let Ok(mut code) = self.code.lock() {
             *code = None;
         }
+        self.clear_device_code();
     }
 }
 
@@ -544,6 +682,11 @@ impl OAuthHost {
         intent: BoundedPublicOAuthIntent,
     ) -> Result<PkceBeginEnvelope, OAuthError> {
         self.check_cancel_deadline(policy)?;
+        if intent.flow == OAuthFlowKind::DeviceCode {
+            return Err(OAuthError::InvalidIntent {
+                reason: "device_code flow does not use pkce_begin".to_string(),
+            });
+        }
         validate_intent(&intent)?;
         let endpoint = admit_path(policy, &intent.path)?;
         let material = pkce::generate()?;
@@ -585,6 +728,9 @@ impl OAuthHost {
             verifier_state: AtomicU8::new(HANDLE_LIVE),
             code_state: AtomicU8::new(HANDLE_LIVE),
             code: Mutex::new(None),
+            device_code: Mutex::new(Zeroizing::new(String::new())),
+            device_state: AtomicU8::new(HANDLE_REVOKED),
+            device_in_flight: AtomicBool::new(false),
         });
         self.inner
             .flows
@@ -626,7 +772,6 @@ impl OAuthHost {
         request: ProviderRequest,
         credential_use: CredentialUse,
     ) -> Result<SanitizedProviderResponse, OAuthError> {
-        self.check_cancel_deadline(policy)?;
         let method = request.method.to_ascii_uppercase();
         if method != "GET" && method != "POST" {
             return Err(OAuthError::MethodDenied { method });
@@ -644,93 +789,77 @@ impl OAuthHost {
                 reason: "credential ID is invalid".to_string(),
             }
         })?;
-        match &credential_use {
-            CredentialUse::None => {}
-            CredentialUse::Access(_) | CredentialUse::Refresh(_) => {}
-            CredentialUse::AuthorizationCode { code, verifier } => {
-                if !code.same_host(&self.inner) || !verifier.same_host(&self.inner) {
-                    return Err(OAuthError::HandleInvalid {
-                        class: CODE_HANDLE_CLASS.to_string(),
-                    });
-                }
-                if code.flow_id() != verifier.flow_id() {
-                    return Err(OAuthError::HandleProvenance {
-                        class: CODE_HANDLE_CLASS.to_string(),
-                    });
-                }
-            }
-            CredentialUse::Device(handle) => {
-                if !handle.same_host(&self.inner) {
-                    return Err(OAuthError::HandleInvalid {
-                        class: DEVICE_HANDLE_CLASS.to_string(),
-                    });
-                }
-            }
+        self.validate_credential_use(policy, credential_id.as_str(), &credential_use)?;
+        if let Err(error) = self.check_cancel_deadline(policy) {
+            self.revoke_credential_use(&credential_use);
+            return Err(error);
         }
-        let prepared_headers = headers;
+        let expected_generation = credential_expected_generation(&credential_use);
         let mut prepared = PreparedHttpsRequest {
             method,
             url: format!("https://{}{}", endpoint.authority, request.path),
-            headers: prepared_headers,
+            headers,
             body: String::new(),
         };
+        let mut device_session = None;
         match credential_use {
-            CredentialUse::None => {
-                prepared.body = body;
-            }
+            CredentialUse::None => {}
             CredentialUse::Access(handle) => {
                 let secret = handle.take_for_transport()?;
                 prepared.headers.insert(
                     "authorization".to_string(),
                     format!("Bearer {}", secret.as_str()),
                 );
-                prepared.body = body;
             }
             CredentialUse::Refresh(handle) => {
                 let secret = handle.take_for_transport()?;
                 append_form(&mut body, "refresh_token", secret.as_str());
-                prepared.body = body;
             }
             CredentialUse::AuthorizationCode { code, verifier } => {
                 let now = self.inner.clock.now();
                 let flow = self.live_flow(&code)?;
-                flow.check_flag(&flow.verifier_state, VERIFIER_HANDLE_CLASS, now)?;
-                flow.check_flag(&flow.code_state, CODE_HANDLE_CLASS, now)?;
-                let raw_code = flow
-                    .code
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                    .ok_or_else(|| OAuthError::HandleInvalid {
-                        class: CODE_HANDLE_CLASS.to_string(),
-                    })?;
-                let raw_verifier = flow
-                    .verifier
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                flow.consume_flag(&flow.code_state, CODE_HANDLE_CLASS, now)?;
-                flow.consume_flag(&flow.verifier_state, VERIFIER_HANDLE_CLASS, now)?;
+                let (raw_code, raw_verifier) = flow.consume_exchange(now)?;
                 append_form(&mut body, "code", &raw_code);
                 append_form(&mut body, "code_verifier", raw_verifier.as_str());
                 append_form(&mut body, "redirect_uri", &flow.redirect_uri);
-                prepared.body = body;
                 let _ = verifier;
             }
             CredentialUse::Device(handle) => {
-                let now = self.inner.clock.now();
-                let flow = self.live_flow(&handle)?;
-                flow.check_flag(&flow.callback, DEVICE_HANDLE_CLASS, now)?;
-                prepared.body = body;
+                device_session = Some(self.live_flow(&handle)?);
             }
         }
+        let now = self.inner.clock.now();
+        let _poll_guard = match device_session.as_ref() {
+            Some(flow) => {
+                let guard = flow.begin_device_poll(now)?;
+                let device_id = flow.device_id()?;
+                append_form(&mut body, "device_code", &device_id);
+                Some(guard)
+            }
+            None => None,
+        };
+        prepared.body = body;
         let raw = self.inner.transport.send(&prepared)?;
         if raw.body.len() > MAX_RESPONSE_BODY_BYTES {
             return Err(OAuthError::ResponseTooLarge {
                 max_bytes: MAX_RESPONSE_BODY_BYTES,
             });
         }
-        sanitize_response(&raw, credential_id.as_str(), policy)
+        let sanitized = sanitize_response(
+            self,
+            &raw,
+            credential_id.as_str(),
+            policy,
+            expected_generation,
+        )?;
+        match device_session.as_ref() {
+            Some(flow) if sanitized.access_slot.is_some() || sanitized.refresh_slot.is_some() => {
+                flow.consume_flag(&flow.device_state, DEVICE_HANDLE_CLASS, now)?;
+                flow.clear_device_code();
+            }
+            _ => {}
+        }
+        Ok(sanitized)
     }
 
     pub fn inject_callback(
@@ -763,21 +892,114 @@ impl OAuthHost {
     }
 
     pub fn forged_callback_handle(&self) -> OpaqueCallbackHandle {
-        OpaqueCallbackHandle::from_inner(Arc::new(FlowInner {
-            id: 0,
-            host: Weak::new(),
-            policy_generation: 0,
-            run_id: "forged".to_string(),
-            credential_id: "forged".to_string(),
-            expires_at: Instant::now(),
-            state: "forged".to_string(),
+        OpaqueCallbackHandle::from_inner(FlowInner::forged())
+    }
+
+    pub fn forged_code_handle(&self) -> OpaqueAuthorizationCodeHandle {
+        OpaqueAuthorizationCodeHandle::from_inner(FlowInner::forged())
+    }
+
+    pub fn forged_verifier_handle(&self) -> OpaqueVerifierHandle {
+        OpaqueVerifierHandle::from_inner(FlowInner::forged())
+    }
+
+    pub fn forged_device_handle(&self) -> OpaqueDeviceSessionHandle {
+        OpaqueDeviceSessionHandle::from_inner(FlowInner::forged())
+    }
+
+    fn validate_credential_use(
+        &self,
+        policy: &TrustedTransportPolicy,
+        credential_id: &str,
+        credential_use: &CredentialUse,
+    ) -> Result<(), OAuthError> {
+        let now = self.inner.clock.now();
+        match credential_use {
+            CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => Ok(()),
+            CredentialUse::AuthorizationCode { code, verifier } => {
+                if !code.same_host(&self.inner) || !verifier.same_host(&self.inner) {
+                    return Err(OAuthError::HandleInvalid {
+                        class: CODE_HANDLE_CLASS.to_string(),
+                    });
+                }
+                if code.flow_id() != verifier.flow_id() {
+                    return Err(OAuthError::HandleProvenance {
+                        class: CODE_HANDLE_CLASS.to_string(),
+                    });
+                }
+                let flow = self.live_flow(code)?;
+                flow.check_binding(policy, credential_id, CODE_HANDLE_CLASS)?;
+                flow.check_flag(&flow.code_state, CODE_HANDLE_CLASS, now)?;
+                flow.check_flag(&flow.verifier_state, VERIFIER_HANDLE_CLASS, now)?;
+                Ok(())
+            }
+            CredentialUse::Device(handle) => {
+                if !handle.same_host(&self.inner) {
+                    return Err(OAuthError::HandleInvalid {
+                        class: DEVICE_HANDLE_CLASS.to_string(),
+                    });
+                }
+                let flow = self.live_flow(handle)?;
+                flow.check_binding(policy, credential_id, DEVICE_HANDLE_CLASS)?;
+                flow.check_flag(&flow.device_state, DEVICE_HANDLE_CLASS, now)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn revoke_credential_use(&self, credential_use: &CredentialUse) {
+        match credential_use {
+            CredentialUse::AuthorizationCode { code, .. } => {
+                if let Ok(flow) = self.live_flow(code) {
+                    flow.revoke();
+                }
+            }
+            CredentialUse::Device(handle) => {
+                if let Ok(flow) = self.live_flow(handle) {
+                    flow.revoke();
+                }
+            }
+            CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => {}
+        }
+    }
+
+    fn mint_device_session(
+        &self,
+        policy: &TrustedTransportPolicy,
+        credential_id: &str,
+        device_id: &str,
+    ) -> Result<OpaqueDeviceSessionHandle, OAuthError> {
+        if device_id.is_empty() || device_id.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(OAuthError::MalformedResponse {
+                reason: "device identifier is outside the bounded range".to_string(),
+            });
+        }
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let expires_at = min_deadline(policy.deadline, self.inner.clock.now() + CALLBACK_TTL);
+        let flow = Arc::new(FlowInner {
+            id,
+            host: Arc::downgrade(&self.inner),
+            policy_generation: policy.generation,
+            run_id: policy.run_id.clone(),
+            credential_id: credential_id.to_string(),
+            expires_at,
+            state: String::new(),
             verifier: Mutex::new(Zeroizing::new(String::new())),
             redirect_uri: String::new(),
-            callback: AtomicU8::new(HANDLE_LIVE),
-            verifier_state: AtomicU8::new(HANDLE_LIVE),
-            code_state: AtomicU8::new(HANDLE_LIVE),
+            callback: AtomicU8::new(HANDLE_REVOKED),
+            verifier_state: AtomicU8::new(HANDLE_REVOKED),
+            code_state: AtomicU8::new(HANDLE_REVOKED),
             code: Mutex::new(None),
-        }))
+            device_code: Mutex::new(Zeroizing::new(device_id.to_string())),
+            device_state: AtomicU8::new(HANDLE_LIVE),
+            device_in_flight: AtomicBool::new(false),
+        });
+        self.inner
+            .flows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, Arc::clone(&flow));
+        Ok(OpaqueDeviceSessionHandle::from_inner(flow))
     }
 
     fn finish_callback(
@@ -1079,9 +1301,11 @@ fn percent_decode(value: &str) -> String {
 }
 
 fn sanitize_response(
+    host: &OAuthHost,
     raw: &RawHttpsResponse,
     credential_id: &str,
     policy: &TrustedTransportPolicy,
+    expected_generation: u64,
 ) -> Result<SanitizedProviderResponse, OAuthError> {
     if raw.body.is_empty() {
         return Ok(SanitizedProviderResponse {
@@ -1107,27 +1331,41 @@ fn sanitize_response(
             reason: "response JSON exceeds depth".to_string(),
         });
     }
-    let mut access = None;
-    let mut refresh = None;
-    let sanitized = strip_secrets(parsed, credential_id, policy, &mut access, &mut refresh)?;
+    let mut sink = SecretSink {
+        access: None,
+        refresh: None,
+        device_id: None,
+        expected_generation,
+    };
+    let sanitized = strip_secrets(parsed, credential_id, policy, &mut sink)?;
+    let device_handle = match sink.device_id {
+        Some(device_id) => Some(host.mint_device_session(policy, credential_id, &device_id)?),
+        None => None,
+    };
     Ok(SanitizedProviderResponse {
         status: raw.status,
         public_headers: public_headers(&raw.headers),
         body_without_secret_fields: sanitized,
         retry_after_ms: retry_after_ms(&raw.headers),
-        access_slot: access,
-        refresh_slot: refresh,
-        device_handle: None,
+        access_slot: sink.access,
+        refresh_slot: sink.refresh,
+        device_handle,
         code_handle: None,
     })
+}
+
+struct SecretSink {
+    access: Option<OpaqueSecretSlot>,
+    refresh: Option<OpaqueSecretSlot>,
+    device_id: Option<String>,
+    expected_generation: u64,
 }
 
 fn strip_secrets(
     value: JsonValue,
     credential_id: &str,
     policy: &TrustedTransportPolicy,
-    access: &mut Option<OpaqueSecretSlot>,
-    refresh: &mut Option<OpaqueSecretSlot>,
+    sink: &mut SecretSink,
 ) -> Result<JsonValue, OAuthError> {
     match value {
         JsonValue::Object(map) => {
@@ -1135,27 +1373,24 @@ fn strip_secrets(
             for (key, nested) in map {
                 if secret_key(&key) {
                     if let JsonValue::String(secret) = nested {
-                        mint_slot(credential_id, policy, &key, &secret, access, refresh)?;
+                        if device_secret_key(&key) {
+                            if sink.device_id.is_none() {
+                                sink.device_id = Some(secret);
+                            }
+                        } else {
+                            mint_slot(credential_id, policy, sink, &key, &secret)?;
+                        }
                     }
                     continue;
                 }
-                kept.insert(
-                    key,
-                    strip_secrets(nested, credential_id, policy, access, refresh)?,
-                );
+                kept.insert(key, strip_secrets(nested, credential_id, policy, sink)?);
             }
             Ok(JsonValue::Object(kept))
         }
         JsonValue::Array(values) => {
             let mut kept = Vec::new();
             for nested in values {
-                kept.push(strip_secrets(
-                    nested,
-                    credential_id,
-                    policy,
-                    access,
-                    refresh,
-                )?);
+                kept.push(strip_secrets(nested, credential_id, policy, sink)?);
             }
             Ok(JsonValue::Array(kept))
         }
@@ -1166,10 +1401,9 @@ fn strip_secrets(
 fn mint_slot(
     credential_id: &str,
     policy: &TrustedTransportPolicy,
+    sink: &mut SecretSink,
     key: &str,
     secret: &str,
-    access: &mut Option<OpaqueSecretSlot>,
-    refresh: &mut Option<OpaqueSecretSlot>,
 ) -> Result<(), OAuthError> {
     let kind = if key.eq_ignore_ascii_case("access_token") {
         Some(SecretSlotKind::Access)
@@ -1184,23 +1418,40 @@ fn mint_slot(
     let slot = OpaqueSecretSlot::from_host_secret_until(
         kind,
         credential_id,
-        0,
+        sink.expected_generation,
         policy.generation,
         &policy.run_id,
         Zeroizing::new(secret.as_bytes().to_vec()),
         policy.deadline,
     )?;
     match kind {
-        SecretSlotKind::Access => *access = Some(slot),
-        SecretSlotKind::Refresh => *refresh = Some(slot),
+        SecretSlotKind::Access => sink.access = Some(slot),
+        SecretSlotKind::Refresh => sink.refresh = Some(slot),
     }
     Ok(())
+}
+
+fn credential_expected_generation(credential_use: &CredentialUse) -> u64 {
+    match credential_use {
+        CredentialUse::Access(handle) => handle.generation(),
+        CredentialUse::Refresh(handle) => handle.generation(),
+        CredentialUse::None
+        | CredentialUse::AuthorizationCode { .. }
+        | CredentialUse::Device(_) => 0,
+    }
 }
 
 fn secret_key(key: &str) -> bool {
     SECRET_JSON_KEYS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
+fn device_secret_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "device_code" | "device_id" | "device_auth_id"
+    )
 }
 
 fn public_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
