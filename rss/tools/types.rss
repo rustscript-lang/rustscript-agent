@@ -1,0 +1,189 @@
+// Canonical model-facing tool descriptor contracts.
+// Individual tool modules later own execute/validate; this module freezes the
+// six current public names, descriptions, schemas, risk classes, and toolsets.
+
+pub fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn map_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+pub fn descriptor_new(
+    name: string,
+    description: string,
+    toolset: string,
+    risk_class: string,
+    schema: map
+) -> map {
+    {
+        name: name,
+        description: description,
+        toolset: toolset,
+        risk_class: risk_class,
+        schema: schema
+    }
+}
+
+pub fn read_file_descriptor() -> map {
+    descriptor_new(
+        "read_file",
+        "Read bounded text from a workspace file",
+        "coding",
+        "read",
+        {
+            type: "object",
+            properties: {
+                path: { type: "string" },
+                offset: { type: "integer", minimum: 1 },
+                limit: { type: "integer", minimum: 1 }
+            },
+            required: ["path"],
+            additionalProperties: false
+        }
+    )
+}
+
+pub fn search_files_descriptor() -> map {
+    descriptor_new(
+        "search_files",
+        "Search workspace files with bounded results",
+        "coding",
+        "read",
+        {
+            type: "object",
+            properties: {
+                pattern: { type: "string" },
+                path: { type: "string" },
+                target: { type: "string", enum: ["content", "files"] },
+                file_glob: { type: "string" },
+                limit: { type: "integer", minimum: 1 },
+                offset: { type: "integer", minimum: 0 }
+            },
+            required: ["pattern"],
+            additionalProperties: false
+        }
+    )
+}
+
+pub fn write_file_descriptor() -> map {
+    descriptor_new(
+        "write_file",
+        "Write complete workspace file contents",
+        "coding",
+        "write",
+        {
+            type: "object",
+            properties: {
+                path: { type: "string" },
+                content: { type: "string" }
+            },
+            required: ["path", "content"],
+            additionalProperties: false
+        }
+    )
+}
+
+pub fn patch_descriptor() -> map {
+    descriptor_new(
+        "patch",
+        "Apply a bounded workspace text patch",
+        "coding",
+        "write",
+        {
+            type: "object",
+            properties: {
+                path: { type: "string" },
+                old_string: { type: "string" },
+                new_string: { type: "string" },
+                replace_all: { type: "boolean" }
+            },
+            required: ["path", "old_string", "new_string"],
+            additionalProperties: false
+        }
+    )
+}
+
+pub fn terminal_descriptor() -> map {
+    descriptor_new(
+        "terminal",
+        "Run one bounded argv process",
+        "process",
+        "execute",
+        {
+            type: "object",
+            properties: {
+                argv: { type: "array", items: { type: "string" }, minItems: 1 },
+                cwd: { type: "string" },
+                timeout_ms: { type: "integer", minimum: 1 },
+                max_output_bytes: { type: "integer", minimum: 1 },
+                stdin: { type: "string" },
+                background: { type: "boolean" }
+            },
+            required: ["argv"],
+            additionalProperties: false
+        }
+    )
+}
+
+pub fn process_descriptor() -> map {
+    descriptor_new(
+        "process",
+        "Inspect one owned background process",
+        "process",
+        "execute",
+        {
+            type: "object",
+            properties: {
+                action: {
+                    type: "string",
+                    enum: ["poll", "wait", "log", "write", "close", "kill"]
+                },
+                process_id: { type: "string" },
+                data: { type: "string" },
+                timeout_ms: { type: "integer", minimum: 1, maximum: 3600000 },
+                offset: { type: "integer", minimum: 0 },
+                limit: { type: "integer", minimum: 1 }
+            },
+            required: ["action", "process_id"],
+            additionalProperties: false
+        }
+    )
+}
+
+pub fn catalog() -> array {
+    let mut tools: array = [];
+    tools[tools.length] = read_file_descriptor();
+    tools[tools.length] = search_files_descriptor();
+    tools[tools.length] = write_file_descriptor();
+    tools[tools.length] = patch_descriptor();
+    tools[tools.length] = terminal_descriptor();
+    tools[tools.length] = process_descriptor();
+    tools
+}

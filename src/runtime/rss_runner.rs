@@ -622,6 +622,12 @@ impl AgentRunner {
             sleeps: Arc::clone(&self.host.sleeps),
             skip_sleep: self.host.skip_sleep,
             metrics: self.host.metrics.clone(),
+            lifecycle: self.host.lifecycle.clone(),
+            capability_owner: self.host.capability_owner.clone(),
+            filesystem: self.host.filesystem.clone(),
+            processes: self.host.processes.clone(),
+            artifacts: self.host.artifacts.clone(),
+            leases: Arc::new(Mutex::new(HashMap::new())),
         });
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)

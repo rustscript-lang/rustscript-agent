@@ -1,0 +1,151 @@
+// Bounded structural validation for an RSS tool descriptor snapshot.
+use json;
+use self::types as types;
+
+pub fn max_registry_entries() -> int {
+    64
+}
+
+pub fn max_tool_name_bytes() -> int {
+    64
+}
+
+pub fn max_description_bytes() -> int {
+    4096
+}
+
+pub fn max_schema_bytes() -> int {
+    65536
+}
+
+fn names_contain(names: array, needle: string) -> bool {
+    let mut found = false;
+    let mut index = 0;
+    while index < names.length {
+        if names.has(index) {
+            if type(names[index].copy()) == "string" {
+                let value: string = names[index].copy();
+                if value == needle {
+                    found = true;
+                }
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+fn ok_result() -> map {
+    { ok: true, code: "", message: "", name: "", limit: 0 }
+}
+
+fn error_result(code: string, message: string, name: string, limit: int) -> map {
+    {
+        ok: false,
+        code: code,
+        message: message,
+        name: name,
+        limit: limit
+    }
+}
+
+fn encoded_schema_length(schema: map) -> int {
+    let encoded: string = json::encode(schema);
+    encoded.length
+}
+
+fn map_ok(value: map) -> bool {
+    let mut result = false;
+    if value.has("ok") {
+        if type(value["ok"]) == "bool" {
+            let coerced: bool = value["ok"];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn allowed_toolset(toolset: string) -> bool {
+    let mut allowed = false;
+    if toolset == "coding" {
+        allowed = true;
+    }
+    if toolset == "process" {
+        allowed = true;
+    }
+    allowed
+}
+
+fn allowed_risk_class(risk_class: string) -> bool {
+    let mut allowed = false;
+    if risk_class == "read" {
+        allowed = true;
+    }
+    if risk_class == "write" {
+        allowed = true;
+    }
+    if risk_class == "execute" {
+        allowed = true;
+    }
+    allowed
+}
+
+fn validate_entry(descriptor: map, seen: array) -> map {
+    let name: string = types::map_string(descriptor, "name", "");
+    if name.length > max_tool_name_bytes() => {
+        error_result("tool_name_too_long", "tool name exceeds the byte limit", name, max_tool_name_bytes())
+    } else if name.length == 0 => {
+        error_result("empty_name", "tool descriptor name must not be empty", "", 0)
+    } else if names_contain(seen, name) => {
+        error_result("duplicate_name", "duplicate tool name", name, 0)
+    } else => {
+        let description: string = types::map_string(descriptor, "description", "");
+        if description.length > max_description_bytes() => {
+            error_result("description_too_long", "tool description exceeds the byte limit", name, max_description_bytes())
+        } else if description.length == 0 => {
+            error_result("empty_description", "tool descriptor must have a description", name, 0)
+        } else if allowed_toolset(types::map_string(descriptor, "toolset", "")) == false => {
+            error_result("unsupported_toolset", "unsupported toolset", name, 0)
+        } else if allowed_risk_class(types::map_string(descriptor, "risk_class", "")) == false => {
+            error_result("unsupported_risk_class", "unsupported risk class", name, 0)
+        } else => {
+            let schema: map = types::map_map(descriptor, "schema");
+            let schema_len: int = encoded_schema_length(schema);
+            if schema_len > max_schema_bytes() => {
+                error_result("schema_too_large", "tool schema exceeds the byte limit", name, max_schema_bytes())
+            } else => {
+                ok_result()
+            }
+        }
+    }
+}
+
+pub fn validate(descriptors: array) -> map {
+    if descriptors.length > max_registry_entries() => {
+        error_result("too_many_entries", "tool registry exceeds the entry limit", "", max_registry_entries())
+    } else => {
+        let mut result: map = ok_result();
+        let mut seen: array = [];
+        let mut index = 0;
+        let mut failed = false;
+        while index < descriptors.length {
+            if failed == false {
+                if descriptors.has(index) {
+                    if type(descriptors[index].copy()) == "map" {
+                        let descriptor: map = descriptors[index].copy();
+                        let name: string = types::map_string(descriptor, "name", "");
+                        let entry: map = validate_entry(descriptor, seen);
+                        if map_ok(entry.copy()) == false {
+                            result = entry;
+                            failed = true;
+                        } else {
+                            seen[seen.length] = name;
+                        }
+                    }
+                }
+            }
+            index += 1;
+        }
+        result
+    }
+}

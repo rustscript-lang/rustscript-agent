@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use rustscript_agent::capabilities::{CapabilityRisk, PrepareMetadata, PrepareOutcome};
 use rustscript_agent::config::{
     ADMISSION_QUERY_RESULT_LIMIT_BYTES, ADMISSION_RUN_COL_INPUT_JSON, AdmissionSqliteCellLens,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_MODEL_NAME_BYTES, MAX_PROVIDER_NAME_BYTES,
@@ -3233,4 +3234,333 @@ async fn provider_step_parent_is_derived_under_commit_gate() {
     assert_ne!(assistant["parent_message_id"], "forged-parent");
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+}
+
+#[tokio::test]
+async fn production_lifecycle_commit_result_replays_after_restart_without_corruption() {
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-cap-commit-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-cap-commit".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let outcome = lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-cap-commit".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "canonical commit".to_string(),
+            },
+        )
+        .expect("prepare should issue a token");
+    let PrepareOutcome::Execute {
+        execution_token, ..
+    } = outcome
+    else {
+        panic!("expected execute token, got {outcome:?}");
+    };
+    lifecycle
+        .commit(
+            &owner,
+            &execution_token,
+            json!({
+                "ok": true,
+                "content": "canonical-from-lifecycle",
+                "data": {"n": 1}
+            }),
+        )
+        .expect("production commit_result should persist");
+    let first_events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&first_events, "tool.completed"), 1);
+    let replayed = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("restart replay must dispatch");
+    assert_eq!(replayed.len(), 1);
+    assert!(
+        replayed[0].ok,
+        "canonical lifecycle result must replay, not be treated as corrupt: {:?}",
+        replayed[0]
+    );
+    assert_eq!(replayed[0].content, "canonical-from-lifecycle");
+    assert_eq!(
+        event_type_count(&service.run_events(&admitted.run_id), "tool.completed"),
+        1
+    );
+    drop(state);
+
+    let resumed = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("reopen");
+    let messages = resumed.service().session_messages(&admitted.session_id);
+    let replayed_block = messages.iter().rev().find_map(|message| {
+        message["content"]
+            .as_array()?
+            .iter()
+            .find(|block| block["type"] == "tool_result" && block["tool_call_id"] == call.id)
+    });
+    assert!(
+        replayed_block.is_some(),
+        "canonical tool_result must survive restart: {messages:?}"
+    );
+    assert_eq!(
+        replayed_block.unwrap()["content"],
+        json!("canonical-from-lifecycle")
+    );
+    drop(resumed);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn production_lifecycle_commit_failure_replays_as_tool_failed_without_corruption() {
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-cap-fail-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-cap-fail".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let outcome = lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-cap-fail".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "canonical failure".to_string(),
+            },
+        )
+        .expect("prepare should issue a token");
+    let PrepareOutcome::Execute {
+        execution_token, ..
+    } = outcome
+    else {
+        panic!("expected execute token, got {outcome:?}");
+    };
+    lifecycle
+        .commit(
+            &owner,
+            &execution_token,
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "not_found",
+                    "message": "missing fixture"
+                }
+            }),
+        )
+        .expect("production commit_result should persist failure");
+    assert_eq!(
+        event_type_count(&service.run_events(&admitted.run_id), "tool.failed"),
+        1
+    );
+    assert_eq!(
+        event_type_count(&service.run_events(&admitted.run_id), "tool.completed"),
+        0
+    );
+    let replayed = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("failure replay must dispatch");
+    assert_eq!(
+        replayed[0].error.as_ref().map(|error| error.code.as_str()),
+        Some("not_found"),
+        "typed failure must replay, not be treated as corrupt: {:?}",
+        replayed[0]
+    );
+    assert_eq!(
+        event_type_count(&service.run_events(&admitted.run_id), "tool.failed"),
+        1
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn production_lifecycle_interrupt_replays_interrupted_effect_without_corruption() {
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-cap-interrupt-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-cap-interrupt".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let outcome = lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-cap-interrupt".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "open effect".to_string(),
+            },
+        )
+        .expect("prepare should issue a token");
+    assert!(matches!(outcome, PrepareOutcome::Execute { .. }));
+    let recovered = lifecycle
+        .recover_open_tokens()
+        .expect("recovery must interrupt open tokens");
+    assert_eq!(recovered, [call.id.as_str()]);
+    let events = service.run_events(&admitted.run_id);
+    let failed = events
+        .iter()
+        .find(|event| event["event"] == "tool.failed")
+        .expect("interrupt must persist tool.failed");
+    assert_eq!(failed["data"]["error_code"], json!("interrupted_effect"));
+    let replayed = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("interrupted replay must dispatch");
+    assert_eq!(
+        replayed[0].error.as_ref().map(|error| error.code.as_str()),
+        Some("interrupted_effect"),
+        "interrupted effect must replay, not be treated as corrupt: {:?}",
+        replayed[0]
+    );
+    assert_eq!(
+        event_type_count(&service.run_events(&admitted.run_id), "tool.failed"),
+        1
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn production_stop_recovers_open_capability_tokens() {
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-cap-stop-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-cap-stop".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let outcome = lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-cap-stop".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "open effect".to_string(),
+            },
+        )
+        .expect("prepare should issue a token");
+    assert!(matches!(outcome, PrepareOutcome::Execute { .. }));
+    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
+    let events = service.run_events(&admitted.run_id);
+    let failed = events
+        .iter()
+        .find(|event| event["event"] == "tool.failed")
+        .expect("stop must persist interrupted_effect");
+    assert_eq!(failed["data"]["error_code"], json!("interrupted_effect"));
+    let replayed = service
+        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+        .expect("stop recovery must dispatch");
+    assert_eq!(
+        replayed[0].error.as_ref().map(|error| error.code.as_str()),
+        Some("interrupted_effect"),
+        "stop must recover open tokens without corruption: {:?}",
+        replayed[0]
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
 }
