@@ -22,7 +22,6 @@ use rustscript_agent::capabilities::{
 use rustscript_agent::config::ProcessToolConfig;
 use rustscript_agent::{
     AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolResult,
-    bundled_tool_registry,
 };
 use rustscript_vm::{CancellationReason, Value as VmValue};
 use serde_json::{Value, json};
@@ -404,7 +403,26 @@ fn default_artifact_limits() -> ArtifactLimits {
     }
 }
 
+fn compile_exec_runner(exec: &RssExec) -> AgentRunner {
+    if exec.unlimited_fuel {
+        compile_rss_with_fuel(exec.module, None)
+    } else {
+        compile_rss(exec.module)
+    }
+}
+
 fn run_rss_exec(fixture: &Fixture, config: &ProcessToolConfig, exec: RssExec) -> RssRun {
+    let runner = compile_exec_runner(&exec);
+    run_rss_exec_with_runner(fixture, config, exec, runner, None)
+}
+
+fn run_rss_exec_with_runner(
+    fixture: &Fixture,
+    config: &ProcessToolConfig,
+    exec: RssExec,
+    runner: AgentRunner,
+    process_spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> RssRun {
     let lifecycle = match exec.shared_lifecycle.clone() {
         Some(lifecycle) => lifecycle,
         None => Arc::new(build_lifecycle(
@@ -423,6 +441,9 @@ fn run_rss_exec(fixture: &Fixture, config: &ProcessToolConfig, exec: RssExec) ->
                 .expect("process capability"),
         ),
     };
+    if let Some(hook) = process_spawn_hook {
+        processes.set_before_os_spawn_hook(hook);
+    }
     let artifacts = if exec.enable_artifacts {
         Some(Arc::new(
             ArtifactCapability::new(lifecycle.as_ref().clone(), owner(), exec.artifact_limits)
@@ -454,11 +475,6 @@ fn run_rss_exec(fixture: &Fixture, config: &ProcessToolConfig, exec: RssExec) ->
         },
         "config": rss_config_json(config),
     });
-    let runner = if exec.unlimited_fuel {
-        compile_rss_with_fuel(exec.module, None)
-    } else {
-        compile_rss(exec.module)
-    };
     let output = runner
         .with_host(host)
         .run_with_context(json_to_vm_value(&context))
@@ -505,17 +521,51 @@ fn unwrap_committed(value: Value) -> Value {
     }
 }
 
-fn native_descriptor(name: &str) -> Value {
-    bundled_tool_registry()
-        .expect("RSS registry")
-        .snapshot()
-        .schemas()
-        .as_array()
-        .expect("descriptor array")
-        .iter()
-        .find(|value| value["name"] == name)
-        .cloned()
-        .unwrap_or_else(|| panic!("missing RSS descriptor {name}"))
+fn frozen_terminal_descriptor() -> Value {
+    json!({
+        "name": "terminal",
+        "description": "Run one bounded argv process",
+        "toolset": "process",
+        "risk_class": "execute",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "argv": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                "cwd": { "type": "string" },
+                "timeout_ms": { "type": "integer", "minimum": 1 },
+                "max_output_bytes": { "type": "integer", "minimum": 1 },
+                "stdin": { "type": "string" },
+                "background": { "type": "boolean" }
+            },
+            "required": ["argv"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn frozen_process_descriptor() -> Value {
+    json!({
+        "name": "process",
+        "description": "Inspect one owned background process",
+        "toolset": "process",
+        "risk_class": "execute",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["poll", "wait", "log", "write", "close", "kill"]
+                },
+                "process_id": { "type": "string" },
+                "data": { "type": "string" },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+                "offset": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["action", "process_id"],
+            "additionalProperties": false
+        }
+    })
 }
 
 fn canonical_envelope(value: &Value) -> Value {
@@ -685,15 +735,21 @@ fn rss_terminal_and_process_modules_compile() {
 
 #[test]
 fn rss_terminal_and_process_descriptors_match_native() {
-    for (module, name) in [("terminal.rss", "terminal"), ("process.rss", "process")] {
+    for (module, expected) in [
+        ("terminal.rss", frozen_terminal_descriptor()),
+        ("process.rss", frozen_process_descriptor()),
+    ] {
         let runner = compile_rss(module);
         let output = runner
             .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
             .expect("descriptor run");
         let rss = vm_value_to_json(&output);
-        assert_eq!(rss, native_descriptor(name));
-        assert_eq!(rss["toolset"], json!("process"));
-        assert_eq!(rss["risk_class"], json!("execute"));
+        assert_eq!(rss["name"], expected["name"]);
+        assert_eq!(rss["description"], expected["description"]);
+        assert_eq!(rss["toolset"], expected["toolset"]);
+        assert_eq!(rss["risk_class"], expected["risk_class"]);
+        assert_eq!(rss["schema"], expected["schema"]);
+        assert_eq!(rss, expected);
     }
 }
 
@@ -1038,15 +1094,29 @@ fn foreground_timeout_kills_child_and_grandchild() {
         ],
         "timeout_ms": 120
     });
-    let started = Instant::now();
-    let rss = run_rss_exec(
+    let spawn_started_at = Arc::new(Mutex::new(None));
+    let exec = default_exec("terminal.rss", "terminal", arguments);
+    let runner = compile_exec_runner(&exec);
+    let rss = run_rss_exec_with_runner(
         &fixture,
         &config,
-        default_exec("terminal.rss", "terminal", arguments),
+        exec,
+        runner,
+        Some({
+            let spawn_started_at = Arc::clone(&spawn_started_at);
+            Arc::new(move || {
+                *spawn_started_at.lock().expect("spawn timer") = Some(Instant::now());
+            })
+        }),
     );
     assert_eq!(rss.result["ok"], json!(false));
     assert_eq!(rss.result["error"]["code"], json!("deadline_elapsed"));
     assert_canonical_envelope(&rss.result);
+    let started = spawn_started_at
+        .lock()
+        .expect("spawn timer")
+        .take()
+        .expect("spawn timer marker");
     assert!(started.elapsed() < Duration::from_secs(2));
     let pid: u32 = fs::read_to_string(&marker)
         .expect("pid marker")

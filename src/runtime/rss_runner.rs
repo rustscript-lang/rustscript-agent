@@ -14,6 +14,7 @@
 //! and a watcher thread jumps the epoch so pure CPU work is interrupted within
 //! the configured epoch bound (surfacing as a typed deadline failure).
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -30,9 +31,9 @@ use rustscript_vm::{
     CallReturn, CancellationReason, CancellationToken, CompileSourceFileOptions, EpochHandle,
     HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt,
     InvocationError, InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy,
-    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason, compile_source_file_with_options,
-    compile_source_with_flavor_and_options, register_http_builtin_module_from_catalog,
-    register_sqlite_builtin_module_from_catalog,
+    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
+    register_http_builtin_module_from_catalog, register_sqlite_builtin_module_from_catalog,
 };
 
 use super::agent_host::{
@@ -47,11 +48,35 @@ use serde_json::json;
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
 pub const COMPILE_CACHE_CAP: usize = 8;
-const COMPILE_TREE_RETRIES: usize = 4;
+pub const COMPILE_CACHE_WEIGHT_CAP: usize = COMPILE_CACHE_CAP * MAX_AGENT_SOURCE_BYTES;
+
+thread_local! {
+    static AFTER_SNAPSHOT_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+}
+
+/// Test seam: invoked after `from_file` captures an immutable snapshot and
+/// before the compiler reads the materialized sandbox copy.
+pub fn set_after_snapshot_hook(hook: Option<fn(&Path)>) {
+    AFTER_SNAPSHOT_HOOK.with(|cell| cell.set(hook));
+}
+
+fn invoke_after_snapshot(path: &Path) {
+    AFTER_SNAPSHOT_HOOK.with(|cell| {
+        if let Some(hook) = cell.get() {
+            hook(path);
+        }
+    });
+}
+
+struct CachedProgram {
+    program: rustscript_vm::Program,
+    weight: usize,
+}
 
 struct ProgramLru {
-    entries: HashMap<String, rustscript_vm::Program>,
+    entries: HashMap<String, CachedProgram>,
     order: VecDeque<String>,
+    total_weight: usize,
 }
 
 impl ProgramLru {
@@ -59,34 +84,46 @@ impl ProgramLru {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
+            total_weight: 0,
         }
     }
 
     fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
-        let program = self.entries.get(digest)?.clone();
+        if !self.entries.contains_key(digest) {
+            return None;
+        }
         if let Some(index) = self.order.iter().position(|key| key == digest) {
             self.order.remove(index);
         }
         self.order.push_back(digest.to_string());
-        Some(program)
+        self.entries.get(digest).map(|entry| entry.program.clone())
     }
 
-    fn insert(&mut self, digest: String, program: rustscript_vm::Program) {
+    fn insert(&mut self, digest: String, program: rustscript_vm::Program, weight: usize) {
         if self.entries.contains_key(&digest) {
-            self.entries.insert(digest.clone(), program);
             if let Some(index) = self.order.iter().position(|key| key == &digest) {
                 self.order.remove(index);
             }
             self.order.push_back(digest);
             return;
         }
-        while self.order.len() >= COMPILE_CACHE_CAP {
-            if let Some(old) = self.order.pop_front() {
-                self.entries.remove(&old);
+        if weight > COMPILE_CACHE_WEIGHT_CAP {
+            return;
+        }
+        while !self.order.is_empty()
+            && (self.order.len() >= COMPILE_CACHE_CAP
+                || self.total_weight.saturating_add(weight) > COMPILE_CACHE_WEIGHT_CAP)
+        {
+            if let Some(old) = self.order.pop_front()
+                && let Some(entry) = self.entries.remove(&old)
+            {
+                self.total_weight = self.total_weight.saturating_sub(entry.weight);
             }
         }
-        self.order.push_back(digest.clone());
-        self.entries.insert(digest, program);
+        self.total_weight = self.total_weight.saturating_add(weight);
+        self.entries
+            .insert(digest.clone(), CachedProgram { program, weight });
+        self.order.push_back(digest);
     }
 }
 
@@ -98,17 +135,37 @@ fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn tree_error(message: &'static str) -> AgentError {
-    AgentError::Compile(message.to_string())
-}
-
 fn snapshot_module_tree(entry: &Path) -> Result<String> {
-    // Whole allowed-root digest: compiler resolution is restricted to that
-    // root, so this includes exactly all possible compiler inputs.
     super::module_snapshot::module_tree_digest(entry)
 }
 
-fn compiled_source_program(source: &str) -> Result<rustscript_vm::Program> {
+fn redact_compile_error(error: impl Display, sandbox: &Path) -> AgentError {
+    let mut text = error.to_string();
+    if let Some(root) = sandbox.to_str()
+        && !root.is_empty()
+    {
+        text = text.replace(root, "");
+    }
+    if let Some(tmp) = compile_temp_root().to_str()
+        && !tmp.is_empty()
+    {
+        text = text.replace(tmp, "");
+    }
+    if let Some(tmp) = std::env::temp_dir().to_str()
+        && !tmp.is_empty()
+    {
+        text = text.replace(tmp, "");
+    }
+    AgentError::Compile(text)
+}
+
+fn compile_temp_root() -> PathBuf {
+    std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn compiled_source_program(source: &str) -> Result<(rustscript_vm::Program, String)> {
     if source.len() > MAX_AGENT_SOURCE_BYTES {
         return Err(AgentError::Compile(format!(
             "agent source exceeds {} bytes",
@@ -119,43 +176,63 @@ fn compiled_source_program(source: &str) -> Result<rustscript_vm::Program> {
     {
         let mut cache = program_cache();
         if let Some(program) = cache.get(&digest) {
-            return Ok(program);
+            return Ok((program, digest));
         }
     }
     let program =
         compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
             .map_err(|error| AgentError::Compile(error.to_string()))?
             .program;
-    program_cache().insert(digest, program.clone());
-    Ok(program)
+    {
+        let mut cache = program_cache();
+        if let Some(cached) = cache.get(&digest) {
+            return Ok((cached, digest));
+        }
+        cache.insert(digest.clone(), program.clone(), source.len());
+    }
+    Ok((program, digest))
 }
 
-fn compiled_file_program(path: &Path) -> Result<rustscript_vm::Program> {
-    let mut last_error = tree_error("module tree changed during compile");
-    for _ in 0..COMPILE_TREE_RETRIES {
-        let digest = snapshot_module_tree(path)?;
-        {
-            let mut cache = program_cache();
-            if let Some(program) = cache.get(&digest) {
-                let verify = snapshot_module_tree(path)?;
-                if verify == digest {
-                    return Ok(program);
-                }
-                last_error = tree_error("module tree changed during compile");
-                continue;
-            }
+fn compiled_file_program(path: &Path) -> Result<(rustscript_vm::Program, String)> {
+    let snapshot = super::module_snapshot::capture_module_snapshot(path)?;
+    invoke_after_snapshot(path);
+    let digest = snapshot.digest().to_string();
+    {
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok((program, digest));
         }
-        let program = compile_source_file_with_options(path, compile_options())
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
-        let verify = snapshot_module_tree(path)?;
-        if verify == digest {
-            program_cache().insert(digest, program.clone());
-            return Ok(program);
-        }
-        last_error = tree_error("module tree changed during compile");
     }
-    Err(last_error)
+    let sandbox = snapshot.materialize()?;
+    let mut options = compile_options();
+    for (rel, bytes) in snapshot.files() {
+        let source = std::str::from_utf8(bytes)
+            .map_err(|_| AgentError::Compile("module tree file is not valid UTF-8".to_string()))?;
+        for key in sandbox.override_source_keys(rel) {
+            options = options.with_module_override_source(key, source);
+        }
+    }
+    let program = compile_source_at_path_with_flavor_and_options(
+        sandbox.entry(),
+        snapshot.entry_source()?,
+        SourceFlavor::RustScript,
+        options,
+    )
+    .map_err(|error| redact_compile_error(error, sandbox.sandbox()))?
+    .program;
+    drop(sandbox);
+    {
+        let mut cache = program_cache();
+        if let Some(cached) = cache.get(&digest) {
+            return Ok((cached, digest));
+        }
+        cache.insert(
+            digest.clone(),
+            program.clone(),
+            snapshot.total_source_bytes(),
+        );
+    }
+    Ok((program, digest))
 }
 
 fn rss_root() -> PathBuf {
@@ -628,18 +705,25 @@ pub struct AgentRunner {
     registry: Arc<HostFunctionRegistry>,
     host: AgentHostBridges,
     prepare_fault: RunnerPrepareFault,
+    snapshot_digest: String,
 }
 
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
-        Self::from_program(compiled_source_program(source)?, config)
+        let (program, digest) = compiled_source_program(source)?;
+        Self::from_program(program, config, digest)
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
-        Self::from_program(compiled_file_program(path.as_ref())?, config)
+        let (program, digest) = compiled_file_program(path.as_ref())?;
+        Self::from_program(program, config, digest)
     }
 
-    fn from_program(program: rustscript_vm::Program, config: AgentConfig) -> Result<Self> {
+    fn from_program(
+        program: rustscript_vm::Program,
+        config: AgentConfig,
+        snapshot_digest: String,
+    ) -> Result<Self> {
         let registry = build_restricted_registry()
             .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
         Ok(Self {
@@ -648,7 +732,13 @@ impl AgentRunner {
             registry: Arc::new(registry),
             host: AgentHostBridges::default(),
             prepare_fault: RunnerPrepareFault::None,
+            snapshot_digest,
         })
+    }
+
+    /// Digest of the snapshot or source bytes this runner compiled.
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
     }
 
     /// Effective HTTP/SQLite/fuel policy compiled into this runner.
@@ -1166,5 +1256,76 @@ impl HostAsyncBridge for AgentAsyncBridge {
 
     fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
         self.futures.remove(&op_id);
+    }
+}
+
+#[cfg(test)]
+mod compile_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn tiny_source(tag: &str) -> String {
+        format!(
+            "pub fn run(context: map) -> map {{ let _x: string = \"{tag}\"; {{ ok: true }} }}\n"
+        )
+    }
+
+    #[test]
+    fn compile_cache_recovers_from_poison_and_compiles_outside_lock() {
+        let _ = thread::spawn(|| {
+            let _guard = program_cache();
+            panic!("poison cache");
+        })
+        .join();
+        compiled_source_program(&tiny_source("poison")).expect("poison recovery");
+    }
+
+    #[test]
+    fn compile_cache_bounds_entries_and_weight() {
+        let program = compiled_source_program(&tiny_source("seed"))
+            .expect("compile")
+            .0;
+        let mut cache = ProgramLru::new();
+        for i in 0..COMPILE_CACHE_CAP {
+            cache.insert(format!("d{i}"), program.clone(), MAX_AGENT_SOURCE_BYTES);
+        }
+        assert_eq!(cache.entries.len(), COMPILE_CACHE_CAP);
+        assert_eq!(cache.total_weight, COMPILE_CACHE_WEIGHT_CAP);
+        cache.insert(
+            "overflow".to_string(),
+            program.clone(),
+            MAX_AGENT_SOURCE_BYTES,
+        );
+        assert_eq!(cache.entries.len(), COMPILE_CACHE_CAP);
+        assert!(!cache.entries.contains_key("d0"));
+        assert!(cache.entries.contains_key("overflow"));
+        cache.insert(
+            "too-heavy".to_string(),
+            program,
+            COMPILE_CACHE_WEIGHT_CAP + 1,
+        );
+        assert!(!cache.entries.contains_key("too-heavy"));
+    }
+
+    #[test]
+    fn compile_cache_concurrent_same_digest_is_safe() {
+        let source = tiny_source("concurrent");
+        let source = Arc::new(source);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let source = Arc::clone(&source);
+            handles.push(thread::spawn(move || compiled_source_program(&source)));
+        }
+        let mut digests = Vec::new();
+        for handle in handles {
+            let (_, digest) = handle.join().expect("thread").expect("compile");
+            digests.push(digest);
+        }
+        assert!(digests.iter().all(|digest| digest == &digests[0]));
+        {
+            let cache = program_cache();
+            assert!(cache.entries.contains_key(&digests[0]));
+        }
     }
 }

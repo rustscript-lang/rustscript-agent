@@ -1241,8 +1241,7 @@ async fn request_runtime_stays_responsive_during_storage_stall() {
         .expect("persistence handle should be exposed");
     // Seed enough state that a full reload (migrate + recovery + load.all)
     // takes a couple of seconds on the dedicated storage worker.
-    let mut now = 4_000_000u64;
-    for index in 0..1500 {
+    for (index, now) in (4_000_000u64..4_001_500).enumerate() {
         persistence
             .session_create(&json!({
                 "id": format!("stall-session-{index:04}"),
@@ -1263,7 +1262,6 @@ async fn request_runtime_stays_responsive_during_storage_stall() {
                 "now_ms": now,
             }))
             .expect("session create should commit");
-        now += 1;
     }
     drop(state);
     let app = build_agent_gateway_app(
@@ -2329,8 +2327,7 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
     // prompts make the reload byte-bound (one row per page), so a handful
     // of commands produce a multi-second reload.
     let big_prompt = "x".repeat(900_000);
-    let mut now = 5_000_000u64;
-    for index in 0..250 {
+    for (index, now) in (5_000_000u64..5_000_250).enumerate() {
         persistence
             .session_create(&json!({
                 "id": format!("stall-session-{index:04}"),
@@ -2351,7 +2348,6 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
                 "now_ms": now,
             }))
             .expect("session create should commit");
-        now += 1;
     }
     let slow_persistence = persistence.clone();
     let slow_load = tokio::task::spawn_blocking(move || {

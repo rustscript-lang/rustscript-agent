@@ -41,8 +41,50 @@ fn fixtures_root() -> PathBuf {
         .join("agent")
 }
 
-const LOOP_TEMP_ROOT: &str =
-    "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t6-agent-loop-9d82a388";
+fn loop_temp_root() -> PathBuf {
+    let root = std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "rustscript-agent-loop-tests-{}",
+                std::process::id()
+            ))
+        });
+    fs::create_dir_all(&root).expect("loop temp root should exist");
+    assert_temp_path_is_lease_safe(&root);
+    root
+}
+
+fn unique_loop_workspace(label: &str, sequence: u64) -> PathBuf {
+    loop_temp_root().join(format!("{}-{}-{}", label, std::process::id(), sequence))
+}
+
+fn assert_temp_path_is_lease_safe(path: &std::path::Path) {
+    if let Some(test_tmpdir) = std::env::var_os("TEST_TMPDIR") {
+        let root = PathBuf::from(test_tmpdir);
+        assert!(
+            path.starts_with(&root),
+            "loop temp paths must stay under TEST_TMPDIR ({}); got {}",
+            root.display(),
+            path.display()
+        );
+        return;
+    }
+    let rendered = path.to_string_lossy();
+    assert!(
+        path.starts_with(std::env::temp_dir()),
+        "loop temp paths must use std::env::temp_dir when TEST_TMPDIR is unset: {rendered}"
+    );
+    let worktrees = format!("/{}s/", "worktree");
+    let lease_tmp = format!("/mnt/{}/workspace/rustscript-agent/tmp/", "TEMP");
+    let prod_tmp = format!("/tmp/{}-agent-", "prod");
+    assert!(
+        !rendered.contains(&worktrees)
+            && !rendered.contains(&lease_tmp)
+            && !rendered.contains(&prod_tmp),
+        "loop temp paths must not write into a hardcoded sibling lease path: {rendered}"
+    );
+}
 
 fn loop_runner() -> AgentRunner {
     AgentRunner::from_file(agent_root().join("main.rss"), AgentConfig::default())
@@ -539,11 +581,7 @@ fn loop_host_with(
 
 fn capability_hoster(max_tool_calls: u64) -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
-        "loop-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = unique_loop_workspace("loop", NEXT.fetch_add(1, Ordering::Relaxed));
     let executor = CountingExecutor::new();
     let host = loop_host_with(max_tool_calls, Arc::clone(&executor), None, root.clone());
     (host, executor, root)
@@ -586,11 +624,7 @@ fn cancel_after_effect_dispatcher(
     cancellation: RunCancellation,
 ) -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
-        "cancel-after-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = unique_loop_workspace("cancel-after", NEXT.fetch_add(1, Ordering::Relaxed));
     let executor = CountingExecutor::new();
     let host = loop_host_with(8, Arc::clone(&executor), Some(cancellation), root.clone());
     let _ = CancelAfterEffect::from_executor(&executor);

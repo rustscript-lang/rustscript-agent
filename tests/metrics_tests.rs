@@ -1244,8 +1244,7 @@ async fn metrics_scrape_does_not_block_on_the_store() {
         .expect("persistence handle should be exposed");
     // Seed enough state that a full reload takes a couple of seconds on the
     // dedicated storage worker (same mechanism as the storage-stall test).
-    let mut now = 4_000_000u64;
-    for index in 0..1500 {
+    for (index, now) in (4_000_000u64..).take(1500).enumerate() {
         persistence
             .session_create(&json!({
                 "id": format!("scrape-session-{index:04}"),
@@ -1266,7 +1265,6 @@ async fn metrics_scrape_does_not_block_on_the_store() {
                 "now_ms": now,
             }))
             .expect("session create should commit");
-        now += 1;
     }
     let metrics = state.metrics();
     let app = build_agent_gateway_app(state);
