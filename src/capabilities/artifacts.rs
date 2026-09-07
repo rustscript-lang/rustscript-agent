@@ -293,6 +293,17 @@ impl ArtifactCapability {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
     }
+
+    /// Opaque artifact identifiers currently stored for this owner.
+    pub fn stored_ids(&self) -> Vec<String> {
+        self.inner
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
 }
 
 struct ResultArtifactGuard {

@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    env,
     net::SocketAddr,
     sync::{
         Arc,
@@ -145,21 +145,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(std::io::Error::other)?;
     }
 
-    let script = match env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")? {
-        Some(path) => Some(fs::read_to_string(path)?),
-        None => None,
-    };
+    let script = env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")?;
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
-    let state = match (script, state_db) {
-        (Some(source), Some(path)) => {
-            AgentGatewayState::with_agent_source_and_sqlite(config, source, path)
-                .map_err(std::io::Error::other)?
+    let state = match (script.as_deref(), state_db.as_deref()) {
+        (Some(path), Some(db)) => AgentGatewayState::with_agent_file_and_sqlite(config, path, db)
+            .map_err(std::io::Error::other)?,
+        (Some(path), None) => {
+            AgentGatewayState::with_agent_file(config, path).map_err(std::io::Error::other)?
         }
-        (Some(source), None) => {
-            AgentGatewayState::with_agent_source(config, source).map_err(std::io::Error::other)?
-        }
-        (None, Some(path)) => {
-            AgentGatewayState::with_sqlite_path(config, path).map_err(std::io::Error::other)?
+        (None, Some(db)) => {
+            AgentGatewayState::with_sqlite_path(config, db).map_err(std::io::Error::other)?
         }
         (None, None) => AgentGatewayState::new(config).map_err(std::io::Error::other)?,
     };

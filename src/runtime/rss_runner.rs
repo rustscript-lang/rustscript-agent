@@ -14,10 +14,10 @@
 //! and a watcher thread jumps the epoch so pure CPU work is interrupted within
 //! the configured epoch bound (surfacing as a typed deadline failure).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -39,15 +39,172 @@ use super::agent_host::{
     AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog,
     register_agent_host_functions,
 };
+use crate::capabilities::sha256_hex;
 use crate::domain::{json_to_vm_value, vm_value_to_json};
+use crate::registry::ToolRegistry;
+use crate::tool_schema::ToolDescriptor;
+use serde_json::json;
 
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
+pub const COMPILE_CACHE_CAP: usize = 8;
+const COMPILE_TREE_RETRIES: usize = 4;
 
-fn compile_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+struct ProgramLru {
+    entries: HashMap<String, rustscript_vm::Program>,
+    order: VecDeque<String>,
+}
+
+impl ProgramLru {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
+        let program = self.entries.get(digest)?.clone();
+        if let Some(index) = self.order.iter().position(|key| key == digest) {
+            self.order.remove(index);
+        }
+        self.order.push_back(digest.to_string());
+        Some(program)
+    }
+
+    fn insert(&mut self, digest: String, program: rustscript_vm::Program) {
+        if self.entries.contains_key(&digest) {
+            self.entries.insert(digest.clone(), program);
+            if let Some(index) = self.order.iter().position(|key| key == &digest) {
+                self.order.remove(index);
+            }
+            self.order.push_back(digest);
+            return;
+        }
+        while self.order.len() >= COMPILE_CACHE_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.order.push_back(digest.clone());
+        self.entries.insert(digest, program);
+    }
+}
+
+fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
+    static CACHE: OnceLock<Mutex<ProgramLru>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(ProgramLru::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn tree_error(message: &'static str) -> AgentError {
+    AgentError::Compile(message.to_string())
+}
+
+fn snapshot_module_tree(entry: &Path) -> Result<String> {
+    // Whole allowed-root digest: compiler resolution is restricted to that
+    // root, so this includes exactly all possible compiler inputs.
+    super::module_snapshot::module_tree_digest(entry)
+}
+
+fn compiled_source_program(source: &str) -> Result<rustscript_vm::Program> {
+    if source.len() > MAX_AGENT_SOURCE_BYTES {
+        return Err(AgentError::Compile(format!(
+            "agent source exceeds {} bytes",
+            MAX_AGENT_SOURCE_BYTES
+        )));
+    }
+    let digest = sha256_hex(source.as_bytes());
+    {
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok(program);
+        }
+    }
+    let program =
+        compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
+            .map_err(|error| AgentError::Compile(error.to_string()))?
+            .program;
+    program_cache().insert(digest, program.clone());
+    Ok(program)
+}
+
+fn compiled_file_program(path: &Path) -> Result<rustscript_vm::Program> {
+    let mut last_error = tree_error("module tree changed during compile");
+    for _ in 0..COMPILE_TREE_RETRIES {
+        let digest = snapshot_module_tree(path)?;
+        {
+            let mut cache = program_cache();
+            if let Some(program) = cache.get(&digest) {
+                let verify = snapshot_module_tree(path)?;
+                if verify == digest {
+                    return Ok(program);
+                }
+                last_error = tree_error("module tree changed during compile");
+                continue;
+            }
+        }
+        let program = compile_source_file_with_options(path, compile_options())
+            .map_err(|error| AgentError::Compile(error.to_string()))?
+            .program;
+        let verify = snapshot_module_tree(path)?;
+        if verify == digest {
+            program_cache().insert(digest, program.clone());
+            return Ok(program);
+        }
+        last_error = tree_error("module tree changed during compile");
+    }
+    Err(last_error)
+}
+
+fn rss_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("rss")
+}
+
+/// Production bundled coding-agent entry (`rss/agent/main.rss`).
+pub fn bundled_agent_main_path() -> PathBuf {
+    rss_root().join("agent/main.rss")
+}
+
+pub(crate) fn module_tree_digest(path: impl AsRef<Path>) -> Result<String> {
+    snapshot_module_tree(path.as_ref())
+}
+
+/// Admits the production RSS tool-registry descriptors after generic bounds.
+pub fn bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
+    load_bundled_tool_registry()
+}
+
+fn load_bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/tools/registry.rss");
+    let runner =
+        AgentRunner::from_file(&path, AgentConfig::default()).map_err(|error| error.to_string())?;
+    let result = runner
+        .run_with_context(json_to_vm_value(
+            &json!({"kind": "descriptors", "config": {}}),
+        ))
+        .map_err(|error| format!("run RSS registry: {error}"))?;
+    let json = vm_value_to_json(&result);
+    if json.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("RSS registry failed: {json}"));
+    }
+    let descriptors = json
+        .get("descriptors")
+        .cloned()
+        .ok_or_else(|| "RSS registry missing descriptors".to_string())?;
+    let parsed: Vec<ToolDescriptor> =
+        serde_json::from_value(descriptors).map_err(|error| error.to_string())?;
+    ToolRegistry::from_descriptors(parsed).map_err(|error| error.to_string())
+}
+
+/// Admitted production RSS registry entries for tests that mutate a snapshot.
+pub fn bundled_tool_entries() -> Vec<crate::registry::ToolRegistryEntry> {
+    bundled_tool_registry()
+        .expect("RSS tool registry validates")
+        .snapshot()
+        .entries()
+        .to_vec()
 }
 
 /// Epoch ticks granted to one cancellable run. The cancellation watcher jumps
@@ -268,7 +425,7 @@ struct RunCancellationInner {
     epoch: Arc<Mutex<Option<EpochHandle>>>,
     watcher: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     stop: Arc<AtomicBool>,
-    /// Native/process token linked to this root. `request` and deadline fire cancel it.
+    /// Process token linked to this root. `request` and deadline fire cancel it.
     token: CancellationToken,
     /// Set when a timeout/deadline cannot be represented as `Instant`.
     deadline_overflow: AtomicBool,
@@ -475,37 +632,11 @@ pub struct AgentRunner {
 
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
-        if source.len() > MAX_AGENT_SOURCE_BYTES {
-            return Err(AgentError::Compile(format!(
-                "agent source exceeds {} bytes",
-                MAX_AGENT_SOURCE_BYTES
-            )));
-        }
-        let _compile = compile_lock();
-        let program = compile_source_with_flavor_and_options(
-            source,
-            SourceFlavor::RustScript,
-            compile_options(),
-        )
-        .map_err(|error| AgentError::Compile(error.to_string()))?
-        .program;
-        Self::from_program(program, config)
+        Self::from_program(compiled_source_program(source)?, config)
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let source_bytes = std::fs::metadata(&path)?.len() as usize;
-        if source_bytes > MAX_AGENT_SOURCE_BYTES {
-            return Err(AgentError::Compile(format!(
-                "agent source exceeds {} bytes",
-                MAX_AGENT_SOURCE_BYTES
-            )));
-        }
-        let _compile = compile_lock();
-        let program = compile_source_file_with_options(&path, compile_options())
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
-        Self::from_program(program, config)
+        Self::from_program(compiled_file_program(path.as_ref())?, config)
     }
 
     fn from_program(program: rustscript_vm::Program, config: AgentConfig) -> Result<Self> {
@@ -534,12 +665,6 @@ impl AgentRunner {
     /// Installs a scripted or custom provider for the serial loop host bridge.
     pub fn with_provider(mut self, provider: Arc<dyn AgentProviderHost>) -> Self {
         self.host.provider = Some(provider);
-        self
-    }
-
-    /// Installs the Task 5 dispatcher used by `agent::tool_dispatch`.
-    pub fn with_dispatcher(mut self, dispatcher: Arc<crate::tools::DispatchContext>) -> Self {
-        self.host.dispatcher = Some(dispatcher);
         self
     }
 
@@ -614,7 +739,6 @@ impl AgentRunner {
             .unwrap_or_else(|| Arc::new(RssAdapterProvider));
         vm.host_context().set_module_state(AgentHostState {
             provider,
-            dispatcher: self.host.dispatcher.clone(),
             cancellation: cancellation
                 .cloned()
                 .or_else(|| self.host.cancellation.clone())
@@ -800,6 +924,7 @@ fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmEr
         "json::decode",
         "stream::emit",
         "bytes::to_utf8",
+        "bytes::to_utf8_lossy",
         "bytes::to_array_u8",
         "bytes::from_utf8",
         "sqlite::open",

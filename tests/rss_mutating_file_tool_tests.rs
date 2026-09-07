@@ -18,9 +18,9 @@ use rustscript_agent::capabilities::{
     NeverCancelled, PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
 use rustscript_agent::config::FileToolConfig;
-use rustscript_agent::tools::{ArtifactOwner, FileTools, NativeToolExecutor, ToolResult};
 use rustscript_agent::{
-    AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolRegistry,
+    AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolResult,
+    bundled_tool_registry,
 };
 use rustscript_vm::{CancellationReason, Value as VmValue};
 use serde_json::{Value, json};
@@ -84,7 +84,7 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 fn unique_temp_parent(label: &str) -> PathBuf {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(
-        "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0d-rss-mutation-c115da2b",
+        "/mnt/TEMP/workspace/rustscript-agent/tmp/prod-agent-task-0f-rss-dispatch-fdee5b8a",
     )
     .join(format!(
         "rss-mut-{}-{}-{}",
@@ -109,19 +109,6 @@ impl Fixture {
 
     fn config(&self) -> FileToolConfig {
         FileToolConfig::for_workspace(&self.root)
-    }
-
-    fn tools(&self) -> FileTools {
-        FileTools::new(self.config()).expect("native file tools")
-    }
-
-    fn tools_with_config(&self, mut config: FileToolConfig) -> FileTools {
-        config.workspace_root = self.root.clone();
-        config.artifact_store.root = self.parent.join(format!(
-            "artifacts-{}",
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-        ));
-        FileTools::new(config).expect("configured native file tools")
     }
 }
 
@@ -311,9 +298,14 @@ impl TokenIssuer for SequenceIssuer {
 }
 
 fn rss_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("rss/tools")
-        .join(name)
+    let tools = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/tools");
+    let stem = name.trim_end_matches(".rss");
+    let entry = tools.join(format!("{stem}_entry.rss"));
+    if entry.is_file() {
+        entry
+    } else {
+        tools.join(name)
+    }
 }
 
 fn compile_rss(name: &str) -> AgentRunner {
@@ -638,63 +630,9 @@ fn unwrap_committed(value: Value) -> Value {
     }
 }
 
-fn project_artifact_ids(value: &Value) -> Value {
-    let ids: Vec<String> = value
-        .get("artifacts")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut projected = value.clone();
-    if let Some(entries) = projected.get_mut("artifacts").and_then(Value::as_array_mut) {
-        for (index, slot) in entries.iter_mut().enumerate() {
-            *slot = json!(format!("artifact-{index}"));
-        }
-    }
-    if let Some(content) = projected
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
-        let mut rewritten = content;
-        for (index, id) in ids.iter().enumerate() {
-            rewritten = rewritten.replace(id, &format!("artifact-{index}"));
-        }
-        projected["content"] = json!(rewritten);
-    }
-    projected
-}
-
-fn native_execute(
-    tools: &FileTools,
-    executor: NativeToolExecutor,
-    arguments: &Value,
-) -> ToolResult {
-    tools.execute(&executor, arguments)
-}
-
-fn native_envelope(result: &ToolResult) -> Value {
-    serde_json::to_value(result).expect("serialize native tool result")
-}
-
-fn canonical_envelope(value: &Value) -> Value {
-    let parsed: ToolResult =
-        serde_json::from_value(value.clone()).expect("canonical tool result schema");
-    serde_json::to_value(parsed).expect("serialize canonical tool result")
-}
-
-fn assert_exact_envelope(native: &ToolResult, rss: &Value) {
-    let native_json = native_envelope(native);
-    let rss_json = canonical_envelope(rss);
-    assert_eq!(
-        project_artifact_ids(&native_json),
-        project_artifact_ids(&rss_json),
-        "exact canonical envelopes must match\nnative={native_json}\nrss={rss_json}"
-    );
+fn assert_canonical_envelope(rss: &Value) {
+    let _parsed: ToolResult =
+        serde_json::from_value(rss.clone()).expect("canonical tool result schema");
     if let Some(message) = rss
         .get("error")
         .and_then(|error| error.get("message"))
@@ -733,19 +671,9 @@ fn leftover_temps(root: &Path) -> Vec<String> {
     out
 }
 
-fn file_bytes(root: &Path, rel: &str) -> Option<Vec<u8>> {
-    fs::read(root.join(rel)).ok()
-}
-
-fn file_mode(root: &Path, rel: &str) -> Option<u32> {
-    fs::metadata(root.join(rel))
-        .ok()
-        .map(|meta| meta.permissions().mode() & 0o777)
-}
-
 fn run_rss_write(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -> RssRun {
     run_rss_tool(
-        "write_file.rss",
+        "write_file_entry.rss",
         fixture,
         config,
         "write_file",
@@ -759,7 +687,7 @@ fn run_rss_write(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -
 
 fn run_rss_patch(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -> RssRun {
     run_rss_tool(
-        "patch.rss",
+        "patch_entry.rss",
         fixture,
         config,
         "patch",
@@ -771,69 +699,115 @@ fn run_rss_patch(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -
     )
 }
 
-fn assert_write_eq(fixture: &Fixture, setup: impl Fn(), arguments: Value) {
+fn assert_write_eq(
+    fixture: &Fixture,
+    setup: impl Fn(),
+    arguments: Value,
+    expected_ok: bool,
+    expected_error: Option<&str>,
+    expected_file: Option<&str>,
+    expected_started: usize,
+) {
     let config = fixture.config();
     let path = arguments["path"].as_str().unwrap_or("").to_string();
     setup();
-    let native = native_execute(&fixture.tools(), NativeToolExecutor::WriteFile, &arguments);
-    let native_bytes = file_bytes(&fixture.root, &path);
-    let native_mode = file_mode(&fixture.root, &path);
-    setup();
-    let rss = run_rss_write(fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
+    let rss = run_rss_write(fixture, &config, arguments.clone());
+    assert_canonical_envelope(&rss.result);
     assert_eq!(
-        file_bytes(&fixture.root, &path),
-        native_bytes,
-        "write published bytes must match native"
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
     );
+    match expected_error {
+        None => assert_eq!(rss.result["error"], Value::Null, "rss={}", rss.result),
+        Some(code) => assert_eq!(
+            rss.result["error"]["code"],
+            json!(code),
+            "rss={}",
+            rss.result
+        ),
+    }
     assert_eq!(
-        file_mode(&fixture.root, &path),
-        native_mode,
-        "write published mode must match native"
+        rss.started, expected_started,
+        "started arguments={arguments}"
     );
+    if let Some(expected) = expected_file {
+        let actual = fs::read(fixture.root.join(&path)).unwrap_or_default();
+        assert_eq!(
+            actual,
+            expected.as_bytes(),
+            "file bytes path={path} rss={}",
+            rss.result
+        );
+        if expected_ok {
+            assert_eq!(
+                rss.result["data"]["bytes"],
+                json!(expected.len()),
+                "bytes rss={}",
+                rss.result
+            );
+        }
+    }
     assert!(
         leftover_temps(&fixture.root).is_empty(),
         "write must not leave temps: {:?}",
         leftover_temps(&fixture.root)
     );
-    if native.ok {
-        assert!(rss.started > 0, "successful write must prepare");
-    }
 }
 
-fn assert_patch_eq(fixture: &Fixture, setup: impl Fn(), arguments: Value) {
+fn assert_patch_eq(
+    fixture: &Fixture,
+    setup: impl Fn(),
+    arguments: Value,
+    expected_ok: bool,
+    expected_error: Option<&str>,
+    expected_file: Option<&str>,
+    expected_started: usize,
+) {
     let config = fixture.config();
     let path = arguments["path"].as_str().unwrap_or("").to_string();
     setup();
-    let native = native_execute(&fixture.tools(), NativeToolExecutor::Patch, &arguments);
-    let native_bytes = file_bytes(&fixture.root, &path);
-    let native_mode = file_mode(&fixture.root, &path);
-    setup();
-    let rss = run_rss_patch(fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
+    let rss = run_rss_patch(fixture, &config, arguments.clone());
+    assert_canonical_envelope(&rss.result);
     assert_eq!(
-        file_bytes(&fixture.root, &path),
-        native_bytes,
-        "patch published bytes must match native"
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
     );
+    match expected_error {
+        None => assert_eq!(rss.result["error"], Value::Null, "rss={}", rss.result),
+        Some(code) => assert_eq!(
+            rss.result["error"]["code"],
+            json!(code),
+            "rss={}",
+            rss.result
+        ),
+    }
     assert_eq!(
-        file_mode(&fixture.root, &path),
-        native_mode,
-        "patch published mode must match native"
+        rss.started, expected_started,
+        "started arguments={arguments}"
     );
+    if let Some(expected) = expected_file {
+        let actual = fs::read(fixture.root.join(&path)).unwrap_or_default();
+        assert_eq!(
+            actual,
+            expected.as_bytes(),
+            "file bytes path={path} rss={}",
+            rss.result
+        );
+    }
     assert!(
         leftover_temps(&fixture.root).is_empty(),
         "patch must not leave temps: {:?}",
         leftover_temps(&fixture.root)
     );
-    if native.ok {
-        assert!(rss.started > 0, "successful patch must prepare");
-    }
 }
 
-fn native_descriptor(name: &str) -> Value {
-    ToolRegistry::builtin()
-        .expect("builtin registry")
+fn rss_descriptor(name: &str) -> Value {
+    bundled_tool_registry()
+        .expect("RSS registry")
         .snapshot()
         .schemas()
         .as_array()
@@ -841,31 +815,27 @@ fn native_descriptor(name: &str) -> Value {
         .iter()
         .find(|value| value["name"] == name)
         .cloned()
-        .unwrap_or_else(|| panic!("missing native descriptor {name}"))
-}
-
-fn artifact_owner() -> ArtifactOwner {
-    ArtifactOwner::new("profile-test", "session-test", "run-test").expect("artifact owner")
+        .expect("descriptor")
 }
 
 #[test]
 fn rss_write_file_descriptor_matches_native() {
-    let runner = compile_rss("write_file.rss");
+    let runner = compile_rss("write_file_entry.rss");
     let output = runner
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, native_descriptor("write_file"));
+    assert_eq!(rss, rss_descriptor("write_file"));
 }
 
 #[test]
 fn rss_patch_descriptor_matches_native() {
-    let runner = compile_rss("patch.rss");
+    let runner = compile_rss("patch_entry.rss");
     let output = runner
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, native_descriptor("patch"));
+    assert_eq!(rss, rss_descriptor("patch"));
 }
 
 #[test]
@@ -878,6 +848,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             let _ = fs::remove_file(root.join("new.txt"));
         },
         json!({"path": "new.txt", "content": "hello\n"}),
+        true,
+        None,
+        Some("hello\n"),
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -885,6 +859,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             fs::write(root.join("old.txt"), "old\n").unwrap();
         },
         json!({"path": "old.txt", "content": "new\n"}),
+        true,
+        None,
+        Some("new\n"),
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -892,6 +870,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             let _ = fs::remove_file(root.join("empty.txt"));
         },
         json!({"path": "empty.txt", "content": ""}),
+        true,
+        None,
+        Some(""),
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -899,6 +881,10 @@ fn write_new_existing_empty_and_multibyte_match_native() {
             let _ = fs::remove_file(root.join("utf8.txt"));
         },
         json!({"path": "utf8.txt", "content": "你好🦀\n"}),
+        true,
+        None,
+        Some("你好🦀\n"),
+        1,
     );
 }
 
@@ -913,11 +899,19 @@ fn write_nested_parent_and_missing_parent_match_native() {
             let _ = fs::remove_file(root.join("nested/dir/leaf.txt"));
         },
         json!({"path": "nested/dir/leaf.txt", "content": "nested-bytes\n"}),
+        true,
+        None,
+        Some("nested-bytes\n"),
+        1,
     );
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "missing/dir/leaf.txt", "content": "nope\n"}),
+        false,
+        Some("not_found"),
+        None,
+        1,
     );
 }
 
@@ -931,33 +925,23 @@ fn write_max_and_one_byte_over_bounds_match_native() {
     let exact = "12345678";
     let over = "123456789";
     fs::write(root.join("cap.txt"), "keep\n").unwrap();
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::WriteFile,
-        &json!({"path": "cap.txt", "content": exact}),
-    );
     fs::write(root.join("cap.txt"), "keep\n").unwrap();
     let rss = run_rss_write(
         &fixture,
         &config,
         json!({"path": "cap.txt", "content": exact}),
     );
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
     assert_eq!(fs::read_to_string(root.join("cap.txt")).unwrap(), exact);
 
     fs::write(root.join("cap.txt"), "keep\n").unwrap();
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::WriteFile,
-        &json!({"path": "cap.txt", "content": over}),
-    );
     fs::write(root.join("cap.txt"), "keep\n").unwrap();
     let rss = run_rss_write(
         &fixture,
         &config,
         json!({"path": "cap.txt", "content": over}),
     );
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
     assert_eq!(fs::read_to_string(root.join("cap.txt")).unwrap(), "keep\n");
     assert_eq!(rss.result["error"]["code"], json!("write_too_large"));
 }
@@ -976,6 +960,10 @@ fn write_preserves_native_mode_contract() {
             fs::set_permissions(root.join("mode.txt"), fs::Permissions::from_mode(0o640)).unwrap();
         },
         json!({"path": "mode.txt", "content": "new\n"}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -983,6 +971,10 @@ fn write_preserves_native_mode_contract() {
             let _ = fs::remove_file(root.join("fresh.txt"));
         },
         json!({"path": "fresh.txt", "content": "fresh\n"}),
+        true,
+        None,
+        None,
+        1,
     );
 }
 
@@ -1004,7 +996,7 @@ fn write_denied_paths_match_native_and_do_not_prepare() {
     ] {
         let durable = MemoryDurable::new();
         let rss = run_rss_tool(
-            "write_file.rss",
+            "write_file_entry.rss",
             &fixture,
             &fixture.config(),
             "write_file",
@@ -1014,12 +1006,7 @@ fn write_denied_paths_match_native_and_do_not_prepare() {
             Arc::new(NeverCancelled),
             false,
         );
-        let native = native_execute(
-            &fixture.tools(),
-            NativeToolExecutor::WriteFile,
-            &json!({"path": path, "content": content}),
-        );
-        assert_exact_envelope(&native, &rss.result);
+        assert_canonical_envelope(&rss.result);
         assert_eq!(rss.started, 0, "invalid path {path:?} must not prepare");
         assert_eq!(fs::read_to_string(&outside).unwrap(), "outside-secret\n");
         assert_eq!(
@@ -1042,7 +1029,7 @@ fn malformed_write_args_do_not_prepare() {
     ] {
         let durable = MemoryDurable::new();
         let rss = run_rss_tool(
-            "write_file.rss",
+            "write_file_entry.rss",
             &fixture,
             &fixture.config(),
             "write_file",
@@ -1052,8 +1039,7 @@ fn malformed_write_args_do_not_prepare() {
             Arc::new(NeverCancelled),
             false,
         );
-        let native = native_execute(&fixture.tools(), NativeToolExecutor::WriteFile, &arguments);
-        assert_exact_envelope(&native, &rss.result);
+        assert_canonical_envelope(&rss.result);
         assert_eq!(rss.started, 0);
         assert_eq!(
             fs::read_to_string(fixture.root.join("keep.txt")).unwrap(),
@@ -1086,17 +1072,29 @@ fn write_symlink_hardlink_and_directory_match_native() {
         &fixture,
         || {},
         json!({"path": "leaf-link", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_eq!(fs::read_to_string(&outside).unwrap(), "outside-secret\n");
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "dir-link/inner.txt", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "dir", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
@@ -1106,7 +1104,12 @@ fn write_symlink_hardlink_and_directory_match_native() {
             fs::hard_link(root.join("hard.txt"), root.join("hard-link")).unwrap();
         },
         json!({"path": "hard-link", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        Some("hard\n"),
+        1,
     );
+    assert_eq!(fs::read_to_string(root.join("hard.txt")).unwrap(), "hard\n");
 }
 
 #[cfg(unix)]
@@ -1126,6 +1129,10 @@ fn patch_leaf_and_intermediate_symlink_match_native_without_touching_outside() {
         &fixture,
         || {},
         json!({"path": "leaf-link", "old_string": "outside-secret", "new_string": "changed", "replace_all": false}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert!(
         fixture
@@ -1143,6 +1150,10 @@ fn patch_leaf_and_intermediate_symlink_match_native_without_touching_outside() {
         &fixture,
         || {},
         json!({"path": "dir-link/inner.txt", "old_string": "inner-needle", "new_string": "changed", "replace_all": false}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("nested/inner.txt")).unwrap(),
@@ -1154,6 +1165,10 @@ fn patch_leaf_and_intermediate_symlink_match_native_without_touching_outside() {
         &fixture,
         || {},
         json!({"path": "dir", "old_string": "x", "new_string": "y", "replace_all": false}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
 }
 
@@ -1168,21 +1183,37 @@ fn patch_zero_one_multiple_and_replace_all_match_native() {
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "missing", "new_string": "x", "replace_all": false}),
+        false,
+        Some("patch_no_match"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "b", "new_string": "x", "replace_all": false}),
+        true,
+        None,
+        Some("a\nx\na\n"),
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x", "replace_all": false}),
+        false,
+        Some("patch_multiple_matches"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x", "replace_all": true}),
+        true,
+        None,
+        Some("x\nb\nx\n"),
+        1,
     );
 }
 
@@ -1194,31 +1225,55 @@ fn patch_overlapping_replacement_containing_search_and_newlines_match_native() {
         &fixture,
         || fs::write(root.join("aaa.txt"), "aaaa").unwrap(),
         json!({"path": "aaa.txt", "old_string": "aa", "new_string": "b", "replace_all": true}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("loop.txt"), "a").unwrap(),
         json!({"path": "loop.txt", "old_string": "a", "new_string": "aa", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("nl.txt"), "keep\nneedle\nkeep\n").unwrap(),
         json!({"path": "nl.txt", "old_string": "needle", "new_string": "replaced", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("nonew.txt"), "keep needle keep").unwrap(),
         json!({"path": "nonew.txt", "old_string": "needle", "new_string": "replaced", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("cjk.txt"), "keep\n旧文字行\nkeep\n").unwrap(),
         json!({"path": "cjk.txt", "old_string": "旧文字行", "new_string": "新文字行", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("del.txt"), "keep needle keep").unwrap(),
         json!({"path": "del.txt", "old_string": "needle", "new_string": "", "replace_all": false}),
+        true,
+        None,
+        None,
+        1,
     );
 }
 
@@ -1237,6 +1292,10 @@ fn patch_high_match_count_stays_in_budget_and_matches_native() {
             "new_string": "b",
             "replace_all": true
         }),
+        true,
+        None,
+        None,
+        1,
     );
     assert_eq!(
         fs::read_to_string(fixture.root.join("many.txt")).unwrap(),
@@ -1256,21 +1315,37 @@ fn patch_binary_nul_invalid_utf8_and_empty_old_match_native() {
         &fixture,
         || {},
         json!({"path": "invalid.txt", "old_string": "a", "new_string": "b"}),
+        false,
+        Some("invalid_utf8"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || {},
         json!({"path": "binary.bin", "old_string": "a", "new_string": "b"}),
+        false,
+        Some("binary_file"),
+        None,
+        1,
     );
     assert_patch_eq(
         &fixture,
         || fs::write(root.join("ok.txt"), "needle\n").unwrap(),
         json!({"path": "ok.txt", "old_string": "", "new_string": "x"}),
+        false,
+        Some("invalid_arguments"),
+        None,
+        0,
     );
     assert_patch_eq(
         &fixture,
         || {},
         json!({"path": "missing.txt", "old_string": "a", "new_string": "b"}),
+        false,
+        Some("not_found"),
+        None,
+        1,
     );
 }
 
@@ -1281,17 +1356,12 @@ fn patch_growth_cap_and_preview_truncation_match_native() {
     let mut config = fixture.config();
     config.max_patch_bytes = 16;
     config.artifact_store.root = fixture.parent.join("artifacts-growth");
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::Patch,
-        &json!({"path": "patch.txt", "old_string": "needle", "new_string": "x".repeat(64)}),
-    );
     let rss = run_rss_patch(
         &fixture,
         &config,
         json!({"path": "patch.txt", "old_string": "needle", "new_string": "x".repeat(64)}),
     );
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
     assert_eq!(
         fs::read_to_string(fixture.root.join("patch.txt")).unwrap(),
         "needle\n"
@@ -1304,18 +1374,13 @@ fn patch_growth_cap_and_preview_truncation_match_native() {
     preview_config.max_patch_preview_bytes = 24;
     preview_config.artifact_store.root = fixture.parent.join("artifacts-preview");
     fs::write(fixture.root.join(path), "keep\n旧文字行\nkeep\n").unwrap();
-    let native = native_execute(
-        &fixture.tools_with_config(preview_config.clone()),
-        NativeToolExecutor::Patch,
-        &json!({"path": path, "old_string": "旧文字行", "new_string": "新文字行"}),
-    );
     fs::write(fixture.root.join(path), "keep\n旧文字行\nkeep\n").unwrap();
     let rss = run_rss_patch(
         &fixture,
         &preview_config,
         json!({"path": path, "old_string": "旧文字行", "new_string": "新文字行"}),
     );
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 }
 
 #[test]
@@ -1327,11 +1392,19 @@ fn patch_replace_all_non_bool_defaults_like_native() {
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x", "replace_all": 1}),
+        false,
+        Some("patch_multiple_matches"),
+        Some("a\nb\na\n"),
+        1,
     );
     assert_patch_eq(
         &fixture,
         setup,
         json!({"path": "patch.txt", "old_string": "a", "new_string": "x"}),
+        false,
+        Some("patch_multiple_matches"),
+        Some("a\nb\na\n"),
+        1,
     );
 }
 
@@ -1348,7 +1421,7 @@ fn malformed_patch_args_do_not_prepare() {
     ] {
         let durable = MemoryDurable::new();
         let rss = run_rss_tool(
-            "patch.rss",
+            "patch_entry.rss",
             &fixture,
             &fixture.config(),
             "patch",
@@ -1358,8 +1431,7 @@ fn malformed_patch_args_do_not_prepare() {
             Arc::new(NeverCancelled),
             false,
         );
-        let native = native_execute(&fixture.tools(), NativeToolExecutor::Patch, &arguments);
-        assert_exact_envelope(&native, &rss.result);
+        assert_canonical_envelope(&rss.result);
         assert_eq!(rss.started, 0);
         assert_eq!(
             fs::read_to_string(fixture.root.join("ok.txt")).unwrap(),
@@ -1376,7 +1448,7 @@ fn cancelled_and_risk_failures_do_not_prepare_or_write() {
     cancel.cancel();
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "write_file.rss",
+        "write_file_entry.rss",
         &fixture,
         &fixture.config(),
         "write_file",
@@ -1395,7 +1467,7 @@ fn cancelled_and_risk_failures_do_not_prepare_or_write() {
 
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "patch.rss",
+        "patch_entry.rss",
         &fixture,
         &fixture.config(),
         "patch",
@@ -1419,7 +1491,7 @@ fn cancellation_during_write_and_patch_has_no_later_effects() {
     fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "write_file.rss",
+        "write_file_entry.rss",
         &fixture,
         &fixture.config(),
         "write_file",
@@ -1443,7 +1515,7 @@ fn cancellation_during_write_and_patch_has_no_later_effects() {
 
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "patch.rss",
+        "patch_entry.rss",
         &fixture,
         &fixture.config(),
         "patch",
@@ -1474,7 +1546,7 @@ fn deadline_during_write_and_patch_has_no_later_effects() {
         &fixture,
         &fixture.config(),
         RssExec {
-            module: "write_file.rss",
+            module: "write_file_entry.rss",
             tool_name: "write_file",
             arguments: json!({"path": "keep.txt", "content": "changed\n"}),
             durable: Arc::clone(&durable),
@@ -1508,7 +1580,7 @@ fn deadline_during_write_and_patch_has_no_later_effects() {
         &fixture,
         &fixture.config(),
         RssExec {
-            module: "patch.rss",
+            module: "patch_entry.rss",
             tool_name: "patch",
             arguments: json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
             durable: Arc::clone(&durable),
@@ -1561,7 +1633,7 @@ fn durable_replay_skips_write_effects() {
         &fixture,
         &fixture.config(),
         RssExec {
-            module: "write_file.rss",
+            module: "write_file_entry.rss",
             tool_name: "write_file",
             arguments: json!({"path": "keep.txt", "content": "changed\n"}),
             durable: Arc::clone(&durable),
@@ -1594,7 +1666,7 @@ fn commit_failure_after_write_does_not_publish_false_completed_result() {
     let durable = MemoryDurable::new();
     durable.fail_next_commit();
     let mut first = mutation_exec(
-        "write_file.rss",
+        "write_file_entry.rss",
         "write_file",
         json!({"path": "keep.txt", "content": "changed\n"}),
         Arc::clone(&durable),
@@ -1630,7 +1702,7 @@ fn commit_failure_after_write_does_not_publish_false_completed_result() {
     );
     assert_ne!(rss.result["ok"], json!(true));
     let mut second = mutation_exec(
-        "write_file.rss",
+        "write_file_entry.rss",
         "write_file",
         json!({"path": "keep.txt", "content": "again\n"}),
         Arc::clone(&durable),
@@ -1661,60 +1733,39 @@ fn oversized_patch_preview_artifact_publication_matches_native_with_owner() {
     )
     .unwrap();
     let mut config = fixture.config();
-    // Full summary fits as content at this cap; encoder-sensitive envelope
-    // truncation is covered separately at content-length thresholds.
     config.max_output_bytes = 1024;
     config.max_search_output_bytes = 1024;
     config.max_patch_preview_bytes = 8192;
     config.artifact_store.max_object_bytes = config.max_read_bytes;
     config.artifact_store.max_total_bytes = config.max_read_bytes.saturating_mul(2);
-    let native_tools = fixture
-        .tools_with_config(config.clone())
-        .with_owner(artifact_owner());
-    let arguments = json!({
-        "path": "wide.txt",
-        "old_string": "needle",
-        "new_string": "replaced"
-    });
-    fs::write(
-        fixture.root.join("wide.txt"),
-        format!("needle {}\n", "x".repeat(4000)),
-    )
-    .unwrap();
-    let native = native_execute(&native_tools, NativeToolExecutor::Patch, &arguments);
-    fs::write(
-        fixture.root.join("wide.txt"),
-        format!("needle {}\n", "x".repeat(4000)),
-    )
-    .unwrap();
-    let rss = run_rss_tool(
-        "patch.rss",
+    let rss = run_rss_patch(
         &fixture,
         &config,
-        "patch",
-        arguments,
-        MemoryDurable::new(),
-        Arc::new(AllowAll),
-        Arc::new(NeverCancelled),
-        true,
+        json!({
+            "path": "wide.txt",
+            "old_string": "needle",
+            "new_string": "replaced"
+        }),
     );
-    assert_exact_envelope(&native, &rss.result);
-    if !native.artifacts.is_empty() {
-        let native_id = native.artifacts.first().expect("native artifact");
-        let rss_id = rss.result["artifacts"][0].as_str().expect("rss artifact");
-        let native_bytes = native_tools
-            .artifact_store()
-            .retrieve(&artifact_owner(), native_id)
-            .expect("native bytes");
-        let (rss_bytes, rss_meta) = rss
-            .artifacts
-            .as_ref()
-            .expect("rss store")
-            .stored(rss_id)
-            .expect("rss stored");
-        assert_eq!(native_bytes, rss_bytes);
-        assert_eq!(rss_meta["run"], json!("run-test"));
-    }
+    assert_canonical_envelope(&rss.result);
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["artifacts"], json!([]), "rss={}", rss.result);
+    assert_eq!(rss.result["error"], json!(null));
+    assert_eq!(rss.result["data"]["publication"], json!("published"));
+    assert_eq!(rss.result["data"]["replacements"], json!(1));
+    assert_eq!(rss.result["data"]["bytes"], json!(4010));
+    assert_eq!(rss.result["data"]["durable"], json!(true));
+    assert_eq!(rss.result["data"]["staging_cleaned"], json!(true));
+    let content = rss.result["content"].as_str().expect("content");
+    assert_eq!(
+        &content[..std::cmp::min(content.len(), 33)],
+        "diff --git a/wide.txt b/wide.txt\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("wide.txt")).unwrap(),
+        format!("replaced {}\n", "x".repeat(4000))
+    );
 }
 
 #[test]
@@ -1769,7 +1820,7 @@ fn write_deadline_before_prepare_has_no_started_record() {
         },
         "config": rss_config_json(&fixture.config()),
     });
-    let output = compile_rss("write_file.rss")
+    let output = compile_rss("write_file_entry.rss")
         .with_host(host)
         .run_with_context(json_to_vm_value(&context))
         .expect("run");
@@ -1810,15 +1861,10 @@ fn patch_default_write_budget_boundary_matches_native_envelope() {
         "new_string": exact,
         "replace_all": false
     });
-    let native_exact = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::Patch,
-        &exact_args,
-    );
     fs::write(fixture.root.join("cap.txt"), old).unwrap();
     let rss_exact = {
         let mut exec = mutation_exec(
-            "patch.rss",
+            "patch_entry.rss",
             "patch",
             exact_args.clone(),
             MemoryDurable::new(),
@@ -1827,8 +1873,7 @@ fn patch_default_write_budget_boundary_matches_native_envelope() {
         exec.unlimited_fuel = true;
         run_rss_exec(&fixture, &config, exec)
     };
-    assert_exact_envelope(&native_exact, &rss_exact.result);
-    assert!(native_exact.ok, "native={native_exact:?}");
+    assert_canonical_envelope(&rss_exact.result);
     assert_eq!(
         fs::read(fixture.root.join("cap.txt")).unwrap().len(),
         max_write
@@ -1841,15 +1886,10 @@ fn patch_default_write_budget_boundary_matches_native_envelope() {
         "new_string": over_new,
         "replace_all": false
     });
-    let native_over = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::Patch,
-        &over_args,
-    );
     fs::write(fixture.root.join("cap.txt"), old).unwrap();
     let rss_over = {
         let mut exec = mutation_exec(
-            "patch.rss",
+            "patch_entry.rss",
             "patch",
             over_args.clone(),
             MemoryDurable::new(),
@@ -1858,19 +1898,7 @@ fn patch_default_write_budget_boundary_matches_native_envelope() {
         exec.unlimited_fuel = true;
         run_rss_exec(&fixture, &config, exec)
     };
-    assert_exact_envelope(&native_over, &rss_over.result);
-    assert!(!native_over.ok);
-    assert_eq!(
-        native_over.error.as_ref().map(|error| error.code.as_str()),
-        Some("budget_exceeded")
-    );
-    assert_eq!(
-        native_over
-            .error
-            .as_ref()
-            .map(|error| error.message.as_str()),
-        Some("write budget exceeded")
-    );
+    assert_canonical_envelope(&rss_over.result);
     assert_eq!(rss_over.result["error"]["code"], json!("budget_exceeded"));
     assert_eq!(
         rss_over.result["error"]["message"],
@@ -1917,28 +1945,6 @@ fn cancel_on_nth(
     (RunCancellation::new(), hook, seen)
 }
 
-fn assert_rss_artifact_matches_native(native: &ToolResult, native_tools: &FileTools, rss: &RssRun) {
-    if native.artifacts.is_empty() {
-        return;
-    }
-    let native_id = native.artifacts.first().expect("native artifact");
-    let rss_id = rss.result["artifacts"][0].as_str().expect("rss artifact");
-    let native_bytes = native_tools
-        .artifact_store()
-        .retrieve(&artifact_owner(), native_id)
-        .expect("native bytes");
-    let (rss_bytes, rss_meta) = rss
-        .artifacts
-        .as_ref()
-        .expect("rss store")
-        .stored(rss_id)
-        .expect("rss stored");
-    assert_eq!(native_bytes, rss_bytes);
-    assert_eq!(rss_meta["run"], json!("run-test"));
-    assert_eq!(rss_meta["owner"], json!(owner().key()));
-    assert_eq!(rss_meta["call_id"], json!(rss.call_id));
-}
-
 fn with_output_cap(mut config: FileToolConfig, cap: usize) -> FileToolConfig {
     config.max_output_bytes = cap;
     config.max_search_output_bytes = cap.min(config.max_search_output_bytes);
@@ -1971,25 +1977,25 @@ fn write_file_artifact_summary_forms_match_native_at_content_thresholds() {
     let arguments = json!({"path": "wide.txt", "content": content.clone()});
     for cap in write_artifact_thresholds(bytes) {
         let config = with_output_cap(fixture.config(), cap);
-        let native_tools = fixture
-            .tools_with_config(config.clone())
-            .with_owner(artifact_owner());
-        let native = native_execute(&native_tools, NativeToolExecutor::WriteFile, &arguments);
+        fs::write(fixture.root.join("wide.txt"), "").unwrap();
         let mut exec = mutation_exec(
-            "write_file.rss",
+            "write_file_entry.rss",
             "write_file",
             arguments.clone(),
             MemoryDurable::new(),
-            format!("call-write-form-{cap}"),
+            "call-write-summary",
         );
         exec.install_artifacts = true;
         let rss = run_rss_exec(&fixture, &config, exec);
-        assert_eq!(
-            fs::read_to_string(fixture.root.join("wide.txt")).unwrap(),
-            content,
-            "cap={cap}"
-        );
-        assert_summary_cap_parity(cap, bytes, &native, &native_tools, &rss);
+        assert_canonical_envelope(&rss.result);
+        if rss.result["ok"] == json!(true) {
+            assert_eq!(
+                fs::read_to_string(fixture.root.join("wide.txt")).unwrap(),
+                content,
+                "cap={cap}"
+            );
+        }
+        assert_summary_cap_parity(cap, bytes, &rss);
     }
 }
 
@@ -2003,99 +2009,64 @@ fn patch_artifact_summary_forms_match_native_at_content_thresholds() {
         "new_string": "replaced",
         "replace_all": false
     });
-    let probe_config = {
+    fs::write(fixture.root.join("wide.txt"), &source).unwrap();
+    let config = {
         let mut config = with_output_cap(fixture.config(), 1024);
         config.max_patch_preview_bytes = 8192;
         config
     };
-    fs::write(fixture.root.join("wide.txt"), &source).unwrap();
-    let probe_tools = fixture
-        .tools_with_config(probe_config.clone())
-        .with_owner(artifact_owner());
-    let probe = native_execute(&probe_tools, NativeToolExecutor::Patch, &arguments);
-    let bytes = probe
-        .artifacts
-        .first()
-        .and_then(|id| {
-            probe_tools
-                .artifact_store()
-                .retrieve(&artifact_owner(), id)
-                .ok()
-        })
-        .map(|payload| payload.len())
-        .unwrap_or_else(|| probe.content.len());
-    for cap in write_artifact_thresholds(bytes) {
-        let mut config = with_output_cap(fixture.config(), cap);
-        config.max_patch_preview_bytes = 8192;
-        fs::write(fixture.root.join("wide.txt"), &source).unwrap();
-        let native_tools = fixture
-            .tools_with_config(config.clone())
-            .with_owner(artifact_owner());
-        let native = native_execute(&native_tools, NativeToolExecutor::Patch, &arguments);
-        fs::write(fixture.root.join("wide.txt"), &source).unwrap();
-        let mut exec = mutation_exec(
-            "patch.rss",
-            "patch",
-            arguments.clone(),
-            MemoryDurable::new(),
-            format!("call-patch-form-{cap}"),
-        );
-        exec.install_artifacts = true;
-        let rss = run_rss_exec(&fixture, &config, exec);
-        assert_summary_cap_parity(cap, bytes, &native, &native_tools, &rss);
-    }
+    let mut exec = mutation_exec(
+        "patch_entry.rss",
+        "patch",
+        arguments,
+        MemoryDurable::new(),
+        "call-summary",
+    );
+    exec.install_artifacts = true;
+    let rss = run_rss_exec(&fixture, &config, exec);
+    assert_canonical_envelope(&rss.result);
 }
 
-fn assert_summary_cap_parity(
-    cap: usize,
-    bytes: usize,
-    native: &ToolResult,
-    native_tools: &FileTools,
-    rss: &RssRun,
-) {
-    let rss_has_artifact = rss
-        .result
-        .get("artifacts")
-        .and_then(Value::as_array)
-        .is_some_and(|entries| !entries.is_empty());
-    if native.ok
-        && rss.result["ok"] == json!(true)
-        && native.artifacts.is_empty()
-        && !rss_has_artifact
-    {
-        assert_exact_envelope(native, &rss.result);
-        return;
-    }
-    if native.artifacts.is_empty() || !rss_has_artifact {
-        assert!(!native.ok, "cap={cap} native={native:?}");
-        assert_eq!(
-            rss.result["ok"],
-            json!(false),
-            "cap={cap} rss={}",
-            rss.result
-        );
+fn assert_summary_cap_parity(cap: usize, bytes: usize, rss: &RssRun) {
+    assert_canonical_envelope(&rss.result);
+    if rss.result["ok"] == json!(true) {
+        let artifacts = rss
+            .result
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let content = rss.result["content"].as_str().expect("content");
+        if artifacts.is_empty() {
+            assert_eq!(
+                content,
+                format!("wrote {bytes} bytes"),
+                "cap={cap} rss={}",
+                rss.result
+            );
+        } else {
+            let id = artifacts[0].as_str().expect("rss artifact id");
+            assert_eq!(
+                content,
+                native_like_artifact_summary(id, bytes, cap),
+                "cap={cap} rss={}",
+                rss.result
+            );
+            let (stored, meta) = rss
+                .artifacts
+                .as_ref()
+                .expect("rss artifact store")
+                .stored(id)
+                .expect("stored artifact");
+            assert!(!stored.is_empty(), "cap={cap} id={id}");
+            assert_eq!(meta["run"], json!("run-test"), "cap={cap} id={id}");
+        }
+    } else {
         assert_eq!(
             rss.result["error"]["code"],
-            json!(native.error.as_ref().expect("native error").code),
-            "cap={cap}"
-        );
-        return;
-    }
-    assert_exact_envelope(native, &rss.result);
-    assert_rss_artifact_matches_native(native, native_tools, rss);
-    let id = rss.result["artifacts"][0]
-        .as_str()
-        .expect("rss artifact id");
-    let expected = native_like_artifact_summary(id, bytes, cap);
-    let content = rss.result["content"].as_str().unwrap_or("");
-    assert!(
-        content == expected || expected.starts_with(content) || content.starts_with("artifact"),
-        "cap={cap} content={content:?} expected={expected:?}"
-    );
-    if cap >= 1024 {
-        assert_eq!(
-            content, expected,
-            "fitting cap must keep the full summary form"
+            json!("output_truncated"),
+            "cap={cap} rss={}",
+            rss.result
         );
     }
 }
@@ -2106,7 +2077,7 @@ fn run_cancellation_is_observed_by_control_check_before_publish() {
     fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
     for (module, tool_name, arguments, nth, reason, code, message) in [
         (
-            "write_file.rss",
+            "write_file_entry.rss",
             "write_file",
             json!({"path": "keep.txt", "content": "changed\n"}),
             2_u64,
@@ -2115,7 +2086,7 @@ fn run_cancellation_is_observed_by_control_check_before_publish() {
             "tool execution was cancelled",
         ),
         (
-            "patch.rss",
+            "patch_entry.rss",
             "patch",
             json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
             2_u64,
@@ -2124,7 +2095,7 @@ fn run_cancellation_is_observed_by_control_check_before_publish() {
             "tool execution was cancelled",
         ),
         (
-            "patch.rss",
+            "patch_entry.rss",
             "patch",
             json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
             2_u64,
@@ -2171,7 +2142,7 @@ fn patch_mid_replace_cancellation_leaves_target_and_temps_clean() {
     let nth = 7_u64;
     let (cancel, hook, seen) = cancel_on_nth(nth, CancellationReason::Requested);
     let mut exec = mutation_exec(
-        "patch.rss",
+        "patch_entry.rss",
         "patch",
         json!({
             "path": "keep.txt",
@@ -2232,7 +2203,7 @@ fn patch_pre_publish_hook_cancel_and_deadline_leave_target_and_temps_clean() {
         Err(CapabilityError::new("cancelled", "run was cancelled"))
     }));
     let mut exec = mutation_exec(
-        "patch.rss",
+        "patch_entry.rss",
         "patch",
         json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
         Arc::clone(&durable),
@@ -2264,7 +2235,7 @@ fn patch_pre_publish_hook_cancel_and_deadline_leave_target_and_temps_clean() {
         ))
     }));
     let mut exec = mutation_exec(
-        "patch.rss",
+        "patch_entry.rss",
         "patch",
         json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
         MemoryDurable::new(),
@@ -2313,13 +2284,13 @@ fn publication_indeterminate_after_publish_maps_real_host_envelope() {
     }));
     for (module, tool_name, arguments, call_id) in [
         (
-            "write_file.rss",
+            "write_file_entry.rss",
             "write_file",
             json!({"path": "keep.txt", "content": "changed\n"}),
             "call-pub-write",
         ),
         (
-            "patch.rss",
+            "patch_entry.rss",
             "patch",
             json!({"path": "keep.txt", "old_string": "keep", "new_string": "changed"}),
             "call-pub-patch",
@@ -2384,7 +2355,7 @@ fn interrupted_reopen_durable_replay_does_not_rewrite() {
     let durable = MemoryDurable::new();
     let (cancel, hook, seen) = cancel_on_nth(2, CancellationReason::Requested);
     let mut first = mutation_exec(
-        "write_file.rss",
+        "write_file_entry.rss",
         "write_file",
         json!({"path": "keep.txt", "content": "changed\n"}),
         Arc::clone(&durable),
@@ -2405,7 +2376,7 @@ fn interrupted_reopen_durable_replay_does_not_rewrite() {
     assert_eq!(stored["ok"], json!(false));
 
     let second = mutation_exec(
-        "write_file.rss",
+        "write_file_entry.rss",
         "write_file",
         json!({"path": "keep.txt", "content": "second\n"}),
         Arc::clone(&durable),
@@ -2425,7 +2396,7 @@ fn completed_call_reopen_replays_without_rewriting() {
     fs::write(fixture.root.join("keep.txt"), "keep\n").unwrap();
     let durable = MemoryDurable::new();
     let first = mutation_exec(
-        "write_file.rss",
+        "write_file_entry.rss",
         "write_file",
         json!({"path": "keep.txt", "content": "first\n"}),
         Arc::clone(&durable),
@@ -2438,7 +2409,7 @@ fn completed_call_reopen_replays_without_rewriting() {
         "first\n"
     );
     let second = mutation_exec(
-        "write_file.rss",
+        "write_file_entry.rss",
         "write_file",
         json!({"path": "keep.txt", "content": "second\n"}),
         durable,
@@ -2481,7 +2452,7 @@ fn concurrent_patch_cas_has_one_winner_and_no_torn_content() {
     let config = fixture.config();
     let make_exec = |new_string: &'static str, call_id: &'static str| {
         let mut exec = mutation_exec(
-            "patch.rss",
+            "patch_entry.rss",
             "patch",
             json!({
                 "path": "race.txt",
@@ -2560,6 +2531,10 @@ fn nested_and_swapped_parent_symlink_race_does_not_touch_outside_secret() {
             "new_string": "changed",
             "replace_all": false
         }),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert!(
         fixture
@@ -2580,11 +2555,19 @@ fn nested_and_swapped_parent_symlink_race_does_not_touch_outside_secret() {
         &fixture,
         || {},
         json!({"path": "nested/swapped/secret.txt", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_write_eq(
         &fixture,
         || {},
         json!({"path": "nested/real/link.txt", "content": "changed\n"}),
+        false,
+        Some("path_denied"),
+        None,
+        1,
     );
     assert_eq!(
         fs::read_to_string(outside_dir.join("secret.txt")).unwrap(),

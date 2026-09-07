@@ -22,12 +22,10 @@ use crate::capabilities::{
     ExecutionLease, FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
     ProcessSnapshot, capability_error_envelope, parse_prepare_metadata, tool_commit, tool_prepare,
 };
-use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
+use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
-use crate::tools::{DispatchContext, ToolResult};
 
 const PROVIDER_CALL: &str = "agent::provider_call";
-const TOOL_DISPATCH: &str = "agent::tool_dispatch";
 const SLEEP_MS: &str = "agent::sleep_ms";
 const CONTROL_CHECK: &str = "agent::control_check";
 const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
@@ -48,6 +46,8 @@ const CAP_ARTIFACT_PUT_RESULT: &str = "cap::artifact_put_result";
 const CAP_ARTIFACT_GET: &str = "cap::artifact_get";
 const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
 const CAP_CLOCK_MONOTONIC_MS: &str = "cap::clock_monotonic_ms";
+const PARSE_JSON_OBJECT: &str = "agent::parse_json_object";
+const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
 
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
@@ -65,11 +65,6 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         builder.function(HostFunctionSchema::with_return(
             PROVIDER_CALL,
             vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            TOOL_DISPATCH,
-            vec![HostParamSchema::value("call", HostTypeSchema::Unknown)],
             response.clone(),
         ));
         builder.function(HostFunctionSchema::with_return(
@@ -140,6 +135,7 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
                     HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
                 ),
                 HostParamSchema::value("limits", HostTypeSchema::Unknown),
+                HostParamSchema::value("stdin", HostTypeSchema::Unknown),
             ],
             response.clone(),
         ));
@@ -168,6 +164,7 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
                 token.clone(),
                 handle.clone(),
                 HostParamSchema::value("bytes", HostTypeSchema::Unknown),
+                HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
             ],
             response.clone(),
         ));
@@ -218,6 +215,11 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         builder.function(HostFunctionSchema::with_return(
             CAP_CLOCK_MONOTONIC_MS,
             vec![token],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            PARSE_JSON_OBJECT,
+            vec![HostParamSchema::value("text", HostTypeSchema::String)],
             response,
         ));
         Arc::new(builder.build().expect("agent host catalog must build"))
@@ -264,11 +266,11 @@ pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct AgentHostBridges {
     pub provider: Option<Arc<dyn AgentProviderHost>>,
-    pub dispatcher: Option<Arc<DispatchContext>>,
     /// Shared with the runner invocation; never an independent cancellation root.
     pub cancellation: Option<RunCancellation>,
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
+    #[allow(dead_code)]
     pub metrics: Option<Arc<Metrics>>,
     pub lifecycle: Option<Arc<CapabilityLifecycle>>,
     pub capability_owner: Option<CapabilityOwner>,
@@ -284,10 +286,10 @@ pub struct AgentHostBridges {
 #[derive(Clone)]
 pub struct AgentHostState {
     pub provider: Arc<dyn AgentProviderHost>,
-    pub dispatcher: Option<Arc<DispatchContext>>,
     pub cancellation: RunCancellation,
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
+    #[allow(dead_code)]
     pub metrics: Option<Arc<Metrics>>,
     pub lifecycle: Option<Arc<CapabilityLifecycle>>,
     pub capability_owner: Option<CapabilityOwner>,
@@ -461,11 +463,17 @@ impl AgentHostState {
         cwd: String,
         env_names: Vec<String>,
         limits: ProcessLimits,
+        stdin: Vec<u8>,
     ) -> JsonValue {
         let Some(processes) = self.processes.as_ref() else {
             return Self::missing_capability("process");
         };
-        match processes.spawn(&token, &argv, &cwd, &env_names, limits) {
+        let stdin = if stdin.is_empty() {
+            None
+        } else {
+            Some(stdin.as_slice())
+        };
+        match processes.spawn_with(&token, &argv, &cwd, &env_names, limits, stdin) {
             Ok(spawned) => json!({
                 "ok": true,
                 "kind": "process_spawn",
@@ -476,59 +484,50 @@ impl AgentHostState {
         }
     }
 
-    fn cap_process_poll(
-        &self,
-        token: String,
-        handle: String,
-        cursor: u64,
-        limit: usize,
-    ) -> JsonValue {
+    fn cap_process_poll(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
         let Some(processes) = self.processes.as_ref() else {
-            return Self::missing_capability("process");
+            return json_to_vm_value(&Self::missing_capability("process"));
         };
         match processes.poll(&token, &handle, cursor, limit) {
-            Ok(snapshot) => process_snapshot_envelope("process_poll", &snapshot),
-            Err(error) => capability_error_envelope(&error),
+            Ok(snapshot) => process_snapshot_value("process_poll", &snapshot),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
         }
     }
 
-    fn cap_process_wait(
+    fn cap_process_wait(&self, token: String, handle: String, timeout_ms: Option<u64>) -> Value {
+        let Some(processes) = self.processes.as_ref() else {
+            return json_to_vm_value(&Self::missing_capability("process"));
+        };
+        match processes.wait(&token, &handle, timeout_ms) {
+            Ok(snapshot) => process_snapshot_value("process_wait", &snapshot),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+        }
+    }
+
+    fn cap_process_log(&self, token: String, handle: String, cursor: u64, limit: usize) -> Value {
+        let Some(processes) = self.processes.as_ref() else {
+            return json_to_vm_value(&Self::missing_capability("process"));
+        };
+        match processes.log(&token, &handle, cursor, limit) {
+            Ok(snapshot) => process_snapshot_value("process_log", &snapshot),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+        }
+    }
+
+    fn cap_process_write(
         &self,
         token: String,
         handle: String,
+        bytes: Vec<u8>,
         timeout_ms: Option<u64>,
     ) -> JsonValue {
         let Some(processes) = self.processes.as_ref() else {
             return Self::missing_capability("process");
         };
-        match processes.wait(&token, &handle, timeout_ms) {
-            Ok(snapshot) => process_snapshot_envelope("process_wait", &snapshot),
-            Err(error) => capability_error_envelope(&error),
-        }
-    }
-
-    fn cap_process_log(
-        &self,
-        token: String,
-        handle: String,
-        cursor: u64,
-        limit: usize,
-    ) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
-            return Self::missing_capability("process");
-        };
-        match processes.log(&token, &handle, cursor, limit) {
-            Ok(snapshot) => process_snapshot_envelope("process_log", &snapshot),
-            Err(error) => capability_error_envelope(&error),
-        }
-    }
-
-    fn cap_process_write(&self, token: String, handle: String, bytes: Vec<u8>) -> JsonValue {
-        let Some(processes) = self.processes.as_ref() else {
-            return Self::missing_capability("process");
-        };
-        match processes.write_stdin(&token, &handle, &bytes) {
-            Ok(()) => json!({"ok": true, "kind": "process_write"}),
+        match processes.write_stdin(&token, &handle, &bytes, timeout_ms) {
+            Ok(wrote_bytes) => {
+                json!({"ok": true, "kind": "process_write", "wrote_bytes": wrote_bytes})
+            }
             Err(error) => capability_error_envelope(&error),
         }
     }
@@ -657,40 +656,6 @@ impl AgentHostState {
             }),
             Err(error) => capability_error_envelope(&error),
         }
-    }
-
-    fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
-        if let Some(error) = self.control_error() {
-            return error_with_block(error, call, None);
-        }
-        let parsed = match parse_tool_call(call) {
-            Ok(parsed) => parsed,
-            Err(message) => {
-                return error_with_block(typed_fail("malformed_payload", &message), call, None);
-            }
-        };
-        let Some(dispatcher) = self.dispatcher.as_ref() else {
-            return error_with_block(
-                typed_fail(
-                    "dispatcher_missing",
-                    "native tool dispatcher is not configured",
-                ),
-                call,
-                Some(&parsed),
-            );
-        };
-        let result = dispatcher.dispatch_one(&parsed);
-        if let Some(metrics) = &self.metrics
-            && !result.replayed
-        {
-            metrics.account_tool_attempt(!result.ok, result.truncated);
-        }
-        let mut envelope = tool_result_envelope(&parsed, result);
-        if let Some(error) = self.control_error() {
-            envelope["terminal"] = json!(true);
-            envelope["control"] = error.get("error").cloned().unwrap_or(error);
-        }
-        envelope
     }
 
     fn sleep_ms(&self, delay_ms: i64) -> i64 {
@@ -856,7 +821,6 @@ pub fn register_agent_host_functions(
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
     register_named(registry, catalog, PROVIDER_CALL, 1, provider_call_adapter)?;
-    register_named(registry, catalog, TOOL_DISPATCH, 1, tool_dispatch_adapter)?;
     register_named(registry, catalog, SLEEP_MS, 1, sleep_ms_adapter)?;
     register_named(registry, catalog, CONTROL_CHECK, 0, control_check_adapter)?;
     register_named(registry, catalog, TOOL_PREPARE, 1, tool_prepare_adapter)?;
@@ -887,7 +851,7 @@ pub fn register_agent_host_functions(
         registry,
         catalog,
         CAP_PROCESS_SPAWN,
-        5,
+        6,
         cap_process_spawn_adapter,
     )?;
     register_named(
@@ -915,7 +879,7 @@ pub fn register_agent_host_functions(
         registry,
         catalog,
         CAP_PROCESS_WRITE,
-        3,
+        4,
         cap_process_write_adapter,
     )?;
     register_named(
@@ -967,6 +931,13 @@ pub fn register_agent_host_functions(
         1,
         cap_clock_monotonic_ms_adapter,
     )?;
+    register_named(
+        registry,
+        catalog,
+        PARSE_JSON_OBJECT,
+        1,
+        parse_json_object_adapter,
+    )?;
     Ok(())
 }
 
@@ -992,13 +963,6 @@ fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     return_json(state.provider_call(&json))
 }
 
-fn tool_dispatch_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let call = args.first().cloned().unwrap_or(Value::Null);
-    let state = installed_state(vm)?;
-    let json = vm_value_to_json(&call);
-    return_json(state.tool_dispatch(&json))
-}
-
 fn sleep_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let delay = match args.first() {
         Some(Value::Int(value)) => *value,
@@ -1015,6 +979,38 @@ fn control_check_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> 
         .control_error()
         .unwrap_or_else(|| json!({"ok": true, "error": {}}));
     return_json(result)
+}
+
+fn parse_json_object_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => return return_json(malformed_json_object()),
+    };
+    return_json(parse_json_object(text))
+}
+
+fn malformed_json_object() -> JsonValue {
+    json!({
+        "ok": false,
+        "code": "malformed_payload",
+        "message": "payload is not a JSON object",
+        "value": {},
+    })
+}
+
+fn parse_json_object(text: &str) -> JsonValue {
+    if text.len() > PARSE_JSON_OBJECT_MAX_BYTES || !text.is_char_boundary(text.len()) {
+        return malformed_json_object();
+    }
+    match serde_json::from_str::<JsonValue>(text) {
+        Ok(JsonValue::Object(map)) => json!({
+            "ok": true,
+            "code": "",
+            "message": "",
+            "value": JsonValue::Object(map),
+        }),
+        _ => malformed_json_object(),
+    }
 }
 
 fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -1105,10 +1101,11 @@ fn cap_process_spawn_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
                 arg_string(args, 2, "cwd")?,
                 arg_string_list(args, 3, "env_names")?,
                 arg_process_limits(args.get(4))?,
+                arg_bytes(args, 5, "stdin")?,
             ))
         },
-        |(token, argv, cwd, env_names, limits)| {
-            return_json(state.cap_process_spawn(token, argv, cwd, env_names, limits))
+        |(token, argv, cwd, env_names, limits, stdin)| {
+            return_json(state.cap_process_spawn(token, argv, cwd, env_names, limits, stdin))
         },
     )
 }
@@ -1125,7 +1122,7 @@ fn cap_process_poll_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
             ))
         },
         |(token, handle, cursor, limit)| {
-            return_json(state.cap_process_poll(token, handle, cursor, limit))
+            return_value(state.cap_process_poll(token, handle, cursor, limit))
         },
     )
 }
@@ -1141,7 +1138,7 @@ fn cap_process_wait_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
             ))
         },
         |(token, handle, timeout_ms)| {
-            return_json(state.cap_process_wait(token, handle, timeout_ms))
+            return_value(state.cap_process_wait(token, handle, timeout_ms))
         },
     )
 }
@@ -1158,7 +1155,7 @@ fn cap_process_log_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>
             ))
         },
         |(token, handle, cursor, limit)| {
-            return_json(state.cap_process_log(token, handle, cursor, limit))
+            return_value(state.cap_process_log(token, handle, cursor, limit))
         },
     )
 }
@@ -1171,9 +1168,12 @@ fn cap_process_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
                 arg_string(args, 0, "execution_token")?,
                 arg_string(args, 1, "handle")?,
                 arg_bytes(args, 2, "bytes")?,
+                arg_timeout(args, 3, "timeout_ms")?.filter(|ms| *ms > 0),
             ))
         },
-        |(token, handle, bytes)| return_json(state.cap_process_write(token, handle, bytes)),
+        |(token, handle, bytes, timeout_ms)| {
+            return_json(state.cap_process_write(token, handle, bytes, timeout_ms))
+        },
     )
 }
 
@@ -1411,6 +1411,13 @@ fn arg_process_limits(value: Option<&Value>) -> Result<ProcessLimits, JsonValue>
     if let Some(log_limit) = json_usize_field(&fields, "log_limit")? {
         limits.log_limit = log_limit;
     }
+    if let Some(JsonValue::Bool(close_after_initial)) = fields.get("close_after_initial") {
+        limits.close_after_initial = *close_after_initial;
+    } else if fields.contains_key("close_after_initial") {
+        return Err(invalid_request(
+            "close_after_initial must be a boolean".to_string(),
+        ));
+    }
     Ok(limits)
 }
 
@@ -1446,17 +1453,87 @@ fn json_usize_field(
     }
 }
 
-fn process_snapshot_envelope(kind: &str, snapshot: &ProcessSnapshot) -> JsonValue {
-    json!({
-        "ok": true,
-        "kind": kind,
-        "handle": snapshot.handle,
-        "running": snapshot.running,
-        "exit_code": snapshot.exit_code,
-        "stdout": snapshot.stdout,
-        "stderr": snapshot.stderr,
-        "truncated": snapshot.truncated,
-    })
+fn process_snapshot_value(kind: &str, snapshot: &ProcessSnapshot) -> Value {
+    Value::map(vec![
+        (Value::string("ok"), Value::Bool(true)),
+        (Value::string("kind"), Value::string(kind)),
+        (Value::string("handle"), Value::string(&snapshot.handle)),
+        (Value::string("running"), Value::Bool(snapshot.running)),
+        (
+            Value::string("exit_code"),
+            snapshot
+                .exit_code
+                .map(i64::from)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+        ),
+        (
+            Value::string("signal"),
+            snapshot
+                .signal
+                .map(i64::from)
+                .map(Value::Int)
+                .unwrap_or(Value::Null),
+        ),
+        (Value::string("stdout"), Value::string(&snapshot.stdout)),
+        (Value::string("stderr"), Value::string(&snapshot.stderr)),
+        (
+            Value::string("stdout_bytes"),
+            Value::bytes(snapshot.stdout_bytes.clone()),
+        ),
+        (
+            Value::string("stderr_bytes"),
+            Value::bytes(snapshot.stderr_bytes.clone()),
+        ),
+        (Value::string("truncated"), Value::Bool(snapshot.truncated)),
+        (
+            Value::string("stdout_offset"),
+            Value::Int(i64::try_from(snapshot.stdout_cursor.offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stdout_next_offset"),
+            Value::Int(i64::try_from(snapshot.stdout_cursor.next_offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stdout_truncated"),
+            Value::Bool(snapshot.stdout_cursor.truncated),
+        ),
+        (
+            Value::string("stdout_gap"),
+            Value::Bool(snapshot.stdout_cursor.gap),
+        ),
+        (
+            Value::string("stdout_eof"),
+            Value::Bool(snapshot.stdout_cursor.eof),
+        ),
+        (
+            Value::string("stderr_offset"),
+            Value::Int(i64::try_from(snapshot.stderr_cursor.offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stderr_next_offset"),
+            Value::Int(i64::try_from(snapshot.stderr_cursor.next_offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            Value::string("stderr_truncated"),
+            Value::Bool(snapshot.stderr_cursor.truncated),
+        ),
+        (
+            Value::string("stderr_gap"),
+            Value::Bool(snapshot.stderr_cursor.gap),
+        ),
+        (
+            Value::string("stderr_eof"),
+            Value::Bool(snapshot.stderr_cursor.eof),
+        ),
+        (Value::string("signaled"), Value::Bool(snapshot.signaled)),
+        (Value::string("unknown"), Value::Bool(snapshot.unknown)),
+        (
+            Value::string("deadline_elapsed"),
+            Value::Bool(snapshot.deadline_elapsed),
+        ),
+        (Value::string("cancelled"), Value::Bool(snapshot.cancelled)),
+    ])
 }
 
 pub(crate) fn typed_fail(code: &str, message: &str) -> JsonValue {
@@ -1483,7 +1560,6 @@ const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
     "scripted_exhausted",
     "cancelled",
     "deadline_elapsed",
-    "dispatcher_missing",
     "adapter_failed",
     "unsupported_parallel",
     "unsupported_task",
@@ -1568,114 +1644,4 @@ fn normalize_provider_envelope(result: JsonValue) -> JsonValue {
         return typed_fail("malformed_payload", "provider tool_calls is not an array");
     }
     result
-}
-
-fn parse_tool_call(value: &JsonValue) -> Result<ToolCall, String> {
-    let id = value
-        .get("id")
-        .or_else(|| value.get("tool_call_id"))
-        .and_then(JsonValue::as_str)
-        .unwrap_or("")
-        .to_string();
-    let name = value
-        .get("name")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("")
-        .to_string();
-    if id.is_empty() || name.is_empty() {
-        return Err("tool call is missing id or name".to_string());
-    }
-    let arguments = if let Some(arguments) = value.get("arguments") {
-        if !arguments.is_object() {
-            return Err("tool call arguments must be an object".to_string());
-        }
-        arguments.clone()
-    } else if let Some(raw) = value.get("arguments_json") {
-        let text = raw
-            .as_str()
-            .ok_or_else(|| "arguments_json must be a string".to_string())?;
-        let parsed: JsonValue = serde_json::from_str(text)
-            .map_err(|error| format!("malformed arguments_json: {error}"))?;
-        if !parsed.is_object() {
-            return Err("arguments_json must decode to an object".to_string());
-        }
-        parsed
-    } else {
-        json!({})
-    };
-    Ok(ToolCall {
-        id,
-        name,
-        arguments,
-    })
-}
-
-fn tool_result_envelope(call: &ToolCall, result: ToolResult) -> JsonValue {
-    let code = result
-        .error
-        .as_ref()
-        .map(|error| error.code.as_str())
-        .unwrap_or("");
-    let terminal = matches!(
-        code,
-        "cancelled" | "deadline_elapsed" | "max_tool_calls" | "event_persist_failed"
-    );
-    let error = result
-        .error
-        .as_ref()
-        .map(|error| json!({"code": error.code, "message": error.message}))
-        .unwrap_or_else(|| json!({}));
-    json!({
-        "ok": result.ok,
-        "terminal": terminal,
-        "error": if result.ok { json!({}) } else { error.clone() },
-        "content_block": {
-            "type": "tool_result",
-            "tool_call_id": call.id,
-            "name": call.name,
-            "content": result.content,
-            "is_error": !result.ok,
-            "result": result,
-            "error": error,
-            "artifact": result.artifacts,
-            "truncated": result.truncated
-        }
-    })
-}
-
-fn error_with_block(fail: JsonValue, call: &JsonValue, parsed: Option<&ToolCall>) -> JsonValue {
-    let id = parsed
-        .map(|call| call.id.clone())
-        .or_else(|| {
-            call.get("id")
-                .or_else(|| call.get("tool_call_id"))
-                .and_then(JsonValue::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let name = parsed
-        .map(|call| call.name.clone())
-        .or_else(|| {
-            call.get("name")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let error = fail.get("error").cloned().unwrap_or_else(|| json!({}));
-    json!({
-        "ok": false,
-        "terminal": true,
-        "error": error.clone(),
-        "content_block": {
-            "type": "tool_result",
-            "tool_call_id": id,
-            "name": name,
-            "content": "",
-            "is_error": true,
-            "result": {},
-            "error": error,
-            "artifact": [],
-            "truncated": false
-        }
-    })
 }

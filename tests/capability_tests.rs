@@ -299,6 +299,14 @@ fn error_code(error: &CapabilityError) -> &str {
     error.code()
 }
 
+fn assert_stdin_workers_joined(processes: &ProcessCapability) {
+    assert_eq!(
+        processes.active_stdin_workers(),
+        0,
+        "stdin write worker must be joined before the capability API returns"
+    );
+}
+
 fn run_cap_source(
     fixture: &Fixture,
     filesystem: Option<Arc<FilesystemCapability>>,
@@ -651,8 +659,13 @@ fn process_deadline_and_cancel_apply_before_and_during_execution() {
         .expect_err("cancelled during wait");
     assert_eq!(error_code(&error), "cancelled");
     assert!(
+        pid_alive(pid),
+        "wait cancellation must leave pid {pid} alive"
+    );
+    processes.cancel_all();
+    assert!(
         wait_until_pid_gone(pid, Duration::from_secs(2)),
-        "run cancellation left pid {pid} alive"
+        "explicit cleanup left pid {pid} alive"
     );
 }
 
@@ -711,6 +724,174 @@ fn process_output_is_truncated_and_handles_clean_up_on_drop() {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("dropped process capability left pid {pid} alive");
+}
+
+#[test]
+fn process_spawn_stdin_and_log_cursors_are_owner_scoped() {
+    let fixture = Fixture::new("proc-list");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/cat".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 2_000,
+                stdout_limit: 64,
+                stderr_limit: 64,
+                total_limit: 64,
+                stdin_limit: 64,
+                log_limit: 64,
+                close_after_initial: false,
+            },
+        )
+        .expect("spawn");
+    let wrote = processes
+        .write_stdin(&token, &spawned.handle, b"hello-cursor\n", None)
+        .expect("write");
+    assert_stdin_workers_joined(&processes);
+    assert_eq!(wrote, 13);
+    processes
+        .close_stdin(&token, &spawned.handle)
+        .expect("close");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait");
+    assert!(snapshot.stdout.contains("hello-cursor"));
+    assert_eq!(snapshot.stdout_cursor.offset, 0);
+    assert!(snapshot.stdout_cursor.next_offset > 0);
+    assert!(snapshot.stdout_cursor.eof);
+    let log = processes.log(&token, &spawned.handle, 0, 64).expect("log");
+    assert_eq!(log.stdout_cursor.offset, 0);
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_log_limit_truncates_each_stream_and_advances_offsets() {
+    let fixture = Fixture::new("proc-log-limit");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &[
+                "/usr/bin/printf".to_string(),
+                "%s".to_string(),
+                "0123456789ABCDEF".to_string(),
+            ],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 2_000,
+                stdout_limit: 64,
+                stderr_limit: 64,
+                total_limit: 64,
+                stdin_limit: 64,
+                log_limit: 64,
+                close_after_initial: false,
+            },
+        )
+        .expect("spawn");
+    let waited = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait");
+    assert!(!waited.running);
+    let first = processes
+        .log(&token, &spawned.handle, 0, 4)
+        .expect("log first");
+    assert_eq!(first.stdout, "0123");
+    assert_eq!(first.stdout_cursor.offset, 0);
+    assert_eq!(first.stdout_cursor.next_offset, 4);
+    assert!(first.stdout_cursor.truncated);
+    assert!(!first.stdout_cursor.eof);
+    let second = processes
+        .log(&token, &spawned.handle, first.stdout_cursor.next_offset, 4)
+        .expect("log second");
+    assert_eq!(second.stdout, "4567");
+    assert_eq!(second.stdout_cursor.offset, 4);
+    assert_eq!(second.stdout_cursor.next_offset, 8);
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_write_timeout_caps_a_full_pipe() {
+    let fixture = Fixture::new("proc-write-timeout");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+        total_limit: 64 * 1024,
+        stdin_limit: 2 * 1024 * 1024,
+        log_limit: 64 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdout_limit: 64 * 1024,
+                stderr_limit: 64 * 1024,
+                total_limit: 64 * 1024,
+                stdin_limit: 2 * 1024 * 1024,
+                log_limit: 64 * 1024,
+                close_after_initial: false,
+            },
+        )
+        .expect("spawn");
+    let started = Instant::now();
+    let error = processes
+        .write_stdin(&token, &spawned.handle, &vec![b'x'; 1024 * 1024], Some(80))
+        .expect_err("full pipe write");
+    assert_stdin_workers_joined(&processes);
+    let elapsed = started.elapsed();
+    assert_eq!(error_code(&error), "deadline_elapsed");
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "timed write blocked for {elapsed:?}"
+    );
+    processes.kill(&token, &spawned.handle).expect("kill");
+    assert!(wait_until_pid_gone(spawned.pid, Duration::from_secs(2)));
+}
+
+#[test]
+fn process_spawn_with_stdin_writes_before_return() {
+    let fixture = Fixture::new("proc-spawn-stdin");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn_with(
+            &token,
+            &["/bin/cat".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 2_000,
+                stdout_limit: 64,
+                stderr_limit: 64,
+                total_limit: 64,
+                stdin_limit: 64,
+                log_limit: 64,
+                close_after_initial: true,
+            },
+            Some(b"from-spawn\n"),
+        )
+        .expect("spawn_with");
+    assert_stdin_workers_joined(&processes);
+    processes
+        .close_stdin(&token, &spawned.handle)
+        .expect("close");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait");
+    assert!(snapshot.stdout.contains("from-spawn"));
+    processes.kill(&token, &spawned.handle).expect("kill");
 }
 
 #[test]
@@ -917,7 +1098,6 @@ fn host_catalog_registers_cap_functions_with_typed_bounds() {
         "cap::artifact_get",
         "cap::artifact_reference",
         "cap::clock_monotonic_ms",
-        "agent::tool_dispatch",
     ] {
         assert!(
             names.contains(&required),
@@ -1253,6 +1433,7 @@ fn host_process_ceilings_clamp_caller_timeout() {
         total_limit: 32,
         stdin_limit: 8,
         log_limit: 16,
+        ..ProcessLimits::default()
     });
     let token = fixture.token(CapabilityRisk::Execute);
     let started = Instant::now();
@@ -1269,6 +1450,7 @@ fn host_process_ceilings_clamp_caller_timeout() {
                 total_limit: 64 * 1024,
                 stdin_limit: 64 * 1024,
                 log_limit: 64 * 1024,
+                close_after_initial: false,
             },
         )
         .expect("spawn");
@@ -1278,7 +1460,7 @@ fn host_process_ceilings_clamp_caller_timeout() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(!snapshot.running);
     let error = processes
-        .write_stdin(&token, &spawned.handle, &[0; 16])
+        .write_stdin(&token, &spawned.handle, &[0; 16], None)
         .expect_err("stdin ceiling");
     assert_eq!(error_code(&error), "budget_exceeded");
 }
@@ -1452,7 +1634,7 @@ fn host_malformed_process_and_artifact_values_fail_without_effects() {
     let stdin = format!(
         r#"
         pub fn run(input: map) -> map {{
-            cap::process_write("{execute}", "{}", {{}})
+            cap::process_write("{execute}", "{}", {{}}, 0)
         }}
     "#,
         spawned.handle
@@ -1467,8 +1649,9 @@ fn host_malformed_process_and_artifact_values_fail_without_effects() {
     assert_eq!(envelope_error_code(&write_result), "invalid_request");
 
     let spawn = r#"
+        use bytes;
         pub fn run(input: map) -> map {
-            cap::process_spawn(input.token, input.argv, "", [], {timeout_ms: -1})
+            cap::process_spawn(input.token, input.argv, "", [], {timeout_ms: -1}, bytes::from_utf8(""))
         }
     "#;
     let spawn_host = AgentHostBridges {
@@ -2118,4 +2301,381 @@ fn list_rejects_regular_hardlinks_and_preserves_dirs_and_files() {
         ))
     );
     let _ = fs::remove_file(&outside);
+}
+
+#[test]
+fn process_wait_own_timeout_sets_deadline_elapsed_and_keeps_running() {
+    let fixture = Fixture::new("proc-wait-deadline");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 30_000,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn sleep");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(80))
+        .expect("wait timeout");
+    assert!(
+        snapshot.deadline_elapsed,
+        "wait timeout must set deadline_elapsed"
+    );
+    assert!(
+        snapshot.running,
+        "wait timeout must preserve the running snapshot"
+    );
+    assert!(!snapshot.cancelled);
+    assert_eq!(processes.table_len(), 1);
+    assert!(
+        fs::read_to_string(format!("/proc/{}/status", spawned.pid)).is_ok(),
+        "child must still be alive after wait timeout"
+    );
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_spawn_initial_stdin_epipe_does_not_fail() {
+    let fixture = Fixture::new("proc-stdin-epipe");
+    let processes = fixture.processes();
+    for i in 0..16 {
+        let token = fixture.token(CapabilityRisk::Execute);
+        let payload = format!("payload-{i}\n");
+        let spawned = processes
+            .spawn_with(
+                &token,
+                &["/bin/true".to_string()],
+                "",
+                &[],
+                ProcessLimits {
+                    timeout_ms: 2_000,
+                    stdin_limit: 4_096,
+                    ..ProcessLimits::default()
+                },
+                Some(payload.as_bytes()),
+            )
+            .unwrap_or_else(|error| panic!("spawn {i} failed: {error:?}"));
+        let snapshot = processes
+            .wait(&token, &spawned.handle, Some(2_000))
+            .expect("wait true");
+        assert!(!snapshot.running, "iteration {i} still running");
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert!(!snapshot.deadline_elapsed);
+        assert!(!snapshot.cancelled);
+    }
+}
+
+#[test]
+fn process_write_completion_wins_when_cancelled_after_worker_finishes() {
+    let fixture = Fixture::new("proc-write-complete-cancel");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/cat".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 64,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    processes.set_before_write_cycle_hook(Arc::new({
+        let cancel = Arc::clone(&fixture.cancel);
+        move || {
+            thread::sleep(Duration::from_millis(30));
+            cancel.cancel();
+        }
+    }));
+    let wrote = processes
+        .write_stdin(&token, &spawned.handle, b"hello\n", Some(2_000))
+        .expect("completed write should win at cancel");
+    assert_stdin_workers_joined(&processes);
+    assert_eq!(wrote, 6);
+    processes.cancel_all();
+}
+
+#[test]
+fn process_write_to_exited_child_is_stdin_closed() {
+    let fixture = Fixture::new("proc-write-epipe");
+    let processes = fixture.processes();
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/true".to_string()],
+            "",
+            &[],
+            ProcessLimits::default(),
+        )
+        .expect("spawn");
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(2_000))
+        .expect("wait true");
+    assert!(!snapshot.running);
+    let error = processes
+        .write_stdin(&token, &spawned.handle, b"late\n", Some(1_000))
+        .expect_err("write after exit");
+    assert_stdin_workers_joined(&processes);
+    assert!(
+        error_code(&error) == "stdin_closed" || error_code(&error) == "process_failed",
+        "EPIPE after exit, got {}",
+        error_code(&error)
+    );
+}
+
+#[test]
+fn process_write_full_pipe_timeout_returns_within_cleanup_timeout() {
+    let fixture = Fixture::new("proc-write-cleanup");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdin_limit: 2 * 1024 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 2 * 1024 * 1024,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    let started = Instant::now();
+    let error = processes
+        .write_stdin(&token, &spawned.handle, &vec![b'x'; 1024 * 1024], Some(50))
+        .expect_err("full pipe timeout");
+    assert_stdin_workers_joined(&processes);
+    let elapsed = started.elapsed();
+    assert_eq!(error_code(&error), "deadline_elapsed");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "timed write cleanup hung: {elapsed:?}"
+    );
+    assert!(pid_alive(spawned.pid), "timeout must not kill the child");
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_spawn_close_after_initial_delivers_slow_reader_payload() {
+    let fixture = Fixture::new("proc-close-after-initial");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 15_000,
+        stdin_limit: 256 * 1024,
+        stdout_limit: 8 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let payload = vec![b'A'; 128 * 1024];
+    let spawned = processes
+        .spawn_with(
+            &token,
+            &[
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                "import sys,time\ntime.sleep(0.05)\nsys.stdout.write(str(len(sys.stdin.buffer.read())))".to_string(),
+            ],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 15_000,
+                stdin_limit: 256 * 1024,
+                stdout_limit: 8 * 1024,
+                close_after_initial: true,
+                ..ProcessLimits::default()
+            },
+            Some(&payload),
+        )
+        .expect("spawn");
+    assert_stdin_workers_joined(&processes);
+    let snapshot = processes
+        .wait(&token, &spawned.handle, Some(15_000))
+        .expect("wait");
+    assert!(!snapshot.running);
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.stdout, payload.len().to_string());
+}
+
+#[test]
+fn process_write_cancel_during_full_pipe_joins_stdin_worker() {
+    let fixture = Fixture::new("proc-write-cancel-join");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdin_limit: 2 * 1024 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 2 * 1024 * 1024,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    processes.set_write_blocked_hook(Arc::new({
+        let cancel = Arc::clone(&fixture.cancel);
+        move || cancel.cancel()
+    }));
+    let error = processes
+        .write_stdin(
+            &token,
+            &spawned.handle,
+            &vec![b'x'; 1024 * 1024],
+            Some(2_000),
+        )
+        .expect_err("cancelled write");
+    assert_stdin_workers_joined(&processes);
+    assert_eq!(error_code(&error), "cancelled");
+    assert!(pid_alive(spawned.pid), "cancel must not kill the child");
+    processes.cancel_all();
+}
+
+#[test]
+fn process_write_close_race_joins_stdin_worker() {
+    let fixture = Fixture::new("proc-write-close-race");
+    let processes = fixture.processes_with(ProcessLimits {
+        timeout_ms: 5_000,
+        stdin_limit: 2 * 1024 * 1024,
+        ..ProcessLimits::default()
+    });
+    let token = fixture.token(CapabilityRisk::Execute);
+    let spawned = processes
+        .spawn(
+            &token,
+            &["/bin/sleep".to_string(), "30".to_string()],
+            "",
+            &[],
+            ProcessLimits {
+                timeout_ms: 5_000,
+                stdin_limit: 2 * 1024 * 1024,
+                ..ProcessLimits::default()
+            },
+        )
+        .expect("spawn");
+    processes.set_write_blocked_hook(Arc::new({
+        let processes = processes.clone();
+        let token = token.clone();
+        let handle = spawned.handle.clone();
+        move || {
+            let _ = processes.close_stdin(&token, &handle);
+        }
+    }));
+    let _ = processes.write_stdin(
+        &token,
+        &spawned.handle,
+        &vec![b'x'; 1024 * 1024],
+        Some(2_000),
+    );
+    assert_stdin_workers_joined(&processes);
+    processes.kill(&token, &spawned.handle).expect("kill");
+}
+
+#[test]
+fn process_shutdown_all_refuses_spawn_before_os_create() {
+    let fixture = Fixture::new("proc-close-before");
+    let processes = fixture.processes();
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    processes.set_before_os_spawn_hook({
+        let ready = Arc::clone(&ready);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            ready.wait();
+            release.wait();
+        })
+    });
+    let spawned = {
+        let processes = processes.clone();
+        let token = fixture.token(CapabilityRisk::Execute);
+        thread::spawn(move || {
+            processes.spawn(
+                &token,
+                &["/bin/sleep".to_string(), "30".to_string()],
+                "",
+                &[],
+                ProcessLimits {
+                    timeout_ms: 5_000,
+                    ..ProcessLimits::default()
+                },
+            )
+        })
+    };
+    ready.wait();
+    processes.shutdown_all();
+    release.wait();
+    let error = spawned
+        .join()
+        .expect("spawn thread")
+        .expect_err("closing fence must refuse spawn");
+    assert_eq!(error_code(&error), "capability_unavailable");
+    assert_eq!(processes.table_len(), 0);
+}
+
+#[test]
+fn process_shutdown_all_terminates_uncommitted_os_process() {
+    let fixture = Fixture::new("proc-close-after");
+    let processes = fixture.processes();
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    processes.set_after_os_spawn_hook({
+        let ready = Arc::clone(&ready);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            ready.wait();
+            release.wait();
+        })
+    });
+    let spawned = {
+        let processes = processes.clone();
+        let token = fixture.token(CapabilityRisk::Execute);
+        thread::spawn(move || {
+            processes.spawn(
+                &token,
+                &["/bin/sleep".to_string(), "30".to_string()],
+                "",
+                &[],
+                ProcessLimits {
+                    timeout_ms: 5_000,
+                    ..ProcessLimits::default()
+                },
+            )
+        })
+    };
+    ready.wait();
+    processes.shutdown_all();
+    release.wait();
+    let error = spawned
+        .join()
+        .expect("spawn thread")
+        .expect_err("uncommitted handle must not insert after close");
+    assert_eq!(error_code(&error), "capability_unavailable");
+    assert_eq!(processes.table_len(), 0);
+    let later = processes.spawn(
+        &fixture.token(CapabilityRisk::Execute),
+        &["/bin/echo".to_string(), "late".to_string()],
+        "",
+        &[],
+        ProcessLimits::default(),
+    );
+    assert!(later.is_err(), "closing is irreversible");
 }

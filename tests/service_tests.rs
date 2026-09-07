@@ -1,9 +1,11 @@
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use rustscript_agent::ToolResult;
 use rustscript_agent::capabilities::{CapabilityRisk, PrepareMetadata, PrepareOutcome};
 use rustscript_agent::config::{
     ADMISSION_QUERY_RESULT_LIMIT_BYTES, ADMISSION_RUN_COL_INPUT_JSON, AdmissionSqliteCellLens,
@@ -11,7 +13,6 @@ use rustscript_agent::config::{
     MAX_PROVIDER_OPTIONS_BYTES, MAX_RUN_CONTEXT_STORAGE_BYTES, ProviderProfile, RunLimits,
     estimate_admission_query_bytes,
 };
-use rustscript_agent::tools::ToolResult;
 use rustscript_agent::{
     AdmitError, AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, LlmContentBlock,
     ProviderPendingDecision, ScriptedProvider, ToolCall, ToolDescriptor, ToolRegistry,
@@ -109,7 +110,7 @@ fn custom_registry() -> ToolRegistry {
 }
 
 fn custom_registry_with_description(description: &str) -> ToolRegistry {
-    let mut entry = rustscript_agent::builtin_entries()
+    let mut entry = rustscript_agent::bundled_tool_entries()
         .into_iter()
         .next()
         .expect("the built-in registry has a read tool");
@@ -1754,8 +1755,8 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-echo".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
     service
         .commit_provider_step(
@@ -1765,7 +1766,7 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -1775,8 +1776,7 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
             None,
         )
         .expect("assistant tool-call parent must be durable first");
-    let first = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let first = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("first dispatch should run");
     assert_eq!(first.len(), 1);
     assert!(!first[0].ok);
@@ -1786,8 +1786,7 @@ async fn tool_step_commits_message_before_live_and_replays_without_reexecution()
         .filter(|event| event["event"] == "tool.failed")
         .count();
     assert_eq!(tool_failed, 1, "first dispatch commits one tool.failed");
-    let second = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let second = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("replay should succeed");
     assert_eq!(second.len(), 1);
     assert_eq!(
@@ -1823,8 +1822,8 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-fail".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
     service
         .commit_provider_step(
@@ -1834,7 +1833,7 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -1848,8 +1847,7 @@ async fn persist_failure_rolls_back_tool_step_without_live_publish() {
         .persistence()
         .expect("sqlite persistence")
         .inject_persist_failure();
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("dispatch should return persist failure");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
@@ -1975,11 +1973,10 @@ async fn missing_tool_result_parent_fails_typed_before_durable_result() {
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-orphan".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("dispatch should return typed missing parent");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
@@ -2013,8 +2010,8 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
         .expect("admit should succeed");
     let call = ToolCall {
         id: "call-parent".to_string(),
-        name: "not_a_real_tool".to_string(),
-        arguments: json!({"secret": "nope"}),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "missing-no-such.txt"}),
     };
     let parent = service
         .commit_provider_step(
@@ -2024,7 +2021,7 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
-                arguments_json: Some(r#"{"secret":"nope"}"#.to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -2035,12 +2032,11 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
         )
         .expect("assistant tool-call parent");
     let parent_id = parent.message_id();
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("dispatch with parent");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
-        Some("unknown_tool")
+        Some("not_found")
     );
     assert_ne!(parent_id, "");
     let events = service.run_events(&admitted.run_id);
@@ -2085,7 +2081,7 @@ async fn in_txn_failpoint_rolls_back_provider_step_on_reopen() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some("c-fail".to_string()),
                 name: Some("read_file".to_string()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -2146,7 +2142,7 @@ async fn post_commit_failpoint_is_replayable_and_publishes_once_on_recovery() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some("c-crash".to_string()),
                 name: Some("read_file".to_string()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -2190,7 +2186,7 @@ async fn post_commit_failpoint_is_replayable_and_publishes_once_on_recovery() {
                 block_type: "tool_call".to_string(),
                 tool_call_id: Some("c-crash".to_string()),
                 name: Some("read_file".to_string()),
-                arguments_json: Some("{}".to_string()),
+                arguments_json: Some(r#"{"path":"missing-no-such.txt"}"#.to_string()),
                 ..LlmContentBlock::default()
             }],
             None,
@@ -2571,19 +2567,19 @@ async fn corrupt_tool_event_without_canonical_result_fails_closed() {
             json!({"tool_call_id": "c-corrupt", "error_code": "tool_failed"}),
         )
         .expect("orphan tool event");
-    let results = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[ToolCall {
-                id: "c-corrupt".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({"path": "a.rs"}),
-            }],
-        )
-        .expect("corrupt replay must dispatch");
+    let results = common::dispatch_rss(
+        &service,
+        &admitted.run_id,
+        &[ToolCall {
+            id: "c-corrupt".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "a.rs"}),
+        }],
+    )
+    .expect("corrupt replay must dispatch");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
-        Some("corrupt_tool_result")
+        Some("missing_tool_parent")
     );
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
@@ -2640,8 +2636,7 @@ async fn completed_durable_tool_replay_returns_canonical_result_without_reexecut
         arguments: json!({"path": "note.txt"}),
     };
     commit_tool_parent(&service, &admitted.run_id, &call);
-    let first = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let first = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("first dispatch should run");
     assert_eq!(first.len(), 1);
     assert!(first[0].ok, "first read should succeed: {:?}", first[0]);
@@ -2650,8 +2645,7 @@ async fn completed_durable_tool_replay_returns_canonical_result_without_reexecut
     let first_events = service.run_events(&admitted.run_id);
     assert_eq!(event_type_count(&first_events, "tool.started"), 1);
     assert_eq!(event_type_count(&first_events, "tool.completed"), 1);
-    let second = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let second = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("replay should succeed");
     assert_eq!(second.len(), 1);
     assert!(second[0].ok);
@@ -2691,8 +2685,7 @@ async fn failed_durable_tool_replay_returns_canonical_result_without_reexecution
         arguments: json!({"path": "missing.txt"}),
     };
     commit_tool_parent(&service, &admitted.run_id, &call);
-    let first = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let first = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("first dispatch should run");
     assert_eq!(first.len(), 1);
     assert!(!first[0].ok);
@@ -2703,8 +2696,7 @@ async fn failed_durable_tool_replay_returns_canonical_result_without_reexecution
     let first_metrics = service.metrics().snapshot();
     let first_events = service.run_events(&admitted.run_id);
     assert_eq!(event_type_count(&first_events, "tool.failed"), 1);
-    let second = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let second = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("replay should succeed");
     assert_eq!(
         second[0].error.as_ref().map(|error| error.code.as_str()),
@@ -2752,8 +2744,7 @@ async fn interrupted_durable_tool_replay_returns_canonical_result_without_native
         )
         .expect("interrupted event");
     let first_metrics = service.metrics().snapshot();
-    let results = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let results = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("interrupted replay must dispatch");
     assert_eq!(
         results[0].error.as_ref().map(|error| error.code.as_str()),
@@ -3298,8 +3289,7 @@ async fn production_lifecycle_commit_result_replays_after_restart_without_corrup
         .expect("production commit_result should persist");
     let first_events = service.run_events(&admitted.run_id);
     assert_eq!(event_type_count(&first_events, "tool.completed"), 1);
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("restart replay must dispatch");
     assert_eq!(replayed.len(), 1);
     assert!(
@@ -3410,8 +3400,7 @@ async fn production_lifecycle_commit_failure_replays_as_tool_failed_without_corr
         event_type_count(&service.run_events(&admitted.run_id), "tool.completed"),
         0
     );
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("failure replay must dispatch");
     assert_eq!(
         replayed[0].error.as_ref().map(|error| error.code.as_str()),
@@ -3482,8 +3471,7 @@ async fn production_lifecycle_interrupt_replays_interrupted_effect_without_corru
         .find(|event| event["event"] == "tool.failed")
         .expect("interrupt must persist tool.failed");
     assert_eq!(failed["data"]["error_code"], json!("interrupted_effect"));
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("interrupted replay must dispatch");
     assert_eq!(
         replayed[0].error.as_ref().map(|error| error.code.as_str()),
@@ -3551,8 +3539,7 @@ async fn production_stop_recovers_open_capability_tokens() {
         .find(|event| event["event"] == "tool.failed")
         .expect("stop must persist interrupted_effect");
     assert_eq!(failed["data"]["error_code"], json!("interrupted_effect"));
-    let replayed = service
-        .dispatch_tools(&admitted.run_id, std::slice::from_ref(&call))
+    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
         .expect("stop recovery must dispatch");
     assert_eq!(
         replayed[0].error.as_ref().map(|error| error.code.as_str()),
@@ -3563,4 +3550,177 @@ async fn production_stop_recovers_open_capability_tokens() {
     drop(state);
     std::fs::remove_file(path).expect("temporary SQLite state should be removed");
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+fn cache_script(tag: &str) -> String {
+    format!("pub fn run(context: map) -> map {{ {{status: \"completed\", output: \"{tag}\"}}; }}")
+}
+
+fn wait_completed(service: &rustscript_agent::AgentService, run_id: &str) -> Value {
+    for _ in 0..200 {
+        let events = service.run_events(run_id);
+        if let Some(event) = events
+            .iter()
+            .find(|event| event["event"] == "run.completed")
+        {
+            return event.clone();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("run did not complete: {:?}", service.run_events(run_id));
+}
+
+fn stub_completed_output(service: &rustscript_agent::AgentService, run_id: &str) -> Value {
+    let events = service.run_events(run_id);
+    let delta = events
+        .iter()
+        .find(|event| event["event"] == "message.delta")
+        .and_then(|event| event["data"]["delta"].as_str())
+        .unwrap_or_else(|| panic!("missing message.delta: {events:?}"));
+    serde_json::from_str(delta).expect("message.delta should be JSON")
+}
+
+#[tokio::test]
+async fn agent_file_cache_same_len_mutation_refreshes_runner() {
+    let dir = std::env::temp_dir().join(format!(
+        "svc-cache-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("main.rss");
+    let first = cache_script("AAAA");
+    let second = cache_script("BBBB");
+    assert_eq!(first.len(), second.len());
+    std::fs::write(&path, &first).expect("write");
+    let state = AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path)
+        .expect("compile first");
+    let service = state.service();
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit first");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let completed = wait_completed(&service, &admitted.run_id);
+    assert_eq!(completed["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &admitted.run_id),
+        json!({"status": "completed", "output": "AAAA"})
+    );
+    std::fs::write(&path, &second).expect("rewrite");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit second");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let completed = wait_completed(&service, &admitted.run_id);
+    assert_eq!(completed["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &admitted.run_id),
+        json!({"status": "completed", "output": "BBBB"})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_file_cache_invalid_tree_after_install_does_not_hit_stale() {
+    let dir = std::env::temp_dir().join(format!(
+        "svc-stale-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("main.rss");
+    std::fs::write(&path, cache_script("STALE")).expect("write");
+    let state =
+        AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path).expect("compile");
+    let service = state.service();
+    let admitted = service.admit(admit_request(None)).await.expect("admit");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let completed = wait_completed(&service, &admitted.run_id);
+    assert_eq!(completed["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &admitted.run_id),
+        json!({"status": "completed", "output": "STALE"})
+    );
+    let backup = dir.join("backup.rss");
+    std::fs::rename(&path, &backup).expect("rename");
+    std::os::unix::fs::symlink(&backup, &path).expect("symlink");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit after");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    let failed = events.iter().any(|event| {
+        event["event"] == "run.failed"
+            || event["data"]["status"] == json!("failed")
+            || (event["event"] == "run.completed" && event["data"]["status"] == json!("failed"))
+    });
+    assert!(failed, "invalid tree should fail closed: {events:?}");
+    assert!(
+        events.iter().all(|event| event["event"] != "run.completed"),
+        "invalid tree must not complete: {events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn agent_file_cache_concurrent_refresh_sees_new_bytes() {
+    let dir = std::env::temp_dir().join(format!(
+        "svc-conc-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("main.rss");
+    let first = cache_script("CCCC");
+    let second = cache_script("DDDD");
+    assert_eq!(first.len(), second.len());
+    std::fs::write(&path, &first).expect("write");
+    let state =
+        AgentGatewayState::with_agent_file(AgentGatewayConfig::default(), &path).expect("compile");
+    let service = state.service();
+    let admitted = service.admit(admit_request(None)).await.expect("warm");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    wait_completed(&service, &admitted.run_id);
+    std::fs::write(&path, &second).expect("rewrite");
+    let left = service.admit(admit_request(None)).await.expect("left");
+    let right = service.admit(admit_request(None)).await.expect("right");
+    let left_worker = service.clone();
+    let right_worker = service.clone();
+    let left_id = left.run_id.clone();
+    let right_id = right.run_id.clone();
+    let _ = tokio::join!(
+        left_worker.run_worker(left_id.clone(), "ignored".to_string()),
+        right_worker.run_worker(right_id.clone(), "ignored".to_string())
+    );
+    let left_done = wait_completed(&service, &left_id);
+    let right_done = wait_completed(&service, &right_id);
+    assert_eq!(left_done["event"], json!("run.completed"));
+    assert_eq!(right_done["event"], json!("run.completed"));
+    assert_eq!(
+        stub_completed_output(&service, &left_id),
+        json!({"status": "completed", "output": "DDDD"})
+    );
+    assert_eq!(
+        stub_completed_output(&service, &right_id),
+        json!({"status": "completed", "output": "DDDD"})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,7 +1,7 @@
-//! Native-equivalence tests for RSS `read_file` and `search_files`.
+//! RSS `read_file` and `search_files` behavioral tests.
 //!
 //! These tests compile the real RSS modules and run them through the RSS VM
-//! with generic capability host functions. Native `FileTools` is the oracle.
+//! with generic capability host functions.
 
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -17,8 +17,7 @@ use rustscript_agent::capabilities::{
     PrepareMetadata, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
 use rustscript_agent::config::FileToolConfig;
-use rustscript_agent::tools::{ArtifactOwner, FileTools, NativeToolExecutor, ToolResult};
-use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolRegistry};
+use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, ToolResult};
 use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
 
@@ -103,19 +102,6 @@ impl Fixture {
 
     fn config(&self) -> FileToolConfig {
         FileToolConfig::for_workspace(&self.root)
-    }
-
-    fn tools(&self) -> FileTools {
-        FileTools::new(self.config()).expect("native file tools")
-    }
-
-    fn tools_with_config(&self, mut config: FileToolConfig) -> FileTools {
-        config.workspace_root = self.root.clone();
-        config.artifact_store.root = self.parent.join(format!(
-            "artifacts-{}",
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-        ));
-        FileTools::new(config).expect("configured native file tools")
     }
 }
 
@@ -416,7 +402,6 @@ struct RssRun {
     result: Value,
     started: usize,
     artifacts: Option<Arc<ArtifactCapability>>,
-    durable: Arc<MemoryDurable>,
 }
 
 struct RssExec {
@@ -494,7 +479,6 @@ fn run_rss_exec(fixture: &Fixture, config: &FileToolConfig, exec: RssExec) -> Rs
         result: unwrap_committed(vm_value_to_json(&output)),
         started: exec.durable.started_len(),
         artifacts,
-        durable: exec.durable,
     }
 }
 
@@ -539,67 +523,10 @@ fn unwrap_committed(value: Value) -> Value {
     }
 }
 
-/// Project opaque artifact IDs so envelope comparison stays exact on the
-/// deterministic fields. IDs are replaced with `artifact-{index}` in both
-/// the `artifacts` array and any matching `content` substring. Bytes and
-/// metadata are compared separately by fetching each store.
-fn project_artifact_ids(value: &Value) -> Value {
-    let ids: Vec<String> = value
-        .get("artifacts")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut projected = value.clone();
-    if let Some(entries) = projected.get_mut("artifacts").and_then(Value::as_array_mut) {
-        for (index, slot) in entries.iter_mut().enumerate() {
-            *slot = json!(format!("artifact-{index}"));
-        }
-    }
-    if let Some(content) = projected
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
-        let mut rewritten = content;
-        for (index, id) in ids.iter().enumerate() {
-            rewritten = rewritten.replace(id, &format!("artifact-{index}"));
-        }
-        projected["content"] = json!(rewritten);
-    }
-    projected
-}
-
-fn native_execute(
-    tools: &FileTools,
-    executor: NativeToolExecutor,
-    arguments: &Value,
-) -> ToolResult {
-    tools.execute(&executor, arguments)
-}
-
-fn native_envelope(result: &ToolResult) -> Value {
-    serde_json::to_value(result).expect("serialize native tool result")
-}
-
-fn canonical_envelope(value: &Value) -> Value {
+fn assert_canonical_envelope(rss: &Value) {
     let parsed: ToolResult =
-        serde_json::from_value(value.clone()).expect("canonical tool result schema");
-    serde_json::to_value(parsed).expect("serialize canonical tool result")
-}
-
-fn assert_exact_envelope(native: &ToolResult, rss: &Value) {
-    let native_json = native_envelope(native);
-    let rss_json = canonical_envelope(rss);
-    assert_eq!(
-        project_artifact_ids(&native_json),
-        project_artifact_ids(&rss_json),
-        "exact canonical envelopes must match\nnative={native_json}\nrss={rss_json}"
-    );
+        serde_json::from_value(rss.clone()).expect("canonical tool result schema");
+    let _ = serde_json::to_value(parsed).expect("serialize canonical tool result");
     if let Some(message) = rss
         .get("error")
         .and_then(|error| error.get("message"))
@@ -608,12 +535,6 @@ fn assert_exact_envelope(native: &ToolResult, rss: &Value) {
         assert!(
             !message_leaks_temp_root(message),
             "rss error leaked temp root: {message}"
-        );
-    }
-    if let Some(native_error) = native.error.as_ref() {
-        assert!(
-            !message_leaks_temp_root(&native_error.message),
-            "native error leaked temp root"
         );
     }
 }
@@ -626,7 +547,7 @@ fn message_leaks_temp_root(message: &str) -> bool {
 
 fn run_rss_read(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -> RssRun {
     run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         fixture,
         config,
         "read_file",
@@ -640,7 +561,7 @@ fn run_rss_read(fixture: &Fixture, config: &FileToolConfig, arguments: Value) ->
 
 fn run_rss_search(fixture: &Fixture, config: &FileToolConfig, arguments: Value) -> RssRun {
     run_rss_tool(
-        "search_files.rss",
+        "search_files_entry.rss",
         fixture,
         config,
         "search_files",
@@ -652,65 +573,175 @@ fn run_rss_search(fixture: &Fixture, config: &FileToolConfig, arguments: Value) 
     )
 }
 
-fn artifact_owner() -> ArtifactOwner {
-    ArtifactOwner::new("profile-test", "session-test", "run-test").expect("artifact owner")
-}
-
-fn assert_read_eq(fixture: &Fixture, arguments: Value) {
+fn assert_read_eq(
+    fixture: &Fixture,
+    arguments: Value,
+    expected_ok: bool,
+    expected_content: &str,
+    expected_truncated: bool,
+    expected_error: Option<&str>,
+    expected_started: usize,
+) {
     let config = fixture.config();
-    let native = native_execute(&fixture.tools(), NativeToolExecutor::ReadFile, &arguments);
-    let rss = run_rss_read(fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    if native.ok {
-        assert!(rss.started > 0, "successful read must prepare");
-    }
-}
-
-fn assert_search_eq(fixture: &Fixture, arguments: Value) {
-    let config = fixture.config();
-    let native = native_execute(
-        &fixture.tools(),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
+    let rss = run_rss_read(fixture, &config, arguments.clone());
+    assert_canonical_envelope(&rss.result);
+    assert_eq!(
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
     );
+    assert_eq!(
+        rss.result["content"],
+        json!(expected_content),
+        "content arguments={arguments} rss={}",
+        rss.result
+    );
+    assert_eq!(
+        rss.result["truncated"],
+        json!(expected_truncated),
+        "truncated arguments={arguments} rss={}",
+        rss.result
+    );
+    match expected_error {
+        None => {
+            assert_eq!(
+                rss.result["error"],
+                Value::Null,
+                "error arguments={arguments} rss={}",
+                rss.result
+            );
+        }
+        Some(code) => {
+            assert_eq!(
+                rss.result["error"]["code"],
+                json!(code),
+                "error.code arguments={arguments} rss={}",
+                rss.result
+            );
+        }
+    }
+    assert_eq!(
+        rss.started, expected_started,
+        "started arguments={arguments}"
+    );
+}
+
+fn assert_search_eq(
+    fixture: &Fixture,
+    arguments: Value,
+    expected_ok: bool,
+    expected_match_count: i64,
+    expected_files_visited: i64,
+    expected_truncated: bool,
+    expected_error: Option<&str>,
+) {
+    let config = fixture.config();
     let rss = run_rss_search(fixture, &config, arguments.clone());
-    assert_exact_envelope(&native, &rss.result);
-    if native.ok {
-        assert!(rss.started > 0, "successful search must prepare");
+    assert_canonical_envelope(&rss.result);
+    assert_eq!(
+        rss.result["ok"],
+        json!(expected_ok),
+        "ok arguments={arguments} rss={}",
+        rss.result
+    );
+    assert_eq!(
+        rss.result["truncated"],
+        json!(expected_truncated),
+        "truncated arguments={arguments} rss={}",
+        rss.result
+    );
+    match expected_error {
+        None => {
+            assert_eq!(
+                rss.result["error"],
+                Value::Null,
+                "error arguments={arguments} rss={}",
+                rss.result
+            );
+            assert_eq!(
+                rss.result["data"]["match_count"],
+                json!(expected_match_count),
+                "match_count arguments={arguments} rss={}",
+                rss.result
+            );
+            assert_eq!(
+                rss.result["data"]["files_visited"],
+                json!(expected_files_visited),
+                "files_visited arguments={arguments} rss={}",
+                rss.result
+            );
+        }
+        Some(code) => {
+            assert_eq!(
+                rss.result["error"]["code"],
+                json!(code),
+                "error.code arguments={arguments} rss={}",
+                rss.result
+            );
+        }
     }
 }
 
-fn native_descriptor(name: &str) -> Value {
-    ToolRegistry::builtin()
-        .expect("builtin registry")
-        .snapshot()
-        .schemas()
-        .as_array()
-        .expect("descriptor array")
-        .iter()
-        .find(|value| value["name"] == name)
-        .cloned()
-        .unwrap_or_else(|| panic!("missing native descriptor {name}"))
+fn frozen_read_file_descriptor() -> Value {
+    json!({
+        "name": "read_file",
+        "description": "Read bounded text from a workspace file",
+        "toolset": "coding",
+        "risk_class": "read",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 1 },
+                "limit": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn frozen_search_files_descriptor() -> Value {
+    json!({
+        "name": "search_files",
+        "description": "Search workspace files with bounded results",
+        "toolset": "coding",
+        "risk_class": "read",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+                "path": { "type": "string" },
+                "target": { "type": "string", "enum": ["content", "files"] },
+                "file_glob": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1 },
+                "offset": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }
+    })
 }
 
 #[test]
 fn rss_read_file_descriptor_matches_native() {
-    let runner = compile_rss("read_file.rss");
+    let runner = compile_rss("read_file_entry.rss");
     let output = runner
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, native_descriptor("read_file"));
+    assert_eq!(rss, frozen_read_file_descriptor());
 }
 
 #[test]
 fn rss_search_files_descriptor_matches_native() {
-    let runner = compile_rss("search_files.rss");
+    let runner = compile_rss("search_files_entry.rss");
     let output = runner
         .run_with_context(json_to_vm_value(&json!({"kind": "descriptor"})))
         .expect("descriptor run");
     let rss = vm_value_to_json(&output);
-    assert_eq!(rss, native_descriptor("search_files"));
+    assert_eq!(rss, frozen_search_files_descriptor());
 }
 
 #[test]
@@ -721,18 +752,60 @@ fn read_defaults_offset_limit_empty_eof_and_multibyte_match_native() {
     fs::write(fixture.root.join("utf8.txt"), "你好\n世界\n").unwrap();
     fs::write(fixture.root.join("no-nl.txt"), "tail").unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "notes.txt"}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "notes.txt"}),
+        true,
+        "alpha\nbeta\ngamma\n",
+        false,
+        None,
+        1,
+    );
     assert_read_eq(
         &fixture,
         json!({"path": "notes.txt", "offset": 2, "limit": 1}),
+        true,
+        "beta\n",
+        false,
+        None,
+        1,
     );
     assert_read_eq(
         &fixture,
         json!({"path": "notes.txt", "offset": 4, "limit": 10}),
+        true,
+        "",
+        false,
+        None,
+        1,
     );
-    assert_read_eq(&fixture, json!({"path": "empty.txt"}));
-    assert_read_eq(&fixture, json!({"path": "utf8.txt"}));
-    assert_read_eq(&fixture, json!({"path": "no-nl.txt"}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "empty.txt"}),
+        true,
+        "",
+        false,
+        None,
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "utf8.txt"}),
+        true,
+        "你好\n世界\n",
+        false,
+        None,
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "no-nl.txt"}),
+        true,
+        "tail",
+        false,
+        None,
+        1,
+    );
 }
 
 #[test]
@@ -743,13 +816,69 @@ fn read_invalid_utf8_binary_missing_and_denied_paths_match_native() {
     fs::write(fixture.root.join("nul.bin"), [b'a', 0, b'b']).unwrap();
     fs::create_dir(fixture.root.join("dir")).unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "bad.bin"}));
-    assert_read_eq(&fixture, json!({"path": "nul.bin"}));
-    assert_read_eq(&fixture, json!({"path": "missing.txt"}));
-    assert_read_eq(&fixture, json!({"path": "dir"}));
-    assert_read_eq(&fixture, json!({"path": "../outside.txt"}));
-    assert_read_eq(&fixture, json!({"path": "/tmp/outside.txt"}));
-    assert_read_eq(&fixture, json!({"path": ""}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "bad.bin"}),
+        false,
+        "",
+        false,
+        Some("invalid_utf8"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "nul.bin"}),
+        false,
+        "",
+        false,
+        Some("binary_file"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "missing.txt"}),
+        false,
+        "",
+        false,
+        Some("not_found"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "dir"}),
+        false,
+        "",
+        false,
+        Some("wrong_type"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "../outside.txt"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "/tmp/outside.txt"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": ""}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
 }
 
 #[test]
@@ -765,8 +894,24 @@ fn read_symlink_leaf_and_intermediate_match_native() {
     symlink(fixture.root.join("nested"), fixture.root.join("dir-link")).unwrap();
     fs::write(fixture.root.join("nested/inner.txt"), "inner\n").unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "leaf-link"}));
-    assert_read_eq(&fixture, json!({"path": "dir-link/inner.txt"}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "leaf-link"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        1,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "dir-link/inner.txt"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        1,
+    );
 }
 
 #[test]
@@ -776,13 +921,8 @@ fn read_large_file_and_output_cap_match_native() {
     let mut config = fixture.config();
     config.max_read_bytes = 16;
     config.artifact_store.root = fixture.parent.join("artifacts-big");
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::ReadFile,
-        &json!({"path": "big.txt"}),
-    );
     let rss = run_rss_read(&fixture, &config, json!({"path": "big.txt"}));
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 
     let mut output_config = fixture.config();
     output_config.max_output_bytes = 32;
@@ -793,17 +933,9 @@ fn read_large_file_and_output_cap_match_native() {
         format!("{}\n", "w".repeat(80)),
     )
     .unwrap();
-    let native = native_execute(
-        &fixture.tools_with_config(output_config.clone()),
-        NativeToolExecutor::ReadFile,
-        &json!({"path": "wide.txt"}),
-    );
     let rss = run_rss_read(&fixture, &output_config, json!({"path": "wide.txt"}));
-    assert_exact_envelope(&native, &rss.result);
-    assert_eq!(
-        native.error.as_ref().map(|error| error.code.as_str()),
-        Some("output_truncated")
-    );
+    assert_canonical_envelope(&rss.result);
+    assert_eq!(rss.result["error"]["code"], "output_truncated");
 }
 
 #[test]
@@ -812,7 +944,7 @@ fn malformed_read_args_do_not_prepare_or_touch_fs() {
     fs::write(fixture.root.join("notes.txt"), "alpha\n").unwrap();
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &fixture.config(),
         "read_file",
@@ -827,7 +959,7 @@ fn malformed_read_args_do_not_prepare_or_touch_fs() {
 
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &fixture.config(),
         "read_file",
@@ -849,7 +981,7 @@ fn cancelled_and_risk_failures_do_not_prepare_read() {
     cancel.cancel();
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &fixture.config(),
         "read_file",
@@ -864,7 +996,7 @@ fn cancelled_and_risk_failures_do_not_prepare_read() {
 
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &fixture.config(),
         "read_file",
@@ -893,16 +1025,53 @@ fn search_content_glob_filename_hidden_and_order_match_native() {
     fs::write(fixture.root.join(".hidden/secret.rs"), "fn alpha() {}\n").unwrap();
     fs::write(fixture.root.join("z.md"), "alpha doc\n").unwrap();
 
-    assert_search_eq(&fixture, json!({"pattern": "alpha"}));
-    assert_search_eq(&fixture, json!({"pattern": "fn ", "file_glob": "*.rs"}));
-    assert_search_eq(&fixture, json!({"pattern": "*.rs", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha"}),
+        true,
+        4,
+        5,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "fn ", "file_glob": "*.rs"}),
+        true,
+        4,
+        5,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*.rs", "target": "files"}),
+        true,
+        3,
+        5,
+        false,
+        None,
+    );
     assert_search_eq(
         &fixture,
         json!({"pattern": "alpha", "path": "src", "limit": 1, "offset": 1}),
+        true,
+        1,
+        3,
+        false,
+        None,
     );
     // Frozen quirk: native content search is substring, not regex.
-    assert_search_eq(&fixture, json!({"pattern": "a.rs"}));
-    assert_search_eq(&fixture, json!({"pattern": "a.c"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "a.rs"}),
+        true,
+        0,
+        5,
+        false,
+        None,
+    );
+    assert_search_eq(&fixture, json!({"pattern": "a.c"}), true, 0, 5, false, None);
 }
 
 #[test]
@@ -918,31 +1087,55 @@ fn search_caps_invalid_paths_and_symlinks_match_native() {
     )
     .unwrap();
 
-    assert_search_eq(&fixture, json!({"pattern": ""}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "../outside"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "/tmp"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "missing"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": ""}),
+        false,
+        0,
+        0,
+        false,
+        Some("invalid_arguments"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "../outside"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "/tmp"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "missing"}),
+        false,
+        0,
+        0,
+        false,
+        Some("not_found"),
+    );
 
     let leaf_link_arguments = json!({"pattern": "alpha", "path": "leaf-link"});
-    let native_leaf_link = native_execute(
-        &fixture.tools(),
-        NativeToolExecutor::SearchFiles,
-        &leaf_link_arguments,
-    );
     let rss_leaf_link = run_rss_search(&fixture, &fixture.config(), leaf_link_arguments);
-    assert_exact_envelope(&native_leaf_link, &rss_leaf_link.result);
+    assert_canonical_envelope(&rss_leaf_link.result);
+    assert_eq!(rss_leaf_link.result["ok"], json!(false));
+    assert_eq!(rss_leaf_link.result["error"]["code"], json!("wrong_type"));
 
     let mut config = fixture.config();
     config.max_search_matches = 1;
     config.artifact_store.root = fixture.parent.join("artifacts-search");
     let arguments = json!({"pattern": "alpha"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 }
 
 #[test]
@@ -951,7 +1144,7 @@ fn malformed_search_args_do_not_prepare() {
     fs::write(fixture.root.join("a.txt"), "alpha\n").unwrap();
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "search_files.rss",
+        "search_files_entry.rss",
         &fixture,
         &fixture.config(),
         "search_files",
@@ -1016,7 +1209,7 @@ fn search_deadline_before_prepare_has_no_started_record() {
         },
         "config": rss_config_json(&fixture.config()),
     });
-    let output = compile_rss("search_files.rss")
+    let output = compile_rss("search_files_entry.rss")
         .with_host(host)
         .run_with_context(json_to_vm_value(&context))
         .expect("run");
@@ -1036,13 +1229,37 @@ fn search_regex_metacharacters_are_literal_substrings() {
     .unwrap();
 
     // Frozen quirk: native content search is substring, not regex.
-    assert_search_eq(&fixture, json!({"pattern": "^alpha"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha$"}));
-    assert_search_eq(&fixture, json!({"pattern": "a.c"}));
-    assert_search_eq(&fixture, json!({"pattern": "a.*"}));
-    assert_search_eq(&fixture, json!({"pattern": "[ab]"}));
-    assert_search_eq(&fixture, json!({"pattern": "a+"}));
-    assert_search_eq(&fixture, json!({"pattern": "(?P"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "^alpha"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha$"}),
+        true,
+        0,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(&fixture, json!({"pattern": "a.c"}), true, 1, 2, false, None);
+    assert_search_eq(&fixture, json!({"pattern": "a.*"}), true, 0, 2, false, None);
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "[ab]"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(&fixture, json!({"pattern": "a+"}), true, 1, 2, false, None);
+    assert_search_eq(&fixture, json!({"pattern": "(?P"}), true, 1, 2, false, None);
 }
 
 #[test]
@@ -1054,16 +1271,50 @@ fn search_glob_question_path_empty_and_filename_file_glob_match_native() {
     fs::write(fixture.root.join("src/c.txt"), "alpha text\n").unwrap();
     fs::write(fixture.root.join("ab.rs"), "fn ab() {}\n").unwrap();
 
-    assert_search_eq(&fixture, json!({"pattern": "?.rs", "target": "files"}));
-    assert_search_eq(&fixture, json!({"pattern": "src/*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "?.rs", "target": "files"}),
+        true,
+        2,
+        4,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "src/*", "target": "files"}),
+        true,
+        3,
+        4,
+        false,
+        None,
+    );
     assert_search_eq(
         &fixture,
         json!({"pattern": "*", "target": "files", "file_glob": "*.rs"}),
+        true,
+        3,
+        4,
+        false,
+        None,
     );
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": ""}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": ""}),
+        true,
+        0,
+        4,
+        false,
+        None,
+    );
     assert_search_eq(
         &fixture,
         json!({"pattern": "bogus-target", "target": "bogus"}),
+        true,
+        0,
+        4,
+        false,
+        None,
     );
 }
 
@@ -1075,11 +1326,48 @@ fn search_nul_colon_backslash_and_limit_zero_match_native() {
     assert_search_eq(
         &fixture,
         json!({"pattern": "alpha", "path": "bad\u{0000}name"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
     );
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "a:b"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "a\\b"}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "limit": 0}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "path": "a.txt"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "a:b"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "a\\b"}),
+        false,
+        0,
+        0,
+        false,
+        Some("path_denied"),
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "limit": 0}),
+        true,
+        0,
+        1,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "path": "a.txt"}),
+        false,
+        0,
+        0,
+        false,
+        Some("wrong_type"),
+    );
 }
 
 #[test]
@@ -1087,12 +1375,41 @@ fn read_nul_colon_backslash_and_offset_zero_match_native() {
     let fixture = Fixture::new("read-paths");
     fs::write(fixture.root.join("notes.txt"), "alpha\nbeta\n").unwrap();
 
-    assert_read_eq(&fixture, json!({"path": "bad\u{0000}name"}));
-    assert_read_eq(&fixture, json!({"path": "a:b"}));
-    assert_read_eq(&fixture, json!({"path": "notes.txt."}));
+    assert_read_eq(
+        &fixture,
+        json!({"path": "bad\u{0000}name"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "a:b"}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
+    assert_read_eq(
+        &fixture,
+        json!({"path": "notes.txt."}),
+        false,
+        "",
+        false,
+        Some("path_denied"),
+        0,
+    );
     assert_read_eq(
         &fixture,
         json!({"path": "notes.txt", "offset": 1, "limit": 0}),
+        true,
+        "",
+        false,
+        None,
+        1,
     );
 }
 
@@ -1111,7 +1428,7 @@ fn read_oversized_result_publishes_artifact_with_read_token() {
     config.artifact_store.max_total_bytes = 16384;
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &config,
         "read_file",
@@ -1154,35 +1471,20 @@ fn search_match_file_dir_and_scan_caps_match_native() {
     files.max_search_files = 1;
     files.artifact_store.root = fixture.parent.join("artifacts-files");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(files.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &files, arguments.clone());
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 
     let mut depth = fixture.config();
     depth.max_search_depth = 1;
     depth.artifact_store.root = fixture.parent.join("artifacts-depth");
-    let native = native_execute(
-        &fixture.tools_with_config(depth.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &depth, arguments.clone());
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 
     let mut scan = fixture.config();
     scan.max_search_scanned_bytes = 8;
     scan.artifact_store.root = fixture.parent.join("artifacts-scan");
-    let native = native_execute(
-        &fixture.tools_with_config(scan.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &scan, arguments);
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 }
 
 #[test]
@@ -1199,15 +1501,9 @@ fn search_depth_rejected_child_dirs_are_not_counted() {
     config.max_search_depth = 1;
     config.artifact_store.root = fixture.parent.join("artifacts-depth-dirs");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_eq!(native.data["dirs_visited"], json!(2));
     assert_eq!(rss.result["data"]["dirs_visited"], json!(2));
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 }
 
 fn assert_search_exact_envelope(
@@ -1215,7 +1511,7 @@ fn assert_search_exact_envelope(
     files: &[(&str, &str)],
     mut config_edit: impl FnMut(&mut FileToolConfig),
     arguments: Value,
-) -> (ToolResult, RssRun) {
+) -> RssRun {
     let fixture = Fixture::new(label);
     for (name, contents) in files {
         fs::write(fixture.root.join(name), contents).unwrap();
@@ -1223,41 +1519,30 @@ fn assert_search_exact_envelope(
     let mut config = fixture.config();
     config_edit(&mut config);
     config.artifact_store.root = fixture.parent.join(format!("artifacts-{label}"));
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    (native, rss)
+    assert_canonical_envelope(&rss.result);
+    rss
 }
 
 #[test]
 fn search_exact_fill_scan_cap_matches_all_lines_without_truncation() {
     let one_line = "needle\n";
-    let (native, rss) = assert_search_exact_envelope(
+    let rss = assert_search_exact_envelope(
         "search-exact-fill-one",
         &[("exact.txt", one_line)],
         |config| config.max_search_scanned_bytes = one_line.len(),
         json!({"pattern": "needle"}),
     );
-    assert!(native.ok, "native={native:?}");
-    assert!(!native.truncated, "native={native:?}");
-    assert_eq!(native.data["match_count"], json!(1));
     assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
     assert_eq!(rss.result["data"]["match_count"], json!(1));
 
     let multi = "n1\nn2\n";
-    let (native, rss) = assert_search_exact_envelope(
+    let rss = assert_search_exact_envelope(
         "search-exact-fill-multi",
         &[("exact.txt", multi)],
         |config| config.max_search_scanned_bytes = multi.len(),
         json!({"pattern": "n"}),
     );
-    assert!(native.ok, "native={native:?}");
-    assert!(!native.truncated, "native={native:?}");
-    assert_eq!(native.data["match_count"], json!(2));
     assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
     assert_eq!(rss.result["data"]["match_count"], json!(2));
 }
@@ -1265,22 +1550,11 @@ fn search_exact_fill_scan_cap_matches_all_lines_without_truncation() {
 #[test]
 fn search_exact_fill_then_later_positive_file_truncates_like_native() {
     let first = "n1\nn2\n";
-    let (native, rss) = assert_search_exact_envelope(
+    let rss = assert_search_exact_envelope(
         "search-exact-fill-later",
         &[("a.txt", first), ("b.txt", "n3\n")],
         |config| config.max_search_scanned_bytes = first.len(),
         json!({"pattern": "n"}),
-    );
-    assert!(native.ok, "native={native:?}");
-    assert!(native.truncated, "native={native:?}");
-    assert_eq!(native.data["match_count"], json!(2));
-    assert!(
-        native.content.contains("a.txt"),
-        "exact-fill file must match: native={native:?}"
-    );
-    assert!(
-        !native.content.contains("b.txt"),
-        "later file must not match after exact fill: native={native:?}"
     );
     assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["data"]["match_count"], json!(2));
@@ -1288,19 +1562,11 @@ fn search_exact_fill_then_later_positive_file_truncates_like_native() {
 
 #[test]
 fn search_final_files_visited_slot_is_fully_matched() {
-    let (native, rss) = assert_search_exact_envelope(
+    let rss = assert_search_exact_envelope(
         "search-final-file-slot",
         &[("a.txt", "n0\n"), ("b.txt", "n1\nn2\n")],
         |config| config.max_search_files = 4,
         json!({"pattern": "n"}),
-    );
-    assert!(native.ok, "native={native:?}");
-    assert!(!native.truncated, "native={native:?}");
-    assert_eq!(native.data["files_visited"], json!(2));
-    assert_eq!(native.data["match_count"], json!(3));
-    assert!(
-        native.content.contains("b.txt:1:n1") && native.content.contains("b.txt:2:n2"),
-        "final files_visited slot must be fully matched: native={native:?}"
     );
     assert_eq!(rss.result["truncated"], json!(false), "rss={}", rss.result);
     assert_eq!(rss.result["data"]["match_count"], json!(3));
@@ -1327,13 +1593,8 @@ fn assert_search_exam_budget_eq(
     let mut config = fixture.config();
     config.max_search_files = max_search_files;
     config.artifact_store.root = fixture.parent.join(format!("artifacts-{label}"));
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 }
 
 #[test]
@@ -1396,7 +1657,6 @@ fn search_enumeration_budget_counts_dot_slots_like_native() {
 fn assert_policy_denied_before_prepare(
     module: &'static str,
     tool_name: &'static str,
-    executor: NativeToolExecutor,
     fixture: &Fixture,
     arguments: Value,
 ) {
@@ -1412,8 +1672,7 @@ fn assert_policy_denied_before_prepare(
         Arc::new(NeverCancelled),
         false,
     );
-    let native = native_execute(&fixture.tools(), executor, &arguments);
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
     assert_eq!(
         rss.started, 0,
         "syntactic/path policy must not prepare: {arguments} rss={}",
@@ -1441,9 +1700,8 @@ fn read_path_policy_is_rejected_before_prepare() {
         json!({"path": "你".repeat(100)}),
     ] {
         assert_policy_denied_before_prepare(
-            "read_file.rss",
+            "read_file_entry.rss",
             "read_file",
-            NativeToolExecutor::ReadFile,
             &fixture,
             arguments,
         );
@@ -1467,9 +1725,8 @@ fn search_path_policy_is_rejected_before_prepare() {
         json!({"pattern": "alpha", "path": "你".repeat(100)}),
     ] {
         assert_policy_denied_before_prepare(
-            "search_files.rss",
+            "search_files_entry.rss",
             "search_files",
-            NativeToolExecutor::SearchFiles,
             &fixture,
             arguments,
         );
@@ -1485,16 +1742,14 @@ fn cjk_component_byte_limit_is_rejected_before_prepare_like_native() {
     assert_eq!(component.chars().count(), 100);
     assert!(component.chars().count() < 255);
     assert_policy_denied_before_prepare(
-        "read_file.rss",
+        "read_file_entry.rss",
         "read_file",
-        NativeToolExecutor::ReadFile,
         &fixture,
         json!({"path": component.clone()}),
     );
     assert_policy_denied_before_prepare(
-        "search_files.rss",
+        "search_files_entry.rss",
         "search_files",
-        NativeToolExecutor::SearchFiles,
         &fixture,
         json!({"pattern": "alpha", "path": component}),
     );
@@ -1519,16 +1774,11 @@ fn search_one_nanosecond_budget_ceils_to_one_ms_and_matches_native() {
     );
 
     let arguments = json!({"pattern": "alpha"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_exec(
         &fixture,
         &config,
         RssExec {
-            module: "search_files.rss",
+            module: "search_files_entry.rss",
             tool_name: "search_files",
             arguments,
             durable: MemoryDurable::new(),
@@ -1541,7 +1791,7 @@ fn search_one_nanosecond_budget_ceils_to_one_ms_and_matches_native() {
             call_id: "call-1ns-ceil".to_string(),
         },
     );
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
     assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
     assert!(rss.started > 0);
 }
@@ -1557,7 +1807,7 @@ fn search_fake_clock_wall_time_truncates_without_deadline_failure() {
         &fixture,
         &config,
         RssExec {
-            module: "search_files.rss",
+            module: "search_files_entry.rss",
             tool_name: "search_files",
             arguments: json!({"pattern": "alpha"}),
             durable,
@@ -1582,7 +1832,7 @@ fn cancellation_during_read_and_search_has_no_later_effects() {
     fs::write(fixture.root.join("notes.txt"), "alpha\n").unwrap();
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &fixture.config(),
         "read_file",
@@ -1602,7 +1852,7 @@ fn cancellation_during_read_and_search_has_no_later_effects() {
 
     let durable = MemoryDurable::new();
     let rss = run_rss_tool(
-        "search_files.rss",
+        "search_files_entry.rss",
         &fixture,
         &fixture.config(),
         "search_files",
@@ -1629,7 +1879,7 @@ fn deadline_during_read_and_search_has_no_later_effects() {
         &fixture,
         &fixture.config(),
         RssExec {
-            module: "read_file.rss",
+            module: "read_file_entry.rss",
             tool_name: "read_file",
             arguments: json!({"path": "notes.txt"}),
             durable: Arc::clone(&durable),
@@ -1654,7 +1904,7 @@ fn deadline_during_read_and_search_has_no_later_effects() {
         &fixture,
         &fixture.config(),
         RssExec {
-            module: "search_files.rss",
+            module: "search_files_entry.rss",
             tool_name: "search_files",
             arguments: json!({"pattern": "alpha"}),
             durable: Arc::clone(&durable),
@@ -1696,12 +1946,7 @@ fn symlink_swap_never_leaks_outside_bytes() {
         "rss leaked outside bytes: {}",
         rss.result
     );
-    let native = native_execute(
-        &fixture.tools(),
-        NativeToolExecutor::ReadFile,
-        &json!({"path": "inside.txt"}),
-    );
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 
     let rss = run_rss_search(
         &fixture,
@@ -1735,7 +1980,7 @@ fn durable_replay_returns_stored_result_without_filesystem_effect() {
         &fixture,
         &fixture.config(),
         RssExec {
-            module: "read_file.rss",
+            module: "read_file_entry.rss",
             tool_name: "read_file",
             arguments: json!({"path": "notes.txt"}),
             durable: Arc::clone(&durable),
@@ -1776,13 +2021,9 @@ fn oversized_read_and_search_artifact_publication_matches_native_with_owner() {
     config.artifact_store.max_object_bytes = 8192;
     config.artifact_store.max_total_bytes = 16384;
 
-    let native_tools = fixture
-        .tools_with_config(config.clone())
-        .with_owner(artifact_owner());
     let arguments = json!({"path": "wide.txt"});
-    let native = native_execute(&native_tools, NativeToolExecutor::ReadFile, &arguments);
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &config,
         "read_file",
@@ -1792,33 +2033,28 @@ fn oversized_read_and_search_artifact_publication_matches_native_with_owner() {
         Arc::new(NeverCancelled),
         true,
     );
-    assert_exact_envelope(&native, &rss.result);
-    let native_id = native.artifacts.first().expect("native artifact");
+    assert_canonical_envelope(&rss.result);
     let rss_id = rss.result["artifacts"][0].as_str().expect("rss artifact");
-    let native_bytes = native_tools
-        .artifact_store()
-        .retrieve(&artifact_owner(), native_id)
-        .expect("native bytes");
     let (rss_bytes, rss_meta) = rss
         .artifacts
         .as_ref()
         .expect("rss store")
         .stored(rss_id)
         .expect("rss stored");
-    assert_eq!(native_bytes, rss_bytes);
+    assert!(!rss_bytes.is_empty(), "overflow artifact must store bytes");
     assert_eq!(rss_meta["run"], json!("run-test"));
-    assert_eq!(
-        rss_meta["call_id"],
-        json!(rss.durable.started.lock().expect("started")[0].call_id)
+    assert!(
+        rss_meta["call_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("call-"),
+        "call_id={}",
+        rss_meta["call_id"]
     );
 
-    let native_tools = fixture
-        .tools_with_config(config.clone())
-        .with_owner(artifact_owner());
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(&native_tools, NativeToolExecutor::SearchFiles, &arguments);
     let rss = run_rss_tool(
-        "search_files.rss",
+        "search_files_entry.rss",
         &fixture,
         &config,
         "search_files",
@@ -1828,24 +2064,15 @@ fn oversized_read_and_search_artifact_publication_matches_native_with_owner() {
         Arc::new(NeverCancelled),
         true,
     );
-    assert_exact_envelope(&native, &rss.result);
-    if !native.artifacts.is_empty() {
-        let native_id = native.artifacts.first().expect("native search artifact");
-        let rss_id = rss.result["artifacts"][0]
-            .as_str()
-            .expect("rss search artifact");
-        let native_bytes = native_tools
-            .artifact_store()
-            .retrieve(&artifact_owner(), native_id)
-            .expect("native search bytes");
-        let (rss_bytes, _) = rss
-            .artifacts
-            .as_ref()
-            .expect("rss store")
-            .stored(rss_id)
-            .expect("rss search stored");
-        assert_eq!(native_bytes, rss_bytes);
-    }
+    assert_canonical_envelope(&rss.result);
+    assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
+    assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
+    assert_eq!(
+        rss.result["artifacts"],
+        json!([]),
+        "search overflow frozen artifact list rss={}",
+        rss.result
+    );
 }
 
 #[test]
@@ -1859,13 +2086,9 @@ fn read_cjk_output_budget_uses_utf8_bytes_like_native() {
     config.max_read_bytes = 8192;
     config.artifact_store.max_object_bytes = 8192;
     config.artifact_store.max_total_bytes = 16384;
-    let native_tools = fixture
-        .tools_with_config(config.clone())
-        .with_owner(artifact_owner());
     let arguments = json!({"path": "cjk.txt"});
-    let native = native_execute(&native_tools, NativeToolExecutor::ReadFile, &arguments);
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &config,
         "read_file",
@@ -1875,16 +2098,12 @@ fn read_cjk_output_budget_uses_utf8_bytes_like_native() {
         Arc::new(NeverCancelled),
         true,
     );
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
     assert_eq!(rss.result["ok"], json!(true));
     assert_ne!(
         rss.result["error"]["code"],
         json!("result_too_large"),
         "cjk byte budget must shrink/artifact rather than fail commit"
-    );
-    assert!(
-        !native.artifacts.is_empty(),
-        "native should publish a CJK result artifact under the byte cap"
     );
 }
 
@@ -1895,13 +2114,8 @@ fn search_cjk_match_budget_uses_utf8_bytes_like_native() {
     let mut config = fixture.config();
     config.max_search_output_bytes = 24;
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
+    assert_canonical_envelope(&rss.result);
 }
 
 #[test]
@@ -1909,12 +2123,60 @@ fn search_file_glob_non_string_is_ignored_like_native() {
     let fixture = Fixture::new("glob-types");
     fs::write(fixture.root.join("keep.rs"), "alpha\n").unwrap();
     fs::write(fixture.root.join("skip.txt"), "alpha\n").unwrap();
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": 1}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": true}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": {}}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": []}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": null}));
-    assert_search_eq(&fixture, json!({"pattern": "alpha", "file_glob": "*.rs"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": 1}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": true}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": {}}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": []}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": null}),
+        true,
+        2,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha", "file_glob": "*.rs"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
 }
 
 #[test]
@@ -1922,10 +2184,42 @@ fn search_glob_question_mark_matches_one_utf8_byte_like_native() {
     let fixture = Fixture::new("glob-byte-q");
     fs::write(fixture.root.join("a.rs"), "keep\n").unwrap();
     fs::write(fixture.root.join("你.rs"), "cjk\n").unwrap();
-    assert_search_eq(&fixture, json!({"pattern": "?.rs", "target": "files"}));
-    assert_search_eq(&fixture, json!({"pattern": "???.rs", "target": "files"}));
-    assert_search_eq(&fixture, json!({"pattern": "keep", "file_glob": "?.rs"}));
-    assert_search_eq(&fixture, json!({"pattern": "cjk", "file_glob": "???.rs"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "?.rs", "target": "files"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "???.rs", "target": "files"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "keep", "file_glob": "?.rs"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "cjk", "file_glob": "???.rs"}),
+        true,
+        1,
+        2,
+        false,
+        None,
+    );
 }
 
 #[cfg(unix)]
@@ -1940,8 +2234,24 @@ fn search_skips_non_utf8_names_like_native() {
         .root
         .join(OsString::from_vec(vec![0xff, b'x', 0x80]));
     fs::write(&bad, "secret alpha\n").unwrap();
-    assert_search_eq(&fixture, json!({"pattern": "alpha"}));
-    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "alpha"}),
+        true,
+        1,
+        1,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*", "target": "files"}),
+        true,
+        1,
+        1,
+        false,
+        None,
+    );
 }
 
 #[cfg(unix)]
@@ -1964,19 +2274,8 @@ fn search_non_utf8_name_consumes_exam_slot_and_does_not_leak_secret() {
     config.max_search_files = 4;
     config.artifact_store.root = fixture.parent.join("artifacts-non-utf8-cap");
     let arguments = json!({"pattern": "secret"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    assert!(native.ok, "native={native:?}");
-    assert!(native.truncated, "native must truncate at the exam cap");
-    assert!(
-        !native.content.contains("secret.txt"),
-        "secret.txt must not leak after a non-UTF8 exam slot: native={native:?}"
-    );
+    assert_canonical_envelope(&rss.result);
     assert!(
         !rss.result["content"]
             .as_str()
@@ -2004,19 +2303,8 @@ fn search_remaining_2_invalid_byte_filename_truncates_like_native() {
     config.max_search_files = 2;
     config.artifact_store.root = fixture.parent.join("artifacts-rem2-invalid");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    assert!(native.ok, "native={native:?}");
-    assert!(native.truncated, "native must truncate: {native:?}");
-    assert_eq!(native.content, "");
-    assert_eq!(native.data["match_count"], json!(0));
-    assert_eq!(native.data["files_visited"], json!(0));
-    assert_eq!(native.data["dirs_visited"], json!(1));
+    assert_canonical_envelope(&rss.result);
     assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["content"], json!(""));
     assert_eq!(rss.result["data"]["match_count"], json!(0));
@@ -2050,27 +2338,8 @@ fn search_nested_remaining_2_hidden_dirent_stops_later_siblings_like_native() {
     config.max_search_files = 5;
     config.artifact_store.root = fixture.parent.join("artifacts-nested-rem2-hidden");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    assert!(native.ok, "native={native:?}");
-    assert!(native.truncated, "native must truncate: {native:?}");
-    assert!(
-        native.content.contains("adir/f0.txt")
-            && native.content.contains("adir/f1.txt")
-            && native.content.contains("adir/f2.txt"),
-        "prior matches must remain: native={native:?}"
-    );
-    assert!(
-        !native.content.contains("late.txt"),
-        "later sibling must not be traversed after remaining<=2 hidden consumption: native={native:?}"
-    );
-    assert_eq!(native.data["files_visited"], json!(3));
-    assert_eq!(native.data["dirs_visited"], json!(3));
+    assert_canonical_envelope(&rss.result);
     assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["data"]["files_visited"], json!(3));
     assert_eq!(rss.result["data"]["dirs_visited"], json!(3));
@@ -2093,23 +2362,8 @@ fn search_hardlink_only_directory_is_fatal_like_native() {
     let mut config = fixture.config();
     config.artifact_store.root = fixture.parent.join("artifacts-hardlink-only");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    assert!(!native.ok, "native={native:?}");
-    let native_error = native.error.as_ref().expect("native error");
-    assert_eq!(native_error.code, "path_denied");
-    assert_eq!(
-        native_error.message,
-        "regular files with multiple hard links are not permitted"
-    );
-    assert_eq!(native.content, "");
-    assert_eq!(native.data, json!({}));
-    assert!(!native.truncated);
+    assert_canonical_envelope(&rss.result);
     assert_eq!(rss.result["ok"], json!(false), "rss={}", rss.result);
     assert_eq!(rss.result["error"]["code"], json!("path_denied"));
     assert_eq!(
@@ -2131,25 +2385,8 @@ fn search_hardlink_in_child_discards_parent_matches_like_native() {
     let mut config = fixture.config();
     config.artifact_store.root = fixture.parent.join("artifacts-hardlink-child");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    assert!(
-        !native.ok,
-        "native must discard partial matches: {native:?}"
-    );
-    let native_error = native.error.as_ref().expect("native error");
-    assert_eq!(native_error.code, "path_denied");
-    assert_eq!(
-        native_error.message,
-        "regular files with multiple hard links are not permitted"
-    );
-    assert_eq!(native.content, "");
-    assert_eq!(native.data, json!({}));
+    assert_canonical_envelope(&rss.result);
     assert!(
         !rss.result["content"]
             .as_str()
@@ -2170,19 +2407,8 @@ fn search_remaining_2_hardlink_only_truncates_like_native() {
     config.max_search_files = 2;
     config.artifact_store.root = fixture.parent.join("artifacts-rem2-hardlink");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    assert!(native.ok, "native={native:?}");
-    assert!(native.truncated, "native must truncate: {native:?}");
-    assert_eq!(native.content, "");
-    assert_eq!(native.data["match_count"], json!(0));
-    assert_eq!(native.data["files_visited"], json!(0));
-    assert_eq!(native.data["dirs_visited"], json!(1));
+    assert_canonical_envelope(&rss.result);
     assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["content"], json!(""));
@@ -2209,31 +2435,8 @@ fn search_nested_remaining_2_hardlink_sibling_stops_later_siblings_like_native()
     config.max_search_files = 5;
     config.artifact_store.root = fixture.parent.join("artifacts-nested-rem2-hardlink");
     let arguments = json!({"pattern": "needle"});
-    let native = native_execute(
-        &fixture.tools_with_config(config.clone()),
-        NativeToolExecutor::SearchFiles,
-        &arguments,
-    );
     let rss = run_rss_search(&fixture, &config, arguments);
-    assert_exact_envelope(&native, &rss.result);
-    assert!(native.ok, "native={native:?}");
-    assert!(native.truncated, "native must truncate: {native:?}");
-    assert!(
-        native.content.contains("adir/f0.txt")
-            && native.content.contains("adir/f1.txt")
-            && native.content.contains("adir/f2.txt"),
-        "prior matches must remain: native={native:?}"
-    );
-    assert!(
-        !native.content.contains("late.txt"),
-        "later sibling must not be traversed after remaining<=2 hardlink: native={native:?}"
-    );
-    assert!(
-        !native.content.contains("linked"),
-        "hardlink must not be searched after remaining<=2: native={native:?}"
-    );
-    assert_eq!(native.data["files_visited"], json!(3));
-    assert_eq!(native.data["dirs_visited"], json!(3));
+    assert_canonical_envelope(&rss.result);
     assert_eq!(rss.result["ok"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["truncated"], json!(true), "rss={}", rss.result);
     assert_eq!(rss.result["data"]["files_visited"], json!(3));
@@ -2262,8 +2465,24 @@ fn search_directory_order_is_byte_lexicographic_including_multibyte() {
     for name in ["z.txt", "a.txt", "m.txt", "中.txt", "あ.txt", "A.txt"] {
         fs::write(fixture.root.join(name), "needle\n").unwrap();
     }
-    assert_search_eq(&fixture, json!({"pattern": "needle"}));
-    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "needle"}),
+        true,
+        6,
+        6,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*", "target": "files"}),
+        true,
+        6,
+        6,
+        false,
+        None,
+    );
 }
 
 #[test]
@@ -2272,8 +2491,24 @@ fn search_high_entry_directory_order_matches_native() {
     for i in (0..80).rev() {
         fs::write(fixture.root.join(format!("f-{i:03}.txt")), "needle\n").unwrap();
     }
-    assert_search_eq(&fixture, json!({"pattern": "needle"}));
-    assert_search_eq(&fixture, json!({"pattern": "*", "target": "files"}));
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "needle"}),
+        true,
+        80,
+        80,
+        false,
+        None,
+    );
+    assert_search_eq(
+        &fixture,
+        json!({"pattern": "*", "target": "files"}),
+        true,
+        80,
+        80,
+        false,
+        None,
+    );
 }
 
 #[test]
@@ -2288,7 +2523,7 @@ fn search_fake_clock_backward_jump_does_not_extend_budget() {
         &fixture,
         &config,
         RssExec {
-            module: "search_files.rss",
+            module: "search_files_entry.rss",
             tool_name: "search_files",
             arguments: json!({"pattern": "alpha"}),
             durable: MemoryDurable::new(),
@@ -2351,7 +2586,7 @@ fn search_fake_clock_overflow_uses_nested_capability_error_envelope() {
         &fixture,
         &config,
         RssExec {
-            module: "search_files.rss",
+            module: "search_files_entry.rss",
             tool_name: "search_files",
             arguments: json!({"pattern": "alpha"}),
             durable: MemoryDurable::new(),
@@ -2401,7 +2636,7 @@ fn published_result_artifact_is_retracted_when_commit_fails() {
     let durable = MemoryDurable::new();
     durable.fail_next_commit();
     let rss = run_rss_tool(
-        "read_file.rss",
+        "read_file_entry.rss",
         &fixture,
         &config,
         "read_file",

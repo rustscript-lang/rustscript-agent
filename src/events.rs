@@ -77,6 +77,61 @@ pub fn schema_violation_error(reason: &str) -> Value {
     })
 }
 
+/// Durable event append failures shared by provider and lifecycle committers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventCommitError {
+    Terminal,
+    Cancelled,
+    PersistFailed(String),
+    MissingParent,
+    Corrupt(String),
+}
+
+/// Durable-first event sink used by lifecycle committers. Implementations must
+/// not publish after the run has committed a terminal state.
+pub trait DurableEventCommitter: Send + Sync {
+    fn is_terminal(&self) -> bool;
+    fn stop_requested(&self) -> bool {
+        false
+    }
+    fn commit(&self, event_type: &str, data: Value) -> Result<(), EventCommitError>;
+    /// Persist a tool step. Default forwards to [`Self::commit`]; production
+    /// committers attach a durable tool_result message for output/completed/failed.
+    fn commit_step(
+        &self,
+        event_type: &str,
+        data: Value,
+        result: Option<&crate::tool_result::ToolResult>,
+    ) -> Result<(), EventCommitError> {
+        let _ = result;
+        self.commit(event_type, data)
+    }
+    /// Read-only pre-effect prepare: resolve the durable assistant tool-call
+    /// parent. Missing or name-mismatched parents return
+    /// [`EventCommitError::MissingParent`]. Default is a no-op success so
+    /// in-memory test committers keep working.
+    fn prepare_tool_parent(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<(String, String), EventCommitError> {
+        let _ = tool_call_id;
+        Ok((String::new(), name.to_string()))
+    }
+    /// Read-only pre-effect replay: return a canonical completed/failed/
+    /// interrupted `ToolResult` when durable state already has one. Default
+    /// is `Ok(None)` so in-memory test committers keep executing.
+    /// Corrupt canonical state must return [`EventCommitError::Corrupt`].
+    fn replay_durable_tool_result(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<crate::tool_result::ToolResult>, EventCommitError> {
+        let _ = (tool_call_id, name);
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,7 +42,7 @@ wins. The aliases are scheduled for removal before v1 — do not rely on them.
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
 | `RUSTSCRIPT_AGENT_ALLOW_PORTS` | `PD_EDGE_AGENT_ALLOW_PORTS` | comma-separated list of `u16` | empty (deny all) | When set it must contain at least one valid port and no empty entries; otherwise startup fails. Empty list denies all ports — with the default configuration no request can be made, so production deployments must list the ports scripts may reach (for example `443`). |
 | `RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS` | `PD_EDGE_AGENT_ALLOW_PRIVATE_IPS` | flag | unset (`false`) | Only the exact value `1` allows destinations on private/loopback IP ranges. |
-| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | unset | Path to the RSS agent source. Read and compiled at startup; sources over 1 MiB (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
+| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | bundled `rss/agent/main.rss` | Path to the RSS agent **entry file**. The gateway compiles that file and its module tree (`with_agent_file`); it is not a source string. When unset, production `AgentGatewayState::new` / `with_sqlite_path` install the bundled `main.rss`. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
 | `RUSTSCRIPT_AGENT_STATE_DB` | `PD_EDGE_AGENT_STATE_DB` | filesystem path | unset (in-memory) | SQLite state file (sessions, messages, runs, events, jobs, approvals, compactions). Without it the gateway runs in-memory only and state is lost on restart. See `docs/deployment.md`. |
 | Rate limiting (A7) |
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED` | `PD_EDGE_AGENT_RATE_LIMIT_ENABLED` | flag | `0` (disabled) | Only the exact values `0`/`1` are accepted; anything else fails startup. When enabled, every API request consumes one per-peer-IP token and verified requests additionally consume one per-account token. |
@@ -193,12 +193,11 @@ page bounds.
 ## Coding tools and serial loop
 
 The library `AgentService` worker compiles bundled `rss/agent/main.rss` and
-drives a **serial** native tool loop. RSS builds canonical provider requests
-and dispatches tools only through the native host bridges
-(`agent::provider_call`, `agent::tool_dispatch`). This is not an
-OpenAI-compatible inference path.
+drives a **serial** RSS `tools::dispatch` loop over the generic capability
+host (`agent::provider_call`, filesystem/process/artifact adapters). This is
+not an OpenAI-compatible inference path.
 
-Built-in native tools, in registry order:
+Built-in RSS registry tools, in registry order:
 
 | Name | Toolset | Risk | Notes |
 | --- | --- | --- | --- |
