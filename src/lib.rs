@@ -28,6 +28,14 @@ pub mod tool_schema;
 mod durable_provider;
 
 pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
+pub use auth::store::{
+    ACCESS_HANDLE_CLASS, AuthMetadata, AuthStore, AuthStoreError, CredentialStore,
+    OpaqueAccessHandle, OpaqueRefreshHandle, OpaqueSecretSlot, REFRESH_HANDLE_CLASS,
+    RefreshSecretAction, SaveCredentialRequest, SaveOutcome,
+};
+#[cfg(feature = "config-fixture")]
+pub use auth::store_host::{AuthFixtureHost, auth_store_fixture_catalog};
+pub use auth::token::{AuthStatus, CredentialId, TokenError};
 pub use config::{AgentGatewayConfig, TelegramConfig};
 pub use config_file::{
     AgentPaths, BoundedPublicConfig, ConfigFile, ConfigFileError, ConfigPaths, LoadedConfig,
@@ -35,6 +43,7 @@ pub use config_file::{
 };
 #[cfg(feature = "config-fixture")]
 pub mod config_fixture {
+    pub use crate::auth::store_host::{AuthFixtureHost, auth_store_fixture_catalog};
     pub use crate::config_file::{
         ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyProbe,
         SanitizedPolicySummary,

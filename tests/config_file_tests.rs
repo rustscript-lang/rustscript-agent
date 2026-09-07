@@ -394,7 +394,6 @@ fn malformed_yaml_is_typed_and_auth_debug_redacts_tokens() {
     let debug = format!("{auth:?}");
     assert!(!debug.contains("SYNTHETIC_ACCESS_TOKEN"));
     assert!(!debug.contains("SYNTHETIC_REFRESH_TOKEN"));
-    assert!(debug.contains("REDACTED"));
 
     let inline_config = "x".repeat(MAX_CONFIG_YAML_BYTES + 1);
     let error = ConfigFile::from_str(&inline_config).expect_err("inline config must be bounded");

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
+use zeroize::Zeroizing;
 
 use crate::config_file::{
     BoundedReadError, YamlBoundsError, YamlPreflightError, parse_yaml_value, preflight_yaml,
@@ -19,8 +20,12 @@ use crate::config_file::{
 /// Maximum bytes read from `auth.yaml` before parsing is attempted.
 pub const MAX_AUTH_YAML_BYTES: usize = 256 * 1024;
 
-/// Version-one credential and token lifecycle document.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Version-one credential document with only structural metadata.
+///
+/// The YAML file contains secret slots, but this public projection deliberately
+/// does not. It is the only credential shape exposed to configuration and RSS
+/// callers, so serialization and diagnostics cannot disclose token bytes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub version: u32,
@@ -28,21 +33,17 @@ pub struct AuthConfig {
     pub credentials: BTreeMap<String, CredentialConfig>,
 }
 
-/// Compatibility name for a persisted credential entry.
+/// Compatibility name for a structural credential record.
 pub type Credential = CredentialConfig;
 
-/// A named credential entry. Token fields are intentionally opaque to callers
-/// and are redacted by the custom `Debug` implementation below.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Structural metadata for one named credential.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialConfig {
     pub provider: String,
     pub kind: String,
     pub source: String,
     pub token_type: String,
-    pub access_token: String,
-    #[serde(default)]
-    pub refresh_token: Option<String>,
     pub expires_at_ms: u64,
     #[serde(default)]
     pub scopes: Vec<String>,
@@ -54,42 +55,210 @@ pub struct CredentialConfig {
     pub status: String,
     #[serde(default)]
     pub last_refresh_at_ms: Option<u64>,
+    #[serde(default)]
+    pub has_refresh_token: bool,
 }
 
 fn default_status() -> String {
     "active".to_string()
 }
 
-impl fmt::Debug for CredentialConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CredentialConfig")
-            .field("provider", &self.provider)
-            .field("kind", &self.kind)
-            .field("source", &self.source)
-            .field("token_type", &self.token_type)
-            .field("access_token", &"REDACTED")
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "REDACTED"),
-            )
-            .field("expires_at_ms", &self.expires_at_ms)
-            .field("scopes", &self.scopes)
-            .field("account_id", &self.account_id)
-            .field("generation", &self.generation)
-            .field("status", &self.status)
-            .field("last_refresh_at_ms", &self.last_refresh_at_ms)
-            .finish()
+/// A private YAML string wrapper whose allocation is zeroized on drop.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SecretText(Zeroizing<Vec<u8>>);
+
+impl SecretText {
+    pub(crate) fn from_bytes(bytes: Zeroizing<Vec<u8>>) -> Result<Self, ()> {
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(());
+        }
+        Ok(Self(bytes))
+    }
+
+    pub(crate) fn into_bytes(self) -> Zeroizing<Vec<u8>> {
+        self.0
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
-impl fmt::Debug for AuthConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AuthConfig")
-            .field("version", &self.version)
-            .field("credentials", &self.credentials)
-            .finish()
+impl Serialize for SecretText {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = std::str::from_utf8(&self.0).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SecretVisitor;
+
+        impl serde::de::Visitor<'_> for SecretVisitor {
+            type Value = SecretText;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded UTF-8 secret string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(SecretText(Zeroizing::new(value.as_bytes().to_vec())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(SecretText(Zeroizing::new(value.into_bytes())))
+            }
+        }
+
+        deserializer.deserialize_string(SecretVisitor)
+    }
+}
+
+/// The private on-disk representation. Secret fields never cross this module's
+/// crate boundary and are converted into opaque slots by the store.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredAuthConfig {
+    pub(crate) version: u32,
+    #[serde(default)]
+    pub(crate) credentials: BTreeMap<String, StoredCredentialConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredCredentialConfig {
+    pub(crate) provider: String,
+    pub(crate) kind: String,
+    pub(crate) source: String,
+    pub(crate) token_type: String,
+    #[serde(alias = "token", alias = "password")]
+    pub(crate) access_token: SecretText,
+    #[serde(default)]
+    pub(crate) refresh_token: Option<SecretText>,
+    pub(crate) expires_at_ms: u64,
+    #[serde(default)]
+    pub(crate) scopes: Vec<String>,
+    #[serde(default)]
+    pub(crate) account_id: Option<String>,
+    #[serde(default)]
+    pub(crate) generation: u64,
+    #[serde(default = "default_status")]
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) last_refresh_at_ms: Option<u64>,
+}
+
+impl StoredAuthConfig {
+    pub(crate) fn empty() -> Self {
+        Self {
+            version: 1,
+            credentials: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn public_projection(&self, source: &Path) -> Result<AuthConfig, AuthConfigError> {
+        self.validate(source)?;
+        Ok(AuthConfig {
+            version: self.version,
+            credentials: self
+                .credentials
+                .iter()
+                .map(|(credential_id, credential)| {
+                    (credential_id.clone(), credential.public_projection())
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn validate(&self, source: &Path) -> Result<(), AuthConfigError> {
+        if self.version != 1 {
+            return Err(AuthConfigError::InvalidVersion {
+                path: source.to_path_buf(),
+                version: self.version,
+            });
+        }
+        for (credential_id, credential) in &self.credentials {
+            validate_visible(
+                credential_id,
+                source,
+                &format!("credentials.{credential_id}"),
+            )?;
+            credential.validate(source, credential_id)?;
+        }
+        Ok(())
+    }
+}
+
+impl StoredCredentialConfig {
+    fn public_projection(&self) -> CredentialConfig {
+        CredentialConfig {
+            provider: self.provider.clone(),
+            kind: self.kind.clone(),
+            source: self.source.clone(),
+            token_type: self.token_type.clone(),
+            expires_at_ms: self.expires_at_ms,
+            scopes: self.scopes.clone(),
+            account_id: self.account_id.clone(),
+            generation: self.generation,
+            status: self.status.clone(),
+            last_refresh_at_ms: self.last_refresh_at_ms,
+            has_refresh_token: self.refresh_token.is_some(),
+        }
+    }
+
+    fn validate(&self, source: &Path, credential_id: &str) -> Result<(), AuthConfigError> {
+        for (field, value) in [
+            ("provider", self.provider.as_str()),
+            ("kind", self.kind.as_str()),
+            ("source", self.source.as_str()),
+            ("token_type", self.token_type.as_str()),
+        ] {
+            validate_visible(
+                value,
+                source,
+                &format!("credentials.{credential_id}.{field}"),
+            )?;
+        }
+        if self.access_token.is_empty() {
+            return Err(invalid_value(
+                source,
+                &format!("credentials.{credential_id}.access_token"),
+                "must not be blank",
+            ));
+        }
+        validate_visible(
+            &self.status,
+            source,
+            &format!("credentials.{credential_id}.status"),
+        )?;
+        for (index, scope) in self.scopes.iter().enumerate() {
+            validate_visible(
+                scope,
+                source,
+                &format!("credentials.{credential_id}.scopes[{index}]"),
+            )?;
+        }
+        if let Some(account_id) = self.account_id.as_deref() {
+            validate_visible(
+                account_id,
+                source,
+                &format!("credentials.{credential_id}.account_id"),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -118,90 +287,30 @@ impl AuthConfig {
         Self::load(&paths.auth)
     }
 
-    fn from_yaml_bytes(path: &Path, bytes: &[u8]) -> Result<Self, AuthConfigError> {
-        preflight_yaml(bytes).map_err(|error| AuthConfigError::from_yaml_preflight(path, error))?;
-        let value: Value = parse_yaml_value(bytes).map_err(|_| AuthConfigError::MalformedYaml {
-            path: path.to_path_buf(),
-            message: "invalid YAML syntax".to_string(),
-        })?;
-        validate_auth_shape(path, &value)?;
-        let config: Self =
-            serde_yaml::from_value(value).map_err(|_| AuthConfigError::InvalidValue {
-                path: path.to_path_buf(),
-                field: "document".to_string(),
-                message: "document does not match the auth schema".to_string(),
-            })?;
-        config.validate(path)?;
-        Ok(config)
+    pub(crate) fn from_yaml_bytes(path: &Path, bytes: &[u8]) -> Result<Self, AuthConfigError> {
+        let stored = parse_stored_yaml(path, bytes)?;
+        stored.public_projection(path)
     }
+}
 
-    fn validate(&self, source: &Path) -> Result<(), AuthConfigError> {
-        if self.version != 1 {
-            return Err(AuthConfigError::InvalidVersion {
-                path: source.to_path_buf(),
-                version: self.version,
-            });
-        }
-        for (credential_id, credential) in &self.credentials {
-            validate_visible(
-                credential_id,
-                source,
-                &format!("credentials.{credential_id}"),
-            )?;
-            validate_visible(
-                &credential.provider,
-                source,
-                &format!("credentials.{credential_id}.provider"),
-            )?;
-            validate_visible(
-                &credential.kind,
-                source,
-                &format!("credentials.{credential_id}.kind"),
-            )?;
-            validate_visible(
-                &credential.source,
-                source,
-                &format!("credentials.{credential_id}.source"),
-            )?;
-            validate_visible(
-                &credential.token_type,
-                source,
-                &format!("credentials.{credential_id}.token_type"),
-            )?;
-            if credential.access_token.is_empty() {
-                return Err(invalid_value(
-                    source,
-                    &format!("credentials.{credential_id}.access_token"),
-                    "must not be blank",
-                ));
-            }
-            if !matches!(
-                credential.status.as_str(),
-                "active" | "reauth_required" | "disabled"
-            ) {
-                return Err(invalid_value(
-                    source,
-                    &format!("credentials.{credential_id}.status"),
-                    "must be active, reauth_required, or disabled",
-                ));
-            }
-            for (index, scope) in credential.scopes.iter().enumerate() {
-                validate_visible(
-                    scope,
-                    source,
-                    &format!("credentials.{credential_id}.scopes[{index}]"),
-                )?;
-            }
-            if let Some(account_id) = credential.account_id.as_deref() {
-                validate_visible(
-                    account_id,
-                    source,
-                    &format!("credentials.{credential_id}.account_id"),
-                )?;
-            }
-        }
-        Ok(())
-    }
+pub(crate) fn parse_stored_yaml(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<StoredAuthConfig, AuthConfigError> {
+    preflight_yaml(bytes).map_err(|error| AuthConfigError::from_yaml_preflight(path, error))?;
+    let value: Value = parse_yaml_value(bytes).map_err(|_| AuthConfigError::MalformedYaml {
+        path: path.to_path_buf(),
+        message: "invalid YAML syntax".to_string(),
+    })?;
+    validate_auth_shape(path, &value)?;
+    let config: StoredAuthConfig =
+        serde_yaml::from_value(value).map_err(|_| AuthConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            field: "document".to_string(),
+            message: "document does not match the auth schema".to_string(),
+        })?;
+    config.validate(path)?;
+    Ok(config)
 }
 
 impl std::str::FromStr for AuthConfig {
@@ -235,6 +344,8 @@ fn validate_auth_shape(source: &Path, value: &Value) -> Result<(), AuthConfigErr
                     "source",
                     "token_type",
                     "access_token",
+                    "token",
+                    "password",
                     "refresh_token",
                     "expires_at_ms",
                     "scopes",
