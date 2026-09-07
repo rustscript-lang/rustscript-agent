@@ -1,0 +1,470 @@
+// Task 2 auth-store fixture entry. RSS owns status, save, rotation, and
+// reauth meaning. The host injects opaque secret slots and a policy handle;
+// this module cannot forge, stringify, or serialize those values, and it never
+// receives raw access or refresh tokens.
+use auth;
+
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn status_for(kind: string) -> string {
+    if kind == "save_reauth" => {
+        "reauth_required"
+    } else if kind == "save_disabled" => {
+        "disabled"
+    } else => {
+        "active"
+    }
+}
+
+fn refresh_action_for(kind: string) -> string {
+    if kind == "save_preserve" => {
+        "preserve"
+    } else if kind == "save_clear" => {
+        "clear"
+    } else => {
+        "replace"
+    }
+}
+
+fn metadata_for(context: map, kind: string) -> map {
+    if kind == "save_malformed" => {
+        {
+            provider: map_string(context, "provider", ""),
+            kind: map_string(context, "credential_kind", ""),
+            source: map_string(context, "source", ""),
+            token_type: map_string(context, "token_type", ""),
+            expires_at_ms: map_int(context, "expires_at_ms", 0),
+            scopes: map_array(context, "scopes"),
+            account_id: map_string(context, "account_id", ""),
+            status: status_for(kind),
+            last_refresh_at_ms: map_int(context, "last_refresh_at_ms", 0),
+            extra_field: "not-allowed"
+        }
+    } else => {
+        {
+            provider: map_string(context, "provider", ""),
+            kind: map_string(context, "credential_kind", ""),
+            source: map_string(context, "source", ""),
+            token_type: map_string(context, "token_type", ""),
+            expires_at_ms: map_int(context, "expires_at_ms", 0),
+            scopes: map_array(context, "scopes"),
+            account_id: map_string(context, "account_id", ""),
+            status: status_for(kind),
+            last_refresh_at_ms: map_int(context, "last_refresh_at_ms", 0)
+        }
+    }
+}
+
+fn sanitize_metadata(value: map) -> map {
+    {
+        credential_id: map_string(value, "credential_id", ""),
+        provider: map_string(value, "provider", ""),
+        kind: map_string(value, "kind", ""),
+        source: map_string(value, "source", ""),
+        token_type: map_string(value, "token_type", ""),
+        expires_at_ms: map_int(value, "expires_at_ms", 0),
+        scopes: map_array(value, "scopes"),
+        account_id: map_string(value, "account_id", ""),
+        generation: map_int(value, "generation", 0),
+        status: map_string(value, "status", ""),
+        last_refresh_at_ms: map_int(value, "last_refresh_at_ms", 0),
+        has_refresh_token: map_bool(value, "has_refresh_token", false)
+    }
+}
+
+fn sanitize_result(result: map) -> map {
+    let ok: bool = map_bool(result, "ok", false);
+    if ok => {
+        {
+            ok: true,
+            outcome: map_string(result, "outcome", ""),
+            metadata: sanitize_metadata(map_map(result, "metadata"))
+        }
+    } else => {
+        {
+            ok: false,
+            error: map_map(result, "error")
+        }
+    }
+}
+
+fn wrap_probe(probed: map) -> map {
+    let ok: bool = map_bool(probed, "ok", false);
+    if ok => {
+        {
+            ok: true,
+            handle_class: map_string(probed, "handle_class", "")
+        }
+    } else => {
+        {
+            ok: false,
+            error: map_map(probed, "error")
+        }
+    }
+}
+
+fn load_request(context: map) -> map {
+    {
+        credential_id: map_string(context, "credential_id", ""),
+        policy_handle: context["policy_handle"].copy()
+    }
+}
+
+fn delete_request(context: map) -> map {
+    {
+        credential_id: map_string(context, "credential_id", ""),
+        policy_handle: context["policy_handle"].copy()
+    }
+}
+
+fn handle_request(context: map) -> map {
+    {
+        credential_id: map_string(context, "credential_id", ""),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    }
+}
+
+fn refresh_for(context: map, kind: string) -> map {
+    let action: string = refresh_action_for(kind);
+    if action == "replace" => {
+        {
+            action: action,
+            slot: context["refresh_slot"].copy()
+        }
+    } else => {
+        {
+            action: action
+        }
+    }
+}
+
+fn save_request(context: map, kind: string) -> map {
+    let credential_id: string = map_string(context, "credential_id", "");
+    let expected_generation: int = map_int(context, "expected_generation", 0);
+    let metadata: map = metadata_for(context, kind);
+    if kind == "save_forged" => {
+        {
+            credential_id: credential_id,
+            expected_generation: expected_generation,
+            policy_handle: context["policy_handle"].copy(),
+            metadata: metadata,
+            access_slot: {
+                class: "OpaqueSecretSlot",
+                id: "forged"
+            },
+            refresh: {
+                action: "replace",
+                slot: {
+                    class: "OpaqueSecretSlot",
+                    id: "forged"
+                }
+            }
+        }
+    } else if kind == "save_serialized" => {
+        {
+            credential_id: credential_id,
+            expected_generation: expected_generation,
+            policy_handle: context["policy_handle"].copy(),
+            metadata: metadata,
+            access_slot: "OpaqueSecretSlot",
+            refresh: {
+                action: "replace",
+                slot: "OpaqueSecretSlot"
+            }
+        }
+    } else => {
+        {
+            credential_id: credential_id,
+            expected_generation: expected_generation,
+            policy_handle: context["policy_handle"].copy(),
+            metadata: metadata,
+            access_slot: context["access_slot"].copy(),
+            refresh: refresh_for(context, kind)
+        }
+    }
+}
+
+fn run_save(context: map, kind: string) -> map {
+    sanitize_result(auth::save_if_generation(save_request(context, kind)))
+}
+
+fn run_save_replay(context: map) -> map {
+    let first: map = sanitize_result(auth::save_if_generation(save_request(context.copy(), "save")));
+    let second: map = sanitize_result(auth::save_if_generation(save_request(context, "save")));
+    {
+        first: first,
+        second: second
+    }
+}
+
+fn run_handle(context: map, kind: string) -> map {
+    let issued: map = if kind == "refresh" => {
+        auth::refresh_handle(handle_request(context))
+    } else => {
+        auth::access_handle(handle_request(context))
+    };
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        {
+            ok: true,
+            handle_class: map_string(issued, "handle_class", ""),
+            generation: map_int(issued, "generation", 0),
+            handle: issued["handle"].copy()
+        }
+    } else => {
+        {
+            ok: false,
+            error: map_map(issued, "error")
+        }
+    }
+}
+
+fn issued_or_error(issued: map) -> map {
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        issued
+    } else => {
+        {
+            ok: false,
+            error: map_map(issued, "error")
+        }
+    }
+}
+
+fn probe_handle_copy(context: map, kind: string) -> map {
+    let issued: map = if kind == "refresh_copy" => {
+        auth::refresh_handle(handle_request(context))
+    } else => {
+        auth::access_handle(handle_request(context))
+    };
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "validate" }))
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_handle_forged(context: map) -> map {
+    let issued: map = auth::access_handle(handle_request(context));
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        let forged: map = {
+            class: "OpaqueAccessHandle",
+            id: "forged"
+        };
+        wrap_probe(auth::check_handle(forged, { op: "validate" }))
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_handle_serialized(context: map) -> map {
+    let issued: map = auth::access_handle(handle_request(context));
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        let handle_type: string = type(issued["handle"].copy());
+        let from_text: map = wrap_probe(auth::check_handle(handle_type, { op: "validate" }));
+        {
+            ok: true,
+            handle_type: handle_type,
+            rendered: handle_type,
+            reconstructed_ok: map_bool(from_text, "ok", false),
+            reconstructed_code: map_string(map_map(from_text, "error"), "code", "")
+        }
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_handle_replay(context: map, kind: string) -> map {
+    let issued: map = if kind == "refresh_replay" => {
+        auth::refresh_handle(handle_request(context))
+    } else => {
+        auth::access_handle(handle_request(context))
+    };
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        let first: map = wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "consume" }));
+        let second: map = wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "consume" }));
+        {
+            first: first,
+            second: second
+        }
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_refresh_validate(context: map) -> map {
+    let issued: map = auth::refresh_handle(handle_request(context));
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        let mismatched: map = wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "mismatch" }));
+        let consumed: map = wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "consume" }));
+        {
+            mismatch_ok: map_bool(mismatched, "ok", false),
+            mismatch_code: map_string(map_map(mismatched, "error"), "code", ""),
+            consume_ok: map_bool(consumed, "ok", false)
+        }
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_handle_expire(context: map) -> map {
+    let issued: map = auth::access_handle(handle_request(context));
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "expire" }))
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_stale_after_save(context: map, kind: string) -> map {
+    let issued: map = if kind == "refresh_stale_after_save" => {
+        auth::refresh_handle(handle_request(context))
+    } else => {
+        auth::access_handle(handle_request(context))
+    };
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        let saved: map = run_save(context, "save");
+        let consumed: map = wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "consume" }));
+        {
+            save_ok: map_bool(saved, "ok", false),
+            consume_ok: map_bool(consumed, "ok", false),
+            consume_code: map_string(map_map(consumed, "error"), "code", "")
+        }
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_refresh_duplicate(context: map) -> map {
+    let first: map = auth::refresh_handle(handle_request(context));
+    let second: map = auth::refresh_handle(handle_request(context));
+    let first_ok: bool = map_bool(first, "ok", false);
+    if first_ok => {
+        let consumed: map = wrap_probe(auth::check_handle(first["handle"].copy(), { op: "consume" }));
+        let third: map = auth::refresh_handle(handle_request(context));
+        {
+            first_ok: true,
+            second_ok: map_bool(second, "ok", false),
+            second_code: map_string(map_map(second, "error"), "code", ""),
+            consume_ok: map_bool(consumed, "ok", false),
+            after_consume_ok: map_bool(third, "ok", false)
+        }
+    } else => {
+        issued_or_error(first)
+    }
+}
+
+fn probe_injected(context: map) -> map {
+    wrap_probe(auth::check_handle(context["injected_handle"].copy(), { op: "validate" }))
+}
+
+pub fn run(context: map) -> map {
+    let kind: string = map_string(context, "kind", "load");
+    if kind == "load" => {
+        sanitize_result(auth::load_metadata(load_request(context)))
+    } else if kind == "save"
+        || kind == "save_copy"
+        || kind == "save_forged"
+        || kind == "save_serialized"
+        || kind == "save_malformed"
+        || kind == "save_preserve"
+        || kind == "save_reauth"
+        || kind == "save_disabled"
+        || kind == "save_clear"
+        || kind == "save_adopt"
+        || kind == "save_future"
+        || kind == "save_cross_run" => {
+        run_save(context, kind)
+    } else if kind == "save_replay" => {
+        run_save_replay(context)
+    } else if kind == "delete" => {
+        sanitize_result(auth::delete(delete_request(context)))
+    } else if kind == "access" || kind == "refresh" => {
+        run_handle(context, kind)
+    } else if kind == "access_copy" || kind == "refresh_copy" => {
+        probe_handle_copy(context, kind)
+    } else if kind == "access_forged" => {
+        probe_handle_forged(context)
+    } else if kind == "access_serialized" => {
+        probe_handle_serialized(context)
+    } else if kind == "access_replay" || kind == "refresh_replay" => {
+        probe_handle_replay(context, kind)
+    } else if kind == "refresh_validate" => {
+        probe_refresh_validate(context)
+    } else if kind == "access_expire" => {
+        probe_handle_expire(context)
+    } else if kind == "access_stale_after_save" || kind == "refresh_stale_after_save" => {
+        probe_stale_after_save(context, kind)
+    } else if kind == "refresh_duplicate" => {
+        probe_refresh_duplicate(context)
+    } else if kind == "injected_check" => {
+        probe_injected(context)
+    } else => {
+        {
+            ok: false,
+            code: "unknown_kind",
+            message: kind
+        }
+    }
+}

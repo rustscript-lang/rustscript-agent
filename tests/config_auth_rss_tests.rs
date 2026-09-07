@@ -194,6 +194,28 @@ fn rust_load_snapshot_and_policy_check_match_rss_surface() {
         )
         .expect_err("frozen admitted root still cannot be added");
     assert!(matches!(admitted, ConfigFileError::PolicyOverreach { .. }));
+
+    let inspect_ok = host
+        .check_policy(
+            &snapshot.policy_handle,
+            &PolicyIntent {
+                op: "inspect".into(),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect("inspect remains an allowed policy op");
+    assert!(inspect_ok.ok);
+
+    let unknown = host
+        .check_policy(
+            &snapshot.policy_handle,
+            &PolicyIntent {
+                op: "not-a-policy-op".into(),
+                ..PolicyIntent::default()
+            },
+        )
+        .expect_err("unknown op is distinct from overreach");
+    assert!(matches!(unknown, ConfigFileError::PolicyHandleInvalid));
 }
 
 #[test]
