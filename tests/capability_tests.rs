@@ -533,6 +533,35 @@ fn atomic_write_rejects_cas_mismatch_and_symlink_race() {
 }
 
 #[test]
+fn atomic_write_unconditional_sentinel_overwrites_and_reports_publication() {
+    let fixture = Fixture::new("uncond");
+    let fs_cap = fixture.filesystem();
+    let token = fixture.token(CapabilityRisk::Write);
+    let created = fs_cap
+        .write_atomic(&token, "fresh.txt", "*", b"hello")
+        .expect("create");
+    assert_eq!(created.len, 5);
+    assert!(created.durable);
+    assert!(created.staging_cleaned);
+    assert_eq!(
+        fs::read(fixture.root.join("fresh.txt")).expect("created"),
+        b"hello"
+    );
+
+    fs::write(fixture.root.join("target.txt"), b"old").expect("seed");
+    let replaced = fs_cap
+        .write_atomic(&token, "target.txt", "*", b"new!")
+        .expect("overwrite");
+    assert_eq!(replaced.len, 4);
+    assert!(replaced.durable);
+    assert!(replaced.staging_cleaned);
+    assert_eq!(
+        fs::read(fixture.root.join("target.txt")).expect("replaced"),
+        b"new!"
+    );
+}
+
+#[test]
 fn process_spawn_is_isolated_by_owner_and_rejects_forged_handles() {
     let fixture = Fixture::new("proc-own");
     let processes = fixture.processes();

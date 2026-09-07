@@ -3314,6 +3314,7 @@ impl AgentService {
                 filesystem,
                 processes,
                 artifacts,
+                control_hook: None,
             };
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling

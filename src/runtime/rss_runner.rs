@@ -628,6 +628,7 @@ impl AgentRunner {
             processes: self.host.processes.clone(),
             artifacts: self.host.artifacts.clone(),
             leases: Arc::new(Mutex::new(HashMap::new())),
+            control_hook: self.host.control_hook.clone(),
         });
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
