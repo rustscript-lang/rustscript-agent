@@ -6,11 +6,17 @@
 //! of stream. The structured run context is the sole callable argument; the
 //! script-visible event builtin is `stream::emit(value)`.
 
+pub mod auth;
 pub mod capabilities;
 pub mod config;
+pub mod config_file;
+#[cfg(feature = "config-fixture")]
+mod config_host;
 pub mod domain;
 pub mod events;
 pub mod gateway;
+#[cfg(any(test, feature = "config-fixture"))]
+mod host_opaque;
 pub mod metrics;
 pub mod prompt;
 pub mod registry;
@@ -21,7 +27,20 @@ pub mod tool_schema;
 
 mod durable_provider;
 
+pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
 pub use config::{AgentGatewayConfig, TelegramConfig};
+pub use config_file::{
+    AgentPaths, BoundedPublicConfig, ConfigFile, ConfigFileError, ConfigPaths, LoadedConfig,
+    RuntimeConfig, load_config,
+};
+#[cfg(feature = "config-fixture")]
+pub mod config_fixture {
+    pub use crate::config_file::{
+        ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyProbe,
+        SanitizedPolicySummary,
+    };
+    pub use crate::config_host::{ConfigFixtureHost, config_fixture_catalog};
+}
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
     LlmResponse, ProviderError, RunContext, Sampling, ToolCall, Usage, decode_message_blocks,

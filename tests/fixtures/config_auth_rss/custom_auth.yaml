@@ -1,0 +1,10 @@
+version: 1
+credentials:
+  fixture-custom:
+    provider: other-provider
+    kind: api-key
+    source: env
+    token_type: Bearer
+    access_token: SYNTHETIC_ACCESS_TOKEN
+    expires_at_ms: 1788440000000
+    status: active

@@ -17,7 +17,8 @@ fails the test suite.
 
 | Source | Owns | Read by |
 | --- | --- | --- |
-| Environment variables (`RUSTSCRIPT_AGENT_*`) | gateway process | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
+| Gateway environment variables (`RUSTSCRIPT_AGENT_*`, excluding library-only `RUSTSCRIPT_AGENT_HOME`) | gateway process | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
+| Library bootstrap (`RUSTSCRIPT_AGENT_HOME`) | persistent config/auth paths | library path resolver |
 | CLI arguments (`--script`, `--allow-host`) | one run | `rustscript-agent` binary (`src/bin/rustscript-agent.rs`) |
 | Native `AgentGatewayConfig` fields | embedding code | library API; the gateway binary maps a fixed subset from environment variables |
 
@@ -26,12 +27,51 @@ through validated native configuration (`AgentConfig`/`HttpConfig`/
 `SqlitePolicy`), and the storage program receives its per-command limits
 through the typed command envelope.
 
+Persistent `config.yaml` / `auth.yaml` are loaded by a Stage A fixture host
+as `config::load_snapshot(host_home)`. Production `agent_host_catalog` /
+`AgentRunner` do not register that bridge. The fixture host binds `HostHome`
+before RSS runs; RSS cannot supply or override the filesystem path. The
+generic loader keeps bounded YAML, HTTPS-or-loopback URL syntax, secret-key
+rejection, and credential-ID reference integrity. Provider-name authority
+mapping, provider defaults, OAuth field interpretation, and local-agent
+special cases are RSS policy: an unknown provider name is not rejected merely
+because it is unknown, and explicit custom HTTPS providers remain
+configurable. The snapshot exposed to RSS is `BoundedPublicConfig`, opaque
+credential IDs, a sanitized policy summary, and a host-native
+`OpaquePolicyHandle` that is not a map or string token. Raw tokens never
+cross into RSS, events, logs, or durable output. Typed config/auth errors
+carry a path-qualified `path` field (filesystem or YAML field path), never
+the full Display prose.
+
 ## Environment variables (gateway binary)
 
-Every `RUSTSCRIPT_AGENT_*` variable has a deprecated prototype alias
-`PD_EDGE_AGENT_*`. When the primary variable is unset, the legacy name is
-read and a deprecation warning is printed to stderr; the primary name always
-wins. The aliases are scheduled for removal before v1 — do not rely on them.
+### Library bootstrap input (library only)
+
+`RUSTSCRIPT_AGENT_HOME` is a Task 1 bootstrap input read by the library
+config/auth path resolver. It is not consumed by the current gateway binary
+and does not add a gateway CLI startup setting. This library-only input has no
+legacy environment alias. When set, it must be a non-empty absolute path
+without parent-directory components and takes precedence over `$HOME` (or
+`$USERPROFILE`). When unset, the resolver uses `$HOME/.rustscript-agent` (or
+`$USERPROFILE/.rustscript-agent`). The selected home derives these paths:
+
+- `<home>/config.yaml`
+- `<home>/auth.yaml`
+- `<home>/auth.yaml.lock`
+- `<home>/state.db`
+
+The Task 1 path resolver does not derive a `skills/` path. Job `skills` values
+are stored as job data and do not select files below this home. The gateway's
+existing `RUSTSCRIPT_AGENT_STATE_DB` remains its separate state-database
+selector.
+
+### Gateway variables and deprecated aliases
+
+Every gateway `RUSTSCRIPT_AGENT_*` variable in the table has a deprecated
+prototype alias `PD_EDGE_AGENT_*`. When the primary variable is unset, the
+legacy name is read and a deprecation warning is printed to stderr; the
+primary name always wins. The aliases are scheduled for removal before v1 —
+do not rely on them.
 
 | Variable | Deprecated alias | Type | Default | Bounds / notes |
 | --- | --- | --- | --- | --- |

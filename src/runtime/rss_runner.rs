@@ -1262,13 +1262,78 @@ impl HostAsyncBridge for AgentAsyncBridge {
 #[cfg(test)]
 mod compile_cache_tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
+
+    static CAPTURED_SANDBOX: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
 
     fn tiny_source(tag: &str) -> String {
         format!(
             "pub fn run(context: map) -> map {{ let _x: string = \"{tag}\"; {{ ok: true }} }}\n"
         )
+    }
+
+    fn capture_sandbox_root(allowed_root: &std::path::Path) {
+        let mut sandbox = allowed_root.to_path_buf();
+        loop {
+            if sandbox
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rss-compile-sandbox-"))
+            {
+                break;
+            }
+            assert!(
+                sandbox.pop(),
+                "sandbox root must be an ancestor of the allowed root"
+            );
+        }
+        *CAPTURED_SANDBOX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("captured sandbox lock") = Some(sandbox);
+    }
+
+    #[test]
+    fn from_file_cleans_compile_sandbox_after_success() {
+        let marker = format!(
+            "from-file-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "rss-runner-sandbox-cleanup-{}-{marker}",
+            std::process::id()
+        ));
+        let path = dir.join("main.rss");
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        std::fs::write(
+            &path,
+            format!(
+                "pub fn run(context: map) -> map {{ let _marker: string = \"{marker}\"; {{ ok: true }} }}\n"
+            ),
+        )
+        .expect("write entry");
+        *CAPTURED_SANDBOX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("captured sandbox lock") = None;
+        crate::runtime::module_snapshot::set_after_sandbox_dir_hook(Some(capture_sandbox_root));
+        let result = AgentRunner::from_file(&path, AgentConfig::default());
+        crate::runtime::module_snapshot::set_after_sandbox_dir_hook(None);
+        let _runner = result.expect("compile from snapshot");
+        let sandbox = CAPTURED_SANDBOX
+            .get()
+            .expect("captured sandbox")
+            .lock()
+            .expect("captured sandbox lock")
+            .take()
+            .expect("from_file must materialize a sandbox");
+        assert!(!sandbox.exists(), "compile sandbox must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

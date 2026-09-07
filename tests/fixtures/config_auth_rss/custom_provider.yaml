@@ -1,0 +1,13 @@
+version: 1
+model:
+  provider: custom-provider
+  model: local-open-model
+providers:
+  custom-provider:
+    protocol: openai-chat
+    base_url: https://llm.example:8443/api
+    auth: fixture-custom
+workspaces:
+  allowed_roots:
+    - /tmp/rustscript-agent-workspace
+  default: /tmp/rustscript-agent-workspace

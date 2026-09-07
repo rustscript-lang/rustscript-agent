@@ -1,0 +1,15 @@
+version: 1
+credentials:
+  fixture-codex:
+    provider: openai-codex
+    kind: oauth
+    source: codex-device
+    token_type: Bearer
+    access_token: SYNTHETIC_ACCESS_TOKEN
+    refresh_token: SYNTHETIC_REFRESH_TOKEN
+    expires_at_ms: 1788440000000
+    scopes: []
+    account_id: acct_synthetic
+    generation: 4
+    status: active
+    last_refresh_at_ms: 1788436400000

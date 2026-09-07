@@ -20,8 +20,8 @@ use rustscript_agent::capabilities::{
 };
 use rustscript_agent::{
     AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentHostBridges,
-    AgentProviderHost, AgentRunner, RunCancellation, RunContext, RunError, ScriptedProvider,
-    ToolRegistry, bundled_tool_entries, bundled_tool_registry,
+    AgentProviderHost, AgentRunner, ControlCheckHook, RunCancellation, RunContext, RunError,
+    ScriptedProvider, ToolRegistry, bundled_tool_entries, bundled_tool_registry,
 };
 use rustscript_vm::{CancellationReason, InvocationError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -91,16 +91,23 @@ fn loop_runner() -> AgentRunner {
         .expect("production loop policy should compile")
 }
 
-fn loop_runner_with(provider: ScriptedProvider, host: Option<AgentHostBridges>) -> AgentRunner {
-    let mut runner = loop_runner().with_skip_sleep(true);
+fn configure_loop_runner(
+    mut runner: AgentRunner,
+    provider: ScriptedProvider,
+    host: Option<AgentHostBridges>,
+) -> AgentRunner {
+    runner = runner.with_skip_sleep(true);
     if let Some(mut host) = host {
         host.provider = Some(Arc::new(provider));
         host.skip_sleep = true;
-        runner = runner.with_host(host);
+        runner.with_host(host)
     } else {
-        runner = runner.with_provider(Arc::new(provider));
+        runner.with_provider(Arc::new(provider))
     }
-    runner
+}
+
+fn loop_runner_with(provider: ScriptedProvider, host: Option<AgentHostBridges>) -> AgentRunner {
+    configure_loop_runner(loop_runner(), provider, host)
 }
 
 thread_local! {
@@ -620,6 +627,19 @@ impl CancelAfterEffect {
     }
 }
 
+struct ProviderReturnMarker {
+    provider: ScriptedProvider,
+    returned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AgentProviderHost for ProviderReturnMarker {
+    fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
+        let result = self.provider.call(request, cancellation);
+        self.returned.store(true, Ordering::SeqCst);
+        result
+    }
+}
+
 fn cancel_after_effect_dispatcher(
     cancellation: RunCancellation,
 ) -> (AgentHostBridges, Arc<CountingExecutor>, PathBuf) {
@@ -705,8 +725,9 @@ fn loop_one_serial_tool_call_then_final() {
         json!([{"id": "call-1", "name": "read_file", "arguments": {"path": "note.txt"}}]),
     ));
     provider.push_ok(text_response("after tool"));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(8);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), echo_tool()),
@@ -776,8 +797,9 @@ fn loop_multiple_serial_calls_in_order_exactly_once() {
         ]),
     ));
     provider.push_ok(text_response("both done"));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(8);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), echo_tool()),
@@ -908,8 +930,9 @@ fn loop_max_turns_is_enforced() {
         "",
         json!([{"id": "c2", "name": "read_file", "arguments": {"path": "note.txt"}}]),
     ));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(8);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(1, 8, loop_config(false, false), echo_tool()),
@@ -931,8 +954,9 @@ fn loop_max_tool_calls_composes_with_task5_budget() {
             {"id": "c2", "name": "read_file", "arguments": {"path": "b.txt"}}
         ]),
     ));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(1);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(4, 1, loop_config(false, false), echo_tool()),
@@ -1066,8 +1090,9 @@ fn loop_completed_tool_effects_are_not_retried() {
     ));
     provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
     provider.push_ok(text_response("after retry"));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(8);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), echo_tool()),
@@ -1108,8 +1133,9 @@ fn loop_frozen_coding_prompt_stays_exactly_one_on_tool_follow_up_and_retry() {
     ));
     provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
     provider.push_ok(text_response("after retry"));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(8);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let context =
         reconstruct_run_context(&frozen_run_context(Some(FROZEN_CODING_PROMPT), echo_tool()));
     let decision = decide_vm(&runner, context.to_vm_value());
@@ -2173,8 +2199,9 @@ fn loop_tool_cycles_consume_turn_budget_and_terminate() {
         "t",
         json!([{"id": "c2", "name": "read_file", "arguments": {"path": "note.txt"}}]),
     ));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(8);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(2, 8, loop_config(false, false), echo_tool()),
@@ -2197,8 +2224,9 @@ fn loop_multi_call_response_pins_tool_call_count() {
         ]),
     ));
     provider.push_ok(text_response("done"));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = capability_hoster(8);
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), echo_tool()),
@@ -2221,8 +2249,9 @@ fn loop_malformed_arguments_json_is_typed_before_optional_tool_effect() {
         }]),
     ));
     provider.push_ok(text_response("should not run"));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = optional_tool_dispatcher();
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), optional_tool()),
@@ -2246,8 +2275,9 @@ fn loop_non_object_arguments_json_is_typed_before_optional_tool_effect() {
             "arguments_json": "[1,2]"
         }]),
     ));
+    let runner = loop_runner();
     let (dispatcher, executor, root) = optional_tool_dispatcher();
-    let runner = loop_runner_with(provider.clone(), Some(dispatcher));
+    let runner = configure_loop_runner(runner, provider.clone(), Some(dispatcher));
     let decision = decide(
         &runner,
         run_context(4, 8, loop_config(false, false), optional_tool()),
@@ -2348,10 +2378,11 @@ fn loop_post_effect_cancel_keeps_tool_result_and_skips_next_effect() {
     ));
     provider.push_ok(text_response("should not run"));
     let cancellation = RunCancellation::new();
+    let runner = loop_runner();
     let (mut dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
     dispatcher.provider = Some(Arc::new(provider.clone()));
     dispatcher.skip_sleep = true;
-    let runner = loop_runner().with_host(dispatcher).with_skip_sleep(true);
+    let runner = runner.with_host(dispatcher).with_skip_sleep(true);
     let mut sink = VecSink::default();
     let result = runner.run_with_context_and_events(
         json_to_vm(&run_context(4, 8, loop_config(false, false), echo_tool())),
@@ -2367,13 +2398,13 @@ fn loop_post_effect_cancel_keeps_tool_result_and_skips_next_effect() {
 #[test]
 fn loop_post_effect_cancel_probe_returns_real_tool_result() {
     let cancellation = RunCancellation::new();
-    let (dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
     let runner = AgentRunner::from_file(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/tools/dispatch_entry.rss"),
         AgentConfig::default(),
     )
-    .expect("dispatch entry should compile")
-    .with_host(dispatcher);
+    .expect("dispatch entry should compile");
+    let (dispatcher, executor, root) = cancel_after_effect_dispatcher(cancellation.clone());
+    let runner = runner.with_host(dispatcher);
     let mut sink = VecSink::default();
     let result = runner.run_with_context_and_events(
         json_to_vm(&json!({
@@ -2415,20 +2446,35 @@ fn loop_cancel_interrupts_backoff_sleep() {
     let provider = ScriptedProvider::new();
     provider.push_error(provider_error(503, "server_error", "unavailable", "down"));
     provider.push_ok(text_response("should not run"));
-    let runner = loop_runner()
-        .with_provider(Arc::new(provider.clone()))
-        .with_skip_sleep(false);
+    let provider_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let backoff_checks = Arc::new(AtomicU64::new(0));
+    let backoff_started = Arc::new(Mutex::new(None));
     let cancellation = RunCancellation::new();
     let cancel = cancellation.clone();
-    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = Arc::clone(&started);
-    thread::spawn(move || {
-        while !flag.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(1));
+    let returned = Arc::clone(&provider_returned);
+    let checks = Arc::clone(&backoff_checks);
+    let started = Arc::clone(&backoff_started);
+    let control_hook: ControlCheckHook = Arc::new(move |_cancellation: &RunCancellation| {
+        if returned.load(Ordering::SeqCst) {
+            let check = checks.fetch_add(1, Ordering::SeqCst);
+            if check == 1 {
+                *started.lock() = Some(Instant::now());
+            }
+            if check == 2 {
+                cancel.request(CancellationReason::Requested);
+            }
         }
-        thread::sleep(Duration::from_millis(25));
-        cancel.request(CancellationReason::Requested);
     });
+    let host = AgentHostBridges {
+        provider: Some(Arc::new(ProviderReturnMarker {
+            provider: provider.clone(),
+            returned: provider_returned,
+        })),
+        skip_sleep: false,
+        control_hook: Some(control_hook),
+        ..AgentHostBridges::default()
+    };
+    let runner = loop_runner().with_host(host);
     let mut sink = VecSink::default();
     let context = json_to_vm(&run_context(
         3,
@@ -2442,15 +2488,18 @@ fn loop_cancel_interrupts_backoff_sleep() {
         }),
         json!([]),
     ));
-    started.store(true, Ordering::SeqCst);
-    let start = Instant::now();
     let result = runner.run_with_context_and_events(context, &mut sink, &cancellation);
-    let elapsed = start.elapsed();
     assert_typed_cancelled(result);
+    let backoff_started = backoff_started
+        .lock()
+        .take()
+        .expect("cancellation must start from the provider backoff");
+    let elapsed = backoff_started.elapsed();
     assert!(
         elapsed < Duration::from_millis(750),
         "backoff sleep should abort promptly, took {elapsed:?}"
     );
+    assert_eq!(runner.recorded_sleeps(), vec![5000]);
     assert_eq!(provider.call_count(), 1);
 }
 
