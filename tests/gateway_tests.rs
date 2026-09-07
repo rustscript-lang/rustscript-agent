@@ -8,7 +8,7 @@ use axum::{
 use rustscript_agent::metrics::{StorageOp, TerminalRetryOutcome, TerminalStatus};
 use rustscript_agent::{
     AdmitError, AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentService,
-    GatewayPersistence, build_agent_gateway_app,
+    GatewayPersistence, LlmContentBlock, Usage, build_agent_gateway_app,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -210,13 +210,29 @@ async fn run_returns_202_and_sse_contains_terminal_events() {
         .await
         .expect("SSE body should be readable");
     let text = String::from_utf8(body.to_vec()).expect("SSE body should be UTF-8");
-    assert!(text.contains("message.delta"));
-    assert!(text.contains("run.completed"));
-    assert!(text.contains("\"delta\""));
-    assert!(text.contains("\"output\""));
-    assert!(text.contains("\"usage\""));
-    assert!(!text.contains("\"data\":{\"delta\""));
-    assert!(text.contains(run_id));
+    let events: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("event: "))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "run.started",
+            "model.requested",
+            "model.failed",
+            "run.failed"
+        ],
+        "default bundled main.rss SSE events: {text}"
+    );
+    assert!(text.contains("\"error_code\":\"adapter_failed\""), "{text}");
+    assert!(text.contains("\"error_code\":\"agent_failed\""), "{text}");
+    assert!(
+        text.contains(
+            "\"error_message\":\"run host failure: invalid HTTP URL: relative URL without a base\""
+        ),
+        "{text}"
+    );
+    assert!(text.contains(run_id), "{text}");
 }
 
 #[tokio::test]
@@ -1225,8 +1241,7 @@ async fn request_runtime_stays_responsive_during_storage_stall() {
         .expect("persistence handle should be exposed");
     // Seed enough state that a full reload (migrate + recovery + load.all)
     // takes a couple of seconds on the dedicated storage worker.
-    let mut now = 4_000_000u64;
-    for index in 0..1500 {
+    for (index, now) in (4_000_000u64..4_001_500).enumerate() {
         persistence
             .session_create(&json!({
                 "id": format!("stall-session-{index:04}"),
@@ -1247,7 +1262,6 @@ async fn request_runtime_stays_responsive_during_storage_stall() {
                 "now_ms": now,
             }))
             .expect("session create should commit");
-        now += 1;
     }
     drop(state);
     let app = build_agent_gateway_app(
@@ -2313,8 +2327,7 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
     // prompts make the reload byte-bound (one row per page), so a handful
     // of commands produce a multi-second reload.
     let big_prompt = "x".repeat(900_000);
-    let mut now = 5_000_000u64;
-    for index in 0..250 {
+    for (index, now) in (5_000_000u64..5_000_250).enumerate() {
         persistence
             .session_create(&json!({
                 "id": format!("stall-session-{index:04}"),
@@ -2335,13 +2348,10 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
                 "now_ms": now,
             }))
             .expect("session create should commit");
-        now += 1;
     }
     let slow_persistence = persistence.clone();
     let slow_load = tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
         slow_persistence.load().expect("reload should succeed");
-        started.elapsed()
     });
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -2358,6 +2368,10 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
         .await
     });
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !slow_load.is_finished(),
+        "the seeded reload must still occupy the worker before stop"
+    );
 
     // The stop request: while it is pending, an unrelated request spawned
     // alongside it must still complete within a strict budget. On a
@@ -2399,16 +2413,15 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
             .0,
         StatusCode::OK
     );
-
-    let slow: std::time::Duration =
-        tokio::time::timeout(std::time::Duration::from_secs(120), slow_load)
-            .await
-            .expect("the reload must finish")
-            .expect("reload task must not panic");
     assert!(
-        slow >= std::time::Duration::from_millis(1200),
-        "the seeded reload must actually occupy the worker for a while (took {slow:?})"
+        !slow_load.is_finished(),
+        "the unrelated request must complete while storage remains stalled"
     );
+
+    tokio::time::timeout(std::time::Duration::from_secs(120), slow_load)
+        .await
+        .expect("the reload must finish")
+        .expect("reload task must not panic");
 
     let (stop_status, stop_body) = tokio::time::timeout(std::time::Duration::from_secs(60), stop)
         .await
@@ -5286,4 +5299,158 @@ async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
         "the registry must count the dropped broadcasts"
     );
     fixture.join().expect("fixture thread");
+}
+
+#[tokio::test]
+async fn session_messages_api_serializes_canonical_tool_call_blocks() {
+    let path = gateway_db_path("durable-messages");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(context: map) -> map { context; }",
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "use a tool"}),
+            platform: "gateway_tests".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit should succeed");
+    let persistence = state.persistence().expect("sqlite persistence");
+    let usage = Usage {
+        input_tokens: 1,
+        output_tokens: 2,
+        total_tokens: 3,
+    };
+    let expected_parent = service
+        .session_messages(&admitted.session_id)
+        .last()
+        .and_then(|message| message["id"].as_str().map(str::to_string))
+        .expect("admission parent");
+    let parent = service
+        .commit_provider_step(
+            &admitted.run_id,
+            1,
+            &[LlmContentBlock {
+                block_type: "tool_call".to_string(),
+                tool_call_id: Some("call-api".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_json: Some(r#"{"path":"lib.rs"}"#.to_string()),
+                ..LlmContentBlock::default()
+            }],
+            Some(&usage),
+            Some("tool_calls"),
+            Some("test-provider"),
+            Some("test-model"),
+            Some("parent-1"),
+        )
+        .expect("provider step should persist");
+    let parent_id = parent.message_id().to_string();
+    persistence
+        .step_commit(&json!({
+            "run_id": admitted.run_id,
+            "session_id": admitted.session_id,
+            "event_id": format!("{}:turn:1:tool.output", admitted.run_id),
+            "event_type": "tool.output",
+            "payload_json": "{\"tool_call_id\":\"call-api\",\"truncated\":true}",
+            "now_ms": 40,
+            "max_events": 128,
+            "message_id": format!("{}:turn:1:tool:call-api:output", admitted.run_id),
+            "role": "user",
+            "content_json": json!([{
+                "type": "tool_result",
+                "tool_call_id": "call-api",
+                "name": "read_file",
+                "content": "notes",
+                "is_error": true,
+                "result": "notes",
+                "error": {"code": "too_large", "message": "truncated output"},
+                "artifact": {"id": "art-1"},
+                "truncated": true
+            }]).to_string(),
+            "name": "read_file",
+            "tool_call_id": "call-api",
+            "parent_message_id": parent_id,
+            "token_estimate": 4,
+            "metadata_json": "{}",
+            "finish_reason": "",
+        }))
+        .expect("canonical tool_result payload");
+    drop(persistence);
+    drop(state);
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        "pub fn run(context: map) -> map { context; }",
+        &path,
+    )
+    .expect("reopen gateway");
+    let app = build_agent_gateway_app(state.clone());
+    let (status, body) = json_request(
+        &app,
+        axum::http::Method::GET,
+        &format!("/api/sessions/{}/messages", admitted.session_id),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = body["data"].as_array().expect("messages list");
+    let assistant = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "assistant")
+        .expect("assistant tool-call message");
+    assert_eq!(assistant["id"], parent_id);
+    assert_eq!(assistant["finish_reason"], "tool_calls");
+    assert_eq!(assistant["parent_message_id"], expected_parent);
+    assert_ne!(assistant["parent_message_id"], "parent-1");
+    assert_eq!(assistant["metadata"]["provider"], "test-provider");
+    assert_eq!(assistant["metadata"]["model"], "test-model");
+    assert_eq!(assistant["metadata"]["usage"]["total_tokens"], 3);
+    assert!(
+        assistant["ordinal"]
+            .as_i64()
+            .is_some_and(|ordinal| ordinal > 0)
+    );
+    let content = assistant["content"].as_array().expect("canonical blocks");
+    assert_eq!(content[0]["type"], "tool_call");
+    assert_eq!(content[0]["tool_call_id"], "call-api");
+    assert_eq!(content[0]["name"], "read_file");
+    assert_eq!(content[0]["arguments_json"], r#"{"path":"lib.rs"}"#);
+    assert!(content[0].get("arguments").is_none());
+    let tool_result = messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message["role"] == "user"
+                && message["tool_call_id"] == "call-api"
+                && message["content"][0]["truncated"] == true
+        })
+        .expect("user tool_result");
+    assert_eq!(tool_result["name"], "read_file");
+    assert_eq!(tool_result["parent_message_id"], parent_id);
+    assert!(
+        tool_result["ordinal"]
+            .as_i64()
+            .is_some_and(|ordinal| ordinal > 0)
+    );
+    assert_eq!(tool_result["content"][0]["type"], "tool_result");
+    assert_eq!(tool_result["content"][0]["result"], "notes");
+    assert_eq!(tool_result["content"][0]["error"]["code"], "too_large");
+    assert_eq!(
+        tool_result["content"][0]["artifact"],
+        json!({"id": "art-1"})
+    );
+    assert!(tool_result["content"][0].get("artifacts").is_none());
+    assert_eq!(tool_result["content"][0]["truncated"], true);
+    let serialized = serde_json::to_string(tool_result).expect("serialize");
+    assert!(
+        serialized.contains("\"ordinal\""),
+        "ordinal must be serialized: {serialized}"
+    );
+    drop(app);
+    drop(state);
+    let _ = std::fs::remove_file(&path);
 }

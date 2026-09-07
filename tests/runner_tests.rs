@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use rustscript_agent::{
     AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
+    RunnerPrepareFault, set_after_snapshot_hook,
 };
 use rustscript_vm::{CancellationReason, InvocationError, Value};
 
@@ -498,4 +499,638 @@ fn blocked_delivery_pauses_invocation_polling() {
         .expect("worker thread should join")
         .expect("the run must complete after delivery resumes");
     assert_eq!(result, Value::string("done"));
+}
+
+#[test]
+fn enormous_timeout_and_wall_deadline_never_panic_and_fail_closed() {
+    let cancel = RunCancellation::with_timeout(Duration::MAX);
+    assert!(cancel.has_deadline_overflow());
+    assert!(!cancel.watcher_is_armed());
+
+    let from_wall = RunCancellation::from_wall_deadline_ms(u64::MAX, 0);
+    assert!(from_wall.has_deadline_overflow());
+    assert!(!from_wall.watcher_is_armed());
+}
+
+fn trivial_runner() -> AgentRunner {
+    AgentRunner::from_source(
+        r#"
+        pub fn run(input: map) -> string {
+            "ok";
+        }
+        "#,
+        AgentConfig::default(),
+    )
+    .expect("compile trivial agent")
+}
+
+#[test]
+fn prepare_panic_disarms_epoch_watcher() {
+    let runner = trivial_runner().with_prepare_fault(RunnerPrepareFault::PanicAfterArm);
+    let cancel = RunCancellation::with_timeout(Duration::from_secs(5));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut sink = RecordingSink::default();
+        let _ = runner.run_with_context_and_events(Value::map(vec![]), &mut sink, &cancel);
+    }));
+    assert!(panicked.is_err());
+    assert!(
+        !cancel.watcher_is_armed(),
+        "watcher must disarm after prepare panic"
+    );
+}
+
+#[test]
+fn prepare_error_disarms_epoch_watcher() {
+    let runner = trivial_runner().with_prepare_fault(RunnerPrepareFault::ErrorAfterArm);
+    let cancel = RunCancellation::with_timeout(Duration::from_secs(5));
+    let mut sink = RecordingSink::default();
+    let error = runner
+        .run_with_context_and_events(Value::map(vec![]), &mut sink, &cancel)
+        .expect_err("injected prepare error");
+    assert!(matches!(error, RunError::Setup(_)));
+    assert!(!cancel.watcher_is_armed());
+}
+
+#[test]
+fn drive_panic_disarms_epoch_watcher() {
+    let runner = trivial_runner().with_prepare_fault(RunnerPrepareFault::PanicDuringDrive);
+    let cancel = RunCancellation::with_timeout(Duration::from_secs(5));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut sink = RecordingSink::default();
+        let _ = runner.run_with_context_and_events(Value::map(vec![]), &mut sink, &cancel);
+    }));
+    assert!(panicked.is_err());
+    assert!(!cancel.watcher_is_armed());
+}
+
+#[test]
+fn from_source_compiles_supplied_bytes_even_when_dispatch_like_text_is_present() {
+    let source = r#"
+        pub fn run(input: map) -> string {
+            let marker: string = "use super::tools::dispatch";
+            "SENTINEL_FROM_SOURCE";
+        }
+    "#;
+    let runner = AgentRunner::from_source(source, AgentConfig::default())
+        .expect("from_source must compile the supplied bytes");
+    let result = runner
+        .run_with_context(Value::map(vec![]))
+        .expect("sentinel source should run");
+    assert_eq!(result, Value::string("SENTINEL_FROM_SOURCE"));
+}
+
+#[test]
+fn from_source_unresolved_import_fails_typed() {
+    let source = r#"
+        use super::tools::dispatch
+        pub fn run(input: map) -> string {
+            "should-not-run";
+        }
+    "#;
+    let error = match AgentRunner::from_source(source, AgentConfig::default()) {
+        Ok(_) => panic!("unresolved import must fail typed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        !message.contains("/home/") && !message.contains("CARGO_MANIFEST_DIR"),
+        "compile error must not leak a host path: {message}"
+    );
+}
+
+#[test]
+fn from_file_rejects_symlink_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-symlink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("real.rss");
+    std::fs::write(&target, "pub fn run(input: map) -> string { \"ok\"; }\n").expect("write");
+    let link = dir.join("link.rss");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let error = match AgentRunner::from_file(&link, AgentConfig::default()) {
+        Ok(_) => panic!("symlink entry must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("symlink"),
+        "expected symlink rejection, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_does_not_use_root_helper_for_missing_nested_helper() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-root-helper-shadow-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        rss.join("helper.rss"),
+        "pub fn value() -> string { \"ROOT_HELPER\"; }\n",
+    )
+    .expect("write root helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use helper;\npub fn run(context: map) -> string { helper::value(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("missing nested helper should not block root compilation");
+    if let Ok(value) = runner.run_with_context(Value::map(vec![])) {
+        assert_ne!(
+            value,
+            Value::string("ROOT_HELPER"),
+            "the root helper source must not be compiled under the nested identity"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_binds_same_named_helpers_to_their_nested_identity() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-nested-helper-identity-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        rss.join("helper.rss"),
+        "pub fn value() -> string { \"ROOT_HELPER\"; }\n",
+    )
+    .expect("write root helper");
+    std::fs::write(
+        agent.join("helper.rss"),
+        "pub fn value() -> string { \"NESTED_HELPER\"; }\n",
+    )
+    .expect("write nested helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use helper;\npub fn run(context: map) -> string { helper::value(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default()).expect("compile nested");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run nested helper"),
+        Value::string("NESTED_HELPER")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_preserves_same_name_host_namespace_for_module_identity() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-host-namespace-identity-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    std::fs::create_dir_all(&rss).expect("create rss dir");
+    let path = rss.join("agent.rss");
+    std::fs::write(
+        &path,
+        "use agent;\npub fn run(context: map) -> string { \"HOST_NAMESPACE\"; }\n",
+    )
+    .expect("write agent module");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("use agent must remain a host namespace in agent.rss");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run host namespace module"),
+        Value::string("HOST_NAMESPACE")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn from_file_rejects_an_ancestor_symlink_before_reading_outside() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-ancestor-symlink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let outside = dir.join("outside");
+    let input = dir.join("input");
+    let outside_agent = outside.join("agent");
+    std::fs::create_dir_all(&outside_agent).expect("create outside agent dir");
+    std::fs::create_dir_all(&input).expect("create input dir");
+    let outside_entry = outside_agent.join("main.rss");
+    std::fs::write(
+        &outside_entry,
+        "pub fn run(context: map) -> string { \"OUTSIDE\"; }\n",
+    )
+    .expect("write outside entry");
+    std::os::unix::fs::symlink(&outside, input.join("link")).expect("ancestor symlink");
+    let entry = input.join("link").join("agent").join("main.rss");
+
+    let result = AgentRunner::from_file(&entry, AgentConfig::default());
+    let error = match result {
+        Ok(_) => panic!("an ancestor symlink must not expose outside source bytes"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "RustScript compile error: module tree contains a symlink"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_content_digest_invalidates_when_bytes_change() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-digest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("main.rss");
+    std::fs::write(&path, "pub fn run(input: map) -> string { \"aaaa\"; }\n").expect("write");
+    let first = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("compile first")
+        .run_with_context(Value::map(vec![]))
+        .expect("run first");
+    assert_eq!(first, Value::string("aaaa"));
+    std::fs::write(&path, "pub fn run(input: map) -> string { \"bbbb\"; }\n").expect("rewrite");
+    let second = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("compile second")
+        .run_with_context(Value::map(vec![]))
+        .expect("run second");
+    assert_eq!(second, Value::string("bbbb"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_oversize_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-oversize-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("main.rss");
+    let mut bytes = b"pub fn run(input: map) -> string { \"x\"; }\n".to_vec();
+    bytes.resize(1024 * 1024 + 32, b'x');
+    std::fs::write(&path, bytes).expect("write");
+    let error = match AgentRunner::from_file(&path, AgentConfig::default()) {
+        Ok(_) => panic!("oversize module file must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("source size cap") || message.contains("exceeds"),
+        "expected size cap rejection, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_malformed_utf8_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-utf8-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("main.rss");
+    std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write");
+    let error = match AgentRunner::from_file(&path, AgentConfig::default()) {
+        Ok(_) => panic!("malformed utf-8 must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("UTF-8") || message.contains("utf-8") || message.contains("utf8"),
+        "expected utf-8 rejection, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_import_that_escapes_allowed_root() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-escape-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("temp dir");
+    std::fs::write(
+        dir.join("evil.rss"),
+        "pub fn leaked() -> string { \"leaked\"; }\n",
+    )
+    .expect("write evil");
+    std::fs::write(
+        agent.join("main.rss"),
+        "use super::super::evil as leaked;\npub fn run(input: map) -> string { leaked::leaked(); }\n",
+    )
+    .expect("write entry");
+    let error = match AgentRunner::from_file(agent.join("main.rss"), AgentConfig::default()) {
+        Ok(_) => panic!("outside-root import must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert_eq!(
+        message,
+        "RustScript compile error: module import escapes the allowed root"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_absolute_import_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-runner-abs-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("main.rss"),
+        "use /tmp/evil.rss;\npub fn run(context: map) -> map { { ok: true } }\n",
+    )
+    .expect("write entry");
+    let error = match AgentRunner::from_file(agent.join("main.rss"), AgentConfig::default()) {
+        Ok(_) => panic!("absolute import must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("malformed")
+            || message.contains("unsupported")
+            || message.contains("escapes")
+            || message.contains("expected"),
+        "absolute import must fail closed, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    assert!(
+        !message.contains("/tmp/evil.rss"),
+        "error must not leak import path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_crate_import_explicitly() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-crate-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("main.rss"),
+        "use crate::evil;\npub fn run(context: map) -> map { { ok: true } }\n",
+    )
+    .expect("write entry");
+    let error = match AgentRunner::from_file(agent.join("main.rss"), AgentConfig::default()) {
+        Ok(_) => panic!("crate import must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("crate"), "got {message}");
+    assert!(!message.contains("escapes the allowed root"), "{message}");
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_preserves_parser_valid_grouped_alias_imports() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-grouped-alias-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("helper.rss"),
+        "pub fn value() -> string { \"grouped-alias\"; }\n",
+    )
+    .expect("write helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use\n\t/* comments and whitespace */\n\tself::helper::{value as answer};\npub fn run(input: map) -> string { answer(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("parser-valid grouped alias import must compile");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run grouped alias import"),
+        Value::string("grouped-alias")
+    );
+    assert_eq!(runner.snapshot_digest().len(), 64);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_supports_nested_self_super_grouped_and_alias_imports() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-nested-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        rss.join("shared.rss"),
+        "pub fn super_value() -> string { \"SUPER_SHARED\"; }\n",
+    )
+    .expect("write shared");
+    std::fs::write(
+        agent.join("helper.rss"),
+        "use super::shared as parent_shared;\npub fn value() -> string { parent_shared::super_value(); }\n",
+    )
+    .expect("write helper");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use self::helper::{value as answer};\npub fn run(input: map) -> string { answer(); }\n",
+    )
+    .expect("write entry");
+
+    let runner = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("nested self/super grouped alias import must compile");
+    assert_eq!(
+        runner
+            .run_with_context(Value::map(vec![]))
+            .expect("run nested self/super import"),
+        Value::string("SUPER_SHARED")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_compile_cannot_open_live_module_added_after_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-live-after-snapshot-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    let path = agent.join("main.rss");
+    std::fs::write(
+        &path,
+        "use self::helper;\npub fn run(context: map) -> string { helper::value(); }\n",
+    )
+    .expect("write entry");
+    set_after_snapshot_hook(Some(|entry| {
+        let helper = entry.with_file_name("helper.rss");
+        let _ = std::fs::write(helper, "pub fn value() -> string { \"live\"; }\n");
+    }));
+    let result = AgentRunner::from_file(&path, AgentConfig::default());
+    set_after_snapshot_hook(None);
+    assert!(
+        result.is_err(),
+        "compiler must not open a live module added after snapshot"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_stores_snapshot_digest_and_ignores_live_mutation_after_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-runner-snapshot-compile-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    let path = agent.join("main.rss");
+    let original = "pub fn run(input: map) -> string { \"snapshot-aaaa\"; }\n";
+    let mutated = "pub fn run(input: map) -> string { \"snapshot-bbbb\"; }\n";
+    std::fs::write(&path, original).expect("write original");
+    set_after_snapshot_hook(Some(|entry| {
+        std::fs::write(
+            entry,
+            "pub fn run(input: map) -> string { \"snapshot-bbbb\"; }\n",
+        )
+        .expect("mutate after snapshot");
+    }));
+    let runner = match AgentRunner::from_file(&path, AgentConfig::default()) {
+        Ok(runner) => runner,
+        Err(error) => {
+            set_after_snapshot_hook(None);
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("from_file should compile the snapshot, got {error}");
+        }
+    };
+    set_after_snapshot_hook(None);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read mutated"),
+        mutated
+    );
+    assert_eq!(runner.snapshot_digest().len(), 64);
+    let output = runner
+        .run_with_context(Value::map(vec![]))
+        .expect("run snapshot program");
+    assert_eq!(output, Value::string("snapshot-aaaa"));
+    let later = AgentRunner::from_file(&path, AgentConfig::default()).expect("compile mutated");
+    assert_ne!(later.snapshot_digest(), runner.snapshot_digest());
+    assert_eq!(
+        later
+            .run_with_context(Value::map(vec![]))
+            .expect("run mutated program"),
+        Value::string("snapshot-bbbb")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

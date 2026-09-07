@@ -6,23 +6,80 @@
 //! of stream. The structured run context is the sole callable argument; the
 //! script-visible event builtin is `stream::emit(value)`.
 
+pub mod auth;
+pub mod capabilities;
 pub mod config;
+pub mod config_file;
+#[cfg(feature = "config-fixture")]
+mod config_host;
 pub mod domain;
 pub mod events;
 pub mod gateway;
+#[cfg(any(test, feature = "config-fixture"))]
+mod host_opaque;
 pub mod metrics;
+pub mod prompt;
+pub mod registry;
 pub mod runtime;
 pub mod service;
+pub mod tool_result;
+pub mod tool_schema;
 
+mod durable_provider;
+
+pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
+#[cfg(feature = "config-fixture")]
+pub use auth::oauth_host::{OAuthFixtureHost, oauth_fixture_catalog};
+pub use auth::store::{
+    ACCESS_HANDLE_CLASS, AuthMetadata, AuthStore, AuthStoreError, CredentialStore,
+    OpaqueAccessHandle, OpaqueRefreshHandle, OpaqueSecretSlot, REFRESH_HANDLE_CLASS,
+    RefreshSecretAction, SaveCredentialRequest, SaveOutcome,
+};
+#[cfg(feature = "config-fixture")]
+pub use auth::store_host::{AuthFixtureHost, auth_store_fixture_catalog};
+pub use auth::token::{AuthStatus, CredentialId, TokenError};
 pub use config::{AgentGatewayConfig, TelegramConfig};
+pub use config_file::{
+    AgentPaths, BoundedPublicConfig, ConfigFile, ConfigFileError, ConfigPaths, LoadedConfig,
+    RuntimeConfig, load_config,
+};
+#[cfg(feature = "config-fixture")]
+pub mod config_fixture {
+    pub use crate::auth::oauth_host::{OAuthFixtureHost, oauth_fixture_catalog};
+    pub use crate::auth::store_host::{AuthFixtureHost, auth_store_fixture_catalog};
+    pub use crate::config_file::{
+        ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyProbe,
+        SanitizedPolicySummary,
+    };
+    pub use crate::config_host::{ConfigFixtureHost, config_fixture_catalog};
+}
 pub use domain::{
     AgentEventEnvelope, InboundEnvelope, LlmContentBlock, LlmEvent, LlmMessage, LlmRequest,
-    LlmResponse, ProviderError, RunContext, Sampling, ToolCall, ToolDescriptor, Usage,
+    LlmResponse, ProviderError, RunContext, Sampling, ToolCall, Usage, decode_message_blocks,
+    decode_message_content, encode_message_content, provider_pending_may_retry,
+    truncate_utf8_chars,
 };
+pub use events::{DurableEventCommitter, EventCommitError};
 pub use gateway::store::GatewayPersistence;
 pub use gateway::{AgentGatewayState, build_agent_gateway_app};
+pub use registry::{
+    SchemaValidationError, SchemaValidationErrorKind, ToolRegistry, ToolRegistryEntry,
+    ToolRegistryError, ToolRegistrySnapshot, validate_json_schema,
+};
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
+    RunnerPrepareFault, bundled_agent_main_path, bundled_tool_entries, bundled_tool_registry,
+    set_after_snapshot_hook,
 };
-pub use service::{AdmitError, AdmitRunRequest, AdmittedRun, AgentService, RunHandle};
+pub use runtime::{
+    AgentHostBridges, AgentProviderHost, ControlCheckHook, ScriptedProvider, agent_host_catalog,
+};
+pub use service::{
+    AdmitError, AdmitRunRequest, AdmittedRun, AgentService, CleanupOutcome, ProviderCommit,
+    ProviderCommitOutcome, ProviderPendingDecision, RunHandle,
+};
+pub use tool_result::{ToolError, ToolOwner, ToolResult};
+pub use tool_schema::{
+    RiskClass, ToolDescriptor, Toolset, UnsupportedRiskClass, UnsupportedToolset,
+};

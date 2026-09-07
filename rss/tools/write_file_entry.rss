@@ -1,0 +1,5 @@
+use self::write_file::{invoke};
+
+pub fn run(context: map) -> map {
+    invoke(context)
+}

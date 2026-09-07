@@ -47,14 +47,23 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rustscript_agent::{
-    AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
+use rustscript_agent::capabilities::{
+    AllowAllApproval, ArtifactCapability, ArtifactLimits, CapabilityLifecycle, CapabilityOwner,
+    DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits, LifecycleClock,
+    LifecycleError, LifecycleLimits, NeverCancelled, ProcessCapability, ProcessLimits, SystemClock,
+    TokenIssuer, UuidIssuer,
 };
-use rustscript_vm::Value;
+use rustscript_agent::{
+    AgentConfig, AgentHostBridges, AgentRunner, RunCancellation, RunDeliveryError, RunError,
+    RunEventSink, ScriptedProvider, bundled_tool_registry,
+};
+use rustscript_vm::{CancellationReason, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 // ---------------------------------------------------------------------------
@@ -447,6 +456,28 @@ fn openai_chat_non_stream_text_usage_and_reasoning() {
 }
 
 #[test]
+fn openai_chat_unknown_finish_reason_is_preserved_as_text_response() {
+    let mut body: JsonValue =
+        serde_json::from_str(&read_fixture("openai_chat/response.json")).expect("fixture json");
+    body["choices"][0]["finish_reason"] = json!("mystery_stop");
+    let (port, _requests, fixture) = spawn_json_fixture(200, body.to_string());
+    let runner = harness_runner(port);
+    let request = canonical_request(port, false);
+
+    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+
+    assert!(result["ok"] == json!(true), "{result}");
+    let response = response_of(&result);
+    assert_eq!(response["stop_reason"], json!("mystery_stop"));
+    assert_eq!(response["tool_calls"], json!([]));
+    assert!(
+        !response["text"].as_str().expect("text").is_empty(),
+        "{response:?}"
+    );
+}
+
+#[test]
 fn openai_chat_non_stream_tool_calls() {
     let body = read_fixture("openai_chat/response_tools.json");
     let (port, requests, fixture) = spawn_json_fixture(200, body);
@@ -565,6 +596,295 @@ fn openai_chat_wire_format_is_standard() {
         "wire body must not mention tool_choice at all: {}",
         recorded.body
     );
+}
+
+/// Loop follow-up messages must convert through the real OpenAI Chat request
+/// builder: assistant `function.arguments` is the canonical JSON string, and
+/// tool results keep wire role/tool_call_id/content instead of being dropped.
+#[test]
+fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
+    let first_arguments = json!({"path": "文档.txt"});
+    let second_arguments = json!({"path": "a\"b.md"});
+    let provider = ScriptedProvider::new();
+    provider.push_ok(json!({
+        "text": "Let me read.",
+        "tool_calls": [
+            {"id": "call-1", "name": "read_file", "arguments": first_arguments},
+            {"id": "call-2", "name": "read_file", "arguments": second_arguments}
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "tool_calls"
+    }));
+    provider.push_ok(json!({
+        "text": "done",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        "reasoning": "",
+        "stop_reason": "stop"
+    }));
+    let loop_runner = AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
+        AgentConfig::default(),
+    )
+    .expect("production loop policy should compile");
+    let (mut dispatcher, _root) = loop_dispatcher(8);
+    dispatcher.provider = Some(Arc::new(provider.clone()));
+    dispatcher.skip_sleep = true;
+    let loop_runner = loop_runner.with_host(dispatcher);
+    let decision = vm_value_to_json(
+        &loop_runner
+            .run_with_context(json_to_vm_value(&loop_context()))
+            .expect("loop should run"),
+    );
+    assert_eq!(decision["kind"], json!("run.completed"));
+    assert_eq!(provider.call_count(), 2);
+
+    let mut follow = provider.requests()[1].clone();
+    assert_eq!(
+        follow["messages"][2]["content"][0]["content"],
+        json!("ran read_file"),
+        "canonical tool_result content before adapter conversion: {}",
+        follow["messages"][2]
+    );
+    let body = read_fixture("openai_chat/error.json");
+    let (port, requests, fixture) = spawn_json_fixture(400, body);
+    follow["provider_options"] = json!({
+        "base_url": format!("http://127.0.0.1:{port}"),
+        "api_key": "test-key",
+    });
+    let runner = harness_runner(port);
+    let (result, _) = run_adapter("openai_chat", follow, profile("openai", port), &runner);
+    fixture.join().expect("fixture thread");
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let recorded = requests.recv().expect("recorded request");
+    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let messages = wire["messages"].as_array().expect("wire messages");
+    assert_eq!(messages[0]["role"], json!("user"));
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    assert_eq!(messages[1]["content"], json!("Let me read."));
+    let first_arguments_json =
+        serde_json::to_string(&first_arguments).expect("first arguments json");
+    let second_arguments_json =
+        serde_json::to_string(&second_arguments).expect("second arguments json");
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["arguments"],
+        json!(first_arguments_json)
+    );
+    assert!(
+        messages[1]["tool_calls"][0]["function"]["arguments"].is_string(),
+        "function.arguments must be an exact JSON string: {}",
+        messages[1]["tool_calls"][0]["function"]["arguments"]
+    );
+    assert_eq!(
+        messages[1]["tool_calls"][1]["function"]["arguments"],
+        json!(second_arguments_json)
+    );
+    assert_eq!(messages[2]["role"], json!("tool"));
+    assert_eq!(messages[2]["tool_call_id"], json!("call-1"));
+    assert_eq!(messages[2]["content"], json!("ran read_file"));
+    assert_eq!(messages[3]["role"], json!("tool"));
+    assert_eq!(messages[3]["tool_call_id"], json!("call-2"));
+    assert_eq!(messages[3]["content"], json!("ran read_file"));
+    assert_eq!(
+        messages.len(),
+        4,
+        "tool results must not be dropped: {wire}"
+    );
+}
+
+fn loop_temp_root() -> PathBuf {
+    let root = std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "rustscript-agent-provider-loop-{}",
+                std::process::id()
+            ))
+        });
+    fs::create_dir_all(&root).expect("loop temp root should exist");
+    assert_temp_path_is_lease_safe(&root);
+    root
+}
+
+fn unique_loop_workspace(label: &str, sequence: u64) -> PathBuf {
+    loop_temp_root().join(format!("{}-{}-{}", label, std::process::id(), sequence))
+}
+
+fn assert_temp_path_is_lease_safe(path: &std::path::Path) {
+    if let Some(test_tmpdir) = std::env::var_os("TEST_TMPDIR") {
+        let root = PathBuf::from(test_tmpdir);
+        assert!(
+            path.starts_with(&root),
+            "loop temp paths must stay under TEST_TMPDIR ({}); got {}",
+            root.display(),
+            path.display()
+        );
+        return;
+    }
+    let rendered = path.to_string_lossy();
+    assert!(
+        path.starts_with(std::env::temp_dir()),
+        "loop temp paths must use std::env::temp_dir when TEST_TMPDIR is unset: {rendered}"
+    );
+    let worktrees = format!("/{}s/", "worktree");
+    let lease_tmp = format!("/mnt/{}/workspace/rustscript-agent/tmp/", "TEMP");
+    let prod_tmp = format!("/tmp/{}-agent-", "prod");
+    assert!(
+        !rendered.contains(&worktrees)
+            && !rendered.contains(&lease_tmp)
+            && !rendered.contains(&prod_tmp),
+        "loop temp paths must not write into a hardcoded sibling lease path: {rendered}"
+    );
+}
+
+thread_local! {
+    static LOOP_WORKSPACE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+struct LoopDurable;
+
+impl DurableToolLifecycle for LoopDurable {
+    fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+    fn prepare_parent(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+    fn replay_result(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<Option<JsonValue>, LifecycleError> {
+        Ok(None)
+    }
+    fn commit_started(&self, _record: &DurableStarted) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+    fn commit_result(
+        &self,
+        call_id: &str,
+        result: &JsonValue,
+    ) -> Result<JsonValue, LifecycleError> {
+        Ok(json!({"ok": true, "kind": "committed", "call_id": call_id, "result": result}))
+    }
+    fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+}
+
+fn loop_owner() -> CapabilityOwner {
+    CapabilityOwner::new("profile-loop", "session-loop", "run-loop").expect("owner")
+}
+
+fn loop_dispatcher(max_tool_calls: u64) -> (AgentHostBridges, PathBuf) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = unique_loop_workspace("adapter-loop", NEXT.fetch_add(1, Ordering::Relaxed));
+    fs::create_dir_all(&root).expect("loop dispatcher workspace");
+    fs::write(root.join("文档.txt"), "ran read_file").expect("seed");
+    fs::write(root.join(r#"a"b.md"#), "ran read_file").expect("seed");
+    LOOP_WORKSPACE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
+    let identity = bundled_tool_registry()
+        .expect("RSS registry")
+        .identity()
+        .to_string();
+    let clock = Arc::new(SystemClock);
+    let deadline_ms = clock.now_ms() + 30_000;
+    let lifecycle = Arc::new(
+        CapabilityLifecycle::builder()
+            .owner(loop_owner())
+            .registry_identity(identity)
+            .workspace(&root)
+            .limits(LifecycleLimits {
+                max_tool_calls: max_tool_calls.max(1),
+                max_output_bytes: 64 * 1024,
+                max_summary_bytes: 256,
+            })
+            .deadline_ms(deadline_ms)
+            .clock(clock)
+            .tokens(Arc::new(UuidIssuer) as Arc<dyn TokenIssuer>)
+            .durable(Arc::new(LoopDurable))
+            .approval(Arc::new(AllowAllApproval))
+            .cancellation(Arc::new(NeverCancelled))
+            .build()
+            .expect("loop lifecycle"),
+    );
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::clone(&lifecycle)),
+        capability_owner: Some(loop_owner()),
+        filesystem: Some(Arc::new(
+            FilesystemCapability::new(
+                lifecycle.as_ref().clone(),
+                loop_owner(),
+                FilesystemLimits::default(),
+            )
+            .expect("fs"),
+        )),
+        processes: Some(Arc::new(
+            ProcessCapability::new(
+                lifecycle.as_ref().clone(),
+                loop_owner(),
+                ProcessLimits::default(),
+            )
+            .expect("proc"),
+        )),
+        artifacts: Some(Arc::new(
+            ArtifactCapability::new(
+                lifecycle.as_ref().clone(),
+                loop_owner(),
+                ArtifactLimits {
+                    max_object_bytes: 8 * 1024 * 1024,
+                    max_total_bytes: 64 * 1024 * 1024,
+                    max_objects: 64,
+                },
+            )
+            .expect("artifacts"),
+        )),
+        ..AgentHostBridges::default()
+    };
+    (host, root)
+}
+
+fn loop_context() -> JsonValue {
+    json!({
+        "run_id": "run-loop",
+        "session_id": "session-loop",
+        "model": "test-model",
+        "provider": "openai",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        }],
+        "tools": bundled_tool_registry()
+            .expect("RSS registry")
+            .snapshot()
+            .schemas(),
+        "provider_options": {},
+        "limits": {
+            "max_turns": 4,
+            "max_tool_calls": 8,
+            "workspace_root": LOOP_WORKSPACE.with(|slot| {
+                slot.borrow().as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
+            })
+        },
+        "metadata": {
+            "registry_identity": bundled_tool_registry().ok().map(|r| r.identity().to_string()).unwrap_or_default()
+        },
+        "config": {
+            "base_retry_delay_ms": 100,
+            "max_retry_delay_ms": 400,
+            "max_retries": 2,
+            "parallel": false,
+            "task": false
+        }
+    })
 }
 
 /// Marker-splice collision guard (P3, user text): the wire splices user
@@ -1032,4 +1352,171 @@ fn anthropic_messages_stream_transcript_is_referenced() {
 
     assert!(result["ok"] == json!(false), "{result}");
     assert_eq!(result["error"]["code"], json!("not_implemented"));
+}
+
+fn production_loop_runner() -> AgentRunner {
+    AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
+        AgentConfig::default(),
+    )
+    .expect("production loop policy should compile")
+}
+
+fn production_loop_context(base_url: &str) -> JsonValue {
+    let mut context = loop_context();
+    context["provider_options"] = json!({
+        "base_url": base_url,
+        "api_key": "test-key",
+    });
+    context
+}
+
+fn spawn_slow_http_fixture() -> (
+    u16,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind slow fixture");
+    let port = listener.local_addr().expect("slow fixture address").port();
+    let accepted = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let accepted_flag = Arc::clone(&accepted);
+    let finished_flag = Arc::clone(&finished);
+    let handle = thread::spawn(move || {
+        let Some(mut stream) = accept_bounded(&listener) else {
+            finished_flag.store(true, Ordering::SeqCst);
+            return;
+        };
+        accepted_flag.store(true, Ordering::SeqCst);
+        let _ = read_http_request(&mut stream);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("slow fixture read timeout");
+        let mut buffer = [0_u8; 256];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+        finished_flag.store(true, Ordering::SeqCst);
+    });
+    (port, accepted, finished, handle)
+}
+
+#[test]
+fn production_adapter_allows_https_default_port_without_explicit_port() {
+    let runner = production_loop_runner();
+    let decision = vm_value_to_json(
+        &runner
+            .run_with_context(json_to_vm_value(&production_loop_context(
+                "https://127.0.0.1/v1",
+            )))
+            .expect("https default-port loop should return a decision"),
+    );
+    let message = decision["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(
+        !message.contains("port 443 is not allowed"),
+        "ordinary https URLs must use port_or_known_default(443): {decision}"
+    );
+    assert!(
+        !message.contains("has no known default port"),
+        "https has a known default port: {decision}"
+    );
+}
+
+#[test]
+fn production_adapter_rejects_unknown_defaultless_scheme() {
+    let runner = production_loop_runner();
+    let decision = vm_value_to_json(
+        &runner
+            .run_with_context(json_to_vm_value(&production_loop_context(
+                "foo://127.0.0.1/v1",
+            )))
+            .expect("unknown-scheme loop should return a decision"),
+    );
+    assert_eq!(decision["kind"], json!("run.failed"));
+    assert_eq!(decision["error"]["code"], json!("config"));
+    assert_eq!(decision["error"]["retryable"], json!(false));
+}
+
+#[test]
+fn production_adapter_allows_explicit_nondefault_http_port() {
+    let body = read_fixture("openai_chat/response.json");
+    let runner = production_loop_runner();
+    let (port, _requests, fixture) = spawn_json_fixture(200, body);
+    let decision = vm_value_to_json(
+        &runner
+            .run_with_context(json_to_vm_value(&production_loop_context(&format!(
+                "http://127.0.0.1:{port}"
+            ))))
+            .expect("explicit nondefault port should reach the adapter"),
+    );
+    fixture.join().expect("fixture thread");
+    assert_eq!(decision["kind"], json!("run.completed"), "{decision}");
+}
+
+#[test]
+fn nested_adapter_http_is_interrupted_by_parent_cancel() {
+    let runner = production_loop_runner();
+    let (port, accepted, finished, fixture) = spawn_slow_http_fixture();
+    let cancellation = RunCancellation::new();
+    let worker_cancel = cancellation.clone();
+    let context = json_to_vm_value(&production_loop_context(&format!(
+        "http://127.0.0.1:{port}"
+    )));
+    let worker = thread::spawn(move || {
+        let mut sink = RecordingSink::default();
+        runner.run_with_context_and_events(context, &mut sink, &worker_cancel)
+    });
+    let wait_start = Instant::now();
+    while !accepted.load(Ordering::SeqCst) {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(8),
+            "nested adapter never opened the HTTP connection"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let start = Instant::now();
+    cancellation.request(CancellationReason::Requested);
+    let result = worker.join().expect("nested adapter worker");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "parent cancel must interrupt nested HTTP promptly, took {elapsed:?}"
+    );
+    match result {
+        Ok(value) => {
+            let decision = vm_value_to_json(&value);
+            assert_eq!(decision["kind"], json!("run.failed"), "{decision}");
+            assert_eq!(decision["error"]["code"], json!("cancelled"), "{decision}");
+        }
+        Err(error) => {
+            let text = format!("{error:?}");
+            assert!(
+                text.contains("Cancelled") || text.contains("Deadline"),
+                "parent stop must return typed cancelled/deadline, got {error:?}"
+            );
+        }
+    }
+    let join_start = Instant::now();
+    fixture
+        .join()
+        .expect("slow fixture must join after client drop");
+    assert!(
+        join_start.elapsed() < Duration::from_secs(2),
+        "HTTP fixture worker must not remain after cancel"
+    );
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "slow HTTP worker must finish with no residue"
+    );
 }

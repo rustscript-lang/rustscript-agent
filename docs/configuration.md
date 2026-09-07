@@ -17,7 +17,8 @@ fails the test suite.
 
 | Source | Owns | Read by |
 | --- | --- | --- |
-| Environment variables (`RUSTSCRIPT_AGENT_*`) | gateway process | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
+| Gateway environment variables (`RUSTSCRIPT_AGENT_*`, excluding library-only `RUSTSCRIPT_AGENT_HOME`) | gateway process | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
+| Library bootstrap (`RUSTSCRIPT_AGENT_HOME`) | persistent config/auth paths | library path resolver |
 | CLI arguments (`--script`, `--allow-host`) | one run | `rustscript-agent` binary (`src/bin/rustscript-agent.rs`) |
 | Native `AgentGatewayConfig` fields | embedding code | library API; the gateway binary maps a fixed subset from environment variables |
 
@@ -26,12 +27,51 @@ through validated native configuration (`AgentConfig`/`HttpConfig`/
 `SqlitePolicy`), and the storage program receives its per-command limits
 through the typed command envelope.
 
+Persistent `config.yaml` / `auth.yaml` are loaded by a Stage A fixture host
+as `config::load_snapshot(host_home)`. Production `agent_host_catalog` /
+`AgentRunner` do not register that bridge. The fixture host binds `HostHome`
+before RSS runs; RSS cannot supply or override the filesystem path. The
+generic loader keeps bounded YAML, HTTPS-or-loopback URL syntax, secret-key
+rejection, and credential-ID reference integrity. Provider-name authority
+mapping, provider defaults, OAuth field interpretation, and local-agent
+special cases are RSS policy: an unknown provider name is not rejected merely
+because it is unknown, and explicit custom HTTPS providers remain
+configurable. The snapshot exposed to RSS is `BoundedPublicConfig`, opaque
+credential IDs, a sanitized policy summary, and a host-native
+`OpaquePolicyHandle` that is not a map or string token. Raw tokens never
+cross into RSS, events, logs, or durable output. Typed config/auth errors
+carry a path-qualified `path` field (filesystem or YAML field path), never
+the full Display prose.
+
 ## Environment variables (gateway binary)
 
-Every `RUSTSCRIPT_AGENT_*` variable has a deprecated prototype alias
-`PD_EDGE_AGENT_*`. When the primary variable is unset, the legacy name is
-read and a deprecation warning is printed to stderr; the primary name always
-wins. The aliases are scheduled for removal before v1 — do not rely on them.
+### Library bootstrap input (library only)
+
+`RUSTSCRIPT_AGENT_HOME` is a Task 1 bootstrap input read by the library
+config/auth path resolver. It is not consumed by the current gateway binary
+and does not add a gateway CLI startup setting. This library-only input has no
+legacy environment alias. When set, it must be a non-empty absolute path
+without parent-directory components and takes precedence over `$HOME` (or
+`$USERPROFILE`). When unset, the resolver uses `$HOME/.rustscript-agent` (or
+`$USERPROFILE/.rustscript-agent`). The selected home derives these paths:
+
+- `<home>/config.yaml`
+- `<home>/auth.yaml`
+- `<home>/auth.yaml.lock`
+- `<home>/state.db`
+
+The Task 1 path resolver does not derive a `skills/` path. Job `skills` values
+are stored as job data and do not select files below this home. The gateway's
+existing `RUSTSCRIPT_AGENT_STATE_DB` remains its separate state-database
+selector.
+
+### Gateway variables and deprecated aliases
+
+Every gateway `RUSTSCRIPT_AGENT_*` variable in the table has a deprecated
+prototype alias `PD_EDGE_AGENT_*`. When the primary variable is unset, the
+legacy name is read and a deprecation warning is printed to stderr; the
+primary name always wins. The aliases are scheduled for removal before v1 —
+do not rely on them.
 
 | Variable | Deprecated alias | Type | Default | Bounds / notes |
 | --- | --- | --- | --- | --- |
@@ -42,7 +82,7 @@ wins. The aliases are scheduled for removal before v1 — do not rely on them.
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
 | `RUSTSCRIPT_AGENT_ALLOW_PORTS` | `PD_EDGE_AGENT_ALLOW_PORTS` | comma-separated list of `u16` | empty (deny all) | When set it must contain at least one valid port and no empty entries; otherwise startup fails. Empty list denies all ports — with the default configuration no request can be made, so production deployments must list the ports scripts may reach (for example `443`). |
 | `RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS` | `PD_EDGE_AGENT_ALLOW_PRIVATE_IPS` | flag | unset (`false`) | Only the exact value `1` allows destinations on private/loopback IP ranges. |
-| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | unset | Path to the RSS agent source. Read and compiled at startup; sources over 1 MiB (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
+| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | bundled `rss/agent/main.rss` | Path to the RSS agent **entry file**. The gateway compiles that file and its module tree (`with_agent_file`); it is not a source string. When unset, production `AgentGatewayState::new` / `with_sqlite_path` install the bundled `main.rss`. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
 | `RUSTSCRIPT_AGENT_STATE_DB` | `PD_EDGE_AGENT_STATE_DB` | filesystem path | unset (in-memory) | SQLite state file (sessions, messages, runs, events, jobs, approvals, compactions). Without it the gateway runs in-memory only and state is lost on restart. See `docs/deployment.md`. |
 | Rate limiting (A7) |
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED` | `PD_EDGE_AGENT_RATE_LIMIT_ENABLED` | flag | `0` (disabled) | Only the exact values `0`/`1` are accepted; anything else fails startup. When enabled, every API request consumes one per-peer-IP token and verified requests additionally consume one per-account token. |
@@ -189,6 +229,129 @@ page bounds.
 | `MAX_AGENT_SOURCE_BYTES` | 1 MiB | Agent sources (and the storage program) over this bound are rejected at load/compile time. |
 | `RUN_EPOCH_DEADLINE_TICKS` | 1 000 000 000 | Epoch budget granted to one cancellable run; the cancellation watcher jumps the epoch past it. |
 | `RUN_EPOCH_CHECK_INTERVAL` | 1 000 | Interpreter operations between epoch checks on cancellable runs. |
+
+## Coding tools and serial loop
+
+The library `AgentService` worker compiles bundled `rss/agent/main.rss` and
+drives a **serial** RSS `tools::dispatch` loop over the generic capability
+host (`agent::provider_call`, filesystem/process/artifact adapters). This is
+not an OpenAI-compatible inference path.
+
+Built-in RSS registry tools, in registry order:
+
+| Name | Toolset | Risk | Notes |
+| --- | --- | --- | --- |
+| `read_file` | coding | read | Bounded workspace file read. |
+| `search_files` | coding | read | Bounded workspace search. |
+| `write_file` | coding | write | Write complete workspace file contents. |
+| `patch` | coding | write | Minimal unique-string replacement. |
+| `terminal` | process | execute | Direct `argv` execution; no shell command string. |
+| `process` | process | execute | Background/control sibling of `terminal`. |
+
+Parallel tool calls are rejected (`unsupported_parallel`). Subagents and A6
+parallel fan-out are out of scope.
+
+## Workspace guidance, priority, and budgets
+
+Admission freezes one coding system prompt from the run workspace. Root-level
+guidance files are read in this priority, highest first: `AGENTS.md`,
+`CLAUDE.md`, `.cursorrules`. Default `CodingPromptBudgets` are 16 KiB total
+prompt, 8 KiB combined guidance, and 4 KiB per guidance file. Each admitted
+file is length-prefixed as untrusted content so project bytes cannot forge
+later contract sections. The frozen prompt is reused as the sole system
+message on every subsequent provider request for that run.
+
+## Provider profiles
+
+`ProviderProfile` is a validated, secret-safe snapshot retained on
+`AgentService`. Built-in names map protocol labels only (`local-agent` →
+`local-agent`, `openai` / `openai-compatible` → `openai-chat-completions`).
+Options are request-shaping controls (`profile`, `protocol`,
+`reasoning_effort`, `base_url`, sampling numbers). Credential-bearing keys,
+headers, and unsafe URLs are rejected rather than redacted. Profiles do not
+grant network access; HTTP remains deny-by-default unless hosts **and** ports
+are allowlisted.
+
+## Run limits, deadline, and cancellation
+
+`RunLimits` (`max_turns`, `max_tool_calls`, `max_tool_output_bytes`,
+`workspace_root`) are captured at admission. `workspace_root` must be an
+absolute existing directory and is canonicalized. `AgentGatewayConfig.run_timeout`
+is the per-run wall-clock deadline; it is not reset per provider or tool
+call. `stop` requests cooperative cancellation once: the provider call, RSS
+run, and native process/terminal children share the run token.
+`cancellation_grace` bounds how long the worker waits after a deadline before
+the thread is abandoned. Client-disconnect policy is independent
+(`keep-running` by default).
+
+## Durable replay
+
+`DurableProviderHost` is the production provider seam. Before each fresh inner
+call it commits a sanitized `model.requested` boundary (`retry_safe` plus a
+`sha256:` fingerprint; never `request`/`messages`/`prompt`/`provider_options`/
+`api_key`/`headers`/`body`). Completed canonical provider steps
+(`model.completed` plus the assistant message) replay on restart without an
+inner call or a second `turns` increment. Pending retry-safe requests retry the
+same logical turn and do not synthesize an assistant/tool parent. Pending
+requests that are not retry-safe, lack a fingerprint, leak secret keys, or
+already have a later tool effect fail closed (`interrupted_provider`) with no
+provider or tool effect.
+
+RSS dispatch is durable-first. Assistant `tool_call` parents and user
+`tool_result` messages carry `parent_message_id` and monotonic `ordinal`
+values. A missing or name-mismatched parent fails closed (`missing_tool_parent`)
+and does not run the executor. Replaying an already durable `ToolResult` does
+not re-account metrics.
+
+Exactly-once delivery to an external receiver is impossible: event delivery is
+at-least-once. Durable replay guarantees the agent does not duplicate tool
+effects or provider-step rows; subscribers may observe the same durable event
+more than once.
+
+## Coding metrics
+
+Five saturating coding-agent counters are recorded without prompts, paths, or
+raw outputs:
+
+| Metric | Prometheus name | Counted when |
+| --- | --- | --- |
+| `model_calls` | `agent_model_calls_total` | Each actual `AgentProviderHost::call` |
+| `tool_calls` | `agent_tool_calls_total` | Each freshly executed or failed tool dispatch |
+| `tool_failures` | `agent_tool_failures_total` | Canonical `ToolResult.ok == false` |
+| `turns` | `agent_turns_total` | Successful `ok: true` provider envelopes |
+| `truncations` | `agent_truncations_total` | Typed `truncated` on a model envelope or tool result |
+
+## Security confinement
+
+Coding file tools and `terminal`/`process` are confined to the admitted
+`workspace_root`. `terminal` executes `argv` directly; a `command` shell
+string is rejected (`invalid_argv`). Default HTTP policy denies all hosts and
+ports. The coding loop E2E uses `ScriptedProvider` as model transport and the
+`local-agent` profile so it cannot fall through to an OpenAI-compatible
+network adapter.
+
+## Local coding-agent E2E
+
+The main real coding workflow is covered by:
+
+```bash
+cargo test --test coding_agent_e2e_tests
+```
+
+Stop-during-terminal cancellation and bounded output-limit overflow are
+covered by:
+
+```bash
+cargo test --test coding_agent_edge_e2e_tests
+```
+
+The main suite generates a temporary git workspace, drives the production
+`AgentService` worker and bundled RSS loop, and asserts a real `read_file` →
+`patch` → `terminal` argv test run. The edge suite asserts stop-during-terminal
+child cleanup, exact tool lifecycle, durable parent/name/ordinal chaining,
+truncated overflow artifacts, that reopening a completed run is a no-op, and
+pending provider-turn restart: retry-safe replay/retry, completed-step replay
+fidelity, unsafe fail-closed, and no duplicate tool effect or metric count.
 
 ## Secrets
 

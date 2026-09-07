@@ -6,6 +6,7 @@
 use json;
 use sqlite;
 use self::existence as existence;
+use self::messages as messages;
 
 struct AdmissionCreateInput {
     session_id: string,
@@ -90,7 +91,7 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             }
             statements[statements.length] = {
                 sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, 'user', ?, '{}', ?, '', ? FROM messages WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                params: [&input.message_id, &input.session_id, &input.input_json, &input.message_run_id, input.now_ms.copy(), &input.session_id, &input.message_id, &input.session_id]
+                params: [&input.message_id, &input.session_id, messages::storage_message_encode_content(db_id, storage_admission_user_content(db_id, input.input_json.copy())), &input.message_run_id, input.now_ms.copy(), &input.session_id, &input.message_id, &input.session_id]
             };
             statements[statements.length] = {
                 sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))",
@@ -207,4 +208,22 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
         }
     }
     result
+}
+
+// Prefer the compact envelope's `run_context.input` as the user message body
+// so conversation rows stay canonical; fall back to the raw payload.
+fn storage_admission_user_content(db_id: resource<sqlite.connection>, input_json: string) -> string {
+    let extracted: map = sqlite::query(
+        &db_id,
+        "SELECT CASE WHEN json_valid(?) AND json_extract(?, '$.run_context.input') IS NOT NULL THEN CAST(json_extract(?, '$.run_context.input') AS TEXT) ELSE ? END AS content",
+        [&input_json, &input_json, &input_json, &input_json],
+        { max_rows: 1, max_result_bytes: 1048576 }
+    );
+    let rows: array = extracted["rows"];
+    let mut content: string = input_json.copy();
+    if rows.length > 0 {
+        let row: array = rows[0].copy();
+        content = row[0];
+    }
+    content
 }

@@ -1,0 +1,5 @@
+use self::process::{invoke};
+
+pub fn run(context: map) -> map {
+    invoke(context)
+}

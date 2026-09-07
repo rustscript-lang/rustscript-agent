@@ -25,9 +25,14 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "5c328b8d5c374b365a2560925204e588b575a30a", default-features = false, features = ["runtime", "http-client", "sqlite"] }
+rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "f9ca4143f8ba2f486e270347504c49f5ea846097", default-features = false, features = ["runtime", "http-client", "sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
+yaml-rust2 = { version = "0.12", default-features = false }
+# Meta-schema validation only; resolver features stay disabled.
+jsonschema = { version = "0.52.1", default-features = false }
+libc = "0.2.189"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", features = ["util"] }
@@ -35,6 +40,37 @@ tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 webpki-roots = "1"
+zeroize = "1"
+ring = "0.17"
 
 [dev-dependencies]
 tracing-core = "0.1"
+
+[features]
+default = []
+config-fixture = []
+
+[[test]]
+name = "auth_store_tests"
+path = "tests/auth_store_tests.rs"
+required-features = ["config-fixture"]
+
+[[test]]
+name = "auth_store_rss_tests"
+path = "tests/auth_store_rss_tests.rs"
+required-features = ["config-fixture"]
+
+[[test]]
+name = "config_auth_rss_tests"
+path = "tests/config_auth_rss_tests.rs"
+required-features = ["config-fixture"]
+
+[[test]]
+name = "oauth_flow_tests"
+path = "tests/oauth_flow_tests.rs"
+required-features = ["config-fixture"]
+
+[[test]]
+name = "oauth_rss_entry_tests"
+path = "tests/oauth_rss_entry_tests.rs"
+required-features = ["config-fixture"]

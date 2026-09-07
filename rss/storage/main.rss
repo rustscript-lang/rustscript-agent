@@ -360,6 +360,10 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         };
     } else if command.op == "event.append" {
         result = storage_unwrap_array(request_id, op, events::storage_event_append(db_id, command.payload_json));
+    } else if command.op == "step.commit" {
+        result = storage_unwrap_array(request_id, op, events::storage_step_commit(db_id, command.payload_json));
+    } else if command.op == "recovery.reconcile_effects" {
+        result = storage_unwrap_array(request_id, op, events::storage_effect_reconcile(db_id, command.payload_json));
     } else if command.op == "event.replay" {
         let replay_input: ReplayFloorInput = json::decode::<ReplayFloorInput>(command.payload_json);
         let floor: map = events::storage_event_retention(db_id, replay_input.run_id);

@@ -14,12 +14,13 @@
 //! and a watcher thread jumps the epoch so pure CPU work is interrupted within
 //! the configured epoch bound (surfacing as a typed deadline failure).
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
@@ -27,13 +28,261 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallReturn, CancellationReason, EpochHandle, HostAsyncBridge, HostFunctionRegistry, HostFuture,
-    HostFutureOutput, HttpConfig, HttpHostExt, InvocationError, InvocationItem, InvocationPoll,
-    SqliteHostExt, SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source, register_http_builtin_module, register_sqlite_builtin_module,
+    CallReturn, CancellationReason, CancellationToken, CompileSourceFileOptions, EpochHandle,
+    HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt,
+    InvocationError, InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy,
+    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
+    register_http_builtin_module_from_catalog, register_sqlite_builtin_module_from_catalog,
 };
 
+use super::agent_host::{
+    AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog,
+    register_agent_host_functions,
+};
+use crate::capabilities::sha256_hex;
+use crate::domain::{json_to_vm_value, vm_value_to_json};
+use crate::registry::ToolRegistry;
+use crate::tool_schema::ToolDescriptor;
+use serde_json::json;
+
 pub const MAX_AGENT_SOURCE_BYTES: usize = 1024 * 1024;
+pub const COMPILE_CACHE_CAP: usize = 8;
+pub const COMPILE_CACHE_WEIGHT_CAP: usize = COMPILE_CACHE_CAP * MAX_AGENT_SOURCE_BYTES;
+
+thread_local! {
+    static AFTER_SNAPSHOT_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+}
+
+/// Test seam: invoked after `from_file` captures an immutable snapshot and
+/// before the compiler reads the materialized sandbox copy.
+pub fn set_after_snapshot_hook(hook: Option<fn(&Path)>) {
+    AFTER_SNAPSHOT_HOOK.with(|cell| cell.set(hook));
+}
+
+fn invoke_after_snapshot(path: &Path) {
+    AFTER_SNAPSHOT_HOOK.with(|cell| {
+        if let Some(hook) = cell.get() {
+            hook(path);
+        }
+    });
+}
+
+struct CachedProgram {
+    program: rustscript_vm::Program,
+    weight: usize,
+}
+
+struct ProgramLru {
+    entries: HashMap<String, CachedProgram>,
+    order: VecDeque<String>,
+    total_weight: usize,
+}
+
+impl ProgramLru {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            total_weight: 0,
+        }
+    }
+
+    fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
+        if !self.entries.contains_key(digest) {
+            return None;
+        }
+        if let Some(index) = self.order.iter().position(|key| key == digest) {
+            self.order.remove(index);
+        }
+        self.order.push_back(digest.to_string());
+        self.entries.get(digest).map(|entry| entry.program.clone())
+    }
+
+    fn insert(&mut self, digest: String, program: rustscript_vm::Program, weight: usize) {
+        if self.entries.contains_key(&digest) {
+            if let Some(index) = self.order.iter().position(|key| key == &digest) {
+                self.order.remove(index);
+            }
+            self.order.push_back(digest);
+            return;
+        }
+        if weight > COMPILE_CACHE_WEIGHT_CAP {
+            return;
+        }
+        while !self.order.is_empty()
+            && (self.order.len() >= COMPILE_CACHE_CAP
+                || self.total_weight.saturating_add(weight) > COMPILE_CACHE_WEIGHT_CAP)
+        {
+            if let Some(old) = self.order.pop_front()
+                && let Some(entry) = self.entries.remove(&old)
+            {
+                self.total_weight = self.total_weight.saturating_sub(entry.weight);
+            }
+        }
+        self.total_weight = self.total_weight.saturating_add(weight);
+        self.entries
+            .insert(digest.clone(), CachedProgram { program, weight });
+        self.order.push_back(digest);
+    }
+}
+
+fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
+    static CACHE: OnceLock<Mutex<ProgramLru>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(ProgramLru::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn snapshot_module_tree(entry: &Path) -> Result<String> {
+    super::module_snapshot::module_tree_digest(entry)
+}
+
+fn redact_compile_error(error: impl Display, sandbox: &Path) -> AgentError {
+    let mut text = error.to_string();
+    if let Some(root) = sandbox.to_str()
+        && !root.is_empty()
+    {
+        text = text.replace(root, "");
+    }
+    if let Some(tmp) = compile_temp_root().to_str()
+        && !tmp.is_empty()
+    {
+        text = text.replace(tmp, "");
+    }
+    if let Some(tmp) = std::env::temp_dir().to_str()
+        && !tmp.is_empty()
+    {
+        text = text.replace(tmp, "");
+    }
+    AgentError::Compile(text)
+}
+
+fn compile_temp_root() -> PathBuf {
+    std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn compiled_source_program(source: &str) -> Result<(rustscript_vm::Program, String)> {
+    if source.len() > MAX_AGENT_SOURCE_BYTES {
+        return Err(AgentError::Compile(format!(
+            "agent source exceeds {} bytes",
+            MAX_AGENT_SOURCE_BYTES
+        )));
+    }
+    let digest = sha256_hex(source.as_bytes());
+    {
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok((program, digest));
+        }
+    }
+    let program =
+        compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, compile_options())
+            .map_err(|error| AgentError::Compile(error.to_string()))?
+            .program;
+    {
+        let mut cache = program_cache();
+        if let Some(cached) = cache.get(&digest) {
+            return Ok((cached, digest));
+        }
+        cache.insert(digest.clone(), program.clone(), source.len());
+    }
+    Ok((program, digest))
+}
+
+fn compiled_file_program(path: &Path) -> Result<(rustscript_vm::Program, String)> {
+    let snapshot = super::module_snapshot::capture_module_snapshot(path)?;
+    invoke_after_snapshot(path);
+    let digest = snapshot.digest().to_string();
+    {
+        let mut cache = program_cache();
+        if let Some(program) = cache.get(&digest) {
+            return Ok((program, digest));
+        }
+    }
+    let sandbox = snapshot.materialize()?;
+    let mut options = compile_options();
+    for (rel, bytes) in snapshot.files() {
+        let source = std::str::from_utf8(bytes)
+            .map_err(|_| AgentError::Compile("module tree file is not valid UTF-8".to_string()))?;
+        for key in sandbox.override_source_keys(rel) {
+            options = options.with_module_override_source(key, source);
+        }
+    }
+    let program = compile_source_at_path_with_flavor_and_options(
+        sandbox.entry(),
+        snapshot.entry_source()?,
+        SourceFlavor::RustScript,
+        options,
+    )
+    .map_err(|error| redact_compile_error(error, sandbox.sandbox()))?
+    .program;
+    drop(sandbox);
+    {
+        let mut cache = program_cache();
+        if let Some(cached) = cache.get(&digest) {
+            return Ok((cached, digest));
+        }
+        cache.insert(
+            digest.clone(),
+            program.clone(),
+            snapshot.total_source_bytes(),
+        );
+    }
+    Ok((program, digest))
+}
+
+fn rss_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("rss")
+}
+
+/// Production bundled coding-agent entry (`rss/agent/main.rss`).
+pub fn bundled_agent_main_path() -> PathBuf {
+    rss_root().join("agent/main.rss")
+}
+
+pub(crate) fn module_tree_digest(path: impl AsRef<Path>) -> Result<String> {
+    snapshot_module_tree(path.as_ref())
+}
+
+/// Admits the production RSS tool-registry descriptors after generic bounds.
+pub fn bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
+    load_bundled_tool_registry()
+}
+
+fn load_bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/tools/registry.rss");
+    let runner =
+        AgentRunner::from_file(&path, AgentConfig::default()).map_err(|error| error.to_string())?;
+    let result = runner
+        .run_with_context(json_to_vm_value(
+            &json!({"kind": "descriptors", "config": {}}),
+        ))
+        .map_err(|error| format!("run RSS registry: {error}"))?;
+    let json = vm_value_to_json(&result);
+    if json.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("RSS registry failed: {json}"));
+    }
+    let descriptors = json
+        .get("descriptors")
+        .cloned()
+        .ok_or_else(|| "RSS registry missing descriptors".to_string())?;
+    let parsed: Vec<ToolDescriptor> =
+        serde_json::from_value(descriptors).map_err(|error| error.to_string())?;
+    ToolRegistry::from_descriptors(parsed).map_err(|error| error.to_string())
+}
+
+/// Admitted production RSS registry entries for tests that mutate a snapshot.
+pub fn bundled_tool_entries() -> Vec<crate::registry::ToolRegistryEntry> {
+    bundled_tool_registry()
+        .expect("RSS tool registry validates")
+        .snapshot()
+        .entries()
+        .to_vec()
+}
 
 /// Epoch ticks granted to one cancellable run. The cancellation watcher jumps
 /// the epoch past this deadline, so the interpreter's next epoch check
@@ -101,7 +350,7 @@ impl From<std::io::Error> for AgentError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
@@ -253,7 +502,34 @@ struct RunCancellationInner {
     epoch: Arc<Mutex<Option<EpochHandle>>>,
     watcher: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     stop: Arc<AtomicBool>,
+    /// Process token linked to this root. `request` and deadline fire cancel it.
+    token: CancellationToken,
+    /// Set when a timeout/deadline cannot be represented as `Instant`.
+    deadline_overflow: AtomicBool,
 }
+
+/// RAII guard that disarms the epoch watcher on every exit path, including panic.
+struct EpochWatcherGuard<'a> {
+    cancellation: &'a RunCancellation,
+}
+
+impl Drop for EpochWatcherGuard<'_> {
+    fn drop(&mut self) {
+        self.cancellation.disarm();
+    }
+}
+
+/// Injected runner fault used to prove watcher cleanup on error/panic paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunnerPrepareFault {
+    #[default]
+    None,
+    PanicAfterArm,
+    ErrorAfterArm,
+    PanicDuringDrive,
+}
+
+pub const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl RunCancellation {
     pub fn new() -> Self {
@@ -264,15 +540,61 @@ impl RunCancellation {
                 epoch: Arc::new(Mutex::new(None)),
                 watcher: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
+                token: CancellationToken::new(),
+                deadline_overflow: AtomicBool::new(false),
             }),
         }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
+        if timeout > MAX_RUN_TIMEOUT {
+            let cancellation = Self::new();
+            cancellation
+                .inner
+                .deadline_overflow
+                .store(true, Ordering::SeqCst);
+            return cancellation;
+        }
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => Self::with_deadline(deadline),
+            None => {
+                let cancellation = Self::new();
+                cancellation
+                    .inner
+                    .deadline_overflow
+                    .store(true, Ordering::SeqCst);
+                cancellation
+            }
+        }
+    }
+
+    pub fn with_deadline(deadline: Instant) -> Self {
         let cancellation = Self::new();
-        *cancellation.inner.deadline.lock().expect("deadline lock") =
-            Some(Instant::now() + timeout);
+        *cancellation.inner.deadline.lock().expect("deadline lock") = Some(deadline);
         cancellation
+    }
+
+    /// Rebuilds cancellation from a persisted wall-clock deadline. Expired
+    /// deadlines fail immediately and never grant a fresh full timeout.
+    /// Enormous remaining durations never panic; they mark overflow instead.
+    pub fn from_wall_deadline_ms(deadline_at_ms: u64, now_ms: u64) -> Self {
+        if now_ms >= deadline_at_ms {
+            let cancellation = Self::new();
+            cancellation.request(CancellationReason::Deadline);
+            cancellation
+        } else {
+            Self::with_timeout(Duration::from_millis(deadline_at_ms - now_ms))
+        }
+    }
+
+    /// True when a timeout or persisted deadline could not be converted to Instant.
+    pub fn has_deadline_overflow(&self) -> bool {
+        self.inner.deadline_overflow.load(Ordering::SeqCst)
+    }
+
+    /// True while an epoch watcher thread is armed.
+    pub fn watcher_is_armed(&self) -> bool {
+        self.inner.watcher.lock().expect("watcher lock").is_some()
     }
 
     pub fn request(&self, reason: CancellationReason) {
@@ -280,18 +602,49 @@ impl RunCancellation {
         if requested.is_none() {
             *requested = Some(reason);
         }
+        drop(requested);
+        self.inner.token.cancel();
     }
 
     pub fn requested(&self) -> Option<CancellationReason> {
         *self.inner.requested.lock().expect("requested lock")
     }
 
-    pub(crate) fn deadline_passed(&self) -> bool {
-        self.inner
-            .deadline
-            .lock()
-            .expect("deadline lock")
+    /// Native dispatcher parent token linked to this cancellation root.
+    pub fn token(&self) -> CancellationToken {
+        self.inner.token.clone()
+    }
+
+    pub fn deadline_passed(&self) -> bool {
+        self.deadline_instant()
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub fn deadline_instant(&self) -> Option<Instant> {
+        *self.inner.deadline.lock().expect("deadline lock")
+    }
+
+    pub fn remaining_deadline(&self) -> Option<Duration> {
+        self.deadline_instant()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Nested adapter runs share request/deadline/token flags but own their epoch
+    /// watcher so the parent run is not disarmed when the nested invocation ends.
+    pub(crate) fn child(&self) -> Self {
+        Self {
+            inner: Arc::new(RunCancellationInner {
+                requested: Arc::clone(&self.inner.requested),
+                deadline: Arc::clone(&self.inner.deadline),
+                epoch: Arc::new(Mutex::new(None)),
+                watcher: Arc::new(Mutex::new(None)),
+                stop: Arc::new(AtomicBool::new(false)),
+                token: self.inner.token.clone(),
+                deadline_overflow: AtomicBool::new(
+                    self.inner.deadline_overflow.load(Ordering::SeqCst),
+                ),
+            }),
+        }
     }
 
     /// Spawns the epoch watcher once the VM (and its epoch handle) exists.
@@ -307,20 +660,25 @@ impl RunCancellation {
             .expect("armed epoch");
         let requested = Arc::clone(&self.inner.requested);
         let deadline = Arc::clone(&self.inner.deadline);
-        let watcher = thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                let fire = requested.lock().expect("requested lock").is_some()
-                    || deadline
-                        .lock()
-                        .expect("deadline lock")
-                        .is_some_and(|deadline| Instant::now() >= deadline);
-                if fire {
-                    epoch.increment_by(RUN_EPOCH_DEADLINE_TICKS);
-                    return;
+        let token = self.inner.token.clone();
+        let watcher = thread::Builder::new()
+            .name("run-epoch-watcher".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let fire = requested.lock().expect("requested lock").is_some()
+                        || deadline
+                            .lock()
+                            .expect("deadline lock")
+                            .is_some_and(|deadline| Instant::now() >= deadline);
+                    if fire {
+                        token.cancel();
+                        epoch.increment_by(RUN_EPOCH_DEADLINE_TICKS);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
                 }
-                thread::sleep(Duration::from_millis(1));
-            }
-        });
+            })
+            .expect("spawn run-epoch-watcher");
         *self.inner.watcher.lock().expect("watcher lock") = Some(watcher);
     }
 
@@ -345,47 +703,87 @@ pub struct AgentRunner {
     program: rustscript_vm::Program,
     config: AgentConfig,
     registry: Arc<HostFunctionRegistry>,
+    host: AgentHostBridges,
+    prepare_fault: RunnerPrepareFault,
+    snapshot_digest: String,
 }
 
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
-        if source.len() > MAX_AGENT_SOURCE_BYTES {
-            return Err(AgentError::Compile(format!(
-                "agent source exceeds {} bytes",
-                MAX_AGENT_SOURCE_BYTES
-            )));
-        }
-        let program = compile_source(source)
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
-        let registry = build_restricted_registry()
-            .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
-        Ok(Self {
-            program,
-            config,
-            registry: Arc::new(registry),
-        })
+        let (program, digest) = compiled_source_program(source)?;
+        Self::from_program(program, config, digest)
     }
 
     pub fn from_file(path: impl AsRef<Path>, config: AgentConfig) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let source_bytes = std::fs::metadata(&path)?.len() as usize;
-        if source_bytes > MAX_AGENT_SOURCE_BYTES {
-            return Err(AgentError::Compile(format!(
-                "agent source exceeds {} bytes",
-                MAX_AGENT_SOURCE_BYTES
-            )));
-        }
-        let program = rustscript_vm::compile_source_file(&path)
-            .map_err(|error| AgentError::Compile(error.to_string()))?
-            .program;
+        let (program, digest) = compiled_file_program(path.as_ref())?;
+        Self::from_program(program, config, digest)
+    }
+
+    fn from_program(
+        program: rustscript_vm::Program,
+        config: AgentConfig,
+        snapshot_digest: String,
+    ) -> Result<Self> {
         let registry = build_restricted_registry()
             .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
         Ok(Self {
             program,
             config,
             registry: Arc::new(registry),
+            host: AgentHostBridges::default(),
+            prepare_fault: RunnerPrepareFault::None,
+            snapshot_digest,
         })
+    }
+
+    /// Digest of the snapshot or source bytes this runner compiled.
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
+    }
+
+    /// Effective HTTP/SQLite/fuel policy compiled into this runner.
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
+    /// Injects a prepare/drive fault for watcher RAII tests.
+    pub fn with_prepare_fault(mut self, fault: RunnerPrepareFault) -> Self {
+        self.prepare_fault = fault;
+        self
+    }
+
+    /// Installs a scripted or custom provider for the serial loop host bridge.
+    pub fn with_provider(mut self, provider: Arc<dyn AgentProviderHost>) -> Self {
+        self.host.provider = Some(provider);
+        self
+    }
+
+    /// Replaces the full host-bridge bundle for one run.
+    pub fn with_host(mut self, host: AgentHostBridges) -> Self {
+        self.host = host;
+        self
+    }
+
+    /// Installs the sole run cancellation root onto the host bridges.
+    pub fn with_cancellation(mut self, cancellation: RunCancellation) -> Self {
+        self.host.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Records backoff delays without sleeping (loop tests).
+    pub fn with_skip_sleep(mut self, skip: bool) -> Self {
+        self.host.skip_sleep = skip;
+        self
+    }
+
+    /// Backoff delays requested by the RSS loop, in milliseconds.
+    pub fn recorded_sleeps(&self) -> Vec<i64> {
+        self.host.sleeps.lock().expect("sleep log lock").requested()
+    }
+
+    /// Number of backoff records dropped after the bounded sleep ring filled.
+    pub fn recorded_sleep_dropped(&self) -> u64 {
+        self.host.sleeps.lock().expect("sleep log lock").dropped()
     }
 
     /// Runs the exported `run(context)` entry with no event sink and no
@@ -404,7 +802,11 @@ impl AgentRunner {
         sink: &mut dyn RunEventSink,
         cancellation: &RunCancellation,
     ) -> std::result::Result<Value, RunError> {
+        let _watcher_guard = EpochWatcherGuard { cancellation };
         let (mut vm, callable) = self.prepare_vm(Some(cancellation))?;
+        if self.prepare_fault == RunnerPrepareFault::PanicDuringDrive {
+            panic!("injected drive panic");
+        }
         self.run_invocation(&mut vm, callable, context, Some(sink), Some(cancellation))
     }
 
@@ -420,12 +822,43 @@ impl AgentRunner {
         self.registry
             .bind_vm_cached(&mut vm)
             .map_err(RunError::Setup)?;
+        let provider: Arc<dyn AgentProviderHost> = self
+            .host
+            .provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(RssAdapterProvider));
+        vm.host_context().set_module_state(AgentHostState {
+            provider,
+            cancellation: cancellation
+                .cloned()
+                .or_else(|| self.host.cancellation.clone())
+                .unwrap_or_default(),
+            sleeps: Arc::clone(&self.host.sleeps),
+            skip_sleep: self.host.skip_sleep,
+            metrics: self.host.metrics.clone(),
+            lifecycle: self.host.lifecycle.clone(),
+            capability_owner: self.host.capability_owner.clone(),
+            filesystem: self.host.filesystem.clone(),
+            processes: self.host.processes.clone(),
+            artifacts: self.host.artifacts.clone(),
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            control_hook: self.host.control_hook.clone(),
+        });
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
                 .map_err(RunError::Setup)?;
             vm.set_epoch_deadline(RUN_EPOCH_DEADLINE_TICKS)
                 .map_err(RunError::Setup)?;
             cancellation.arm(vm.epoch_handle());
+            match self.prepare_fault {
+                RunnerPrepareFault::PanicAfterArm => panic!("injected prepare panic"),
+                RunnerPrepareFault::ErrorAfterArm => {
+                    return Err(RunError::Setup(VmError::HostError(
+                        "injected prepare error".to_string(),
+                    )));
+                }
+                RunnerPrepareFault::None | RunnerPrepareFault::PanicDuringDrive => {}
+            }
         } else if let Some(fuel) = self.config.fuel {
             vm.set_fuel(fuel);
         }
@@ -513,6 +946,9 @@ impl AgentRunner {
         mut sink: Option<&mut dyn RunEventSink>,
         cancellation: Option<&RunCancellation>,
     ) -> std::result::Result<Value, RunError> {
+        if matches!(self.prepare_fault, RunnerPrepareFault::PanicDuringDrive) {
+            panic!("injected drive panic");
+        }
         let result = (|| {
             let mut invocation = vm
                 .start_invocation(callable, vec![context])
@@ -534,9 +970,6 @@ impl AgentRunner {
                 drop(guard);
                 match poll? {
                     InvocationPoll::Pending => {
-                        // The VM is paused on an outstanding host operation.
-                        // Polling drives the operation; the cancellation
-                        // checks above cancel it with the typed reason.
                         thread::sleep(Duration::from_millis(1));
                     }
                     InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) => {
@@ -567,20 +1000,23 @@ impl AgentRunner {
 }
 
 /// Binds the restricted capability registry: JSON, bytes conversion, the
-/// invocation stream emit builtin, generic SQLite, and the HTTP client
-/// (buffered request plus the callable SSE stream, consumed by the
-/// `openai_chat` streaming adapter since core revision fd4b570; see
-/// plans/2026-08-14_a3-rustscript-core-unblock.md). Ambient runtime
-/// input/emit builtins are intentionally absent from agent execution.
+/// invocation stream emit builtin, generic SQLite, the HTTP client, and the
+/// bounded agent provider/tool host bridges. Ambient runtime input/emit
+/// builtins are intentionally absent from agent execution.
 fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmError> {
+    let catalog = agent_host_catalog();
     let mut registry = HostFunctionRegistry::restricted();
-    register_sqlite_builtin_module(&mut registry)?;
-    register_http_builtin_module(&mut registry)?;
+    register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    register_agent_host_functions(&mut registry, catalog.as_ref())?;
     for name in [
         "json::encode",
         "json::decode",
         "stream::emit",
         "bytes::to_utf8",
+        "bytes::to_utf8_lossy",
+        "bytes::to_array_u8",
+        "bytes::from_utf8",
         "sqlite::open",
         "sqlite::execute",
         "sqlite::query",
@@ -595,6 +1031,147 @@ fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmEr
         registry.allow_builtin(name)?;
     }
     Ok(registry)
+}
+
+fn compile_options() -> CompileSourceFileOptions {
+    CompileSourceFileOptions::default().with_host_api_catalog(agent_host_catalog())
+}
+
+/// Default production provider: invoke the existing RSS adapter harness.
+pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
+    Arc::new(RssAdapterProvider)
+}
+
+struct RssAdapterProvider;
+
+impl AgentProviderHost for RssAdapterProvider {
+    fn call(
+        &self,
+        request: &serde_json::Value,
+        cancellation: &RunCancellation,
+    ) -> serde_json::Value {
+        invoke_existing_adapter(request, cancellation)
+    }
+}
+
+fn invoke_existing_adapter(
+    request: &serde_json::Value,
+    cancellation: &RunCancellation,
+) -> serde_json::Value {
+    let provider = request
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("openai");
+    let kind = adapter_kind(provider);
+    let mut config = AgentConfig::default();
+    if let Some(base_url) = request
+        .pointer("/provider_options/base_url")
+        .and_then(serde_json::Value::as_str)
+    {
+        match adapter_http_config(base_url) {
+            Ok(parsed) => config = parsed,
+            Err(error) => return error,
+        }
+    }
+    let harness_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss");
+    let runner = match AgentRunner::from_file(harness_path, config) {
+        Ok(runner) => runner,
+        Err(error) => {
+            return adapter_fail("adapter_unavailable", &error.to_string());
+        }
+    };
+    let mut forwarded = request.clone();
+    if let Some(object) = forwarded.as_object_mut() {
+        object.remove("provider");
+    }
+    let profile = serde_json::json!({
+        "provider": provider,
+        "base_url": request.pointer("/provider_options/base_url").cloned().unwrap_or(serde_json::Value::Null),
+        "api_key": request.pointer("/provider_options/api_key").cloned().unwrap_or(serde_json::Value::Null),
+        "model": request.get("model").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    let context = json_to_vm_value(&serde_json::json!({
+        "kind": kind,
+        "request": forwarded,
+        "profile": profile,
+    }));
+    let child = cancellation.child();
+    match runner.run_with_context_and_events(context, &mut DiscardSink, &child) {
+        Ok(value) => vm_value_to_json(&value),
+        Err(RunError::Invocation(InvocationError::Cancelled(reason))) => {
+            if matches!(reason, CancellationReason::Deadline) {
+                adapter_fail("deadline_elapsed", "run deadline elapsed")
+            } else {
+                adapter_fail("cancelled", "run was cancelled")
+            }
+        }
+        Err(RunError::Invocation(InvocationError::DeadlineReached { .. })) => {
+            adapter_fail("deadline_elapsed", "run deadline elapsed")
+        }
+        Err(error) => adapter_fail("adapter_failed", &error.to_string()),
+    }
+}
+
+fn adapter_http_config(base_url: &str) -> std::result::Result<AgentConfig, serde_json::Value> {
+    let url = url::Url::parse(base_url)
+        .map_err(|error| adapter_fail("config", &format!("invalid provider base_url: {error}")))?;
+    let Some(host) = url.host_str() else {
+        return Err(adapter_fail("config", "provider base_url has no host"));
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return Err(adapter_fail(
+            "config",
+            &format!(
+                "provider base_url scheme '{}' has no known default port",
+                url.scheme()
+            ),
+        ));
+    };
+    let mut config = AgentConfig::for_hosts([host]);
+    config.http.allowed_schemes = vec![url.scheme().to_string()];
+    config.http.allowed_ports = vec![port];
+    if host == "127.0.0.1" || host == "localhost" {
+        config.http.allow_private_ips = true;
+    }
+    Ok(config)
+}
+
+struct DiscardSink;
+
+impl RunEventSink for DiscardSink {
+    fn deliver(&mut self, _value: Value) -> std::result::Result<(), RunDeliveryError> {
+        Ok(())
+    }
+}
+
+fn adapter_kind(provider: &str) -> &'static str {
+    match provider {
+        "openai_responses" | "responses" => "openai_responses",
+        "anthropic" | "anthropic_messages" => "anthropic_messages",
+        "profile:openrouter" => "profile:openrouter",
+        "profile:deepseek" => "profile:deepseek",
+        "profile:opencode_zen" => "profile:opencode_zen",
+        "profile:opencode_go" => "profile:opencode_go",
+        "profile:custom" => "profile:custom",
+        _ => "openai_chat",
+    }
+}
+
+fn adapter_fail(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "response": {},
+        "error": {
+            "status": 0,
+            "type": "api_error",
+            "code": code,
+            "message": message,
+            "param": "",
+            "request_id": "",
+            "retryable": false
+        }
+    })
 }
 
 /// Drives futures submitted by async host builtins (for example the HTTP
@@ -679,5 +1256,141 @@ impl HostAsyncBridge for AgentAsyncBridge {
 
     fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
         self.futures.remove(&op_id);
+    }
+}
+
+#[cfg(test)]
+mod compile_cache_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
+
+    static CAPTURED_SANDBOX: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+
+    fn tiny_source(tag: &str) -> String {
+        format!(
+            "pub fn run(context: map) -> map {{ let _x: string = \"{tag}\"; {{ ok: true }} }}\n"
+        )
+    }
+
+    fn capture_sandbox_root(allowed_root: &std::path::Path) {
+        let mut sandbox = allowed_root.to_path_buf();
+        loop {
+            if sandbox
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rss-compile-sandbox-"))
+            {
+                break;
+            }
+            assert!(
+                sandbox.pop(),
+                "sandbox root must be an ancestor of the allowed root"
+            );
+        }
+        *CAPTURED_SANDBOX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("captured sandbox lock") = Some(sandbox);
+    }
+
+    #[test]
+    fn from_file_cleans_compile_sandbox_after_success() {
+        let marker = format!(
+            "from-file-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "rss-runner-sandbox-cleanup-{}-{marker}",
+            std::process::id()
+        ));
+        let path = dir.join("main.rss");
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        std::fs::write(
+            &path,
+            format!(
+                "pub fn run(context: map) -> map {{ let _marker: string = \"{marker}\"; {{ ok: true }} }}\n"
+            ),
+        )
+        .expect("write entry");
+        *CAPTURED_SANDBOX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("captured sandbox lock") = None;
+        crate::runtime::module_snapshot::set_after_sandbox_dir_hook(Some(capture_sandbox_root));
+        let result = AgentRunner::from_file(&path, AgentConfig::default());
+        crate::runtime::module_snapshot::set_after_sandbox_dir_hook(None);
+        let _runner = result.expect("compile from snapshot");
+        let sandbox = CAPTURED_SANDBOX
+            .get()
+            .expect("captured sandbox")
+            .lock()
+            .expect("captured sandbox lock")
+            .take()
+            .expect("from_file must materialize a sandbox");
+        assert!(!sandbox.exists(), "compile sandbox must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_cache_recovers_from_poison_and_compiles_outside_lock() {
+        let _ = thread::spawn(|| {
+            let _guard = program_cache();
+            panic!("poison cache");
+        })
+        .join();
+        compiled_source_program(&tiny_source("poison")).expect("poison recovery");
+    }
+
+    #[test]
+    fn compile_cache_bounds_entries_and_weight() {
+        let program = compiled_source_program(&tiny_source("seed"))
+            .expect("compile")
+            .0;
+        let mut cache = ProgramLru::new();
+        for i in 0..COMPILE_CACHE_CAP {
+            cache.insert(format!("d{i}"), program.clone(), MAX_AGENT_SOURCE_BYTES);
+        }
+        assert_eq!(cache.entries.len(), COMPILE_CACHE_CAP);
+        assert_eq!(cache.total_weight, COMPILE_CACHE_WEIGHT_CAP);
+        cache.insert(
+            "overflow".to_string(),
+            program.clone(),
+            MAX_AGENT_SOURCE_BYTES,
+        );
+        assert_eq!(cache.entries.len(), COMPILE_CACHE_CAP);
+        assert!(!cache.entries.contains_key("d0"));
+        assert!(cache.entries.contains_key("overflow"));
+        cache.insert(
+            "too-heavy".to_string(),
+            program,
+            COMPILE_CACHE_WEIGHT_CAP + 1,
+        );
+        assert!(!cache.entries.contains_key("too-heavy"));
+    }
+
+    #[test]
+    fn compile_cache_concurrent_same_digest_is_safe() {
+        let source = tiny_source("concurrent");
+        let source = Arc::new(source);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let source = Arc::clone(&source);
+            handles.push(thread::spawn(move || compiled_source_program(&source)));
+        }
+        let mut digests = Vec::new();
+        for handle in handles {
+            let (_, digest) = handle.join().expect("thread").expect("compile");
+            digests.push(digest);
+        }
+        assert!(digests.iter().all(|digest| digest == &digests[0]));
+        {
+            let cache = program_cache();
+            assert!(cache.entries.contains_key(&digests[0]));
+        }
     }
 }
