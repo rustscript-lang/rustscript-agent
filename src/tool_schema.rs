@@ -38,7 +38,7 @@ impl ToolDescriptor {
     }
 }
 
-/// The only toolsets enabled by the first native registry.
+/// The only toolsets enabled by the RSS registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Toolset {
@@ -92,7 +92,7 @@ impl From<Toolset> for String {
     }
 }
 
-/// A toolset that is not part of the initial native registry policy.
+/// A toolset that is not part of the RSS registry policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnsupportedToolset {
     pub value: String,

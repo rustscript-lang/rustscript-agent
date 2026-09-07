@@ -205,8 +205,8 @@ Built-in RSS registry tools, in registry order:
 | `search_files` | coding | read | Bounded workspace search. |
 | `write_file` | coding | write | Write complete workspace file contents. |
 | `patch` | coding | write | Minimal unique-string replacement. |
-| `terminal` | process | process | Direct `argv` execution; no shell command string. |
-| `process` | process | process | Background/control sibling of `terminal`. |
+| `terminal` | process | execute | Direct `argv` execution; no shell command string. |
+| `process` | process | execute | Background/control sibling of `terminal`. |
 
 Parallel tool calls are rejected (`unsupported_parallel`). Subagents and A6
 parallel fan-out are out of scope.
@@ -257,7 +257,7 @@ requests that are not retry-safe, lack a fingerprint, leak secret keys, or
 already have a later tool effect fail closed (`interrupted_provider`) with no
 provider or tool effect.
 
-Native dispatch is durable-first. Assistant `tool_call` parents and user
+RSS dispatch is durable-first. Assistant `tool_call` parents and user
 `tool_result` messages carry `parent_message_id` and monotonic `ordinal`
 values. A missing or name-mismatched parent fails closed (`missing_tool_parent`)
 and does not run the executor. Replaying an already durable `ToolResult` does
