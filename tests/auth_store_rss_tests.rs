@@ -268,12 +268,26 @@ fn rss_corrupt_auth_file_fails_closed_without_secrets() {
     assert_eq!(loaded["ok"], false);
     assert_eq!(loaded["error"]["code"], "corrupt_file");
     assert_complete_safe(&loaded);
+    drop(host);
     let recovered = AuthFixtureHost::bind(root.as_ref());
-    assert!(recovered.is_ok() || recovered.is_err());
-    if let Ok(recovered) = recovered {
-        let after = recovered.run_json("load").expect("recovered load");
-        assert_eq!(after["ok"], false);
-        assert_complete_safe(&after);
+    match recovered {
+        Ok(recovered) => {
+            let after = recovered.run_json("load").expect("recovered load");
+            assert_eq!(after["ok"], false);
+            assert_eq!(after["error"]["code"], "corrupt_file");
+            assert_complete_safe(&after);
+        }
+        Err(error) => {
+            assert_no_secrets(&error);
+            let lower = error.to_lowercase();
+            assert!(
+                lower.contains("corrupt")
+                    || lower.contains("yaml")
+                    || lower.contains("parse")
+                    || lower.contains("invalid"),
+                "rebind must fail closed with a typed parse/corrupt error, got {error}"
+            );
+        }
     }
 }
 
@@ -412,4 +426,47 @@ fn rss_forged_and_serialized_handles_are_rejected() {
     assert_eq!(serialized["reconstructed_code"], "handle_invalid");
     assert_complete_safe(&forged);
     assert_complete_safe(&serialized);
+}
+
+#[test]
+fn rss_stale_handles_fail_after_save_rotation() {
+    let (_root, host) = fixture("stale-after-save");
+    host.run_json("save").expect("initial save");
+    let access = host
+        .run_json("access_stale_after_save")
+        .expect("access after save");
+    assert_eq!(access["save_ok"], true);
+    assert_eq!(access["consume_ok"], false);
+    let access_code = access["consume_code"].as_str().expect("access code");
+    assert!(
+        access_code == "handle_revoked" || access_code == "generation_conflict",
+        "{access:?}"
+    );
+    assert_complete_safe(&access);
+    let refresh = host
+        .run_json("refresh_stale_after_save")
+        .expect("refresh after save");
+    assert_eq!(refresh["save_ok"], true);
+    assert_eq!(refresh["consume_ok"], false);
+    let refresh_code = refresh["consume_code"].as_str().expect("refresh code");
+    assert!(
+        refresh_code == "handle_revoked" || refresh_code == "generation_conflict",
+        "{refresh:?}"
+    );
+    assert_complete_safe(&refresh);
+}
+
+#[test]
+fn rss_refresh_single_flight_rejects_duplicate_until_consumed() {
+    let (_root, host) = fixture("refresh-single-flight");
+    host.run_json("save").expect("initial save");
+    let duplicate = host
+        .run_json("refresh_duplicate")
+        .expect("duplicate refresh");
+    assert_eq!(duplicate["first_ok"], true);
+    assert_eq!(duplicate["second_ok"], false);
+    assert_eq!(duplicate["second_code"], "handle_replayed");
+    assert_eq!(duplicate["consume_ok"], true);
+    assert_eq!(duplicate["after_consume_ok"], true);
+    assert_complete_safe(&duplicate);
 }

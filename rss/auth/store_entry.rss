@@ -376,6 +376,45 @@ fn probe_handle_expire(context: map) -> map {
     }
 }
 
+fn probe_stale_after_save(context: map, kind: string) -> map {
+    let issued: map = if kind == "refresh_stale_after_save" => {
+        auth::refresh_handle(handle_request(context))
+    } else => {
+        auth::access_handle(handle_request(context))
+    };
+    let ok: bool = map_bool(issued, "ok", false);
+    if ok => {
+        let saved: map = run_save(context, "save");
+        let consumed: map = wrap_probe(auth::check_handle(issued["handle"].copy(), { op: "consume" }));
+        {
+            save_ok: map_bool(saved, "ok", false),
+            consume_ok: map_bool(consumed, "ok", false),
+            consume_code: map_string(map_map(consumed, "error"), "code", "")
+        }
+    } else => {
+        issued_or_error(issued)
+    }
+}
+
+fn probe_refresh_duplicate(context: map) -> map {
+    let first: map = auth::refresh_handle(handle_request(context));
+    let second: map = auth::refresh_handle(handle_request(context));
+    let first_ok: bool = map_bool(first, "ok", false);
+    if first_ok => {
+        let consumed: map = wrap_probe(auth::check_handle(first["handle"].copy(), { op: "consume" }));
+        let third: map = auth::refresh_handle(handle_request(context));
+        {
+            first_ok: true,
+            second_ok: map_bool(second, "ok", false),
+            second_code: map_string(map_map(second, "error"), "code", ""),
+            consume_ok: map_bool(consumed, "ok", false),
+            after_consume_ok: map_bool(third, "ok", false)
+        }
+    } else => {
+        issued_or_error(first)
+    }
+}
+
 fn probe_injected(context: map) -> map {
     wrap_probe(auth::check_handle(context["injected_handle"].copy(), { op: "validate" }))
 }
@@ -415,6 +454,10 @@ pub fn run(context: map) -> map {
         probe_refresh_validate(context)
     } else if kind == "access_expire" => {
         probe_handle_expire(context)
+    } else if kind == "access_stale_after_save" || kind == "refresh_stale_after_save" => {
+        probe_stale_after_save(context, kind)
+    } else if kind == "refresh_duplicate" => {
+        probe_refresh_duplicate(context)
     } else if kind == "injected_check" => {
         probe_injected(context)
     } else => {
