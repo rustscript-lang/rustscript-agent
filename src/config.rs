@@ -7,8 +7,324 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rustscript_vm::{HttpConfig, SqlitePolicy};
+use rustscript_vm::{
+    HttpConfig, MAX_ENUM_ENTRIES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, MAX_TIMEOUT, SqlitePolicy,
+};
 use serde_json::{Map, Value, json};
+
+/// Hard upper bounds for the coding file-tool budgets.
+///
+/// These ceilings prevent configuration from turning a bounded tool into an
+/// unbounded host-file reader or an in-memory artifact cache.
+pub const MAX_FILE_TOOL_READ_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_FILE_TOOL_READ_LINES: usize = 1_000_000;
+pub const MAX_FILE_TOOL_WRITE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_FILE_TOOL_SEARCH_FILES: usize = 1_000_000;
+pub const MAX_FILE_TOOL_SEARCH_SCANNED_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_FILE_TOOL_SEARCH_DEPTH: usize = 128;
+pub const MAX_FILE_TOOL_SEARCH_MATCHES: usize = 1_000_000;
+pub const MAX_FILE_TOOL_SEARCH_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_FILE_TOOL_PATCH_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_FILE_TOOL_PATCH_PREVIEW_BYTES: usize = 64 * 1024;
+/// Canonical model-visible tool-result envelope ceiling, aligned with
+/// [`RunLimits::MAX_TOOL_OUTPUT_BYTES`].
+const TOOL_OUTPUT_HARD_CEILING_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = TOOL_OUTPUT_HARD_CEILING_BYTES as usize;
+pub const DEFAULT_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_FILE_TOOL_WALL_TIME: Duration = Duration::from_secs(600);
+pub const MAX_ARTIFACT_OBJECT_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_ARTIFACT_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+/// Core confined-fs enumeration hard max. Directory listing counts `.` and `..`.
+const CORE_ENUM_MAX_ENTRIES: usize = MAX_ENUM_ENTRIES;
+const ARTIFACT_RECONCILE_MANIFEST_ENTRY: usize = 1;
+const ARTIFACT_RECONCILE_INDEX_TEMP_ENTRY: usize = 1;
+const ARTIFACT_RECONCILE_CORE_DOT_ENTRIES: usize = 2;
+const ARTIFACT_RECONCILE_ENUM_SAFETY_MARGIN: usize = 8;
+/// Extra directory entries counted besides payload objects: `manifest.json`,
+/// one leftover index temp, `.` and `..`, and a safety margin of 8.
+pub const ARTIFACT_RECONCILE_OVERHEAD_ENTRIES: usize = ARTIFACT_RECONCILE_MANIFEST_ENTRY
+    + ARTIFACT_RECONCILE_INDEX_TEMP_ENTRY
+    + ARTIFACT_RECONCILE_CORE_DOT_ENTRIES
+    + ARTIFACT_RECONCILE_ENUM_SAFETY_MARGIN;
+/// Maximum retained payloads that still fit core enumeration with overhead.
+pub const MAX_ARTIFACT_OBJECTS: usize = CORE_ENUM_MAX_ENTRIES - ARTIFACT_RECONCILE_OVERHEAD_ENTRIES;
+pub const MAX_ARTIFACT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Bounded on-disk artifact-store policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactStoreConfig {
+    /// Existing or setup-time-created directory containing artifact objects.
+    pub root: PathBuf,
+    /// Maximum payload bytes in one object.
+    pub max_object_bytes: usize,
+    /// Maximum payload bytes retained by one store instance.
+    pub max_total_bytes: usize,
+    /// Maximum number of retained objects.
+    pub max_objects: usize,
+    /// How long a stored object remains retrievable before cleanup.
+    pub ttl: Duration,
+}
+
+impl ArtifactStoreConfig {
+    /// Creates the default policy for an artifact directory.
+    pub fn for_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            max_object_bytes: 8 * 1024 * 1024,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_objects: 1_024,
+            ttl: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+
+    /// Validates the path and every store budget before opening the store.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_absolute_directory(&self.root, "artifact_store.root")?;
+        validate_positive_bounded(
+            self.max_object_bytes,
+            MAX_ARTIFACT_OBJECT_BYTES,
+            "artifact_store.max_object_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_total_bytes,
+            MAX_ARTIFACT_TOTAL_BYTES,
+            "artifact_store.max_total_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_objects,
+            MAX_ARTIFACT_OBJECTS,
+            "artifact_store.max_objects",
+        )?;
+        if self.ttl.is_zero() || self.ttl > MAX_ARTIFACT_TTL {
+            return Err("artifact_store.ttl must be positive and at most 7 days".to_string());
+        }
+        if self.max_total_bytes < self.max_object_bytes {
+            return Err(
+                "artifact_store.max_total_bytes must be at least max_object_bytes".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Native configuration for the confined coding file tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileToolConfig {
+    /// Canonical absolute workspace root used for every user path.
+    pub workspace_root: PathBuf,
+    /// Maximum bytes inspected by `read_file`.
+    pub max_read_bytes: usize,
+    /// Maximum lines returned by `read_file` when no request limit is given.
+    pub max_read_lines: usize,
+    /// Maximum UTF-8 bytes accepted by `write_file`.
+    pub max_write_bytes: usize,
+    /// Maximum files visited by `search_files`.
+    pub max_search_files: usize,
+    /// Maximum file bytes inspected by `search_files`.
+    pub max_search_scanned_bytes: usize,
+    /// Maximum directory depth visited by `search_files`.
+    pub max_search_depth: usize,
+    /// Maximum content/path matches returned by `search_files`.
+    pub max_search_matches: usize,
+    /// Maximum bytes retained in the complete search result before artifacting.
+    pub max_search_output_bytes: usize,
+    /// Wall-clock budget for one search traversal.
+    pub max_search_wall_time: Duration,
+    /// Maximum source and resulting bytes for one `patch` operation.
+    pub max_patch_bytes: usize,
+    /// Maximum bytes in the patch diff preview.
+    pub max_patch_preview_bytes: usize,
+    /// Maximum model-visible content bytes in a common tool result.
+    pub max_output_bytes: usize,
+    /// Root-confined bounded artifact policy used for oversized results.
+    pub artifact_store: ArtifactStoreConfig,
+}
+
+impl FileToolConfig {
+    /// Returns safe defaults rooted at the current directory.
+    pub fn default_for_current_directory() -> Self {
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::for_workspace(root)
+    }
+
+    /// Returns safe defaults for one workspace root.
+    pub fn for_workspace(root: impl Into<PathBuf>) -> Self {
+        let workspace_root = root.into();
+        let artifact_store = ArtifactStoreConfig::for_root(derived_artifact_root(&workspace_root));
+        Self {
+            workspace_root,
+            max_read_bytes: 1024 * 1024,
+            max_read_lines: 10_000,
+            max_write_bytes: 1024 * 1024,
+            max_search_files: 10_000,
+            max_search_scanned_bytes: 16 * 1024 * 1024,
+            max_search_depth: 32,
+            max_search_matches: 10_000,
+            max_search_output_bytes: 64 * 1024,
+            max_search_wall_time: Duration::from_secs(2),
+            max_patch_bytes: 8 * 1024 * 1024,
+            max_patch_preview_bytes: 16 * 1024,
+            max_output_bytes: DEFAULT_TOOL_OUTPUT_BYTES,
+            artifact_store,
+        }
+    }
+
+    /// Validates the workspace path and every file-tool/artifact budget.
+    pub fn validate(&self) -> Result<(), String> {
+        canonical_workspace_root(&self.workspace_root).map_err(|error| error.to_string())?;
+        validate_positive_bounded(
+            self.max_read_bytes,
+            MAX_FILE_TOOL_READ_BYTES,
+            "max_read_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_read_lines,
+            MAX_FILE_TOOL_READ_LINES,
+            "max_read_lines",
+        )?;
+        validate_positive_bounded(
+            self.max_write_bytes,
+            MAX_FILE_TOOL_WRITE_BYTES,
+            "max_write_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_search_files,
+            MAX_FILE_TOOL_SEARCH_FILES,
+            "max_search_files",
+        )?;
+        validate_positive_bounded(
+            self.max_search_scanned_bytes,
+            MAX_FILE_TOOL_SEARCH_SCANNED_BYTES,
+            "max_search_scanned_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_search_depth,
+            MAX_FILE_TOOL_SEARCH_DEPTH,
+            "max_search_depth",
+        )?;
+        validate_positive_bounded(
+            self.max_search_matches,
+            MAX_FILE_TOOL_SEARCH_MATCHES,
+            "max_search_matches",
+        )?;
+        validate_positive_bounded(
+            self.max_search_output_bytes,
+            MAX_FILE_TOOL_SEARCH_OUTPUT_BYTES,
+            "max_search_output_bytes",
+        )?;
+        if self.max_search_wall_time.is_zero()
+            || self.max_search_wall_time > MAX_FILE_TOOL_WALL_TIME
+        {
+            return Err(
+                "max_search_wall_time must be positive and at most 600 seconds".to_string(),
+            );
+        }
+        validate_positive_bounded(
+            self.max_patch_bytes,
+            MAX_FILE_TOOL_PATCH_BYTES,
+            "max_patch_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_patch_preview_bytes,
+            MAX_FILE_TOOL_PATCH_PREVIEW_BYTES,
+            "max_patch_preview_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_output_bytes,
+            MAX_TOOL_OUTPUT_BYTES,
+            "max_output_bytes",
+        )?;
+        self.artifact_store.validate()?;
+        if self.max_output_bytes > self.artifact_store.max_object_bytes {
+            return Err(
+                "max_output_bytes must not exceed artifact_store.max_object_bytes".to_string(),
+            );
+        }
+        if self.max_search_output_bytes > self.max_output_bytes {
+            return Err("max_search_output_bytes must not exceed max_output_bytes".to_string());
+        }
+        if self.max_search_output_bytes > self.artifact_store.max_object_bytes {
+            return Err(
+                "max_search_output_bytes must not exceed artifact_store.max_object_bytes"
+                    .to_string(),
+            );
+        }
+        if self.max_read_bytes > self.artifact_store.max_object_bytes {
+            return Err(
+                "max_read_bytes must not exceed artifact_store.max_object_bytes".to_string(),
+            );
+        }
+        let workspace = identity_path(&self.workspace_root, "workspace_root")?;
+        let artifacts = identity_path(&self.artifact_store.root, "artifact_store.root")?;
+        if paths_overlap(&workspace, &artifacts) {
+            return Err("artifact_store.root must be outside workspace_root".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Default for FileToolConfig {
+    fn default() -> Self {
+        Self::default_for_current_directory()
+    }
+}
+
+fn validate_absolute_directory(path: &std::path::Path, label: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.is_relative() {
+        return Err(format!("{label} must be a non-empty absolute path"));
+    }
+    if path.as_os_str().to_string_lossy().contains('\0') {
+        return Err(format!("{label} must not contain NUL"));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "{label} must not contain parent-directory components"
+        ));
+    }
+    Ok(())
+}
+
+fn derived_artifact_root(workspace_root: &Path) -> PathBuf {
+    let name = workspace_root
+        .file_name()
+        .map(|component| component.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "workspace".to_string());
+    match workspace_root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            parent.join(format!(".rustscript-agent-state-{name}"))
+        }
+        _ => PathBuf::from(format!("/.rustscript-agent-state-{name}")),
+    }
+}
+
+fn identity_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|_| format!("{label} cannot be resolved"));
+    }
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(path.to_path_buf());
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{label} is missing a file name"))?;
+    let parent = if parent.exists() {
+        std::fs::canonicalize(parent).map_err(|_| format!("{label} cannot be resolved"))?
+    } else {
+        parent.to_path_buf()
+    };
+    Ok(parent.join(file_name))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || right.starts_with(left) || left.starts_with(right)
+}
 
 /// Telegram Bot API adapter configuration.
 ///
@@ -1054,7 +1370,7 @@ pub struct RunLimits {
 impl RunLimits {
     pub const MAX_TURNS: u64 = 1_000_000;
     pub const MAX_TOOL_CALLS: u64 = 1_000_000;
-    pub const MAX_TOOL_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+    pub const MAX_TOOL_OUTPUT_BYTES: u64 = TOOL_OUTPUT_HARD_CEILING_BYTES;
 
     pub fn new(
         max_turns: u64,
@@ -1192,6 +1508,119 @@ fn canonical_workspace_root(path: &Path) -> Result<PathBuf, RunLimitsError> {
         ));
     }
     Ok(canonical)
+}
+
+/// Hard upper bounds for native terminal/process tool budgets.
+pub const MAX_PROCESS_TOOL_OUTPUT_BYTES: usize = MAX_TOOL_OUTPUT_BYTES;
+pub const MAX_PROCESS_TOOL_STREAM_BYTES: usize = MAX_OUTPUT_BYTES;
+pub const MAX_PROCESS_TOOL_STDIN_BYTES: usize = MAX_STDIN_BYTES;
+pub const MAX_PROCESS_TOOL_PROCESSES: usize = 1_024;
+pub const MAX_PROCESS_TOOL_PROCESSES_PER_OWNER: usize = 256;
+pub const MAX_PROCESS_TOOL_TIMEOUT: Duration = MAX_TIMEOUT;
+pub const MAX_PROCESS_TOOL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validated native configuration for bounded terminal and process tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessToolConfig {
+    /// Canonical absolute workspace used as the default child cwd.
+    pub workspace_root: PathBuf,
+    /// Default spawn timeout when a request omits `timeout_ms`.
+    pub default_timeout: Duration,
+    /// Maximum spawn/lifecycle timeout accepted from configuration or a request.
+    pub max_timeout: Duration,
+    /// Maximum model-visible content bytes in one tool result.
+    pub max_output_bytes: usize,
+    /// Maximum retained stdout/stderr ring bytes passed to the core process API.
+    pub max_stream_bytes: usize,
+    /// Maximum initial stdin bytes accepted by `terminal`.
+    pub max_stdin_bytes: usize,
+    /// Maximum retained process records in one table.
+    pub max_processes: usize,
+    /// Maximum retained process records for one profile/session/run owner.
+    pub max_processes_per_owner: usize,
+    /// Upper bound for owner cleanup and table drop.
+    pub cleanup_timeout: Duration,
+}
+
+impl ProcessToolConfig {
+    /// Returns fail-closed defaults rooted at `workspace`.
+    pub fn for_workspace(root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: root.into(),
+            default_timeout: Duration::from_secs(30),
+            max_timeout: MAX_PROCESS_TOOL_TIMEOUT,
+            max_output_bytes: DEFAULT_TOOL_OUTPUT_BYTES,
+            max_stream_bytes: 1024 * 1024,
+            max_stdin_bytes: 1024 * 1024,
+            max_processes: 32,
+            max_processes_per_owner: 8,
+            cleanup_timeout: Duration::from_secs(2),
+        }
+    }
+
+    /// Validates every process-tool budget. Invalid values fail closed.
+    pub fn validate(&self) -> Result<(), String> {
+        canonical_workspace_root(&self.workspace_root).map_err(|error| error.to_string())?;
+        if self.default_timeout.is_zero() || self.default_timeout > self.max_timeout {
+            return Err("default_timeout must be positive and at most max_timeout".to_string());
+        }
+        if self.max_timeout.is_zero() || self.max_timeout > MAX_PROCESS_TOOL_TIMEOUT {
+            return Err("max_timeout must be positive and at most 3600 seconds".to_string());
+        }
+        validate_positive_bounded(
+            self.max_output_bytes,
+            MAX_PROCESS_TOOL_OUTPUT_BYTES,
+            "max_output_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_stream_bytes,
+            MAX_PROCESS_TOOL_STREAM_BYTES,
+            "max_stream_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_stdin_bytes,
+            MAX_PROCESS_TOOL_STDIN_BYTES,
+            "max_stdin_bytes",
+        )?;
+        validate_positive_bounded(
+            self.max_processes,
+            MAX_PROCESS_TOOL_PROCESSES,
+            "max_processes",
+        )?;
+        validate_positive_bounded(
+            self.max_processes_per_owner,
+            MAX_PROCESS_TOOL_PROCESSES_PER_OWNER,
+            "max_processes_per_owner",
+        )?;
+        if self.max_processes_per_owner > self.max_processes {
+            return Err("max_processes_per_owner must be at most max_processes".to_string());
+        }
+        if self.cleanup_timeout.is_zero() || self.cleanup_timeout > MAX_PROCESS_TOOL_CLEANUP_TIMEOUT
+        {
+            return Err("cleanup_timeout must be positive and at most 30 seconds".to_string());
+        }
+        Ok(())
+    }
+
+    /// Returns a copy with a canonical workspace after validation.
+    pub fn validated(&self) -> Result<Self, String> {
+        self.validate()?;
+        Ok(Self {
+            workspace_root: canonical_workspace_root(&self.workspace_root)
+                .map_err(|error| error.to_string())?,
+            ..self.clone()
+        })
+    }
+}
+
+fn validate_positive_bounded(value: usize, max: usize, name: &str) -> Result<(), String> {
+    if value == 0 {
+        return Err(format!("{name} must be positive"));
+    }
+    if value > max {
+        return Err(format!("{name} is too large: {value}"));
+    }
+    Ok(())
 }
 
 /// Validated configuration shared by the gateway, AgentService, and runner.
@@ -1449,6 +1878,30 @@ mod tests {
         AgentGatewayConfig::default()
             .validate()
             .expect("default configuration must validate");
+    }
+
+    #[test]
+    fn process_tool_config_fail_closes_on_zero_and_oversize_budgets() {
+        let root = std::env::current_dir().expect("current dir");
+        let base = ProcessToolConfig::for_workspace(&root);
+        base.validate()
+            .expect("default process tool config must validate");
+
+        let mut invalid = base.clone();
+        invalid.max_timeout = Duration::ZERO;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = base.clone();
+        invalid.max_output_bytes = 0;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = base.clone();
+        invalid.max_processes = 0;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = base;
+        invalid.max_timeout = MAX_PROCESS_TOOL_TIMEOUT + Duration::from_secs(1);
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
