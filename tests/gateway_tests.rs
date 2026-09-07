@@ -2351,9 +2351,7 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
     }
     let slow_persistence = persistence.clone();
     let slow_load = tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
         slow_persistence.load().expect("reload should succeed");
-        started.elapsed()
     });
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -2370,6 +2368,10 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
         .await
     });
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !slow_load.is_finished(),
+        "the seeded reload must still occupy the worker before stop"
+    );
 
     // The stop request: while it is pending, an unrelated request spawned
     // alongside it must still complete within a strict budget. On a
@@ -2411,16 +2413,15 @@ async fn stop_waits_on_a_blocking_thread_during_a_storage_stall() {
             .0,
         StatusCode::OK
     );
-
-    let slow: std::time::Duration =
-        tokio::time::timeout(std::time::Duration::from_secs(120), slow_load)
-            .await
-            .expect("the reload must finish")
-            .expect("reload task must not panic");
     assert!(
-        slow >= std::time::Duration::from_millis(1200),
-        "the seeded reload must actually occupy the worker for a while (took {slow:?})"
+        !slow_load.is_finished(),
+        "the unrelated request must complete while storage remains stalled"
     );
+
+    tokio::time::timeout(std::time::Duration::from_secs(120), slow_load)
+        .await
+        .expect("the reload must finish")
+        .expect("reload task must not panic");
 
     let (stop_status, stop_body) = tokio::time::timeout(std::time::Duration::from_secs(60), stop)
         .await

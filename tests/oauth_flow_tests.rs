@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use rustscript_agent::auth::oauth::{
     BoundedPublicOAuthIntent, BrowserOpener, CallbackMode, CallbackWaiter, CredentialUse,
-    MAX_LIVE_OAUTH_FLOWS, OAuthClock, OAuthError, OAuthFlowKind, OAuthHost,
-    OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle, PreparedHttpsRequest, ProviderRequest,
-    RawCallbackInput, RawHttpsResponse, ScriptedBrowser, ScriptedCallback, ScriptedCancel,
-    ScriptedClock, ScriptedHttpsTransport, TrustedEndpoint, TrustedTransportPolicy,
+    MAX_LIVE_OAUTH_FLOWS, OAuthError, OAuthFlowKind, OAuthHost, OpaqueAuthorizationCodeHandle,
+    OpaqueVerifierHandle, PreparedHttpsRequest, ProviderRequest, RawCallbackInput, ScriptedBrowser,
+    ScriptedCallback, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport, TrustedEndpoint,
+    TrustedTransportPolicy,
 };
 use rustscript_agent::auth::pkce::{self, PKCE_CHALLENGE_METHOD};
 use rustscript_agent::auth::store::AuthStore;
