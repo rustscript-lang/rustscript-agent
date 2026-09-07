@@ -40,9 +40,12 @@ use crate::host_opaque::{OpaqueError, OpaqueRegistry};
 const OAUTH_PKCE_BEGIN: &str = "oauth::pkce_begin";
 const OAUTH_CALLBACK_WAIT: &str = "oauth::callback_wait";
 const OAUTH_TRANSPORT: &str = "oauth::transport";
+const OAUTH_WAIT_MS: &str = "oauth::wait_ms";
+const OAUTH_TERMINAL: &str = "oauth::terminal";
 const AUTH_LOAD_METADATA: &str = "auth::load_metadata";
 const AUTH_SAVE_IF_GENERATION: &str = "auth::save_if_generation";
 const AUTH_REFRESH_HANDLE: &str = "auth::refresh_handle";
+const AUTH_ACCESS_HANDLE: &str = "auth::access_handle";
 const AUTH_CHECK_HANDLE: &str = "auth::check_handle";
 const SECRET_SLOT_CLASS: &str = "OpaqueSecretSlot";
 const FIXTURE_RUN_DEADLINE: Duration = Duration::from_secs(60);
@@ -364,6 +367,16 @@ pub fn oauth_fixture_catalog() -> Arc<HostApiCatalog> {
             response.clone(),
         ));
         builder.function(HostFunctionSchema::with_return(
+            OAUTH_WAIT_MS,
+            vec![HostParamSchema::value("millis", HostTypeSchema::Int)],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            OAUTH_TERMINAL,
+            vec![HostParamSchema::value("handle", unknown.clone())],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
             AUTH_LOAD_METADATA,
             vec![HostParamSchema::value("request", unknown.clone())],
             response.clone(),
@@ -375,6 +388,11 @@ pub fn oauth_fixture_catalog() -> Arc<HostApiCatalog> {
         ));
         builder.function(HostFunctionSchema::with_return(
             AUTH_REFRESH_HANDLE,
+            vec![HostParamSchema::value("request", unknown.clone())],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            AUTH_ACCESS_HANDLE,
             vec![HostParamSchema::value("request", unknown.clone())],
             response.clone(),
         ));
@@ -403,6 +421,8 @@ fn register_host_functions(
         callback_wait_adapter,
     )?;
     register_named(registry, catalog, OAUTH_TRANSPORT, 2, transport_adapter)?;
+    register_named(registry, catalog, OAUTH_WAIT_MS, 1, wait_ms_adapter)?;
+    register_named(registry, catalog, OAUTH_TERMINAL, 1, terminal_adapter)?;
     register_named(
         registry,
         catalog,
@@ -423,6 +443,13 @@ fn register_host_functions(
         AUTH_REFRESH_HANDLE,
         1,
         refresh_handle_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        AUTH_ACCESS_HANDLE,
+        1,
+        access_handle_adapter,
     )?;
     register_named(
         registry,
@@ -520,6 +547,37 @@ fn transport_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
 }
 
+fn wait_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = match state(vm) {
+        Ok(state) => state,
+        Err(error) => return return_json(error),
+    };
+    let millis = match args.first() {
+        Some(Value::Int(value)) if *value > 0 => *value as u64,
+        _ => 0,
+    };
+    match state.oauth.wait_ms(millis) {
+        Ok(()) => return_json(json!({ "ok": true })),
+        Err(error) => return_json(oauth_error(&error)),
+    }
+}
+
+fn terminal_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = match state(vm) {
+        Ok(state) => state,
+        Err(error) => return return_json(error),
+    };
+    let value = args.first().cloned().unwrap_or(Value::Null);
+    let handle = match decode_device(&state, &value) {
+        Ok(handle) => handle,
+        Err(error) => return return_json(error),
+    };
+    match state.oauth.terminal(&handle) {
+        Ok(()) => return_json(json!({ "ok": true })),
+        Err(error) => return_json(oauth_error(&error)),
+    }
+}
+
 fn load_metadata_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = match state(vm) {
         Ok(state) => state,
@@ -595,6 +653,42 @@ fn refresh_handle_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> 
     ) {
         Ok(handle) => match state.policies.opaques().mint(handle.class(), handle) {
             Ok(minted) => return_handle(REFRESH_HANDLE_CLASS, minted.to_vm_value()),
+            Err(error) => return_json(opaque_error_json(error)),
+        },
+        Err(error) => return_json(store_error(&error)),
+    }
+}
+
+fn access_handle_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = match state(vm) {
+        Ok(state) => state,
+        Err(error) => return return_json(error),
+    };
+    let value = args.first().cloned().unwrap_or(Value::Null);
+    let credential_id = match required_string(map_get(&value, "credential_id"), "credential_id") {
+        Ok(value) => value,
+        Err(error) => return return_json(error),
+    };
+    let expected_generation = match required_u64(
+        map_get(&value, "expected_generation"),
+        "expected_generation",
+    ) {
+        Ok(value) => value,
+        Err(error) => return return_json(error),
+    };
+    let policy = match admitted_policy(&state, map_get(&value, "policy_handle"), "access") {
+        Ok(policy) => policy,
+        Err(error) => return return_json(error),
+    };
+    match state.store.issue_access_handle_until(
+        &credential_id,
+        expected_generation,
+        policy.generation,
+        &policy.run_id,
+        policy.deadline,
+    ) {
+        Ok(handle) => match state.policies.opaques().mint(handle.class(), handle) {
+            Ok(minted) => return_handle(ACCESS_HANDLE_CLASS, minted.to_vm_value()),
             Err(error) => return_json(opaque_error_json(error)),
         },
         Err(error) => return_json(store_error(&error)),
@@ -884,6 +978,10 @@ fn parse_credential_use(
         required_string(map_get(value, "kind"), "kind").unwrap_or_else(|_| "none".to_string());
     match kind.as_str() {
         "none" | "" => Ok(CredentialUse::None),
+        "access" => {
+            let handle = decode_access(state, map_get(value, "handle").unwrap_or(&Value::Null))?;
+            Ok(CredentialUse::Access(handle))
+        }
         "refresh" => {
             let handle = decode_refresh(state, map_get(value, "handle").unwrap_or(&Value::Null))?;
             Ok(CredentialUse::Refresh(handle))
@@ -1078,6 +1176,27 @@ fn decode_refresh(
         .downcast_arc::<OpaqueRefreshHandle>()
         .map(|handle| (*handle).clone())
         .ok_or_else(|| bridge_error("handle_invalid", "refresh handle is invalid"))
+}
+
+fn decode_access(
+    state: &OAuthFixtureState,
+    value: &Value,
+) -> Result<OpaqueAccessHandle, JsonValue> {
+    let opaque = state
+        .policies
+        .opaques()
+        .from_vm_value(value)
+        .ok_or_else(|| bridge_error("handle_invalid", "access handle is not host-owned"))?;
+    if opaque.class() != ACCESS_HANDLE_CLASS {
+        return Err(bridge_error(
+            "handle_invalid",
+            "access handle class mismatch",
+        ));
+    }
+    opaque
+        .downcast_arc::<OpaqueAccessHandle>()
+        .map(|handle| (*handle).clone())
+        .ok_or_else(|| bridge_error("handle_invalid", "access handle is invalid"))
 }
 
 fn decode_device(

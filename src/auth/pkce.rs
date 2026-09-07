@@ -57,8 +57,8 @@ impl std::fmt::Debug for PkceVerifier {
     }
 }
 
-/// Host-owned OAuth `state` value. Debug is redacted.
-pub struct PkceState(String);
+/// Host-owned OAuth `state` value. Debug is redacted and the allocation is zeroized.
+pub struct PkceState(Zeroizing<String>);
 
 impl PkceState {
     pub(crate) fn as_str(&self) -> &str {
@@ -104,7 +104,7 @@ pub fn generate() -> Result<PkceMaterial, PkceError> {
     Ok(PkceMaterial {
         challenge,
         verifier: PkceVerifier(Zeroizing::new(verifier)),
-        state: PkceState(state),
+        state: PkceState(Zeroizing::new(state)),
     })
 }
 

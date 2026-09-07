@@ -4,9 +4,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
+#[allow(deprecated)]
+use ring::constant_time;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use zeroize::Zeroizing;
 
@@ -20,6 +22,8 @@ const MAX_PUBLIC_QUERY_ENTRIES: usize = 32;
 const MAX_PUBLIC_QUERY_BYTES: usize = 2048;
 const MAX_JSON_DEPTH: usize = 8;
 const CALLBACK_TTL: Duration = Duration::from_secs(15 * 60);
+/// Live PKCE/device flow ceiling, matching the opaque registry bound.
+pub const MAX_LIVE_OAUTH_FLOWS: usize = 64;
 const HANDLE_LIVE: u8 = 0;
 const HANDLE_USED: u8 = 1;
 const HANDLE_EXPIRED: u8 = 2;
@@ -31,6 +35,8 @@ pub const STATE_HANDLE_CLASS: &str = "OpaqueStateHandle";
 pub const VERIFIER_HANDLE_CLASS: &str = "OpaqueVerifierHandle";
 pub const CODE_HANDLE_CLASS: &str = "OpaqueAuthorizationCodeHandle";
 pub const DEVICE_HANDLE_CLASS: &str = "OpaqueDeviceSessionHandle";
+
+const RESERVED_FORM_KEYS: &[&str] = &["refresh_token", "code", "code_verifier", "device_code"];
 
 const SECRET_JSON_KEYS: &[&str] = &[
     "access_token",
@@ -203,12 +209,35 @@ impl fmt::Debug for SanitizedProviderResponse {
 }
 
 /// Prepared HTTPS request at the host boundary. Tests may inspect it host-side.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PreparedHttpsRequest {
     pub method: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: String,
+}
+
+impl fmt::Debug for PreparedHttpsRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut headers = BTreeMap::new();
+        for (name, value) in &self.headers {
+            if name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("cookie")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+            {
+                headers.insert(name.clone(), "<redacted>".to_string());
+            } else {
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+        formatter
+            .debug_struct("PreparedHttpsRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Raw HTTPS response before sanitization.
@@ -372,7 +401,7 @@ struct FlowInner {
     run_id: String,
     credential_id: String,
     expires_at: Instant,
-    state: String,
+    state: Mutex<Zeroizing<String>>,
     verifier: Mutex<Zeroizing<String>>,
     redirect_uri: String,
     callback: AtomicU8,
@@ -403,7 +432,7 @@ impl FlowInner {
             run_id: "forged".to_string(),
             credential_id: "forged".to_string(),
             expires_at: Instant::now(),
-            state: "forged".to_string(),
+            state: Mutex::new(Zeroizing::new("forged".to_string())),
             verifier: Mutex::new(Zeroizing::new(String::new())),
             redirect_uri: String::new(),
             callback: AtomicU8::new(HANDLE_LIVE),
@@ -589,7 +618,29 @@ impl FlowInner {
             *code = None;
         }
         self.clear_device_code();
+        if let Ok(mut state) = self.state.lock() {
+            state.clear();
+        }
     }
+
+    fn csrf_state(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_str()
+            .to_string()
+    }
+
+    fn is_terminal(&self) -> bool {
+        !flag_live(&self.callback)
+            && !flag_live(&self.verifier_state)
+            && !flag_live(&self.code_state)
+            && !flag_live(&self.device_state)
+    }
+}
+
+fn flag_live(flag: &AtomicU8) -> bool {
+    flag.load(Ordering::Acquire) == HANDLE_LIVE
 }
 
 macro_rules! opaque_handle {
@@ -612,6 +663,11 @@ macro_rules! opaque_handle {
             #[allow(dead_code)]
             fn flow_id(&self) -> u64 {
                 self.inner.id
+            }
+
+            #[allow(dead_code)]
+            fn flow_inner(&self) -> Arc<FlowInner> {
+                Arc::clone(&self.inner)
             }
 
             #[allow(dead_code)]
@@ -707,10 +763,13 @@ impl OAuthHost {
             PKCE_CHALLENGE_METHOD.to_string(),
         );
         query.insert("redirect_uri".to_string(), redirect_uri.clone());
+        // Use the admitted exact path. `path_prefix` is the policy matcher, not
+        // the request path. The loopback redirect is synthetic fixture-only;
+        // Task 4 owns production bind/exposure.
         let authorization_url = format!(
             "https://{}{}?{}",
             endpoint.authority,
-            endpoint.path_prefix,
+            intent.path,
             encode_query(&query)
         );
         let expires_at = min_deadline(policy.deadline, self.inner.clock.now() + CALLBACK_TTL);
@@ -721,7 +780,7 @@ impl OAuthHost {
             run_id: policy.run_id.clone(),
             credential_id: intent.credential_id.clone(),
             expires_at,
-            state: state.as_str().to_string(),
+            state: Mutex::new(Zeroizing::new(state.as_str().to_string())),
             verifier: Mutex::new(Zeroizing::new(verifier.as_str().to_string())),
             redirect_uri: redirect_uri.clone(),
             callback: AtomicU8::new(HANDLE_LIVE),
@@ -732,13 +791,12 @@ impl OAuthHost {
             device_state: AtomicU8::new(HANDLE_REVOKED),
             device_in_flight: AtomicBool::new(false),
         });
-        self.inner
-            .flows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id, Arc::clone(&flow));
-        if intent.callback_mode == CallbackMode::Browser {
-            self.inner.browser.open(&authorization_url)?;
+        self.insert_flow(Arc::clone(&flow))?;
+        if intent.callback_mode == CallbackMode::Browser
+            && let Err(error) = self.inner.browser.open(&authorization_url)
+        {
+            self.drop_and_revoke(&flow);
+            return Err(error);
         }
         Ok(PkceBeginEnvelope {
             authorization_url,
@@ -756,14 +814,14 @@ impl OAuthHost {
         handle: &OpaqueCallbackHandle,
     ) -> Result<CallbackEnvelope, OAuthError> {
         let flow = self.live_flow(handle)?;
-        let now = self.inner.clock.now();
         if self.inner.cancel.is_cancelled() {
-            flow.revoke();
+            self.drop_and_revoke(&flow);
             return Err(OAuthError::CallbackCancelled);
         }
+        let now = self.inner.clock.now();
         flow.check_flag(&flow.callback, CALLBACK_HANDLE_CLASS, now)?;
         let input = self.inner.callbacks.wait_one()?;
-        self.finish_callback(&flow, input, now)
+        self.finish_callback(&flow, input)
     }
 
     pub fn transport(
@@ -790,6 +848,7 @@ impl OAuthHost {
             }
         })?;
         self.validate_credential_use(policy, credential_id.as_str(), &credential_use)?;
+        reject_reserved_form_keys(&body)?;
         if let Err(error) = self.check_cancel_deadline(policy) {
             self.revoke_credential_use(&credential_use);
             return Err(error);
@@ -818,10 +877,17 @@ impl OAuthHost {
             CredentialUse::AuthorizationCode { code, verifier } => {
                 let now = self.inner.clock.now();
                 let flow = self.live_flow(&code)?;
-                let (raw_code, raw_verifier) = flow.consume_exchange(now)?;
+                let (raw_code, raw_verifier) = match flow.consume_exchange(now) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        self.drop_and_revoke(&flow);
+                        return Err(error);
+                    }
+                };
                 append_form(&mut body, "code", &raw_code);
                 append_form(&mut body, "code_verifier", raw_verifier.as_str());
                 append_form(&mut body, "redirect_uri", &flow.redirect_uri);
+                self.drop_flow(flow.id);
                 let _ = verifier;
             }
             CredentialUse::Device(handle) => {
@@ -856,6 +922,7 @@ impl OAuthHost {
             Some(flow) if sanitized.access_slot.is_some() || sanitized.refresh_slot.is_some() => {
                 flow.consume_flag(&flow.device_state, DEVICE_HANDLE_CLASS, now)?;
                 flow.clear_device_code();
+                self.drop_flow(flow.id);
             }
             _ => {}
         }
@@ -885,7 +952,7 @@ impl OAuthHost {
         self.inject_callback(
             handle,
             RawCallbackInput::Query {
-                state: flow.state.clone(),
+                state: flow.csrf_state(),
                 code: code.to_string(),
             },
         )
@@ -915,7 +982,23 @@ impl OAuthHost {
     ) -> Result<(), OAuthError> {
         let now = self.inner.clock.now();
         match credential_use {
-            CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => Ok(()),
+            CredentialUse::None => Ok(()),
+            CredentialUse::Access(handle) => handle
+                .validate_binding(
+                    credential_id,
+                    handle.generation(),
+                    policy.generation,
+                    policy.run_id.as_str(),
+                )
+                .map_err(OAuthError::from),
+            CredentialUse::Refresh(handle) => handle
+                .validate_binding(
+                    credential_id,
+                    handle.generation(),
+                    policy.generation,
+                    policy.run_id.as_str(),
+                )
+                .map_err(OAuthError::from),
             CredentialUse::AuthorizationCode { code, verifier } => {
                 if !code.same_host(&self.inner) || !verifier.same_host(&self.inner) {
                     return Err(OAuthError::HandleInvalid {
@@ -951,12 +1034,12 @@ impl OAuthHost {
         match credential_use {
             CredentialUse::AuthorizationCode { code, .. } => {
                 if let Ok(flow) = self.live_flow(code) {
-                    flow.revoke();
+                    self.drop_and_revoke(&flow);
                 }
             }
             CredentialUse::Device(handle) => {
                 if let Ok(flow) = self.live_flow(handle) {
-                    flow.revoke();
+                    self.drop_and_revoke(&flow);
                 }
             }
             CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => {}
@@ -983,7 +1066,7 @@ impl OAuthHost {
             run_id: policy.run_id.clone(),
             credential_id: credential_id.to_string(),
             expires_at,
-            state: String::new(),
+            state: Mutex::new(Zeroizing::new(String::new())),
             verifier: Mutex::new(Zeroizing::new(String::new())),
             redirect_uri: String::new(),
             callback: AtomicU8::new(HANDLE_REVOKED),
@@ -994,43 +1077,73 @@ impl OAuthHost {
             device_state: AtomicU8::new(HANDLE_LIVE),
             device_in_flight: AtomicBool::new(false),
         });
-        self.inner
-            .flows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id, Arc::clone(&flow));
+        self.insert_flow(Arc::clone(&flow))?;
         Ok(OpaqueDeviceSessionHandle::from_inner(flow))
+    }
+
+    /// RSS-owned terminal action. Host revokes and drops without interpreting
+    /// provider error strings.
+    pub fn terminal(&self, handle: &OpaqueDeviceSessionHandle) -> Result<(), OAuthError> {
+        let flow = self.live_flow(handle)?;
+        self.drop_and_revoke(&flow);
+        Ok(())
+    }
+
+    /// Fixture wait primitive. Checks cancel; does not busy-poll.
+    /// Production sleep belongs to Task 4.
+    pub fn wait_ms(&self, _millis: u64) -> Result<(), OAuthError> {
+        if self.inner.cancel.is_cancelled() {
+            return Err(OAuthError::Cancelled);
+        }
+        Ok(())
     }
 
     fn finish_callback(
         &self,
         flow: &Arc<FlowInner>,
         input: RawCallbackInput,
-        now: Instant,
     ) -> Result<CallbackEnvelope, OAuthError> {
+        let now = self.inner.clock.now();
+        if self.inner.cancel.is_cancelled() {
+            self.drop_and_revoke(flow);
+            return Err(OAuthError::CallbackCancelled);
+        }
+        if now >= flow.expires_at {
+            self.drop_and_revoke(flow);
+            return Err(OAuthError::CallbackTimeout);
+        }
         let (state, code) = match input {
             RawCallbackInput::Timeout => {
-                flow.revoke();
+                self.drop_and_revoke(flow);
                 return Err(OAuthError::CallbackTimeout);
             }
             RawCallbackInput::Cancelled => {
-                flow.revoke();
+                self.drop_and_revoke(flow);
                 return Err(OAuthError::CallbackCancelled);
             }
             RawCallbackInput::Query { state, code } => (state, code),
-            RawCallbackInput::ManualUrl(url) => parse_callback_url(&url)?,
+            RawCallbackInput::ManualUrl(url) => match parse_callback_url(&url) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.drop_and_revoke(flow);
+                    return Err(error);
+                }
+            },
         };
         if code.len() > MAX_REQUEST_BODY_BYTES || state.len() > MAX_PUBLIC_QUERY_BYTES {
-            flow.revoke();
+            self.drop_and_revoke(flow);
             return Err(OAuthError::RequestTooLarge {
                 max_bytes: MAX_REQUEST_BODY_BYTES,
             });
         }
-        if state != flow.state {
-            flow.revoke();
+        if !state_matches(&state, &flow.csrf_state()) {
+            self.drop_and_revoke(flow);
             return Err(OAuthError::StateMismatch);
         }
-        flow.consume_flag(&flow.callback, CALLBACK_HANDLE_CLASS, now)?;
+        if let Err(error) = flow.consume_flag(&flow.callback, CALLBACK_HANDLE_CLASS, now) {
+            self.drop_and_revoke(flow);
+            return Err(error);
+        }
         *flow
             .code
             .lock()
@@ -1047,17 +1160,49 @@ impl OAuthHost {
                 class: handle.class().to_string(),
             });
         }
-        let flows = self
-            .inner
+        Ok(handle.flow_inner())
+    }
+
+    fn insert_flow(&self, flow: Arc<FlowInner>) -> Result<(), OAuthError> {
+        let mut flows = self.lock_flows();
+        self.sweep_locked(&mut flows);
+        if flows.len() >= MAX_LIVE_OAUTH_FLOWS {
+            drop(flows);
+            flow.revoke();
+            return Err(OAuthError::InvalidIntent {
+                reason: "live oauth flow limit reached".to_string(),
+            });
+        }
+        flows.insert(flow.id, flow);
+        Ok(())
+    }
+
+    fn drop_flow(&self, id: u64) {
+        self.lock_flows().remove(&id);
+    }
+
+    fn drop_and_revoke(&self, flow: &Arc<FlowInner>) {
+        flow.revoke();
+        self.drop_flow(flow.id);
+    }
+
+    fn lock_flows(&self) -> MutexGuard<'_, HashMap<u64, Arc<FlowInner>>> {
+        self.inner
             .flows
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        flows
-            .get(&handle.flow_id())
-            .cloned()
-            .ok_or_else(|| OAuthError::HandleInvalid {
-                class: handle.class().to_string(),
-            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn sweep_locked(&self, flows: &mut HashMap<u64, Arc<FlowInner>>) {
+        let now = self.inner.clock.now();
+        flows.retain(|_, flow| {
+            if now >= flow.expires_at || flow.is_terminal() {
+                flow.revoke();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn check_cancel_deadline(&self, policy: &TrustedTransportPolicy) -> Result<(), OAuthError> {
@@ -1089,8 +1234,10 @@ impl Drop for OAuthHost {
 
 trait FlowHandle {
     fn class(&self) -> &'static str;
+    #[allow(dead_code)]
     fn flow_id(&self) -> u64;
     fn same_host(&self, host: &Arc<HostInner>) -> bool;
+    fn flow_inner(&self) -> Arc<FlowInner>;
 }
 
 impl FlowHandle for OpaqueCallbackHandle {
@@ -1102,6 +1249,9 @@ impl FlowHandle for OpaqueCallbackHandle {
     }
     fn same_host(&self, host: &Arc<HostInner>) -> bool {
         self.same_host(host)
+    }
+    fn flow_inner(&self) -> Arc<FlowInner> {
+        self.flow_inner()
     }
 }
 
@@ -1115,6 +1265,9 @@ impl FlowHandle for OpaqueAuthorizationCodeHandle {
     fn same_host(&self, host: &Arc<HostInner>) -> bool {
         self.same_host(host)
     }
+    fn flow_inner(&self) -> Arc<FlowInner> {
+        self.flow_inner()
+    }
 }
 
 impl FlowHandle for OpaqueDeviceSessionHandle {
@@ -1126,6 +1279,9 @@ impl FlowHandle for OpaqueDeviceSessionHandle {
     }
     fn same_host(&self, host: &Arc<HostInner>) -> bool {
         self.same_host(host)
+    }
+    fn flow_inner(&self) -> Arc<FlowInner> {
+        self.flow_inner()
     }
 }
 
@@ -1248,6 +1404,36 @@ fn append_form(body: &mut String, key: &str, value: &str) {
     body.push_str(&percent_encode(key));
     body.push('=');
     body.push_str(&percent_encode(value));
+}
+
+fn reject_reserved_form_keys(body: &str) -> Result<(), OAuthError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    for pair in body.split('&') {
+        let raw_key = pair.split('=').next().unwrap_or("");
+        if reserved_form_key(&decode_form_key(raw_key)) {
+            return Err(OAuthError::InvalidIntent {
+                reason: "public body must not include host-owned form keys".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn decode_form_key(raw: &str) -> String {
+    percent_decode(&raw.replace('+', " "))
+}
+
+fn reserved_form_key(key: &str) -> bool {
+    RESERVED_FORM_KEYS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
+#[allow(deprecated)]
+fn state_matches(left: &str, right: &str) -> bool {
+    constant_time::verify_slices_are_equal(left.as_bytes(), right.as_bytes()).is_ok()
 }
 
 fn parse_callback_url(url: &str) -> Result<(String, String), OAuthError> {

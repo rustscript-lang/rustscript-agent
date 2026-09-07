@@ -186,6 +186,8 @@ fn rss_refresh_timing_and_backoff_are_rss_owned() {
     assert_eq!(not_due["due"], false);
     let backoff = host.run_json("retry_backoff").expect("backoff");
     assert_eq!(backoff["wait_ms"], 800);
+    let capped = host.run_json("retry_backoff_cap").expect("backoff cap");
+    assert_eq!(capped["wait_ms"], 15000);
 }
 
 #[test]
@@ -229,6 +231,26 @@ fn rss_stale_policy_and_local_refresh_validation() {
     assert_eq!(validate["denied_ok"], false);
     assert_eq!(validate["denied_code"], "path_denied");
     assert_eq!(validate["validate_ok"], true);
+
+    let access = host
+        .run_json("local_access_validate")
+        .expect("local access");
+    assert_eq!(access["ok"], true);
+    assert_eq!(access["denied_ok"], false);
+    assert_eq!(access["denied_code"], "path_denied");
+    assert_eq!(access["validate_ok"], true);
+}
+
+#[test]
+fn rss_reserved_form_keys_fail_before_consume() {
+    let (_root, host) = fixture("reserved-form");
+    let reserved = host
+        .run_json("reserved_form_refresh")
+        .expect("reserved form");
+    assert_eq!(reserved["ok"], true);
+    assert_eq!(reserved["denied_ok"], false);
+    assert_eq!(reserved["denied_code"], "invalid_intent");
+    assert_eq!(reserved["validate_ok"], true);
 }
 
 #[test]

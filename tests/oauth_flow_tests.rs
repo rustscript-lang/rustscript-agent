@@ -3,15 +3,16 @@
 //! These tests exercise host-side primitives through a fake transport and
 //! callback. They do not invoke a live provider or the production host catalog.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustscript_agent::auth::oauth::{
-    BoundedPublicOAuthIntent, CallbackMode, CredentialUse, OAuthClock, OAuthError, OAuthFlowKind,
-    OAuthHost, OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle, PreparedHttpsRequest,
-    ProviderRequest, RawCallbackInput, RawHttpsResponse, ScriptedBrowser, ScriptedCallback,
-    ScriptedCancel, ScriptedClock, ScriptedHttpsTransport, TrustedEndpoint, TrustedTransportPolicy,
+    BoundedPublicOAuthIntent, BrowserOpener, CallbackMode, CallbackWaiter, CredentialUse,
+    MAX_LIVE_OAUTH_FLOWS, OAuthClock, OAuthError, OAuthFlowKind, OAuthHost,
+    OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle, PreparedHttpsRequest, ProviderRequest,
+    RawCallbackInput, RawHttpsResponse, ScriptedBrowser, ScriptedCallback, ScriptedCancel,
+    ScriptedClock, ScriptedHttpsTransport, TrustedEndpoint, TrustedTransportPolicy,
 };
 use rustscript_agent::auth::pkce::{self, PKCE_CHALLENGE_METHOD};
 use rustscript_agent::auth::store::AuthStore;
@@ -983,6 +984,368 @@ fn forged_stale_expired_and_restart_code_handles_fail_closed() {
     );
 }
 
+fn form_key_count(body: &str, key: &str) -> usize {
+    body.split('&')
+        .filter(|pair| {
+            let raw = pair.split('=').next().unwrap_or("");
+            form_key_matches(raw, key)
+        })
+        .count()
+}
+
+fn form_key_matches(raw: &str, expected: &str) -> bool {
+    percent_decode_form(raw).eq_ignore_ascii_case(expected)
+}
+
+fn percent_decode_form(value: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        } else if bytes[index] == b'+' {
+            out.push(b' ');
+            index += 1;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+struct FailBrowser;
+
+impl BrowserOpener for FailBrowser {
+    fn open(&self, _url: &str) -> Result<(), OAuthError> {
+        Err(OAuthError::Transport {
+            message: "synthetic browser open failed".to_string(),
+        })
+    }
+}
+
+struct RaceCallback {
+    on_wait: Box<dyn Fn() + Send + Sync>,
+    queued: Mutex<VecDeque<RawCallbackInput>>,
+}
+
+impl CallbackWaiter for RaceCallback {
+    fn wait_one(&self) -> Result<RawCallbackInput, OAuthError> {
+        (self.on_wait)();
+        self.queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+            .ok_or(OAuthError::CallbackTimeout)
+    }
+
+    fn inject(&self, input: RawCallbackInput) -> Result<(), OAuthError> {
+        self.queued
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(input);
+        Ok(())
+    }
+}
+
+#[test]
+fn access_and_refresh_binding_mismatch_does_not_consume() {
+    let root = tempfile_home("binding-mismatch");
+    let store = open_store(&root);
+    seed_credential(&store);
+    let access = store
+        .issue_access_handle("primary", 1, 1, "oauth-primitive-run")
+        .expect("access handle");
+    let refresh = store
+        .issue_refresh_handle("primary", 1, 1, "oauth-primitive-run")
+        .expect("refresh handle");
+    let (host, transport, _, _, _, _) = default_host();
+
+    let mut foreign = provider_request("/v1/me", "");
+    foreign.method = "GET".to_string();
+    foreign.credential_id = "other".to_string();
+    let access_mismatch = host
+        .transport(&policy(), foreign, CredentialUse::Access(access.clone()))
+        .expect_err("access credential mismatch");
+    assert_eq!(access_mismatch.code(), "handle_provenance");
+    access.validate().expect("access still live");
+
+    let mut stale = policy();
+    stale.generation = 99;
+    let refresh_stale = host
+        .transport(
+            &stale,
+            provider_request("/oauth/token", "grant_type=refresh_token"),
+            CredentialUse::Refresh(refresh.clone()),
+        )
+        .expect_err("refresh policy mismatch");
+    assert_eq!(refresh_stale.code(), "handle_provenance");
+    refresh.validate().expect("refresh still live");
+    assert!(transport.take_sent().is_empty());
+}
+
+#[test]
+fn access_transport_injects_bearer_after_binding() {
+    let root = tempfile_home("access-send");
+    let store = open_store(&root);
+    seed_credential(&store);
+    let access = store
+        .issue_access_handle("primary", 1, 1, "oauth-primitive-run")
+        .expect("access handle");
+    let (host, transport, _, _, _, _) = default_host();
+    transport.push_json(200, serde_json::json!({"ok": true}));
+    let mut request = provider_request("/v1/me", "");
+    request.method = "GET".to_string();
+    let sent = host
+        .transport(&policy(), request, CredentialUse::Access(access.clone()))
+        .expect("access send");
+    assert_eq!(sent.status, 200);
+    let prepared = transport.take_sent();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(
+        prepared[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer SYNTHETIC_ACCESS_TOKEN")
+    );
+    assert_eq!(
+        access.consume().expect_err("consumed").code(),
+        "handle_replayed"
+    );
+}
+
+#[test]
+fn reserved_form_keys_including_encoded_duplicates_fail_before_consume() {
+    let root = tempfile_home("reserved-form");
+    let store = open_store(&root);
+    seed_credential(&store);
+    let refresh = store
+        .issue_refresh_handle("primary", 1, 1, "oauth-primitive-run")
+        .expect("refresh handle");
+    let (host, transport, _, _, _, _) = default_host();
+    for body in [
+        "grant_type=refresh_token&refresh_token=evil",
+        "grant_type=refresh_token&refresh%5Ftoken=evil",
+        "grant_type=refresh_token&Refresh_Token=evil",
+    ] {
+        let denied = host
+            .transport(
+                &policy(),
+                provider_request("/oauth/token", body),
+                CredentialUse::Refresh(refresh.clone()),
+            )
+            .expect_err("reserved refresh key");
+        assert_eq!(denied.code(), "invalid_intent", "{body}");
+        refresh.validate().expect("refresh still live");
+    }
+
+    let (code, verifier) = begin_code_exchange(&host);
+    let code_denied = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code&code=evil"),
+            CredentialUse::AuthorizationCode {
+                code: code.clone(),
+                verifier: verifier.clone(),
+            },
+        )
+        .expect_err("reserved code");
+    assert_eq!(code_denied.code(), "invalid_intent");
+    transport.push_json(200, token_success_json());
+    let exchanged = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode { code, verifier },
+        )
+        .expect("code still live after reserved reject");
+    assert!(exchanged.access_slot.is_some());
+    assert_eq!(
+        form_key_count(&transport.take_sent().last().expect("sent").body, "code"),
+        1
+    );
+}
+
+#[test]
+fn host_injected_refresh_token_appears_exactly_once() {
+    let root = tempfile_home("refresh-once");
+    let store = open_store(&root);
+    seed_credential(&store);
+    let refresh = store
+        .issue_refresh_handle("primary", 1, 1, "oauth-primitive-run")
+        .expect("refresh handle");
+    let (host, transport, _, _, _, _) = default_host();
+    transport.push_json(200, token_success_json());
+    host.transport(
+        &policy(),
+        provider_request("/oauth/token", "grant_type=refresh_token"),
+        CredentialUse::Refresh(refresh),
+    )
+    .expect("refresh send");
+    let sent = transport.take_sent();
+    assert_eq!(form_key_count(&sent[0].body, "refresh_token"), 1);
+}
+
+#[test]
+fn flows_registry_caps_at_64_and_recovers_expired_and_dropped_entries() {
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let callback = Arc::new(ScriptedCallback::new());
+    let browser = Arc::new(ScriptedBrowser::new());
+    let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+    let cancel = Arc::new(ScriptedCancel::new());
+    let host = host_with(
+        Arc::clone(&transport),
+        Arc::clone(&callback),
+        Arc::clone(&browser),
+        Arc::clone(&clock),
+        Arc::clone(&cancel),
+    );
+    let mut long_lived = policy();
+    long_lived.deadline = Instant::now() + Duration::from_secs(48 * 60 * 60);
+    for _ in 0..MAX_LIVE_OAUTH_FLOWS {
+        host.pkce_begin(&long_lived, intent(CallbackMode::Manual))
+            .expect("fill");
+    }
+    let capped = host
+        .pkce_begin(&long_lived, intent(CallbackMode::Manual))
+        .expect_err("cap");
+    assert_eq!(capped.code(), "invalid_intent");
+    clock.expire();
+    host.pkce_begin(&long_lived, intent(CallbackMode::Manual))
+        .expect("sweep recovered");
+}
+
+#[test]
+fn browser_open_failure_drops_the_flow_and_does_not_leak_cap() {
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let callback = Arc::new(ScriptedCallback::new());
+    let browser = Arc::new(FailBrowser);
+    let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+    let cancel = Arc::new(ScriptedCancel::new());
+    let host = OAuthHost::new(transport, callback, browser, clock, cancel);
+    for _ in 0..MAX_LIVE_OAUTH_FLOWS {
+        let failed = host
+            .pkce_begin(&policy(), intent(CallbackMode::Browser))
+            .expect_err("open failed");
+        assert_eq!(failed.code(), "transport_error");
+    }
+    host.pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("failed opens must not occupy the cap");
+}
+
+#[test]
+fn callback_finish_rechecks_cancel_and_deadline_after_wait() {
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let cancel = Arc::new(ScriptedCancel::new());
+    let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+    let wait_cancel = Arc::clone(&cancel);
+    let host = OAuthHost::new(
+        Arc::clone(&transport) as Arc<_>,
+        Arc::new(RaceCallback {
+            on_wait: Box::new(move || wait_cancel.cancel()),
+            queued: Mutex::new(VecDeque::new()),
+        }) as Arc<_>,
+        Arc::new(ScriptedBrowser::new()) as Arc<_>,
+        Arc::clone(&clock) as Arc<_>,
+        Arc::clone(&cancel) as Arc<_>,
+    );
+    let begun = host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("begin");
+    host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+        .expect("inject matching");
+    let cancelled = host
+        .callback_wait(&begun.callback_handle)
+        .expect_err("cancel during wait");
+    assert_eq!(cancelled.code(), "callback_cancelled");
+
+    let wait_clock = Arc::clone(&clock);
+    let expire_host = OAuthHost::new(
+        Arc::clone(&transport) as Arc<_>,
+        Arc::new(RaceCallback {
+            on_wait: Box::new(move || wait_clock.expire()),
+            queued: Mutex::new(VecDeque::new()),
+        }) as Arc<_>,
+        Arc::new(ScriptedBrowser::new()) as Arc<_>,
+        Arc::clone(&clock) as Arc<_>,
+        Arc::new(ScriptedCancel::new()) as Arc<_>,
+    );
+    let timed = expire_host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("timed begin");
+    expire_host
+        .inject_matching_callback(&timed.callback_handle, AUTH_CODE)
+        .expect("inject timed");
+    let expired = expire_host
+        .callback_wait(&timed.callback_handle)
+        .expect_err("expire during wait");
+    assert_eq!(expired.code(), "callback_timeout");
+}
+
+#[test]
+fn prepared_https_request_debug_redacts_authorization_and_form_secrets() {
+    let request = PreparedHttpsRequest {
+        method: "POST".to_string(),
+        url: "https://auth.example.test/oauth/token".to_string(),
+        headers: BTreeMap::from([("authorization".to_string(), format!("Bearer {ACCESS}"))]),
+        body: format!("grant_type=refresh_token&refresh_token={REFRESH}&code={AUTH_CODE}"),
+    };
+    let rendered = format!("{request:?}");
+    assert_no_secrets(&rendered);
+    assert!(!rendered.contains("Bearer "));
+    assert!(!rendered.contains("refresh_token="));
+}
+
+#[test]
+fn authorization_url_uses_admitted_exact_path_not_prefix() {
+    let (host, _, _, _, _, _) = default_host();
+    let mut consent = intent(CallbackMode::Manual);
+    consent.path = "/authorize/consent".to_string();
+    let begun = host.pkce_begin(&policy(), consent).expect("begin");
+    assert!(
+        begun
+            .authorization_url
+            .starts_with("https://auth.example.test/authorize/consent?"),
+        "{}",
+        begun.authorization_url
+    );
+    assert!(begun.redirect_uri.starts_with("http://127.0.0.1:"));
+}
+
+#[test]
+fn device_terminal_revokes_capability_without_parsing_provider_errors() {
+    let (host, transport, _, _, _, _) = default_host();
+    transport.push_json(200, device_start_json());
+    let started = host
+        .transport(
+            &policy(),
+            provider_request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("start");
+    let handle = started.device_handle.expect("device handle");
+    host.terminal(&handle).expect("rss-owned terminal");
+    let replay = host
+        .transport(
+            &policy(),
+            provider_request(
+                "/oauth/device/token",
+                "grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            ),
+            CredentialUse::Device(handle),
+        )
+        .expect_err("terminal consume");
+    assert!(
+        replay.code() == "handle_revoked" || replay.code() == "handle_invalid",
+        "{}",
+        replay.code()
+    );
+}
+
 fn tempfile_home(name: &str) -> std::path::PathBuf {
     let base = std::env::var_os("TEST_TMPDIR")
         .filter(|value| !value.is_empty())
@@ -1036,17 +1399,3 @@ fn seed_credential(store: &AuthStore) {
         ))
         .expect("seed");
 }
-
-// Silence unused imports if helpers shift during GREEN.
-#[allow(dead_code)]
-fn _clock_trait(_: &dyn OAuthClock) {}
-#[allow(dead_code)]
-fn _error_code(error: OAuthError) -> &'static str {
-    error.code()
-}
-#[allow(dead_code)]
-fn _lock<T>(value: T) -> Mutex<T> {
-    Mutex::new(value)
-}
-#[allow(dead_code)]
-fn _prepared(_request: PreparedHttpsRequest, _response: RawHttpsResponse) {}

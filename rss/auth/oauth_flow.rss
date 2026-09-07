@@ -157,9 +157,16 @@ fn refresh_due(expires_at_ms: int, now_ms: int, skew_seconds: int) -> bool {
 }
 
 fn backoff_ms(attempt: int) -> int {
+    let mut n: int = attempt;
+    if n < 0 {
+        n = 0;
+    }
+    if n > 7 {
+        n = 7;
+    }
     let mut ms: int = 200;
     let mut i: int = 0;
-    while i < attempt {
+    while i < n {
         ms = ms * 2;
         if ms > 15000 {
             ms = 15000;
@@ -401,6 +408,60 @@ fn local_refresh_validate(context: map) -> map {
     }
 }
 
+fn local_access_validate(context: map) -> map {
+    let issued: map = auth::access_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
+    if failed(issued) => {
+        issued
+    } else => {
+        let mut request: map = token_request(context, "/not-admitted", {}, "");
+        request["method"] = "GET";
+        let denied: map = oauth::transport(
+            request,
+            {
+                kind: "access",
+                handle: issued["handle"].copy()
+            }
+        );
+        let checked: map = auth::check_handle(issued["handle"].copy(), { op: "validate" });
+        {
+            ok: true,
+            denied_ok: map_bool(denied, "ok", false),
+            denied_code: error_code(denied),
+            validate_ok: map_bool(checked, "ok", false)
+        }
+    }
+}
+
+fn reserved_form_refresh(context: map) -> map {
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
+    if failed(issued) => {
+        issued
+    } else => {
+        let denied: map = oauth::transport(
+            token_request(context, "/oauth/token", form_headers(), "grant_type=refresh_token&refresh%5Ftoken=evil"),
+            {
+                kind: "refresh",
+                handle: issued["handle"].copy()
+            }
+        );
+        let checked: map = auth::check_handle(issued["handle"].copy(), { op: "validate" });
+        {
+            ok: true,
+            denied_ok: map_bool(denied, "ok", false),
+            denied_code: error_code(denied),
+            validate_ok: map_bool(checked, "ok", false)
+        }
+    }
+}
+
 fn forged_callback() -> map {
     let forged: map = {
         class: "OpaqueCallbackHandle",
@@ -456,6 +517,16 @@ fn device_poll(context: map, started: map) -> map {
     )
 }
 
+fn terminal_device(started: map) -> map {
+    if started.has("device_handle") => {
+        oauth::terminal(started["device_handle"].copy())
+    } else => {
+        {
+            ok: true
+        }
+    }
+}
+
 fn device_follow(context: map, started: map) -> map {
     let max_attempts: int = map_int(context, "max_polls", 8);
     let mut attempt: int = 0;
@@ -467,8 +538,23 @@ fn device_follow(context: map, started: map) -> map {
     };
     while attempt < max_attempts {
         if done == false {
+            let gated: map = oauth::wait_ms(0);
+            if failed(gated) {
+                terminal_device(started);
+                result = {
+                    ok: false,
+                    start: started,
+                    transport: gated,
+                    error: map_map(gated, "error"),
+                    class: error_code(gated)
+                };
+                done = true;
+            }
+        }
+        if done == false {
             let polled: map = device_poll(context, started);
             if failed(polled) {
+                terminal_device(started);
                 result = {
                     ok: false,
                     start: started,
@@ -490,11 +576,22 @@ fn device_follow(context: map, started: map) -> map {
                         saved: saved
                     };
                     done = true;
-                } else if class == "pending" {
-                    done = false;
-                } else if class == "retryable" {
-                    done = false;
+                } else if class == "pending" || class == "retryable" {
+                    let wait: int = map_int(classified, "wait_ms", backoff_ms(attempt));
+                    let slept: map = oauth::wait_ms(wait);
+                    if failed(slept) {
+                        terminal_device(started);
+                        result = {
+                            ok: false,
+                            start: started,
+                            transport: slept,
+                            error: map_map(slept, "error"),
+                            class: error_code(slept)
+                        };
+                        done = true;
+                    }
                 } else {
+                    terminal_device(started);
                     result = {
                         ok: false,
                         start: started,
@@ -507,6 +604,9 @@ fn device_follow(context: map, started: map) -> map {
             }
         }
         attempt = attempt + 1;
+    }
+    if done == false {
+        terminal_device(started);
     }
     result
 }
@@ -720,12 +820,21 @@ pub fn run(context: map) -> map {
             ok: true,
             wait_ms: backoff_ms(map_int(context, "attempt", 0))
         }
+    } else if kind == "retry_backoff_cap" => {
+        {
+            ok: true,
+            wait_ms: backoff_ms(100)
+        }
     } else if kind == "forged" => {
         forged_callback()
     } else if kind == "serialized" => {
         serialized_callback(context)
     } else if kind == "local_refresh_validate" => {
         local_refresh_validate(context)
+    } else if kind == "local_access_validate" => {
+        local_access_validate(context)
+    } else if kind == "reserved_form_refresh" => {
+        reserved_form_refresh(context)
     } else if kind == "device_login" || kind == "device_pending_success" || kind == "device_slow_down" || kind == "device_timeout" || kind == "device_cancel" || kind == "device_denied" => {
         device_login(context)
     } else if kind == "device_start" => {
