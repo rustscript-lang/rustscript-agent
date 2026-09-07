@@ -6,6 +6,7 @@
 //! of stream. The structured run context is the sole callable argument; the
 //! script-visible event builtin is `stream::emit(value)`.
 
+pub mod capabilities;
 pub mod config;
 pub mod domain;
 pub mod events;
@@ -32,7 +33,7 @@ pub use runtime::rss_runner::{
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,
     RunnerPrepareFault,
 };
-pub use runtime::{AgentHostBridges, AgentProviderHost, ScriptedProvider};
+pub use runtime::{AgentHostBridges, AgentProviderHost, ScriptedProvider, agent_host_catalog};
 pub use service::{
     AdmitError, AdmitRunRequest, AdmittedRun, AgentService, CleanupOutcome, ProviderCommit,
     ProviderCommitOutcome, ProviderPendingDecision, RunHandle,

@@ -1,0 +1,108 @@
+// Ordered RSS tool registry. Descriptors, enablement, and identity input are
+// owned here; Rust later applies generic structural bounds to the snapshot.
+use self::types as types;
+use self::validate as validate;
+
+fn array_contains_string(items: array, needle: string) -> bool {
+    let mut found = false;
+    let mut index = 0;
+    while index < items.length {
+        if items.has(index) {
+            if type(items[index].copy()) == "string" {
+                let value: string = items[index].copy();
+                if value == needle {
+                    found = true;
+                }
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+fn append_enabled(tools: array, source: array, filter: bool, enabled: array) -> array {
+    let mut next: array = tools;
+    let mut index = 0;
+    while index < source.length {
+        if source.has(index) {
+            if type(source[index].copy()) == "map" {
+                let descriptor: map = source[index].copy();
+                let toolset: string = types::map_string(descriptor, "toolset", "");
+                let mut allowed = true;
+                if filter {
+                    allowed = array_contains_string(enabled, toolset);
+                }
+                if allowed {
+                    next[next.length] = descriptor;
+                }
+            }
+        }
+        index += 1;
+    }
+    next
+}
+
+pub fn descriptors(config: map) -> array {
+    let filter: bool = config.has("enabled_toolsets");
+    let enabled: array = types::map_array(config, "enabled_toolsets");
+    let extras: array = types::map_array(config, "extra_descriptors");
+    let with_catalog: array = append_enabled([], types::catalog(), filter, enabled);
+    append_enabled(with_catalog, extras, filter, enabled)
+}
+
+pub fn identity(config: map) -> map {
+    {
+        version: "tool-registry-identity-v1",
+        descriptors: descriptors(config)
+    }
+}
+
+pub fn find(name: string, config: map) -> map {
+    let tools: array = descriptors(config);
+    let mut found: map = {};
+    let mut index = 0;
+    while index < tools.length {
+        if tools.has(index) {
+            if type(tools[index].copy()) == "map" {
+                let descriptor: map = tools[index].copy();
+                let current: string = types::map_string(descriptor, "name", "");
+                if current == name {
+                    found = descriptor;
+                }
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+pub fn run(context: map) -> map {
+    let kind: string = types::map_string(context, "kind", "");
+    let name: string = types::map_string(context, "name", "");
+    let config: map = types::map_map(context, "config");
+    if kind == "descriptors" => {
+        {
+            ok: true,
+            descriptors: descriptors(config)
+        }
+    } else if kind == "identity" => {
+        {
+            ok: true,
+            identity: identity(config)
+        }
+    } else if kind == "find" => {
+        {
+            ok: true,
+            descriptor: find(name, config)
+        }
+    } else if kind == "validate" => {
+        validate::validate(descriptors(config))
+    } else => {
+        {
+            ok: false,
+            code: "unknown_kind",
+            message: kind,
+            descriptors: []
+        }
+    }
+}

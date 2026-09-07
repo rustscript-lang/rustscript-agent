@@ -1106,6 +1106,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonschema",
+ "libc",
  "parking_lot",
  "pd-vm",
  "rustls",

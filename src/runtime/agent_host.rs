@@ -4,7 +4,7 @@
 //! through these host functions. Provider adapters stay in RSS; this module
 //! does not add an OpenAI-compatible inference path.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +17,11 @@ use rustscript_vm::{
 use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
+use crate::capabilities::{
+    ArtifactCapability, CapabilityError, CapabilityLifecycle, CapabilityOwner, ExecutionLease,
+    FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
+    ProcessSnapshot, capability_error_envelope, parse_prepare_metadata, tool_commit, tool_prepare,
+};
 use crate::domain::{ToolCall, json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
 use crate::tools::{DispatchContext, ToolResult};
@@ -25,6 +30,22 @@ const PROVIDER_CALL: &str = "agent::provider_call";
 const TOOL_DISPATCH: &str = "agent::tool_dispatch";
 const SLEEP_MS: &str = "agent::sleep_ms";
 const CONTROL_CHECK: &str = "agent::control_check";
+const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
+const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
+const CAP_FS_METADATA: &str = "cap::fs_metadata";
+const CAP_FS_READ_RANGE: &str = "cap::fs_read_range";
+const CAP_FS_LIST: &str = "cap::fs_list";
+const CAP_FS_WRITE_ATOMIC: &str = "cap::fs_write_atomic";
+const CAP_PROCESS_SPAWN: &str = "cap::process_spawn";
+const CAP_PROCESS_POLL: &str = "cap::process_poll";
+const CAP_PROCESS_WAIT: &str = "cap::process_wait";
+const CAP_PROCESS_LOG: &str = "cap::process_log";
+const CAP_PROCESS_WRITE: &str = "cap::process_write";
+const CAP_PROCESS_CLOSE: &str = "cap::process_close";
+const CAP_PROCESS_KILL: &str = "cap::process_kill";
+const CAP_ARTIFACT_PUT: &str = "cap::artifact_put";
+const CAP_ARTIFACT_GET: &str = "cap::artifact_get";
+const CAP_ARTIFACT_REFERENCE: &str = "cap::artifact_reference";
 
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
@@ -57,6 +78,127 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
         builder.function(HostFunctionSchema::with_return(
             CONTROL_CHECK,
             vec![],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            TOOL_PREPARE,
+            vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            TOOL_COMMIT,
+            vec![
+                HostParamSchema::value("execution_token", HostTypeSchema::String),
+                HostParamSchema::value("result", HostTypeSchema::Unknown),
+            ],
+            response.clone(),
+        ));
+        let token = HostParamSchema::value("execution_token", HostTypeSchema::String);
+        let path = HostParamSchema::value("path", HostTypeSchema::String);
+        let handle = HostParamSchema::value("handle", HostTypeSchema::String);
+        let offset = HostParamSchema::value("offset", HostTypeSchema::Int);
+        let limit = HostParamSchema::value("limit", HostTypeSchema::Int);
+        let cursor = HostParamSchema::value("cursor", HostTypeSchema::Int);
+        builder.function(HostFunctionSchema::with_return(
+            CAP_FS_METADATA,
+            vec![token.clone(), path.clone()],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_FS_READ_RANGE,
+            vec![token.clone(), path.clone(), offset, limit.clone()],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_FS_LIST,
+            vec![token.clone(), path.clone(), cursor.clone(), limit.clone()],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_FS_WRITE_ATOMIC,
+            vec![
+                token.clone(),
+                path,
+                HostParamSchema::value("expected_hash", HostTypeSchema::String),
+                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_PROCESS_SPAWN,
+            vec![
+                token.clone(),
+                HostParamSchema::value(
+                    "argv",
+                    HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+                ),
+                HostParamSchema::value("cwd", HostTypeSchema::String),
+                HostParamSchema::value(
+                    "env_names",
+                    HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+                ),
+                HostParamSchema::value("limits", HostTypeSchema::Unknown),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_PROCESS_POLL,
+            vec![token.clone(), handle.clone(), cursor.clone(), limit.clone()],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_PROCESS_WAIT,
+            vec![
+                token.clone(),
+                handle.clone(),
+                HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_PROCESS_LOG,
+            vec![token.clone(), handle.clone(), cursor, limit],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_PROCESS_WRITE,
+            vec![
+                token.clone(),
+                handle.clone(),
+                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_PROCESS_CLOSE,
+            vec![token.clone(), handle.clone()],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_PROCESS_KILL,
+            vec![token.clone(), handle],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_ARTIFACT_PUT,
+            vec![
+                token.clone(),
+                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
+                HostParamSchema::value("metadata", HostTypeSchema::Unknown),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_ARTIFACT_GET,
+            vec![
+                token.clone(),
+                HostParamSchema::value("id", HostTypeSchema::String),
+            ],
+            response.clone(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            CAP_ARTIFACT_REFERENCE,
+            vec![token, HostParamSchema::value("id", HostTypeSchema::String)],
             response,
         ));
         Arc::new(builder.build().expect("agent host catalog must build"))
@@ -107,6 +249,11 @@ pub struct AgentHostBridges {
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
     pub metrics: Option<Arc<Metrics>>,
+    pub lifecycle: Option<Arc<CapabilityLifecycle>>,
+    pub capability_owner: Option<CapabilityOwner>,
+    pub filesystem: Option<Arc<FilesystemCapability>>,
+    pub processes: Option<Arc<ProcessCapability>>,
+    pub artifacts: Option<Arc<ArtifactCapability>>,
 }
 
 /// Per-VM state installed before `run(context)`.
@@ -118,6 +265,12 @@ pub struct AgentHostState {
     pub sleeps: Arc<Mutex<SleepLog>>,
     pub skip_sleep: bool,
     pub metrics: Option<Arc<Metrics>>,
+    pub lifecycle: Option<Arc<CapabilityLifecycle>>,
+    pub capability_owner: Option<CapabilityOwner>,
+    pub filesystem: Option<Arc<FilesystemCapability>>,
+    pub processes: Option<Arc<ProcessCapability>>,
+    pub artifacts: Option<Arc<ArtifactCapability>>,
+    pub(crate) leases: Arc<Mutex<HashMap<String, ExecutionLease>>>,
 }
 
 impl AgentHostState {
@@ -136,6 +289,283 @@ impl AgentHostState {
             return error;
         }
         normalize_provider_envelope(self.provider.call(request, &self.cancellation))
+    }
+
+    fn capability_prepare(&self, metadata: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        let envelope = match parse_prepare_metadata(metadata) {
+            Ok(metadata) => tool_prepare(lifecycle, owner, metadata),
+            Err(error) => return crate::capabilities::host::error_envelope(&error),
+        };
+        if envelope.get("ok") == Some(&JsonValue::Bool(true))
+            && envelope.get("kind") == Some(&JsonValue::String("execute".to_string()))
+            && let Some(token) = envelope.get("execution_token").and_then(JsonValue::as_str)
+            && let Ok(lease) = lifecycle.lease(token)
+        {
+            self.leases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(token.to_string(), lease);
+        }
+        envelope
+    }
+
+    fn capability_commit(&self, token: &str, result: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        let envelope = tool_commit(lifecycle, owner, token, result.clone());
+        if envelope.get("ok") == Some(&JsonValue::Bool(true))
+            && let Some(mut lease) = self
+                .leases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(token)
+        {
+            lease.disarm();
+        }
+        envelope
+    }
+
+    fn missing_capability(name: &str) -> JsonValue {
+        capability_error_envelope(&CapabilityError::new(
+            "invalid_metadata",
+            format!("{name} capability is not installed"),
+        ))
+    }
+
+    fn cap_fs_metadata(&self, token: String, path: String) -> JsonValue {
+        let Some(fs) = self.filesystem.as_ref() else {
+            return Self::missing_capability("filesystem");
+        };
+        match fs.metadata(&token, &path) {
+            Ok(meta) => json!({
+                "ok": true,
+                "kind": "fs_metadata",
+                "file_type": meta.file_type,
+                "len": meta.len,
+            }),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_fs_read_range(&self, token: String, path: String, offset: u64, limit: usize) -> Value {
+        let Some(fs) = self.filesystem.as_ref() else {
+            return json_to_vm_value(&Self::missing_capability("filesystem"));
+        };
+        match fs.read_range(&token, &path, offset, limit) {
+            Ok(read) => fs_read_value(read),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+        }
+    }
+
+    fn cap_fs_list(&self, token: String, path: String, cursor: u64, limit: usize) -> JsonValue {
+        let Some(fs) = self.filesystem.as_ref() else {
+            return Self::missing_capability("filesystem");
+        };
+        match fs.list(&token, &path, cursor, limit) {
+            Ok(list) => json!({
+                "ok": true,
+                "kind": "fs_list",
+                "cursor": list.cursor,
+                "next_cursor": list.next_cursor,
+                "truncated": list.truncated,
+                "entries": list.entries.iter().map(|entry| json!({
+                    "name": entry.name,
+                    "file_type": entry.file_type,
+                    "len": entry.len,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_fs_write_atomic(
+        &self,
+        token: String,
+        path: String,
+        expected_hash: String,
+        bytes: Vec<u8>,
+    ) -> JsonValue {
+        let Some(fs) = self.filesystem.as_ref() else {
+            return Self::missing_capability("filesystem");
+        };
+        match fs.write_atomic(&token, &path, &expected_hash, &bytes) {
+            Ok(write) => json!({
+                "ok": true,
+                "kind": "fs_write",
+                "hash": write.hash,
+                "len": write.len,
+            }),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_process_spawn(
+        &self,
+        token: String,
+        argv: Vec<String>,
+        cwd: String,
+        env_names: Vec<String>,
+        limits: ProcessLimits,
+    ) -> JsonValue {
+        let Some(processes) = self.processes.as_ref() else {
+            return Self::missing_capability("process");
+        };
+        match processes.spawn(&token, &argv, &cwd, &env_names, limits) {
+            Ok(spawned) => json!({
+                "ok": true,
+                "kind": "process_spawn",
+                "handle": spawned.handle,
+                "pid": spawned.pid,
+            }),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_process_poll(
+        &self,
+        token: String,
+        handle: String,
+        cursor: u64,
+        limit: usize,
+    ) -> JsonValue {
+        let Some(processes) = self.processes.as_ref() else {
+            return Self::missing_capability("process");
+        };
+        match processes.poll(&token, &handle, cursor, limit) {
+            Ok(snapshot) => process_snapshot_envelope("process_poll", &snapshot),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_process_wait(
+        &self,
+        token: String,
+        handle: String,
+        timeout_ms: Option<u64>,
+    ) -> JsonValue {
+        let Some(processes) = self.processes.as_ref() else {
+            return Self::missing_capability("process");
+        };
+        match processes.wait(&token, &handle, timeout_ms) {
+            Ok(snapshot) => process_snapshot_envelope("process_wait", &snapshot),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_process_log(
+        &self,
+        token: String,
+        handle: String,
+        cursor: u64,
+        limit: usize,
+    ) -> JsonValue {
+        let Some(processes) = self.processes.as_ref() else {
+            return Self::missing_capability("process");
+        };
+        match processes.log(&token, &handle, cursor, limit) {
+            Ok(snapshot) => process_snapshot_envelope("process_log", &snapshot),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_process_write(&self, token: String, handle: String, bytes: Vec<u8>) -> JsonValue {
+        let Some(processes) = self.processes.as_ref() else {
+            return Self::missing_capability("process");
+        };
+        match processes.write_stdin(&token, &handle, &bytes) {
+            Ok(()) => json!({"ok": true, "kind": "process_write"}),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_process_close(&self, token: String, handle: String) -> JsonValue {
+        let Some(processes) = self.processes.as_ref() else {
+            return Self::missing_capability("process");
+        };
+        match processes.close_stdin(&token, &handle) {
+            Ok(()) => json!({"ok": true, "kind": "process_close"}),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_process_kill(&self, token: String, handle: String) -> JsonValue {
+        let Some(processes) = self.processes.as_ref() else {
+            return Self::missing_capability("process");
+        };
+        match processes.kill(&token, &handle) {
+            Ok(()) => json!({"ok": true, "kind": "process_kill"}),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_artifact_put(&self, token: String, bytes: Vec<u8>, metadata: Value) -> JsonValue {
+        let Some(artifacts) = self.artifacts.as_ref() else {
+            return Self::missing_capability("artifact");
+        };
+        match artifacts.put(&token, &bytes, &vm_value_to_json(&metadata)) {
+            Ok(refer) => json!({
+                "ok": true,
+                "kind": "artifact_put",
+                "id": refer.id,
+                "len": refer.len,
+                "hash": refer.hash,
+                "metadata": refer.metadata,
+            }),
+            Err(error) => capability_error_envelope(&error),
+        }
+    }
+
+    fn cap_artifact_get(&self, token: String, id: String) -> Value {
+        let Some(artifacts) = self.artifacts.as_ref() else {
+            return json_to_vm_value(&Self::missing_capability("artifact"));
+        };
+        match artifacts.get(&token, &id) {
+            Ok(bytes) => Value::map(vec![
+                (Value::string("ok"), Value::Bool(true)),
+                (Value::string("kind"), Value::string("artifact_get")),
+                (
+                    Value::string("len"),
+                    Value::Int(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+                ),
+                (Value::string("bytes"), Value::bytes(bytes)),
+            ]),
+            Err(error) => json_to_vm_value(&capability_error_envelope(&error)),
+        }
+    }
+
+    fn cap_artifact_reference(&self, token: String, id: String) -> JsonValue {
+        let Some(artifacts) = self.artifacts.as_ref() else {
+            return Self::missing_capability("artifact");
+        };
+        match artifacts.reference(&token, &id) {
+            Ok(refer) => json!({
+                "ok": true,
+                "kind": "artifact_reference",
+                "id": refer.id,
+                "len": refer.len,
+                "hash": refer.hash,
+                "metadata": refer.metadata,
+            }),
+            Err(error) => capability_error_envelope(&error),
+        }
     }
 
     fn tool_dispatch(&self, call: &JsonValue) -> JsonValue {
@@ -338,6 +768,100 @@ pub fn register_agent_host_functions(
     register_named(registry, catalog, TOOL_DISPATCH, 1, tool_dispatch_adapter)?;
     register_named(registry, catalog, SLEEP_MS, 1, sleep_ms_adapter)?;
     register_named(registry, catalog, CONTROL_CHECK, 0, control_check_adapter)?;
+    register_named(registry, catalog, TOOL_PREPARE, 1, tool_prepare_adapter)?;
+    register_named(registry, catalog, TOOL_COMMIT, 2, tool_commit_adapter)?;
+    register_named(
+        registry,
+        catalog,
+        CAP_FS_METADATA,
+        2,
+        cap_fs_metadata_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_FS_READ_RANGE,
+        4,
+        cap_fs_read_range_adapter,
+    )?;
+    register_named(registry, catalog, CAP_FS_LIST, 4, cap_fs_list_adapter)?;
+    register_named(
+        registry,
+        catalog,
+        CAP_FS_WRITE_ATOMIC,
+        4,
+        cap_fs_write_atomic_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_PROCESS_SPAWN,
+        5,
+        cap_process_spawn_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_PROCESS_POLL,
+        4,
+        cap_process_poll_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_PROCESS_WAIT,
+        3,
+        cap_process_wait_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_PROCESS_LOG,
+        4,
+        cap_process_log_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_PROCESS_WRITE,
+        3,
+        cap_process_write_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_PROCESS_CLOSE,
+        2,
+        cap_process_close_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_PROCESS_KILL,
+        2,
+        cap_process_kill_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_ARTIFACT_PUT,
+        3,
+        cap_artifact_put_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_ARTIFACT_GET,
+        2,
+        cap_artifact_get_adapter,
+    )?;
+    register_named(
+        registry,
+        catalog,
+        CAP_ARTIFACT_REFERENCE,
+        2,
+        cap_artifact_reference_adapter,
+    )?;
     Ok(())
 }
 
@@ -388,6 +912,232 @@ fn control_check_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> 
     return_json(result)
 }
 
+fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let metadata = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_prepare(&vm_value_to_json(&metadata)))
+}
+
+fn tool_commit_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let token = match args.first() {
+        Some(Value::String(value)) => value.to_string(),
+        _ => String::new(),
+    };
+    let result = args.get(1).cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_commit(&token, &vm_value_to_json(&result)))
+}
+
+fn cap_fs_metadata_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "path")?,
+            ))
+        },
+        |(token, path)| return_json(state.cap_fs_metadata(token, path)),
+    )
+}
+
+fn cap_fs_read_range_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "path")?,
+                arg_u64(args, 2, "offset")?,
+                arg_positive_usize(args, 3, "limit")?,
+            ))
+        },
+        |(token, path, offset, limit)| {
+            return_value(state.cap_fs_read_range(token, path, offset, limit))
+        },
+    )
+}
+
+fn cap_fs_list_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "path")?,
+                arg_u64(args, 2, "cursor")?,
+                arg_positive_usize(args, 3, "limit")?,
+            ))
+        },
+        |(token, path, cursor, limit)| return_json(state.cap_fs_list(token, path, cursor, limit)),
+    )
+}
+
+fn cap_fs_write_atomic_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "path")?,
+                arg_string(args, 2, "expected_hash")?,
+                arg_bytes(args, 3, "bytes")?,
+            ))
+        },
+        |(token, path, expected_hash, bytes)| {
+            return_json(state.cap_fs_write_atomic(token, path, expected_hash, bytes))
+        },
+    )
+}
+
+fn cap_process_spawn_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string_list(args, 1, "argv")?,
+                arg_string(args, 2, "cwd")?,
+                arg_string_list(args, 3, "env_names")?,
+                arg_process_limits(args.get(4))?,
+            ))
+        },
+        |(token, argv, cwd, env_names, limits)| {
+            return_json(state.cap_process_spawn(token, argv, cwd, env_names, limits))
+        },
+    )
+}
+
+fn cap_process_poll_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "handle")?,
+                arg_u64(args, 2, "cursor")?,
+                arg_positive_usize(args, 3, "limit")?,
+            ))
+        },
+        |(token, handle, cursor, limit)| {
+            return_json(state.cap_process_poll(token, handle, cursor, limit))
+        },
+    )
+}
+
+fn cap_process_wait_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "handle")?,
+                arg_timeout(args, 2, "timeout_ms")?,
+            ))
+        },
+        |(token, handle, timeout_ms)| {
+            return_json(state.cap_process_wait(token, handle, timeout_ms))
+        },
+    )
+}
+
+fn cap_process_log_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "handle")?,
+                arg_u64(args, 2, "cursor")?,
+                arg_positive_usize(args, 3, "limit")?,
+            ))
+        },
+        |(token, handle, cursor, limit)| {
+            return_json(state.cap_process_log(token, handle, cursor, limit))
+        },
+    )
+}
+
+fn cap_process_write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "handle")?,
+                arg_bytes(args, 2, "bytes")?,
+            ))
+        },
+        |(token, handle, bytes)| return_json(state.cap_process_write(token, handle, bytes)),
+    )
+}
+
+fn cap_process_close_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "handle")?,
+            ))
+        },
+        |(token, handle)| return_json(state.cap_process_close(token, handle)),
+    )
+}
+
+fn cap_process_kill_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "handle")?,
+            ))
+        },
+        |(token, handle)| return_json(state.cap_process_kill(token, handle)),
+    )
+}
+
+fn cap_artifact_put_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_bytes(args, 1, "bytes")?,
+                args.get(2).cloned().unwrap_or(Value::Null),
+            ))
+        },
+        |(token, bytes, metadata)| return_json(state.cap_artifact_put(token, bytes, metadata)),
+    )
+}
+
+fn cap_artifact_get_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "id")?,
+            ))
+        },
+        |(token, id)| return_value(state.cap_artifact_get(token, id)),
+    )
+}
+
+fn cap_artifact_reference_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let state = installed_state(vm)?;
+    decode_then(
+        || {
+            Ok((
+                arg_string(args, 0, "execution_token")?,
+                arg_string(args, 1, "id")?,
+            ))
+        },
+        |(token, id)| return_json(state.cap_artifact_reference(token, id)),
+    )
+}
+
 fn installed_state(vm: &mut Vm) -> VmResult<AgentHostState> {
     vm.host_context()
         .module_state::<AgentHostState>()
@@ -396,9 +1146,188 @@ fn installed_state(vm: &mut Vm) -> VmResult<AgentHostState> {
 }
 
 fn return_json(value: JsonValue) -> VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(CallReturn::One(json_to_vm_value(
-        &value,
-    ))))
+    return_value(json_to_vm_value(&value))
+}
+
+fn return_value(value: Value) -> VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::One(value)))
+}
+
+fn decode_then<T>(
+    decode: impl FnOnce() -> Result<T, JsonValue>,
+    then: impl FnOnce(T) -> VmResult<CallOutcome>,
+) -> VmResult<CallOutcome> {
+    match decode() {
+        Ok(value) => then(value),
+        Err(error) => return_json(error),
+    }
+}
+
+fn invalid_request(message: impl Into<String>) -> JsonValue {
+    capability_error_envelope(&CapabilityError::new("invalid_request", message.into()))
+}
+
+fn fs_read_value(read: FsRead) -> Value {
+    let mut fields = vec![
+        (Value::string("ok"), Value::Bool(true)),
+        (Value::string("kind"), Value::string("fs_read")),
+        (
+            Value::string("offset"),
+            Value::Int(i64::try_from(read.offset).unwrap_or(i64::MAX)),
+        ),
+        (Value::string("truncated"), Value::Bool(read.truncated)),
+        (
+            Value::string("len"),
+            Value::Int(i64::try_from(read.bytes.len()).unwrap_or(i64::MAX)),
+        ),
+        (Value::string("bytes"), Value::bytes(read.bytes)),
+    ];
+    if let Some(hash) = read.hash {
+        fields.push((Value::string("hash"), Value::string(hash)));
+    }
+    Value::map(fields)
+}
+
+fn arg_string(args: &[Value], index: usize, name: &str) -> Result<String, JsonValue> {
+    match args.get(index) {
+        Some(Value::String(value)) => Ok(value.to_string()),
+        _ => Err(invalid_request(format!("{name} must be a string"))),
+    }
+}
+
+fn arg_u64(args: &[Value], index: usize, name: &str) -> Result<u64, JsonValue> {
+    match args.get(index) {
+        Some(Value::Int(value)) => u64::try_from(*value)
+            .map_err(|_| invalid_request(format!("{name} must be a non-negative integer"))),
+        _ => Err(invalid_request(format!(
+            "{name} must be a non-negative integer"
+        ))),
+    }
+}
+
+fn arg_usize(args: &[Value], index: usize, name: &str) -> Result<usize, JsonValue> {
+    usize::try_from(arg_u64(args, index, name)?)
+        .map_err(|_| invalid_request(format!("{name} is out of range")))
+}
+
+fn arg_positive_usize(args: &[Value], index: usize, name: &str) -> Result<usize, JsonValue> {
+    let value = arg_usize(args, index, name)?;
+    if value == 0 {
+        return Err(invalid_request(format!("{name} must be positive")));
+    }
+    Ok(value)
+}
+
+fn arg_timeout(args: &[Value], index: usize, name: &str) -> Result<Option<u64>, JsonValue> {
+    match args.get(index) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Int(value)) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| invalid_request(format!("{name} must be a non-negative integer"))),
+        _ => Err(invalid_request(format!(
+            "{name} must be a non-negative integer"
+        ))),
+    }
+}
+
+fn arg_bytes(args: &[Value], index: usize, name: &str) -> Result<Vec<u8>, JsonValue> {
+    match args.get(index) {
+        Some(Value::Bytes(value)) => Ok(value.as_ref().to_vec()),
+        _ => Err(invalid_request(format!("{name} must be bytes"))),
+    }
+}
+
+fn arg_string_list(args: &[Value], index: usize, name: &str) -> Result<Vec<String>, JsonValue> {
+    match args.get(index) {
+        Some(Value::Array(values)) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values.iter() {
+                match value {
+                    Value::String(text) => out.push(text.to_string()),
+                    _ => {
+                        return Err(invalid_request(format!(
+                            "{name} must be an array of strings"
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(invalid_request(format!(
+            "{name} must be an array of strings"
+        ))),
+    }
+}
+
+fn arg_process_limits(value: Option<&Value>) -> Result<ProcessLimits, JsonValue> {
+    let mut limits = ProcessLimits::default();
+    let JsonValue::Object(fields) = value.map(vm_value_to_json).unwrap_or(JsonValue::Null) else {
+        return Err(invalid_request("limits must be a map"));
+    };
+    if let Some(timeout_ms) = json_u64_field(&fields, "timeout_ms")? {
+        limits.timeout_ms = timeout_ms;
+    }
+    if let Some(stdout_limit) = json_usize_field(&fields, "stdout_limit")? {
+        limits.stdout_limit = stdout_limit;
+    }
+    if let Some(stderr_limit) = json_usize_field(&fields, "stderr_limit")? {
+        limits.stderr_limit = stderr_limit;
+    }
+    if let Some(total_limit) = json_usize_field(&fields, "total_limit")? {
+        limits.total_limit = total_limit;
+    }
+    if let Some(stdin_limit) = json_usize_field(&fields, "stdin_limit")? {
+        limits.stdin_limit = stdin_limit;
+    }
+    if let Some(log_limit) = json_usize_field(&fields, "log_limit")? {
+        limits.log_limit = log_limit;
+    }
+    Ok(limits)
+}
+
+fn json_u64_field(
+    fields: &serde_json::Map<String, JsonValue>,
+    name: &str,
+) -> Result<Option<u64>, JsonValue> {
+    let Some(value) = fields.get(name) else {
+        return Ok(None);
+    };
+    if let Some(parsed) = value.as_u64() {
+        return Ok(Some(parsed));
+    }
+    if let Some(parsed) = value.as_i64() {
+        return u64::try_from(parsed)
+            .map(Some)
+            .map_err(|_| invalid_request(format!("{name} must be a non-negative integer")));
+    }
+    Err(invalid_request(format!(
+        "{name} must be a non-negative integer"
+    )))
+}
+
+fn json_usize_field(
+    fields: &serde_json::Map<String, JsonValue>,
+    name: &str,
+) -> Result<Option<usize>, JsonValue> {
+    match json_u64_field(fields, name)? {
+        Some(parsed) => usize::try_from(parsed)
+            .map(Some)
+            .map_err(|_| invalid_request(format!("{name} is out of range"))),
+        None => Ok(None),
+    }
+}
+
+fn process_snapshot_envelope(kind: &str, snapshot: &ProcessSnapshot) -> JsonValue {
+    json!({
+        "ok": true,
+        "kind": kind,
+        "handle": snapshot.handle,
+        "running": snapshot.running,
+        "exit_code": snapshot.exit_code,
+        "stdout": snapshot.stdout,
+        "stderr": snapshot.stderr,
+        "truncated": snapshot.truncated,
+    })
 }
 
 pub(crate) fn typed_fail(code: &str, message: &str) -> JsonValue {
