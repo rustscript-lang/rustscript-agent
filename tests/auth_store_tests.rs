@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustscript_agent::auth::store::{AuthMetadata, AuthStore, AuthStoreError};
 use rustscript_agent::config_file::AgentPaths;
@@ -418,6 +418,74 @@ fn access_and_refresh_handles_are_one_shot_and_redacted() {
     assert!(matches!(
         expired.validate().expect_err("expired"),
         AuthStoreError::HandleExpired { .. }
+    ));
+}
+
+#[test]
+fn expired_access_credential_still_issues_a_live_refresh_handle() {
+    let root = TempRoot::new("expired-access");
+    let paths = AgentPaths::from_home(root.path.join("home")).expect("paths");
+    let store = AuthStore::open(paths.clone()).expect("open");
+    fs::write(
+        &paths.auth,
+        auth_yaml(ACCESS, Some(REFRESH), 0, "active")
+            .replace("expires_at_ms: 1900000000000", "expires_at_ms: 1"),
+    )
+    .expect("write expired access fixture");
+    set_private_mode(&paths.auth);
+
+    let refresh = store
+        .issue_refresh_handle("primary", 0, 1, "test-run")
+        .expect("refresh handle must ignore access expiry");
+    refresh
+        .validate()
+        .expect("refresh handle must stay live after access expiry");
+    refresh.consume().expect("refresh handle remains sendable");
+
+    let access = store
+        .issue_access_handle("primary", 0, 1, "test-run")
+        .expect_err("expired access must fail closed");
+    assert!(matches!(access, AuthStoreError::HandleExpired { .. }));
+}
+
+#[test]
+fn expired_refresh_transaction_deadline_fails_closed() {
+    let (_root, _paths, store) =
+        open_with_yaml("refresh-deadline", ACCESS, Some(REFRESH), 4, "active");
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("clock");
+    let expired = store
+        .issue_refresh_handle_until("primary", 4, 1, "test-run", deadline)
+        .expect_err("expired refresh transaction must fail closed");
+    assert!(matches!(expired, AuthStoreError::HandleExpired { .. }));
+}
+
+#[test]
+fn expired_access_request_deadline_fails_closed() {
+    let (_root, _paths, store) =
+        open_with_yaml("access-deadline", ACCESS, Some(REFRESH), 4, "active");
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("clock");
+    let expired = store
+        .issue_access_handle_until("primary", 4, 1, "test-run", deadline)
+        .expect_err("expired access request deadline must fail closed");
+    assert!(matches!(expired, AuthStoreError::HandleExpired { .. }));
+}
+
+#[test]
+fn delete_removes_the_named_credential_without_generation_cas() {
+    let (_root, _paths, store) = open_with_yaml("delete", ACCESS, Some(REFRESH), 4, "active");
+    let deleted = store.delete("primary").expect("delete");
+    assert_eq!(deleted.generation, 4);
+    assert_no_secrets(&format!("{deleted:?}"));
+    let missing = store
+        .load_metadata("primary")
+        .expect_err("named credential is gone");
+    assert!(matches!(
+        missing,
+        AuthStoreError::CredentialNotFound { ref credential_id } if credential_id == "primary"
     ));
 }
 

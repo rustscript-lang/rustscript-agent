@@ -1,9 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustscript_agent::config_fixture::AuthFixtureHost;
+use serde_json::Value as JsonValue;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -54,14 +57,29 @@ fn auth_yaml() -> &'static str {
     "version: 1\ncredentials:\n  primary:\n    provider: synthetic-provider\n    kind: oauth\n    source: synthetic-test\n    token_type: Bearer\n    access_token: INITIAL_ACCESS_HOST_ONLY\n    refresh_token: INITIAL_REFRESH_HOST_ONLY\n    expires_at_ms: 1900000000000\n    scopes: [scope.synthetic]\n    account_id: acct.synthetic\n    generation: 0\n    status: active\n"
 }
 
+fn auth_yaml_expired() -> String {
+    auth_yaml().replace("expires_at_ms: 1900000000000", "expires_at_ms: 1")
+}
+
+fn auth_yaml_multi() -> String {
+    format!(
+        "{}\n  secondary:\n    provider: synthetic-provider\n    kind: oauth\n    source: synthetic-test\n    token_type: Bearer\n    access_token: INITIAL_ACCESS_HOST_ONLY\n    refresh_token: INITIAL_REFRESH_HOST_ONLY\n    expires_at_ms: 1900000000000\n    scopes: [scope.synthetic]\n    account_id: acct.synthetic-secondary\n    generation: 0\n    status: active\n",
+        auth_yaml().trim_end()
+    )
+}
+
 fn config_yaml() -> &'static str {
     "version: 1\nmodel:\n  provider: local-agent\n  model: local-agent\n"
 }
 
 fn fixture(name: &str) -> (TempRoot, AuthFixtureHost) {
+    fixture_from_auth(name, auth_yaml())
+}
+
+fn fixture_from_auth(name: &str, auth: impl AsRef<str>) -> (TempRoot, AuthFixtureHost) {
     let root = TempRoot::new(name);
     fs::write(root.0.join("config.yaml"), config_yaml()).expect("config fixture");
-    fs::write(root.0.join("auth.yaml"), auth_yaml()).expect("auth fixture");
+    fs::write(root.0.join("auth.yaml"), auth.as_ref()).expect("auth fixture");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -81,6 +99,13 @@ fn assert_no_secrets(value: &str) {
     assert!(!value.contains("INITIAL_ACCESS_HOST_ONLY"));
     assert!(!value.contains("INITIAL_REFRESH_HOST_ONLY"));
     assert!(!value.contains("HOST_ONLY"));
+}
+
+/// AuthFixtureHost invoke path exposes Complete JSON and the VM Value Debug
+/// form. No Event/snapshot collector is wired on this fixture.
+fn assert_complete_safe(json: &JsonValue) {
+    assert_no_secrets(&json.to_string());
+    assert_no_secrets(&format!("{json:?}"));
 }
 
 #[test]
@@ -104,8 +129,12 @@ fn rss_round_trip_returns_only_metadata_and_opaque_handles() {
     assert_eq!(refresh["ok"], true);
     assert_eq!(refresh["handle_class"], "OpaqueRefreshHandle");
     assert_eq!(refresh["handle"], "<callable>");
-    assert_no_secrets(&access.to_string());
-    assert_no_secrets(&refresh.to_string());
+    assert_complete_safe(&saved);
+    assert_complete_safe(&loaded);
+    assert_complete_safe(&access);
+    assert_complete_safe(&refresh);
+    let loaded_value = host.run_value("load").expect("RSS load value");
+    assert_no_secrets(&format!("{loaded_value:?}"));
 }
 
 #[test]
@@ -229,4 +258,158 @@ fn rss_cross_owner_policy_handle_is_rejected() {
         .expect("cross-owner policy");
     assert_eq!(probed["ok"], false);
     assert_eq!(probed["error"]["code"], "policy_handle_invalid");
+}
+
+#[test]
+fn rss_corrupt_auth_file_fails_closed_without_secrets() {
+    let (root, host) = fixture("corrupt");
+    fs::write(root.as_ref().join("auth.yaml"), "{not: [valid").expect("corrupt auth");
+    let loaded = host.run_json("load").expect("corrupt load");
+    assert_eq!(loaded["ok"], false);
+    assert_eq!(loaded["error"]["code"], "corrupt_file");
+    assert_complete_safe(&loaded);
+    let recovered = AuthFixtureHost::bind(root.as_ref());
+    assert!(recovered.is_ok() || recovered.is_err());
+    if let Ok(recovered) = recovered {
+        let after = recovered.run_json("load").expect("recovered load");
+        assert_eq!(after["ok"], false);
+        assert_complete_safe(&after);
+    }
+}
+
+#[test]
+fn rss_same_credential_concurrent_saves_adopt_or_commit() {
+    let (_root, host) = fixture("concurrent-same");
+    let host = Arc::new(host);
+    let left = {
+        let host = Arc::clone(&host);
+        thread::spawn(move || host.run_json("save"))
+    };
+    let right = {
+        let host = Arc::clone(&host);
+        thread::spawn(move || host.run_json("save"))
+    };
+    let first = left.join().expect("left join").expect("left save");
+    let second = right.join().expect("right join").expect("right save");
+    assert_eq!(first["ok"], true);
+    assert_eq!(second["ok"], true);
+    for outcome in [&first["outcome"], &second["outcome"]] {
+        assert!(outcome == "committed" || outcome == "adopted");
+    }
+    assert_complete_safe(&first);
+    assert_complete_safe(&second);
+    let loaded = host.run_json("load").expect("load after concurrent save");
+    assert_eq!(loaded["ok"], true);
+    let generation = loaded["metadata"]["generation"]
+        .as_u64()
+        .expect("generation");
+    assert!(generation == 1 || generation == 2);
+    assert_complete_safe(&loaded);
+}
+
+#[test]
+fn rss_multi_credential_save_preserves_the_other_entry() {
+    let (_root, host) = fixture_from_auth("multi", auth_yaml_multi());
+    let saved = host
+        .run_json_for("save", "secondary")
+        .expect("secondary save");
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["metadata"]["credential_id"], "secondary");
+    assert_eq!(saved["metadata"]["generation"], 1);
+    assert_complete_safe(&saved);
+    let primary = host.run_json_for("load", "primary").expect("primary load");
+    assert_eq!(primary["ok"], true);
+    assert_eq!(primary["metadata"]["generation"], 0);
+    assert_eq!(primary["metadata"]["credential_id"], "primary");
+    let secondary = host
+        .run_json_for("load", "secondary")
+        .expect("secondary load");
+    assert_eq!(secondary["ok"], true);
+    assert_eq!(secondary["metadata"]["generation"], 1);
+    assert_complete_safe(&primary);
+    assert_complete_safe(&secondary);
+}
+
+#[test]
+fn rss_copied_access_and_refresh_handles_alias_the_issued_capability() {
+    let (_root, host) = fixture("handle-copy");
+    host.run_json("save").expect("save");
+    let access_copy = host.run_json("access_copy").expect("access copy");
+    assert_eq!(access_copy["ok"], true);
+    assert_eq!(access_copy["handle_class"], "OpaqueAccessHandle");
+    let refresh_copy = host.run_json("refresh_copy").expect("refresh copy");
+    assert_eq!(refresh_copy["ok"], true);
+    assert_eq!(refresh_copy["handle_class"], "OpaqueRefreshHandle");
+    assert_complete_safe(&access_copy);
+    assert_complete_safe(&refresh_copy);
+}
+
+#[test]
+fn rss_save_cross_run_is_rejected_by_slot_provenance() {
+    let (_root, host) = fixture("cross-run");
+    let cross = host.run_json("save_cross_run").expect("cross run");
+    assert_eq!(cross["ok"], false);
+    assert_eq!(cross["error"]["code"], "secret_slot_provenance");
+    assert_complete_safe(&cross);
+}
+
+#[test]
+fn rss_stale_policy_generation_is_rejected_after_reload() {
+    let (_root, mut host) = fixture("stale-policy");
+    host.run_json("save").expect("save");
+    let old_policy = host.policy_value();
+    host.reload_policy().expect("reload");
+    let probed = host
+        .run_json_with_policy_value("load", old_policy)
+        .expect("stale policy");
+    assert_eq!(probed["ok"], false);
+    assert_eq!(probed["error"]["code"], "policy_handle_invalid");
+    assert_complete_safe(&probed);
+}
+
+#[test]
+fn rss_expired_access_still_issues_a_live_refresh_handle() {
+    let (_root, host) = fixture_from_auth("expired-access", auth_yaml_expired());
+    let access = host.run_json("access").expect("expired access");
+    assert_eq!(access["ok"], false);
+    assert_eq!(access["error"]["code"], "handle_expired");
+    let refresh = host.run_json("refresh").expect("live refresh");
+    assert_eq!(refresh["ok"], true);
+    assert_eq!(refresh["handle_class"], "OpaqueRefreshHandle");
+    assert_complete_safe(&access);
+    assert_complete_safe(&refresh);
+}
+
+#[test]
+fn rss_duplicate_save_and_handle_replay_fail_closed() {
+    let (_root, host) = fixture("duplicates");
+    let replay = host.run_json("save_replay").expect("save replay");
+    assert_eq!(replay["first"]["ok"], true);
+    assert_eq!(replay["second"]["ok"], false);
+    assert_eq!(replay["second"]["error"]["code"], "secret_slot_replayed");
+    assert_complete_safe(&replay);
+    let handle_replay = host.run_json("access_replay").expect("handle replay");
+    assert_eq!(handle_replay["first"]["ok"], true);
+    assert_eq!(handle_replay["second"]["ok"], false);
+    assert_eq!(handle_replay["second"]["error"]["code"], "handle_replayed");
+    assert_complete_safe(&handle_replay);
+    let refresh_replay = host.run_json("refresh_replay").expect("refresh replay");
+    assert_eq!(refresh_replay["first"]["ok"], true);
+    assert_eq!(refresh_replay["second"]["ok"], false);
+    assert_complete_safe(&refresh_replay);
+}
+
+#[test]
+fn rss_forged_and_serialized_handles_are_rejected() {
+    let (_root, host) = fixture("forged-serialized");
+    host.run_json("save").expect("save");
+    let forged = host.run_json("access_forged").expect("forged");
+    assert_eq!(forged["ok"], false);
+    assert_eq!(forged["error"]["code"], "handle_invalid");
+    let serialized = host.run_json("access_serialized").expect("serialized");
+    assert_eq!(serialized["ok"], true);
+    assert_eq!(serialized["reconstructed_ok"], false);
+    assert_eq!(serialized["reconstructed_code"], "handle_invalid");
+    assert_complete_safe(&forged);
+    assert_complete_safe(&serialized);
 }
