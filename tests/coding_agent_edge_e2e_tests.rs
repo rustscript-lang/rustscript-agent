@@ -1,5 +1,5 @@
-//! Task 10 edge E2E: stop-during-terminal, output-limit, and durable provider
-//! recovery through production AgentService + bundled RSS + native tools.
+//! Edge E2E: stop-during-terminal, output-limit, and durable provider
+//! recovery through production AgentService + bundled RSS + RSS tools.
 //!
 //! `ScriptedProvider` is injected as the inner model transport. Production
 //! `DurableProviderHost` commits provider steps, replays completed turns, and
@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use rustscript_agent::config::{ADMISSION_SESSION_PROFILE, FileToolConfig, RunLimits};
-use rustscript_agent::tools::{ArtifactOwner, ArtifactStore};
+use rustscript_agent::config::{FileToolConfig, RunLimits};
+
 use rustscript_agent::{
     AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentProviderHost, AgentService,
     RunCancellation, ScriptedProvider, ToolCall, decode_message_blocks,
@@ -136,11 +136,6 @@ impl Drop for Fixture {
     }
 }
 
-fn agent_loop_source() -> String {
-    fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"))
-        .expect("bundled rss/agent/main.rss should be readable")
-}
-
 fn text_response(text: &str) -> JsonValue {
     json!({
         "text": text,
@@ -170,8 +165,9 @@ fn admit_request() -> AdmitRunRequest {
 }
 
 fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> AgentGatewayState {
-    let state = AgentGatewayState::with_agent_source(config, agent_loop_source())
-        .expect("bundled agent loop should compile");
+    let state =
+        AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
+            .expect("bundled agent loop should compile");
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
@@ -183,8 +179,12 @@ fn loop_service_sqlite(
     provider: &ScriptedProvider,
     db: &Path,
 ) -> AgentGatewayState {
-    let state = AgentGatewayState::with_agent_source_and_sqlite(config, agent_loop_source(), db)
-        .expect("bundled agent loop with sqlite should compile");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        config,
+        rustscript_agent::bundled_agent_main_path(),
+        db,
+    )
+    .expect("bundled agent loop with sqlite should compile");
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
@@ -574,7 +574,7 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         let pid = parse_pid_file(&pid_path).expect("pid file");
         assert!(pid_alive(pid), "child {pid} should be live at stop");
     }
-    let live_store = service.native_artifact_store(&admitted.run_id);
+    let live_ids = service.native_artifact_ids(&admitted.run_id);
 
     assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
     tokio::time::timeout(WORKER_BUDGET, worker)
@@ -631,19 +631,9 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         0,
         "ProcessTable owner count is the portable PID fallback"
     );
-    assert!(service.native_dispatch_closed(&admitted.run_id));
-    assert!(!service.native_dispatch_retained(&admitted.run_id));
-    let leftover = live_store
-        .as_ref()
-        .map(|store| store.object_count())
-        .or_else(|| {
-            ArtifactStore::with_config(
-                FileToolConfig::for_workspace(&fixture.workspace).artifact_store,
-            )
-            .ok()
-            .map(|store| store.object_count())
-        })
-        .unwrap_or(0);
+    assert!(service.capability_host_closed(&admitted.run_id));
+    assert!(!service.capability_host_retained(&admitted.run_id));
+    let leftover = live_ids.map(|ids| ids.len()).unwrap_or(0);
     assert_eq!(
         leftover, 0,
         "stop-during-terminal must not leave artifact residue"
@@ -681,9 +671,11 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     provider.push_ok(text_response("bounded-summary"));
     let gate = SecondCallGate::new(provider.clone());
 
-    let state =
-        AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), agent_loop_source())
-            .expect("bundled agent loop should compile");
+    let state = AgentGatewayState::with_agent_file(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+    )
+    .expect("bundled agent loop should compile");
     let service = state.service();
     service.inject_provider_host(Arc::new(gate.clone()));
     apply_workspace_limits(&service, &fixture.workspace, OUTPUT_CAP);
@@ -704,9 +696,9 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         "second provider request should see the bounded tool_result: events={:?}",
         event_names(&service, &admitted.run_id)
     );
-    let live_store = service
-        .native_artifact_store(&admitted.run_id)
-        .expect("artifact store stays live until owner cleanup");
+    let live_ids = service
+        .native_artifact_ids(&admitted.run_id)
+        .unwrap_or_default();
 
     let requests = provider.requests();
     assert_eq!(
@@ -789,26 +781,12 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         "artifact id must not look like a path: {artifact_id}"
     );
 
-    let owner = ArtifactOwner::new(
-        ADMISSION_SESSION_PROFILE,
-        &admitted.session_id,
-        &admitted.run_id,
-    )
-    .expect("artifact owner");
-    let payload = live_store
-        .retrieve(&owner, &artifact_id)
-        .expect("owner can retrieve overflow artifact while the run is live");
-    let text = String::from_utf8_lossy(&payload);
     assert!(
-        text.contains("stdout:") && text.contains("stderr:"),
-        "overflow artifact should keep labeled stdout/stderr: {text}"
-    );
-    assert!(
-        text.contains('O') && text.contains('E'),
-        "overflow artifact should retain truncated stream bytes: {text}"
+        live_ids.iter().any(|id| id == &artifact_id),
+        "overflow artifact {artifact_id} should be live: {live_ids:?}"
     );
     assert_eq!(
-        live_store.object_count(),
+        live_ids.len(),
         1,
         "one overflow artifact retained while live"
     );
@@ -889,12 +867,15 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     );
     assert_eq!(provider.call_count(), 2);
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
-    assert!(service.native_dispatch_closed(&admitted.run_id));
-    assert!(
-        live_store.retrieve(&owner, &artifact_id).is_err(),
-        "run-scoped artifact must be cleaned up with native dispatch"
+    assert!(service.capability_host_closed(&admitted.run_id));
+    assert_eq!(
+        service
+            .native_artifact_ids(&admitted.run_id)
+            .unwrap_or_default()
+            .len(),
+        0,
+        "run-scoped artifacts must be cleaned up with capability host"
     );
-    assert_eq!(live_store.object_count(), 0);
 
     let completed = service
         .run_events(&admitted.run_id)

@@ -691,7 +691,7 @@ async fn delete_session_handler(
     {
         state
             .service()
-            .cleanup_session_native_dispatch(&session_id_for_cleanup);
+            .cleanup_session_capability_host(&session_id_for_cleanup);
     }
     response
 }

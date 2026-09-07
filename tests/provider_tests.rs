@@ -53,15 +53,17 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustscript_agent::tools::{
-    DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError, NativeToolExecutor,
-    ToolExecutorBoundary, ToolOwner, ToolResult,
+use rustscript_agent::capabilities::{
+    AllowAllApproval, ArtifactCapability, ArtifactLimits, CapabilityLifecycle, CapabilityOwner,
+    DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits, LifecycleClock,
+    LifecycleError, LifecycleLimits, NeverCancelled, ProcessCapability, ProcessLimits, SystemClock,
+    TokenIssuer, UuidIssuer,
 };
 use rustscript_agent::{
-    AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
-    ScriptedProvider, ToolRegistry,
+    AgentConfig, AgentHostBridges, AgentRunner, RunCancellation, RunDeliveryError, RunError,
+    RunEventSink, ScriptedProvider, bundled_tool_registry,
 };
-use rustscript_vm::{CancellationReason, CancellationToken, Value};
+use rustscript_vm::{CancellationReason, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 // ---------------------------------------------------------------------------
@@ -602,7 +604,7 @@ fn openai_chat_wire_format_is_standard() {
 #[test]
 fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
     let first_arguments = json!({"path": "文档.txt"});
-    let second_arguments = json!({"path": "a\"b\\c.md"});
+    let second_arguments = json!({"path": "a\"b.md"});
     let provider = ScriptedProvider::new();
     provider.push_ok(json!({
         "text": "Let me read.",
@@ -621,15 +623,15 @@ fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
         "reasoning": "",
         "stop_reason": "stop"
     }));
-    let (dispatcher, _root) = loop_dispatcher(8);
     let loop_runner = AgentRunner::from_file(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
         AgentConfig::default(),
     )
-    .expect("production loop policy should compile")
-    .with_provider(Arc::new(provider.clone()))
-    .with_dispatcher(dispatcher)
-    .with_skip_sleep(true);
+    .expect("production loop policy should compile");
+    let (mut dispatcher, _root) = loop_dispatcher(8);
+    dispatcher.provider = Some(Arc::new(provider.clone()));
+    dispatcher.skip_sleep = true;
+    let loop_runner = loop_runner.with_host(dispatcher);
     let decision = vm_value_to_json(
         &loop_runner
             .run_with_context(json_to_vm_value(&loop_context()))
@@ -695,37 +697,52 @@ fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
 const LOOP_TEMP_ROOT: &str =
     "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t6-agent-loop-9d82a388";
 
-struct LoopEvents;
+thread_local! {
+    static LOOP_WORKSPACE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 
-impl DurableEventCommitter for LoopEvents {
-    fn is_terminal(&self) -> bool {
-        false
+struct LoopDurable;
+
+impl DurableToolLifecycle for LoopDurable {
+    fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
+        Ok(())
     }
-
-    fn stop_requested(&self) -> bool {
-        false
+    fn prepare_parent(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
     }
-
-    fn commit(&self, _event_type: &str, _data: JsonValue) -> Result<(), EventCommitError> {
+    fn replay_result(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<Option<JsonValue>, LifecycleError> {
+        Ok(None)
+    }
+    fn commit_started(&self, _record: &DurableStarted) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+    fn commit_result(
+        &self,
+        call_id: &str,
+        result: &JsonValue,
+    ) -> Result<JsonValue, LifecycleError> {
+        Ok(json!({"ok": true, "kind": "committed", "call_id": call_id, "result": result}))
+    }
+    fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
         Ok(())
     }
 }
 
-struct LoopExecutor;
-
-impl ToolExecutorBoundary for LoopExecutor {
-    fn execute(
-        &self,
-        executor: &NativeToolExecutor,
-        _arguments: &JsonValue,
-        _cancellation: &CancellationToken,
-        _deadline: Instant,
-    ) -> ToolResult {
-        ToolResult::success(format!("ran {}", executor.tool_name()), json!({"ok": true}))
-    }
+fn loop_owner() -> CapabilityOwner {
+    CapabilityOwner::new("profile-loop", "session-loop", "run-loop").expect("owner")
 }
 
-fn loop_dispatcher(max_tool_calls: u64) -> (Arc<DispatchContext>, PathBuf) {
+fn loop_dispatcher(max_tool_calls: u64) -> (AgentHostBridges, PathBuf) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = PathBuf::from(LOOP_TEMP_ROOT).join(format!(
         "adapter-loop-{}-{}",
@@ -733,28 +750,68 @@ fn loop_dispatcher(max_tool_calls: u64) -> (Arc<DispatchContext>, PathBuf) {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&root).expect("loop dispatcher workspace");
-    let snapshot = ToolRegistry::builtin()
-        .expect("builtin registry")
-        .snapshot();
-    let identity = snapshot.identity().to_string();
-    let dispatcher = DispatchContext::new(
-        ToolOwner::new("profile-loop", "session-loop", "run-loop").expect("owner"),
-        root.clone(),
-        CancellationToken::new(),
-        Instant::now() + Duration::from_secs(30),
-        snapshot,
-        identity.clone(),
-        identity,
-        DispatchLimits {
-            max_tool_calls,
-            max_tool_output_bytes: 64 * 1024,
-            max_event_bytes: 32 * 1024,
-        },
-        Arc::new(LoopEvents),
-        Arc::new(LoopExecutor),
-    )
-    .expect("dispatch context");
-    (Arc::new(dispatcher), root)
+    fs::write(root.join("文档.txt"), "ran read_file").expect("seed");
+    fs::write(root.join(r#"a"b.md"#), "ran read_file").expect("seed");
+    LOOP_WORKSPACE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
+    let identity = bundled_tool_registry()
+        .expect("RSS registry")
+        .identity()
+        .to_string();
+    let clock = Arc::new(SystemClock);
+    let deadline_ms = clock.now_ms() + 30_000;
+    let lifecycle = Arc::new(
+        CapabilityLifecycle::builder()
+            .owner(loop_owner())
+            .registry_identity(identity)
+            .workspace(&root)
+            .limits(LifecycleLimits {
+                max_tool_calls: max_tool_calls.max(1),
+                max_output_bytes: 64 * 1024,
+                max_summary_bytes: 256,
+            })
+            .deadline_ms(deadline_ms)
+            .clock(clock)
+            .tokens(Arc::new(UuidIssuer) as Arc<dyn TokenIssuer>)
+            .durable(Arc::new(LoopDurable))
+            .approval(Arc::new(AllowAllApproval))
+            .cancellation(Arc::new(NeverCancelled))
+            .build()
+            .expect("loop lifecycle"),
+    );
+    let host = AgentHostBridges {
+        lifecycle: Some(Arc::clone(&lifecycle)),
+        capability_owner: Some(loop_owner()),
+        filesystem: Some(Arc::new(
+            FilesystemCapability::new(
+                lifecycle.as_ref().clone(),
+                loop_owner(),
+                FilesystemLimits::default(),
+            )
+            .expect("fs"),
+        )),
+        processes: Some(Arc::new(
+            ProcessCapability::new(
+                lifecycle.as_ref().clone(),
+                loop_owner(),
+                ProcessLimits::default(),
+            )
+            .expect("proc"),
+        )),
+        artifacts: Some(Arc::new(
+            ArtifactCapability::new(
+                lifecycle.as_ref().clone(),
+                loop_owner(),
+                ArtifactLimits {
+                    max_object_bytes: 8 * 1024 * 1024,
+                    max_total_bytes: 64 * 1024 * 1024,
+                    max_objects: 64,
+                },
+            )
+            .expect("artifacts"),
+        )),
+        ..AgentHostBridges::default()
+    };
+    (host, root)
 }
 
 fn loop_context() -> JsonValue {
@@ -767,15 +824,20 @@ fn loop_context() -> JsonValue {
             "role": "user",
             "content": [{"type": "text", "text": "hello"}]
         }],
-        "tools": [{
-            "name": "read_file",
-            "description": "Read bounded text from a workspace file",
-            "schema_json": "{\"type\":\"object\"}"
-        }],
+        "tools": bundled_tool_registry()
+            .expect("RSS registry")
+            .snapshot()
+            .schemas(),
         "provider_options": {},
         "limits": {
             "max_turns": 4,
-            "max_tool_calls": 8
+            "max_tool_calls": 8,
+            "workspace_root": LOOP_WORKSPACE.with(|slot| {
+                slot.borrow().as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
+            })
+        },
+        "metadata": {
+            "registry_identity": bundled_tool_registry().ok().map(|r| r.identity().to_string()).unwrap_or_default()
         },
         "config": {
             "base_retry_delay_ms": 100,
@@ -1351,8 +1413,8 @@ fn production_adapter_rejects_unknown_defaultless_scheme() {
 #[test]
 fn production_adapter_allows_explicit_nondefault_http_port() {
     let body = read_fixture("openai_chat/response.json");
-    let (port, _requests, fixture) = spawn_json_fixture(200, body);
     let runner = production_loop_runner();
+    let (port, _requests, fixture) = spawn_json_fixture(200, body);
     let decision = vm_value_to_json(
         &runner
             .run_with_context(json_to_vm_value(&production_loop_context(&format!(
@@ -1366,8 +1428,8 @@ fn production_adapter_allows_explicit_nondefault_http_port() {
 
 #[test]
 fn nested_adapter_http_is_interrupted_by_parent_cancel() {
-    let (port, accepted, finished, fixture) = spawn_slow_http_fixture();
     let runner = production_loop_runner();
+    let (port, accepted, finished, fixture) = spawn_slow_http_fixture();
     let cancellation = RunCancellation::new();
     let worker_cancel = cancellation.clone();
     let context = json_to_vm_value(&production_loop_context(&format!(

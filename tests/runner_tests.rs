@@ -562,3 +562,195 @@ fn drive_panic_disarms_epoch_watcher() {
     assert!(panicked.is_err());
     assert!(!cancel.watcher_is_armed());
 }
+
+#[test]
+fn from_source_compiles_supplied_bytes_even_when_dispatch_like_text_is_present() {
+    let source = r#"
+        pub fn run(input: map) -> string {
+            let marker: string = "use super::tools::dispatch";
+            "SENTINEL_FROM_SOURCE";
+        }
+    "#;
+    let runner = AgentRunner::from_source(source, AgentConfig::default())
+        .expect("from_source must compile the supplied bytes");
+    let result = runner
+        .run_with_context(Value::map(vec![]))
+        .expect("sentinel source should run");
+    assert_eq!(result, Value::string("SENTINEL_FROM_SOURCE"));
+}
+
+#[test]
+fn from_source_unresolved_import_fails_typed() {
+    let source = r#"
+        use super::tools::dispatch
+        pub fn run(input: map) -> string {
+            "should-not-run";
+        }
+    "#;
+    let error = match AgentRunner::from_source(source, AgentConfig::default()) {
+        Ok(_) => panic!("unresolved import must fail typed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        !message.contains("/home/") && !message.contains("CARGO_MANIFEST_DIR"),
+        "compile error must not leak a host path: {message}"
+    );
+}
+
+#[test]
+fn from_file_rejects_symlink_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-symlink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("real.rss");
+    std::fs::write(&target, "pub fn run(input: map) -> string { \"ok\"; }\n").expect("write");
+    let link = dir.join("link.rss");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let error = match AgentRunner::from_file(&link, AgentConfig::default()) {
+        Ok(_) => panic!("symlink entry must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("symlink"),
+        "expected symlink rejection, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_content_digest_invalidates_when_bytes_change() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-digest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("main.rss");
+    std::fs::write(&path, "pub fn run(input: map) -> string { \"aaaa\"; }\n").expect("write");
+    let first = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("compile first")
+        .run_with_context(Value::map(vec![]))
+        .expect("run first");
+    assert_eq!(first, Value::string("aaaa"));
+    std::fs::write(&path, "pub fn run(input: map) -> string { \"bbbb\"; }\n").expect("rewrite");
+    let second = AgentRunner::from_file(&path, AgentConfig::default())
+        .expect("compile second")
+        .run_with_context(Value::map(vec![]))
+        .expect("run second");
+    assert_eq!(second, Value::string("bbbb"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_oversize_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-oversize-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("main.rss");
+    let mut bytes = b"pub fn run(input: map) -> string { \"x\"; }\n".to_vec();
+    bytes.resize(1024 * 1024 + 32, b'x');
+    std::fs::write(&path, bytes).expect("write");
+    let error = match AgentRunner::from_file(&path, AgentConfig::default()) {
+        Ok(_) => panic!("oversize module file must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("source size cap") || message.contains("exceeds"),
+        "expected size cap rejection, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_malformed_utf8_without_host_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-utf8-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("main.rss");
+    std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write");
+    let error = match AgentRunner::from_file(&path, AgentConfig::default()) {
+        Ok(_) => panic!("malformed utf-8 must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("UTF-8") || message.contains("utf-8") || message.contains("utf8"),
+        "expected utf-8 rejection, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_rejects_import_that_escapes_allowed_root() {
+    let dir = std::env::temp_dir().join(format!(
+        "rss-escape-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let rss = dir.join("rss");
+    let agent = rss.join("agent");
+    std::fs::create_dir_all(&agent).expect("temp dir");
+    std::fs::write(
+        dir.join("evil.rss"),
+        "pub fn leaked() -> string { \"leaked\"; }\n",
+    )
+    .expect("write evil");
+    std::fs::write(
+        agent.join("main.rss"),
+        "use super::super::evil as leaked;\npub fn run(input: map) -> string { leaked::leaked(); }\n",
+    )
+    .expect("write entry");
+    let error = match AgentRunner::from_file(agent.join("main.rss"), AgentConfig::default()) {
+        Ok(_) => panic!("outside-root import must fail closed"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("escapes the allowed root") || message.contains("escapes"),
+        "expected escape rejection, got {message}"
+    );
+    assert!(
+        !message.contains(dir.to_string_lossy().as_ref()),
+        "error must not leak host path: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

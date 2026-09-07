@@ -1,16 +1,14 @@
 use std::{collections::BTreeSet, io, sync::Arc};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
-use crate::config::MAX_PROCESS_TOOL_TIMEOUT;
-
-use super::types::{NativeToolExecutor, RiskClass, ToolDescriptor, Toolset};
+use crate::tool_schema::{RiskClass, ToolDescriptor, Toolset};
 
 /// Computes a SHA-256 digest for the deterministic registry fingerprint.
 ///
 /// This digest is a resume-consistency value, not a signature and not an
 /// authentication or authorization mechanism.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     const INITIAL: [u32; 8] = [
         0x6a09_e667,
         0xbb67_ae85,
@@ -189,40 +187,23 @@ const MAX_POINTER_BYTES: usize = 256;
 const MAX_RISK_CLASS_BYTES: usize = 7;
 const MAX_TOOLSET_BYTES: usize = 7;
 
-const BUILTIN_TOOL_ORDER: [&str; 6] = [
-    "read_file",
-    "search_files",
-    "write_file",
-    "patch",
-    "terminal",
-    "process",
-];
-
-/// An inert native slot paired with one public tool descriptor.
+/// Admitted public descriptor after structural bounds checks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolRegistryEntry {
     pub descriptor: ToolDescriptor,
-    pub executor: NativeToolExecutor,
 }
 
 impl ToolRegistryEntry {
-    pub fn new(descriptor: ToolDescriptor, executor: NativeToolExecutor) -> Self {
-        Self {
-            descriptor,
-            executor,
-        }
+    pub fn new(descriptor: ToolDescriptor) -> Self {
+        Self { descriptor }
     }
 
     pub fn descriptor(&self) -> &ToolDescriptor {
         &self.descriptor
     }
-
-    pub fn executor(&self) -> &NativeToolExecutor {
-        &self.executor
-    }
 }
 
-/// Typed construction failures for a native tool registry.
+/// Typed construction failures for an admitted descriptor registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolRegistryError {
     TooManyEntries {
@@ -253,20 +234,6 @@ pub enum ToolRegistryError {
     UnsupportedToolset {
         name: String,
         toolset: String,
-    },
-    ExecutorNameMismatch {
-        name: String,
-        executor_name: String,
-    },
-    ExecutorToolsetMismatch {
-        name: String,
-        expected: String,
-        actual: String,
-    },
-    ExecutorRiskClassMismatch {
-        name: String,
-        expected: String,
-        actual: String,
     },
     DuplicateName {
         name: String,
@@ -332,29 +299,6 @@ impl std::fmt::Display for ToolRegistryError {
                     "tool {name:?} uses unsupported toolset {toolset:?}"
                 )
             }
-            Self::ExecutorNameMismatch {
-                name,
-                executor_name,
-            } => write!(
-                formatter,
-                "tool {name:?} is paired with executor slot {executor_name:?}"
-            ),
-            Self::ExecutorToolsetMismatch {
-                name,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "tool {name:?} has toolset {actual:?}; executor requires {expected:?}"
-            ),
-            Self::ExecutorRiskClassMismatch {
-                name,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "tool {name:?} has risk class {actual:?}; executor requires {expected:?}"
-            ),
             Self::DuplicateName { name } => write!(formatter, "duplicate tool name {name:?}"),
             Self::SchemaTooLarge { name, limit, .. } => {
                 write!(
@@ -1083,7 +1027,7 @@ impl ToolRegistrySnapshot {
     }
 }
 
-/// Validated native tool registry.
+/// Admitted descriptor registry after generic structural bounds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolRegistry {
     snapshot: ToolRegistrySnapshot,
@@ -1123,9 +1067,6 @@ impl ToolRegistry {
             })?;
         }
 
-        collected.sort_by(|left, right| {
-            compare_tool_names(&left.descriptor.name, &right.descriptor.name)
-        });
         let descriptors: Vec<_> = collected
             .iter()
             .map(|entry| entry.descriptor.clone())
@@ -1165,13 +1106,12 @@ impl ToolRegistry {
         Self::new(entries)
     }
 
-    /// Builds the initial coding/process registry from inert native slots.
-    pub fn builtin() -> Result<Self, ToolRegistryError> {
-        Self::new(builtin_entries())
-    }
-
-    pub fn default_registry() -> Result<Self, ToolRegistryError> {
-        Self::builtin()
+    /// Admit descriptors exported by RSS after generic structural bounds.
+    pub fn from_descriptors<I>(descriptors: I) -> Result<Self, ToolRegistryError>
+    where
+        I: IntoIterator<Item = ToolDescriptor>,
+    {
+        Self::new(descriptors.into_iter().map(ToolRegistryEntry::new))
     }
 
     pub fn snapshot(&self) -> ToolRegistrySnapshot {
@@ -1189,159 +1129,6 @@ impl ToolRegistry {
     pub fn identity(&self) -> &str {
         self.snapshot.identity()
     }
-}
-
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        Self::builtin().expect("built-in tool registry must be valid")
-    }
-}
-
-pub fn builtin_tool_registry() -> Result<ToolRegistry, ToolRegistryError> {
-    ToolRegistry::builtin()
-}
-
-pub fn default_tool_registry() -> Result<ToolRegistry, ToolRegistryError> {
-    ToolRegistry::builtin()
-}
-
-/// Schema for `timeout_ms` using the compile-time millisecond ceiling when it
-/// fits in `u64`. Runtime still enforces `ProcessToolConfig.max_timeout`.
-fn timeout_ms_schema() -> Value {
-    match u64::try_from(MAX_PROCESS_TOOL_TIMEOUT.as_millis()) {
-        Ok(maximum) => json!({"type": "integer", "minimum": 1, "maximum": maximum}),
-        Err(_) => json!({"type": "integer", "minimum": 1}),
-    }
-}
-
-/// Returns the six initial inert registrations in their canonical declaration
-/// order. The registry constructor freezes that order for the initial names.
-pub fn builtin_entries() -> Vec<ToolRegistryEntry> {
-    vec![
-        ToolRegistryEntry::new(
-            ToolDescriptor::new(
-                "read_file",
-                "Read bounded text from a workspace file",
-                Toolset::CODING,
-                "read",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "offset": {"type": "integer", "minimum": 1},
-                        "limit": {"type": "integer", "minimum": 1}
-                    },
-                    "required": ["path"],
-                    "additionalProperties": false
-                }),
-            ),
-            NativeToolExecutor::ReadFile,
-        ),
-        ToolRegistryEntry::new(
-            ToolDescriptor::new(
-                "search_files",
-                "Search workspace files with bounded results",
-                Toolset::CODING,
-                "read",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "pattern": {"type": "string"},
-                        "path": {"type": "string"},
-                        "target": {"type": "string", "enum": ["content", "files"]},
-                        "file_glob": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1},
-                        "offset": {"type": "integer", "minimum": 0}
-                    },
-                    "required": ["pattern"],
-                    "additionalProperties": false
-                }),
-            ),
-            NativeToolExecutor::SearchFiles,
-        ),
-        ToolRegistryEntry::new(
-            ToolDescriptor::new(
-                "write_file",
-                "Write complete workspace file contents",
-                Toolset::CODING,
-                "write",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": false
-                }),
-            ),
-            NativeToolExecutor::WriteFile,
-        ),
-        ToolRegistryEntry::new(
-            ToolDescriptor::new(
-                "patch",
-                "Apply a bounded workspace text patch",
-                Toolset::CODING,
-                "write",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"},
-                        "replace_all": {"type": "boolean"}
-                    },
-                    "required": ["path", "old_string", "new_string"],
-                    "additionalProperties": false
-                }),
-            ),
-            NativeToolExecutor::Patch,
-        ),
-        ToolRegistryEntry::new(
-            ToolDescriptor::new(
-                "terminal",
-                "Run one bounded argv process",
-                Toolset::PROCESS,
-                "execute",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                        "cwd": {"type": "string"},
-                        "timeout_ms": {"type": "integer", "minimum": 1},
-                        "max_output_bytes": {"type": "integer", "minimum": 1},
-                        "stdin": {"type": "string"},
-                        "background": {"type": "boolean"}
-                    },
-                    "required": ["argv"],
-                    "additionalProperties": false
-                }),
-            ),
-            NativeToolExecutor::Terminal,
-        ),
-        ToolRegistryEntry::new(
-            ToolDescriptor::new(
-                "process",
-                "Inspect one owned background process",
-                Toolset::PROCESS,
-                "execute",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["poll", "wait", "log", "write", "close", "kill"]},
-                        "process_id": {"type": "string"},
-                        "data": {"type": "string"},
-                        "timeout_ms": timeout_ms_schema(),
-                        "offset": {"type": "integer", "minimum": 0},
-                        "limit": {"type": "integer", "minimum": 1}
-                    },
-                    "required": ["action", "process_id"],
-                    "additionalProperties": false
-                }),
-            ),
-            NativeToolExecutor::Process,
-        ),
-    ]
 }
 
 fn preflight_descriptor(
@@ -1405,35 +1192,6 @@ fn preflight_descriptor(
         });
     }
 
-    let executor_name = entry.executor.tool_name();
-    if executor_name != descriptor.name {
-        return Err(ToolRegistryError::ExecutorNameMismatch {
-            name: descriptor.name.clone(),
-            executor_name: bounded_string(executor_name, MAX_ERROR_FIELD_BYTES),
-        });
-    }
-
-    let contract = entry.executor.contract();
-    debug_assert_eq!(contract.tool_name, descriptor.name);
-    if let Some(expected) = contract.toolset
-        && descriptor.toolset != expected
-    {
-        return Err(ToolRegistryError::ExecutorToolsetMismatch {
-            name: descriptor.name.clone(),
-            expected: expected.to_string(),
-            actual: descriptor.toolset.clone(),
-        });
-    }
-    if let Some(expected) = contract.risk_class
-        && descriptor.risk_class != expected
-    {
-        return Err(ToolRegistryError::ExecutorRiskClassMismatch {
-            name: descriptor.name.clone(),
-            expected: expected.to_string(),
-            actual: descriptor.risk_class.clone(),
-        });
-    }
-
     inspect_schema_limits(&descriptor.schema).map_err(|error| match error {
         SchemaPreflightError::SchemaTooLarge { actual } => ToolRegistryError::SchemaTooLarge {
             name: descriptor.name.clone(),
@@ -1483,35 +1241,13 @@ fn bounded_string(value: &str, limit: usize) -> String {
     value[..end].to_string()
 }
 
-fn compare_tool_names(left: &str, right: &str) -> std::cmp::Ordering {
-    let left_rank = BUILTIN_TOOL_ORDER.iter().position(|name| *name == left);
-    let right_rank = BUILTIN_TOOL_ORDER.iter().position(|name| *name == right);
-
-    match (left_rank, right_rank) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => left.cmp(right),
-    }
-}
-
 fn registry_identity(entries: &[ToolRegistryEntry]) -> String {
     let value = Value::Array(
         entries
             .iter()
             .map(|entry| {
-                let mut identity_entry = Map::new();
-                identity_entry.insert(
-                    "descriptor".to_string(),
-                    serde_json::to_value(&entry.descriptor)
-                        .expect("ToolDescriptor contains only serializable fields"),
-                );
-                identity_entry.insert(
-                    "executor_contract".to_string(),
-                    serde_json::to_value(entry.executor.contract())
-                        .expect("NativeExecutorContract must serialize"),
-                );
-                Value::Object(identity_entry)
+                serde_json::to_value(&entry.descriptor)
+                    .expect("ToolDescriptor contains only serializable fields")
             })
             .collect(),
     );

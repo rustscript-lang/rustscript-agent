@@ -10,6 +10,8 @@ pub mod types;
 mod confined_io;
 mod hash;
 
+pub(crate) use hash::sha256_hex;
+
 pub use artifacts::{ArtifactCapability, ArtifactLimits, ArtifactRef};
 pub use filesystem::{
     FilesystemCapability, FilesystemLimits, FsDirEntry, FsList, FsMetadata, FsRead, FsWrite,
@@ -22,7 +24,9 @@ pub use lifecycle::{
     CapabilityLifecycleBuilder, DurableToolLifecycle, ExecutionLease, LifecycleClock,
     NeverCancelled, SystemClock, TokenIssuer, UuidIssuer, positive_duration_ms,
 };
-pub use process::{ProcessCapability, ProcessLimits, ProcessSnapshot, ProcessSpawn};
+pub use process::{
+    ProcessCapability, ProcessLimits, ProcessLogCursor, ProcessSnapshot, ProcessSpawn,
+};
 pub use types::{
     CapabilityError, CapabilityOwner, CapabilityRisk, CommitOutcome, DurableStarted,
     LifecycleError, LifecycleLimits, PrepareMetadata, PrepareOutcome, TokenClaims,

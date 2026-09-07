@@ -56,33 +56,29 @@ use crate::config::{
     validate_request_hash, validate_visible_name,
 };
 use crate::domain::{
-    LlmContentBlock, MAX_DURABLE_TEXT_CHARS, RunContext, ToolCall, decode_message_blocks,
+    LlmContentBlock, MAX_DURABLE_TEXT_CHARS, RunContext, decode_message_blocks,
     decode_message_content, durable_message_id, durable_provider_event_id, durable_tool_event_id,
     encode_message_content, provider_pending_may_retry, timestamp, truncate_for_log,
     truncate_utf8_chars, vm_value_to_json,
 };
 use crate::events;
+use crate::events::{DurableEventCommitter, EventCommitError};
 use crate::gateway::store::{
     GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
     SessionRecord, SessionView,
 };
 use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
 use crate::prompt::{CodingPromptBudgets, DateSource, SystemDateSource, build_coding_prompt};
+use crate::registry::{ToolRegistry, ToolRegistrySnapshot};
 use crate::runtime::delivery::{
     ChannelEventSink, DeliveryContext, apply_event_locked, event_candidate, run_delivery_task,
 };
-use crate::runtime::rss_runner::{AgentConfig, AgentRunner};
-use crate::tools::artifacts::ArtifactStorePool;
-use crate::tools::{
-    ArtifactError, ArtifactOwner, ArtifactStore, DispatchContext, DispatchLimits,
-    DurableEventCommitter, EventCommitError, FileTools, NativeExecutionDeps, ProcessArtifactSink,
-    ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry,
-    ToolRegistrySnapshot, ToolResult,
-};
+use crate::runtime::rss_runner::{AgentConfig, AgentRunner, bundled_tool_registry};
+use crate::tool_result::ToolResult;
 use crate::{AgentHostBridges, AgentProviderHost, RunCancellation, RunError};
 
-/// Typed outcome of bounded native-host cleanup. Never claims success when
-/// dispatcher or process residue could not be confirmed stopped.
+/// Typed outcome of bounded capability-host cleanup. Never claims success when
+/// process residue could not be confirmed stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupOutcome {
     Clean,
@@ -91,16 +87,13 @@ pub enum CleanupOutcome {
 }
 
 struct CachedAgentRunner {
-    source_digest: u64,
+    source_digest: String,
     config: AgentConfig,
     runner: AgentRunner,
 }
 
-fn agent_source_digest(source: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut hasher);
-    hasher.finish()
+fn agent_source_digest(source: &str) -> String {
+    crate::capabilities::sha256_hex(source.as_bytes())
 }
 
 fn failed_payload_with_code(code: &str, error: String) -> JsonValue {
@@ -209,9 +202,9 @@ pub struct RunHandle {
     disconnect_policy: ClientDisconnectPolicy,
     /// Created at admission and cancelled by every stop/deadline/terminal path.
     tool_cancel: CancellationToken,
-    /// Run-scoped native dispatch state shared by every `dispatch_tools` call.
-    native_dispatch: Mutex<NativeDispatchPhase>,
-    native_dispatch_cv: Condvar,
+    /// Run-scoped capability host shared by RSS `tools::dispatch` and cleanup.
+    capability_host: Mutex<CapabilityHostPhase>,
+    capability_host_cv: Condvar,
     /// Frozen coding system prompt captured at admission.
     coding_system_prompt: Arc<str>,
     /// Exclusive worker occupancy. Concurrent `run_worker` tasks cannot both
@@ -219,14 +212,12 @@ pub struct RunHandle {
     occupancy: AtomicBool,
 }
 
-/// Shared native dispatch machinery for one admitted run.
-struct NativeDispatchState {
-    dispatcher: DispatchContext,
-    files: FileTools,
-    table: Arc<ProcessTable>,
+/// Run-scoped capability host shared by RSS dispatch and lifecycle cleanup.
+struct CapabilityHostState {
     cleaned: AtomicBool,
     shutdown_entered: Option<Arc<dyn Fn() + Send + Sync>>,
     cleanup_grace: Duration,
+    uncooperative: Option<Arc<AtomicBool>>,
     lifecycle: Arc<CapabilityLifecycle>,
     capability_owner: CapabilityOwner,
     filesystem: Arc<FilesystemCapability>,
@@ -234,30 +225,29 @@ struct NativeDispatchState {
     artifacts: Arc<ArtifactCapability>,
 }
 
-/// Two-phase native dispatch slot. The handle lock is never held across
-/// FileTools/ArtifactStore filesystem IO. `Closed` retains the process table so
-/// residue stays observable after FileTools are released.
-enum NativeDispatchPhase {
+/// Two-phase capability-host slot. The handle lock is never held across
+/// filesystem IO. `Closed` retains the process capability so residue stays
+/// observable after the live host is released.
+enum CapabilityHostPhase {
     Empty,
     Initializing,
-    Ready(Arc<NativeDispatchState>),
-    Closed(Option<ClosedDispatch>),
+    Ready(Arc<CapabilityHostState>),
+    Closed(Option<ClosedCapabilityHost>),
 }
 
 #[derive(Clone)]
-struct ClosedDispatch {
-    table: Arc<ProcessTable>,
-    owner: ProcessOwner,
+struct ClosedCapabilityHost {
+    processes: Arc<ProcessCapability>,
 }
 
 /// Restores a retriable `Empty` phase if initialization panics or returns
 /// `Err` before `Ready` is published. Drop never waits on IO or the condvar.
-struct NativeDispatchInitGuard {
+struct CapabilityHostInitGuard {
     handle: Arc<RunHandle>,
     armed: bool,
 }
 
-impl NativeDispatchInitGuard {
+impl CapabilityHostInitGuard {
     fn arm(handle: &Arc<RunHandle>) -> Self {
         Self {
             handle: Arc::clone(handle),
@@ -270,35 +260,31 @@ impl NativeDispatchInitGuard {
     }
 }
 
-impl Drop for NativeDispatchInitGuard {
+impl Drop for CapabilityHostInitGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         let mut phase = self
             .handle
-            .native_dispatch
+            .capability_host
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(*phase, NativeDispatchPhase::Initializing) {
-            *phase = NativeDispatchPhase::Empty;
+        if matches!(*phase, CapabilityHostPhase::Initializing) {
+            *phase = CapabilityHostPhase::Empty;
         }
-        self.handle.native_dispatch_cv.notify_all();
+        self.handle.capability_host_cv.notify_all();
     }
 }
 
-impl NativeDispatchState {
-    fn owner(&self) -> ProcessOwner {
-        ProcessOwner::from(self.dispatcher.owner().clone())
-    }
-
+impl CapabilityHostState {
     fn shutdown(&self) -> CleanupOutcome {
         self.shutdown_with_grace(self.cleanup_grace)
     }
 
     fn shutdown_with_grace(&self, grace: Duration) -> CleanupOutcome {
         if self.cleaned.swap(true, Ordering::SeqCst) {
-            return if self.table.owner_count(&self.owner()) == 0 {
+            return if self.processes.table_len() == 0 {
                 CleanupOutcome::Clean
             } else {
                 CleanupOutcome::Timeout
@@ -307,25 +293,46 @@ impl NativeDispatchState {
         if let Some(observer) = &self.shutdown_entered {
             observer();
         }
-        self.processes.cancel_all();
+        if let Some(release) = &self.uncooperative {
+            let started = Instant::now();
+            while !release.load(Ordering::SeqCst) && started.elapsed() < grace {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if !release.load(Ordering::SeqCst) {
+                return CleanupOutcome::Timeout;
+            }
+        }
+        self.processes.shutdown_all();
         let _ = self.lifecycle.recover_open_tokens();
-        self.dispatcher.close();
-        let quiesced = self.dispatcher.try_quiesce(grace);
-        let owner = self.owner();
-        let _ = self.table.cleanup_owner(&owner);
-        let _ = self
-            .files
-            .artifact_store_arc()
-            .cleanup_owner(&ArtifactOwner::from(self.dispatcher.owner().clone()));
-        if !quiesced || self.table.owner_count(&owner) > 0 {
+        if self.processes.table_len() > 0 {
             CleanupOutcome::Timeout
         } else {
             CleanupOutcome::Clean
         }
     }
+
+    fn host_bridges(
+        &self,
+        cancellation: RunCancellation,
+        metrics: Option<Arc<Metrics>>,
+    ) -> AgentHostBridges {
+        AgentHostBridges {
+            provider: None,
+            cancellation: Some(cancellation),
+            sleeps: Default::default(),
+            skip_sleep: false,
+            metrics,
+            lifecycle: Some(Arc::clone(&self.lifecycle)),
+            capability_owner: Some(self.capability_owner.clone()),
+            filesystem: Some(Arc::clone(&self.filesystem)),
+            processes: Some(Arc::clone(&self.processes)),
+            artifacts: Some(Arc::clone(&self.artifacts)),
+            control_hook: None,
+        }
+    }
 }
 
-impl Drop for NativeDispatchState {
+impl Drop for CapabilityHostState {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -350,7 +357,7 @@ impl RunHandle {
     }
 
     /// Sole cancellation root for this run. `stop` requests it; hosts and the
-    /// native dispatcher child tokens are linked to it.
+    /// capability host child tokens are linked to it.
     pub fn cancellation(&self) -> &RunCancellation {
         &self.cancel
     }
@@ -358,18 +365,18 @@ impl RunHandle {
     fn request_user_stop(&self) {
         *self.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
         self.cancel.request(CancellationReason::Requested);
-        self.cancel_native_tools();
+        self.cancel_run_tools();
     }
 
-    fn cancel_native_tools(&self) {
+    fn cancel_run_tools(&self) {
         self.tool_cancel.cancel();
         let (lifecycle, processes) = {
             let phase = self
-                .native_dispatch
+                .capability_host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &*phase {
-                NativeDispatchPhase::Ready(state) => (
+                CapabilityHostPhase::Ready(state) => (
                     Some(Arc::clone(&state.lifecycle)),
                     Some(Arc::clone(&state.processes)),
                 ),
@@ -384,33 +391,32 @@ impl RunHandle {
         }
     }
 
-    fn native_dispatch_closed(&self) -> bool {
+    fn capability_host_closed(&self) -> bool {
         matches!(
-            *self.native_dispatch.lock().expect("native dispatch lock"),
-            NativeDispatchPhase::Closed(_)
+            *self.capability_host.lock().expect("capability host lock"),
+            CapabilityHostPhase::Closed(_)
         )
     }
 
-    fn release_native_dispatch(&self) -> CleanupOutcome {
+    fn release_capability_host(&self) -> CleanupOutcome {
         self.tool_cancel.cancel();
         let state = {
-            let mut phase = self.native_dispatch.lock().expect("native dispatch lock");
-            match std::mem::replace(&mut *phase, NativeDispatchPhase::Closed(None)) {
-                NativeDispatchPhase::Ready(state) => {
-                    *phase = NativeDispatchPhase::Closed(Some(ClosedDispatch {
-                        table: Arc::clone(&state.table),
-                        owner: state.owner(),
+            let mut phase = self.capability_host.lock().expect("capability host lock");
+            match std::mem::replace(&mut *phase, CapabilityHostPhase::Closed(None)) {
+                CapabilityHostPhase::Ready(state) => {
+                    *phase = CapabilityHostPhase::Closed(Some(ClosedCapabilityHost {
+                        processes: Arc::clone(&state.processes),
                     }));
-                    self.native_dispatch_cv.notify_all();
+                    self.capability_host_cv.notify_all();
                     Some(state)
                 }
-                NativeDispatchPhase::Closed(existing) => {
-                    *phase = NativeDispatchPhase::Closed(existing);
-                    self.native_dispatch_cv.notify_all();
+                CapabilityHostPhase::Closed(existing) => {
+                    *phase = CapabilityHostPhase::Closed(existing);
+                    self.capability_host_cv.notify_all();
                     None
                 }
-                NativeDispatchPhase::Empty | NativeDispatchPhase::Initializing => {
-                    self.native_dispatch_cv.notify_all();
+                CapabilityHostPhase::Empty | CapabilityHostPhase::Initializing => {
+                    self.capability_host_cv.notify_all();
                     None
                 }
             }
@@ -421,10 +427,10 @@ impl RunHandle {
         }
     }
 
-    fn native_dispatch_retained(&self) -> bool {
+    fn capability_host_retained(&self) -> bool {
         matches!(
-            *self.native_dispatch.lock().expect("native dispatch lock"),
-            NativeDispatchPhase::Ready(_)
+            *self.capability_host.lock().expect("capability host lock"),
+            CapabilityHostPhase::Ready(_)
         )
     }
 }
@@ -475,7 +481,7 @@ impl Drop for SubscriberGuard {
             .lock()
             .expect("cancel reason lock") = Some("client_disconnect");
         self.handle.cancel.request(CancellationReason::Requested);
-        self.handle.cancel_native_tools();
+        self.handle.cancel_run_tools();
     }
 }
 
@@ -488,18 +494,6 @@ fn handle_cancel_reason(handle: &RunHandle, fallback: &'static str) -> &'static 
         .lock()
         .expect("cancel reason lock")
         .unwrap_or(fallback)
-}
-
-fn cancelled_dispatch_results(calls: &[ToolCall], terminal: bool) -> Vec<ToolResult> {
-    let message = if terminal {
-        "run already committed a terminal state"
-    } else {
-        "native dispatch is closed"
-    };
-    calls
-        .iter()
-        .map(|_| ToolResult::failure("cancelled", message))
-        .collect()
 }
 
 /// Admission request built by the transport from the normalized request.
@@ -636,6 +630,7 @@ struct AgentServiceInner {
     store: Arc<RwLock<GatewayStore>>,
     persistence: Option<Arc<GatewayPersistence>>,
     agent_source: Option<Arc<String>>,
+    agent_entry: Mutex<Option<PathBuf>>,
     http_config: HttpConfig,
     tool_registry: RwLock<ToolRegistry>,
     provider_profiles: RwLock<HashMap<String, ProviderProfile>>,
@@ -650,17 +645,16 @@ struct AgentServiceInner {
     store_generation: AtomicU64,
     metrics: Arc<Metrics>,
     file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    native_dispatch_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    native_dispatch_init_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    capability_host_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    capability_host_init_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     prompt_read_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    artifact_stores: ArtifactStorePool,
     date_source: RwLock<Arc<dyn DateSource>>,
     /// Optional one-shot injected provider host for tests. Consumed atomically
     /// by the next `run_worker`; production uses RssAdapterProvider.
     provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
     runner: Mutex<Option<CachedAgentRunner>>,
-    /// When set, the next native dispatcher holds its serial mutex until released.
+    /// When set, the next capability host holds its serial mutex until released.
     uncooperative_dispatch: Mutex<Option<Arc<AtomicBool>>>,
     /// Serializes durable event/message commits so seq/ordinal reservation
     /// cannot interleave. Never held across GET; the GatewayStore lock is
@@ -682,7 +676,7 @@ impl Drop for AgentServiceInner {
             .map(|(_, handle)| handle)
             .collect();
         for handle in handles {
-            handle.release_native_dispatch();
+            handle.release_capability_host();
         }
     }
 }
@@ -699,7 +693,7 @@ impl AgentService {
         let capacity = Arc::new(Semaphore::new(config.max_concurrent_runs));
         let context_cache_capacity = config.max_concurrent_runs.saturating_mul(4).max(16);
         normalize_loaded_session_messages(&store);
-        let default_registry = ToolRegistry::builtin().expect("built-in tool registry validates");
+        let default_registry = bundled_tool_registry().expect("RSS tool registry validates");
         let default_provider = config
             .provider
             .clone()
@@ -713,6 +707,7 @@ impl AgentService {
             store,
             persistence,
             agent_source,
+            agent_entry: Mutex::new(None),
             http_config,
             tool_registry: RwLock::new(default_registry),
             provider_profiles: RwLock::new(provider_profiles),
@@ -727,10 +722,9 @@ impl AgentService {
             store_generation: AtomicU64::new(0),
             metrics,
             file_search_entered: Mutex::new(None),
-            native_dispatch_shutdown: Mutex::new(None),
-            native_dispatch_init_entered: Mutex::new(None),
+            capability_host_shutdown: Mutex::new(None),
+            capability_host_init_entered: Mutex::new(None),
             prompt_read_entered: Mutex::new(None),
-            artifact_stores: ArtifactStorePool::default(),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
             runner: Mutex::new(None),
@@ -771,7 +765,7 @@ impl AgentService {
             .insert(profile.name.clone(), profile);
     }
 
-    /// Holds the next native dispatcher's serial mutex until
+    /// Holds the next capability host's serial mutex until
     /// [`Self::release_uncooperative_dispatch`].
     pub fn inject_uncooperative_dispatch(&self) {
         *self
@@ -806,12 +800,15 @@ impl AgentService {
 
     /// Compiles or reuses the cached runner using current source + effective config.
     pub fn materialize_cached_runner(&self) -> Result<AgentConfig, String> {
-        let source = self
-            .inner
-            .agent_source
-            .as_ref()
-            .ok_or_else(|| "agent source is missing".to_string())?;
-        Ok(self.cached_agent_runner(source)?.config().clone())
+        Ok(self
+            .cached_agent_runner(
+                self.inner
+                    .agent_source
+                    .as_ref()
+                    .map(|source| source.as_str()),
+            )?
+            .config()
+            .clone())
     }
 
     /// Test failpoint: panic after a successful provider-step commit, before
@@ -1013,7 +1010,7 @@ impl AgentService {
     }
 
     /// Run-scoped capability engine used by `agent_runtime::tool_prepare`
-    /// and `agent_runtime::tool_commit`. Initializes native dispatch if needed.
+    /// and `agent_runtime::tool_commit`. Initializes capability host if needed.
     pub fn capability_lifecycle(
         &self,
         run_id: &str,
@@ -1023,65 +1020,35 @@ impl AgentService {
             .ok_or_else(|| RunContextError::Missing {
                 run_id: run_id.to_string(),
             })?;
-        match self.native_dispatch_state(run_id, &handle)? {
+        match self.capability_host_state(run_id, &handle)? {
             Some(state) => Ok((Arc::clone(&state.lifecycle), state.capability_owner.clone())),
             None => Err(RunContextError::InvalidMetadata {
                 run_id: run_id.to_string(),
-                reason: "native dispatch is closed".to_string(),
+                reason: "capability host is closed".to_string(),
             }),
         }
     }
 
-    /// Serial, validated native dispatch against the admitted registry snapshot.
-    ///
-    /// The live registry is not consulted. Durable event append uses the same
-    /// store/persist/publish path as script delivery.
-    pub fn dispatch_tools(
+    /// Capability host bridges for a live run. Production workers attach these
+    /// to `rss/agent/main.rss`; tests may attach them to an AgentRunner harness.
+    pub fn capability_host_bridges(
         &self,
         run_id: &str,
-        calls: &[ToolCall],
-    ) -> Result<Vec<ToolResult>, RunContextError> {
+    ) -> Result<Option<AgentHostBridges>, RunContextError> {
         let handle = self
             .handle(run_id)
             .ok_or_else(|| RunContextError::Missing {
                 run_id: run_id.to_string(),
             })?;
-        if handle.is_terminal() || handle.native_dispatch_closed() {
-            return Ok(cancelled_dispatch_results(calls, handle.is_terminal()));
+        if handle.is_terminal() || handle.capability_host_closed() {
+            return Ok(None);
         }
-        match self.native_dispatch_state(run_id, &handle)? {
-            Some(state) => {
-                let mut results = Vec::with_capacity(calls.len());
-                let mut pending = Vec::new();
-                let mut pending_idx = Vec::new();
-                for (index, call) in calls.iter().enumerate() {
-                    match self.replay_durable_tool_result(run_id, &call.id, &call.name) {
-                        Ok(Some(replayed)) => results.push(Some(replayed)),
-                        Ok(None) => {
-                            results.push(None);
-                            pending.push(call.clone());
-                            pending_idx.push(index);
-                        }
-                        Err(error) => results.push(Some(replay_commit_failure(error))),
-                    }
-                }
-                if !pending.is_empty() {
-                    let dispatched = state.dispatcher.dispatch(&pending);
-                    for (slot, result) in pending_idx.into_iter().zip(dispatched) {
-                        if !result.replayed {
-                            self.inner
-                                .metrics
-                                .account_tool_attempt(!result.ok, result.truncated);
-                        }
-                        results[slot] = Some(result);
-                    }
-                }
-                Ok(results
-                    .into_iter()
-                    .map(|result| result.expect("dispatch slot filled"))
-                    .collect())
-            }
-            None => Ok(cancelled_dispatch_results(calls, handle.is_terminal())),
+        match self.capability_host_state(run_id, &handle)? {
+            Some(state) => Ok(Some(state.host_bridges(
+                handle.cancel.clone(),
+                Some(Arc::clone(&self.inner.metrics)),
+            ))),
+            None => Ok(None),
         }
     }
 
@@ -1661,53 +1628,53 @@ impl AgentService {
         )
     }
 
-    fn native_dispatch_state(
+    fn capability_host_state(
         &self,
         run_id: &str,
         handle: &Arc<RunHandle>,
-    ) -> Result<Option<Arc<NativeDispatchState>>, RunContextError> {
+    ) -> Result<Option<Arc<CapabilityHostState>>, RunContextError> {
         loop {
-            let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
-            if matches!(*phase, NativeDispatchPhase::Closed(_)) {
+            let mut phase = handle.capability_host.lock().expect("capability host lock");
+            if matches!(*phase, CapabilityHostPhase::Closed(_)) {
                 return Ok(None);
             }
-            if let NativeDispatchPhase::Ready(state) = &*phase {
+            if let CapabilityHostPhase::Ready(state) = &*phase {
                 return Ok(Some(Arc::clone(state)));
             }
-            if matches!(*phase, NativeDispatchPhase::Initializing) {
+            if matches!(*phase, CapabilityHostPhase::Initializing) {
                 drop(
                     handle
-                        .native_dispatch_cv
+                        .capability_host_cv
                         .wait(phase)
-                        .expect("native dispatch condvar"),
+                        .expect("capability host condvar"),
                 );
                 continue;
             }
-            *phase = NativeDispatchPhase::Initializing;
+            *phase = CapabilityHostPhase::Initializing;
             break;
         }
-        let mut guard = NativeDispatchInitGuard::arm(handle);
+        let mut guard = CapabilityHostInitGuard::arm(handle);
         let observer = self
             .inner
-            .native_dispatch_init_entered
+            .capability_host_init_entered
             .lock()
-            .expect("native dispatch init observer lock")
+            .expect("capability host init observer lock")
             .clone();
         if let Some(observer) = observer {
             observer();
         }
-        let built = self.build_native_dispatch_state(run_id, handle);
+        let built = self.build_capability_host_state(run_id, handle);
         match built {
             Ok(state) => {
                 let state = Arc::new(state);
-                let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
-                if matches!(*phase, NativeDispatchPhase::Initializing) {
-                    *phase = NativeDispatchPhase::Ready(Arc::clone(&state));
-                    handle.native_dispatch_cv.notify_all();
+                let mut phase = handle.capability_host.lock().expect("capability host lock");
+                if matches!(*phase, CapabilityHostPhase::Initializing) {
+                    *phase = CapabilityHostPhase::Ready(Arc::clone(&state));
+                    handle.capability_host_cv.notify_all();
                     guard.disarm();
                     Ok(Some(state))
                 } else {
-                    handle.native_dispatch_cv.notify_all();
+                    handle.capability_host_cv.notify_all();
                     guard.disarm();
                     drop(phase);
                     drop(state);
@@ -1718,11 +1685,11 @@ impl AgentService {
         }
     }
 
-    fn build_native_dispatch_state(
+    fn build_capability_host_state(
         &self,
         run_id: &str,
         handle: &Arc<RunHandle>,
-    ) -> Result<NativeDispatchState, RunContextError> {
+    ) -> Result<CapabilityHostState, RunContextError> {
         let context = self
             .run_context(run_id)
             .ok_or_else(|| RunContextError::Missing {
@@ -1743,18 +1710,6 @@ impl AgentService {
                 actual: registry.identity().to_string(),
             });
         }
-        let toolset_hash = context
-            .metadata
-            .get("toolset_hash")
-            .and_then(JsonValue::as_str)
-            .unwrap_or(expected)
-            .to_string();
-        let owner = ToolOwner::new(
-            ADMISSION_SESSION_PROFILE,
-            &context.session_id,
-            &context.run_id,
-        )
-        .map_err(|error| invalid_context_metadata(run_id, &error))?;
         let workspace = context
             .limits
             .get("workspace_root")
@@ -1794,43 +1749,8 @@ impl AgentService {
             total_limit: process_config.max_stream_bytes,
             stdin_limit: process_config.max_stdin_bytes,
             log_limit: process_config.max_output_bytes.max(1),
+            close_after_initial: false,
         };
-        let artifacts = self
-            .inner
-            .artifact_stores
-            .get_or_open(file_config.artifact_store.clone())
-            .map_err(|error| artifact_init_error(run_id, &error))?;
-        let mut files = FileTools::with_artifact_store(file_config, artifacts)
-            .map_err(|error| invalid_context_metadata(run_id, &error))?
-            .with_owner(ArtifactOwner::from(owner.clone()));
-        if let Some(observer) = self
-            .inner
-            .file_search_entered
-            .lock()
-            .expect("file search observer lock")
-            .clone()
-        {
-            files = files.with_search_entered_observer(observer);
-        }
-        let table = Arc::new(
-            ProcessTable::new(process_config.clone())
-                .map_err(|error| invalid_context_metadata(run_id, &error))?,
-        );
-        let sink: Arc<dyn ProcessArtifactSink> = files.artifact_store_arc();
-        let terminal = TerminalExecutor::new(
-            process_config.clone(),
-            Arc::clone(&table),
-            ProcessOwner::from(owner.clone()),
-        )
-        .map_err(|error| invalid_context_metadata(run_id, &error))?
-        .with_artifact_sink(Arc::clone(&sink));
-        let process = ProcessExecutor::new(
-            process_config,
-            Arc::clone(&table),
-            ProcessOwner::from(owner.clone()),
-        )
-        .map_err(|error| invalid_context_metadata(run_id, &error))?
-        .with_artifact_sink(sink);
         let events: Arc<dyn DurableEventCommitter> = Arc::new(ServiceEventCommitter {
             store: Arc::clone(&self.inner.store),
             persistence: self.inner.persistence.clone(),
@@ -1896,59 +1816,21 @@ impl AgentService {
             ArtifactCapability::new(lifecycle.clone(), capability_owner.clone(), artifact_limits)
                 .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
         );
-        let dispatcher = DispatchContext::new(
-            owner,
-            workspace.clone(),
-            handle.cancel.token(),
-            handle.cancel.deadline_instant().unwrap_or_else(|| {
-                Instant::now()
-                    .checked_add(self.inner.config.run_timeout)
-                    .unwrap_or_else(Instant::now)
-            }),
-            registry,
-            expected.to_string(),
-            toolset_hash,
-            DispatchLimits {
-                max_tool_calls,
-                max_tool_output_bytes: output_cap,
-                max_event_bytes: self.inner.config.max_event_bytes,
-            },
-            Arc::clone(&events),
-            Arc::new(NativeExecutionDeps {
-                files: files.clone(),
-                terminal,
-                process,
-            }),
-        )
-        .map_err(|error| invalid_context_metadata(run_id, &error))?;
-        if let Some(release) = self
-            .inner
-            .uncooperative_dispatch
-            .lock()
-            .expect("uncooperative dispatch lock")
-            .clone()
-        {
-            let holder = dispatcher.clone();
-            thread::spawn(move || {
-                let _guard = holder.lock_serial();
-                while !release.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(10));
-                }
-            });
-            thread::sleep(Duration::from_millis(5));
-        }
-        Ok(NativeDispatchState {
-            dispatcher,
-            files,
-            table,
+        Ok(CapabilityHostState {
             cleaned: AtomicBool::new(false),
             shutdown_entered: self
                 .inner
-                .native_dispatch_shutdown
+                .capability_host_shutdown
                 .lock()
-                .expect("native dispatch shutdown observer lock")
+                .expect("capability host shutdown observer lock")
                 .clone(),
             cleanup_grace: self.inner.config.cancellation_grace,
+            uncooperative: self
+                .inner
+                .uncooperative_dispatch
+                .lock()
+                .expect("uncooperative dispatch lock")
+                .clone(),
             lifecycle: Arc::new(lifecycle),
             capability_owner,
             filesystem,
@@ -1957,16 +1839,16 @@ impl AgentService {
         })
     }
 
-    /// True when run-scoped native dispatch state is still retained.
-    pub fn native_dispatch_retained(&self, run_id: &str) -> bool {
+    /// True when run-scoped capability host state is still retained.
+    pub fn capability_host_retained(&self, run_id: &str) -> bool {
         self.handle(run_id)
-            .is_some_and(|handle| handle.native_dispatch_retained())
+            .is_some_and(|handle| handle.capability_host_retained())
     }
 
-    /// True when native dispatch for `run_id` is sticky-closed.
-    pub fn native_dispatch_closed(&self, run_id: &str) -> bool {
+    /// True when capability host for `run_id` is sticky-closed.
+    pub fn capability_host_closed(&self, run_id: &str) -> bool {
         self.handle(run_id)
-            .is_some_and(|handle| handle.native_dispatch_closed())
+            .is_some_and(|handle| handle.capability_host_closed())
     }
 
     /// Live process-owner residue for `run_id`, or 0 after cleanup/close.
@@ -1974,18 +1856,15 @@ impl AgentService {
         let Some(handle) = self.handle(run_id) else {
             return 0;
         };
-        let Ok(phase) = handle.native_dispatch.lock() else {
+        let Ok(phase) = handle.capability_host.lock() else {
             return 0;
         };
         match &*phase {
-            NativeDispatchPhase::Ready(state) => {
-                let owner = ProcessOwner::from(state.dispatcher.owner().clone());
-                state.table.owner_count(&owner)
-            }
-            NativeDispatchPhase::Closed(Some(closed)) => closed.table.owner_count(&closed.owner),
-            NativeDispatchPhase::Empty
-            | NativeDispatchPhase::Initializing
-            | NativeDispatchPhase::Closed(None) => 0,
+            CapabilityHostPhase::Ready(state) => state.processes.table_len(),
+            CapabilityHostPhase::Closed(Some(closed)) => closed.processes.table_len(),
+            CapabilityHostPhase::Empty
+            | CapabilityHostPhase::Initializing
+            | CapabilityHostPhase::Closed(None) => 0,
         }
     }
 
@@ -1994,23 +1873,20 @@ impl AgentService {
         let Some(handle) = self.handle(run_id) else {
             return Vec::new();
         };
-        let Ok(phase) = handle.native_dispatch.lock() else {
+        let Ok(phase) = handle.capability_host.lock() else {
             return Vec::new();
         };
         match &*phase {
-            NativeDispatchPhase::Ready(state) => {
-                let owner = ProcessOwner::from(state.dispatcher.owner().clone());
-                state.table.owner_pids(&owner)
-            }
-            NativeDispatchPhase::Closed(Some(closed)) => closed.table.owner_pids(&closed.owner),
-            NativeDispatchPhase::Empty
-            | NativeDispatchPhase::Initializing
-            | NativeDispatchPhase::Closed(None) => Vec::new(),
+            CapabilityHostPhase::Ready(state) => state.processes.live_pids(),
+            CapabilityHostPhase::Closed(Some(closed)) => closed.processes.live_pids(),
+            CapabilityHostPhase::Empty
+            | CapabilityHostPhase::Initializing
+            | CapabilityHostPhase::Closed(None) => Vec::new(),
         }
     }
 
     fn cleanup_run_hosts(&self, handle: &RunHandle) -> CleanupOutcome {
-        handle.release_native_dispatch()
+        handle.release_capability_host()
     }
 
     async fn commit_cleanup_or_continue(&self, run_id: &str, handle: &RunHandle) -> bool {
@@ -2021,7 +1897,7 @@ impl AgentService {
                     run_id,
                     failed_payload_with_code(
                         "cleanup_timeout",
-                        "native dispatcher or process cleanup exceeded grace".into(),
+                        "capability host or process cleanup exceeded grace".into(),
                     ),
                 )
                 .await;
@@ -2032,7 +1908,7 @@ impl AgentService {
                     run_id,
                     failed_payload_with_code(
                         "cleanup_failed",
-                        "native dispatcher or process cleanup failed".into(),
+                        "capability host or process cleanup failed".into(),
                     ),
                 )
                 .await;
@@ -2041,8 +1917,36 @@ impl AgentService {
         }
     }
 
-    fn cached_agent_runner(&self, source: &str) -> Result<AgentRunner, String> {
+    fn cached_agent_runner(&self, source: Option<&str>) -> Result<AgentRunner, String> {
         let expected = self.effective_agent_config();
+        if let Some(entry) = self
+            .inner
+            .agent_entry
+            .lock()
+            .expect("agent entry lock")
+            .clone()
+        {
+            let digest = crate::runtime::rss_runner::module_tree_digest(&entry)
+                .map_err(|error| error.to_string())?;
+            let mut cache = self.inner.runner.lock().expect("runner cache lock");
+            if let Some(cached) = cache.as_ref()
+                && cached.source_digest == digest
+                && cached.config == expected
+            {
+                return Ok(cached.runner.clone());
+            }
+            let runner = AgentRunner::from_file(&entry, expected.clone())
+                .map_err(|error| error.to_string())?;
+            let digest = crate::runtime::rss_runner::module_tree_digest(&entry)
+                .map_err(|error| error.to_string())?;
+            *cache = Some(CachedAgentRunner {
+                source_digest: digest,
+                config: expected,
+                runner: runner.clone(),
+            });
+            return Ok(runner);
+        }
+        let source = source.ok_or_else(|| "RSS agent source is not configured".to_string())?;
         let digest = agent_source_digest(source);
         let mut cache = self.inner.runner.lock().expect("runner cache lock");
         if let Some(cached) = cache.as_ref()
@@ -2070,18 +1974,38 @@ impl AgentService {
     }
 
     /// Install a precompiled runner so workers do not recompile the agent source.
+    /// Only a successful SHA-256 digest is stored; digest failure leaves the
+    /// cache empty so a later refresh cannot hit a stale runner.
     pub fn install_agent_runner(&self, runner: AgentRunner) {
-        let digest = self
+        let digest = if let Some(entry) = self
             .inner
-            .agent_source
-            .as_ref()
-            .map(|source| agent_source_digest(source))
-            .unwrap_or(0);
+            .agent_entry
+            .lock()
+            .expect("agent entry lock")
+            .clone()
+        {
+            match crate::runtime::rss_runner::module_tree_digest(&entry) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    *self.inner.runner.lock().expect("runner cache lock") = None;
+                    return;
+                }
+            }
+        } else if let Some(source) = self.inner.agent_source.as_ref() {
+            agent_source_digest(source)
+        } else {
+            *self.inner.runner.lock().expect("runner cache lock") = None;
+            return;
+        };
         *self.inner.runner.lock().expect("runner cache lock") = Some(CachedAgentRunner {
             source_digest: digest,
             config: runner.config().clone(),
             runner,
         });
+    }
+
+    pub fn install_agent_entry(&self, path: PathBuf) {
+        *self.inner.agent_entry.lock().expect("agent entry lock") = Some(path);
     }
 
     /// Drops the live handle so `run_worker` must restore cancellation from
@@ -2137,8 +2061,8 @@ impl AgentService {
             }),
             disconnect_policy: self.inner.config.client_disconnect_policy,
             started_at: Instant::now(),
-            native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
-            native_dispatch_cv: Condvar::new(),
+            capability_host: Mutex::new(CapabilityHostPhase::Empty),
+            capability_host_cv: Condvar::new(),
             coding_system_prompt: Arc::from(prompt),
             occupancy: AtomicBool::new(false),
         });
@@ -2153,32 +2077,32 @@ impl AgentService {
         Some(handle)
     }
 
-    /// Shared owner-scoped artifact store for an initialized run, if any.
-    pub fn native_artifact_store(&self, run_id: &str) -> Option<Arc<ArtifactStore>> {
+    /// Shared in-memory artifact capability for an initialized run, if any.
+    pub fn native_artifact_ids(&self, run_id: &str) -> Option<Vec<String>> {
         let handle = self.handle(run_id)?;
-        let phase = handle.native_dispatch.lock().ok()?;
+        let phase = handle.capability_host.lock().ok()?;
         match &*phase {
-            NativeDispatchPhase::Ready(state) => Some(state.files.artifact_store_arc()),
-            NativeDispatchPhase::Empty
-            | NativeDispatchPhase::Initializing
-            | NativeDispatchPhase::Closed(_) => None,
+            CapabilityHostPhase::Ready(state) => Some(state.artifacts.stored_ids()),
+            CapabilityHostPhase::Empty
+            | CapabilityHostPhase::Initializing
+            | CapabilityHostPhase::Closed(_) => None,
         }
     }
 
-    /// Test seam: later native dispatch construction invokes `observer` after
+    /// Test seam: later capability host construction invokes `observer` after
     /// releasing the slot lock and before FileTools/ArtifactStore IO.
-    pub fn inject_native_dispatch_init_entered_observer(
+    pub fn inject_capability_host_init_entered_observer(
         &self,
         observer: Arc<dyn Fn() + Send + Sync>,
     ) {
         *self
             .inner
-            .native_dispatch_init_entered
+            .capability_host_init_entered
             .lock()
-            .expect("native dispatch init observer lock") = Some(observer);
+            .expect("capability host init observer lock") = Some(observer);
     }
 
-    /// Test seam: later native `search_files` walks invoke `observer` when they
+    /// Test seam: later `search_files` walks invoke `observer` when they
     /// begin, so service tests can prove stop overlaps an in-flight search.
     pub fn inject_file_search_entered_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
         *self
@@ -2188,15 +2112,15 @@ impl AgentService {
             .expect("file search observer lock") = Some(observer);
     }
 
-    /// Test seam: later native-dispatch shutdown invokes `observer` before
+    /// Test seam: later capability-host shutdown invokes `observer` before
     /// process/artifact teardown, so service tests can overlap handle/stop/admit
     /// with an in-flight close.
-    pub fn inject_native_dispatch_shutdown_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+    pub fn inject_capability_host_shutdown_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
         *self
             .inner
-            .native_dispatch_shutdown
+            .capability_host_shutdown
             .lock()
-            .expect("native dispatch shutdown observer lock") = Some(observer);
+            .expect("capability host shutdown observer lock") = Some(observer);
     }
 
     /// Test seam: later coding-prompt guidance reads invoke `observer` after
@@ -2210,9 +2134,9 @@ impl AgentService {
             .expect("prompt read observer lock") = Some(observer);
     }
 
-    /// Drops native dispatch state and cleans processes/artifacts for every
+    /// Drops capability host state and cleans processes/artifacts for every
     /// run belonging to `session_id`.
-    pub fn cleanup_session_native_dispatch(&self, session_id: &str) {
+    pub fn cleanup_session_capability_host(&self, session_id: &str) {
         let run_ids: Vec<String> = {
             let store = self.inner.store.read();
             let mut ids: Vec<String> = store
@@ -2243,12 +2167,12 @@ impl AgentService {
                 .collect()
         };
         for handle in handles {
-            handle.release_native_dispatch();
+            handle.release_capability_host();
         }
     }
 
-    /// Cancels and drops every retained native dispatch state.
-    pub fn shutdown_native_dispatch(&self) {
+    /// Cancels and drops every retained capability host state.
+    pub fn shutdown_capability_host(&self) {
         let handles: Vec<Arc<RunHandle>> = self
             .inner
             .runs
@@ -2258,7 +2182,7 @@ impl AgentService {
             .cloned()
             .collect();
         for handle in handles {
-            handle.release_native_dispatch();
+            handle.release_capability_host();
         }
     }
 
@@ -2794,8 +2718,8 @@ impl AgentService {
             }),
             disconnect_policy: self.inner.config.client_disconnect_policy,
             started_at: Instant::now(),
-            native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
-            native_dispatch_cv: Condvar::new(),
+            capability_host: Mutex::new(CapabilityHostPhase::Empty),
+            capability_host_cv: Condvar::new(),
             coding_system_prompt: Arc::from(coding_system_prompt),
             occupancy: AtomicBool::new(false),
         });
@@ -3035,7 +2959,7 @@ impl AgentService {
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
             handle.cancel.request(CancellationReason::Requested);
             drop(store);
-            handle.cancel_native_tools();
+            handle.cancel_run_tools();
             tracing::debug!(
                 run_id,
                 reason = "requested",
@@ -3068,7 +2992,7 @@ impl AgentService {
         for handle in handles {
             *handle.cancel_reason.lock().expect("cancel reason lock") = Some("resource_closed");
             handle.cancel.request(CancellationReason::ResourceClosed);
-            handle.cancel_native_tools();
+            handle.cancel_run_tools();
         }
     }
 
@@ -3115,7 +3039,7 @@ impl AgentService {
         *terminal_at = Some(now);
         drop(terminal_at);
         handle.permit.lock().expect("permit lock").take();
-        handle.release_native_dispatch();
+        handle.release_capability_host();
     }
 
     /// Records one run's terminal state for the bounded durable-first retry
@@ -3263,19 +3187,26 @@ impl AgentService {
             return;
         }
 
-        let output_text = if let Some(source) = self.inner.agent_source.clone() {
+        let output_text = if self.inner.agent_source.is_some()
+            || self
+                .inner
+                .agent_entry
+                .lock()
+                .expect("agent entry lock")
+                .is_some()
+        {
+            let source = self.inner.agent_source.clone();
             let context = self.build_run_context(&run_id);
-            let (dispatcher, lifecycle, capability_owner, filesystem, processes, artifacts) =
-                match self.native_dispatch_state(&run_id, &handle) {
+            let (lifecycle, capability_owner, filesystem, processes, artifacts) =
+                match self.capability_host_state(&run_id, &handle) {
                     Ok(Some(state)) => (
-                        Some(Arc::new(state.dispatcher.clone())),
                         Some(Arc::clone(&state.lifecycle)),
                         Some(state.capability_owner.clone()),
                         Some(Arc::clone(&state.filesystem)),
                         Some(Arc::clone(&state.processes)),
                         Some(Arc::clone(&state.artifacts)),
                     ),
-                    Ok(None) => (None, None, None, None, None, None),
+                    Ok(None) => (None, None, None, None, None),
                     Err(error) => {
                         if !self.commit_cleanup_or_continue(&run_id, &handle).await {
                             return;
@@ -3304,7 +3235,6 @@ impl AgentService {
             )) as Arc<dyn AgentProviderHost>);
             let host = AgentHostBridges {
                 provider,
-                dispatcher,
                 cancellation: Some(cancellation.clone()),
                 sleeps: Default::default(),
                 skip_sleep: false,
@@ -3335,7 +3265,8 @@ impl AgentService {
             ));
             let mut sink = ChannelEventSink(sender);
             let run_cancellation = cancellation.clone();
-            let runner = match self.cached_agent_runner(source.as_ref()) {
+            let runner = match self.cached_agent_runner(source.as_ref().map(|value| value.as_str()))
+            {
                 Ok(runner) => runner,
                 Err(error) => {
                     if !self.commit_cleanup_or_continue(&run_id, &handle).await {
@@ -4287,18 +4218,24 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
     }
 
     fn commit_started(&self, record: &DurableStarted) -> Result<(), LifecycleError> {
+        let data = json!({
+            "tool_call_id": record.call_id,
+            "name": record.tool_name,
+            "argument_digest": record.argument_digest,
+            "registry_identity": record.registry_identity,
+            "risk_class": record.risk_class.as_str(),
+            "generation": record.generation,
+        });
         self.events
-            .commit(
-                "tool.started",
-                json!({
-                    "tool_call_id": record.call_id,
-                    "name": record.tool_name,
-                    "argument_digest": record.argument_digest,
-                    "registry_identity": record.registry_identity,
-                    "risk_class": record.risk_class.as_str(),
-                    "generation": record.generation,
-                }),
-            )
+            .commit("tool.requested", data.clone())
+            .map_err(|error| match error {
+                EventCommitError::PersistFailed(message) => {
+                    LifecycleError::StartedCommitFailed(message)
+                }
+                other => map_event_commit_error(other),
+            })?;
+        self.events
+            .commit("tool.started", data)
             .map_err(|error| match error {
                 EventCommitError::PersistFailed(message) => {
                     LifecycleError::StartedCommitFailed(message)
@@ -4321,10 +4258,22 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
         let mut data = json!({
             "tool_call_id": call_id,
             "ok": tool_result.ok,
+            "truncated": tool_result.truncated,
         });
         if let Some(error) = &tool_result.error {
             data["error_code"] = json!(error.code);
         }
+        if !tool_result.artifacts.is_empty() {
+            data["artifacts"] = json!(tool_result.artifacts);
+        }
+        self.events
+            .commit_step("tool.output", data.clone(), Some(&tool_result))
+            .map_err(|error| match error {
+                EventCommitError::PersistFailed(message) => {
+                    LifecycleError::ResultCommitFailed(message)
+                }
+                other => map_event_commit_error(other),
+            })?;
         self.events
             .commit_step(event_type, data, Some(&tool_result))
             .map_err(|error| match error {
@@ -4629,34 +4578,21 @@ impl DurableEventCommitter for ServiceEventCommitter {
                 max_events_per_run: self.max_events_per_run,
             }
         };
-        let result = persist_and_apply(&self.store, self.persistence.as_deref(), reserved);
-        if result.is_ok()
+        let persist = persist_and_apply(&self.store, self.persistence.as_deref(), reserved);
+        if persist.is_ok()
             && matches!(event_type, "tool.completed" | "tool.failed")
             && let Some(inner) = self.service.upgrade()
-            && inner.crash_after_tool_commit.swap(false, Ordering::SeqCst)
         {
-            inner.provider_commit_crashed.store(true, Ordering::SeqCst);
-            panic!("tool_commit_crash");
+            let failed =
+                event_type == "tool.failed" || result.map(|tool| !tool.ok).unwrap_or(false);
+            let truncated = result.map(|tool| tool.truncated).unwrap_or(false);
+            inner.metrics.account_tool_attempt(failed, truncated);
+            if inner.crash_after_tool_commit.swap(false, Ordering::SeqCst) {
+                inner.provider_commit_crashed.store(true, Ordering::SeqCst);
+                panic!("tool_commit_crash");
+            }
         }
-        result
-    }
-}
-
-fn replay_commit_failure(error: EventCommitError) -> ToolResult {
-    match error {
-        EventCommitError::Corrupt(_) => ToolResult::failure(
-            "corrupt_tool_result",
-            "durable tool output is missing a canonical result payload",
-        ),
-        EventCommitError::MissingParent => ToolResult::failure(
-            "missing_tool_parent",
-            "tool result parent tool_call is missing",
-        ),
-        EventCommitError::Cancelled => ToolResult::failure("cancelled", "run was cancelled"),
-        EventCommitError::Terminal => ToolResult::failure("run_terminal", "run is terminal"),
-        EventCommitError::PersistFailed(_) => {
-            ToolResult::failure("persist_failed", "durable event persist failed")
-        }
+        persist
     }
 }
 
@@ -4918,10 +4854,6 @@ fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {
         run_id: run_id.to_string(),
         reason: reason.to_string(),
     }
-}
-
-fn artifact_init_error(run_id: &str, error: &ArtifactError) -> RunContextError {
-    invalid_context_metadata(run_id, &format!("{}: {}", error.code(), error.message()))
 }
 
 fn optional_string(value: Option<&JsonValue>) -> Option<String> {
@@ -5526,7 +5458,7 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
                 expired
             };
             for handle in expired_handles {
-                handle.release_native_dispatch();
+                handle.release_capability_host();
             }
             if !expired_run_ids.is_empty() {
                 inner

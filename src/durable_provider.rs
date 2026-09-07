@@ -19,11 +19,11 @@ use std::sync::{
 use serde_json::{Value as JsonValue, json};
 
 use crate::domain::{LlmContentBlock, MAX_DURABLE_TEXT_CHARS, Usage};
+use crate::events::EventCommitError;
 use crate::metrics::Metrics;
 use crate::runtime::agent_host::{provider_error_is_retryable, typed_fail};
 use crate::runtime::rss_runner::RunCancellation;
 use crate::service::{AgentService, ProviderCommitOutcome};
-use crate::tools::EventCommitError;
 use crate::{AgentProviderHost, ProviderPendingDecision};
 
 /// Counts actual inner provider calls. Turn metrics are recorded by
@@ -264,7 +264,7 @@ pub(crate) fn canonical_provider_request_fingerprint(request: &JsonValue) -> Str
         }
     }
     let bytes = serde_json::to_vec(&JsonValue::Object(safe)).unwrap_or_else(|_| b"{}".to_vec());
-    format!("sha256:{}", crate::tools::sha256_hex(&bytes))
+    format!("sha256:{}", crate::registry::sha256_hex(&bytes))
 }
 
 pub(crate) fn canonical_provider_step_from_envelope(
@@ -698,9 +698,9 @@ pub(crate) fn reconstruct_provider_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventCommitError;
     use crate::gateway::AgentGatewayState;
     use crate::runtime::agent_host::error_is_retryable_code;
-    use crate::tools::EventCommitError;
     use crate::{AdmitRunRequest, AgentGatewayConfig, AgentProviderHost, ScriptedProvider};
 
     fn request() -> JsonValue {
