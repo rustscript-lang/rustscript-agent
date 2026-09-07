@@ -10,7 +10,8 @@ use std::{
 
 use rustscript_vm::{
     ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind, ConfinedFsLimits, ConfinedFsRoot,
-    ConfinedMetadata, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES,
+    ConfinedMetadata, ConfinedPublicationState, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES,
+    MAX_READ_BYTES, MAX_WRITE_BYTES,
 };
 
 use super::{
@@ -76,7 +77,12 @@ pub struct FsList {
 pub struct FsWrite {
     pub hash: String,
     pub len: usize,
+    pub durable: bool,
+    pub staging_cleaned: bool,
 }
+
+type BeforeWriteHook = Arc<dyn Fn(&str, &[u8]) -> Result<(), CapabilityError> + Send + Sync>;
+type AfterPublishHook = Arc<dyn Fn(&str, &[u8]) -> bool + Send + Sync>;
 
 /// Confined filesystem capability bound to one lifecycle owner.
 #[derive(Clone)]
@@ -87,6 +93,8 @@ pub struct FilesystemCapability {
     root: Arc<ConfinedFsRoot>,
     frozen: Arc<FrozenDir>,
     cas_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    before_write: Arc<Mutex<Option<BeforeWriteHook>>>,
+    after_publish: Arc<Mutex<Option<AfterPublishHook>>>,
 }
 
 impl FilesystemCapability {
@@ -124,7 +132,32 @@ impl FilesystemCapability {
             root: Arc::new(root),
             frozen: Arc::new(frozen),
             cas_locks: Arc::new(Mutex::new(HashMap::new())),
+            before_write: Arc::new(Mutex::new(None)),
+            after_publish: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Installs a production-neutral pre-publish hook for tests.
+    ///
+    /// The hook runs after authorization and the write-size bound, immediately
+    /// before the per-path CAS lock and atomic publish. It is tool-name-agnostic.
+    pub fn inject_before_write(&self, hook: BeforeWriteHook) {
+        *self
+            .before_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Installs a production-neutral post-publish hook for tests.
+    ///
+    /// The hook runs after confined rename/publish returns a published
+    /// outcome. Returning true forces the same `publication_indeterminate`
+    /// capability error produced by `ConfinedPublicationState::Indeterminate`.
+    pub fn inject_after_publish(&self, hook: AfterPublishHook) {
+        *self
+            .after_publish
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     /// Stats a workspace-relative path without following a leaf symlink.
@@ -231,6 +264,8 @@ impl FilesystemCapability {
     /// Atomically writes a file when the expected content hash matches.
     ///
     /// An empty `expected_hash` requires the destination not to exist.
+    /// The tool-name-agnostic sentinel `"*"` skips compare-and-swap and
+    /// publishes create-or-replace under the same confinement policy.
     pub fn write_atomic(
         &self,
         token: &str,
@@ -245,14 +280,52 @@ impl FilesystemCapability {
                 "requested write exceeds the configured bound",
             ));
         }
+        if let Some(hook) = self
+            .before_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook(path, bytes)?;
+        }
         let lock = self.lock_for(path);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.validate_expected_hash(path, expected_hash)?;
-        self.root.write_file(path, bytes).map_err(map_fs_error)?;
-        Ok(FsWrite {
-            hash: content_hash(bytes),
-            len: bytes.len(),
-        })
+        if expected_hash != "*" {
+            self.validate_expected_hash(path, expected_hash)?;
+        }
+        match self.root.write_file(path, bytes) {
+            Ok(publication) => {
+                if self.after_publish_forces_indeterminate(path, bytes) {
+                    return Err(publication_indeterminate_error());
+                }
+                Ok(FsWrite {
+                    hash: content_hash(bytes),
+                    len: bytes.len(),
+                    durable: publication.is_durable(),
+                    staging_cleaned: publication.staging_cleaned(),
+                })
+            }
+            Err(error) => match error.publication_state() {
+                ConfinedPublicationState::Published {
+                    durable,
+                    staging_cleaned,
+                } => {
+                    if self.after_publish_forces_indeterminate(path, bytes) {
+                        return Err(publication_indeterminate_error());
+                    }
+                    Ok(FsWrite {
+                        hash: content_hash(bytes),
+                        len: bytes.len(),
+                        durable,
+                        staging_cleaned,
+                    })
+                }
+                ConfinedPublicationState::Indeterminate { .. } => {
+                    Err(publication_indeterminate_error())
+                }
+                ConfinedPublicationState::NotPublished => Err(map_fs_error(error)),
+            },
+        }
     }
 
     fn validate_expected_hash(
@@ -317,6 +390,21 @@ impl FilesystemCapability {
             .authorize(&self.owner, token, risk)
             .map_err(CapabilityError::from)
     }
+
+    fn after_publish_forces_indeterminate(&self, path: &str, bytes: &[u8]) -> bool {
+        self.after_publish
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|hook| hook(path, bytes))
+    }
+}
+
+fn publication_indeterminate_error() -> CapabilityError {
+    CapabilityError::new(
+        "publication_indeterminate",
+        "write publication could not be classified",
+    )
 }
 
 fn bounded_identity(offset: u64, window_len: usize, file_len: u64) -> String {
