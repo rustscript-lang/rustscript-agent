@@ -646,6 +646,69 @@ fn artifact_sink_is_optional_and_overflow_stays_bounded() {
 }
 
 #[test]
+fn overflow_artifact_contains_stdout_and_stderr_with_labels() {
+    let fixture = Fixture::new();
+    let mut config = fixture.config();
+    config.max_stream_bytes = 8_192;
+    config.max_output_bytes = 600;
+    let table = Arc::new(ProcessTable::new(config.clone()).expect("table"));
+    let sink = Arc::new(MemorySink::default());
+    let terminal = TerminalExecutor::new(config, Arc::clone(&table), owner())
+        .expect("terminal")
+        .with_artifact_sink(Arc::clone(&sink) as Arc<dyn ProcessArtifactSink>);
+    let stdout = format!("{}STDOUT_UNIQUE_aaa", "X".repeat(300));
+    let stderr = format!("{}STDERR_UNIQUE_bbb", "Y".repeat(300));
+    let script = format!("printf '%s' '{stdout}'; printf '%s' '{stderr}' >&2");
+    let result = terminal.run(TerminalRequest {
+        argv: vec!["/bin/sh".to_string(), "-c".to_string(), script],
+        ..TerminalRequest::default()
+    });
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.artifacts.len(), 1, "{result:?}");
+    assert_eq!(result.data["overflow_encoding"], "labeled-utf8");
+    assert!(result.data["overflow_stdout_bytes"].as_u64().unwrap() > 0);
+    assert!(result.data["overflow_stderr_bytes"].as_u64().unwrap() > 0);
+    let stored = sink.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    let payload = String::from_utf8_lossy(&stored[0].1);
+    assert!(payload.contains("stdout:"), "{payload}");
+    assert!(payload.contains("STDOUT_UNIQUE_aaa"), "{payload}");
+    assert!(payload.contains("stderr:"), "{payload}");
+    assert!(payload.contains("STDERR_UNIQUE_bbb"), "{payload}");
+    table.shutdown();
+}
+
+#[test]
+fn stderr_only_overflow_artifact_is_recoverable() {
+    let fixture = Fixture::new();
+    let mut config = fixture.config();
+    config.max_stream_bytes = 8_192;
+    config.max_output_bytes = 600;
+    let table = Arc::new(ProcessTable::new(config.clone()).expect("table"));
+    let sink = Arc::new(MemorySink::default());
+    let terminal = TerminalExecutor::new(config, Arc::clone(&table), owner())
+        .expect("terminal")
+        .with_artifact_sink(Arc::clone(&sink) as Arc<dyn ProcessArtifactSink>);
+    let stderr = format!("{}STDERR_ONLY_ccc", "Z".repeat(400));
+    let result = terminal.run(TerminalRequest {
+        argv: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("printf '%s' '{stderr}' >&2"),
+        ],
+        ..TerminalRequest::default()
+    });
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.artifacts.len(), 1, "{result:?}");
+    assert!(result.data["overflow_stderr_bytes"].as_u64().unwrap() > 0);
+    let stored = sink.stored.lock().unwrap();
+    let payload = String::from_utf8_lossy(&stored[0].1);
+    assert!(payload.contains("stderr:"), "{payload}");
+    assert!(payload.contains("STDERR_ONLY_ccc"), "{payload}");
+    table.shutdown();
+}
+
+#[test]
 fn log_limit_advances_next_offset_so_follow_up_returns_unread_bytes() {
     let fixture = Fixture::new();
     let (terminal, process, table) = fixture.pair();

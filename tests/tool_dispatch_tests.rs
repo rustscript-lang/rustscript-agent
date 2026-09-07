@@ -7,23 +7,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use rustscript_agent::config::{FileToolConfig, ProcessToolConfig, RunLimits};
+use rustscript_agent::config::{ArtifactStoreConfig, FileToolConfig, ProcessToolConfig, RunLimits};
+use rustscript_agent::service::RunContextError;
 use rustscript_agent::tools::{
-    ArtifactOwner, DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError,
-    FileTools, NativeExecutionDeps, NativeToolExecutor, ProcessArtifactSink, ProcessExecutor,
-    ProcessOwner, ProcessTable, TerminalExecutor, TerminalRequest, ToolExecutorBoundary, ToolOwner,
-    ToolRegistry, ToolRegistryEntry, ToolRegistrySnapshot, ToolResult,
+    ArtifactOwner, ArtifactStore, DispatchContext, DispatchLimits, DurableEventCommitter,
+    EventCommitError, FileTools, NativeExecutionDeps, NativeToolExecutor, ProcessArtifactSink,
+    ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, TerminalRequest,
+    ToolExecutorBoundary, ToolOwner, ToolRegistry, ToolRegistryEntry, ToolRegistrySnapshot,
+    ToolResult,
 };
 use rustscript_agent::{
-    AdmitRunRequest, AdmittedRun, AgentGatewayConfig, AgentGatewayState, AgentService, ToolCall,
-    ToolDescriptor, Toolset,
+    AdmitRunRequest, AdmittedRun, AgentGatewayConfig, AgentGatewayState, AgentService,
+    LlmContentBlock, ToolCall, ToolDescriptor, Toolset,
 };
 use rustscript_vm::CancellationToken;
 use serde_json::{Value, json};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-const TEMP_ROOT: &str =
-    "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t5-address-quality2-e8f12102";
+const TEMP_ROOT: &str = "/mnt/TEMP/workspace/rustscript-agent/tmp/coding-t7-address-spec-148adf54";
 const SECRET_NEEDLE: &str = "NEONSECRET_t5_9f3a2c";
 const PATH_NEEDLE: &str = "/tmp/t5-redact-path-zzq91";
 const STDIN_NEEDLE: &str = "STDIN_t5_kettledrum";
@@ -133,6 +134,15 @@ fn error_code(result: &ToolResult) -> &str {
         .as_str()
 }
 
+fn assert_replayed_canonical(result: &ToolResult, canonical: &ToolResult) {
+    assert_eq!(result.ok, canonical.ok);
+    assert_eq!(result.content, canonical.content);
+    assert_eq!(result.data, canonical.data);
+    assert_eq!(result.error, canonical.error);
+    assert_eq!(result.truncated, canonical.truncated);
+    assert_eq!(result.artifacts, canonical.artifacts);
+}
+
 fn pid_alive(pid: u32) -> bool {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => {
@@ -212,6 +222,31 @@ async fn admit_run(service: &Arc<AgentService>) -> AdmittedRun {
         })
         .await
         .expect("admit")
+}
+
+fn commit_tool_parents(service: &AgentService, run_id: &str, turn: u64, calls: &[ToolCall]) {
+    let blocks: Vec<LlmContentBlock> = calls
+        .iter()
+        .map(|call| LlmContentBlock {
+            block_type: "tool_call".to_string(),
+            tool_call_id: Some(call.id.clone()),
+            name: Some(call.name.clone()),
+            arguments_json: Some(call.arguments.to_string()),
+            ..LlmContentBlock::default()
+        })
+        .collect();
+    service
+        .commit_provider_step(
+            run_id,
+            turn,
+            &blocks,
+            None,
+            Some("tool_calls"),
+            None,
+            None,
+            None,
+        )
+        .expect("tool-call parent");
 }
 
 fn event_history(events: &MemoryEvents) -> String {
@@ -303,6 +338,44 @@ impl DurableEventCommitter for MemoryEvents {
         }
         self.events.lock().push((event_type.to_string(), data));
         Ok(())
+    }
+}
+
+struct ReplayEvents {
+    inner: Arc<MemoryEvents>,
+    replay: Mutex<Result<Option<ToolResult>, EventCommitError>>,
+}
+
+impl ReplayEvents {
+    fn new(replay: Result<Option<ToolResult>, EventCommitError>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryEvents::new(),
+            replay: Mutex::new(replay),
+        })
+    }
+}
+
+impl DurableEventCommitter for ReplayEvents {
+    fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.inner.stop_requested()
+    }
+
+    fn commit(&self, event_type: &str, data: Value) -> Result<(), EventCommitError> {
+        self.inner.commit(event_type, data)
+    }
+
+    fn replay_durable_tool_result(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
+        assert_eq!(tool_call_id, "c-replay");
+        assert_eq!(name, "read_file");
+        self.replay.lock().clone()
     }
 }
 
@@ -1042,6 +1115,83 @@ fn terminal_after_requested_prevents_started_and_effect() {
     assert_eq!(events.types(), ["tool.requested"]);
 }
 
+fn replay_dispatcher(
+    fixture: &Fixture,
+    events: Arc<ReplayEvents>,
+    executor: Arc<CountingExecutor>,
+) -> DispatchContext {
+    context_with(
+        tool_owner(),
+        fixture.root.clone(),
+        events,
+        executor,
+        default_limits(),
+    )
+}
+
+fn replay_call() -> ToolCall {
+    call("c-replay", "read_file", json!({"path": "a.txt"}))
+}
+
+#[test]
+fn completed_durable_replay_skips_native_effect_and_lifecycle() {
+    let fixture = Fixture::new();
+    let canonical = ToolResult::success("cached-output", json!({"from": "durable"}));
+    let events = ReplayEvents::new(Ok(Some(canonical.clone())));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_replayed_canonical(&result, &canonical);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
+}
+
+#[test]
+fn failed_durable_replay_skips_native_effect_and_lifecycle() {
+    let fixture = Fixture::new();
+    let canonical = ToolResult::failure("tool_failed", "cached failure");
+    let events = ReplayEvents::new(Ok(Some(canonical.clone())));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_replayed_canonical(&result, &canonical);
+    assert_eq!(error_code(&result), "tool_failed");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
+}
+
+#[test]
+fn interrupted_durable_replay_skips_native_effect_and_lifecycle() {
+    let fixture = Fixture::new();
+    let canonical = ToolResult::failure("interrupted_effect", "effect interrupted by restart");
+    let events = ReplayEvents::new(Ok(Some(canonical.clone())));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_replayed_canonical(&result, &canonical);
+    assert_eq!(error_code(&result), "interrupted_effect");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
+}
+
+#[test]
+fn corrupt_durable_replay_fails_closed_without_native_effect() {
+    let fixture = Fixture::new();
+    let events = ReplayEvents::new(Err(EventCommitError::Corrupt(
+        "durable tool output is missing a canonical result payload".to_string(),
+    )));
+    let executor = CountingExecutor::new();
+    let dispatcher = replay_dispatcher(&fixture, Arc::clone(&events), Arc::clone(&executor));
+
+    let result = dispatcher.dispatch_one(&replay_call());
+    assert_eq!(error_code(&result), "corrupt_tool_result");
+    assert_eq!(executor.count.load(Ordering::SeqCst), 0);
+    assert!(events.inner.types().is_empty());
+}
+
 #[test]
 fn max_tool_calls_enforced_atomically() {
     let fixture = Fixture::new();
@@ -1501,21 +1651,19 @@ async fn service_dispatch_uses_admitted_snapshot_not_live_registry() {
         .set_tool_registry(live)
         .expect("replace live registry");
 
+    let results_calls = [call("c1", "read_file", json!({"path": "admitted.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &results_calls);
     let results = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[call("c1", "read_file", json!({"path": "admitted.txt"}))],
-        )
+        .dispatch_tools(&admitted.run_id, &results_calls)
         .expect("service dispatch");
     assert_eq!(results.len(), 1);
     assert!(results[0].ok, "{:?}", results[0]);
     assert!(results[0].content.contains("from-admitted"));
 
+    let unknown_calls = [call("c2", "not_in_admitted_registry", json!({}))];
+    commit_tool_parents(&service, &admitted.run_id, 2, &unknown_calls);
     let unknown = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[call("c2", "not_in_admitted_registry", json!({}))],
-        )
+        .dispatch_tools(&admitted.run_id, &unknown_calls)
         .expect("unknown dispatch");
     assert_eq!(error_code(&unknown[0]), "unknown_tool");
 
@@ -1715,20 +1863,18 @@ async fn service_cumulative_budget_and_serial_dispatch_share_run_state() {
         .await
         .expect("admit");
 
+    let first_calls = [call("c1", "read_file", json!({"path": "a.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &first_calls);
     let first = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[call("c1", "read_file", json!({"path": "a.txt"}))],
-        )
+        .dispatch_tools(&admitted.run_id, &first_calls)
         .expect("first dispatch");
     assert!(first[0].ok, "{:?}", first[0]);
     assert!(service.native_dispatch_retained(&admitted.run_id));
 
+    let second_calls = [call("c2", "read_file", json!({"path": SECRET_NEEDLE}))];
+    commit_tool_parents(&service, &admitted.run_id, 2, &second_calls);
     let second = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[call("c2", "read_file", json!({"path": SECRET_NEEDLE}))],
-        )
+        .dispatch_tools(&admitted.run_id, &second_calls)
         .expect("second dispatch");
     assert_eq!(error_code(&second[0]), "max_tool_calls");
 
@@ -1777,18 +1923,12 @@ async fn service_concurrent_dispatch_is_serialized_for_one_run() {
     let right = service.clone();
     let left_id = run_id.clone();
     let right_id = run_id.clone();
-    let left_thread = thread::spawn(move || {
-        left.dispatch_tools(
-            &left_id,
-            &[call("c1", "read_file", json!({"path": "a.txt"}))],
-        )
-    });
-    let right_thread = thread::spawn(move || {
-        right.dispatch_tools(
-            &right_id,
-            &[call("c2", "read_file", json!({"path": "b.txt"}))],
-        )
-    });
+    let left_calls = [call("c1", "read_file", json!({"path": "a.txt"}))];
+    let right_calls = [call("c2", "read_file", json!({"path": "b.txt"}))];
+    commit_tool_parents(&service, &run_id, 1, &left_calls);
+    commit_tool_parents(&service, &run_id, 2, &right_calls);
+    let left_thread = thread::spawn(move || left.dispatch_tools(&left_id, &left_calls));
+    let right_thread = thread::spawn(move || right.dispatch_tools(&right_id, &right_calls));
     let left_result = left_thread
         .join()
         .expect("left join")
@@ -1836,30 +1976,28 @@ async fn service_background_process_survives_across_dispatch_calls() {
         })
         .await
         .expect("admit");
+    let spawn_calls = [call(
+        "c1",
+        "terminal",
+        json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000}),
+    )];
+    commit_tool_parents(&service, &admitted.run_id, 1, &spawn_calls);
     let spawned = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[call(
-                "c1",
-                "terminal",
-                json!({"argv": ["/bin/sleep", "30"], "background": true, "timeout_ms": 5000}),
-            )],
-        )
+        .dispatch_tools(&admitted.run_id, &spawn_calls)
         .expect("spawn");
     assert!(spawned[0].ok, "{:?}", spawned[0]);
     let process_id = spawned[0].data["process_id"]
         .as_str()
         .expect("process_id")
         .to_string();
+    let poll_calls = [call(
+        "c2",
+        "process",
+        json!({"action": "poll", "process_id": process_id}),
+    )];
+    commit_tool_parents(&service, &admitted.run_id, 2, &poll_calls);
     let polled = service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[call(
-                "c2",
-                "process",
-                json!({"action": "poll", "process_id": process_id}),
-            )],
-        )
+        .dispatch_tools(&admitted.run_id, &poll_calls)
         .expect("poll");
     assert!(polled[0].ok, "{:?}", polled[0]);
 }
@@ -1872,16 +2010,13 @@ async fn service_live_stop_cancels_blocking_terminal_and_file_search() {
     let run_id = admitted.run_id.clone();
     let worker = service.clone();
     let worker_id = run_id.clone();
-    let handle = thread::spawn(move || {
-        worker.dispatch_tools(
-            &worker_id,
-            &[call(
-                "c1",
-                "terminal",
-                json!({"argv": ["/bin/sleep", "30"], "timeout_ms": 30_000}),
-            )],
-        )
-    });
+    let worker_calls = [call(
+        "c1",
+        "terminal",
+        json!({"argv": ["/bin/sleep", "30"], "timeout_ms": 30_000}),
+    )];
+    commit_tool_parents(&service, &run_id, 1, &worker_calls);
+    let handle = thread::spawn(move || worker.dispatch_tools(&worker_id, &worker_calls));
     let started = Instant::now();
     loop {
         let events = service.run_events(&run_id);
@@ -1913,17 +2048,14 @@ async fn service_live_stop_cancels_blocking_terminal_and_file_search() {
     }));
     let searcher = search_service.clone();
     let search_id = admitted_search.run_id.clone();
+    let search_calls = [call(
+        "c2",
+        "search_files",
+        json!({"pattern": "needle", "path": "."}),
+    )];
+    commit_tool_parents(&search_service, &search_id, 1, &search_calls);
     let search_started = Instant::now();
-    let search = thread::spawn(move || {
-        searcher.dispatch_tools(
-            &search_id,
-            &[call(
-                "c2",
-                "search_files",
-                json!({"pattern": "needle", "path": "."}),
-            )],
-        )
-    });
+    let search = thread::spawn(move || searcher.dispatch_tools(&search_id, &search_calls));
     let entered_deadline = Instant::now();
     while !entered.load(Ordering::SeqCst) {
         if search.is_finished() {
@@ -1988,11 +2120,10 @@ async fn service_cleanup_drops_dispatch_state_on_terminal_session_and_shutdown()
         })
         .await
         .expect("admit");
+    let first_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &first_calls);
     service
-        .dispatch_tools(
-            &admitted.run_id,
-            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
-        )
+        .dispatch_tools(&admitted.run_id, &first_calls)
         .expect("dispatch");
     assert!(service.native_dispatch_retained(&admitted.run_id));
     service.mark_terminal(&admitted.run_id);
@@ -2006,11 +2137,10 @@ async fn service_cleanup_drops_dispatch_state_on_terminal_session_and_shutdown()
         })
         .await
         .expect("admit session");
+    let session_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted_session.run_id, 1, &session_calls);
     service
-        .dispatch_tools(
-            &admitted_session.run_id,
-            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
-        )
+        .dispatch_tools(&admitted_session.run_id, &session_calls)
         .expect("session dispatch");
     assert!(service.native_dispatch_retained(&admitted_session.run_id));
     service.cleanup_session_native_dispatch(&admitted_session.session_id);
@@ -2024,11 +2154,10 @@ async fn service_cleanup_drops_dispatch_state_on_terminal_session_and_shutdown()
         })
         .await
         .expect("admit shutdown");
+    let shutdown_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted_shutdown.run_id, 1, &shutdown_calls);
     service
-        .dispatch_tools(
-            &admitted_shutdown.run_id,
-            &[call("c1", "read_file", json!({"path": "ok.txt"}))],
-        )
+        .dispatch_tools(&admitted_shutdown.run_id, &shutdown_calls)
         .expect("shutdown dispatch");
     assert!(service.native_dispatch_retained(&admitted_shutdown.run_id));
     service.shutdown_native_dispatch();
@@ -2043,21 +2172,19 @@ async fn service_cleanup_does_not_refill_native_dispatch_or_leave_processes() {
     let (_state, service) = admit_dispatch_service(&fixture).await;
 
     let admitted_session = admit_run(&service).await;
+    let spawn_calls = [call("c1", "terminal", hostile_ignore_term_args(&marker))];
+    commit_tool_parents(&service, &admitted_session.run_id, 1, &spawn_calls);
     let spawned = service
-        .dispatch_tools(
-            &admitted_session.run_id,
-            &[call("c1", "terminal", hostile_ignore_term_args(&marker))],
-        )
+        .dispatch_tools(&admitted_session.run_id, &spawn_calls)
         .expect("spawn hostile");
     assert!(spawned[0].ok, "{:?}", spawned[0]);
     let pid: u32 = wait_for_file(&marker).trim().parse().expect("pid");
     service.cleanup_session_native_dispatch(&admitted_session.session_id);
     assert!(!service.native_dispatch_retained(&admitted_session.run_id));
+    let after_cleanup_calls = [call("c2", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted_session.run_id, 2, &after_cleanup_calls);
     let after_cleanup = service
-        .dispatch_tools(
-            &admitted_session.run_id,
-            &[call("c2", "read_file", json!({"path": "ok.txt"}))],
-        )
+        .dispatch_tools(&admitted_session.run_id, &after_cleanup_calls)
         .expect("dispatch after session cleanup");
     assert_cancelled_bounded(&after_cleanup[0]);
     assert!(!service.native_dispatch_retained(&admitted_session.run_id));
@@ -2098,12 +2225,10 @@ async fn concurrent_mark_terminal_versus_first_dispatch_leaves_no_retained_state
         let closer = service.clone();
         let dispatch_id = run_id.clone();
         let close_id = run_id.clone();
-        let dispatch = thread::spawn(move || {
-            dispatcher.dispatch_tools(
-                &dispatch_id,
-                &[call("c1", "read_file", json!({"path": "ok.txt"}))],
-            )
-        });
+        let dispatch_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+        commit_tool_parents(&service, &run_id, 1, &dispatch_calls);
+        let dispatch =
+            thread::spawn(move || dispatcher.dispatch_tools(&dispatch_id, &dispatch_calls));
         let close = thread::spawn(move || closer.mark_terminal(&close_id));
         let results = dispatch.join().expect("dispatch join").expect("dispatch");
         close.join().expect("close join");
@@ -2131,11 +2256,10 @@ async fn session_cleanup_does_not_block_handle_stop_or_admission_during_hostile_
 
     let admitted_hostile = admit_run(&service).await;
     let admitted_other = admit_run(&service).await;
+    let spawn_calls = [call("c1", "terminal", hostile_ignore_term_args(&marker))];
+    commit_tool_parents(&service, &admitted_hostile.run_id, 1, &spawn_calls);
     let spawned = service
-        .dispatch_tools(
-            &admitted_hostile.run_id,
-            &[call("c1", "terminal", hostile_ignore_term_args(&marker))],
-        )
+        .dispatch_tools(&admitted_hostile.run_id, &spawn_calls)
         .expect("spawn hostile");
     assert!(spawned[0].ok, "{:?}", spawned[0]);
     let pid: u32 = wait_for_file(&marker).trim().parse().expect("pid");
@@ -2174,4 +2298,437 @@ async fn session_cleanup_does_not_block_handle_stop_or_admission_during_hostile_
     cleanup.join().expect("cleanup join");
     wait_until_dead(pid);
     assert!(!service.native_dispatch_retained(&admitted_hostile.run_id));
+}
+
+fn derived_artifact_root(workspace: &Path) -> PathBuf {
+    let name = workspace
+        .file_name()
+        .map(|component| component.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".to_string());
+    workspace
+        .parent()
+        .expect("workspace parent")
+        .join(format!(".rustscript-agent-state-{name}"))
+}
+
+#[tokio::test]
+async fn same_workspace_two_runs_share_one_artifact_store() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let first = admit_run(&service).await;
+    let second = admit_run(&service).await;
+    let first_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    let second_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &first.run_id, 1, &first_calls);
+    commit_tool_parents(&service, &second.run_id, 1, &second_calls);
+    let first_result = service
+        .dispatch_tools(&first.run_id, &first_calls)
+        .expect("first dispatch");
+    let second_result = service
+        .dispatch_tools(&second.run_id, &second_calls)
+        .expect("second dispatch");
+    assert!(first_result[0].ok, "{:?}", first_result[0]);
+    assert!(second_result[0].ok, "{:?}", second_result[0]);
+    let store_a = service
+        .native_artifact_store(&first.run_id)
+        .expect("first store");
+    let store_b = service
+        .native_artifact_store(&second.run_id)
+        .expect("second store");
+    assert!(
+        Arc::ptr_eq(&store_a, &store_b),
+        "concurrent runs in one workspace must share one ArtifactStore"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_workspace_first_inits_share_one_store() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let first = admit_run(&service).await;
+    let second = admit_run(&service).await;
+    let left = service.clone();
+    let right = service.clone();
+    let left_id = first.run_id.clone();
+    let right_id = second.run_id.clone();
+    let left_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    let right_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &first.run_id, 1, &left_calls);
+    commit_tool_parents(&service, &second.run_id, 1, &right_calls);
+    let left_thread = thread::spawn(move || left.dispatch_tools(&left_id, &left_calls));
+    let right_thread = thread::spawn(move || right.dispatch_tools(&right_id, &right_calls));
+    let left_result = left_thread
+        .join()
+        .expect("left join")
+        .expect("left dispatch");
+    let right_result = right_thread
+        .join()
+        .expect("right join")
+        .expect("right dispatch");
+    assert!(left_result[0].ok, "{:?}", left_result[0]);
+    assert!(right_result[0].ok, "{:?}", right_result[0]);
+    let store_a = service
+        .native_artifact_store(&first.run_id)
+        .expect("first store");
+    let store_b = service
+        .native_artifact_store(&second.run_id)
+        .expect("second store");
+    assert!(Arc::ptr_eq(&store_a, &store_b));
+}
+
+#[tokio::test]
+async fn different_workspace_artifact_stores_stay_isolated() {
+    let left_fixture = Fixture::new();
+    let right_fixture = Fixture::new();
+    fs::write(left_fixture.root.join("ok.txt"), "left\n").expect("write left");
+    fs::write(right_fixture.root.join("ok.txt"), "right\n").expect("write right");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 64 * 1024, &left_fixture.root).expect("left limits"))
+        .expect("set left");
+    let left_run = admit_run(&service).await;
+    service
+        .set_run_limits(RunLimits::new(8, 8, 64 * 1024, &right_fixture.root).expect("right limits"))
+        .expect("set right");
+    let right_run = admit_run(&service).await;
+    let left_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    let right_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &left_run.run_id, 1, &left_calls);
+    commit_tool_parents(&service, &right_run.run_id, 1, &right_calls);
+    let left_result = service
+        .dispatch_tools(&left_run.run_id, &left_calls)
+        .expect("left dispatch");
+    let right_result = service
+        .dispatch_tools(&right_run.run_id, &right_calls)
+        .expect("right dispatch");
+    assert!(left_result[0].ok, "{:?}", left_result[0]);
+    assert!(right_result[0].ok, "{:?}", right_result[0]);
+    let store_a = service
+        .native_artifact_store(&left_run.run_id)
+        .expect("left store");
+    let store_b = service
+        .native_artifact_store(&right_run.run_id)
+        .expect("right store");
+    assert!(!Arc::ptr_eq(&store_a, &store_b));
+}
+
+#[tokio::test]
+async fn artifact_store_pool_drops_dead_stores_so_root_can_reopen() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    let pool_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &pool_calls);
+    service
+        .dispatch_tools(&admitted.run_id, &pool_calls)
+        .expect("dispatch");
+    service.mark_terminal(&admitted.run_id);
+    assert!(!service.native_dispatch_retained(&admitted.run_id));
+    let config = ArtifactStoreConfig::for_root(derived_artifact_root(&fixture.root));
+    ArtifactStore::with_config(config).expect("dead pool entry must release the exclusive flock");
+}
+
+#[tokio::test]
+async fn native_dispatch_init_preserves_artifact_store_error_code() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let artifact_root = derived_artifact_root(&fixture.root);
+    fs::write(&artifact_root, b"not-a-directory").expect("block artifact root with a file");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    let init_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &init_calls);
+    let error = service
+        .dispatch_tools(&admitted.run_id, &init_calls)
+        .expect_err("blocked artifact root must fail native init");
+    match error {
+        RunContextError::InvalidMetadata { reason, .. } => {
+            assert!(
+                reason.contains("invalid_config"),
+                "typed ArtifactStoreError code must survive native init: {reason}"
+            );
+        }
+        other => panic!("expected InvalidMetadata, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn admitted_32kib_cap_artifacts_at_executor_layer() {
+    let fixture = Fixture::new();
+    let payload = "0123456789abcdef".repeat(40 * 1024 / 16);
+    fs::write(fixture.root.join("mid.txt"), &payload).expect("write mid file");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 32 * 1024, &fixture.root).expect("32KiB limits"))
+        .expect("set limits");
+    let admitted = admit_run(&service).await;
+    let mid_calls = [call("c1", "read_file", json!({"path": "mid.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &mid_calls);
+    let result = service
+        .dispatch_tools(&admitted.run_id, &mid_calls)
+        .expect("dispatch");
+    assert!(
+        result[0].truncated || !result[0].artifacts.is_empty(),
+        "32KiB admitted cap must artifact at the executor: {:?}",
+        result[0]
+    );
+    let encoded = serde_json::to_vec(&result[0]).expect("encode");
+    assert!(
+        encoded.len() <= 32 * 1024,
+        "serialized cap is defense-in-depth: {}",
+        encoded.len()
+    );
+}
+
+#[tokio::test]
+async fn admitted_1mib_cap_keeps_over_64kib_inline() {
+    let fixture = Fixture::new();
+    let payload = "0123456789abcdef".repeat(80 * 1024 / 16);
+    fs::write(fixture.root.join("large.txt"), &payload).expect("write large file");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 1024 * 1024, &fixture.root).expect("1MiB limits"))
+        .expect("set limits");
+    let admitted = admit_run(&service).await;
+    let large_calls = [call("c1", "read_file", json!({"path": "large.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &large_calls);
+    let result = service
+        .dispatch_tools(&admitted.run_id, &large_calls)
+        .expect("dispatch");
+    assert!(result[0].ok, "{:?}", result[0]);
+    assert!(
+        result[0].artifacts.is_empty(),
+        "80KiB payload must stay inline under the 1MiB admitted cap: {:?}",
+        result[0]
+    );
+    assert!(result[0].content.contains("0123456789abcdef"));
+    let encoded = serde_json::to_vec(&result[0]).expect("encode");
+    assert!(encoded.len() <= 1024 * 1024, "{}", encoded.len());
+    assert!(
+        encoded.len() > 64 * 1024,
+        "payload should exceed the old 64KiB executor default"
+    );
+}
+
+#[tokio::test]
+async fn first_init_close_does_not_wait_for_init_io() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let entered = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(2));
+    let observer_entered = Arc::clone(&entered);
+    let observer_barrier = Arc::clone(&barrier);
+    service.inject_native_dispatch_init_entered_observer(Arc::new(move || {
+        observer_entered.store(true, Ordering::SeqCst);
+        observer_barrier.wait();
+    }));
+    let admitted = admit_run(&service).await;
+    let run_id = admitted.run_id.clone();
+    let dispatcher = service.clone();
+    let dispatch_id = run_id.clone();
+    let init_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &run_id, 1, &init_calls);
+    let dispatch = thread::spawn(move || dispatcher.dispatch_tools(&dispatch_id, &init_calls));
+    let wait_start = Instant::now();
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(2),
+            "native dispatch init did not start"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let closer = service.clone();
+    let close_id = run_id.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        closer.mark_terminal(&close_id);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_millis(500))
+        .expect("mark_terminal must not wait for init IO");
+    barrier.wait();
+    let results = dispatch.join().expect("dispatch join").expect("dispatch");
+    assert!(!service.native_dispatch_retained(&run_id));
+    if !results[0].ok {
+        assert_eq!(error_code(&results[0]), "cancelled");
+    }
+}
+
+#[tokio::test]
+async fn blocked_put_then_cleanup_leaves_no_object_reservation_or_bytes() {
+    let fixture = Fixture::new();
+    let payload = "0123456789abcdef".repeat(8 * 1024);
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write small");
+    fs::write(fixture.root.join("large.txt"), &payload).expect("write large");
+    let state = AgentGatewayState::new(AgentGatewayConfig::default()).expect("gateway state");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 32 * 1024, &fixture.root).expect("32KiB limits"))
+        .expect("set limits");
+    let admitted = admit_run(&service).await;
+    let prime_calls = [call("c0", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &prime_calls);
+    service
+        .dispatch_tools(&admitted.run_id, &prime_calls)
+        .expect("prime dispatch");
+    let store = service
+        .native_artifact_store(&admitted.run_id)
+        .expect("store after init");
+    let entered = Arc::new(AtomicBool::new(false));
+    let hold = Arc::new(Barrier::new(2));
+    let observer_entered = Arc::clone(&entered);
+    let observer_hold = Arc::clone(&hold);
+    store.inject_put_entered_observer(Arc::new(move || {
+        observer_entered.store(true, Ordering::SeqCst);
+        observer_hold.wait();
+    }));
+    let dispatcher = service.clone();
+    let dispatch_id = admitted.run_id.clone();
+    let overflow_calls = [call("c1", "read_file", json!({"path": "large.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 2, &overflow_calls);
+    let dispatch = thread::spawn(move || dispatcher.dispatch_tools(&dispatch_id, &overflow_calls));
+    let wait_start = Instant::now();
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(2),
+            "overflow put did not start"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let cleanup_service = service.clone();
+    let session_id = admitted.session_id.clone();
+    let cleanup = thread::spawn(move || {
+        cleanup_service.cleanup_session_native_dispatch(&session_id);
+    });
+    let closed_start = Instant::now();
+    while !service.native_dispatch_closed(&admitted.run_id) {
+        assert!(
+            closed_start.elapsed() < Duration::from_secs(2),
+            "cleanup did not close native dispatch"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    hold.wait();
+    dispatch.join().expect("dispatch join").expect("dispatch");
+    cleanup.join().expect("cleanup join");
+    assert_eq!(store.object_count(), 0);
+    assert_eq!(store.total_bytes(), 0);
+    assert_eq!(store.reserved_count(), 0);
+    assert_eq!(store.reserved_bytes(), 0);
+    assert!(
+        store
+            .confined_object_names()
+            .expect("confined names")
+            .is_empty()
+    );
+    let after_calls = [call("c2", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 3, &after_calls);
+    let after = service
+        .dispatch_tools(&admitted.run_id, &after_calls)
+        .expect("sticky closed dispatch");
+    assert_cancelled_bounded(&after[0]);
+}
+
+#[tokio::test]
+async fn native_dispatch_init_panic_wakes_waiters_and_allows_retry() {
+    // Empty restore: the init guard returns the slot to Empty, waiters wake,
+    // and a later dispatch can initialize Ready. Closed-vs-panic is covered by
+    // `native_dispatch_init_panic_does_not_overwrite_closed_and_redrive_cancels_once`.
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    let run_id = admitted.run_id.clone();
+
+    let entered = Arc::new(Barrier::new(2));
+    let panic_gate = Arc::new(Barrier::new(2));
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let observer_entered = Arc::clone(&entered);
+    let observer_gate = Arc::clone(&panic_gate);
+    let observer_panic = Arc::clone(&panic_once);
+    service.inject_native_dispatch_init_entered_observer(Arc::new(move || {
+        if observer_panic.swap(false, Ordering::SeqCst) {
+            observer_entered.wait();
+            observer_gate.wait();
+            panic!("injected native dispatch init panic");
+        }
+    }));
+
+    let init_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &run_id, 1, &init_calls);
+    let initiator = {
+        let dispatcher = service.clone();
+        let dispatch_id = run_id.clone();
+        thread::spawn(move || dispatcher.dispatch_tools(&dispatch_id, &init_calls))
+    };
+    entered.wait();
+
+    let waiter_calls = [call("c2", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &run_id, 2, &waiter_calls);
+    let (waiter_tx, waiter_rx) = mpsc::sync_channel(1);
+    let waiter = {
+        let dispatcher = service.clone();
+        let dispatch_id = run_id.clone();
+        thread::spawn(move || {
+            let result = dispatcher.dispatch_tools(&dispatch_id, &waiter_calls);
+            let _ = waiter_tx.send(result);
+        })
+    };
+
+    panic_gate.wait();
+    assert!(
+        initiator.join().is_err(),
+        "init thread must propagate the injected panic"
+    );
+    let waiter_result = waiter_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("concurrent waiter must complete after init panic recovery");
+    waiter.join().expect("waiter join");
+    let waiter_results = waiter_result.expect("waiter dispatch after recovered init");
+    assert!(
+        waiter_results[0].ok,
+        "recovered waiter must initialize successfully: {:?}",
+        waiter_results[0]
+    );
+
+    let retry_calls = [call("c3", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &run_id, 3, &retry_calls);
+    let retry = service
+        .dispatch_tools(&run_id, &retry_calls)
+        .expect("retry after init panic");
+    assert!(retry[0].ok, "{:?}", retry[0]);
+    assert!(service.native_dispatch_retained(&run_id));
+    assert!(!service.native_dispatch_closed(&run_id));
+    assert_eq!(service.process_owner_count(&run_id), 0);
+}
+
+#[tokio::test]
+async fn native_dispatch_init_error_can_retry_after_fixing_artifact_root() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("ok.txt"), "ok\n").expect("write");
+    let artifact_root = derived_artifact_root(&fixture.root);
+    fs::write(&artifact_root, b"not-a-directory").expect("block artifact root with a file");
+    let (_state, service) = admit_dispatch_service(&fixture).await;
+    let admitted = admit_run(&service).await;
+    let init_calls = [call("c1", "read_file", json!({"path": "ok.txt"}))];
+    commit_tool_parents(&service, &admitted.run_id, 1, &init_calls);
+    service
+        .dispatch_tools(&admitted.run_id, &init_calls)
+        .expect_err("blocked artifact root must fail native init");
+    assert!(!service.native_dispatch_retained(&admitted.run_id));
+    assert!(!service.native_dispatch_closed(&admitted.run_id));
+    fs::remove_file(&artifact_root).expect("unblock artifact root");
+    let retry = service
+        .dispatch_tools(&admitted.run_id, &init_calls)
+        .expect("retry after init error");
+    assert!(retry[0].ok, "{:?}", retry[0]);
+    assert!(service.native_dispatch_retained(&admitted.run_id));
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
 }

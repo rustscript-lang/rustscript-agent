@@ -1,14 +1,23 @@
 {
-  "turn": 0,
-  "max_turns": 3,
-  "retry_count": 0,
-  "max_retries": 2,
-  "phase": "start",
+  "run_id": "run-loop",
+  "session_id": "session-loop",
   "model": "test-model",
-  "provider": {},
+  "provider": "openai",
+  "messages": [
+    {
+      "role": "user",
+      "content": [{ "type": "text", "text": "hello" }]
+    }
+  ],
+  "tools": [],
+  "limits": {
+    "max_turns": 3,
+    "max_tool_calls": 8
+  },
   "config": {
     "base_retry_delay_ms": 100,
     "max_retry_delay_ms": 400,
+    "max_retries": 2,
     "parallel": false,
     "task": false
   }

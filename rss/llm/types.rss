@@ -72,13 +72,80 @@ pub fn error_new(
     param: string,
     request_id: string
 ) -> map {
+    let mut retryable = false;
+    if status == 429 {
+        retryable = true;
+    }
+    if status == 408 {
+        retryable = true;
+    }
+    if status >= 500 {
+        if status <= 599 {
+            retryable = true;
+        }
+    }
+    if error_type == "rate_limit_error" {
+        retryable = true;
+    }
+    if error_type == "overloaded_error" {
+        retryable = true;
+    }
+    if error_type == "server_error" {
+        retryable = true;
+    }
+    if error_type == "timeout_error" {
+        retryable = true;
+    }
+    if error_type == "malformed_payload" {
+        retryable = false;
+    }
+    if error_type == "invalid_request_error" {
+        retryable = false;
+    }
+    if code == "setup" {
+        retryable = false;
+    }
+    if code == "config" {
+        retryable = false;
+    }
+    if code == "adapter_unavailable" {
+        retryable = false;
+    }
+    if code == "malformed_payload" {
+        retryable = false;
+    }
+    if code == "scripted_exhausted" {
+        retryable = false;
+    }
+    if code == "corrupt_provider_step" {
+        retryable = false;
+    }
+    if code == "run_terminal" {
+        retryable = false;
+    }
+    if code == "missing_tool_parent" {
+        retryable = false;
+    }
+    if code == "cancelled" {
+        retryable = false;
+    }
+    if code == "deadline_elapsed" {
+        retryable = false;
+    }
+    if code == "provider_step_persist_failed" {
+        retryable = false;
+    }
+    if code == "interrupted_provider" {
+        retryable = false;
+    }
     {
         status: status,
         type: error_type,
         code: code,
         message: message,
         param: param,
-        request_id: request_id
+        request_id: request_id,
+        retryable: retryable
     }
 }
 
@@ -256,4 +323,40 @@ pub fn provider_options(request: map) -> map {
 /// Resolved profile fields: `{provider, base_url, api_key, model}`.
 pub fn profile_string(profile: map, key: string) -> string {
     request_string(profile, key)
+}
+
+pub fn content_text(text: string) -> map {
+    { type: "text", text: text }
+}
+
+pub fn content_tool_call(tool_call_id: string, name: string, arguments_json: string) -> map {
+    {
+        type: "tool_call",
+        tool_call_id: tool_call_id,
+        name: name,
+        arguments_json: arguments_json
+    }
+}
+
+pub fn content_tool_result(
+    tool_call_id: string,
+    name: string,
+    content: string,
+    is_error: bool,
+    result: map,
+    error: map,
+    artifact: array,
+    truncated: bool
+) -> map {
+    {
+        type: "tool_result",
+        tool_call_id: tool_call_id,
+        name: name,
+        content: content,
+        is_error: is_error,
+        result: result,
+        error: error,
+        artifact: artifact,
+        truncated: truncated
+    }
 }

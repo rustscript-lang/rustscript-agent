@@ -15,21 +15,24 @@
 //! `terminal_persist_retry_delay`); if every attempt fails, the run becomes
 //! observably `terminal_pending` (never a false terminal): the admission
 //! permit is released immediately, and a bounded retry loop (janitor
-//! cadence) commits the typed terminal exactly once when storage recovers.
-//! After the retry window the durable side is left for restart recovery, so
-//! a sustained outage can neither exhaust capacity nor leak handles or live
+//! cadence) commits the typed terminal when storage recovers. After the
+//! retry window the durable side is left for restart recovery, so a
+//! sustained outage can neither exhaust capacity nor leak handles or live
 //! streams forever. Nothing is ever published before the durable commit
-//! succeeds.
+//! succeeds. Live subscribers observe at-least-once delivery of durable
+//! events; exactly-once is not guaranteed across an unacknowledged receiver
+//! crash window.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex, Weak,
+    Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustscript_vm::{
     CancellationReason, CancellationToken, HttpConfig, InvocationError, Value as VmValue,
 };
@@ -43,32 +46,130 @@ use crate::config::{
     ADMISSION_RUN_COL_SCRIPT_HASH, ADMISSION_RUN_COL_SESSION_ID, ADMISSION_RUN_COL_STATUS,
     ADMISSION_SESSION_PROFILE, AdmissionSqliteCellLens, AgentGatewayConfig, ClientDisconnectPolicy,
     FileToolConfig, MAX_IDEMPOTENCY_KEY_BYTES, MAX_MODEL_NAME_BYTES, MAX_PROVIDER_NAME_BYTES,
-    MAX_RUN_CONTEXT_STORAGE_BYTES, ProcessToolConfig, ProviderProfile, ProviderProfileError,
-    RunLimits, RunLimitsError, estimate_admission_query_bytes, validate_request_hash,
-    validate_visible_name,
+    MAX_RUN_CONTEXT_STORAGE_BYTES, MAX_TOOL_OUTPUT_BYTES, ProcessToolConfig, ProviderProfile,
+    ProviderProfileError, RunLimits, RunLimitsError, estimate_admission_query_bytes,
+    validate_request_hash, validate_visible_name,
 };
-use crate::domain::{RunContext, ToolCall, timestamp, truncate_for_log, vm_value_to_json};
+use crate::domain::{
+    LlmContentBlock, MAX_DURABLE_TEXT_CHARS, RunContext, ToolCall, decode_message_blocks,
+    decode_message_content, durable_message_id, durable_provider_event_id, durable_tool_event_id,
+    encode_message_content, provider_pending_may_retry, timestamp, truncate_for_log,
+    truncate_utf8_chars, vm_value_to_json,
+};
 use crate::events;
 use crate::gateway::store::{
     GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
-    SessionRecord, SessionView, append_message,
+    SessionRecord, SessionView,
 };
 use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
+use crate::prompt::{CodingPromptBudgets, DateSource, SystemDateSource, build_coding_prompt};
 use crate::runtime::delivery::{
-    ChannelEventSink, DeliveryContext, append_event_locked, run_delivery_task,
+    ChannelEventSink, DeliveryContext, apply_event_locked, event_candidate, run_delivery_task,
 };
-use crate::runtime::rss_runner::execute_rss_source;
+use crate::runtime::rss_runner::{AgentConfig, AgentRunner};
+use crate::tools::artifacts::ArtifactStorePool;
 use crate::tools::{
-    ArtifactOwner, DispatchContext, DispatchLimits, DurableEventCommitter, EventCommitError,
-    FileTools, NativeExecutionDeps, ProcessArtifactSink, ProcessExecutor, ProcessOwner,
-    ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry, ToolRegistrySnapshot, ToolResult,
+    ArtifactError, ArtifactOwner, ArtifactStore, DispatchContext, DispatchLimits,
+    DurableEventCommitter, EventCommitError, FileTools, NativeExecutionDeps, ProcessArtifactSink,
+    ProcessExecutor, ProcessOwner, ProcessTable, TerminalExecutor, ToolOwner, ToolRegistry,
+    ToolRegistrySnapshot, ToolResult,
 };
-use crate::{RunCancellation, RunError};
+use crate::{AgentHostBridges, AgentProviderHost, RunCancellation, RunError};
+
+/// Typed outcome of bounded native-host cleanup. Never claims success when
+/// dispatcher or process residue could not be confirmed stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupOutcome {
+    Clean,
+    Timeout,
+    Failed,
+}
+
+struct CachedAgentRunner {
+    source_digest: u64,
+    config: AgentConfig,
+    runner: AgentRunner,
+}
+
+fn agent_source_digest(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn failed_payload_with_code(code: &str, error: String) -> JsonValue {
+    json!({
+        "status": "failed",
+        "error_code": code,
+        "error_message": error,
+    })
+}
+
+/// Recovery action for a pending provider request after restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderPendingDecision {
+    Retry,
+    Replay,
+    Interrupted,
+    /// The run is already terminal; recovery must not append `model.completed`.
+    RefusedTerminal,
+}
+
+/// Canonical durable provider step returned by [`AgentService::commit_provider_step`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderCommit {
+    pub message_id: String,
+    pub envelope: JsonValue,
+}
+
+/// Inserted records a new turn. Existing returns the durable envelope and
+/// never the caller's fresh payload.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProviderCommitOutcome {
+    Inserted(ProviderCommit),
+    Existing(ProviderCommit),
+}
+
+impl ProviderCommitOutcome {
+    pub fn message_id(&self) -> &str {
+        match self {
+            Self::Inserted(commit) | Self::Existing(commit) => &commit.message_id,
+        }
+    }
+
+    pub fn envelope(&self) -> &JsonValue {
+        match self {
+            Self::Inserted(commit) | Self::Existing(commit) => &commit.envelope,
+        }
+    }
+
+    pub fn is_inserted(&self) -> bool {
+        matches!(self, Self::Inserted(_))
+    }
+}
+
+const PROVIDER_RETRY_BUDGET: u64 = 2;
+const SECRET_PROVIDER_REQUEST_KEYS: &[&str] = &[
+    "request",
+    "messages",
+    "prompt",
+    "provider_options",
+    "api_key",
+    "headers",
+    "body",
+    "authorization",
+    "system",
+    "instructions",
+    "content",
+];
 
 /// One run whose terminal state could not be committed durably. The worker
 /// has already exited; a bounded retry loop (janitor cadence) commits the
-/// typed terminal exactly once when storage recovers — durable commit
-/// first, publish and permit release only after. The deadline bounds the
+/// typed terminal when storage recovers — durable commit first, then
+/// broadcast. Live subscribers observe at-least-once delivery of durable
+/// events; exactly-once is not guaranteed across an unacknowledged receiver
+/// crash window. The deadline bounds the
 /// retry so a sustained outage cannot exhaust admission capacity or
 /// accumulate retry state forever; the durable side is repaired by restart
 /// recovery once the window expires.
@@ -104,7 +205,13 @@ pub struct RunHandle {
     /// Created at admission and cancelled by every stop/deadline/terminal path.
     tool_cancel: CancellationToken,
     /// Run-scoped native dispatch state shared by every `dispatch_tools` call.
-    native_dispatch: Mutex<NativeDispatchSlot>,
+    native_dispatch: Mutex<NativeDispatchPhase>,
+    native_dispatch_cv: Condvar,
+    /// Frozen coding system prompt captured at admission.
+    coding_system_prompt: Arc<str>,
+    /// Exclusive worker occupancy. Concurrent `run_worker` tasks cannot both
+    /// call the provider or advance the turn. Released on Drop (error/panic).
+    occupancy: AtomicBool,
 }
 
 /// Shared native dispatch machinery for one admitted run.
@@ -114,30 +221,95 @@ struct NativeDispatchState {
     table: Arc<ProcessTable>,
     cleaned: AtomicBool,
     shutdown_entered: Option<Arc<dyn Fn() + Send + Sync>>,
+    cleanup_grace: Duration,
 }
 
-/// Monotonic native-dispatch slot: once `closed`, lazy init must never refill.
-struct NativeDispatchSlot {
-    closed: bool,
-    state: Option<Arc<NativeDispatchState>>,
+/// Two-phase native dispatch slot. The handle lock is never held across
+/// FileTools/ArtifactStore filesystem IO. `Closed` retains the process table so
+/// residue stays observable after FileTools are released.
+enum NativeDispatchPhase {
+    Empty,
+    Initializing,
+    Ready(Arc<NativeDispatchState>),
+    Closed(Option<ClosedDispatch>),
+}
+
+#[derive(Clone)]
+struct ClosedDispatch {
+    table: Arc<ProcessTable>,
+    owner: ProcessOwner,
+}
+
+/// Restores a retriable `Empty` phase if initialization panics or returns
+/// `Err` before `Ready` is published. Drop never waits on IO or the condvar.
+struct NativeDispatchInitGuard {
+    handle: Arc<RunHandle>,
+    armed: bool,
+}
+
+impl NativeDispatchInitGuard {
+    fn arm(handle: &Arc<RunHandle>) -> Self {
+        Self {
+            handle: Arc::clone(handle),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NativeDispatchInitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut phase = self
+            .handle
+            .native_dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*phase, NativeDispatchPhase::Initializing) {
+            *phase = NativeDispatchPhase::Empty;
+        }
+        self.handle.native_dispatch_cv.notify_all();
+    }
 }
 
 impl NativeDispatchState {
-    fn shutdown(&self) {
+    fn owner(&self) -> ProcessOwner {
+        ProcessOwner::from(self.dispatcher.owner().clone())
+    }
+
+    fn shutdown(&self) -> CleanupOutcome {
+        self.shutdown_with_grace(self.cleanup_grace)
+    }
+
+    fn shutdown_with_grace(&self, grace: Duration) -> CleanupOutcome {
         if self.cleaned.swap(true, Ordering::SeqCst) {
-            return;
+            return if self.table.owner_count(&self.owner()) == 0 {
+                CleanupOutcome::Clean
+            } else {
+                CleanupOutcome::Timeout
+            };
         }
         if let Some(observer) = &self.shutdown_entered {
             observer();
         }
-        self.dispatcher.cancellation().cancel();
-        let owner = self.dispatcher.owner();
-        let _ = self.table.cleanup_owner(&ProcessOwner::from(owner.clone()));
+        self.dispatcher.close();
+        let quiesced = self.dispatcher.try_quiesce(grace);
+        let owner = self.owner();
+        let _ = self.table.cleanup_owner(&owner);
         let _ = self
             .files
             .artifact_store_arc()
-            .cleanup_owner(&ArtifactOwner::from(owner.clone()));
-        self.table.shutdown();
+            .cleanup_owner(&ArtifactOwner::from(self.dispatcher.owner().clone()));
+        if !quiesced || self.table.owner_count(&owner) > 0 {
+            CleanupOutcome::Timeout
+        } else {
+            CleanupOutcome::Clean
+        }
     }
 }
 
@@ -160,35 +332,69 @@ impl RunHandle {
         self.terminal_at.lock().expect("terminal lock").is_some()
     }
 
+    /// Frozen coding system prompt captured at admission for this run.
+    pub fn coding_system_prompt(&self) -> &str {
+        &self.coding_system_prompt
+    }
+
+    /// Sole cancellation root for this run. `stop` requests it; hosts and the
+    /// native dispatcher child tokens are linked to it.
+    pub fn cancellation(&self) -> &RunCancellation {
+        &self.cancel
+    }
+
+    fn request_user_stop(&self) {
+        *self.cancel_reason.lock().expect("cancel reason lock") = Some("requested");
+        self.cancel.request(CancellationReason::Requested);
+        self.cancel_native_tools();
+    }
+
     fn cancel_native_tools(&self) {
         self.tool_cancel.cancel();
     }
 
     fn native_dispatch_closed(&self) -> bool {
-        self.native_dispatch
-            .lock()
-            .expect("native dispatch lock")
-            .closed
+        matches!(
+            *self.native_dispatch.lock().expect("native dispatch lock"),
+            NativeDispatchPhase::Closed(_)
+        )
     }
 
-    fn release_native_dispatch(&self) {
+    fn release_native_dispatch(&self) -> CleanupOutcome {
         self.tool_cancel.cancel();
         let state = {
-            let mut slot = self.native_dispatch.lock().expect("native dispatch lock");
-            slot.closed = true;
-            slot.state.take()
+            let mut phase = self.native_dispatch.lock().expect("native dispatch lock");
+            match std::mem::replace(&mut *phase, NativeDispatchPhase::Closed(None)) {
+                NativeDispatchPhase::Ready(state) => {
+                    *phase = NativeDispatchPhase::Closed(Some(ClosedDispatch {
+                        table: Arc::clone(&state.table),
+                        owner: state.owner(),
+                    }));
+                    self.native_dispatch_cv.notify_all();
+                    Some(state)
+                }
+                NativeDispatchPhase::Closed(existing) => {
+                    *phase = NativeDispatchPhase::Closed(existing);
+                    self.native_dispatch_cv.notify_all();
+                    None
+                }
+                NativeDispatchPhase::Empty | NativeDispatchPhase::Initializing => {
+                    self.native_dispatch_cv.notify_all();
+                    None
+                }
+            }
         };
-        if let Some(state) = state {
-            state.shutdown();
+        match state {
+            Some(state) => state.shutdown(),
+            None => CleanupOutcome::Clean,
         }
     }
 
     fn native_dispatch_retained(&self) -> bool {
-        self.native_dispatch
-            .lock()
-            .expect("native dispatch lock")
-            .state
-            .is_some()
+        matches!(
+            *self.native_dispatch.lock().expect("native dispatch lock"),
+            NativeDispatchPhase::Ready(_)
+        )
     }
 }
 
@@ -414,6 +620,25 @@ struct AgentServiceInner {
     metrics: Arc<Metrics>,
     file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     native_dispatch_shutdown: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    native_dispatch_init_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    prompt_read_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    artifact_stores: ArtifactStorePool,
+    date_source: RwLock<Arc<dyn DateSource>>,
+    /// Optional one-shot injected provider host for tests. Consumed atomically
+    /// by the next `run_worker`; production uses RssAdapterProvider.
+    provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
+    /// Compiled agent source reused across workers so compile does not reset the deadline.
+    runner: Mutex<Option<CachedAgentRunner>>,
+    /// When set, the next native dispatcher holds its serial mutex until released.
+    uncooperative_dispatch: Mutex<Option<Arc<AtomicBool>>>,
+    /// Serializes durable event/message commits so seq/ordinal reservation
+    /// cannot interleave. Never held across GET; the GatewayStore lock is
+    /// released before SQLite/worker IO.
+    commit_gate: Arc<ParkingMutex<()>>,
+    crash_after_provider_commit: AtomicBool,
+    crash_after_provider_request: AtomicBool,
+    crash_after_tool_commit: AtomicBool,
+    provider_commit_crashed: AtomicBool,
 }
 
 impl Drop for AgentServiceInner {
@@ -472,6 +697,18 @@ impl AgentService {
             metrics,
             file_search_entered: Mutex::new(None),
             native_dispatch_shutdown: Mutex::new(None),
+            native_dispatch_init_entered: Mutex::new(None),
+            prompt_read_entered: Mutex::new(None),
+            artifact_stores: ArtifactStorePool::default(),
+            date_source: RwLock::new(Arc::new(SystemDateSource)),
+            provider_host: Mutex::new(None),
+            runner: Mutex::new(None),
+            uncooperative_dispatch: Mutex::new(None),
+            commit_gate: Arc::new(ParkingMutex::new(())),
+            crash_after_provider_commit: AtomicBool::new(false),
+            crash_after_provider_request: AtomicBool::new(false),
+            crash_after_tool_commit: AtomicBool::new(false),
+            provider_commit_crashed: AtomicBool::new(false),
         });
         spawn_lifecycle_janitor(Arc::clone(&inner));
         Self { inner }
@@ -487,6 +724,116 @@ impl AgentService {
 
     pub fn http_config(&self) -> &HttpConfig {
         &self.inner.http_config
+    }
+
+    /// Test seam: one-shot provider host consumed by the next `run_worker`.
+    /// A second run without another inject uses the production adapter.
+    pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
+        *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
+    }
+
+    /// Installs or replaces a provider profile used by later admissions.
+    pub fn upsert_provider_profile(&self, profile: ProviderProfile) {
+        self.inner
+            .provider_profiles
+            .write()
+            .insert(profile.name.clone(), profile);
+    }
+
+    /// Holds the next native dispatcher's serial mutex until
+    /// [`Self::release_uncooperative_dispatch`].
+    pub fn inject_uncooperative_dispatch(&self) {
+        *self
+            .inner
+            .uncooperative_dispatch
+            .lock()
+            .expect("uncooperative dispatch lock") = Some(Arc::new(AtomicBool::new(false)));
+    }
+
+    /// Releases an injected uncooperative dispatcher lock.
+    pub fn release_uncooperative_dispatch(&self) {
+        if let Some(flag) = self
+            .inner
+            .uncooperative_dispatch
+            .lock()
+            .expect("uncooperative dispatch lock")
+            .take()
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Effective AgentConfig compiled into the cached runner, if any.
+    pub fn cached_runner_config(&self) -> Option<AgentConfig> {
+        self.inner
+            .runner
+            .lock()
+            .expect("runner cache lock")
+            .as_ref()
+            .map(|cached| cached.config.clone())
+    }
+
+    /// Compiles or reuses the cached runner using current source + effective config.
+    pub fn materialize_cached_runner(&self) -> Result<AgentConfig, String> {
+        let source = self
+            .inner
+            .agent_source
+            .as_ref()
+            .ok_or_else(|| "agent source is missing".to_string())?;
+        Ok(self.cached_agent_runner(source)?.config().clone())
+    }
+
+    /// Test failpoint: panic after a successful provider-step commit, before
+    /// the envelope is returned to RSS. The worker leaves the run started so
+    /// a restart can replay the durable step.
+    pub fn inject_crash_after_provider_commit(&self) {
+        self.inner
+            .crash_after_provider_commit
+            .store(true, Ordering::SeqCst);
+        self.inner
+            .provider_commit_crashed
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Test failpoint: panic after a durable `model.requested` boundary, before
+    /// the inner provider call. Restart may retry the same logical turn.
+    pub fn inject_crash_after_provider_request(&self) {
+        self.inner
+            .crash_after_provider_request
+            .store(true, Ordering::SeqCst);
+        self.inner
+            .provider_commit_crashed
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Test failpoint: panic after a successful durable tool completion, before
+    /// the next provider response. The worker leaves the run started so a
+    /// restart can replay the canonical tool result without a second effect.
+    pub fn inject_crash_after_tool_commit(&self) {
+        self.inner
+            .crash_after_tool_commit
+            .store(true, Ordering::SeqCst);
+        self.inner
+            .provider_commit_crashed
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_crash_after_provider_commit(&self) -> bool {
+        self.inner
+            .crash_after_provider_commit
+            .swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn take_crash_after_provider_request(&self) -> bool {
+        self.inner
+            .crash_after_provider_request
+            .swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_provider_commit_crashed(&self) {
+        self.inner
+            .provider_commit_crashed
+            .store(true, Ordering::SeqCst);
     }
 
     /// Returns the registry snapshot currently used for future admissions.
@@ -523,6 +870,12 @@ impl AgentService {
         let limits = limits.normalized()?;
         *self.inner.run_limits.write() = limits;
         Ok(())
+    }
+
+    /// Replaces the date source used by future admissions. Existing runs keep
+    /// the date captured into their frozen coding prompt.
+    pub fn set_date_source(&self, source: Arc<dyn DateSource>) {
+        *self.inner.date_source.write() = source;
     }
 
     /// Returns the immutable context captured at admission time.
@@ -575,6 +928,59 @@ impl AgentService {
             .unwrap_or_default()
     }
 
+    /// Blocking GET of session messages. Used by tests to observe live
+    /// visibility without `try_read` skipping a held write lock.
+    pub fn session_messages(&self, session_id: &str) -> Vec<JsonValue> {
+        self.inner
+            .store
+            .read()
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                session
+                    .messages
+                    .iter()
+                    .map(|message| serde_json::to_value(message).expect("session message json"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Persist one run event without attaching a message (tests / recovery).
+    pub fn persist_run_event(
+        &self,
+        run_id: &str,
+        event_id: &str,
+        event_type: &str,
+        payload: JsonValue,
+    ) -> Result<(), EventCommitError> {
+        self.persist_provider_event(run_id, event_id, event_type, payload)
+    }
+
+    /// Persist one tool step (event + optional tool_result message).
+    pub fn commit_tool_step(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        data: JsonValue,
+        result: Option<&ToolResult>,
+    ) -> Result<(), EventCommitError> {
+        ServiceEventCommitter {
+            store: Arc::clone(&self.inner.store),
+            persistence: self.inner.persistence.clone(),
+            run_id: run_id.to_string(),
+            handle: self
+                .handle(run_id)
+                .map(|handle| Arc::downgrade(&handle))
+                .unwrap_or_default(),
+            max_event_bytes: self.inner.config.max_event_bytes,
+            max_events_per_run: self.inner.config.max_events_per_run,
+            commit_gate: Arc::clone(&self.inner.commit_gate),
+            service: Arc::downgrade(&self.inner),
+        }
+        .commit_step(event_type, data, result)
+    }
+
     /// Serial, validated native dispatch against the admitted registry snapshot.
     ///
     /// The live registry is not consulted. Durable event append uses the same
@@ -593,9 +999,615 @@ impl AgentService {
             return Ok(cancelled_dispatch_results(calls, handle.is_terminal()));
         }
         match self.native_dispatch_state(run_id, &handle)? {
-            Some(state) => Ok(state.dispatcher.dispatch(calls)),
+            Some(state) => {
+                let mut results = Vec::with_capacity(calls.len());
+                let mut pending = Vec::new();
+                let mut pending_idx = Vec::new();
+                for (index, call) in calls.iter().enumerate() {
+                    match self.replay_durable_tool_result(run_id, &call.id, &call.name) {
+                        Ok(Some(replayed)) => results.push(Some(replayed)),
+                        Ok(None) => {
+                            results.push(None);
+                            pending.push(call.clone());
+                            pending_idx.push(index);
+                        }
+                        Err(error) => results.push(Some(replay_commit_failure(error))),
+                    }
+                }
+                if !pending.is_empty() {
+                    let dispatched = state.dispatcher.dispatch(&pending);
+                    for (slot, result) in pending_idx.into_iter().zip(dispatched) {
+                        if !result.replayed {
+                            self.inner
+                                .metrics
+                                .account_tool_attempt(!result.ok, result.truncated);
+                        }
+                        results[slot] = Some(result);
+                    }
+                }
+                Ok(results
+                    .into_iter()
+                    .map(|result| result.expect("dispatch slot filled"))
+                    .collect())
+            }
             None => Ok(cancelled_dispatch_results(calls, handle.is_terminal())),
         }
+    }
+
+    /// Replay a completed/failed tool result from durable messages/events.
+    /// Completed effects are never dispatched again. Interrupted effects
+    /// surface as typed `interrupted_effect` failures without re-execution.
+    /// Corrupt canonical state fails closed. Name must match the durable
+    /// parent/result when present.
+    fn replay_durable_tool_result(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
+        let has_output = run.events.iter().any(|event| {
+            matches!(
+                event.event.as_str(),
+                "tool.output" | "tool.completed" | "tool.failed"
+            ) && event.data.get("tool_call_id").and_then(JsonValue::as_str) == Some(tool_call_id)
+        });
+        if !has_output {
+            return Ok(None);
+        }
+        if let Some((_, stored_name)) =
+            lookup_tool_call_parent(&store, &run.session_id, tool_call_id)
+            && stored_name != name
+        {
+            return Err(EventCommitError::Corrupt(
+                "tool call name does not match durable parent".to_string(),
+            ));
+        }
+        if let Some(session) = store.sessions.get(&run.session_id) {
+            for message in session.messages.iter().rev() {
+                if message.tool_call_id.as_deref() != Some(tool_call_id) {
+                    continue;
+                }
+                if let Some(stored_name) = message.name.as_deref()
+                    && stored_name != name
+                {
+                    return Err(EventCommitError::Corrupt(
+                        "tool result name does not match the requested tool".to_string(),
+                    ));
+                }
+                for block in decode_message_blocks(&message.content) {
+                    if block.block_type != "tool_result"
+                        || block.tool_call_id.as_deref() != Some(tool_call_id)
+                    {
+                        continue;
+                    }
+                    if block.is_error == Some(true) {
+                        let (code, message_text) = block
+                            .error
+                            .as_ref()
+                            .map(|error| {
+                                (
+                                    error
+                                        .get("code")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("tool_failed")
+                                        .to_string(),
+                                    error
+                                        .get("message")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("tool failed")
+                                        .to_string(),
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                ("tool_failed".to_string(), "tool failed".to_string())
+                            });
+                        return Ok(Some(ToolResult::failure(code, message_text)));
+                    }
+                    let mut result = ToolResult::success(
+                        block.content.clone().unwrap_or_default(),
+                        block.result.clone().unwrap_or(JsonValue::Null),
+                    );
+                    result.truncated = block.truncated.unwrap_or(false);
+                    if let Some(JsonValue::Object(artifact)) = block.artifact {
+                        if let Some(id) = artifact.get("id").and_then(JsonValue::as_str) {
+                            result.artifacts = vec![id.to_string()];
+                        }
+                    } else if let Some(JsonValue::String(id)) = block.artifact {
+                        result.artifacts = vec![id];
+                    } else if let Some(JsonValue::Array(artifacts)) = block.artifact {
+                        result.artifacts = artifacts
+                            .iter()
+                            .filter_map(JsonValue::as_str)
+                            .map(str::to_string)
+                            .collect();
+                    }
+                    return Ok(Some(result));
+                }
+            }
+        }
+        let interrupted = run.events.iter().any(|event| {
+            event.event == "tool.failed"
+                && event.data.get("error_code").and_then(JsonValue::as_str)
+                    == Some("interrupted_effect")
+                && event.data.get("tool_call_id").and_then(JsonValue::as_str) == Some(tool_call_id)
+        });
+        if interrupted {
+            return Ok(Some(ToolResult::failure(
+                "interrupted_effect",
+                "effect interrupted by restart",
+            )));
+        }
+        Err(EventCommitError::Corrupt(
+            "durable tool output is missing a canonical result payload".to_string(),
+        ))
+    }
+
+    /// Persist one provider step (assistant message + model.completed) before
+    /// live visibility. Completed provider responses are replayed when a
+    /// durable response already exists. The store lock is not held across
+    /// SQLite/worker IO; GET sees the old snapshot until durable success.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_provider_step(
+        &self,
+        run_id: &str,
+        turn: u64,
+        blocks: &[LlmContentBlock],
+        usage: Option<&crate::domain::Usage>,
+        finish_reason: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+        parent_message_id: Option<&str>,
+    ) -> Result<ProviderCommitOutcome, EventCommitError> {
+        self.commit_provider_step_with_meta(
+            run_id,
+            turn,
+            blocks,
+            usage,
+            finish_reason,
+            provider,
+            model,
+            parent_message_id,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_provider_step_with_meta(
+        &self,
+        run_id: &str,
+        turn: u64,
+        blocks: &[LlmContentBlock],
+        usage: Option<&crate::domain::Usage>,
+        finish_reason: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+        _parent_message_id: Option<&str>,
+        truncated: Option<bool>,
+        reasoning: Option<&JsonValue>,
+    ) -> Result<ProviderCommitOutcome, EventCommitError> {
+        crate::durable_provider::validate_provider_blocks(blocks)?;
+        let _serial = self.inner.commit_gate.lock();
+        let event_id = durable_provider_event_id(run_id, turn, "model.completed");
+        let message_id = durable_message_id(run_id, "turn", &turn.to_string());
+        let content = encode_message_content(blocks);
+        let encoded_blocks = decode_message_blocks(&content);
+        crate::durable_provider::validate_provider_blocks(&encoded_blocks)?;
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("turn".to_string(), json!(turn));
+        if let Some(usage) = usage {
+            metadata.insert(
+                "usage".to_string(),
+                json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens,
+                }),
+            );
+        }
+        if let Some(provider) = provider.filter(|value| !value.is_empty()) {
+            metadata.insert("provider".to_string(), json!(provider));
+        }
+        if let Some(model) = model.filter(|value| !value.is_empty()) {
+            metadata.insert("model".to_string(), json!(model));
+        }
+        if let Some(truncated) = truncated {
+            metadata.insert("truncated".to_string(), json!(truncated));
+        }
+        if let Some(reasoning) = reasoning {
+            metadata.insert("reasoning".to_string(), reasoning.clone());
+        }
+        let metadata = JsonValue::Object(metadata);
+        let reserved = {
+            let store = self.inner.store.read();
+            let Some(run) = store.runs.get(run_id) else {
+                return Err(EventCommitError::Terminal);
+            };
+            if run.events.iter().any(|event| event.event_id == event_id) {
+                return existing_provider_commit(&store, run, &message_id);
+            }
+            if run.status == "cancelled" {
+                return Err(EventCommitError::Cancelled);
+            }
+            if run_refuses_pending_provider(run) {
+                return Err(EventCommitError::Terminal);
+            }
+            let session_id = run.session_id.clone();
+            let parent_message_id = store
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.messages.last().map(|message| message.id.clone()));
+            let mut event = event_candidate(
+                run,
+                "model.completed",
+                json!({
+                    "turn": turn,
+                    "finish_reason": finish_reason.unwrap_or(""),
+                    "provider": provider.unwrap_or(""),
+                    "model": model.unwrap_or(""),
+                }),
+                self.inner.config.max_event_bytes,
+            );
+            event.event_id = event_id.clone();
+            let ordinal = store.sessions.get(&session_id).map(next_message_ordinal);
+            let message = SessionMessage {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                role: "assistant".to_string(),
+                content: content.clone(),
+                created_at: timestamp(),
+                run_id: Some(run_id.to_string()),
+                finish_reason: finish_reason.map(str::to_string),
+                name: None,
+                tool_call_id: None,
+                parent_message_id: parent_message_id.clone(),
+                token_estimate: usage.map(|usage| usage.total_tokens as i64),
+                metadata: metadata.clone(),
+                ordinal,
+            };
+            let payload = json!({
+                "run_id": run_id,
+                "session_id": session_id,
+                "event_id": event_id,
+                "event_type": "model.completed",
+                "payload_json": serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()),
+                "now_ms": timestamp(),
+                "max_events": self.inner.config.max_events_per_run,
+                "message_id": message_id,
+                "role": "assistant",
+                "content_json": serde_json::to_string(&content).unwrap_or_else(|_| "[]".to_string()),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": parent_message_id.unwrap_or_default(),
+                "token_estimate": usage.map(|usage| usage.total_tokens as i64).unwrap_or(0),
+                "metadata_json": serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string()),
+                "finish_reason": finish_reason.unwrap_or(""),
+                "seq": event.seq,
+                "ordinal": ordinal.unwrap_or(0),
+            });
+            ReservedCommit {
+                event,
+                message: Some(message),
+                persist_payload: payload,
+                kind: PersistKind::Step,
+                max_events_per_run: self.inner.config.max_events_per_run,
+            }
+        };
+        let envelope = crate::durable_provider::reconstruct_provider_envelope(
+            &content,
+            &metadata,
+            finish_reason,
+        )?;
+        persist_and_apply(
+            &self.inner.store,
+            self.inner.persistence.as_deref(),
+            reserved,
+        )?;
+        Ok(ProviderCommitOutcome::Inserted(ProviderCommit {
+            message_id,
+            envelope,
+        }))
+    }
+
+    /// Persist a sanitized provider request boundary (`model.requested`).
+    ///
+    /// Fresh request (no existing boundary for this turn): persist exactly one
+    /// row whose `attempt` is the logical provider attempt about to run
+    /// (normally 1). Same-turn retry must not call this again — reuse the
+    /// existing row so request-boundary ids never conflict. Never stores
+    /// request/messages/prompt/provider_options/api_key/headers/body.
+    pub fn commit_provider_request(
+        &self,
+        run_id: &str,
+        turn: u64,
+        attempt: u64,
+        request_is_idempotent: bool,
+        request: &JsonValue,
+    ) -> Result<(), EventCommitError> {
+        let event_id = durable_provider_event_id(run_id, turn, "model.requested");
+        let mut payload = json!({
+            "turn": turn,
+            "attempt": attempt,
+            "request_fingerprint": crate::durable_provider::canonical_provider_request_fingerprint(request),
+            "retry_safe": request_is_idempotent,
+        });
+        if let JsonValue::Object(map) = &mut payload {
+            for key in SECRET_PROVIDER_REQUEST_KEYS {
+                map.remove(*key);
+            }
+        }
+        self.persist_provider_event(run_id, &event_id, "model.requested", payload)
+    }
+
+    /// Inspect durable provider-request state. Retry does not call the inner
+    /// provider or synthesize an assistant step; Interrupted fail-closes.
+    /// `request` is the current sanitized canonical request; its fingerprint
+    /// must match the stored digest before Retry is allowed.
+    pub fn recover_pending_provider(
+        &self,
+        run_id: &str,
+        turn: u64,
+        request: &JsonValue,
+    ) -> Result<ProviderPendingDecision, EventCommitError> {
+        let decision = self.provider_pending_decision(run_id, turn, request);
+        match decision {
+            ProviderPendingDecision::Replay
+            | ProviderPendingDecision::RefusedTerminal
+            | ProviderPendingDecision::Retry => Ok(decision),
+            ProviderPendingDecision::Interrupted => {
+                self.persist_interrupted_provider(run_id, turn)?;
+                Ok(ProviderPendingDecision::Interrupted)
+            }
+        }
+    }
+
+    pub fn provider_pending_decision(
+        &self,
+        run_id: &str,
+        turn: u64,
+        request: &JsonValue,
+    ) -> ProviderPendingDecision {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return ProviderPendingDecision::Interrupted;
+        };
+        let requested_id = durable_provider_event_id(run_id, turn, "model.requested");
+        let completed_id = durable_provider_event_id(run_id, turn, "model.completed");
+        let interrupted_id = durable_provider_event_id(run_id, turn, "interrupted_provider");
+        let requested = run
+            .events
+            .iter()
+            .find(|event| event.event_id == requested_id);
+        let has_completed = run
+            .events
+            .iter()
+            .any(|event| event.event_id == completed_id);
+        if has_completed {
+            return ProviderPendingDecision::Replay;
+        }
+        let has_terminal_failure = run.events.iter().any(|event| {
+            event.event_id == interrupted_id
+                || (event.event == "model.failed"
+                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn)
+                    && !provider_failure_is_retryable(event))
+        });
+        if has_terminal_failure {
+            return ProviderPendingDecision::Interrupted;
+        }
+        if run_refuses_pending_provider(run) {
+            return ProviderPendingDecision::RefusedTerminal;
+        }
+        let Some(requested) = requested else {
+            return ProviderPendingDecision::Interrupted;
+        };
+        let retry_safe = requested
+            .data
+            .get("retry_safe")
+            .and_then(JsonValue::as_bool)
+            .or_else(|| {
+                requested
+                    .data
+                    .get("idempotent")
+                    .and_then(JsonValue::as_bool)
+            });
+        let stored_fingerprint = requested
+            .data
+            .get("request_fingerprint")
+            .and_then(JsonValue::as_str);
+        let current_fingerprint =
+            crate::durable_provider::canonical_provider_request_fingerprint(request);
+        let fingerprint_ok = stored_fingerprint == Some(current_fingerprint.as_str())
+            && current_fingerprint.starts_with("sha256:");
+        let secret_leak = requested_payload_leaks_secrets(&requested.data);
+        if retry_safe != Some(true) || !fingerprint_ok || secret_leak {
+            return ProviderPendingDecision::Interrupted;
+        }
+        let request_seq = requested.seq;
+        let has_effect = run
+            .events
+            .iter()
+            .any(|event| event.seq > request_seq && event.event.starts_with("tool."));
+        let retryable_failures = run
+            .events
+            .iter()
+            .filter(|event| {
+                event.event == "model.failed"
+                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn)
+                    && provider_failure_is_retryable(event)
+            })
+            .count() as u64;
+        let has_durable_response = false;
+        if provider_pending_may_retry(has_durable_response, true, has_effect)
+            && retryable_failures <= PROVIDER_RETRY_BUDGET
+        {
+            ProviderPendingDecision::Retry
+        } else {
+            ProviderPendingDecision::Interrupted
+        }
+    }
+
+    fn persist_interrupted_provider(
+        &self,
+        run_id: &str,
+        turn: u64,
+    ) -> Result<(), EventCommitError> {
+        let event_id = durable_provider_event_id(run_id, turn, "interrupted_provider");
+        let payload = json!({
+            "turn": turn,
+            "error_code": "interrupted_provider",
+            "retryable": false,
+        });
+        self.persist_provider_event(run_id, &event_id, "model.failed", payload)
+    }
+
+    pub(crate) fn has_provider_request(&self, run_id: &str, turn: u64) -> bool {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return false;
+        };
+        let event_id = durable_provider_event_id(run_id, turn, "model.requested");
+        run.events.iter().any(|event| event.event_id == event_id)
+    }
+
+    /// Next logical provider attempt for `turn`: one past the highest durable
+    /// `model.failed.attempt`, or 1 when no failure has been recorded.
+    pub(crate) fn next_provider_attempt(&self, run_id: &str, turn: u64) -> u64 {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return 1;
+        };
+        let max_attempt = run
+            .events
+            .iter()
+            .filter(|event| {
+                event.event == "model.failed"
+                    && event.data.get("turn").and_then(JsonValue::as_u64) == Some(turn)
+            })
+            .filter_map(|event| event.data.get("attempt").and_then(JsonValue::as_u64))
+            .max()
+            .unwrap_or(0);
+        max_attempt.saturating_add(1)
+    }
+
+    pub(crate) fn persist_provider_failure(
+        &self,
+        run_id: &str,
+        turn: u64,
+        attempt: u64,
+        code: &str,
+        status: Option<u64>,
+        retryable: bool,
+    ) -> Result<(), EventCommitError> {
+        let event_id = durable_provider_event_id(run_id, turn, &format!("model.failed:{attempt}"));
+        let bounded_code = truncate_for_log(code, 64);
+        let mut payload = json!({
+            "turn": turn,
+            "attempt": attempt,
+            "error_code": bounded_code,
+            "retryable": retryable,
+        });
+        if let Some(status) = status {
+            payload["status"] = json!(status);
+        }
+        self.persist_provider_event(run_id, &event_id, "model.failed", payload)
+    }
+
+    pub(crate) fn replay_provider_envelope(
+        &self,
+        run_id: &str,
+        turn: u64,
+    ) -> Result<Option<JsonValue>, EventCommitError> {
+        let store = self.inner.store.read();
+        let Some(run) = store.runs.get(run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
+        let completed_id = durable_provider_event_id(run_id, turn, "model.completed");
+        let message_id = durable_message_id(run_id, "turn", &turn.to_string());
+        let completed = run
+            .events
+            .iter()
+            .find(|event| event.event_id == completed_id);
+        let message = store.sessions.get(&run.session_id).and_then(|session| {
+            session
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+        });
+        match (completed, message) {
+            (None, None) => Ok(None),
+            (Some(event), Some(message)) if message.role == "assistant" => {
+                let finish_reason = message
+                    .finish_reason
+                    .as_deref()
+                    .or_else(|| event.data.get("finish_reason").and_then(JsonValue::as_str));
+                crate::durable_provider::reconstruct_provider_envelope(
+                    &message.content,
+                    &message.metadata,
+                    finish_reason,
+                )
+                .map(Some)
+            }
+            _ => Err(EventCommitError::Corrupt(
+                "durable provider step is incomplete".to_string(),
+            )),
+        }
+    }
+
+    fn persist_provider_event(
+        &self,
+        run_id: &str,
+        event_id: &str,
+        event_type: &str,
+        payload: JsonValue,
+    ) -> Result<(), EventCommitError> {
+        let _serial = self.inner.commit_gate.lock();
+        let reserved = {
+            let store = self.inner.store.read();
+            let Some(run) = store.runs.get(run_id) else {
+                return Err(EventCommitError::Terminal);
+            };
+            if run.events.iter().any(|event| event.event_id == event_id) {
+                return Ok(());
+            }
+            if run.status == "cancelled" {
+                return Err(EventCommitError::Cancelled);
+            }
+            if run_refuses_pending_provider(run) {
+                return Err(EventCommitError::Terminal);
+            }
+            let session_id = run.session_id.clone();
+            let max_event_bytes = self.inner.config.max_event_bytes;
+            let max_events = self.inner.config.max_events_per_run;
+            let mut event = event_candidate(run, event_type, payload, max_event_bytes);
+            event.event_id = event_id.to_string();
+            let persist_payload = json!({
+                "run_id": run_id,
+                "session_id": session_id,
+                "event_id": event_id,
+                "event_type": event_type,
+                "payload_json": serde_json::to_string(&event.data)
+                    .unwrap_or_else(|_| "{}".to_string()),
+                "now_ms": timestamp(),
+                "max_events": max_events,
+                "seq": event.seq,
+            });
+            ReservedCommit {
+                event,
+                message: None,
+                persist_payload,
+                kind: PersistKind::EventAppend,
+                max_events_per_run: max_events,
+            }
+        };
+        persist_and_apply(
+            &self.inner.store,
+            self.inner.persistence.as_deref(),
+            reserved,
+        )
     }
 
     fn native_dispatch_state(
@@ -603,20 +1615,56 @@ impl AgentService {
         run_id: &str,
         handle: &Arc<RunHandle>,
     ) -> Result<Option<Arc<NativeDispatchState>>, RunContextError> {
-        let mut slot = handle.native_dispatch.lock().expect("native dispatch lock");
-        if slot.closed {
-            return Ok(None);
+        loop {
+            let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
+            if matches!(*phase, NativeDispatchPhase::Closed(_)) {
+                return Ok(None);
+            }
+            if let NativeDispatchPhase::Ready(state) = &*phase {
+                return Ok(Some(Arc::clone(state)));
+            }
+            if matches!(*phase, NativeDispatchPhase::Initializing) {
+                drop(
+                    handle
+                        .native_dispatch_cv
+                        .wait(phase)
+                        .expect("native dispatch condvar"),
+                );
+                continue;
+            }
+            *phase = NativeDispatchPhase::Initializing;
+            break;
         }
-        if let Some(existing) = slot.state.as_ref() {
-            return Ok(Some(Arc::clone(existing)));
+        let mut guard = NativeDispatchInitGuard::arm(handle);
+        let observer = self
+            .inner
+            .native_dispatch_init_entered
+            .lock()
+            .expect("native dispatch init observer lock")
+            .clone();
+        if let Some(observer) = observer {
+            observer();
         }
-        let created = Arc::new(self.build_native_dispatch_state(run_id, handle)?);
-        if slot.closed {
-            drop(slot);
-            return Ok(None);
+        let built = self.build_native_dispatch_state(run_id, handle);
+        match built {
+            Ok(state) => {
+                let state = Arc::new(state);
+                let mut phase = handle.native_dispatch.lock().expect("native dispatch lock");
+                if matches!(*phase, NativeDispatchPhase::Initializing) {
+                    *phase = NativeDispatchPhase::Ready(Arc::clone(&state));
+                    handle.native_dispatch_cv.notify_all();
+                    guard.disarm();
+                    Ok(Some(state))
+                } else {
+                    handle.native_dispatch_cv.notify_all();
+                    guard.disarm();
+                    drop(phase);
+                    drop(state);
+                    Ok(None)
+                }
+            }
+            Err(error) => Err(error),
         }
-        slot.state = Some(Arc::clone(&created));
-        Ok(Some(created))
     }
 
     fn build_native_dispatch_state(
@@ -673,9 +1721,17 @@ impl AgentService {
             .and_then(JsonValue::as_u64)
             .ok_or_else(|| invalid_context_metadata(run_id, "max_tool_output_bytes is missing"))?
             as usize;
-        let file_config = FileToolConfig::for_workspace(&workspace);
-        let process_config = ProcessToolConfig::for_workspace(&workspace);
-        let mut files = FileTools::new(file_config)
+        let output_cap = max_tool_output_bytes.clamp(1, MAX_TOOL_OUTPUT_BYTES);
+        let mut file_config = FileToolConfig::for_workspace(&workspace);
+        file_config.apply_admitted_output_cap(output_cap);
+        let mut process_config = ProcessToolConfig::for_workspace(&workspace);
+        process_config.apply_admitted_output_cap(output_cap);
+        let artifacts = self
+            .inner
+            .artifact_stores
+            .get_or_open(file_config.artifact_store.clone())
+            .map_err(|error| artifact_init_error(run_id, &error))?;
+        let mut files = FileTools::with_artifact_store(file_config, artifacts)
             .map_err(|error| invalid_context_metadata(run_id, &error))?
             .with_owner(ArtifactOwner::from(owner.clone()));
         if let Some(observer) = self
@@ -713,18 +1769,24 @@ impl AgentService {
             handle: Arc::downgrade(handle),
             max_event_bytes: self.inner.config.max_event_bytes,
             max_events_per_run: self.inner.config.max_events_per_run,
+            commit_gate: Arc::clone(&self.inner.commit_gate),
+            service: Arc::downgrade(&self.inner),
         });
         let dispatcher = DispatchContext::new(
             owner,
             workspace,
-            handle.tool_cancel.clone(),
-            handle.started_at + self.inner.config.run_timeout,
+            handle.cancel.token(),
+            handle.cancel.deadline_instant().unwrap_or_else(|| {
+                Instant::now()
+                    .checked_add(self.inner.config.run_timeout)
+                    .unwrap_or_else(Instant::now)
+            }),
             registry,
             expected.to_string(),
             toolset_hash,
             DispatchLimits {
                 max_tool_calls,
-                max_tool_output_bytes,
+                max_tool_output_bytes: output_cap,
                 max_event_bytes: self.inner.config.max_event_bytes,
             },
             events,
@@ -735,6 +1797,22 @@ impl AgentService {
             }),
         )
         .map_err(|error| invalid_context_metadata(run_id, &error))?;
+        if let Some(release) = self
+            .inner
+            .uncooperative_dispatch
+            .lock()
+            .expect("uncooperative dispatch lock")
+            .clone()
+        {
+            let holder = dispatcher.clone();
+            thread::spawn(move || {
+                let _guard = holder.lock_serial();
+                while !release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+            thread::sleep(Duration::from_millis(5));
+        }
         Ok(NativeDispatchState {
             dispatcher,
             files,
@@ -746,6 +1824,7 @@ impl AgentService {
                 .lock()
                 .expect("native dispatch shutdown observer lock")
                 .clone(),
+            cleanup_grace: self.inner.config.cancellation_grace,
         })
     }
 
@@ -753,6 +1832,221 @@ impl AgentService {
     pub fn native_dispatch_retained(&self, run_id: &str) -> bool {
         self.handle(run_id)
             .is_some_and(|handle| handle.native_dispatch_retained())
+    }
+
+    /// True when native dispatch for `run_id` is sticky-closed.
+    pub fn native_dispatch_closed(&self, run_id: &str) -> bool {
+        self.handle(run_id)
+            .is_some_and(|handle| handle.native_dispatch_closed())
+    }
+
+    /// Live process-owner residue for `run_id`, or 0 after cleanup/close.
+    pub fn process_owner_count(&self, run_id: &str) -> usize {
+        let Some(handle) = self.handle(run_id) else {
+            return 0;
+        };
+        let Ok(phase) = handle.native_dispatch.lock() else {
+            return 0;
+        };
+        match &*phase {
+            NativeDispatchPhase::Ready(state) => {
+                let owner = ProcessOwner::from(state.dispatcher.owner().clone());
+                state.table.owner_count(&owner)
+            }
+            NativeDispatchPhase::Closed(Some(closed)) => closed.table.owner_count(&closed.owner),
+            NativeDispatchPhase::Empty
+            | NativeDispatchPhase::Initializing
+            | NativeDispatchPhase::Closed(None) => 0,
+        }
+    }
+
+    /// OS PIDs retained for `run_id`, including draining residue after close.
+    pub fn process_owner_pids(&self, run_id: &str) -> Vec<u32> {
+        let Some(handle) = self.handle(run_id) else {
+            return Vec::new();
+        };
+        let Ok(phase) = handle.native_dispatch.lock() else {
+            return Vec::new();
+        };
+        match &*phase {
+            NativeDispatchPhase::Ready(state) => {
+                let owner = ProcessOwner::from(state.dispatcher.owner().clone());
+                state.table.owner_pids(&owner)
+            }
+            NativeDispatchPhase::Closed(Some(closed)) => closed.table.owner_pids(&closed.owner),
+            NativeDispatchPhase::Empty
+            | NativeDispatchPhase::Initializing
+            | NativeDispatchPhase::Closed(None) => Vec::new(),
+        }
+    }
+
+    fn cleanup_run_hosts(&self, handle: &RunHandle) -> CleanupOutcome {
+        handle.release_native_dispatch()
+    }
+
+    async fn commit_cleanup_or_continue(&self, run_id: &str, handle: &RunHandle) -> bool {
+        match self.cleanup_run_hosts(handle) {
+            CleanupOutcome::Clean => true,
+            CleanupOutcome::Timeout => {
+                self.finish_failed(
+                    run_id,
+                    failed_payload_with_code(
+                        "cleanup_timeout",
+                        "native dispatcher or process cleanup exceeded grace".into(),
+                    ),
+                )
+                .await;
+                false
+            }
+            CleanupOutcome::Failed => {
+                self.finish_failed(
+                    run_id,
+                    failed_payload_with_code(
+                        "cleanup_failed",
+                        "native dispatcher or process cleanup failed".into(),
+                    ),
+                )
+                .await;
+                false
+            }
+        }
+    }
+
+    fn cached_agent_runner(&self, source: &str) -> Result<AgentRunner, String> {
+        let expected = self.effective_agent_config();
+        let digest = agent_source_digest(source);
+        let mut cache = self.inner.runner.lock().expect("runner cache lock");
+        if let Some(cached) = cache.as_ref()
+            && cached.source_digest == digest
+            && cached.config == expected
+        {
+            return Ok(cached.runner.clone());
+        }
+        let runner = AgentRunner::from_source(source, expected.clone())
+            .map_err(|error| error.to_string())?;
+        *cache = Some(CachedAgentRunner {
+            source_digest: digest,
+            config: expected,
+            runner: runner.clone(),
+        });
+        Ok(runner)
+    }
+
+    fn effective_agent_config(&self) -> AgentConfig {
+        AgentConfig {
+            http: self.inner.http_config.clone(),
+            sqlite: self.inner.config.sqlite.clone(),
+            fuel: self.inner.config.fuel,
+        }
+    }
+
+    /// Install a precompiled runner so workers do not recompile the agent source.
+    pub fn install_agent_runner(&self, runner: AgentRunner) {
+        let digest = self
+            .inner
+            .agent_source
+            .as_ref()
+            .map(|source| agent_source_digest(source))
+            .unwrap_or(0);
+        *self.inner.runner.lock().expect("runner cache lock") = Some(CachedAgentRunner {
+            source_digest: digest,
+            config: runner.config().clone(),
+            runner,
+        });
+    }
+
+    /// Drops the live handle so `run_worker` must restore cancellation from
+    /// frozen context metadata (restart seam).
+    pub fn evict_run_handle(&self, run_id: &str) {
+        self.inner.runs.lock().expect("runs lock").remove(run_id);
+    }
+
+    /// Test seam: overwrite frozen context deadline for overflow restore tests.
+    pub fn set_context_deadline_at_ms(&self, run_id: &str, deadline_at_ms: u64) {
+        if let Some(context) = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get_mut(run_id)
+            && let Some(metadata) = context.metadata.as_object_mut()
+        {
+            metadata.insert(
+                "deadline_at_ms".to_string(),
+                JsonValue::from(deadline_at_ms.to_string()),
+            );
+        }
+    }
+
+    fn restore_handle_from_frozen_context(&self, run_id: &str) -> Option<Arc<RunHandle>> {
+        let status = {
+            let store = self.inner.store.read();
+            store.runs.get(run_id)?.status.clone()
+        };
+        if !matches!(status.as_str(), "started" | "stopping") {
+            return None;
+        }
+        let context = self.run_context(run_id)?;
+        let deadline_at_ms = context.metadata.get("deadline_at_ms").and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        })?;
+        let cancel = RunCancellation::from_wall_deadline_ms(deadline_at_ms, timestamp());
+        let prompt = context.coding_system_prompt.clone().unwrap_or_default();
+        let handle = Arc::new(RunHandle {
+            tool_cancel: cancel.token(),
+            cancel,
+            terminal_at: Mutex::new(None),
+            permit: Mutex::new(None),
+            terminal: AtomicBool::new(false),
+            cancel_reason: Mutex::new(None),
+            subscribers: Mutex::new(SubscriberState {
+                count: 0,
+                notified: false,
+            }),
+            disconnect_policy: self.inner.config.client_disconnect_policy,
+            started_at: Instant::now(),
+            native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
+            native_dispatch_cv: Condvar::new(),
+            coding_system_prompt: Arc::from(prompt),
+            occupancy: AtomicBool::new(false),
+        });
+        self.inner
+            .runs
+            .lock()
+            .expect("runs lock")
+            .insert(run_id.to_string(), Arc::clone(&handle));
+        if status == "stopping" {
+            handle.request_user_stop();
+        }
+        Some(handle)
+    }
+
+    /// Shared owner-scoped artifact store for an initialized run, if any.
+    pub fn native_artifact_store(&self, run_id: &str) -> Option<Arc<ArtifactStore>> {
+        let handle = self.handle(run_id)?;
+        let phase = handle.native_dispatch.lock().ok()?;
+        match &*phase {
+            NativeDispatchPhase::Ready(state) => Some(state.files.artifact_store_arc()),
+            NativeDispatchPhase::Empty
+            | NativeDispatchPhase::Initializing
+            | NativeDispatchPhase::Closed(_) => None,
+        }
+    }
+
+    /// Test seam: later native dispatch construction invokes `observer` after
+    /// releasing the slot lock and before FileTools/ArtifactStore IO.
+    pub fn inject_native_dispatch_init_entered_observer(
+        &self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .inner
+            .native_dispatch_init_entered
+            .lock()
+            .expect("native dispatch init observer lock") = Some(observer);
     }
 
     /// Test seam: later native `search_files` walks invoke `observer` when they
@@ -774,6 +2068,17 @@ impl AgentService {
             .native_dispatch_shutdown
             .lock()
             .expect("native dispatch shutdown observer lock") = Some(observer);
+    }
+
+    /// Test seam: later coding-prompt guidance reads invoke `observer` after
+    /// admission has cloned prompt inputs and released the store lock, and
+    /// before any `ConfinedFsRoot` filesystem IO.
+    pub fn inject_prompt_read_entered_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .prompt_read_entered
+            .lock()
+            .expect("prompt read observer lock") = Some(observer);
     }
 
     /// Drops native dispatch state and cleans processes/artifacts for every
@@ -1119,10 +2424,16 @@ impl AgentService {
             id: message_id.clone(),
             session_id: session_id.clone(),
             role: "user".to_string(),
-            content: request.input.clone(),
+            content: decode_message_content(&request.input),
             created_at: now,
             run_id: Some(run_id.clone()),
             finish_reason: None,
+            name: None,
+            tool_call_id: None,
+            parent_message_id: None,
+            token_estimate: None,
+            metadata: JsonValue::Null,
+            ordinal: None,
         };
         let mut context_messages = store
             .sessions
@@ -1142,7 +2453,41 @@ impl AgentService {
             provider: effective_provider.clone(),
             system_prompt: effective_system_prompt.clone(),
         };
-        let context = self.make_admitted_context(&context_input, &snapshot);
+        let date = self.inner.date_source.read().current_date();
+        let platform = std::env::consts::OS.to_string();
+        let arch = std::env::consts::ARCH.to_string();
+        let workspace_root = snapshot.limits.workspace_root.clone();
+        let tool_descriptors = snapshot.registry.descriptors().to_vec();
+        let run_limits = snapshot.limits.clone();
+        drop(store);
+
+        let prompt_read_observer = self
+            .inner
+            .prompt_read_entered
+            .lock()
+            .expect("prompt read observer lock")
+            .clone();
+        if let Some(observer) = prompt_read_observer {
+            observer();
+        }
+
+        let coding_system_prompt = build_coding_prompt(
+            &workspace_root,
+            &tool_descriptors,
+            &run_limits,
+            &date,
+            &platform,
+            &arch,
+            CodingPromptBudgets::default(),
+        )
+        .map_err(|error| {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Invalid);
+            AdmitError::Invalid(error.to_string())
+        })?;
+        let context =
+            self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
         let persisted_input = persisted_run_context_json(&context)?;
         let provider = effective_provider.clone().unwrap_or_default();
         let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
@@ -1199,7 +2544,6 @@ impl AgentService {
             "expires_at_ms": 0,
         });
 
-        drop(store);
         let durable = match self.inner.persistence.as_ref() {
             Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
                 self.inner
@@ -1233,6 +2577,20 @@ impl AgentService {
             &run_id,
         )? {
             return Ok(replayed);
+        }
+        if !session_new && !store.sessions.contains_key(&session_id) {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::SessionNotFound);
+            return Err(AdmitError::SessionNotFound);
+        }
+        if let Some(parent_run_id) = request.parent_run_id.as_deref()
+            && !store.runs.contains_key(parent_run_id)
+        {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::ParentNotFound);
+            return Err(AdmitError::ParentNotFound);
         }
         self.inner.store_generation.fetch_add(1, Ordering::Release);
         if session_new {
@@ -1293,8 +2651,10 @@ impl AgentService {
             );
         }
 
+        let cancel = RunCancellation::with_timeout(self.inner.config.run_timeout);
         let handle = Arc::new(RunHandle {
-            cancel: RunCancellation::with_timeout(self.inner.config.run_timeout),
+            tool_cancel: cancel.token(),
+            cancel,
             terminal_at: Mutex::new(None),
             permit: Mutex::new(Some(capacity_permit)),
             terminal: AtomicBool::new(false),
@@ -1305,11 +2665,10 @@ impl AgentService {
             }),
             disconnect_policy: self.inner.config.client_disconnect_policy,
             started_at: Instant::now(),
-            tool_cancel: CancellationToken::new(),
-            native_dispatch: Mutex::new(NativeDispatchSlot {
-                closed: false,
-                state: None,
-            }),
+            native_dispatch: Mutex::new(NativeDispatchPhase::Empty),
+            native_dispatch_cv: Condvar::new(),
+            coding_system_prompt: Arc::from(coding_system_prompt),
+            occupancy: AtomicBool::new(false),
         });
         self.inner
             .runs
@@ -1484,12 +2843,20 @@ impl AgentService {
             .ok_or_else(|| {
                 invalid_context_metadata(&context.run_id, "admitted message is missing")
             })?;
-        serde_json::to_value(&session.messages[..=cutoff]).map_err(|error| {
+        let mut messages = serde_json::to_value(&session.messages[..=cutoff]).map_err(|error| {
             invalid_context_metadata(
                 &context.run_id,
                 &format!("session messages could not be reconstructed: {error}"),
             )
-        })
+        })?;
+        if let Some(items) = messages.as_array_mut() {
+            for item in items {
+                if let Some(object) = item.as_object_mut() {
+                    object.remove("ordinal");
+                }
+            }
+        }
+        Ok(messages)
     }
 
     /// Registers one live SSE subscriber against an active run's handle and
@@ -1693,13 +3060,25 @@ impl AgentService {
     pub async fn run_worker(self: Arc<Self>, run_id: String, _input: String) {
         tokio::task::yield_now().await;
         let Some(handle) = self
-            .inner
-            .runs
-            .lock()
-            .expect("runs lock")
-            .get(&run_id)
-            .cloned()
+            .handle(&run_id)
+            .or_else(|| self.restore_handle_from_frozen_context(&run_id))
         else {
+            return;
+        };
+        if handle.cancel.has_deadline_overflow() {
+            if self.commit_cleanup_or_continue(&run_id, &handle).await {
+                self.finish_failed(
+                    &run_id,
+                    failed_payload_with_code(
+                        "invalid_deadline",
+                        "persisted run deadline overflowed Instant arithmetic".into(),
+                    ),
+                )
+                .await;
+            }
+            return;
+        }
+        let Some(_occupancy) = try_occupy_run(&handle) else {
             return;
         };
         let session_id = {
@@ -1709,12 +3088,39 @@ impl AgentService {
             };
             run.session_id.clone()
         };
+        let cancellation = handle.cancel.clone();
+
+        if let Some(reason) = cancellation.requested() {
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
+            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, reason.as_str()))
+                .await;
+            return;
+        }
+        if cancellation.deadline_passed()
+            || cancellation
+                .remaining_deadline()
+                .is_some_and(|remaining| remaining.is_zero())
+        {
+            cancellation.request(CancellationReason::Deadline);
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
+            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "deadline"))
+                .await;
+            return;
+        }
+
         if let Err(error) = self.verify_run_context(&run_id) {
             tracing::error!(
                 run_id = %run_id,
                 error = %error,
                 "run context verification failed before RSS execution"
             );
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
             self.finish_failed(
                 &run_id,
                 json!({
@@ -1726,19 +3132,46 @@ impl AgentService {
             .await;
             return;
         }
-        let cancellation = handle.cancel.clone();
-
-        if cancellation.requested().is_some() {
-            self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
-                .await;
-            return;
-        }
 
         let output_text = if let Some(source) = self.inner.agent_source.clone() {
-            let http_config = self.inner.http_config.clone();
-            let sqlite_policy = self.inner.config.sqlite.clone();
-            let run_timeout = self.inner.config.run_timeout;
             let context = self.build_run_context(&run_id);
+            let dispatcher = match self.native_dispatch_state(&run_id, &handle) {
+                Ok(Some(state)) => Some(Arc::new(state.dispatcher.clone())),
+                Ok(None) => None,
+                Err(error) => {
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
+                    self.finish_failed(&run_id, failed_payload(error.to_string()))
+                        .await;
+                    return;
+                }
+            };
+            let raw_provider = self
+                .inner
+                .provider_host
+                .lock()
+                .expect("provider host lock")
+                .take()
+                .unwrap_or_else(crate::runtime::rss_runner::default_agent_provider_host);
+            let accounted = Arc::new(crate::durable_provider::AccountingProvider::new(
+                raw_provider,
+                Arc::clone(&self.inner.metrics),
+            ));
+            let provider = Some(Arc::new(crate::durable_provider::DurableProviderHost::new(
+                AgentService::clone(self.as_ref()),
+                run_id.clone(),
+                accounted,
+                Arc::clone(&self.inner.metrics),
+            )) as Arc<dyn AgentProviderHost>);
+            let host = AgentHostBridges {
+                provider,
+                dispatcher,
+                cancellation: Some(cancellation.clone()),
+                sleeps: Default::default(),
+                skip_sleep: false,
+                metrics: Some(Arc::clone(&self.inner.metrics)),
+            };
             // One bounded delivery path: the worker blocks on this channel
             // when the delivery task is busy, which pauses invocation polling
             // (backpressure). The delivery task validates, sequences, appends
@@ -1751,30 +3184,42 @@ impl AgentService {
                     persistence: self.inner.persistence.clone(),
                     config: Arc::clone(&self.inner.config),
                     metrics: Arc::clone(&self.inner.metrics),
+                    commit_gate: Arc::clone(&self.inner.commit_gate),
                 },
                 run_id.clone(),
                 receiver,
             ));
             let mut sink = ChannelEventSink(sender);
             let run_cancellation = cancellation.clone();
+            let runner = match self.cached_agent_runner(source.as_ref()) {
+                Ok(runner) => runner,
+                Err(error) => {
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
+                    self.finish_failed(
+                        &run_id,
+                        failed_payload(format!("compile RSS run source: {error}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let mut worker = tokio::task::spawn_blocking(move || {
-                execute_rss_source(
-                    &source,
-                    http_config,
-                    sqlite_policy,
+                runner.with_host(host).run_with_context_and_events(
                     context,
                     &mut sink,
                     &run_cancellation,
                 )
             });
-            let outcome = match tokio::time::timeout(run_timeout, &mut worker).await {
+            let remaining = cancellation
+                .remaining_deadline()
+                .unwrap_or(Duration::from_millis(1));
+            let outcome = match tokio::time::timeout(remaining, &mut worker).await {
                 Ok(Ok(Ok(value))) => WorkerOutcome::Completed(value),
                 Ok(Ok(Err(error))) => WorkerOutcome::from_run_error(error),
                 Ok(Err(error)) => WorkerOutcome::Failed(format!("RSS worker join failed: {error}")),
                 Err(_) => {
-                    // The timeout is authoritative: cancel with the typed
-                    // deadline reason and wait only the configured grace for
-                    // worker exit.
                     tracing::warn!(
                         run_id,
                         reason = "deadline",
@@ -1797,14 +3242,28 @@ impl AgentService {
                     .ok()
                     .and_then(|result| result.ok())
                     .unwrap_or_default();
+            if self
+                .inner
+                .provider_commit_crashed
+                .swap(false, Ordering::SeqCst)
+            {
+                self.cleanup_run_hosts(&handle);
+                return;
+            }
             match outcome {
                 WorkerOutcome::Completed(value) => {
                     if let Some(reason) = delivery_outcome.schema_violation {
+                        if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                            return;
+                        }
                         self.finish_failed(&run_id, events::schema_violation_error(&reason))
                             .await;
                         return;
                     }
                     if delivery_outcome.persist_failed {
+                        if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                            return;
+                        }
                         self.finish_failed(
                             &run_id,
                             json!({
@@ -1816,17 +3275,40 @@ impl AgentService {
                         .await;
                         return;
                     }
-                    vm_value_to_json(&value).to_string()
+                    match interpret_loop_decision(&value, &cancellation) {
+                        WorkerOutcome::Completed(value) => completed_output_text(&value),
+                        WorkerOutcome::Cancelled(core_reason) => {
+                            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                                return;
+                            }
+                            self.finish_cancelled(
+                                &run_id,
+                                handle_cancel_reason(&handle, core_reason),
+                            )
+                            .await;
+                            return;
+                        }
+                        WorkerOutcome::Failed(error) => {
+                            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                                return;
+                            }
+                            self.finish_failed(&run_id, failed_payload(error)).await;
+                            return;
+                        }
+                    }
                 }
                 WorkerOutcome::Cancelled(core_reason) => {
-                    // Prefer the typed gateway reason recorded on the handle
-                    // (stop/halt/client disconnect); the core-derived string
-                    // is the fallback for worker-requested cancellations.
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
                     self.finish_cancelled(&run_id, handle_cancel_reason(&handle, core_reason))
                         .await;
                     return;
                 }
                 WorkerOutcome::Failed(error) => {
+                    if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                        return;
+                    }
                     self.finish_failed(&run_id, failed_payload(error)).await;
                     return;
                 }
@@ -1842,11 +3324,17 @@ impl AgentService {
         };
 
         if cancellation.requested().is_some() {
+            if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+                return;
+            }
             self.finish_cancelled(&run_id, handle_cancel_reason(&handle, "requested"))
                 .await;
             return;
         }
 
+        if !self.commit_cleanup_or_continue(&run_id, &handle).await {
+            return;
+        }
         self.finish_completed(&run_id, &session_id, &output_text)
             .await;
     }
@@ -1932,88 +3420,128 @@ impl AgentService {
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
         tokio::task::spawn_blocking(move || {
-            let mut store = service.inner.store.write();
+            let _serial = service.inner.commit_gate.lock();
             let persistence = service.persistence_handle();
-            let run_active = store
-                .runs
-                .get(&run_id_for_commit)
-                .is_some_and(|run| run.status == "started");
-            if !run_active {
-                return TerminalOutcome::NotActive;
-            }
-            let Some(session) = store.sessions.get_mut(&session_id_for_commit) else {
-                return TerminalOutcome::SessionMissing;
+            let reserved = {
+                let store = service.inner.store.read();
+                let Some(run) = store.runs.get(&run_id_for_commit) else {
+                    return TerminalOutcome::NotActive;
+                };
+                if run.status != "started" {
+                    return TerminalOutcome::NotActive;
+                }
+                let Some(session) = store.sessions.get(&session_id_for_commit) else {
+                    return TerminalOutcome::SessionMissing;
+                };
+                let provider_step_present = run
+                    .events
+                    .iter()
+                    .any(|event| event.event == "model.completed");
+                if provider_step_present {
+                    let completed_event = event_candidate(
+                        run,
+                        "run.completed",
+                        json!({
+                            "status": "completed",
+                            "output": {"text": output_text_for_commit},
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0
+                            }
+                        }),
+                        max_event_bytes,
+                    );
+                    (None, vec![completed_event])
+                } else {
+                    let ordinal = next_message_ordinal(session);
+                    let message = SessionMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id: session_id_for_commit.clone(),
+                        role: "assistant".to_string(),
+                        content: decode_message_content(&JsonValue::String(
+                            output_text_for_commit.clone(),
+                        )),
+                        created_at: timestamp(),
+                        run_id: Some(run_id_for_commit.clone()),
+                        finish_reason: Some("stop".to_string()),
+                        name: None,
+                        tool_call_id: None,
+                        parent_message_id: None,
+                        token_estimate: None,
+                        metadata: JsonValue::Null,
+                        ordinal: Some(ordinal),
+                    };
+                    let delta_event = event_candidate(
+                        run,
+                        "message.delta",
+                        json!({
+                            "message_id": message.id,
+                            "delta": output_text_for_commit,
+                            "role": "assistant"
+                        }),
+                        max_event_bytes,
+                    );
+                    let mut completed_event = event_candidate(
+                        run,
+                        "run.completed",
+                        json!({
+                            "status": "completed",
+                            "output": {"message": message},
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0
+                            }
+                        }),
+                        max_event_bytes,
+                    );
+                    completed_event.seq = delta_event.seq + 1;
+                    (Some(message), vec![delta_event, completed_event])
+                }
             };
-            let previous_session_updated = session.view.updated_at;
-            let message = append_message(
-                &mut session.view,
-                &mut session.messages,
-                "assistant",
-                JsonValue::String(output_text_for_commit.clone()),
-                Some(run_id_for_commit.clone()),
-                Some("stop".to_string()),
-            );
-            let run = store
-                .runs
-                .get_mut(&run_id_for_commit)
-                .expect("run was checked above");
-            let previous_status = run.status.clone();
-            let previous_events = run.events.len();
-            let delta_event = append_event_locked(
-                run,
-                "message.delta",
-                json!({"message_id":message.id, "delta":output_text_for_commit, "role":"assistant"}),
-                max_event_bytes,
-                max_events_per_run,
-            );
-            let completed_event = append_event_locked(
-                run,
-                "run.completed",
-                json!({"status":"completed", "output":{"message":message}, "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}),
-                max_event_bytes,
-                max_events_per_run,
-            );
-            run.status = "completed".to_string();
-            let durable = terminal_commit(
+            let (assistant_message, events) = reserved;
+            match terminal_commit(
                 persistence.as_deref(),
-                run,
+                &run_id_for_commit,
                 &session_id_for_commit,
                 "completed",
-                &[&delta_event, &completed_event],
-                Some(&message),
-            );
-            match durable {
-                Ok(()) => {
-                    if let Some(sender) = &run.sender {
-                        let _ = sender.send(delta_event);
-                        let _ = sender.send(completed_event);
+                &events,
+                assistant_message.as_ref(),
+            ) {
+                Ok(seqs) => {
+                    let mut store = service.inner.store.write();
+                    apply_terminal(
+                        &mut store,
+                        &run_id_for_commit,
+                        "completed",
+                        &events,
+                        &seqs,
+                        assistant_message.as_ref(),
+                        max_events_per_run,
+                    );
+                    let sender = store
+                        .runs
+                        .get(&run_id_for_commit)
+                        .and_then(|run| run.sender.clone());
+                    drop(store);
+                    if let Some(sender) = sender {
+                        for event in events {
+                            let _ = sender.send(event);
+                        }
                     }
                     TerminalOutcome::Committed
                 }
-                Err(error) => {
-                    // Roll the in-memory terminal state back: the run becomes
-                    // observably terminal-pending and the retry loop owns the
-                    // exact same terminal (events, message, status).
-                    run.status = previous_status;
-                    run.events.truncate(previous_events);
-                    let session = store
-                        .sessions
-                        .get_mut(&session_id_for_commit)
-                        .expect("session was checked above");
-                    session.messages.pop();
-                    session.view.message_count = session.messages.len();
-                    session.view.updated_at = previous_session_updated;
-                    TerminalOutcome::TerminalPersistFailed {
-                        error: error.to_string(),
-                        pending: Box::new(PendingTerminal {
-                            to_status: "completed".to_string(),
-                            session_id: Some(session_id_for_commit),
-                            events: vec![delta_event, completed_event],
-                            assistant_message: Some(message),
-                            deadline: std::time::Instant::now() + retry_window,
-                        }),
-                    }
-                }
+                Err(error) => TerminalOutcome::TerminalPersistFailed {
+                    error: error.to_string(),
+                    pending: Box::new(PendingTerminal {
+                        to_status: "completed".to_string(),
+                        session_id: Some(session_id_for_commit),
+                        events,
+                        assistant_message,
+                        deadline: std::time::Instant::now() + retry_window,
+                    }),
+                },
             }
         })
         .await
@@ -2025,7 +3553,7 @@ impl AgentService {
     /// change in one transaction, and only then is the event published. The
     /// commit is retried with bounded backoff; on final failure the
     /// cancellation is handed to the bounded retry loop (`terminal_pending`),
-    /// which commits and publishes it exactly once when storage recovers.
+    /// which commits it durably then broadcasts when storage recovers.
     pub(crate) async fn finish_cancelled(&self, run_id: &str, reason: &str) {
         let attempts = 1 + self.inner.config.terminal_persist_retries;
         for attempt in 0..attempts {
@@ -2069,55 +3597,63 @@ impl AgentService {
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
         tokio::task::spawn_blocking(move || {
-            let mut store = service.inner.store.write();
+            let _serial = service.inner.commit_gate.lock();
             let persistence = service.persistence_handle();
-            let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
-                return TerminalOutcome::NotActive;
+            let event = {
+                let store = service.inner.store.read();
+                let Some(run) = store.runs.get(&run_id_for_commit) else {
+                    return TerminalOutcome::NotActive;
+                };
+                if run_is_terminal(&run.status) {
+                    return TerminalOutcome::NotActive;
+                }
+                event_candidate(
+                    run,
+                    "run.cancelled",
+                    json!({"status":"cancelled", "reason":reason_for_commit}),
+                    max_event_bytes,
+                )
             };
-            if matches!(
-                run.status.as_str(),
-                "completed" | "failed" | "cancelled" | "terminal_pending"
-            ) {
-                return TerminalOutcome::NotActive;
-            }
-            let previous_status = run.status.clone();
-            let previous_events = run.events.len();
-            let event = append_event_locked(
-                run,
-                "run.cancelled",
-                json!({"status":"cancelled", "reason":reason_for_commit}),
-                max_event_bytes,
-                max_events_per_run,
-            );
-            run.status = "cancelled".to_string();
+            let events = vec![event.clone()];
             match terminal_commit(
                 persistence.as_deref(),
-                run,
+                &run_id_for_commit,
                 "",
                 "cancelled",
-                &[&event],
+                &events,
                 None,
             ) {
-                Ok(()) => {
-                    if let Some(sender) = &run.sender {
+                Ok(seqs) => {
+                    let mut store = service.inner.store.write();
+                    apply_terminal(
+                        &mut store,
+                        &run_id_for_commit,
+                        "cancelled",
+                        &events,
+                        &seqs,
+                        None,
+                        max_events_per_run,
+                    );
+                    let sender = store
+                        .runs
+                        .get(&run_id_for_commit)
+                        .and_then(|run| run.sender.clone());
+                    drop(store);
+                    if let Some(sender) = sender {
                         let _ = sender.send(event);
                     }
                     TerminalOutcome::Committed
                 }
-                Err(error) => {
-                    run.status = previous_status;
-                    run.events.truncate(previous_events);
-                    TerminalOutcome::TerminalPersistFailed {
-                        error: error.to_string(),
-                        pending: Box::new(PendingTerminal {
-                            to_status: "cancelled".to_string(),
-                            session_id: None,
-                            events: vec![event],
-                            assistant_message: None,
-                            deadline: std::time::Instant::now() + retry_window,
-                        }),
-                    }
-                }
+                Err(error) => TerminalOutcome::TerminalPersistFailed {
+                    error: error.to_string(),
+                    pending: Box::new(PendingTerminal {
+                        to_status: "cancelled".to_string(),
+                        session_id: None,
+                        events: vec![event],
+                        assistant_message: None,
+                        deadline: std::time::Instant::now() + retry_window,
+                    }),
+                },
             }
         })
         .await
@@ -2128,8 +3664,8 @@ impl AgentService {
     /// commits the failure event and the status change in one transaction,
     /// and only then is the event published. The commit is retried with
     /// bounded backoff; on final failure the failure is handed to the bounded
-    /// retry loop (`terminal_pending`), which commits and publishes it
-    /// exactly once when storage recovers.
+    /// retry loop (`terminal_pending`), which commits it durably then
+    /// broadcasts when storage recovers.
     pub(crate) async fn finish_failed(&self, run_id: &str, data: JsonValue) {
         let attempts = 1 + self.inner.config.terminal_persist_retries;
         for attempt in 0..attempts {
@@ -2170,43 +3706,58 @@ impl AgentService {
         let max_event_bytes = self.inner.config.max_event_bytes;
         let max_events_per_run = self.inner.config.max_events_per_run;
         tokio::task::spawn_blocking(move || {
-            let mut store = service.inner.store.write();
+            let _serial = service.inner.commit_gate.lock();
             let persistence = service.persistence_handle();
-            let Some(run) = store.runs.get_mut(&run_id_for_commit) else {
-                return TerminalOutcome::NotActive;
+            let event = {
+                let store = service.inner.store.read();
+                let Some(run) = store.runs.get(&run_id_for_commit) else {
+                    return TerminalOutcome::NotActive;
+                };
+                if run_is_terminal(&run.status) {
+                    return TerminalOutcome::NotActive;
+                }
+                event_candidate(run, "run.failed", data, max_event_bytes)
             };
-            if matches!(
-                run.status.as_str(),
-                "completed" | "failed" | "cancelled" | "terminal_pending"
+            let events = vec![event.clone()];
+            match terminal_commit(
+                persistence.as_deref(),
+                &run_id_for_commit,
+                "",
+                "failed",
+                &events,
+                None,
             ) {
-                return TerminalOutcome::NotActive;
-            }
-            let previous_status = run.status.clone();
-            let previous_events = run.events.len();
-            let event =
-                append_event_locked(run, "run.failed", data, max_event_bytes, max_events_per_run);
-            run.status = "failed".to_string();
-            match terminal_commit(persistence.as_deref(), run, "", "failed", &[&event], None) {
-                Ok(()) => {
-                    if let Some(sender) = &run.sender {
+                Ok(seqs) => {
+                    let mut store = service.inner.store.write();
+                    apply_terminal(
+                        &mut store,
+                        &run_id_for_commit,
+                        "failed",
+                        &events,
+                        &seqs,
+                        None,
+                        max_events_per_run,
+                    );
+                    let sender = store
+                        .runs
+                        .get(&run_id_for_commit)
+                        .and_then(|run| run.sender.clone());
+                    drop(store);
+                    if let Some(sender) = sender {
                         let _ = sender.send(event);
                     }
                     TerminalOutcome::Committed
                 }
-                Err(error) => {
-                    run.status = previous_status;
-                    run.events.truncate(previous_events);
-                    TerminalOutcome::TerminalPersistFailed {
-                        error: error.to_string(),
-                        pending: Box::new(PendingTerminal {
-                            to_status: "failed".to_string(),
-                            session_id: None,
-                            events: vec![event],
-                            assistant_message: None,
-                            deadline: std::time::Instant::now() + retry_window,
-                        }),
-                    }
-                }
+                Err(error) => TerminalOutcome::TerminalPersistFailed {
+                    error: error.to_string(),
+                    pending: Box::new(PendingTerminal {
+                        to_status: "failed".to_string(),
+                        session_id: None,
+                        events: vec![event],
+                        assistant_message: None,
+                        deadline: std::time::Instant::now() + retry_window,
+                    }),
+                },
             }
         })
         .await
@@ -2228,6 +3779,7 @@ impl AgentService {
         &self,
         admission: &ContextAdmissionInput,
         snapshot: &RunAdmissionSnapshot,
+        coding_system_prompt: String,
     ) -> RunContext {
         let provider_options = snapshot.provider_profile.options().clone();
         let tool_schemas = snapshot.registry.schemas();
@@ -2261,6 +3813,14 @@ impl AgentService {
             "message_id".to_string(),
             JsonValue::String(admission.message_id.clone()),
         );
+        let created_at_ms = timestamp();
+        let timeout_ms =
+            u64::try_from(self.inner.config.run_timeout.as_millis()).unwrap_or(u64::MAX);
+        metadata.insert("created_at_ms".to_string(), JsonValue::from(created_at_ms));
+        metadata.insert(
+            "deadline_at_ms".to_string(),
+            JsonValue::from(created_at_ms.saturating_add(timeout_ms)),
+        );
         RunContext {
             run_id: admission.run_id.clone(),
             session_id: admission.session_id.clone(),
@@ -2276,6 +3836,7 @@ impl AgentService {
             tool_schemas,
             limits,
             metadata: JsonValue::Object(metadata),
+            coding_system_prompt: Some(coding_system_prompt),
         }
     }
 
@@ -2490,24 +4051,38 @@ fn normalize_loaded_session_messages(store: &Arc<RwLock<GatewayStore>>) {
     let mut store = store.write();
     for session in store.sessions.values_mut() {
         for message in &mut session.messages {
-            let Some(envelope) = message.content.as_object() else {
-                continue;
-            };
-            if envelope.get("schema_version").and_then(JsonValue::as_u64)
-                != Some(RUN_CONTEXT_METADATA_VERSION)
-            {
-                continue;
+            if let Some(input) = admission_input_from_message_content(&message.content) {
+                message.content = decode_message_content(&input);
             }
-            let Some(input) = envelope
-                .get(RUN_CONTEXT_STORAGE_KEY)
-                .and_then(JsonValue::as_object)
-                .and_then(|context| context.get("input"))
-            else {
-                continue;
-            };
-            message.content = input.clone();
         }
     }
+}
+
+fn admission_input_from_message_content(content: &JsonValue) -> Option<JsonValue> {
+    if let Some(input) = envelope_run_input(content) {
+        return Some(input);
+    }
+    let text = content
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block.get("text"))
+        .and_then(JsonValue::as_str)?;
+    let parsed: JsonValue = serde_json::from_str(text).ok()?;
+    envelope_run_input(&parsed)
+}
+
+fn envelope_run_input(value: &JsonValue) -> Option<JsonValue> {
+    let envelope = value.as_object()?;
+    if envelope.get("schema_version").and_then(JsonValue::as_u64)
+        != Some(RUN_CONTEXT_METADATA_VERSION)
+    {
+        return None;
+    }
+    envelope
+        .get(RUN_CONTEXT_STORAGE_KEY)
+        .and_then(JsonValue::as_object)
+        .and_then(|context| context.get("input"))
+        .cloned()
 }
 
 fn admit_context_error(error: RunContextError) -> AdmitError {
@@ -2524,6 +4099,8 @@ struct ServiceEventCommitter {
     handle: Weak<RunHandle>,
     max_event_bytes: usize,
     max_events_per_run: usize,
+    commit_gate: Arc<ParkingMutex<()>>,
+    service: Weak<AgentServiceInner>,
 }
 
 impl DurableEventCommitter for ServiceEventCommitter {
@@ -2542,57 +4119,457 @@ impl DurableEventCommitter for ServiceEventCommitter {
     }
 
     fn commit(&self, event_type: &str, data: JsonValue) -> Result<(), EventCommitError> {
+        self.commit_step(event_type, data, None)
+    }
+
+    fn prepare_tool_parent(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<(String, String), EventCommitError> {
+        let store = self.store.read();
+        let Some(run) = store.runs.get(&self.run_id) else {
+            return Err(EventCommitError::Terminal);
+        };
+        if run_is_terminal(&run.status) {
+            return Err(EventCommitError::Terminal);
+        }
+        match lookup_tool_call_parent(&store, &run.session_id, tool_call_id) {
+            Some((parent_id, stored_name)) if stored_name == name => Ok((parent_id, stored_name)),
+            _ => Err(EventCommitError::MissingParent),
+        }
+    }
+
+    fn replay_durable_tool_result(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
+        let Some(inner) = self.service.upgrade() else {
+            return Err(EventCommitError::Terminal);
+        };
+        let _serial = self.commit_gate.lock();
+        AgentService { inner }.replay_durable_tool_result(&self.run_id, tool_call_id, name)
+    }
+
+    fn commit_step(
+        &self,
+        event_type: &str,
+        data: JsonValue,
+        result: Option<&ToolResult>,
+    ) -> Result<(), EventCommitError> {
         if self.is_terminal() {
             return Err(EventCommitError::Terminal);
         }
-        let mut store = self.store.write();
-        let Some(run) = store.runs.get_mut(&self.run_id) else {
-            return Err(EventCommitError::Terminal);
+        let _serial = self.commit_gate.lock();
+        let tool_call_id = data
+            .get("tool_call_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let event_id = if tool_call_id.is_empty() {
+            String::new()
+        } else {
+            durable_tool_event_id(&self.run_id, &tool_call_id, event_type)
         };
-        if matches!(
-            run.status.as_str(),
-            "completed" | "failed" | "cancelled" | "terminal_pending"
-        ) {
-            return Err(EventCommitError::Terminal);
-        }
-        let event = append_event_locked(
-            run,
-            event_type,
-            data,
-            self.max_event_bytes,
-            self.max_events_per_run,
-        );
-        let durable = match self.persistence.as_ref() {
-            Some(persistence) => {
-                let payload = json!({
+        let attach_message = result.is_some()
+            && !tool_call_id.is_empty()
+            && matches!(event_type, "tool.output" | "tool.completed" | "tool.failed");
+        let message_id = if attach_message {
+            durable_message_id(&self.run_id, "result", &tool_call_id)
+        } else {
+            String::new()
+        };
+        let content = result
+            .filter(|_| attach_message)
+            .map(|result| tool_result_content_json(&tool_call_id, result));
+        let reserved = {
+            let store = self.store.read();
+            let Some(run) = store.runs.get(&self.run_id) else {
+                return Err(EventCommitError::Terminal);
+            };
+            if run_is_terminal(&run.status) {
+                return Err(EventCommitError::Terminal);
+            }
+            if !event_id.is_empty() && run.events.iter().any(|event| event.event_id == event_id) {
+                return Ok(());
+            }
+            let session_id = run.session_id.clone();
+            let (parent_message_id, tool_name) = if attach_message {
+                match lookup_tool_call_parent(&store, &session_id, &tool_call_id) {
+                    Some(pair) => pair,
+                    None => return Err(EventCommitError::MissingParent),
+                }
+            } else {
+                (String::new(), String::new())
+            };
+            let mut event = event_candidate(run, event_type, data, self.max_event_bytes);
+            if !event_id.is_empty() {
+                event.event_id = event_id.clone();
+            }
+            let ordinal = if attach_message {
+                store.sessions.get(&session_id).map(next_message_ordinal)
+            } else {
+                None
+            };
+            let message = if attach_message {
+                Some(SessionMessage {
+                    id: message_id.clone(),
+                    session_id: session_id.clone(),
+                    role: "user".to_string(),
+                    content: content.clone().unwrap_or(JsonValue::Array(Vec::new())),
+                    created_at: timestamp(),
+                    run_id: Some(self.run_id.clone()),
+                    finish_reason: None,
+                    name: if tool_name.is_empty() {
+                        None
+                    } else {
+                        Some(tool_name.clone())
+                    },
+                    tool_call_id: Some(tool_call_id.clone()),
+                    parent_message_id: if parent_message_id.is_empty() {
+                        None
+                    } else {
+                        Some(parent_message_id.clone())
+                    },
+                    token_estimate: None,
+                    metadata: JsonValue::Null,
+                    ordinal,
+                })
+            } else {
+                None
+            };
+            let payload_json =
+                serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string());
+            let persist_payload = if attach_message {
+                json!({
+                    "run_id": self.run_id,
+                    "session_id": session_id,
+                    "event_id": event.event_id,
+                    "event_type": event.event,
+                    "payload_json": payload_json,
+                    "now_ms": timestamp(),
+                    "max_events": self.max_events_per_run,
+                    "message_id": message_id,
+                    "role": "user",
+                    "content_json": serde_json::to_string(
+                        content.as_ref().unwrap_or(&JsonValue::Array(Vec::new()))
+                    )
+                    .unwrap_or_else(|_| "[]".to_string()),
+                    "name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "parent_message_id": parent_message_id,
+                    "token_estimate": 0,
+                    "metadata_json": "{}",
+                    "finish_reason": "",
+                    "seq": event.seq,
+                    "ordinal": ordinal.unwrap_or(0),
+                })
+            } else {
+                json!({
                     "run_id": self.run_id,
                     "event_id": event.event_id,
                     "event_type": event.event,
-                    "payload_json": serde_json::to_string(&event.data)
-                        .unwrap_or_else(|_| "{}".to_string()),
+                    "payload_json": payload_json,
                     "now_ms": timestamp(),
                     "max_events": self.max_events_per_run,
-                });
-                persistence.event_append(&payload).map(|_| ())
+                    "seq": event.seq,
+                })
+            };
+            ReservedCommit {
+                event,
+                message,
+                persist_payload,
+                kind: if attach_message {
+                    PersistKind::Step
+                } else {
+                    PersistKind::EventAppend
+                },
+                max_events_per_run: self.max_events_per_run,
             }
-            None => Ok(()),
         };
-        match durable {
-            Ok(()) => {
-                let sender = run.sender.clone();
-                drop(store);
-                if let Some(sender) = sender {
-                    let _ = sender.send(event);
-                }
-                Ok(())
-            }
-            Err(error) => {
-                run.events
-                    .retain(|existing| existing.event_id != event.event_id);
-                Err(EventCommitError::PersistFailed(error.to_string()))
+        let result = persist_and_apply(&self.store, self.persistence.as_deref(), reserved);
+        if result.is_ok()
+            && matches!(event_type, "tool.completed" | "tool.failed")
+            && let Some(inner) = self.service.upgrade()
+            && inner.crash_after_tool_commit.swap(false, Ordering::SeqCst)
+        {
+            inner.provider_commit_crashed.store(true, Ordering::SeqCst);
+            panic!("tool_commit_crash");
+        }
+        result
+    }
+}
+
+fn replay_commit_failure(error: EventCommitError) -> ToolResult {
+    match error {
+        EventCommitError::Corrupt(_) => ToolResult::failure(
+            "corrupt_tool_result",
+            "durable tool output is missing a canonical result payload",
+        ),
+        EventCommitError::MissingParent => ToolResult::failure(
+            "missing_tool_parent",
+            "tool result parent tool_call is missing",
+        ),
+        EventCommitError::Cancelled => ToolResult::failure("cancelled", "run was cancelled"),
+        EventCommitError::Terminal => ToolResult::failure("run_terminal", "run is terminal"),
+        EventCommitError::PersistFailed(_) => {
+            ToolResult::failure("persist_failed", "durable event persist failed")
+        }
+    }
+}
+
+fn lookup_tool_call_parent(
+    store: &GatewayStore,
+    session_id: &str,
+    tool_call_id: &str,
+) -> Option<(String, String)> {
+    let session = store.sessions.get(session_id)?;
+    for message in &session.messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        for block in decode_message_blocks(&message.content) {
+            if block.block_type == "tool_call"
+                && block.tool_call_id.as_deref() == Some(tool_call_id)
+            {
+                return Some((message.id.clone(), block.name.unwrap_or_default()));
             }
         }
     }
+    None
+}
+
+fn run_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "terminal_pending"
+    )
+}
+
+/// Worker-committed terminals must not grow a pending `model.completed`.
+/// Restart recovery fails leftover active runs with `gateway_restart`; those
+/// still retry or interrupt a pending provider request.
+fn run_refuses_pending_provider(run: &RunRecord) -> bool {
+    match run.status.as_str() {
+        "completed" | "cancelled" | "terminal_pending" => true,
+        "failed" => !run.events.iter().any(|event| {
+            event.event == "run.failed"
+                && event.data.get("error_code").and_then(JsonValue::as_str)
+                    == Some("gateway_restart")
+        }),
+        _ => false,
+    }
+}
+
+fn next_message_ordinal(session: &SessionRecord) -> i64 {
+    let max_ordinal = session
+        .messages
+        .iter()
+        .filter_map(|message| message.ordinal)
+        .max()
+        .unwrap_or(0);
+    max_ordinal.max(session.messages.len() as i64) + 1
+}
+
+struct RunOccupancyGuard {
+    handle: Arc<RunHandle>,
+}
+
+impl Drop for RunOccupancyGuard {
+    fn drop(&mut self) {
+        self.handle.occupancy.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_occupy_run(handle: &Arc<RunHandle>) -> Option<RunOccupancyGuard> {
+    handle
+        .occupancy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()
+        .map(|_| RunOccupancyGuard {
+            handle: Arc::clone(handle),
+        })
+}
+
+fn existing_provider_commit(
+    store: &GatewayStore,
+    run: &RunRecord,
+    message_id: &str,
+) -> Result<ProviderCommitOutcome, EventCommitError> {
+    let Some(session) = store.sessions.get(&run.session_id) else {
+        return Err(EventCommitError::Corrupt(
+            "durable provider step is incomplete".to_string(),
+        ));
+    };
+    let Some(message) = session
+        .messages
+        .iter()
+        .find(|message| message.id == message_id)
+    else {
+        return Err(EventCommitError::Corrupt(
+            "durable provider step is incomplete".to_string(),
+        ));
+    };
+    if message.role != "assistant" {
+        return Err(EventCommitError::Corrupt(
+            "durable provider step is incomplete".to_string(),
+        ));
+    }
+    let envelope = crate::durable_provider::reconstruct_provider_envelope(
+        &message.content,
+        &message.metadata,
+        message.finish_reason.as_deref(),
+    )?;
+    Ok(ProviderCommitOutcome::Existing(ProviderCommit {
+        message_id: message_id.to_string(),
+        envelope,
+    }))
+}
+
+fn provider_failure_is_retryable(event: &GatewayEvent) -> bool {
+    event.data.get("retryable").and_then(JsonValue::as_bool) == Some(true)
+}
+
+fn requested_payload_leaks_secrets(data: &JsonValue) -> bool {
+    match data {
+        JsonValue::Object(map) => map.iter().any(|(key, value)| {
+            SECRET_PROVIDER_REQUEST_KEYS.contains(&key.as_str())
+                || requested_payload_leaks_secrets(value)
+        }),
+        JsonValue::Array(items) => items.iter().any(requested_payload_leaks_secrets),
+        _ => false,
+    }
+}
+
+enum PersistKind {
+    Step,
+    EventAppend,
+}
+
+struct ReservedCommit {
+    event: GatewayEvent,
+    message: Option<SessionMessage>,
+    persist_payload: JsonValue,
+    kind: PersistKind,
+    max_events_per_run: usize,
+}
+
+fn persist_and_apply(
+    store: &RwLock<GatewayStore>,
+    persistence: Option<&GatewayPersistence>,
+    reserved: ReservedCommit,
+) -> Result<(), EventCommitError> {
+    let durable = match persistence {
+        Some(persistence) => match reserved.kind {
+            PersistKind::Step => persistence
+                .step_commit(&reserved.persist_payload)
+                .map(|_| ()),
+            PersistKind::EventAppend => persistence
+                .event_append(&reserved.persist_payload)
+                .map(|_| ()),
+        },
+        None => Ok(()),
+    };
+    match durable {
+        Ok(()) => {
+            let mut store = store.write();
+            apply_reserved(&mut store, &reserved);
+            let sender = store
+                .runs
+                .get(&reserved.event.run_id)
+                .and_then(|run| run.sender.clone());
+            drop(store);
+            if let Some(sender) = sender {
+                let _ = sender.send(reserved.event);
+            }
+            Ok(())
+        }
+        Err(error) => Err(EventCommitError::PersistFailed(error.to_string())),
+    }
+}
+
+fn apply_reserved(store: &mut GatewayStore, reserved: &ReservedCommit) {
+    if let Some(run) = store.runs.get_mut(&reserved.event.run_id) {
+        apply_event_locked(run, &reserved.event, reserved.max_events_per_run);
+    }
+    if let Some(message) = &reserved.message
+        && let Some(session) = store.sessions.get_mut(&message.session_id)
+        && !session
+            .messages
+            .iter()
+            .any(|existing| existing.id == message.id)
+    {
+        session.messages.push(message.clone());
+        session.view.message_count = session.messages.len();
+        session.view.updated_at = timestamp();
+    }
+}
+
+fn apply_terminal(
+    store: &mut GatewayStore,
+    run_id: &str,
+    to_status: &str,
+    events: &[GatewayEvent],
+    seqs: &[(String, u64)],
+    message: Option<&SessionMessage>,
+    max_events_per_run: usize,
+) {
+    if let Some(run) = store.runs.get_mut(run_id) {
+        for event in events {
+            let mut event = event.clone();
+            if let Some((_, seq)) = seqs
+                .iter()
+                .find(|(event_id, _)| event_id == &event.event_id)
+            {
+                event.seq = *seq;
+            }
+            apply_event_locked(run, &event, max_events_per_run);
+        }
+        run.status = to_status.to_string();
+    }
+    if let Some(message) = message
+        && let Some(session) = store.sessions.get_mut(&message.session_id)
+        && !session
+            .messages
+            .iter()
+            .any(|existing| existing.id == message.id)
+    {
+        session.messages.push(message.clone());
+        session.view.message_count = session.messages.len();
+        session.view.updated_at = timestamp();
+    }
+}
+
+fn tool_result_content_json(tool_call_id: &str, result: &ToolResult) -> JsonValue {
+    let (content, cut) = truncate_utf8_chars(&result.content, MAX_DURABLE_TEXT_CHARS);
+    let truncated = result.truncated || cut;
+    let error = result.error.as_ref().map(|error| {
+        json!({
+            "code": error.code,
+            "message": error.message,
+        })
+    });
+    let artifact = result
+        .artifacts
+        .first()
+        .cloned()
+        .map(|id| json!({"id": id}));
+    encode_message_content(&[LlmContentBlock {
+        block_type: "tool_result".to_string(),
+        tool_call_id: Some(tool_call_id.to_string()),
+        content: Some(content),
+        is_error: Some(!result.ok),
+        result: if result.ok {
+            Some(result.data.clone())
+        } else {
+            None
+        },
+        error,
+        artifact,
+        truncated: truncated.then_some(true),
+        ..LlmContentBlock::default()
+    }])
 }
 
 fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {
@@ -2600,6 +4577,10 @@ fn invalid_context_metadata(run_id: &str, reason: &str) -> RunContextError {
         run_id: run_id.to_string(),
         reason: reason.to_string(),
     }
+}
+
+fn artifact_init_error(run_id: &str, error: &ArtifactError) -> RunContextError {
+    invalid_context_metadata(run_id, &format!("{}: {}", error.code(), error.message()))
 }
 
 fn optional_string(value: Option<&JsonValue>) -> Option<String> {
@@ -2756,36 +4737,37 @@ fn verify_context_registry(
 }
 
 impl AgentService {
-    /// Retries one run's pending terminal commit. Runs on a blocking thread
-    /// with the store write lock held (durable-before-visible). On success
-    /// the terminal events are published exactly once and the run record
-    /// reaches its true terminal state; on a typed transition conflict the
-    /// pending terminal is dropped without publishing (never a fabricated
-    /// terminal).
+    /// Retries one run's pending terminal commit. Runs on a blocking thread.
+    /// The GatewayStore lock is not held across SQLite/worker IO. On success
+    /// the durable terminal is applied then broadcast; on a typed transition
+    /// conflict the pending terminal is dropped without broadcasting (never a
+    /// fabricated terminal). Live subscribers observe at-least-once delivery
+    /// of durable events; exactly-once is not guaranteed across an
+    /// unacknowledged receiver crash window.
     async fn retry_pending_terminal(&self, run_id: &str) -> PendingRetryOutcome {
         let service = self.clone();
         let run_id_for_block = run_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut store = service.inner.store.write();
+            let _serial = service.inner.commit_gate.lock();
             let persistence = service.persistence_handle();
-            // The retry owns the pending entry while it attempts the commit.
             let Some(pending) = service.take_pending_terminal(&run_id_for_block) else {
                 return PendingRetryOutcome::Gone;
             };
             service.inner.metrics.runs_terminal_pending_dec();
-            let Some(run) = store.runs.get_mut(&run_id_for_block) else {
-                return PendingRetryOutcome::Gone;
-            };
-            if run.status != "terminal_pending" {
-                return PendingRetryOutcome::Gone;
+            {
+                let store = service.inner.store.read();
+                let Some(run) = store.runs.get(&run_id_for_block) else {
+                    return PendingRetryOutcome::Gone;
+                };
+                if run.status != "terminal_pending" {
+                    return PendingRetryOutcome::Gone;
+                }
             }
             if std::time::Instant::now() >= pending.deadline {
-                // Bounded: after the window no more events can ever be
-                // published for this run in this process. Close the live
-                // stream so SSE subscribers are not held forever; the handle
-                // is released via its TTL and the durable side is repaired by
-                // restart recovery.
-                close_run_stream(run);
+                let mut store = service.inner.store.write();
+                if let Some(run) = store.runs.get_mut(&run_id_for_block) {
+                    close_run_stream(run);
+                }
                 service
                     .inner
                     .metrics
@@ -2796,65 +4778,41 @@ impl AgentService {
                 );
                 return PendingRetryOutcome::Expired;
             }
-            let previous_status = run.status.clone();
-            let previous_events = run.events.len();
-            // Rebuild the terminal's assistant message under the same lock
-            // (durable-before-visible: it is appended in memory only after
-            // the durable commit succeeds).
-            let message = pending.assistant_message.clone();
-            let mut previous_session_updated = None;
-            if let Some(message) = &message {
-                let Some(session_id) = pending.session_id.as_deref() else {
-                    return PendingRetryOutcome::Gone;
-                };
-                let Some(session) = store.sessions.get_mut(session_id) else {
-                    return PendingRetryOutcome::Gone;
-                };
-                previous_session_updated = Some(session.view.updated_at);
-                session.messages.push(message.clone());
-                session.view.message_count = session.messages.len();
-                session.view.updated_at = timestamp();
-            }
-            let events = pending.events.iter().collect::<Vec<_>>();
-            let durable = {
-                let run = store
-                    .runs
-                    .get_mut(&run_id_for_block)
-                    .expect("run presence was checked above");
-                for event in &pending.events {
-                    run.events.push(event.clone());
-                }
-                let max_events = service.inner.config.max_events_per_run;
-                if run.events.len() > max_events {
-                    let excess = run.events.len() - max_events;
-                    run.events.drain(0..excess);
-                }
-                run.status = pending.to_status.clone();
-                terminal_commit(
-                    persistence.as_deref(),
-                    run,
-                    pending.session_id.as_deref().unwrap_or(""),
-                    &pending.to_status,
-                    &events,
-                    message.as_ref(),
-                )
-            };
+            let durable = terminal_commit(
+                persistence.as_deref(),
+                &run_id_for_block,
+                pending.session_id.as_deref().unwrap_or(""),
+                &pending.to_status,
+                &pending.events,
+                pending.assistant_message.as_ref(),
+            );
             match durable {
-                Ok(()) => {
-                    let run = store
+                Ok(seqs) => {
+                    let mut store = service.inner.store.write();
+                    apply_terminal(
+                        &mut store,
+                        &run_id_for_block,
+                        &pending.to_status,
+                        &pending.events,
+                        &seqs,
+                        pending.assistant_message.as_ref(),
+                        service.inner.config.max_events_per_run,
+                    );
+                    let sender = store
                         .runs
-                        .get_mut(&run_id_for_block)
-                        .expect("run presence was checked above");
-                    // Publish the reconciled copies (sequences were updated in
-                    // place by the commit), exactly once per event.
-                    for event in &pending.events {
-                        if let Some(reconciled) = run
-                            .events
-                            .iter()
-                            .find(|candidate| candidate.event_id == event.event_id)
-                            && let Some(sender) = &run.sender
-                        {
-                            let _ = sender.send(reconciled.clone());
+                        .get(&run_id_for_block)
+                        .and_then(|run| run.sender.clone());
+                    drop(store);
+                    if let Some(sender) = sender {
+                        for event in &pending.events {
+                            let mut published = event.clone();
+                            if let Some((_, seq)) = seqs
+                                .iter()
+                                .find(|(event_id, _)| event_id == &event.event_id)
+                            {
+                                published.seq = *seq;
+                            }
+                            let _ = sender.send(published);
                         }
                     }
                     service
@@ -2869,17 +4827,7 @@ impl AgentService {
                     PendingRetryOutcome::Committed
                 }
                 Err(error) if error.code == "transition_conflict" => {
-                    // The durable side already reached a different terminal
-                    // (e.g. restart recovery); publishing ours would fabricate
-                    // a terminal that never happened durably.
-                    rollback_pending_retry(
-                        &mut store,
-                        &run_id_for_block,
-                        &pending,
-                        previous_status,
-                        previous_events,
-                        previous_session_updated,
-                    );
+                    let mut store = service.inner.store.write();
                     if let Some(run) = store.runs.get_mut(&run_id_for_block) {
                         close_run_stream(run);
                     }
@@ -2899,14 +4847,6 @@ impl AgentService {
                         run_id = %run_id_for_block,
                         error = %truncate_for_log(&error.message, 256),
                         "terminal retry failed; will retry on the next janitor tick"
-                    );
-                    rollback_pending_retry(
-                        &mut store,
-                        &run_id_for_block,
-                        &pending,
-                        previous_status,
-                        previous_events,
-                        previous_session_updated,
                     );
                     service.put_pending_terminal(&run_id_for_block, pending);
                     service
@@ -2996,6 +4936,51 @@ impl WorkerOutcome {
     }
 }
 
+fn interpret_loop_decision(value: &VmValue, cancellation: &RunCancellation) -> WorkerOutcome {
+    if let Some(reason) = cancellation.requested() {
+        return WorkerOutcome::Cancelled(reason.as_str());
+    }
+    if cancellation.deadline_passed() {
+        return WorkerOutcome::Cancelled("deadline");
+    }
+    let json = vm_value_to_json(value);
+    match json.get("kind").and_then(JsonValue::as_str) {
+        Some("run.failed") => {
+            let code = json
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("failed");
+            match code {
+                "cancelled" => WorkerOutcome::Cancelled("requested"),
+                "deadline_elapsed" => WorkerOutcome::Cancelled("deadline"),
+                other => {
+                    let message = json
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(other)
+                        .to_string();
+                    WorkerOutcome::Failed(message)
+                }
+            }
+        }
+        _ => WorkerOutcome::Completed(value.clone()),
+    }
+}
+
+fn completed_output_text(value: &VmValue) -> String {
+    let json = vm_value_to_json(value);
+    if json.get("kind").and_then(JsonValue::as_str) == Some("run.completed") {
+        match json.get("answer") {
+            Some(JsonValue::String(answer)) => return answer.clone(),
+            Some(answer) => return answer.to_string(),
+            None => {}
+        }
+    }
+    json.to_string()
+}
+
 /// Outcome of one durable terminal commit attempt.
 enum TerminalOutcome {
     /// The terminal state was committed durably and published.
@@ -3031,28 +5016,30 @@ impl std::fmt::Display for TerminalCommitError {
 
 /// Commits one run's terminal state through the typed `run.terminal`
 /// transaction (status change + terminal events + optional assistant
-/// message in one durable commit). The caller holds the store write lock on
-/// a blocking thread. The in-memory events' sequences are reconciled with
-/// the transactionally allocated sequences returned by the command, so
-/// reload adjacency validation can never diverge from the durable side.
-/// Callers publish the terminal events only after this returns `Ok`.
+/// message in one durable commit). The GatewayStore lock is not held
+/// across SQLite/worker IO. Sequences returned by the command are applied
+/// after persist so live and reopened history stay adjacent. Callers
+/// broadcast only after this returns `Ok`.
 fn terminal_commit(
     persistence: Option<&GatewayPersistence>,
-    run: &mut RunRecord,
+    run_id: &str,
     session_id: &str,
     to_status: &str,
-    events: &[&GatewayEvent],
+    events: &[GatewayEvent],
     assistant_message: Option<&SessionMessage>,
-) -> Result<(), TerminalCommitError> {
+) -> Result<Vec<(String, u64)>, TerminalCommitError> {
     let Some(persistence) = persistence else {
-        return Ok(());
+        return Ok(events
+            .iter()
+            .map(|event| (event.event_id.clone(), event.seq))
+            .collect());
     };
     let event = |index: usize| -> &GatewayEvent {
         events.get(index).expect("terminal event index in range")
     };
     let event_count = events.len();
     let payload = json!({
-        "run_id": run.run_id,
+        "run_id": run_id,
         "to_status": to_status,
         "error_code": "",
         "error_message": "",
@@ -3079,6 +5066,7 @@ fn terminal_commit(
         "message_finish_reason": assistant_message
             .and_then(|message| message.finish_reason.clone())
             .unwrap_or_default(),
+        "message_ordinal": assistant_message.and_then(|message| message.ordinal).unwrap_or(0),
         "now_ms": timestamp(),
     });
     let data = persistence
@@ -3087,8 +5075,6 @@ fn terminal_commit(
             code: error.code.clone(),
             message: error.message.clone(),
         })?;
-    // Reconcile the in-memory terminal event sequences with the
-    // transactionally allocated durable sequences.
     let rows = data
         .get("events")
         .and_then(|events| events.get("rows"))
@@ -3107,6 +5093,7 @@ fn terminal_commit(
         });
     }
     let offset = rows.len() - event_count;
+    let mut seqs = Vec::with_capacity(event_count);
     for (index, event) in events.iter().enumerate() {
         let row = rows
             .get(offset + index)
@@ -3122,20 +5109,16 @@ fn terminal_commit(
                 code: "terminal_commit_invalid".to_string(),
                 message: "run.terminal returned a malformed event sequence".to_string(),
             })?;
-        if let Some(in_memory) = run
-            .events
-            .iter_mut()
-            .find(|candidate| candidate.event_id == event.event_id)
-        {
-            in_memory.seq = seq;
-        }
+        seqs.push((event.event_id.clone(), seq));
     }
-    Ok(())
+    Ok(seqs)
 }
 
 /// Outcome of one bounded terminal retry attempt.
 enum PendingRetryOutcome {
-    /// The terminal was committed durably and published (exactly once).
+    /// The terminal was committed durably and then broadcast. Live
+    /// subscribers observe at-least-once delivery; exactly-once is not
+    /// guaranteed across an unacknowledged receiver crash window.
     Committed,
     /// The run or its pending entry no longer exists; nothing to do.
     Gone,
@@ -3147,32 +5130,6 @@ enum PendingRetryOutcome {
     Expired,
     /// Storage is still unavailable; retry again on the next tick.
     RetryFailed,
-}
-
-/// Rolls one failed retry attempt back to the observable terminal-pending
-/// state (or the durable-terminal-elsewhere state), mirroring the worker's
-/// rollback so no unpersisted terminal is ever visible.
-#[allow(clippy::too_many_arguments)]
-fn rollback_pending_retry(
-    store: &mut GatewayStore,
-    run_id: &str,
-    pending: &PendingTerminal,
-    previous_status: String,
-    previous_events: usize,
-    previous_session_updated: Option<u64>,
-) {
-    if let Some(run) = store.runs.get_mut(run_id) {
-        run.status = previous_status;
-        run.events.truncate(previous_events);
-    }
-    if let (Some(session_id), Some(updated_at)) =
-        (pending.session_id.as_deref(), previous_session_updated)
-        && let Some(session) = store.sessions.get_mut(session_id)
-    {
-        session.messages.pop();
-        session.view.message_count = session.messages.len();
-        session.view.updated_at = updated_at;
-    }
 }
 
 /// Closes a run's live delivery stream: existing subscribers observe
