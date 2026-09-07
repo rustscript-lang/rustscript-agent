@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 const RUSTSCRIPT_GIT: &str = "https://github.com/rustscript-lang/rustscript.git";
-const RUSTSCRIPT_REV: &str = "5c328b8d5c374b365a2560925204e588b575a30a";
+const RUSTSCRIPT_REV: &str = "f9ca4143f8ba2f486e270347504c49f5ea846097";
 
 fn manifest() -> String {
     std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
@@ -56,7 +56,7 @@ fn pd_vm_and_pd_host_function_lock_sources_are_canonical_https_at_the_pinned_rev
     // revision, and the `#<rev>` checkout suffix.
     let canonical = format!("git+{RUSTSCRIPT_GIT}?rev={RUSTSCRIPT_REV}#{RUSTSCRIPT_REV}");
 
-    for package in ["pd-vm", "pd-host-function"] {
+    for package in ["pd-vm", "pd-host-schema", "pd-host-function"] {
         let block = lockfile
             .split("\n[[package]]")
             .find(|block| block.contains(&format!("\nname = \"{package}\"\n")))

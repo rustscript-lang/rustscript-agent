@@ -22,6 +22,7 @@ pub const CANONICAL_SCRIPT_EVENTS: &[&str] = &[
     "tool.started",
     "tool.output",
     "tool.completed",
+    "tool.failed",
     "compact.started",
     "compact.completed",
     "subagent.started",
