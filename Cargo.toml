@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "5c328b8d5c374b365a2560925204e588b575a30a", default-features = false, features = ["runtime", "http-client", "sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Meta-schema validation only; resolver features stay disabled.
+jsonschema = { version = "0.52.1", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", features = ["util"] }

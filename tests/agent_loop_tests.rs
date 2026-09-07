@@ -24,7 +24,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustscript_agent::{AgentConfig, AgentRunner};
+use rustscript_agent::{
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner, ToolRegistry,
+    builtin_entries,
+};
 use rustscript_vm::Value;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
@@ -2614,6 +2617,92 @@ fn recovery_fails_pending_compaction_even_when_run_is_terminal() {
         json!("run interrupted during gateway restart"),
         "the typed recovery failure reason must be recorded"
     );
-
     fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+}
+
+#[tokio::test]
+async fn agent_loop_receives_an_admission_snapshot_with_real_tool_schemas() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(context: map) -> map { context; }",
+    )
+    .expect("agent source should compile");
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"prompt": "inspect"}),
+            platform: "agent_loop_tests".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admission should succeed");
+    let context = service
+        .run_context(&admitted.run_id)
+        .expect("the loop should receive a captured context");
+
+    assert!(
+        context
+            .tool_schemas
+            .as_array()
+            .is_some_and(|schemas| schemas.iter().any(|schema| schema["name"] == "read_file"))
+    );
+    assert_eq!(
+        context.metadata["registry_identity"],
+        context.metadata["toolset_hash"]
+    );
+    assert!(
+        context
+            .provider_options
+            .as_object()
+            .is_some_and(|options| { !options.is_empty() })
+    );
+    for field in [
+        "max_turns",
+        "max_tool_calls",
+        "max_tool_output_bytes",
+        "workspace_root",
+    ] {
+        assert!(!context.limits[field].is_null(), "missing limit {field}");
+    }
+}
+
+#[tokio::test]
+async fn registry_mismatch_is_observed_as_durable_failure_before_rss_source() {
+    let state = AgentGatewayState::with_agent_source(
+        AgentGatewayConfig::default(),
+        "pub fn run(context: map) -> string { \"RSS_SENTINEL\"; }",
+    )
+    .expect("agent source should compile");
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"prompt": "must not reach RSS"}),
+            platform: "agent_loop_tests".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admission should succeed");
+    let changed_registry = ToolRegistry::new(builtin_entries().into_iter().take(1))
+        .expect("a one-tool registry should validate");
+    service
+        .set_tool_registry(changed_registry)
+        .expect("the changed registry should be accepted");
+
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    let terminal = events
+        .last()
+        .expect("the worker should commit an observable terminal event");
+    assert_eq!(terminal["event"], "run.failed");
+    assert_eq!(terminal["data"]["error_code"], "run_context_mismatch");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.to_string().contains("RSS_SENTINEL")),
+        "the RSS source must not be invoked after pre-entry context failure"
+    );
 }
