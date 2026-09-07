@@ -28,6 +28,8 @@ pub mod tool_schema;
 mod durable_provider;
 
 pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
+#[cfg(feature = "config-fixture")]
+pub use auth::oauth_host::{OAuthFixtureHost, oauth_fixture_catalog};
 pub use auth::store::{
     ACCESS_HANDLE_CLASS, AuthMetadata, AuthStore, AuthStoreError, CredentialStore,
     OpaqueAccessHandle, OpaqueRefreshHandle, OpaqueSecretSlot, REFRESH_HANDLE_CLASS,
@@ -43,6 +45,7 @@ pub use config_file::{
 };
 #[cfg(feature = "config-fixture")]
 pub mod config_fixture {
+    pub use crate::auth::oauth_host::{OAuthFixtureHost, oauth_fixture_catalog};
     pub use crate::auth::store_host::{AuthFixtureHost, auth_store_fixture_catalog};
     pub use crate::config_file::{
         ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyProbe,

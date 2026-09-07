@@ -82,6 +82,10 @@ impl SecretText {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("")
+    }
 }
 
 impl Serialize for SecretText {
