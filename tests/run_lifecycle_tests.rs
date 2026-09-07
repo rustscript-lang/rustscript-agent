@@ -1203,22 +1203,18 @@ async fn hanging_http_adapter_stop_cancels() {
         .await
         .expect("RssAdapterProvider should connect within the run setup window")
         .expect("hanging HTTP server should report its accepted connection");
-    let _ = service.stop(&admitted.run_id);
+    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
     tokio::time::timeout(Duration::from_secs(6), worker)
         .await
         .expect("hanging HTTP stop must stay bounded")
         .expect("worker join");
-    let terminals = terminal_events(&service, &admitted.run_id);
     assert_eq!(
-        terminals.len(),
-        1,
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.cancelled".to_string()],
         "{:?}",
         service.run_events(&admitted.run_id)
     );
-    assert!(
-        terminals[0] == "run.cancelled" || terminals[0] == "run.failed",
-        "stop must commit a typed terminal, got {terminals:?}"
-    );
+    assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
     let _ = shutdown_tx.send(());
     server.await.expect("hanging HTTP server task");
 }
