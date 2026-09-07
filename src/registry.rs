@@ -22,24 +22,18 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
     let bit_length = (bytes.len() as u64).wrapping_mul(8);
     let mut state = INITIAL;
-    let mut chunks = bytes.chunks_exact(64);
-    for chunk in &mut chunks {
-        let block: &[u8; 64] = chunk
-            .try_into()
-            .expect("chunks_exact yields 64-byte blocks");
+    let (chunks, remainder) = bytes.as_chunks::<64>();
+    for block in chunks {
         sha256_compress(&mut state, block);
     }
 
-    let remainder = chunks.remainder();
     let mut final_blocks = [0_u8; 128];
     final_blocks[..remainder.len()].copy_from_slice(remainder);
     final_blocks[remainder.len()] = 0x80;
     let final_len = if remainder.len() < 56 { 64 } else { 128 };
     final_blocks[final_len - 8..final_len].copy_from_slice(&bit_length.to_be_bytes());
-    for block in final_blocks[..final_len].chunks_exact(64) {
-        let block: &[u8; 64] = block
-            .try_into()
-            .expect("chunks_exact yields 64-byte blocks");
+    let (final_chunks, _) = final_blocks[..final_len].as_chunks::<64>();
+    for block in final_chunks {
         sha256_compress(&mut state, block);
     }
 

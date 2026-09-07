@@ -1,0 +1,36 @@
+version: 1
+agent:
+  source: bundled:coding
+  max_turns: 64
+  max_tool_calls: 128
+  max_tool_output_bytes: 1048576
+model:
+  provider: openai-codex
+  model: gpt-5-codex
+providers:
+  openai-codex:
+    protocol: codex-responses
+    base_url: https://chatgpt.com/backend-api/codex
+    auth: fixture-codex
+    oauth:
+      flow: codex-device
+      issuer: https://auth.openai.com
+      client_id: public-client-id
+      device_user_code_path: /api/accounts/deviceauth/usercode
+      device_poll_path: /api/accounts/deviceauth/token
+      authorization_path: /codex/device
+      token_endpoint: https://auth.openai.com/oauth/token
+      redirect_uri: https://auth.openai.com/deviceauth/callback
+      refresh_skew_seconds: 120
+workspaces:
+  allowed_roots:
+    - /tmp/rustscript-agent-workspace
+  default: /tmp/rustscript-agent-workspace
+approvals:
+  read: allow
+  write: ask
+  process: ask
+compaction:
+  enabled: true
+  max_context_messages: 120
+  retained_tail: 32

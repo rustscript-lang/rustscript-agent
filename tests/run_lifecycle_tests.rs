@@ -3,7 +3,6 @@
 mod common;
 
 use std::fs;
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -1148,15 +1147,23 @@ async fn non_expired_restart_keeps_remaining_deadline() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hanging_http_adapter_stop_cancels() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hang server");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hang server");
     let port = listener.local_addr().expect("local addr").port();
-    let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let accepted_flag = Arc::clone(&accepted);
-    let server = thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
-            accepted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            thread::sleep(Duration::from_secs(30));
-            drop(stream);
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut shutdown_rx = shutdown_rx;
+        tokio::select! {
+            accepted = listener.accept() => {
+                if let Ok((stream, _)) = accepted {
+                    let _ = accepted_tx.send(());
+                    let _ = shutdown_rx.await;
+                    drop(stream);
+                }
+            }
+            _ = &mut shutdown_rx => {}
         }
     });
     let mut config = short_config(Duration::from_secs(8));
@@ -1175,6 +1182,12 @@ async fn hanging_http_adapter_stop_cancels() {
         )
         .expect("profile"),
     );
+    // The provider adapter is compiled on its first call. Prepare that RSS
+    // snapshot before admission so the test's four-second window measures the
+    // HTTP lifecycle, not unrelated setup work on a loaded CI runner.
+    let harness_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss");
+    AgentRunner::from_file(&harness_path, AgentConfig::default())
+        .expect("compile adapter harness before admission");
     let admitted = service
         .admit(admit_request())
         .await
@@ -1186,30 +1199,24 @@ async fn hanging_http_adapter_stop_cancels() {
             service.run_worker(run_id, "ignored".to_string()).await;
         }
     });
-    assert!(
-        wait_until(Duration::from_secs(4), || {
-            accepted.load(std::sync::atomic::Ordering::SeqCst)
-        })
-        .await,
-        "RssAdapterProvider should connect to the hanging HTTP server"
-    );
-    let _ = service.stop(&admitted.run_id);
+    tokio::time::timeout(Duration::from_secs(4), accepted_rx)
+        .await
+        .expect("RssAdapterProvider should connect within the run setup window")
+        .expect("hanging HTTP server should report its accepted connection");
+    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
     tokio::time::timeout(Duration::from_secs(6), worker)
         .await
         .expect("hanging HTTP stop must stay bounded")
         .expect("worker join");
-    let terminals = terminal_events(&service, &admitted.run_id);
     assert_eq!(
-        terminals.len(),
-        1,
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.cancelled".to_string()],
         "{:?}",
         service.run_events(&admitted.run_id)
     );
-    assert!(
-        terminals[0] == "run.cancelled" || terminals[0] == "run.failed",
-        "stop must commit a typed terminal, got {terminals:?}"
-    );
-    drop(server);
+    assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
+    let _ = shutdown_tx.send(());
+    server.await.expect("hanging HTTP server task");
 }
 
 #[tokio::test(flavor = "multi_thread")]
