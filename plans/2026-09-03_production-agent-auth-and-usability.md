@@ -847,7 +847,7 @@ The RSS-tool migration is the first implementation phase. Tasks 1–13 remain bl
 
 ### Task 1: Address the integrated config/auth boundary
 
-**Status:** acceptance reopened for the boundary address. Existing integration `1c0b8dfd8aaac82552adf66cf0dee114f0af4e8f` remains in history and is not reverted. This task must pass Stage A before Task 2 continuation.
+**Status:** accepted in the current integration line. Stage A passed independent spec and quality review after opaque identity, fixture isolation, bounded lifetime and CI-test race corrections. The accepted integration history is retained; no earlier integration commit is reverted.
 
 **Objective:** add bounded structural config/auth schemas and path resolution while proving that provider selection/default/business interpretation is RSS-owned and that the foundation can be exercised through a minimal RSS entry.
 
@@ -879,7 +879,7 @@ tests/config_rss_entry_tests.rs
 
 ### Task 2: Snapshot-review and build the secure auth store
 
-**Status:** unaccepted. The interrupted Task 2 snapshot must be reviewed before continuation; no acceptance may be inferred from the existing integration commit.
+**Status:** accepted in the current integration line. The interrupted snapshot was frozen and reviewed before recovery; the completed store then passed independent spec and quality review, including canonical envelopes, generation-aware revocation, per-credential refresh single-flight and bounded secret-slot lifetime.
 
 **Objective:** provide host-side credential persistence and concurrency primitives while keeping token lifecycle meaning and refresh/reauth policy in RSS.
 
@@ -922,6 +922,8 @@ tests/auth_store_rss_tests.rs
 
 ### Task 3: Implement generic OAuth/PKCE primitives for RSS orchestration
 
+**Status:** accepted in the current integration line. Generic PKCE, callback, bounded transport, authorization-code/device primitives and the real RSS flow entry passed independent spec and quality review. OAuth host entries remain fixture-only; Task 4 still owns production catalog exposure.
+
 **Objective:** provide reusable crypto, callback, bounded transport and secret-persistence primitives without implementing a Rust OAuth workflow engine.
 
 **RSS owner:** create `rss/auth/oauth_flow.rss` for generic authorization-code/device flow sequencing, refresh timing, retry/backoff and status/error policy. Provider adapters select scopes, public parameters and payload interpretation.
@@ -947,6 +949,8 @@ tests/oauth_rss_entry_tests.rs
 **RSS entry acceptance:** run the real generic RSS auth entry with a fixture provider and fake host, cover browser/manual/callback/cancel/timeout plus sanitized response interpretation. No live provider call is permitted.
 
 **Commit:** `feat(auth): add generic oauth flows and refresh`
+
+**Batch seal record (2026-09-07):** work through Task 3 is sealed at integration code commit `31f2df8` (Task 2 integration base `543543f`; Task 3 commits `a8ed9e9`, `318b025`, `31f2df8`). Final focused verification covered Task 1 config/auth, Task 2 store/RSS and Task 3 OAuth/RSS suites, plus format, workspace all-feature check and strict Clippy. Tasks 4 and later remain pending for a future batch; no production OAuth catalog is exposed by this seal.
 
 ### Task 4: Expose the confined OAuth host bridge
 
