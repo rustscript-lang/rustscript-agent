@@ -390,12 +390,6 @@ impl IssuedHandleInner {
         self.state.load(Ordering::Acquire) == HANDLE_LIVE && !self.is_time_expired()
     }
 
-    fn matches_refresh_flight(&self, other: &Self) -> bool {
-        self.generation == other.generation
-            && self.policy_generation == other.policy_generation
-            && self.run_id == other.run_id
-    }
-
     fn mark_revoked(&self) {
         let previous = self.state.swap(HANDLE_REVOKED, Ordering::AcqRel);
         if previous != HANDLE_USED && previous != HANDLE_REVOKED {
@@ -1125,6 +1119,8 @@ struct StoreInner {
     /// filesystem advisory lock, then `handle_registry`. Never hold
     /// `handle_registry` across filesystem I/O. This table can only govern
     /// handles issued by this host; store generation remains the authority.
+    /// Refresh occupancy is one live unexpired flight per credential, across
+    /// every run, policy generation, and store generation on this host.
     handle_registry: Mutex<HandleRegistry>,
     #[cfg(unix)]
     home: std::os::fd::OwnedFd,
@@ -1178,11 +1174,13 @@ impl HandleRegistry {
                     .by_credential
                     .entry(handle.credential_id.clone())
                     .or_default();
-                if let Some(existing) = &entry.refresh
-                    && existing.is_inflight()
-                    && existing.matches_refresh_flight(&handle)
-                {
-                    return Err(existing.replayed_error());
+                if let Some(existing) = entry.refresh.take() {
+                    if existing.is_inflight() {
+                        let error = existing.replayed_error();
+                        entry.refresh = Some(existing);
+                        return Err(error);
+                    }
+                    existing.mark_revoked();
                 }
                 entry.refresh = Some(handle);
                 Ok(())

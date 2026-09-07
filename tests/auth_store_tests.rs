@@ -653,6 +653,59 @@ fn duplicate_same_generation_refresh_issuance_is_rejected() {
 }
 
 #[test]
+fn different_run_id_cannot_issue_second_live_refresh() {
+    let (_root, _paths, store) = open_with_yaml("refresh-run", ACCESS, Some(REFRESH), 4, "active");
+    let first = store
+        .issue_refresh_handle("primary", 4, 1, "run-a")
+        .expect("first refresh");
+    let duplicate = store
+        .issue_refresh_handle("primary", 4, 1, "run-b")
+        .expect_err("different run must not replace live refresh");
+    assert!(
+        matches!(duplicate, AuthStoreError::HandleReplayed { .. }),
+        "{duplicate:?}"
+    );
+    assert_no_secrets(&duplicate.to_string());
+    first
+        .validate()
+        .expect("rejected run must not consume the live refresh");
+    first
+        .validate_binding("primary", 4, 1, "run-a")
+        .expect("original run remains the sole live flight");
+    first.consume().expect("original refresh remains sendable");
+}
+
+#[test]
+fn different_policy_generation_cannot_replace_live_refresh() {
+    let (_root, _paths, store) =
+        open_with_yaml("refresh-policy", ACCESS, Some(REFRESH), 4, "active");
+    let first = store
+        .issue_refresh_handle("primary", 4, 1, "run-a")
+        .expect("first refresh");
+    let duplicate = store
+        .issue_refresh_handle("primary", 4, 2, "run-a")
+        .expect_err("different policy generation must not replace live refresh");
+    assert!(
+        matches!(duplicate, AuthStoreError::HandleReplayed { .. }),
+        "{duplicate:?}"
+    );
+    assert_no_secrets(&duplicate.to_string());
+    first
+        .validate_binding("primary", 4, 1, "run-a")
+        .expect("original policy remains valid for the sole flight");
+    let mismatched = first
+        .validate_binding("primary", 4, 2, "run-a")
+        .expect_err("reloaded policy must not consume the original flight");
+    assert!(
+        matches!(mismatched, AuthStoreError::HandleProvenance { .. }),
+        "{mismatched:?}"
+    );
+    first
+        .consume()
+        .expect("original refresh remains sendable under its policy");
+}
+
+#[test]
 fn consumed_expired_or_revoked_refresh_frees_single_flight() {
     let (_root, _paths, store) = open_with_yaml("refresh-free", ACCESS, Some(REFRESH), 4, "active");
 
@@ -661,17 +714,17 @@ fn consumed_expired_or_revoked_refresh_frees_single_flight() {
         .expect("first refresh");
     first.consume().expect("consume frees the slot");
     store
-        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .issue_refresh_handle("primary", 4, 2, "run-after-consume")
         .expect("refresh after consume")
         .force_expire();
 
     store
-        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .issue_refresh_handle("primary", 4, 3, "run-after-expire")
         .expect("refresh after expire")
         .force_expire();
 
     let before_delete = store
-        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .issue_refresh_handle("primary", 4, 1, "run-before-delete")
         .expect("refresh before delete");
     store.delete("primary").expect("delete revokes in-flight");
     assert_stale_handle(
@@ -679,6 +732,71 @@ fn consumed_expired_or_revoked_refresh_frees_single_flight() {
             .consume()
             .expect_err("deleted credential revokes refresh"),
     );
+}
+
+#[test]
+fn observed_stale_refresh_releases_single_flight() {
+    let (_root, paths, store) =
+        open_with_yaml("refresh-stale-slot", ACCESS, Some(REFRESH), 4, "active");
+    let first = store
+        .issue_refresh_handle("primary", 4, 1, "run-a")
+        .expect("first refresh");
+
+    fs::write(
+        &paths.auth,
+        auth_yaml(ROTATED_ACCESS, Some(ROTATED_REFRESH), 5, "active").as_bytes(),
+    )
+    .expect("rotate file outside save");
+    set_private_mode(&paths.auth);
+
+    let blocked = store
+        .issue_refresh_handle("primary", 5, 2, "run-b")
+        .expect_err("live stale flight still occupies the slot");
+    assert!(
+        matches!(blocked, AuthStoreError::HandleReplayed { .. }),
+        "{blocked:?}"
+    );
+
+    assert_stale_handle(first.consume().expect_err("stale refresh"));
+    store
+        .issue_refresh_handle("primary", 5, 2, "run-c")
+        .expect("slot frees after stale observation")
+        .consume()
+        .expect("new refresh is sendable");
+}
+
+#[test]
+fn concurrent_refresh_issuance_across_run_and_policy_is_single_flight() {
+    let (_root, _paths, store) = open_with_yaml("refresh-race", ACCESS, Some(REFRESH), 4, "active");
+    let workers: Vec<_> = (0..8)
+        .map(|index| {
+            let store = store.clone();
+            thread::spawn(move || {
+                store.issue_refresh_handle("primary", 4, 1 + (index % 3), &format!("run-{index}"))
+            })
+        })
+        .collect();
+    let mut successes = Vec::new();
+    let mut failures = 0usize;
+    for worker in workers {
+        match worker.join().expect("join refresh worker") {
+            Ok(handle) => successes.push(handle),
+            Err(error) => {
+                assert!(
+                    matches!(error, AuthStoreError::HandleReplayed { .. }),
+                    "{error:?}"
+                );
+                assert_no_secrets(&error.to_string());
+                failures += 1;
+            }
+        }
+    }
+    assert_eq!(successes.len(), 1, "exactly one live refresh");
+    assert_eq!(failures, 7);
+    successes
+        .remove(0)
+        .consume()
+        .expect("sole live refresh remains consumable");
 }
 
 #[test]
