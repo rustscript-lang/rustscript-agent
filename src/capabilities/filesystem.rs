@@ -346,6 +346,10 @@ fn map_fs_error(error: ConfinedFsError) -> CapabilityError {
     let code = match error.kind() {
         ConfinedFsErrorKind::ParentTraversal
         | ConfinedFsErrorKind::AbsolutePath
+        | ConfinedFsErrorKind::EmptyPath
+        | ConfinedFsErrorKind::NulByte
+        | ConfinedFsErrorKind::PathTooLong
+        | ConfinedFsErrorKind::ComponentTooLong
         | ConfinedFsErrorKind::SymlinkDenied
         | ConfinedFsErrorKind::HardlinkDenied
         | ConfinedFsErrorKind::PathPrefix
@@ -356,5 +360,5 @@ fn map_fs_error(error: ConfinedFsError) -> CapabilityError {
         ConfinedFsErrorKind::BudgetExceeded => "budget_exceeded",
         other => other.as_str(),
     };
-    CapabilityError::new(code, error.to_string())
+    CapabilityError::new(code, error.message())
 }
