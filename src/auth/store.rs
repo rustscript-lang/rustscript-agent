@@ -4,10 +4,11 @@
 //! and opaque secret slots. It does not select providers, refresh policies, or
 //! status transitions. Those decisions stay in RSS and its host adapter.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use zeroize::{Zeroize, Zeroizing};
@@ -24,11 +25,15 @@ pub const MAX_AUTH_STORE_BYTES: usize = crate::auth::config::MAX_AUTH_YAML_BYTES
 const MAX_SECRET_SLOT_BYTES: usize = 64 * 1024;
 const SLOT_LIVE: u8 = 0;
 const SLOT_USED: u8 = 1;
+const SLOT_EXPIRED: u8 = 2;
 const HANDLE_LIVE: u8 = 0;
 const HANDLE_USED: u8 = 1;
 const HANDLE_EXPIRED: u8 = 2;
+const HANDLE_REVOKED: u8 = 3;
 const ACCESS_HANDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const REFRESH_HANDLE_TTL: Duration = Duration::from_secs(60);
+#[cfg(any(test, feature = "config-fixture"))]
+const SECRET_SLOT_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// RSS-visible class name for a host-minted access handle.
 pub const ACCESS_HANDLE_CLASS: &str = "OpaqueAccessHandle";
@@ -66,6 +71,7 @@ struct SecretSlotInner {
     run_id: String,
     bytes: Mutex<Zeroizing<Vec<u8>>>,
     state: AtomicU8,
+    expires_at: Instant,
 }
 
 impl fmt::Debug for OpaqueSecretSlot {
@@ -83,6 +89,7 @@ impl fmt::Debug for OpaqueSecretSlot {
 }
 
 impl OpaqueSecretSlot {
+    #[cfg(any(test, feature = "config-fixture"))]
     pub(crate) fn from_host_secret(
         kind: SecretSlotKind,
         credential_id: &str,
@@ -90,6 +97,26 @@ impl OpaqueSecretSlot {
         policy_generation: u64,
         run_id: &str,
         bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, AuthStoreError> {
+        Self::from_host_secret_until(
+            kind,
+            credential_id,
+            expected_generation,
+            policy_generation,
+            run_id,
+            bytes,
+            Instant::now() + SECRET_SLOT_TTL,
+        )
+    }
+
+    pub(crate) fn from_host_secret_until(
+        kind: SecretSlotKind,
+        credential_id: &str,
+        expected_generation: u64,
+        policy_generation: u64,
+        run_id: &str,
+        bytes: Zeroizing<Vec<u8>>,
+        expires_at: Instant,
     ) -> Result<Self, AuthStoreError> {
         if bytes.is_empty() || bytes.len() > MAX_SECRET_SLOT_BYTES {
             return Err(AuthStoreError::SecretSlotInvalid {
@@ -120,8 +147,48 @@ impl OpaqueSecretSlot {
                 run_id: run_id.to_string(),
                 bytes: Mutex::new(bytes),
                 state: AtomicU8::new(SLOT_LIVE),
+                expires_at,
             }),
         })
+    }
+
+    fn expired_error(&self) -> AuthStoreError {
+        AuthStoreError::SecretSlotExpired {
+            credential_id: self.inner.credential_id.clone(),
+            kind: self.inner.kind.as_str().to_string(),
+        }
+    }
+
+    fn zeroize_bytes(&self) {
+        let mut bytes = self
+            .inner
+            .bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        bytes.zeroize();
+    }
+
+    fn mark_expired(&self) {
+        if self
+            .inner
+            .state
+            .compare_exchange(SLOT_LIVE, SLOT_EXPIRED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.zeroize_bytes();
+        }
+    }
+
+    fn expire_if_due(&self) -> Result<(), AuthStoreError> {
+        if self.inner.state.load(Ordering::Acquire) == SLOT_EXPIRED {
+            self.zeroize_bytes();
+            return Err(self.expired_error());
+        }
+        if Instant::now() >= self.inner.expires_at {
+            self.mark_expired();
+            return Err(self.expired_error());
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_for_request(
@@ -132,6 +199,7 @@ impl OpaqueSecretSlot {
         policy_generation: u64,
         run_id: &str,
     ) -> Result<(), AuthStoreError> {
+        self.expire_if_due()?;
         if self.inner.kind != kind
             || self.inner.credential_id != credential_id
             || self.inner.expected_generation != expected_generation
@@ -201,6 +269,7 @@ impl OpaqueSecretSlot {
     }
 
     pub(crate) fn consume(&self) -> Result<(), AuthStoreError> {
+        self.expire_if_due()?;
         if self
             .inner
             .state
@@ -270,6 +339,7 @@ struct IssuedHandleInner {
     expires_at: Instant,
     state: AtomicU8,
     slot: OpaqueSecretSlot,
+    store: Weak<StoreInner>,
 }
 
 impl IssuedHandleInner {
@@ -280,28 +350,87 @@ impl IssuedHandleInner {
         }
     }
 
-    fn is_expired(&self) -> bool {
-        self.state.load(Ordering::Acquire) == HANDLE_EXPIRED || Instant::now() >= self.expires_at
+    fn kind_label(&self) -> String {
+        self.kind.as_str().to_string()
     }
 
-    fn check_live(&self) -> Result<(), AuthStoreError> {
-        if self.state.load(Ordering::Acquire) == HANDLE_USED {
-            return Err(AuthStoreError::HandleReplayed {
-                credential_id: self.credential_id.clone(),
-                kind: self.kind.as_str().to_string(),
-            });
+    fn replayed_error(&self) -> AuthStoreError {
+        AuthStoreError::HandleReplayed {
+            credential_id: self.credential_id.clone(),
+            kind: self.kind_label(),
         }
-        if self.is_expired() {
-            let _ = self.state.compare_exchange(
+    }
+
+    fn revoked_error(&self) -> AuthStoreError {
+        AuthStoreError::HandleRevoked {
+            credential_id: self.credential_id.clone(),
+            kind: self.kind_label(),
+        }
+    }
+
+    fn expired_error(&self) -> AuthStoreError {
+        AuthStoreError::HandleExpired {
+            credential_id: self.credential_id.clone(),
+            kind: self.kind_label(),
+        }
+    }
+
+    fn host_store(&self) -> Result<AuthStore, AuthStoreError> {
+        self.store
+            .upgrade()
+            .map(|inner| AuthStore { inner })
+            .ok_or_else(|| self.revoked_error())
+    }
+
+    fn is_time_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+
+    fn is_inflight(&self) -> bool {
+        self.state.load(Ordering::Acquire) == HANDLE_LIVE && !self.is_time_expired()
+    }
+
+    fn matches_refresh_flight(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.policy_generation == other.policy_generation
+            && self.run_id == other.run_id
+    }
+
+    fn mark_revoked(&self) {
+        let previous = self.state.swap(HANDLE_REVOKED, Ordering::AcqRel);
+        if previous != HANDLE_USED && previous != HANDLE_REVOKED {
+            self.slot.revoke();
+        }
+    }
+
+    fn mark_expired(&self) {
+        if self
+            .state
+            .compare_exchange(
                 HANDLE_LIVE,
                 HANDLE_EXPIRED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            );
-            return Err(AuthStoreError::HandleExpired {
-                credential_id: self.credential_id.clone(),
-                kind: self.kind.as_str().to_string(),
-            });
+            )
+            .is_ok()
+        {
+            self.slot.revoke();
+        }
+    }
+
+    fn check_live(&self) -> Result<(), AuthStoreError> {
+        match self.state.load(Ordering::Acquire) {
+            HANDLE_USED => return Err(self.replayed_error()),
+            HANDLE_REVOKED => return Err(self.revoked_error()),
+            HANDLE_EXPIRED => {
+                self.slot.revoke();
+                return Err(self.expired_error());
+            }
+            _ => {}
+        }
+        if self.is_time_expired() {
+            self.mark_expired();
+            return Err(self.expired_error());
         }
         Ok(())
     }
@@ -320,7 +449,7 @@ impl IssuedHandleInner {
         {
             return Err(AuthStoreError::HandleProvenance {
                 credential_id: credential_id.to_string(),
-                kind: self.kind.as_str().to_string(),
+                kind: self.kind_label(),
             });
         }
         Ok(())
@@ -338,22 +467,25 @@ impl IssuedHandleInner {
             )
             .is_err()
         {
-            return Err(AuthStoreError::HandleReplayed {
-                credential_id: self.credential_id.clone(),
-                kind: self.kind.as_str().to_string(),
-            });
+            return Err(self.replayed_error());
         }
         self.slot.revoke();
         Ok(())
     }
 
     fn force_expire(&self) {
-        let _ = self.state.compare_exchange(
-            HANDLE_LIVE,
-            HANDLE_EXPIRED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.mark_expired();
+        if let Ok(store) = self.host_store() {
+            store.unregister_issued(self);
+        }
+    }
+
+    fn validate_against_store(&self) -> Result<(), AuthStoreError> {
+        self.host_store()?.revalidate_issued(self)
+    }
+
+    fn consume_against_store(&self) -> Result<(), AuthStoreError> {
+        self.host_store()?.consume_issued(self)
     }
 }
 
@@ -381,7 +513,7 @@ impl OpaqueAccessHandle {
     }
 
     pub fn validate(&self) -> Result<(), AuthStoreError> {
-        self.inner.check_live()
+        self.inner.validate_against_store()
     }
 
     pub fn validate_binding(
@@ -397,7 +529,7 @@ impl OpaqueAccessHandle {
     }
 
     pub fn consume(&self) -> Result<(), AuthStoreError> {
-        self.inner.consume_live()
+        self.inner.consume_against_store()
     }
 
     pub fn force_expire(&self) {
@@ -439,7 +571,7 @@ impl OpaqueRefreshHandle {
     }
 
     pub fn validate(&self) -> Result<(), AuthStoreError> {
-        self.inner.check_live()
+        self.inner.validate_against_store()
     }
 
     pub fn validate_binding(
@@ -455,7 +587,7 @@ impl OpaqueRefreshHandle {
     }
 
     pub fn consume(&self) -> Result<(), AuthStoreError> {
-        self.inner.consume_live()
+        self.inner.consume_against_store()
     }
 
     pub fn force_expire(&self) {
@@ -696,6 +828,10 @@ pub enum AuthStoreError {
         credential_id: String,
         kind: String,
     },
+    SecretSlotExpired {
+        credential_id: String,
+        kind: String,
+    },
     HandleInvalid {
         credential_id: String,
         kind: String,
@@ -709,6 +845,10 @@ pub enum AuthStoreError {
         kind: String,
     },
     HandleReplayed {
+        credential_id: String,
+        kind: String,
+    },
+    HandleRevoked {
         credential_id: String,
         kind: String,
     },
@@ -739,10 +879,12 @@ impl AuthStoreError {
             Self::SecretSlotInvalid { .. } => "secret_slot_invalid",
             Self::SecretSlotProvenance { .. } => "secret_slot_provenance",
             Self::SecretSlotReplayed { .. } => "secret_slot_replayed",
+            Self::SecretSlotExpired { .. } => "secret_slot_expired",
             Self::HandleInvalid { .. } => "handle_invalid",
             Self::HandleExpired { .. } => "handle_expired",
             Self::HandleProvenance { .. } => "handle_provenance",
             Self::HandleReplayed { .. } => "handle_replayed",
+            Self::HandleRevoked { .. } => "handle_revoked",
             Self::Serialization { .. } => "serialization_error",
         }
     }
@@ -898,6 +1040,13 @@ impl fmt::Display for AuthStoreError {
                 formatter,
                 "{kind} secret slot for credential {credential_id:?} was already used"
             ),
+            Self::SecretSlotExpired {
+                credential_id,
+                kind,
+            } => write!(
+                formatter,
+                "{kind} secret slot for credential {credential_id:?} has expired"
+            ),
             Self::HandleInvalid {
                 credential_id,
                 kind,
@@ -925,6 +1074,13 @@ impl fmt::Display for AuthStoreError {
             } => write!(
                 formatter,
                 "{kind} handle for credential {credential_id:?} was already used"
+            ),
+            Self::HandleRevoked {
+                credential_id,
+                kind,
+            } => write!(
+                formatter,
+                "{kind} handle for credential {credential_id:?} was revoked"
             ),
             Self::Serialization { message } => {
                 write!(formatter, "cannot serialize auth document: {message}")
@@ -965,8 +1121,103 @@ pub trait CredentialStore {
 struct StoreInner {
     paths: AgentPaths,
     process_lock: Mutex<()>,
+    /// In-process issued-handle table. Lock order: `process_lock`, then the
+    /// filesystem advisory lock, then `handle_registry`. Never hold
+    /// `handle_registry` across filesystem I/O. This table can only govern
+    /// handles issued by this host; store generation remains the authority.
+    handle_registry: Mutex<HandleRegistry>,
     #[cfg(unix)]
     home: std::os::fd::OwnedFd,
+}
+
+#[derive(Default)]
+struct IssuedHandleSet {
+    access: Vec<Arc<IssuedHandleInner>>,
+    refresh: Option<Arc<IssuedHandleInner>>,
+}
+
+#[derive(Default)]
+struct HandleRegistry {
+    by_credential: HashMap<String, IssuedHandleSet>,
+}
+
+impl HandleRegistry {
+    fn sweep_expired(&mut self) {
+        self.by_credential.retain(|_, entry| {
+            for handle in &entry.access {
+                if handle.is_time_expired() {
+                    handle.mark_expired();
+                }
+            }
+            entry.access.retain(|handle| handle.is_inflight());
+            if let Some(handle) = &entry.refresh {
+                if handle.is_time_expired() {
+                    handle.mark_expired();
+                }
+                if !handle.is_inflight() {
+                    entry.refresh = None;
+                }
+            }
+            !entry.access.is_empty() || entry.refresh.is_some()
+        });
+    }
+
+    fn register(&mut self, handle: Arc<IssuedHandleInner>) -> Result<(), AuthStoreError> {
+        self.sweep_expired();
+        match handle.kind {
+            SecretSlotKind::Access => {
+                self.by_credential
+                    .entry(handle.credential_id.clone())
+                    .or_default()
+                    .access
+                    .push(handle);
+                Ok(())
+            }
+            SecretSlotKind::Refresh => {
+                let entry = self
+                    .by_credential
+                    .entry(handle.credential_id.clone())
+                    .or_default();
+                if let Some(existing) = &entry.refresh
+                    && existing.is_inflight()
+                    && existing.matches_refresh_flight(&handle)
+                {
+                    return Err(existing.replayed_error());
+                }
+                entry.refresh = Some(handle);
+                Ok(())
+            }
+        }
+    }
+
+    fn unregister(&mut self, handle: &IssuedHandleInner) {
+        let Some(entry) = self.by_credential.get_mut(&handle.credential_id) else {
+            return;
+        };
+        match handle.kind {
+            SecretSlotKind::Access => {
+                entry
+                    .access
+                    .retain(|candidate| !std::ptr::eq(candidate.as_ref(), handle));
+            }
+            SecretSlotKind::Refresh => {
+                if entry
+                    .refresh
+                    .as_ref()
+                    .is_some_and(|candidate| std::ptr::eq(candidate.as_ref(), handle))
+                {
+                    entry.refresh = None;
+                }
+            }
+        }
+        if entry.access.is_empty() && entry.refresh.is_none() {
+            self.by_credential.remove(&handle.credential_id);
+        }
+    }
+
+    fn revoke_credential(&mut self, credential_id: &str) -> IssuedHandleSet {
+        self.by_credential.remove(credential_id).unwrap_or_default()
+    }
 }
 
 impl AuthStore {
@@ -985,6 +1236,7 @@ impl AuthStore {
                 inner: Arc::new(StoreInner {
                     paths,
                     process_lock: Mutex::new(()),
+                    handle_registry: Mutex::new(HandleRegistry::default()),
                     home,
                 }),
             })
@@ -1066,74 +1318,82 @@ impl AuthStore {
     ) -> Result<SaveOutcome, AuthStoreError> {
         request.validate()?;
         let credential_id = request.credential_id.to_string();
-        let result = self.with_lock(|store| {
-            let mut document = store.load_locked()?;
-            let current = document.credentials.get(&credential_id);
-            let actual_generation = current.map_or(0, |credential| credential.generation);
-            if actual_generation > request.expected_generation {
-                let current = current.expect("generation is present when greater than expected");
-                return Ok(SaveOutcome::Adopted {
-                    metadata: AuthMetadata::from_stored(&credential_id, current),
-                });
-            }
-            if actual_generation < request.expected_generation {
-                return Err(AuthStoreError::GenerationConflict {
-                    credential_id: credential_id.clone(),
-                    expected: request.expected_generation,
-                    actual: actual_generation,
-                });
-            }
-            let next_generation = request.expected_generation.checked_add(1).ok_or_else(|| {
-                AuthStoreError::GenerationOverflow {
-                    credential_id: credential_id.clone(),
+        let result = self.with_process_lock(|store| {
+            let outcome = store.with_file_lock(|store| {
+                let mut document = store.load_locked()?;
+                let current = document.credentials.get(&credential_id);
+                let actual_generation = current.map_or(0, |credential| credential.generation);
+                if actual_generation > request.expected_generation {
+                    let current =
+                        current.expect("generation is present when greater than expected");
+                    return Ok(SaveOutcome::Adopted {
+                        metadata: AuthMetadata::from_stored(&credential_id, current),
+                    });
                 }
-            })?;
-            let access = request.access_slot.snapshot_text(
-                SecretSlotKind::Access,
-                &credential_id,
-                request.expected_generation,
-                request.policy_generation,
-                &request.run_id,
-            )?;
-            let refresh = match &request.refresh {
-                RefreshSecretAction::Preserve => {
-                    current.and_then(|value| value.refresh_token.clone())
+                if actual_generation < request.expected_generation {
+                    return Err(AuthStoreError::GenerationConflict {
+                        credential_id: credential_id.clone(),
+                        expected: request.expected_generation,
+                        actual: actual_generation,
+                    });
                 }
-                RefreshSecretAction::Replace(slot) => Some(slot.snapshot_text(
-                    SecretSlotKind::Refresh,
+                let next_generation =
+                    request.expected_generation.checked_add(1).ok_or_else(|| {
+                        AuthStoreError::GenerationOverflow {
+                            credential_id: credential_id.clone(),
+                        }
+                    })?;
+                let access = request.access_slot.snapshot_text(
+                    SecretSlotKind::Access,
                     &credential_id,
                     request.expected_generation,
                     request.policy_generation,
                     &request.run_id,
-                )?),
-                RefreshSecretAction::Clear => None,
-            };
-            let updated = StoredCredentialConfig {
-                provider: request.metadata.provider.clone(),
-                kind: request.metadata.kind.clone(),
-                source: request.metadata.source.clone(),
-                token_type: request.metadata.token_type.clone(),
-                access_token: access,
-                refresh_token: refresh,
-                expires_at_ms: request.metadata.expires_at_ms,
-                scopes: request.metadata.scopes.clone(),
-                account_id: request.metadata.account_id.clone(),
-                generation: next_generation,
-                status: request.metadata.status.clone(),
-                last_refresh_at_ms: request.metadata.last_refresh_at_ms,
-            };
-            document.credentials.insert(credential_id.clone(), updated);
-            store.save_locked(&document)?;
-            let saved = document
-                .credentials
-                .get(&credential_id)
-                .expect("saved credential is present");
-            let metadata = AuthMetadata::from_stored(&credential_id, saved);
-            request.access_slot.consume()?;
-            if let RefreshSecretAction::Replace(slot) = &request.refresh {
-                slot.consume()?;
+                )?;
+                let refresh = match &request.refresh {
+                    RefreshSecretAction::Preserve => {
+                        current.and_then(|value| value.refresh_token.clone())
+                    }
+                    RefreshSecretAction::Replace(slot) => Some(slot.snapshot_text(
+                        SecretSlotKind::Refresh,
+                        &credential_id,
+                        request.expected_generation,
+                        request.policy_generation,
+                        &request.run_id,
+                    )?),
+                    RefreshSecretAction::Clear => None,
+                };
+                let updated = StoredCredentialConfig {
+                    provider: request.metadata.provider.clone(),
+                    kind: request.metadata.kind.clone(),
+                    source: request.metadata.source.clone(),
+                    token_type: request.metadata.token_type.clone(),
+                    access_token: access,
+                    refresh_token: refresh,
+                    expires_at_ms: request.metadata.expires_at_ms,
+                    scopes: request.metadata.scopes.clone(),
+                    account_id: request.metadata.account_id.clone(),
+                    generation: next_generation,
+                    status: request.metadata.status.clone(),
+                    last_refresh_at_ms: request.metadata.last_refresh_at_ms,
+                };
+                document.credentials.insert(credential_id.clone(), updated);
+                store.save_locked(&document)?;
+                let saved = document
+                    .credentials
+                    .get(&credential_id)
+                    .expect("saved credential is present");
+                let metadata = AuthMetadata::from_stored(&credential_id, saved);
+                request.access_slot.consume()?;
+                if let RefreshSecretAction::Replace(slot) = &request.refresh {
+                    slot.consume()?;
+                }
+                Ok(SaveOutcome::Committed { metadata })
+            })?;
+            if matches!(&outcome, SaveOutcome::Committed { .. }) {
+                store.revoke_issued_handles(&credential_id);
             }
-            Ok(SaveOutcome::Committed { metadata })
+            Ok(outcome)
         });
         if matches!(
             result,
@@ -1148,15 +1408,19 @@ impl AuthStore {
     /// other entries in the YAML document.
     pub fn delete(&self, credential_id: &str) -> Result<AuthMetadata, AuthStoreError> {
         let credential_id = checked_credential_id(credential_id)?;
-        self.with_lock(|store| {
-            let mut document = store.load_locked()?;
-            let Some(removed) = document.credentials.remove(credential_id.as_str()) else {
-                return Err(AuthStoreError::CredentialNotFound {
-                    credential_id: credential_id.to_string(),
-                });
-            };
-            store.save_locked(&document)?;
-            Ok(AuthMetadata::from_stored(credential_id.as_str(), &removed))
+        self.with_process_lock(|store| {
+            let metadata = store.with_file_lock(|store| {
+                let mut document = store.load_locked()?;
+                let Some(removed) = document.credentials.remove(credential_id.as_str()) else {
+                    return Err(AuthStoreError::CredentialNotFound {
+                        credential_id: credential_id.to_string(),
+                    });
+                };
+                store.save_locked(&document)?;
+                Ok(AuthMetadata::from_stored(credential_id.as_str(), &removed))
+            })?;
+            store.revoke_issued_handles(credential_id.as_str());
+            Ok(metadata)
         })
     }
 
@@ -1244,40 +1508,36 @@ impl AuthStore {
         request_deadline: Instant,
     ) -> Result<Arc<IssuedHandleInner>, AuthStoreError> {
         let credential_id = checked_credential_id(credential_id)?;
-        self.with_lock(|store| {
-            let document = store.load_locked()?;
-            let credential = document
-                .credentials
-                .get(credential_id.as_str())
-                .ok_or_else(|| AuthStoreError::CredentialNotFound {
-                    credential_id: credential_id.to_string(),
-                })?;
-            if credential.generation != generation {
-                return Err(AuthStoreError::GenerationConflict {
-                    credential_id: credential_id.to_string(),
-                    expected: generation,
-                    actual: credential.generation,
-                });
-            }
-            let expires_at_ms = credential.expires_at_ms;
-            let secret = match kind {
-                SecretSlotKind::Access => credential.access_token.clone(),
-                SecretSlotKind::Refresh => credential.refresh_token.clone().ok_or_else(|| {
-                    AuthStoreError::InvalidMetadata {
+        self.with_process_lock(|store| {
+            let (expires_at_ms, secret) = store.with_file_lock(|store| {
+                let document = store.load_locked()?;
+                let credential = document
+                    .credentials
+                    .get(credential_id.as_str())
+                    .ok_or_else(|| AuthStoreError::CredentialNotFound {
                         credential_id: credential_id.to_string(),
-                        field: "refresh_token".to_string(),
-                        reason: "refresh slot is absent".to_string(),
+                    })?;
+                if credential.generation != generation {
+                    return Err(AuthStoreError::GenerationConflict {
+                        credential_id: credential_id.to_string(),
+                        expected: generation,
+                        actual: credential.generation,
+                    });
+                }
+                let secret = match kind {
+                    SecretSlotKind::Access => credential.access_token.clone(),
+                    SecretSlotKind::Refresh => {
+                        credential.refresh_token.clone().ok_or_else(|| {
+                            AuthStoreError::InvalidMetadata {
+                                credential_id: credential_id.to_string(),
+                                field: "refresh_token".to_string(),
+                                reason: "refresh slot is absent".to_string(),
+                            }
+                        })?
                     }
-                })?,
-            };
-            let slot = OpaqueSecretSlot::from_host_secret(
-                kind,
-                credential_id.as_str(),
-                generation,
-                policy_generation,
-                run_id,
-                secret.into_bytes(),
-            )?;
+                };
+                Ok((credential.expires_at_ms, secret))
+            })?;
             let expires_at = handle_deadline(kind, expires_at_ms, request_deadline);
             if Instant::now() >= expires_at {
                 return Err(AuthStoreError::HandleExpired {
@@ -1285,7 +1545,16 @@ impl AuthStore {
                     kind: kind.as_str().to_string(),
                 });
             }
-            Ok(Arc::new(IssuedHandleInner {
+            let slot = OpaqueSecretSlot::from_host_secret_until(
+                kind,
+                credential_id.as_str(),
+                generation,
+                policy_generation,
+                run_id,
+                secret.into_bytes(),
+                expires_at,
+            )?;
+            let inner = Arc::new(IssuedHandleInner {
                 kind,
                 credential_id: credential_id.to_string(),
                 generation,
@@ -1294,7 +1563,10 @@ impl AuthStore {
                 expires_at,
                 state: AtomicU8::new(HANDLE_LIVE),
                 slot,
-            }))
+                store: Arc::downgrade(&store.inner),
+            });
+            store.register_issued(Arc::clone(&inner))?;
+            Ok(inner)
         })
     }
 
@@ -1363,18 +1635,125 @@ impl AuthStore {
         &self,
         operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
     ) -> Result<T, AuthStoreError> {
+        self.with_process_lock(|store| store.with_file_lock(operation))
+    }
+
+    fn with_process_lock<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
+    ) -> Result<T, AuthStoreError> {
         let process_guard = self
             .inner
             .process_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = operation(self);
+        drop(process_guard);
+        result
+    }
+
+    fn with_file_lock<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
+    ) -> Result<T, AuthStoreError> {
         #[cfg(unix)]
         let file_guard = unix::lock_file(&self.inner.home, &self.inner.paths.auth_lock)?;
         let result = operation(self);
         #[cfg(unix)]
         drop(file_guard);
-        drop(process_guard);
         result
+    }
+
+    fn registry_lock(&self) -> std::sync::MutexGuard<'_, HandleRegistry> {
+        self.inner
+            .handle_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn register_issued(&self, handle: Arc<IssuedHandleInner>) -> Result<(), AuthStoreError> {
+        self.registry_lock().register(handle)
+    }
+
+    fn unregister_issued(&self, handle: &IssuedHandleInner) {
+        self.registry_lock().unregister(handle);
+    }
+
+    fn revoke_issued_handles(&self, credential_id: &str) {
+        let revoked = self.registry_lock().revoke_credential(credential_id);
+        for handle in revoked.access {
+            handle.mark_revoked();
+        }
+        if let Some(handle) = revoked.refresh {
+            handle.mark_revoked();
+        }
+    }
+
+    fn live_store_generation(&self, handle: &IssuedHandleInner) -> Result<u64, AuthStoreError> {
+        let document = self.load_locked()?;
+        let credential = document
+            .credentials
+            .get(&handle.credential_id)
+            .ok_or_else(|| handle.revoked_error())?;
+        Ok(credential.generation)
+    }
+
+    fn fail_stale_handle(
+        &self,
+        handle: &IssuedHandleInner,
+        error: AuthStoreError,
+    ) -> AuthStoreError {
+        handle.mark_revoked();
+        self.unregister_issued(handle);
+        error
+    }
+
+    fn revalidate_issued(&self, handle: &IssuedHandleInner) -> Result<(), AuthStoreError> {
+        handle.check_live()?;
+        self.with_process_lock(|store| {
+            handle.check_live()?;
+            match store.with_file_lock(|store| store.live_store_generation(handle)) {
+                Ok(actual) if actual == handle.generation => Ok(()),
+                Ok(actual) => Err(store.fail_stale_handle(
+                    handle,
+                    AuthStoreError::GenerationConflict {
+                        credential_id: handle.credential_id.clone(),
+                        expected: handle.generation,
+                        actual,
+                    },
+                )),
+                Err(error @ AuthStoreError::HandleRevoked { .. }) => {
+                    Err(store.fail_stale_handle(handle, error))
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn consume_issued(&self, handle: &IssuedHandleInner) -> Result<(), AuthStoreError> {
+        handle.check_live()?;
+        self.with_process_lock(|store| {
+            handle.check_live()?;
+            match store.with_file_lock(|store| store.live_store_generation(handle)) {
+                Ok(actual) if actual == handle.generation => {
+                    handle.consume_live()?;
+                    store.unregister_issued(handle);
+                    Ok(())
+                }
+                Ok(actual) => Err(store.fail_stale_handle(
+                    handle,
+                    AuthStoreError::GenerationConflict {
+                        credential_id: handle.credential_id.clone(),
+                        expected: handle.generation,
+                        actual,
+                    },
+                )),
+                Err(error @ AuthStoreError::HandleRevoked { .. }) => {
+                    Err(store.fail_stale_handle(handle, error))
+                }
+                Err(error) => Err(error),
+            }
+        })
     }
 }
 
@@ -2024,6 +2403,29 @@ impl AuthStore {
             policy_generation,
             run_id,
             secret,
+        )
+    }
+
+    /// Host-only test helper: mint an access secret slot with an explicit deadline.
+    #[cfg(any(test, feature = "config-fixture"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fixture_access_slot_until(
+        &self,
+        credential_id: &str,
+        expected_generation: u64,
+        policy_generation: u64,
+        run_id: &str,
+        secret: &str,
+        expires_at: Instant,
+    ) -> Result<OpaqueSecretSlot, AuthStoreError> {
+        OpaqueSecretSlot::from_host_secret_until(
+            SecretSlotKind::Access,
+            credential_id,
+            expected_generation,
+            policy_generation,
+            run_id,
+            Zeroizing::new(secret.as_bytes().to_vec()),
+            expires_at,
         )
     }
 

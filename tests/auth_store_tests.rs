@@ -528,3 +528,252 @@ fn concurrent_writers_preserve_distinct_credentials() {
         assert_no_secrets(&format!("{metadata:?}"));
     }
 }
+
+fn assert_stale_handle(error: AuthStoreError) {
+    assert_no_secrets(&error.to_string());
+    assert!(
+        matches!(
+            error,
+            AuthStoreError::GenerationConflict { .. } | AuthStoreError::HandleRevoked { .. }
+        ),
+        "stale handle must fail closed without a secret, got {error:?}"
+    );
+}
+
+#[test]
+fn save_rotation_revokes_previously_issued_handles() {
+    let (_root, _paths, store) = open_with_yaml("revoke-save", ACCESS, Some(REFRESH), 0, "active");
+    let access = store
+        .issue_access_handle("primary", 0, 1, "test-run")
+        .expect("access handle");
+    let refresh = store
+        .issue_refresh_handle("primary", 0, 1, "test-run")
+        .expect("refresh handle");
+
+    store
+        .save_if_generation(save_request(
+            &store,
+            "primary",
+            0,
+            ROTATED_ACCESS,
+            RefreshSecretAction::Preserve,
+            "active",
+        ))
+        .expect("rotate generation");
+
+    assert_stale_handle(access.consume().expect_err("old access after CAS"));
+    assert_stale_handle(refresh.consume().expect_err("old refresh after CAS"));
+}
+
+#[test]
+fn delete_revokes_previously_issued_handles() {
+    let (_root, _paths, store) =
+        open_with_yaml("revoke-delete", ACCESS, Some(REFRESH), 4, "active");
+    let access = store
+        .issue_access_handle("primary", 4, 1, "test-run")
+        .expect("access handle");
+    let refresh = store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect("refresh handle");
+
+    store.delete("primary").expect("delete");
+
+    assert_stale_handle(access.consume().expect_err("access after delete"));
+    assert_stale_handle(refresh.consume().expect_err("refresh after delete"));
+}
+
+#[test]
+fn consume_revalidates_store_generation_as_authority() {
+    let (_root, paths, store) = open_with_yaml("gen-authority", ACCESS, Some(REFRESH), 4, "active");
+    let access = store
+        .issue_access_handle("primary", 4, 1, "test-run")
+        .expect("access handle");
+    let refresh = store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect("refresh handle");
+
+    fs::write(
+        &paths.auth,
+        auth_yaml(ROTATED_ACCESS, Some(ROTATED_REFRESH), 5, "active").as_bytes(),
+    )
+    .expect("rotate file outside save");
+    set_private_mode(&paths.auth);
+
+    let access_error = access
+        .consume()
+        .expect_err("out-of-process generation bump must reject access");
+    assert!(
+        matches!(
+            access_error,
+            AuthStoreError::GenerationConflict {
+                expected: 4,
+                actual: 5,
+                ..
+            }
+        ),
+        "{access_error:?}"
+    );
+    assert_no_secrets(&access_error.to_string());
+
+    let refresh_error = refresh
+        .consume()
+        .expect_err("out-of-process generation bump must reject refresh");
+    assert!(
+        matches!(
+            refresh_error,
+            AuthStoreError::GenerationConflict {
+                expected: 4,
+                actual: 5,
+                ..
+            }
+        ),
+        "{refresh_error:?}"
+    );
+    assert_no_secrets(&refresh_error.to_string());
+}
+
+#[test]
+fn duplicate_same_generation_refresh_issuance_is_rejected() {
+    let (_root, _paths, store) =
+        open_with_yaml("refresh-single", ACCESS, Some(REFRESH), 4, "active");
+    let first = store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect("first refresh");
+    let duplicate = store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect_err("second refresh must fail closed");
+    assert!(
+        matches!(duplicate, AuthStoreError::HandleReplayed { .. }),
+        "{duplicate:?}"
+    );
+    first
+        .validate()
+        .expect("rejected duplicate must not consume the live refresh");
+    first.consume().expect("original refresh remains sendable");
+}
+
+#[test]
+fn consumed_expired_or_revoked_refresh_frees_single_flight() {
+    let (_root, _paths, store) = open_with_yaml("refresh-free", ACCESS, Some(REFRESH), 4, "active");
+
+    let first = store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect("first refresh");
+    first.consume().expect("consume frees the slot");
+    store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect("refresh after consume")
+        .force_expire();
+
+    store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect("refresh after expire")
+        .force_expire();
+
+    let before_delete = store
+        .issue_refresh_handle("primary", 4, 1, "test-run")
+        .expect("refresh before delete");
+    store.delete("primary").expect("delete revokes in-flight");
+    assert_stale_handle(
+        before_delete
+            .consume()
+            .expect_err("deleted credential revokes refresh"),
+    );
+}
+
+#[test]
+fn multiple_access_handles_share_generation_revalidation() {
+    let (_root, _paths, store) = open_with_yaml("access-multi", ACCESS, Some(REFRESH), 2, "active");
+    let first = store
+        .issue_access_handle("primary", 2, 1, "test-run")
+        .expect("first access");
+    let second = store
+        .issue_access_handle("primary", 2, 1, "test-run")
+        .expect("second access is allowed");
+    first.consume().expect("first access request");
+    second
+        .validate()
+        .expect("sibling access handle stays live until send");
+    store
+        .save_if_generation(save_request(
+            &store,
+            "primary",
+            2,
+            ROTATED_ACCESS,
+            RefreshSecretAction::Preserve,
+            "active",
+        ))
+        .expect("rotate");
+    assert_stale_handle(second.consume().expect_err("sibling access after CAS"));
+}
+
+#[test]
+fn expired_secret_slot_save_is_rejected() {
+    let (_root, _paths, store) = open_with_yaml("slot-expire", ACCESS, Some(REFRESH), 0, "active");
+    let expired = store
+        .fixture_access_slot_until(
+            "primary",
+            0,
+            1,
+            "test-run",
+            ROTATED_ACCESS,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .expect("mint expired slot");
+    let error = store
+        .save_if_generation(SaveCredentialRequest::new(
+            CredentialId::new("primary").expect("id"),
+            0,
+            1,
+            "test-run",
+            metadata(0, "active"),
+            expired,
+            RefreshSecretAction::Preserve,
+        ))
+        .expect_err("expired slot must fail closed");
+    assert!(
+        matches!(error, AuthStoreError::SecretSlotExpired { .. }),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "secret_slot_expired");
+    assert_no_secrets(&error.to_string());
+    let loaded = store.load_metadata("primary").expect("live credential");
+    assert_eq!(loaded.generation, 0);
+}
+
+#[test]
+fn local_prevalidation_failure_does_not_consume_live_unexpired_slot() {
+    let (_root, _paths, store) =
+        open_with_yaml("slot-prevalid", ACCESS, Some(REFRESH), 0, "active");
+    let live = store
+        .fixture_access_slot("primary", 0, 1, "test-run", ROTATED_ACCESS)
+        .expect("live slot");
+    let mismatched = store
+        .save_if_generation(SaveCredentialRequest::new(
+            CredentialId::new("primary").expect("id"),
+            0,
+            2,
+            "test-run",
+            metadata(0, "active"),
+            live.clone(),
+            RefreshSecretAction::Preserve,
+        ))
+        .expect_err("wrong policy generation is local prevalidation");
+    assert!(
+        matches!(mismatched, AuthStoreError::SecretSlotProvenance { .. }),
+        "{mismatched:?}"
+    );
+    store
+        .save_if_generation(SaveCredentialRequest::new(
+            CredentialId::new("primary").expect("id"),
+            0,
+            1,
+            "test-run",
+            metadata(0, "active"),
+            live,
+            RefreshSecretAction::Preserve,
+        ))
+        .expect("live unexpired slot remains usable after local failure");
+    let loaded = store.load_metadata("primary").expect("saved");
+    assert_eq!(loaded.generation, 1);
+}
