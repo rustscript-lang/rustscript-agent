@@ -481,6 +481,10 @@ impl IssuedHandleInner {
     fn consume_against_store(&self) -> Result<(), AuthStoreError> {
         self.host_store()?.consume_issued(self)
     }
+
+    fn take_against_store(&self) -> Result<SecretText, AuthStoreError> {
+        self.host_store()?.take_issued(self)
+    }
 }
 
 /// One-shot access handle. Copies alias the same host entry; Debug is redacted.
@@ -524,6 +528,10 @@ impl OpaqueAccessHandle {
 
     pub fn consume(&self) -> Result<(), AuthStoreError> {
         self.inner.consume_against_store()
+    }
+
+    pub(crate) fn take_for_transport(&self) -> Result<SecretText, AuthStoreError> {
+        self.inner.take_against_store()
     }
 
     pub fn force_expire(&self) {
@@ -582,6 +590,10 @@ impl OpaqueRefreshHandle {
 
     pub fn consume(&self) -> Result<(), AuthStoreError> {
         self.inner.consume_against_store()
+    }
+
+    pub(crate) fn take_for_transport(&self) -> Result<SecretText, AuthStoreError> {
+        self.inner.take_against_store()
     }
 
     pub fn force_expire(&self) {
@@ -1737,6 +1749,39 @@ impl AuthStore {
                     handle.consume_live()?;
                     store.unregister_issued(handle);
                     Ok(())
+                }
+                Ok(actual) => Err(store.fail_stale_handle(
+                    handle,
+                    AuthStoreError::GenerationConflict {
+                        credential_id: handle.credential_id.clone(),
+                        expected: handle.generation,
+                        actual,
+                    },
+                )),
+                Err(error @ AuthStoreError::HandleRevoked { .. }) => {
+                    Err(store.fail_stale_handle(handle, error))
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn take_issued(&self, handle: &IssuedHandleInner) -> Result<SecretText, AuthStoreError> {
+        handle.check_live()?;
+        self.with_process_lock(|store| {
+            handle.check_live()?;
+            match store.with_file_lock(|store| store.live_store_generation(handle)) {
+                Ok(actual) if actual == handle.generation => {
+                    let secret = handle.slot.snapshot_text(
+                        handle.kind,
+                        &handle.credential_id,
+                        handle.generation,
+                        handle.policy_generation,
+                        &handle.run_id,
+                    )?;
+                    handle.consume_live()?;
+                    store.unregister_issued(handle);
+                    Ok(secret)
                 }
                 Ok(actual) => Err(store.fail_stale_handle(
                     handle,

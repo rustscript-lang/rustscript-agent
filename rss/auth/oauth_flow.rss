@@ -1,0 +1,863 @@
+// Task 3 generic OAuth flow entry. RSS owns sequencing, retry/backoff,
+// refresh timing, and status/business error classification. Host primitives
+// supply PKCE, callback wait, and bounded transport only.
+use oauth;
+use auth;
+
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_int(value: map, key: string, fallback: int) -> int {
+    let mut result: int = fallback;
+    if value.has(key) {
+        if type(value[key]) == "int" {
+            let coerced: int = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_map(value: map, key: string) -> map {
+    let mut result: map = {};
+    if value.has(key) {
+        if type(value[key]) == "map" {
+            let coerced: map = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn failed(result: map) -> bool {
+    result.has("ok") && type(result["ok"]) == "bool" && result["ok"] == false
+}
+
+fn error_code(result: map) -> string {
+    map_string(map_map(result, "error"), "code", "")
+}
+
+fn default_scopes() -> array {
+    let mut scopes: array = [];
+    scopes[scopes.length] = "scope.synthetic";
+    scopes
+}
+
+fn form_headers() -> map {
+    let mut headers: map = {};
+    headers["content-type"] = "application/x-www-form-urlencoded";
+    headers
+}
+
+fn public_intent(context: map, mode: string) -> map {
+    let mut query: map = {};
+    query["client_id"] = "synthetic-client";
+    query["response_type"] = "code";
+    {
+        flow: "authorization_code_pkce",
+        callback_mode: mode,
+        path: "/authorize",
+        scopes: default_scopes(),
+        public_query: query,
+        credential_id: map_string(context, "credential_id", "primary")
+    }
+}
+
+fn classify_status(status: int, error: string, retry_after_ms: int) -> map {
+    if error == "authorization_pending" => {
+        let mut wait: int = retry_after_ms;
+        if wait <= 0 {
+            wait = 5000;
+        }
+        {
+            class: "pending",
+            retry: true,
+            wait_ms: wait
+        }
+    } else if error == "slow_down" => {
+        let mut wait: int = retry_after_ms;
+        if wait <= 0 {
+            wait = 5000;
+        }
+        {
+            class: "retryable",
+            retry: true,
+            wait_ms: wait
+        }
+    } else if error == "access_denied" => {
+        {
+            class: "denied",
+            retry: false,
+            wait_ms: 0
+        }
+    } else if error == "expired_token" => {
+        {
+            class: "expired",
+            retry: false,
+            wait_ms: 0
+        }
+    } else if status == 401 || status == 403 || error == "invalid_grant" || error == "invalid_token" => {
+        {
+            class: "reauth_required",
+            retry: false,
+            wait_ms: 0
+        }
+    } else if status == 429 => {
+        let mut wait: int = retry_after_ms;
+        if wait <= 0 {
+            wait = 1000;
+        }
+        {
+            class: "retryable",
+            retry: true,
+            wait_ms: wait
+        }
+    } else if status >= 500 || status == 0 => {
+        {
+            class: "retryable",
+            retry: true,
+            wait_ms: 1000
+        }
+    } else if status >= 200 && status < 300 => {
+        {
+            class: "success",
+            retry: false,
+            wait_ms: 0
+        }
+    } else => {
+        {
+            class: "provider_error",
+            retry: false,
+            wait_ms: 0
+        }
+    }
+}
+
+fn refresh_due(expires_at_ms: int, now_ms: int, skew_seconds: int) -> bool {
+    expires_at_ms <= now_ms + skew_seconds * 1000
+}
+
+fn backoff_ms(attempt: int) -> int {
+    let mut n: int = attempt;
+    if n < 0 {
+        n = 0;
+    }
+    if n > 7 {
+        n = 7;
+    }
+    let mut ms: int = 200;
+    let mut i: int = 0;
+    while i < n {
+        ms = ms * 2;
+        if ms > 15000 {
+            ms = 15000;
+        }
+        i = i + 1;
+    }
+    ms
+}
+
+fn begin_flow(context: map, mode: string) -> map {
+    oauth::pkce_begin(context["policy_handle"].copy(), public_intent(context, mode))
+}
+
+fn wait_callback(begin: map) -> map {
+    oauth::callback_wait(begin["callback_handle"].copy())
+}
+
+fn token_request(context: map, path: string, headers: map, body: string) -> map {
+    {
+        policy_handle: context["policy_handle"].copy(),
+        method: "POST",
+        path: path,
+        public_headers: headers,
+        public_body: body,
+        credential_id: map_string(context, "credential_id", "primary")
+    }
+}
+
+fn exchange_code(context: map, begin: map, waited: map) -> map {
+    oauth::transport(
+        token_request(context, "/oauth/token", form_headers(), "grant_type=authorization_code"),
+        {
+            kind: "authorization_code",
+            code: waited["code_handle"].copy(),
+            verifier: begin["verifier_handle"].copy()
+        }
+    )
+}
+
+fn classify_response(response: map) -> map {
+    classify_status(
+        map_int(response, "status", 0),
+        map_string(map_map(response, "body"), "error", ""),
+        map_int(response, "retry_after_ms", 0)
+    )
+}
+
+fn save_tokens(context: map, response: map) -> map {
+    let body: map = map_map(response, "body");
+    let now_ms: int = map_int(context, "now_ms", 0);
+    let expires_in: int = map_int(body, "expires_in", 3600);
+    let mut refresh: map = {
+        action: "preserve"
+    };
+    if response.has("refresh_slot") {
+        if type(response["refresh_slot"]) != "null" {
+            refresh = {
+                action: "replace",
+                slot: response["refresh_slot"].copy()
+            };
+        }
+    }
+    auth::save_if_generation({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy(),
+        metadata: {
+            provider: "synthetic-oauth",
+            kind: "oauth",
+            source: "synthetic-test",
+            token_type: map_string(body, "token_type", "Bearer"),
+            expires_at_ms: now_ms + expires_in * 1000,
+            scopes: default_scopes(),
+            account_id: "acct.synthetic",
+            generation: map_int(context, "expected_generation", 0),
+            status: "active",
+            last_refresh_at_ms: now_ms
+        },
+        access_slot: response["access_slot"].copy(),
+        refresh: refresh
+    })
+}
+
+fn login(context: map, mode: string) -> map {
+    let begin: map = begin_flow(context, mode);
+    if failed(begin) => {
+        begin
+    } else => {
+        let waited: map = wait_callback(begin);
+        if failed(waited) => {
+            {
+                ok: false,
+                begin: begin,
+                callback: waited,
+                error: map_map(waited, "error")
+            }
+        } else => {
+            let response: map = exchange_code(context, begin, waited);
+            if failed(response) => {
+                {
+                    ok: false,
+                    begin: begin,
+                    callback: waited,
+                    transport: response,
+                    error: map_map(response, "error")
+                }
+            } else => {
+                let classified: map = classify_response(response);
+                let saved: map = if map_string(classified, "class", "") == "success" => {
+                    save_tokens(context, response)
+                } else => {
+                    {
+                        ok: false,
+                        classified: classified
+                    }
+                };
+                {
+                    ok: map_bool(saved, "ok", false),
+                    begin: begin,
+                    callback: waited,
+                    transport: response,
+                    classified: classified,
+                    saved: saved,
+                    authorization_url: map_string(begin, "authorization_url", ""),
+                    redirect_uri: map_string(begin, "redirect_uri", "")
+                }
+            }
+        }
+    }
+}
+
+fn begin_and_wait(context: map, mode: string) -> map {
+    let begin: map = begin_flow(context, mode);
+    if failed(begin) => {
+        begin
+    } else => {
+        let waited: map = wait_callback(begin);
+        {
+            ok: map_bool(waited, "ok", false),
+            begin: begin,
+            callback: waited,
+            error: map_map(waited, "error"),
+            authorization_url: map_string(begin, "authorization_url", ""),
+            handle_type: type(begin["callback_handle"].copy())
+        }
+    }
+}
+
+fn duplicate_callback(context: map) -> map {
+    let begin: map = begin_flow(context, "manual");
+    if failed(begin) => {
+        begin
+    } else => {
+        let first: map = wait_callback(begin);
+        let second: map = wait_callback(begin);
+        {
+            ok: true,
+            first_ok: map_bool(first, "ok", false),
+            second_ok: map_bool(second, "ok", false),
+            second_code: error_code(second)
+        }
+    }
+}
+
+fn classify_transport(context: map) -> map {
+    let response: map = oauth::transport(
+        token_request(context, "/oauth/token", form_headers(), "grant_type=refresh_token"),
+        {
+            kind: "none"
+        }
+    );
+    if failed(response) => {
+        {
+            ok: false,
+            transport: response,
+            error: map_map(response, "error")
+        }
+    } else => {
+        let classified: map = classify_response(response);
+        {
+            ok: true,
+            transport: response,
+            classified: classified
+        }
+    }
+}
+
+fn denied_path(context: map) -> map {
+    let response: map = oauth::transport(
+        token_request(context, "/not-admitted", form_headers(), "grant_type=refresh_token"),
+        {
+            kind: "none"
+        }
+    );
+    {
+        ok: map_bool(response, "ok", false),
+        error: map_map(response, "error")
+    }
+}
+
+fn denied_header(context: map) -> map {
+    let mut headers: map = form_headers();
+    headers["authorization"] = "Bearer placeholder";
+    let response: map = oauth::transport(
+        token_request(context, "/oauth/token", headers, "grant_type=refresh_token"),
+        {
+            kind: "none"
+        }
+    );
+    {
+        ok: map_bool(response, "ok", false),
+        error: map_map(response, "error")
+    }
+}
+
+fn local_refresh_validate(context: map) -> map {
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
+    if failed(issued) => {
+        issued
+    } else => {
+        let denied: map = oauth::transport(
+            token_request(context, "/not-admitted", form_headers(), "grant_type=refresh_token"),
+            {
+                kind: "refresh",
+                handle: issued["handle"].copy()
+            }
+        );
+        let checked: map = auth::check_handle(issued["handle"].copy(), { op: "validate" });
+        {
+            ok: true,
+            denied_ok: map_bool(denied, "ok", false),
+            denied_code: error_code(denied),
+            validate_ok: map_bool(checked, "ok", false)
+        }
+    }
+}
+
+fn local_access_validate(context: map) -> map {
+    let issued: map = auth::access_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
+    if failed(issued) => {
+        issued
+    } else => {
+        let mut request: map = token_request(context, "/not-admitted", {}, "");
+        request["method"] = "GET";
+        let denied: map = oauth::transport(
+            request,
+            {
+                kind: "access",
+                handle: issued["handle"].copy()
+            }
+        );
+        let checked: map = auth::check_handle(issued["handle"].copy(), { op: "validate" });
+        {
+            ok: true,
+            denied_ok: map_bool(denied, "ok", false),
+            denied_code: error_code(denied),
+            validate_ok: map_bool(checked, "ok", false)
+        }
+    }
+}
+
+fn reserved_form_refresh(context: map) -> map {
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
+    if failed(issued) => {
+        issued
+    } else => {
+        let denied: map = oauth::transport(
+            token_request(context, "/oauth/token", form_headers(), "grant_type=refresh_token&refresh%5Ftoken=evil"),
+            {
+                kind: "refresh",
+                handle: issued["handle"].copy()
+            }
+        );
+        let checked: map = auth::check_handle(issued["handle"].copy(), { op: "validate" });
+        {
+            ok: true,
+            denied_ok: map_bool(denied, "ok", false),
+            denied_code: error_code(denied),
+            validate_ok: map_bool(checked, "ok", false)
+        }
+    }
+}
+
+fn forged_callback() -> map {
+    let forged: map = {
+        class: "OpaqueCallbackHandle",
+        id: "forged"
+    };
+    let waited: map = oauth::callback_wait(forged);
+    {
+        ok: map_bool(waited, "ok", false),
+        error: map_map(waited, "error")
+    }
+}
+
+fn serialized_callback(context: map) -> map {
+    let begin: map = begin_flow(context, "manual");
+    if failed(begin) => {
+        begin
+    } else => {
+        let handle_type: string = type(begin["callback_handle"].copy());
+        let reconstructed: map = oauth::callback_wait(handle_type);
+        {
+            ok: true,
+            handle_type: handle_type,
+            reconstructed_ok: map_bool(reconstructed, "ok", false),
+            reconstructed_code: error_code(reconstructed)
+        }
+    }
+}
+
+fn injected_callback(context: map) -> map {
+    oauth::callback_wait(context["injected_handle"].copy())
+}
+
+fn device_grant_body() -> string {
+    "grant_type=urn:ietf:params:oauth:grant-type:device_code"
+}
+
+fn device_start(context: map) -> map {
+    oauth::transport(
+        token_request(context, "/oauth/device", form_headers(), "client_id=synthetic-client"),
+        {
+            kind: "none"
+        }
+    )
+}
+
+fn device_poll(context: map, started: map) -> map {
+    oauth::transport(
+        token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+        {
+            kind: "device",
+            handle: started["device_handle"].copy()
+        }
+    )
+}
+
+fn terminal_device(started: map) -> map {
+    if started.has("device_handle") => {
+        oauth::terminal(started["device_handle"].copy())
+    } else => {
+        {
+            ok: true
+        }
+    }
+}
+
+fn device_follow(context: map, started: map) -> map {
+    let max_attempts: int = map_int(context, "max_polls", 8);
+    let mut attempt: int = 0;
+    let mut done: bool = false;
+    let mut result: map = {
+        ok: false,
+        start: started,
+        class: "timeout"
+    };
+    while attempt < max_attempts {
+        if done == false {
+            let gated: map = oauth::wait_ms(0);
+            if failed(gated) {
+                terminal_device(started);
+                result = {
+                    ok: false,
+                    start: started,
+                    transport: gated,
+                    error: map_map(gated, "error"),
+                    class: error_code(gated)
+                };
+                done = true;
+            }
+        }
+        if done == false {
+            let polled: map = device_poll(context, started);
+            if failed(polled) {
+                terminal_device(started);
+                result = {
+                    ok: false,
+                    start: started,
+                    transport: polled,
+                    error: map_map(polled, "error"),
+                    class: error_code(polled)
+                };
+                done = true;
+            } else {
+                let classified: map = classify_response(polled);
+                let class: string = map_string(classified, "class", "");
+                if class == "success" {
+                    let saved: map = save_tokens(context, polled);
+                    result = {
+                        ok: map_bool(saved, "ok", false),
+                        start: started,
+                        transport: polled,
+                        classified: classified,
+                        saved: saved
+                    };
+                    done = true;
+                } else if class == "pending" || class == "retryable" {
+                    let wait: int = map_int(classified, "wait_ms", backoff_ms(attempt));
+                    let slept: map = oauth::wait_ms(wait);
+                    if failed(slept) {
+                        terminal_device(started);
+                        result = {
+                            ok: false,
+                            start: started,
+                            transport: slept,
+                            error: map_map(slept, "error"),
+                            class: error_code(slept)
+                        };
+                        done = true;
+                    }
+                } else {
+                    terminal_device(started);
+                    result = {
+                        ok: false,
+                        start: started,
+                        transport: polled,
+                        classified: classified,
+                        class: class
+                    };
+                    done = true;
+                }
+            }
+        }
+        attempt = attempt + 1;
+    }
+    if done == false {
+        terminal_device(started);
+    }
+    result
+}
+
+fn device_login(context: map) -> map {
+    let started: map = device_start(context);
+    if failed(started) => {
+        started
+    } else => {
+        device_follow(context, started)
+    }
+}
+
+fn device_replay(context: map) -> map {
+    let started: map = device_start(context);
+    if failed(started) => {
+        started
+    } else => {
+        let first: map = device_poll(context, started);
+        let second: map = device_poll(context, started);
+        {
+            ok: true,
+            first_ok: map_bool(first, "ok", false),
+            second_ok: map_bool(second, "ok", false),
+            second_code: error_code(second),
+            start: started
+        }
+    }
+}
+
+fn forged_device(context: map) -> map {
+    let forged: map = {
+        class: "OpaqueDeviceSessionHandle",
+        id: "forged"
+    };
+    let polled: map = oauth::transport(
+        token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+        {
+            kind: "device",
+            handle: forged
+        }
+    );
+    {
+        ok: map_bool(polled, "ok", false),
+        error: map_map(polled, "error")
+    }
+}
+
+fn serialized_device(context: map) -> map {
+    let started: map = device_start(context);
+    if failed(started) => {
+        started
+    } else => {
+        let handle_type: string = type(started["device_handle"].copy());
+        let reconstructed: map = oauth::transport(
+            token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+            {
+                kind: "device",
+                handle: handle_type
+            }
+        );
+        {
+            ok: true,
+            handle_type: handle_type,
+            reconstructed_ok: map_bool(reconstructed, "ok", false),
+            reconstructed_code: error_code(reconstructed)
+        }
+    }
+}
+
+fn injected_device(context: map) -> map {
+    oauth::transport(
+        token_request(context, "/oauth/device/token", form_headers(), device_grant_body()),
+        {
+            kind: "device",
+            handle: context["injected_handle"].copy()
+        }
+    )
+}
+
+fn code_replay(context: map) -> map {
+    let begin: map = begin_flow(context, "manual");
+    if failed(begin) => {
+        begin
+    } else => {
+        let waited: map = wait_callback(begin);
+        if failed(waited) => {
+            waited
+        } else => {
+            let first: map = exchange_code(context, begin, waited);
+            let second: map = exchange_code(context, begin, waited);
+            {
+                ok: true,
+                first_ok: map_bool(first, "ok", false),
+                second_ok: map_bool(second, "ok", false),
+                second_code: error_code(second)
+            }
+        }
+    }
+}
+
+fn serialized_code(context: map) -> map {
+    let begin: map = begin_flow(context, "manual");
+    if failed(begin) => {
+        begin
+    } else => {
+        let waited: map = wait_callback(begin);
+        if failed(waited) => {
+            waited
+        } else => {
+            let handle_type: string = type(waited["code_handle"].copy());
+            let reconstructed: map = oauth::transport(
+                token_request(context, "/oauth/token", form_headers(), "grant_type=authorization_code"),
+                {
+                    kind: "authorization_code",
+                    code: handle_type,
+                    verifier: handle_type
+                }
+            );
+            {
+                ok: true,
+                handle_type: handle_type,
+                reconstructed_ok: map_bool(reconstructed, "ok", false),
+                reconstructed_code: error_code(reconstructed)
+            }
+        }
+    }
+}
+
+fn refresh_save(context: map) -> map {
+    let issued: map = auth::refresh_handle({
+        credential_id: map_string(context, "credential_id", "primary"),
+        expected_generation: map_int(context, "expected_generation", 0),
+        policy_handle: context["policy_handle"].copy()
+    });
+    if failed(issued) => {
+        issued
+    } else => {
+        let response: map = oauth::transport(
+            token_request(context, "/oauth/token", form_headers(), "grant_type=refresh_token"),
+            {
+                kind: "refresh",
+                handle: issued["handle"].copy()
+            }
+        );
+        if failed(response) => {
+            {
+                ok: false,
+                transport: response,
+                error: map_map(response, "error")
+            }
+        } else => {
+            let saved: map = save_tokens(context, response);
+            {
+                ok: map_bool(saved, "ok", false),
+                transport: response,
+                saved: saved
+            }
+        }
+    }
+}
+
+pub fn run(context: map) -> map {
+    let kind: string = map_string(context, "kind", "login_browser");
+    if kind == "login_browser" || kind == "secrets_absent" => {
+        login(context, "browser")
+    } else if kind == "login_manual" => {
+        login(context, "manual")
+    } else if kind == "begin" => {
+        begin_flow(context, "manual")
+    } else if kind == "callback" => {
+        begin_and_wait(context, "manual")
+    } else if kind == "callback_mismatch" => {
+        begin_and_wait(context, "manual")
+    } else if kind == "timeout" => {
+        begin_and_wait(context, "manual")
+    } else if kind == "cancel" => {
+        begin_and_wait(context, "manual")
+    } else if kind == "callback_duplicate" => {
+        duplicate_callback(context)
+    } else if kind == "callback_injected" => {
+        injected_callback(context)
+    } else if kind == "classify_401" || kind == "classify_429" || kind == "classify_5xx" => {
+        classify_transport(context)
+    } else if kind == "transport_malformed" || kind == "transport_oversized" => {
+        classify_transport(context)
+    } else if kind == "transport_denied_path" => {
+        denied_path(context)
+    } else if kind == "transport_denied_header" => {
+        denied_header(context)
+    } else if kind == "refresh_due" => {
+        {
+            ok: true,
+            due: refresh_due(
+                map_int(context, "expires_at_ms", 0),
+                map_int(context, "now_ms", 0),
+                map_int(context, "skew_seconds", 120)
+            )
+        }
+    } else if kind == "refresh_not_due" => {
+        {
+            ok: true,
+            due: refresh_due(
+                map_int(context, "expires_at_ms", 0),
+                map_int(context, "now_ms", 0),
+                map_int(context, "skew_seconds", 120)
+            )
+        }
+    } else if kind == "retry_backoff" => {
+        {
+            ok: true,
+            wait_ms: backoff_ms(map_int(context, "attempt", 0))
+        }
+    } else if kind == "retry_backoff_cap" => {
+        {
+            ok: true,
+            wait_ms: backoff_ms(100)
+        }
+    } else if kind == "forged" => {
+        forged_callback()
+    } else if kind == "serialized" => {
+        serialized_callback(context)
+    } else if kind == "local_refresh_validate" => {
+        local_refresh_validate(context)
+    } else if kind == "local_access_validate" => {
+        local_access_validate(context)
+    } else if kind == "reserved_form_refresh" => {
+        reserved_form_refresh(context)
+    } else if kind == "device_login" || kind == "device_pending_success" || kind == "device_slow_down" || kind == "device_timeout" || kind == "device_cancel" || kind == "device_denied" => {
+        device_login(context)
+    } else if kind == "device_start" => {
+        device_start(context)
+    } else if kind == "device_replay" => {
+        device_replay(context)
+    } else if kind == "device_forged" => {
+        forged_device(context)
+    } else if kind == "device_serialized" => {
+        serialized_device(context)
+    } else if kind == "device_injected" => {
+        injected_device(context)
+    } else if kind == "code_replay" => {
+        code_replay(context)
+    } else if kind == "code_serialized" => {
+        serialized_code(context)
+    } else if kind == "refresh_save" => {
+        refresh_save(context)
+    } else => {
+        {
+            ok: false,
+            code: "unknown_kind",
+            message: kind
+        }
+    }
+}

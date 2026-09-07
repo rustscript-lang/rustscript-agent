@@ -1134,6 +1134,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "pd-vm",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

@@ -1891,6 +1891,16 @@ mod fixture_policy {
         pub ok: bool,
     }
 
+    /// Frozen HTTPS endpoints admitted for generic OAuth transport.
+    #[derive(Clone, Debug)]
+    pub(crate) struct AdmittedTransportView {
+        pub generation: u64,
+        pub run_id: String,
+        pub deadline: Instant,
+        pub endpoints: Vec<(String, String)>,
+        pub allowed_header_names: BTreeSet<String>,
+    }
+
     #[derive(Clone, Debug)]
     struct TrustedPolicySnapshot {
         #[allow(dead_code)]
@@ -1905,6 +1915,7 @@ mod fixture_policy {
         allowed_header_names: BTreeSet<String>,
         #[allow(dead_code)]
         provider_authorities: Vec<String>,
+        provider_endpoints: Vec<(String, String)>,
         #[allow(dead_code)]
         providers: Vec<String>,
         #[allow(dead_code)]
@@ -2031,8 +2042,12 @@ mod fixture_policy {
                         approval_read: summary.approval_read.clone(),
                         approval_write: summary.approval_write.clone(),
                         approval_process: summary.approval_process.clone(),
-                        allowed_header_names: BTreeSet::new(),
+                        allowed_header_names: ["content-type", "accept"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
                         provider_authorities: freeze_provider_authorities(&loaded.config),
+                        provider_endpoints: freeze_provider_endpoints(&loaded.config),
                         providers: summary.providers.clone(),
                         max_turns: summary.max_turns,
                         max_tool_calls: summary.max_tool_calls,
@@ -2078,9 +2093,8 @@ mod fixture_policy {
                 });
             }
             match intent.op.as_str() {
-                "inspect" | "load" | "save" | "access" | "refresh" | "delete" => {
-                    Ok(PolicyProbe { ok: true })
-                }
+                "inspect" | "load" | "save" | "access" | "refresh" | "delete" | "pkce"
+                | "callback" | "transport" => Ok(PolicyProbe { ok: true }),
                 "expire" => {
                     table.entries.remove(&id);
                     drop(table);
@@ -2095,6 +2109,32 @@ mod fixture_policy {
                 }
                 _ => Err(ConfigFileError::PolicyHandleInvalid),
             }
+        }
+
+        pub(crate) fn admitted_transport(
+            &self,
+            handle: &OpaquePolicyHandle,
+        ) -> Result<AdmittedTransportView, ConfigFileError> {
+            let _ = self.check_policy(
+                handle,
+                &PolicyIntent {
+                    op: "transport".to_string(),
+                    ..PolicyIntent::default()
+                },
+            )?;
+            let id = handle.prototype_id();
+            let table = self.inner.lock();
+            let entry = table
+                .entries
+                .get(&id)
+                .ok_or(ConfigFileError::PolicyHandleInvalid)?;
+            Ok(AdmittedTransportView {
+                generation: entry.snapshot.generation,
+                run_id: self.run_id.clone(),
+                deadline: entry.expires_at,
+                endpoints: entry.snapshot.provider_endpoints.clone(),
+                allowed_header_names: entry.snapshot.allowed_header_names.clone(),
+            })
         }
     }
 
@@ -2119,6 +2159,65 @@ mod fixture_policy {
             });
         }
         authorities
+    }
+
+    fn freeze_provider_endpoints(config: &ConfigFile) -> Vec<(String, String)> {
+        let mut endpoints = Vec::new();
+        for provider in config.providers.values() {
+            if let Some(endpoint) = https_authority_path(&provider.base_url) {
+                endpoints.push(endpoint);
+            }
+            let Some(oauth) = provider.oauth.as_ref() else {
+                continue;
+            };
+            if let Some(token) = oauth.token_endpoint.as_deref()
+                && let Some(endpoint) = https_authority_path(token)
+            {
+                endpoints.push(endpoint);
+            }
+            let authority = oauth
+                .issuer
+                .as_deref()
+                .and_then(https_authority)
+                .or_else(|| https_authority(&provider.base_url));
+            if let Some(authority) = authority {
+                for path in [
+                    oauth.authorization_path.as_deref(),
+                    oauth.device_user_code_path.as_deref(),
+                    oauth.device_poll_path.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if path.starts_with('/') && !path.contains("..") && !path.contains("://") {
+                        endpoints.push((authority.clone(), path.to_string()));
+                    }
+                }
+            }
+        }
+        endpoints
+    }
+
+    fn https_authority(url: &str) -> Option<String> {
+        https_authority_path(url).map(|(authority, _)| authority)
+    }
+
+    fn https_authority_path(url: &str) -> Option<(String, String)> {
+        let parsed = Url::parse(url).ok()?;
+        if parsed.scheme() != "https" {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        let authority = match parsed.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        let path = if parsed.path().is_empty() {
+            "/".to_string()
+        } else {
+            parsed.path().to_string()
+        };
+        Some((authority, path))
     }
 
     fn workspace_root_admitted(snapshot: &TrustedPolicySnapshot, path: &str) -> bool {
@@ -2170,7 +2269,7 @@ mod fixture_policy {
 }
 
 #[cfg(feature = "config-fixture")]
-pub(crate) use fixture_policy::PolicyOwner;
+pub(crate) use fixture_policy::{AdmittedTransportView, PolicyOwner};
 #[cfg(feature = "config-fixture")]
 pub use fixture_policy::{
     ConfigSnapshotEnvelope, OpaquePolicyHandle, PolicyIntent, PolicyProbe, SanitizedPolicySummary,
