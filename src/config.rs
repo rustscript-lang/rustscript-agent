@@ -5,7 +5,9 @@
 //! values. Configuration is native-owned; RSS never reads ambient config.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::runtime::rss_runner::MAX_RUN_TIMEOUT;
 
 use rustscript_vm::{
     HttpConfig, MAX_ENUM_ENTRIES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, MAX_TIMEOUT, SqlitePolicy,
@@ -261,6 +263,17 @@ impl FileToolConfig {
         }
         Ok(())
     }
+
+    /// Aligns file-tool envelope and search caps with an admitted run output budget.
+    pub fn apply_admitted_output_cap(&mut self, max_tool_output_bytes: usize) {
+        let cap = max_tool_output_bytes
+            .clamp(1, MAX_TOOL_OUTPUT_BYTES)
+            .min(self.artifact_store.max_object_bytes.max(1));
+        self.max_output_bytes = cap;
+        if self.max_search_output_bytes > cap {
+            self.max_search_output_bytes = cap;
+        }
+    }
 }
 
 impl Default for FileToolConfig {
@@ -301,7 +314,7 @@ fn derived_artifact_root(workspace_root: &Path) -> PathBuf {
     }
 }
 
-fn identity_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+pub(crate) fn identity_path(path: &Path, label: &str) -> Result<PathBuf, String> {
     if path.exists() {
         return std::fs::canonicalize(path).map_err(|_| format!("{label} cannot be resolved"));
     }
@@ -1602,6 +1615,11 @@ impl ProcessToolConfig {
         Ok(())
     }
 
+    /// Aligns the model-visible process/terminal envelope with an admitted run output budget.
+    pub fn apply_admitted_output_cap(&mut self, max_tool_output_bytes: usize) {
+        self.max_output_bytes = max_tool_output_bytes.clamp(1, MAX_PROCESS_TOOL_OUTPUT_BYTES);
+    }
+
     /// Returns a copy with a canonical workspace after validation.
     pub fn validated(&self) -> Result<Self, String> {
         self.validate()?;
@@ -1685,6 +1703,11 @@ impl AgentGatewayConfig {
         }
         if self.run_timeout.is_zero() {
             return Err("run_timeout must be positive".to_string());
+        }
+        if self.run_timeout > MAX_RUN_TIMEOUT
+            || Instant::now().checked_add(self.run_timeout).is_none()
+        {
+            return Err("run_timeout overflows Instant deadline arithmetic".to_string());
         }
         if self.event_channel_capacity == 0 {
             return Err("event_channel_capacity must be positive".to_string());

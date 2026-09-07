@@ -10,7 +10,7 @@ use super::types::{NativeToolExecutor, RiskClass, ToolDescriptor, Toolset};
 ///
 /// This digest is a resume-consistency value, not a signature and not an
 /// authentication or authorization mechanism.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     const INITIAL: [u32; 8] = [
         0x6a09_e667,
         0xbb67_ae85,

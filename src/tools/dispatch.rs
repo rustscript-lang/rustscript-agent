@@ -48,7 +48,10 @@ pub struct DispatchLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventCommitError {
     Terminal,
+    Cancelled,
     PersistFailed(String),
+    MissingParent,
+    Corrupt(String),
 }
 
 /// Durable-first event sink used by dispatch. Implementations must not publish
@@ -59,6 +62,41 @@ pub trait DurableEventCommitter: Send + Sync {
         false
     }
     fn commit(&self, event_type: &str, data: Value) -> Result<(), EventCommitError>;
+    /// Persist a tool step. Default forwards to [`Self::commit`]; production
+    /// committers attach a durable tool_result message for output/completed/failed.
+    fn commit_step(
+        &self,
+        event_type: &str,
+        data: Value,
+        result: Option<&ToolResult>,
+    ) -> Result<(), EventCommitError> {
+        let _ = result;
+        self.commit(event_type, data)
+    }
+    /// Read-only pre-effect prepare: resolve the durable assistant tool-call
+    /// parent. Missing or name-mismatched parents return
+    /// [`EventCommitError::MissingParent`]. Default is a no-op success so
+    /// in-memory test committers keep working.
+    fn prepare_tool_parent(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<(String, String), EventCommitError> {
+        let _ = tool_call_id;
+        Ok((String::new(), name.to_string()))
+    }
+    /// Read-only pre-effect replay: return a canonical completed/failed/
+    /// interrupted `ToolResult` when durable state already has one. Default
+    /// is `Ok(None)` so in-memory test committers keep executing natively.
+    /// Corrupt canonical state must return [`EventCommitError::Corrupt`].
+    fn replay_durable_tool_result(
+        &self,
+        tool_call_id: &str,
+        name: &str,
+    ) -> Result<Option<ToolResult>, EventCommitError> {
+        let _ = (tool_call_id, name);
+        Ok(None)
+    }
 }
 
 /// Injectable native executor boundary. Production code uses
@@ -209,6 +247,7 @@ struct DispatchInner {
     call_count: AtomicU64,
     serial: Mutex<()>,
     fail_linked_spawn: AtomicBool,
+    closed: AtomicBool,
 }
 
 /// Serial dispatcher bound to one admitted run snapshot.
@@ -257,6 +296,7 @@ impl DispatchContext {
                 call_count: AtomicU64::new(0),
                 serial: Mutex::new(()),
                 fail_linked_spawn: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
             }),
         })
     }
@@ -274,6 +314,29 @@ impl DispatchContext {
     /// Owner bound to this dispatcher.
     pub fn owner(&self) -> &ToolOwner {
         &self.inner.owner
+    }
+
+    /// Sticky-closes this dispatcher so later calls cannot commit effects.
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.cancellation.cancel();
+    }
+
+    /// Blocks until in-flight dispatch releases the serial mutex.
+    pub fn quiesce(&self) {
+        drop(self.inner.serial.lock());
+    }
+
+    /// Deadline-aware quiesce. Returns true if the serial mutex was acquired
+    /// before `timeout` elapsed.
+    pub fn try_quiesce(&self, timeout: Duration) -> bool {
+        self.inner.serial.try_lock_for(timeout).is_some()
+    }
+
+    /// Holds the serial mutex until the returned guard is dropped. Test seam
+    /// for uncooperative in-flight dispatch.
+    pub fn lock_serial(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.serial.lock()
     }
 
     /// Canonical workspace retained at construction.
@@ -300,20 +363,46 @@ impl DispatchContext {
         if let Some(result) = self.gate_before_publication() {
             return result;
         }
+        if let Err(error) = self.inner.events.prepare_tool_parent(&call.id, &call.name) {
+            return match error {
+                EventCommitError::MissingParent => missing_parent_result(),
+                EventCommitError::Terminal => {
+                    ToolResult::failure("run_terminal", "run is terminal")
+                }
+                EventCommitError::Cancelled => {
+                    ToolResult::failure("cancelled", "run was cancelled")
+                }
+                EventCommitError::PersistFailed(_) => persist_failed_result(),
+                EventCommitError::Corrupt(_) => corrupt_durable_result(),
+            };
+        }
+        match self
+            .inner
+            .events
+            .replay_durable_tool_result(&call.id, &call.name)
+        {
+            Ok(None) => {}
+            Ok(Some(result)) => return mark_replayed(result),
+            Err(error) => return mark_replayed(pre_effect_commit_failure(error)),
+        }
         let used = self.inner.call_count.fetch_add(1, Ordering::SeqCst);
         if used >= self.inner.limits.max_tool_calls {
             let ordinal = used + 1;
             let result = ToolResult::failure("max_tool_calls", "max_tool_calls exceeded");
             if let Some(entry) = self.inner.registry.entry(&call.name) {
-                self.publish_validation_failure(
+                if let Err(error) = self.publish_validation_failure(
                     call,
                     ordinal,
                     entry.executor().tool_name(),
                     Some(entry.descriptor().risk_class.as_str()),
                     &result,
-                );
-            } else {
-                self.publish_validation_failure(call, ordinal, "unknown", None, &result);
+                ) {
+                    return pre_effect_commit_failure(error);
+                }
+            } else if let Err(error) =
+                self.publish_validation_failure(call, ordinal, "unknown", None, &result)
+            {
+                return pre_effect_commit_failure(error);
             }
             return result;
         }
@@ -321,7 +410,11 @@ impl DispatchContext {
 
         let Some(entry) = self.inner.registry.entry(&call.name) else {
             let result = unknown_tool_result(&call.name);
-            self.publish_validation_failure(call, ordinal, "unknown", None, &result);
+            if let Err(error) =
+                self.publish_validation_failure(call, ordinal, "unknown", None, &result)
+            {
+                return pre_effect_commit_failure(error);
+            }
             return result;
         };
         let executor_name = entry.executor().tool_name();
@@ -332,7 +425,11 @@ impl DispatchContext {
             .validate_arguments(&call.name, &call.arguments)
         {
             let result = ToolResult::failure("invalid_arguments", reason);
-            self.publish_validation_failure(call, ordinal, executor_name, Some(risk), &result);
+            if let Err(error) =
+                self.publish_validation_failure(call, ordinal, executor_name, Some(risk), &result)
+            {
+                return pre_effect_commit_failure(error);
+            }
             return result;
         }
 
@@ -344,7 +441,7 @@ impl DispatchContext {
         }
         if let Some(result) = self.gate_before_effect() {
             if !self.inner.events.is_terminal() {
-                let _ = self.commit(
+                let _ = self.commit_with_result(
                     "tool.failed",
                     self.lifecycle_payload(
                         call,
@@ -354,6 +451,7 @@ impl DispatchContext {
                         "failed",
                         Some(&result),
                     ),
+                    Some(&result),
                 );
             }
             return result;
@@ -377,7 +475,7 @@ impl DispatchContext {
         if self.inner.events.is_terminal() {
             return result;
         }
-        match self.commit(
+        match self.commit_with_result(
             "tool.output",
             self.lifecycle_payload(
                 call,
@@ -387,10 +485,14 @@ impl DispatchContext {
                 "output",
                 Some(&result),
             ),
+            Some(&result),
         ) {
             Ok(()) => {}
             Err(EventCommitError::Terminal) => return result,
+            Err(EventCommitError::Cancelled) => return result,
             Err(EventCommitError::PersistFailed(_)) => return persist_failed_result(),
+            Err(EventCommitError::MissingParent) => return missing_parent_result(),
+            Err(EventCommitError::Corrupt(_)) => return corrupt_durable_result(),
         }
         if self.inner.events.is_terminal() {
             return result;
@@ -400,7 +502,7 @@ impl DispatchContext {
         } else {
             ("tool.failed", "failed")
         };
-        match self.commit(
+        match self.commit_with_result(
             event_type,
             self.lifecycle_payload(
                 call,
@@ -410,10 +512,14 @@ impl DispatchContext {
                 status,
                 Some(&result),
             ),
+            Some(&result),
         ) {
             Ok(()) => result,
             Err(EventCommitError::Terminal) => result,
+            Err(EventCommitError::Cancelled) => result,
             Err(EventCommitError::PersistFailed(_)) => persist_failed_result(),
+            Err(EventCommitError::MissingParent) => missing_parent_result(),
+            Err(EventCommitError::Corrupt(_)) => corrupt_durable_result(),
         }
     }
 
@@ -450,6 +556,12 @@ impl DispatchContext {
     }
 
     fn control_failure(&self) -> Option<ToolResult> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Some(ToolResult::failure(
+                "cancelled",
+                "native dispatch is closed",
+            ));
+        }
         if self.inner.events.is_terminal() {
             return Some(ToolResult::failure(
                 "cancelled",
@@ -487,26 +599,22 @@ impl DispatchContext {
         executor: &str,
         risk: Option<&str>,
         result: &ToolResult,
-    ) {
+    ) -> Result<(), EventCommitError> {
         if self.inner.events.is_terminal() {
-            return;
+            return Err(EventCommitError::Terminal);
         }
-        if self
-            .commit(
-                "tool.requested",
-                self.lifecycle_payload(call, ordinal, executor, risk, "requested", None),
-            )
-            .is_err()
-        {
-            return;
-        }
+        self.commit(
+            "tool.requested",
+            self.lifecycle_payload(call, ordinal, executor, risk, "requested", None),
+        )?;
         if self.inner.events.is_terminal() {
-            return;
+            return Err(EventCommitError::Terminal);
         }
-        let _ = self.commit(
+        self.commit_with_result(
             "tool.failed",
             self.lifecycle_payload(call, ordinal, executor, risk, "failed", Some(result)),
-        );
+            Some(result),
+        )
     }
 
     fn lifecycle_payload(
@@ -530,10 +638,19 @@ impl DispatchContext {
     }
 
     fn commit(&self, event_type: &str, data: Value) -> Result<(), EventCommitError> {
+        self.commit_with_result(event_type, data, None)
+    }
+
+    fn commit_with_result(
+        &self,
+        event_type: &str,
+        data: Value,
+        result: Option<&ToolResult>,
+    ) -> Result<(), EventCommitError> {
         if self.inner.events.is_terminal() {
             return Err(EventCommitError::Terminal);
         }
-        self.inner.events.commit(event_type, data)
+        self.inner.events.commit_step(event_type, data, result)
     }
 }
 
@@ -556,10 +673,29 @@ fn cancellation_unavailable_result() -> ToolResult {
 fn pre_effect_commit_failure(error: EventCommitError) -> ToolResult {
     match error {
         EventCommitError::PersistFailed(_) => persist_failed_result(),
+        EventCommitError::MissingParent => missing_parent_result(),
         EventCommitError::Terminal => {
             ToolResult::failure("cancelled", "run already committed a terminal state")
         }
+        EventCommitError::Cancelled => ToolResult::failure("cancelled", "run was cancelled"),
+        EventCommitError::Corrupt(_) => corrupt_durable_result(),
     }
+}
+
+fn corrupt_durable_result() -> ToolResult {
+    ToolResult::failure("corrupt_tool_result", "durable state is corrupt")
+}
+
+fn missing_parent_result() -> ToolResult {
+    ToolResult::failure(
+        "missing_tool_parent",
+        "tool result parent tool_call is missing",
+    )
+}
+
+fn mark_replayed(mut result: ToolResult) -> ToolResult {
+    result.replayed = true;
+    result
 }
 
 fn lifecycle_data(

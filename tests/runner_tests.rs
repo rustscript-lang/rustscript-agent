@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use rustscript_agent::{
     AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
+    RunnerPrepareFault,
 };
 use rustscript_vm::{CancellationReason, InvocationError, Value};
 
@@ -498,4 +499,66 @@ fn blocked_delivery_pauses_invocation_polling() {
         .expect("worker thread should join")
         .expect("the run must complete after delivery resumes");
     assert_eq!(result, Value::string("done"));
+}
+
+#[test]
+fn enormous_timeout_and_wall_deadline_never_panic_and_fail_closed() {
+    let cancel = RunCancellation::with_timeout(Duration::MAX);
+    assert!(cancel.has_deadline_overflow());
+    assert!(!cancel.watcher_is_armed());
+
+    let from_wall = RunCancellation::from_wall_deadline_ms(u64::MAX, 0);
+    assert!(from_wall.has_deadline_overflow());
+    assert!(!from_wall.watcher_is_armed());
+}
+
+fn trivial_runner() -> AgentRunner {
+    AgentRunner::from_source(
+        r#"
+        pub fn run(input: map) -> string {
+            "ok";
+        }
+        "#,
+        AgentConfig::default(),
+    )
+    .expect("compile trivial agent")
+}
+
+#[test]
+fn prepare_panic_disarms_epoch_watcher() {
+    let runner = trivial_runner().with_prepare_fault(RunnerPrepareFault::PanicAfterArm);
+    let cancel = RunCancellation::with_timeout(Duration::from_secs(5));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut sink = RecordingSink::default();
+        let _ = runner.run_with_context_and_events(Value::map(vec![]), &mut sink, &cancel);
+    }));
+    assert!(panicked.is_err());
+    assert!(
+        !cancel.watcher_is_armed(),
+        "watcher must disarm after prepare panic"
+    );
+}
+
+#[test]
+fn prepare_error_disarms_epoch_watcher() {
+    let runner = trivial_runner().with_prepare_fault(RunnerPrepareFault::ErrorAfterArm);
+    let cancel = RunCancellation::with_timeout(Duration::from_secs(5));
+    let mut sink = RecordingSink::default();
+    let error = runner
+        .run_with_context_and_events(Value::map(vec![]), &mut sink, &cancel)
+        .expect_err("injected prepare error");
+    assert!(matches!(error, RunError::Setup(_)));
+    assert!(!cancel.watcher_is_armed());
+}
+
+#[test]
+fn drive_panic_disarms_epoch_watcher() {
+    let runner = trivial_runner().with_prepare_fault(RunnerPrepareFault::PanicDuringDrive);
+    let cancel = RunCancellation::with_timeout(Duration::from_secs(5));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut sink = RecordingSink::default();
+        let _ = runner.run_with_context_and_events(Value::map(vec![]), &mut sink, &cancel);
+    }));
+    assert!(panicked.is_err());
+    assert!(!cancel.watcher_is_armed());
 }

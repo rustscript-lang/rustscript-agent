@@ -190,6 +190,130 @@ page bounds.
 | `RUN_EPOCH_DEADLINE_TICKS` | 1 000 000 000 | Epoch budget granted to one cancellable run; the cancellation watcher jumps the epoch past it. |
 | `RUN_EPOCH_CHECK_INTERVAL` | 1 000 | Interpreter operations between epoch checks on cancellable runs. |
 
+## Coding tools and serial loop
+
+The library `AgentService` worker compiles bundled `rss/agent/main.rss` and
+drives a **serial** native tool loop. RSS builds canonical provider requests
+and dispatches tools only through the native host bridges
+(`agent::provider_call`, `agent::tool_dispatch`). This is not an
+OpenAI-compatible inference path.
+
+Built-in native tools, in registry order:
+
+| Name | Toolset | Risk | Notes |
+| --- | --- | --- | --- |
+| `read_file` | coding | read | Bounded workspace file read. |
+| `search_files` | coding | read | Bounded workspace search. |
+| `write_file` | coding | write | Write complete workspace file contents. |
+| `patch` | coding | write | Minimal unique-string replacement. |
+| `terminal` | process | process | Direct `argv` execution; no shell command string. |
+| `process` | process | process | Background/control sibling of `terminal`. |
+
+Parallel tool calls are rejected (`unsupported_parallel`). Subagents and A6
+parallel fan-out are out of scope.
+
+## Workspace guidance, priority, and budgets
+
+Admission freezes one coding system prompt from the run workspace. Root-level
+guidance files are read in this priority, highest first: `AGENTS.md`,
+`CLAUDE.md`, `.cursorrules`. Default `CodingPromptBudgets` are 16 KiB total
+prompt, 8 KiB combined guidance, and 4 KiB per guidance file. Each admitted
+file is length-prefixed as untrusted content so project bytes cannot forge
+later contract sections. The frozen prompt is reused as the sole system
+message on every subsequent provider request for that run.
+
+## Provider profiles
+
+`ProviderProfile` is a validated, secret-safe snapshot retained on
+`AgentService`. Built-in names map protocol labels only (`local-agent` →
+`local-agent`, `openai` / `openai-compatible` → `openai-chat-completions`).
+Options are request-shaping controls (`profile`, `protocol`,
+`reasoning_effort`, `base_url`, sampling numbers). Credential-bearing keys,
+headers, and unsafe URLs are rejected rather than redacted. Profiles do not
+grant network access; HTTP remains deny-by-default unless hosts **and** ports
+are allowlisted.
+
+## Run limits, deadline, and cancellation
+
+`RunLimits` (`max_turns`, `max_tool_calls`, `max_tool_output_bytes`,
+`workspace_root`) are captured at admission. `workspace_root` must be an
+absolute existing directory and is canonicalized. `AgentGatewayConfig.run_timeout`
+is the per-run wall-clock deadline; it is not reset per provider or tool
+call. `stop` requests cooperative cancellation once: the provider call, RSS
+run, and native process/terminal children share the run token.
+`cancellation_grace` bounds how long the worker waits after a deadline before
+the thread is abandoned. Client-disconnect policy is independent
+(`keep-running` by default).
+
+## Durable replay
+
+`DurableProviderHost` is the production provider seam. Before each fresh inner
+call it commits a sanitized `model.requested` boundary (`retry_safe` plus a
+`sha256:` fingerprint; never `request`/`messages`/`prompt`/`provider_options`/
+`api_key`/`headers`/`body`). Completed canonical provider steps
+(`model.completed` plus the assistant message) replay on restart without an
+inner call or a second `turns` increment. Pending retry-safe requests retry the
+same logical turn and do not synthesize an assistant/tool parent. Pending
+requests that are not retry-safe, lack a fingerprint, leak secret keys, or
+already have a later tool effect fail closed (`interrupted_provider`) with no
+provider or tool effect.
+
+Native dispatch is durable-first. Assistant `tool_call` parents and user
+`tool_result` messages carry `parent_message_id` and monotonic `ordinal`
+values. A missing or name-mismatched parent fails closed (`missing_tool_parent`)
+and does not run the executor. Replaying an already durable `ToolResult` does
+not re-account metrics.
+
+Exactly-once delivery to an external receiver is impossible: event delivery is
+at-least-once. Durable replay guarantees the agent does not duplicate tool
+effects or provider-step rows; subscribers may observe the same durable event
+more than once.
+
+## Coding metrics
+
+Five saturating coding-agent counters are recorded without prompts, paths, or
+raw outputs:
+
+| Metric | Prometheus name | Counted when |
+| --- | --- | --- |
+| `model_calls` | `agent_model_calls_total` | Each actual `AgentProviderHost::call` |
+| `tool_calls` | `agent_tool_calls_total` | Each freshly executed or failed tool dispatch |
+| `tool_failures` | `agent_tool_failures_total` | Canonical `ToolResult.ok == false` |
+| `turns` | `agent_turns_total` | Successful `ok: true` provider envelopes |
+| `truncations` | `agent_truncations_total` | Typed `truncated` on a model envelope or tool result |
+
+## Security confinement
+
+Coding file tools and `terminal`/`process` are confined to the admitted
+`workspace_root`. `terminal` executes `argv` directly; a `command` shell
+string is rejected (`invalid_argv`). Default HTTP policy denies all hosts and
+ports. The coding loop E2E uses `ScriptedProvider` as model transport and the
+`local-agent` profile so it cannot fall through to an OpenAI-compatible
+network adapter.
+
+## Local coding-agent E2E
+
+The main real coding workflow is covered by:
+
+```bash
+cargo test --test coding_agent_e2e_tests
+```
+
+Stop-during-terminal cancellation and bounded output-limit overflow are
+covered by:
+
+```bash
+cargo test --test coding_agent_edge_e2e_tests
+```
+
+The main suite generates a temporary git workspace, drives the production
+`AgentService` worker and bundled RSS loop, and asserts a real `read_file` →
+`patch` → `terminal` argv test run. The edge suite asserts stop-during-terminal
+child cleanup, exact tool lifecycle, durable parent/name/ordinal chaining,
+truncated overflow artifacts, that reopening a completed run is a no-op, and
+pending provider-turn restart: retry-safe replay/retry, completed-step replay
+fidelity, unsafe fail-closed, and no duplicate tool effect or metric count.
+
 ## Secrets
 
 - `RUSTSCRIPT_AGENT_BEARER_TOKEN` and `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`

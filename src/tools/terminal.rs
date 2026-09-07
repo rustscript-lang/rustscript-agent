@@ -276,6 +276,7 @@ impl TerminalExecutor {
             &self.inner.owner,
             self.inner.artifact_sink.as_deref(),
             &stdout.bytes,
+            &stderr.bytes,
         );
         result
     }
