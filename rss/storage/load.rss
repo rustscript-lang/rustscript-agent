@@ -8,6 +8,39 @@
 use json;
 use sqlite;
 
+fn sql_text(value: string) -> SqliteValue {
+    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+}
+
+fn sql_int(value: int) -> SqliteValue {
+    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+}
+
+fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
+    {
+        max_connections: 16,
+        max_statements: 128,
+        max_rows: max_rows,
+        max_columns: 128,
+        max_result_bytes: max_bytes,
+        max_statement_bytes: 1048576,
+        max_parameters: 128,
+        max_parameter_bytes: 1048576,
+        max_pending_operations: 32,
+        max_transaction_ms: 5000,
+        busy_timeout_ms: 5000
+    }
+}
+
+fn sqlite_query_map(result: SqliteQueryResult) -> map {
+    {
+        columns: result.columns,
+        rows: result.rows,
+        truncated: result.truncated
+    }
+}
+
+
 /// The `load.all` command payload: page bounds and the hard total-row cap.
 /// `load_cap` is what turns an absurd state into the typed `load_too_large`
 /// error (the production gateway sends 1,000,000); tests parameterize it.
@@ -17,29 +50,35 @@ struct LoadAllInput {
     load_cap: int
 }
 
+struct LoadPage {
+    columns: array<string>,
+    rows: array<array<SqliteValue>>,
+    overload: bool
+}
+
 pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: LoadAllInput = json::decode::<LoadAllInput>(payload_json);
     let page_size: int = 512;
     let load_cap: int = input.load_cap.copy();
-    let sessions = load_page(
+    let sessions: LoadPage = load_page(
         db_id,
         "SELECT rowid AS _cursor, id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms, title, end_reason FROM sessions WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
         page_size,
         load_cap
     );
-    let runs = load_page(
+    let runs: LoadPage = load_page(
         db_id,
         "SELECT rowid AS _cursor, id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
         page_size,
         load_cap
     );
-    let jobs = load_page(
+    let jobs: LoadPage = load_page(
         db_id,
         "SELECT rowid AS _cursor, id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
         page_size,
         load_cap
     );
-    let idempotency = load_page(
+    let idempotency: LoadPage = load_page(
         db_id,
         "SELECT rowid AS _cursor, scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
         page_size,
@@ -47,10 +86,10 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
     );
     let mut failed: bool = false;
     let mut failure_message: string = "";
-    let sessions_overload: bool = sessions["overload"];
-    let runs_overload: bool = runs["overload"];
-    let jobs_overload: bool = jobs["overload"];
-    let idempotency_overload: bool = idempotency["overload"];
+    let sessions_overload: bool = sessions.overload;
+    let runs_overload: bool = runs.overload;
+    let jobs_overload: bool = jobs.overload;
+    let idempotency_overload: bool = idempotency.overload;
     if sessions_overload == true {
         failed = true;
         failure_message = "gateway session state exceeds the load cap";
@@ -73,38 +112,33 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
             failure_message = "gateway idempotency state exceeds the load cap";
         }
     }
-    let sessions_rows: array = sessions["rows"];
-    let runs_rows: array = runs["rows"];
-    let jobs_rows: array = jobs["rows"];
-    let idempotency_rows: array = idempotency["rows"];
-    let mut messages = [];
+    let sessions_rows: array<array<SqliteValue>> = sessions.rows;
+    let runs_rows: array<array<SqliteValue>> = runs.rows;
+    let jobs_rows: array<array<SqliteValue>> = jobs.rows;
+    let idempotency_rows: array<array<SqliteValue>> = idempotency.rows;
+    let mut messages: array<array<SqliteValue>> = [];
     if failed == false {
-        let session_rows: array = sessions_rows;
+        let session_rows: array<array<SqliteValue>> = sessions_rows;
         let session_count: int = session_rows.length;
         let mut session_index = 0;
         while session_index < session_count {
-            let session_row: array = session_rows[session_index].copy();
-            let session_id: string = session_row[0];
+            let session_row: array<SqliteValue> = session_rows[session_index].copy();
+            let session_id: string = session_row.copy()[0].text_value;
             let mut ordinal_cursor: int = 0;
             let mut page_done = false;
             while page_done == false {
-                let page: map = sqlite::query(
-                    &db_id,
-                    "SELECT ordinal, id, session_id, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?",
-                    [&session_id, ordinal_cursor, page_size + 1],
-                    { max_rows: page_size, max_result_bytes: 2097152 }
-                );
-                let page_rows: array = page["rows"];
-                let truncated: bool = page["truncated"];
+                let page: SqliteQueryResult = sqlite::query(&db_id, "SELECT ordinal, id, session_id, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?", [sql_text(session_id.copy()), sql_int(ordinal_cursor), sql_int(page_size + 1)], sql_limits(page_size, 2097152));
+                let page_rows: array<SqliteRow> = page.rows.copy();
+                let truncated: bool = page.truncated;
                 let page_count: int = page_rows.length;
-                if page_count > 0 {
-                    let last_row: array = page_rows[page_count - 1].copy();
-                    let last_cursor: int = last_row[0];
-                    ordinal_cursor = last_cursor;
-                }
                 let mut row_index = 0;
                 while row_index < page_count {
-                    messages[messages.length] = page_rows[row_index].copy();
+                    let row: SqliteRow = page_rows[row_index].copy();
+                    let cells: array<SqliteValue> = row.cells.copy();
+                    if row_index == page_count - 1 {
+                        ordinal_cursor = cells.copy()[0].int_value;
+                    }
+                    messages[messages.length] = cells;
                     row_index += 1;
                 }
                 if truncated == false {
@@ -122,34 +156,29 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
             session_index += 1;
         }
     }
-    let mut events = [];
+    let mut events: array<array<SqliteValue>> = [];
     if failed == false {
-        let run_rows: array = runs_rows;
+        let run_rows: array<array<SqliteValue>> = runs_rows;
         let run_count: int = run_rows.length;
         let mut run_index = 0;
         while run_index < run_count {
-            let run_row: array = run_rows[run_index].copy();
-            let run_id: string = run_row[0];
+            let run_row: array<SqliteValue> = run_rows[run_index].copy();
+            let run_id: string = run_row.copy()[0].text_value;
             let mut seq_cursor: int = 0;
             let mut event_page_done = false;
             while event_page_done == false {
-                let page: map = sqlite::query(
-                    &db_id,
-                    "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
-                    [&run_id, seq_cursor, page_size + 1],
-                    { max_rows: page_size, max_result_bytes: 2097152 }
-                );
-                let page_rows: array = page["rows"];
-                let truncated: bool = page["truncated"];
+                let page: SqliteQueryResult = sqlite::query(&db_id, "SELECT seq, run_id, event_id, event_type, payload_json, created_at_ms FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?", [sql_text(run_id.copy()), sql_int(seq_cursor), sql_int(page_size + 1)], sql_limits(page_size, 2097152));
+                let page_rows: array<SqliteRow> = page.rows.copy();
+                let truncated: bool = page.truncated;
                 let page_count: int = page_rows.length;
-                if page_count > 0 {
-                    let last_row: array = page_rows[page_count - 1].copy();
-                    let last_cursor: int = last_row[0];
-                    seq_cursor = last_cursor;
-                }
                 let mut row_index = 0;
                 while row_index < page_count {
-                    events[events.length] = page_rows[row_index].copy();
+                    let row: SqliteRow = page_rows[row_index].copy();
+                    let cells: array<SqliteValue> = row.cells.copy();
+                    if row_index == page_count - 1 {
+                        seq_cursor = cells.copy()[0].int_value;
+                    }
+                    events[events.length] = cells;
                     row_index += 1;
                 }
                 if truncated == false {
@@ -198,9 +227,9 @@ pub fn storage_load_all(db_id: resource<sqlite.connection>, payload_json: string
     result
 }
 
-fn load_page(db_id: resource<sqlite.connection>, sql: string, page_size: int, load_cap: int) -> map {
-    let mut rows = [];
-    let mut columns = [];
+fn load_page(db_id: resource<sqlite.connection>, sql: string, page_size: int, load_cap: int) -> LoadPage {
+    let mut rows: array<array<SqliteValue>> = [];
+    let mut columns: array<string> = [];
     let mut last_rowid: int = 0;
     let mut done = false;
     let mut first = true;
@@ -209,27 +238,24 @@ fn load_page(db_id: resource<sqlite.connection>, sql: string, page_size: int, lo
         // Fetch page_size + 1 rows: the SQL LIMIT alone would exhaust
         // exactly at the host's max_rows cap without setting `truncated`,
         // silently losing the rest of the table.
-        let result: map = sqlite::query(
-            &db_id,
-            sql,
-            [last_rowid, page_size + 1],
-            { max_rows: page_size, max_result_bytes: 2097152 }
-        );
+        let result: SqliteQueryResult = sqlite::query(&db_id, sql, [sql_int(last_rowid), sql_int(page_size + 1)], sql_limits(page_size, 2097152));
         if first {
-            let cols: array = result["columns"];
+            let cols: array<string> = result.columns;
             columns = drop_first_column(cols);
             first = false;
         }
-        let page: array = result["rows"];
-        let truncated: bool = result["truncated"];
+        let page: array<SqliteRow> = result.rows.copy();
+        let truncated: bool = result.truncated;
         let page_count: int = page.length;
         if page_count > 0 {
-            let last_row: array = page[page_count - 1].copy();
-            let last_cursor: int = last_row[0];
-            last_rowid = last_cursor;
             let mut index = 0;
             while index < page_count {
-                rows[rows.length] = drop_first_column(page[index].copy());
+                let row: SqliteRow = page[index].copy();
+                let cells: array<SqliteValue> = row.cells.copy();
+                if index == page_count - 1 {
+                    last_rowid = cells.copy()[0].int_value;
+                }
+                rows[rows.length] = drop_first_cells_from(cells);
                 index += 1;
             }
         }
@@ -244,11 +270,32 @@ fn load_page(db_id: resource<sqlite.connection>, sql: string, page_size: int, lo
     { columns: columns, rows: rows, overload: overload }
 }
 
-fn drop_first_column(row: array) -> array {
-    let mut out = [];
+fn drop_first_column(row: array<string>) -> array<string> {
+    let mut out: array<string> = [];
     let mut index = 1;
     while index < row.length {
         out[out.length] = row[index];
+        index += 1;
+    }
+    out
+}
+
+
+fn drop_first_cells_keep_all(row: SqliteRow) -> array<SqliteValue> {
+    let cells: array<SqliteValue> = row.cells.copy();
+    let mut out: array<SqliteValue> = [];
+    let mut index = 0;
+    while index < cells.length {
+        out[out.length] = cells[index].copy();
+        index += 1;
+    }
+    out
+}
+fn drop_first_cells_from(cells: array<SqliteValue>) -> array<SqliteValue> {
+    let mut out: array<SqliteValue> = [];
+    let mut index = 1;
+    while index < cells.length {
+        out[out.length] = cells[index].copy();
         index += 1;
     }
     out

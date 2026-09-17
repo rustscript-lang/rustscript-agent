@@ -4,8 +4,41 @@
 use json;
 use sqlite;
 
-fn jobs_query_limits(max_rows: int, max_bytes: int) -> map<int> {
-    { max_rows: max_rows, max_result_bytes: max_bytes }
+fn sql_text(value: string) -> SqliteValue {
+    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+}
+
+fn sql_int(value: int) -> SqliteValue {
+    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+}
+
+fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
+    {
+        max_connections: 16,
+        max_statements: 128,
+        max_rows: max_rows,
+        max_columns: 128,
+        max_result_bytes: max_bytes,
+        max_statement_bytes: 1048576,
+        max_parameters: 128,
+        max_parameter_bytes: 1048576,
+        max_pending_operations: 32,
+        max_transaction_ms: 5000,
+        busy_timeout_ms: 5000
+    }
+}
+
+fn sqlite_query_map(result: SqliteQueryResult) -> map {
+    {
+        columns: result.columns,
+        rows: result.rows,
+        truncated: result.truncated
+    }
+}
+
+
+fn jobs_query_limits(max_rows: int, max_bytes: int) {
+    sql_limits(max_rows, max_bytes)
 }
 
 struct JobCreateInput {
@@ -38,56 +71,31 @@ struct JobIdInput {
 
 pub fn storage_job_create(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: JobCreateInput = json::decode::<JobCreateInput>(payload_json);
-    sqlite::execute(
-        &db_id,
-        "INSERT INTO jobs (id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, schedule_json = excluded.schedule_json, prompt = excluded.prompt, deliver_json = excluded.deliver_json, skills_json = excluded.skills_json, repeat_count = excluded.repeat_count, enabled = excluded.enabled, updated_at_ms = excluded.updated_at_ms",
-        [&input.id, &input.name, &input.schedule_json, &input.prompt, &input.deliver_json, &input.skills_json, input.repeat_count.copy(), input.enabled.copy(), input.now_ms.copy(), input.now_ms.copy()]
-    );
-    { ok: true, result: storage_job_query(db_id, input.id, max_rows, max_bytes) }
+    sqlite::execute(&db_id, "INSERT INTO jobs (id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, schedule_json = excluded.schedule_json, prompt = excluded.prompt, deliver_json = excluded.deliver_json, skills_json = excluded.skills_json, repeat_count = excluded.repeat_count, enabled = excluded.enabled, updated_at_ms = excluded.updated_at_ms", [sql_text(input.id.copy()), sql_text(input.name.copy()), sql_text(input.schedule_json.copy()), sql_text(input.prompt.copy()), sql_text(input.deliver_json.copy()), sql_text(input.skills_json.copy()), sql_int(input.repeat_count.copy()), sql_int(input.enabled.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy())]);
+    { ok: true, result: sqlite_query_map(storage_job_query(db_id, input.id, max_rows, max_bytes)) }
 }
 
 pub fn storage_job_update(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: JobUpdateInput = json::decode::<JobUpdateInput>(payload_json);
-    sqlite::execute(
-        &db_id,
-        "UPDATE jobs SET name = ?, schedule_json = ?, prompt = ?, deliver_json = ?, skills_json = ?, repeat_count = ?, enabled = ?, updated_at_ms = ? WHERE id = ?",
-        [&input.name, &input.schedule_json, &input.prompt, &input.deliver_json, &input.skills_json, input.repeat_count.copy(), input.enabled.copy(), input.now_ms.copy(), &input.id]
-    );
-    { ok: true, result: storage_job_query(db_id, input.id, max_rows, max_bytes) }
+    sqlite::execute(&db_id, "UPDATE jobs SET name = ?, schedule_json = ?, prompt = ?, deliver_json = ?, skills_json = ?, repeat_count = ?, enabled = ?, updated_at_ms = ? WHERE id = ?", [sql_text(input.name.copy()), sql_text(input.schedule_json.copy()), sql_text(input.prompt.copy()), sql_text(input.deliver_json.copy()), sql_text(input.skills_json.copy()), sql_int(input.repeat_count.copy()), sql_int(input.enabled.copy()), sql_int(input.now_ms.copy()), sql_text(input.id.copy())]);
+    { ok: true, result: sqlite_query_map(storage_job_query(db_id, input.id, max_rows, max_bytes)) }
 }
 
-pub fn storage_job_delete(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+pub fn storage_job_delete(db_id: resource<sqlite.connection>, payload_json: string) -> SqliteExecuteResult {
     let input: JobIdInput = json::decode::<JobIdInput>(payload_json);
-    // Report the REAL rows affected: deleting a missing job is a typed
-    // zero-row result, never a hardcoded success.
-    let result: map = sqlite::execute(
-        &db_id,
-        "DELETE FROM jobs WHERE id = ?",
-        [&input.job_id]
-    );
-    { ok: true, result: result }
+    sqlite::execute(&db_id, "DELETE FROM jobs WHERE id = ?", [sql_text(input.job_id.copy())])
 }
 
 pub fn storage_job_get(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: JobIdInput = json::decode::<JobIdInput>(payload_json);
-    { ok: true, result: storage_job_query(db_id, input.job_id, max_rows, max_bytes) }
+    { ok: true, result: sqlite_query_map(storage_job_query(db_id, input.job_id, max_rows, max_bytes)) }
 }
 
 pub fn storage_job_list(db_id: resource<sqlite.connection>, max_rows: int, max_bytes: int) -> map {
-    let result: map = sqlite::query(
-        &db_id,
-        "SELECT id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs ORDER BY created_at_ms ASC, id ASC LIMIT ?",
-        [(max_rows)],
-        jobs_query_limits(max_rows, max_bytes)
-    );
-    { ok: true, result: result }
+    let result = sqlite::query(&db_id, "SELECT id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs ORDER BY created_at_ms ASC, id ASC LIMIT ?", [sql_int(max_rows)], jobs_query_limits(max_rows, max_bytes));
+    { ok: true, result: sqlite_query_map(result) }
 }
 
-fn storage_job_query(db_id: resource<sqlite.connection>, job_id: string, max_rows: int, max_bytes: int) -> map {
-    sqlite::query(
-        &db_id,
-        "SELECT id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs WHERE id = ? LIMIT ?",
-        [&job_id, (max_rows)],
-        jobs_query_limits(max_rows, max_bytes)
-    )
+fn storage_job_query(db_id: resource<sqlite.connection>, job_id: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
+    sqlite::query(&db_id, "SELECT id, name, schedule_json, prompt, deliver_json, skills_json, repeat_count, enabled, output_json, created_at_ms, updated_at_ms, last_run_at_ms FROM jobs WHERE id = ? LIMIT ?", [sql_text(job_id), sql_int(max_rows)], jobs_query_limits(max_rows, max_bytes))
 }

@@ -152,16 +152,16 @@ fn chat_send_complete(
         chat_splice_user_parts(body_text, types::request_array(request, "messages")),
         types::request_array(request, "tools")
     );
-    let response: map = http::client::request({
+    let response = http::client::request({
         method: "POST",
         url: url,
-        headers: {
-            "content-type": "application/json",
-            "authorization": "Bearer " + api_key
-        },
-        body: body
+        headers: [
+            { name: "content-type", value: "application/json" },
+            { name: "authorization", value: "Bearer " + api_key }
+        ],
+        body: { kind: "text", text: body }
     });
-    let status: int = response["status"].copy();
+    let status: int = response.status.copy();
     if status >= 200 && status < 300 => {
         chat_parse_response(response, status, provider)
     } else => {
@@ -463,8 +463,8 @@ fn chat_splice_user_parts(body: string, messages: array) -> string {
 // Response parsing
 // ---------------------------------------------------------------------------
 
-fn chat_parse_response(response: map, status: int, provider: string) -> map {
-    let body_bytes: bytes = response["body"];
+fn chat_parse_response(response: HttpResponse, status: int, provider: string) -> map {
+    let body_bytes: bytes = response.body;
     let body_text: string = bytes::to_utf8(body_bytes);
     let body: map = json::decode(body_text);
     chat_parse_response_body(body, status, provider)
@@ -580,8 +580,8 @@ fn chat_parse_tool_calls(tool_calls: array) -> array {
     calls
 }
 
-fn chat_parse_error(response: map, status: int) -> map {
-    let body_bytes: bytes = response["body"];
+fn chat_parse_error(response: HttpResponse, status: int) -> map {
+    let body_bytes: bytes = response.body;
     let body_text: string = bytes::to_utf8(body_bytes);
     let payload: map = chat_error_payload(body_text);
     let mut error_type: string = "api_error";
@@ -694,16 +694,16 @@ fn chat_send_stream(
     let mut total_tokens: int = 0;
     let mut tools: array = [];
     let mut done = false;
-    let stream_result: map = http::client::sse({
+    let stream_result = http::client::sse({
         method: "POST",
         url: url,
-        headers: {
-            "content-type": "application/json",
-            "authorization": "Bearer " + api_key
-        },
-        body: body
-    }, |item| if item["kind"] == "event" => {
-        let data: string = item["data"].copy();
+        headers: [
+            { name: "content-type", value: "application/json" },
+            { name: "authorization", value: "Bearer " + api_key }
+        ],
+        body: { kind: "text", text: body }
+    }, |item| if item.kind == "event" => {
+        let data: string = item.data.copy();
         if data == "[DONE]" => {
             done = true;
             { action: "stop" }
@@ -739,8 +739,8 @@ fn chat_send_stream(
     } else => {
         { action: "continue" }
     });
-    let outcome: string = types::request_string(stream_result, "outcome");
-    let status: int = types::request_int(stream_result, "status", 0);
+    let outcome: string = stream_result.outcome.copy();
+    let status: int = stream_result.status.copy();
     if done && outcome == "stopped" => {
         types::ok(types::response_new(
             text,

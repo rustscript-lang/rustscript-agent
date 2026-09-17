@@ -11,6 +11,31 @@
 use json;
 use sqlite;
 
+fn sql_text(value: string) -> SqliteValue {
+    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+}
+
+fn sql_int(value: int) -> SqliteValue {
+    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+}
+
+fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
+    {
+        max_connections: 16,
+        max_statements: 128,
+        max_rows: max_rows,
+        max_columns: 128,
+        max_result_bytes: max_bytes,
+        max_statement_bytes: 1048576,
+        max_parameters: 128,
+        max_parameter_bytes: 1048576,
+        max_pending_operations: 32,
+        max_transaction_ms: 5000,
+        busy_timeout_ms: 5000
+    }
+}
+
+
 struct GatewayCommand {
     op: string,
     kind: string,
@@ -26,22 +51,16 @@ struct GatewayCommand {
     payload_json: string
 }
 
-fn gateway_limits(command: GatewayCommand) -> map<int> {
-    {max_rows: command.max_rows, max_result_bytes: command.max_bytes}
+fn gateway_limits(command: GatewayCommand) -> SqliteLimits {
+    sql_limits(command.max_rows, command.max_bytes)
 }
 
-fn gateway_open(command: GatewayCommand) -> int {
+fn gateway_open(command: GatewayCommand) -> resource<sqlite.connection> {
     sqlite::open({
         path: command.db_path,
         mode: command.db_mode,
-        limits: {
-            busy_timeout_ms: command.busy_timeout_ms,
-            max_connections: 1,
-            max_rows: command.max_rows,
-            max_result_bytes: command.max_bytes,
-            max_statements: 1024,
-            max_transaction_ms: 5000
-        }
+        root: null,
+        limits: sql_limits(command.max_rows, command.max_bytes)
     })
 }
 
@@ -50,28 +69,32 @@ fn gateway_open(command: GatewayCommand) -> int {
 /// configured `max_events` so durable history matches in-memory retention.
 fn gateway_put(db_id: resource<sqlite.connection>, command: GatewayCommand) -> map {
     if command.kind.copy() == "session" => {
-        sqlite::execute(&db_id, "INSERT INTO gateway_sessions (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [command.record_id.copy(), command.payload_json.copy(), command.now_ms.copy()])
+        sqlite::execute(&db_id, "INSERT INTO gateway_sessions (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [sql_text(command.record_id.copy()), sql_text(command.payload_json.copy()), sql_int(command.now_ms.copy())])
     } else => {
         if command.kind.copy() == "run" => {
-            sqlite::execute(&db_id, "INSERT INTO gateway_runs (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [command.record_id.copy(), command.payload_json.copy(), command.now_ms.copy()])
+            sqlite::execute(&db_id, "INSERT INTO gateway_runs (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [sql_text(command.record_id.copy()), sql_text(command.payload_json.copy()), sql_int(command.now_ms.copy())])
         } else => {
             if command.kind.copy() == "job" => {
-                sqlite::execute(&db_id, "INSERT INTO gateway_jobs (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [command.record_id.copy(), command.payload_json.copy(), command.now_ms.copy()])
+                sqlite::execute(&db_id, "INSERT INTO gateway_jobs (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [sql_text(command.record_id.copy()), sql_text(command.payload_json.copy()), sql_int(command.now_ms.copy())])
             } else => {
                 if command.kind.copy() == "event" => {
                     { results: sqlite::transaction(&db_id, [
                         {
                             sql: "INSERT INTO gateway_events (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms",
-                            params: [command.record_id.copy(), command.payload_json.copy(), command.now_ms.copy()]
+                            params: [sql_text(command.record_id.copy()), sql_text(command.payload_json.copy()), sql_int(command.now_ms.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
                         },
                         {
                             sql: "DELETE FROM gateway_events WHERE substr(record_id, 1, instr(record_id, ':') - 1) = substr(?, 1, instr(?, ':') - 1) AND record_id NOT IN (SELECT record_id FROM gateway_events WHERE substr(record_id, 1, instr(record_id, ':') - 1) = substr(?, 1, instr(?, ':') - 1) ORDER BY record_id DESC LIMIT CASE WHEN ? <= 0 THEN 128 WHEN ? > 256 THEN 256 ELSE ? END)",
-                            params: [command.record_id.copy(), command.record_id.copy(), command.record_id.copy(), command.record_id.copy(), command.max_events.copy(), command.max_events.copy(), command.max_events.copy()]
+                            params: [sql_text(command.record_id.copy()), sql_text(command.record_id.copy()), sql_text(command.record_id.copy()), sql_text(command.record_id.copy()), sql_int(command.max_events.copy()), sql_int(command.max_events.copy()), sql_int(command.max_events.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
                         }
                     ]) }
                 } else => {
                     if command.kind.copy() == "idempotency" => {
-                        sqlite::execute(&db_id, "INSERT INTO gateway_idempotency (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [command.record_id.copy(), command.payload_json.copy(), command.now_ms.copy()])
+                        sqlite::execute(&db_id, "INSERT INTO gateway_idempotency (record_id, payload_json, updated_at_ms) VALUES (?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms", [sql_text(command.record_id.copy()), sql_text(command.payload_json.copy()), sql_int(command.now_ms.copy())])
                     } else => {
                         sqlite::execute(&db_id, "SELECT 1", [])
                     }
@@ -85,19 +108,19 @@ fn gateway_put(db_id: resource<sqlite.connection>, command: GatewayCommand) -> m
 /// session/run cascade can remove a run's whole retained history.
 fn gateway_delete(db_id: resource<sqlite.connection>, command: GatewayCommand) -> map {
     if command.kind.copy() == "event" => {
-        sqlite::execute(&db_id, "DELETE FROM gateway_events WHERE record_id = ? OR record_id LIKE ? || ':%'", [command.record_id.copy(), command.record_id.copy()])
+        sqlite::execute(&db_id, "DELETE FROM gateway_events WHERE record_id = ? OR record_id LIKE ? || ':%'", [sql_text(command.record_id.copy()), sql_text(command.record_id.copy())])
     } else => {
         if command.kind.copy() == "session" => {
-            sqlite::execute(&db_id, "DELETE FROM gateway_sessions WHERE record_id = ?", [command.record_id.copy()])
+            sqlite::execute(&db_id, "DELETE FROM gateway_sessions WHERE record_id = ?", [sql_text(command.record_id.copy())])
         } else => {
             if command.kind.copy() == "run" => {
-                sqlite::execute(&db_id, "DELETE FROM gateway_runs WHERE record_id = ?", [command.record_id.copy()])
+                sqlite::execute(&db_id, "DELETE FROM gateway_runs WHERE record_id = ?", [sql_text(command.record_id.copy())])
             } else => {
                 if command.kind.copy() == "job" => {
-                    sqlite::execute(&db_id, "DELETE FROM gateway_jobs WHERE record_id = ?", [command.record_id.copy()])
+                    sqlite::execute(&db_id, "DELETE FROM gateway_jobs WHERE record_id = ?", [sql_text(command.record_id.copy())])
                 } else => {
                     if command.kind.copy() == "idempotency" => {
-                        sqlite::execute(&db_id, "DELETE FROM gateway_idempotency WHERE record_id = ?", [command.record_id.copy()])
+                        sqlite::execute(&db_id, "DELETE FROM gateway_idempotency WHERE record_id = ?", [sql_text(command.record_id.copy())])
                     } else => {
                         sqlite::execute(&db_id, "SELECT 1", [])
                     }
@@ -115,7 +138,7 @@ sqlite::execute(&db_id, "CREATE TABLE IF NOT EXISTS gateway_jobs (record_id TEXT
 sqlite::execute(&db_id, "CREATE TABLE IF NOT EXISTS gateway_events (record_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL)", []);
 sqlite::execute(&db_id, "CREATE TABLE IF NOT EXISTS gateway_idempotency (record_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL)", []);
 let raw_result: map = if command.op.copy() == "load" => {
-    sqlite::query(&db_id, "SELECT 'session' AS kind, record_id, payload_json FROM gateway_sessions UNION ALL SELECT 'run', record_id, payload_json FROM gateway_runs UNION ALL SELECT 'job', record_id, payload_json FROM gateway_jobs UNION ALL SELECT 'event', record_id, payload_json FROM gateway_events UNION ALL SELECT 'idempotency', record_id, payload_json FROM gateway_idempotency ORDER BY kind, record_id LIMIT ?", [command.max_rows.copy()], gateway_limits(command.copy()))
+    sqlite::query(&db_id, "SELECT 'session' AS kind, record_id, payload_json FROM gateway_sessions UNION ALL SELECT 'run', record_id, payload_json FROM gateway_runs UNION ALL SELECT 'job', record_id, payload_json FROM gateway_jobs UNION ALL SELECT 'event', record_id, payload_json FROM gateway_events UNION ALL SELECT 'idempotency', record_id, payload_json FROM gateway_idempotency ORDER BY kind, record_id LIMIT ?", [sql_int(command.max_rows.copy())], gateway_limits(command.copy()))
 } else => {
     if command.op.copy() == "put" => {
         gateway_put(db_id, command.copy())

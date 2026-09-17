@@ -3,16 +3,15 @@
 // blocker), so every typed command that references a parent record must
 // verify the parent exists before writing; agent correctness never depends
 // on FK enforcement.
-use sqlite;
+//
+// These helpers return SQL only. Guest functions cannot take
+// `resource<sqlite.connection>` arguments (bound type is unknown), so
+// callers run `sqlite::query(&db_id, ...)` themselves.
 
-pub fn run_exists(db_id: resource<sqlite.connection>, run_id: string) -> bool {
-    let result: map = sqlite::query(&db_id, "SELECT 1 FROM runs WHERE id = ? LIMIT 1", [run_id], { max_rows: 1, max_result_bytes: 4096 });
-    let rows: array = result["rows"];
-    rows.length > 0
+pub fn run_exists_sql() -> string {
+    "SELECT 1 FROM runs WHERE id = ? LIMIT 1"
 }
 
-pub fn session_exists(db_id: resource<sqlite.connection>, session_id: string) -> bool {
-    let result: map = sqlite::query(&db_id, "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", [session_id], { max_rows: 1, max_result_bytes: 4096 });
-    let rows: array = result["rows"];
-    rows.length > 0
+pub fn session_exists_sql() -> string {
+    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1"
 }

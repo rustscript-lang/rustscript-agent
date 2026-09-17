@@ -6,7 +6,8 @@ fn map_int(value: map, key: string, fallback: int) -> int {
     let mut result: int = fallback;
     if value.has(key) {
         if type(value[key]) == "int" {
-            result = value[key];
+            let coerced: int = value[key];
+            result = coerced;
         }
     }
     result
@@ -69,8 +70,9 @@ fn glob_match_bytes(pat: array, text: array) -> bool {
         let mut advanced: bool = false;
         if pi < pat.length {
             let p: int = pat[pi];
+            let t: int = text[ti];
             if p != 42 {
-                if p == 63 || p == text[ti] {
+                if p == 63 || p == t {
                     pi = pi + 1;
                     ti = ti + 1;
                     advanced = true;
@@ -185,6 +187,39 @@ fn join_lines(lines: array) -> string {
     out
 }
 
+fn string_le(a: string, b: string) -> bool {
+    let a_bytes: bytes = bytes::from_utf8(a);
+    let b_bytes: bytes = bytes::from_utf8(b);
+    let a_arr: array = bytes::to_array_u8(a_bytes);
+    let b_arr: array = bytes::to_array_u8(b_bytes);
+    let mut i: int = 0;
+    let mut decided: bool = false;
+    let mut result: bool = true;
+    let mut limit: int = a_arr.length;
+    if b_arr.length < limit {
+        limit = b_arr.length;
+    }
+    while decided == false && i < limit {
+        let av: int = a_arr[i].copy();
+        let bv: int = b_arr[i].copy();
+        if av < bv {
+            decided = true;
+            result = true;
+        } else {
+            if bv < av {
+                decided = true;
+                result = false;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    if decided == false {
+        result = a_arr.length <= b_arr.length;
+    }
+    result
+}
+
 fn sort_strings(items: array) -> array {
     merge_sort_strings(copy_array(items))
 }
@@ -282,7 +317,7 @@ fn merge_string_arrays(left: array, right: array) -> array {
     while i < left.length && j < right.length {
         let a: string = left[i].copy();
         let b: string = right[j].copy();
-        if a <= b {
+        if string_le(a, b) {
             out[out.length] = a;
             i = i + 1;
         } else {
@@ -310,7 +345,7 @@ fn merge_map_arrays(left: array, right: array) -> array {
         let right_item: map = right[j].copy();
         let a: string = types::map_string(left_item, "name", "");
         let b: string = types::map_string(right_item, "name", "");
-        if a <= b {
+        if string_le(a, b) {
             out[out.length] = left_item;
             i = i + 1;
         } else {
@@ -1006,13 +1041,10 @@ pub fn execute(context: map, arguments: map) -> map {
                     file_glob_active = true;
                 }
             }
-            let mut offset: int = 0;
-            if arguments.has("offset") {
-                offset = arguments.offset;
-            }
+            let mut offset: int = map_int(arguments, "offset", 0);
             let mut limit: int = map_int(config, "max_search_matches", 10000);
-            if arguments.has("limit") {
-                limit = arguments.limit;
+            if arguments.has("limit") && type(arguments.limit) == "int" {
+                limit = map_int(arguments, "limit", limit);
             }
             if limit > map_int(config, "max_search_matches", 10000) {
                 limit = map_int(config, "max_search_matches", 10000);
