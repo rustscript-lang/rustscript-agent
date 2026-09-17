@@ -372,9 +372,7 @@ impl GatewayPersistence {
                     .to_string(),
             });
         }
-        Ok(decode_command_data(
-            result.get("data").cloned().unwrap_or(Value::Null),
-        )?)
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
     }
 
     // ------------------------------------------------------------------
