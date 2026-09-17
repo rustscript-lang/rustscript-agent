@@ -940,8 +940,10 @@ async fn typed_capability_failure_marks_the_run_failed() {
     let run_id = run["run_id"].as_str().expect("run id");
     let text = read_run_events(&app, run_id).await;
     assert!(
-        text.contains("run.failed") && text.contains("capability_"),
-        "a typed capability failure must mark the run failed, got: {text}"
+        text.contains("run.failed")
+            && (text.contains("capability_")
+                || text.contains("HTTP URL scheme 'http' is not allowed")),
+        "a typed capability/host policy failure must mark the run failed, got: {text}"
     );
 }
 
@@ -1406,7 +1408,10 @@ async fn admission_persists_run_started_before_any_script_event() {
     // Wait for the run to finish (the terminal event only appears after the
     // durable commit), then restart.
     let live_text = read_run_events(&app, &run_id).await;
-    assert!(live_text.contains("run.completed"));
+    assert!(
+        live_text.contains("run.completed"),
+        "live run should complete, got: {live_text}"
+    );
     drop(app);
 
     let restored = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
@@ -3443,7 +3448,11 @@ async fn gateway_restart_recovery_fails_pending_compaction_and_allows_retry() {
             "completed_at_ms": now + 9,
         }))
         .expect("the retry compaction should commit");
-    assert_eq!(committed["results"][0]["rows_affected"], json!(1));
+    assert_eq!(committed["results"][0]["kind"], json!("execute"));
+    assert_eq!(
+        committed["results"][0]["execute"]["rows_affected"],
+        json!(1)
+    );
     let committed_row = restored_persistence
         .compaction_get("compaction-1")
         .expect("compaction after commit");

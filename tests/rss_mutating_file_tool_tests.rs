@@ -11,6 +11,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustscript_agent::CancellationReason;
 use rustscript_agent::capabilities::{
     ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityError,
     CapabilityLifecycle, CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle,
@@ -21,7 +22,7 @@ use rustscript_agent::config::FileToolConfig;
 use rustscript_agent::{
     AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolResult,
 };
-use rustscript_vm::{CancellationReason, Value as VmValue};
+use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
 
 fn json_to_vm_value(value: &Value) -> VmValue {

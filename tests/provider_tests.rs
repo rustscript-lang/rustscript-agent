@@ -53,6 +53,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustscript_agent::CancellationReason;
 use rustscript_agent::capabilities::{
     AllowAllApproval, ArtifactCapability, ArtifactLimits, CapabilityLifecycle, CapabilityOwner,
     DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits, LifecycleClock,
@@ -63,7 +64,7 @@ use rustscript_agent::{
     AgentConfig, AgentHostBridges, AgentRunner, RunCancellation, RunDeliveryError, RunError,
     RunEventSink, ScriptedProvider, bundled_tool_registry,
 };
-use rustscript_vm::{CancellationReason, Value};
+use rustscript_vm::Value;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 // ---------------------------------------------------------------------------
@@ -1158,7 +1159,7 @@ fn openai_chat_stream_cancellation_is_typed() {
     let trigger = cancellation.clone();
     let canceller = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
-        trigger.request(rustscript_vm::CancellationReason::Requested);
+        trigger.request(rustscript_agent::CancellationReason::Requested);
     });
     let mut sink = RecordingSink::default();
     let error = runner

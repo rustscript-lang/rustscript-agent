@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rustscript_agent::CancellationReason;
 use rustscript_agent::capabilities::{
     ApprovalGate, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
     CapabilityOwner, CapabilityRisk, DurableStarted, DurableToolLifecycle, LifecycleClock,
@@ -23,7 +24,7 @@ use rustscript_agent::config::ProcessToolConfig;
 use rustscript_agent::{
     AgentConfig, AgentHostBridges, AgentRunner, ControlCheckHook, RunCancellation, ToolResult,
 };
-use rustscript_vm::{CancellationReason, Value as VmValue};
+use rustscript_vm::Value as VmValue;
 use serde_json::{Value, json};
 use uuid::Uuid;
 

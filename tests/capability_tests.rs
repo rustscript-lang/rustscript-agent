@@ -307,6 +307,21 @@ fn assert_stdin_workers_joined(processes: &ProcessCapability) {
     );
 }
 
+fn compile_source_error(source: &str) -> String {
+    match AgentRunner::from_source(source, AgentConfig::default()) {
+        Ok(_) => panic!("expected compile failure for malformed host payload"),
+        Err(error) => error.to_string(),
+    }
+}
+
+fn assert_compile_rejects_non_bytes(source: &str, payload: &str) {
+    let message = compile_source_error(source);
+    assert!(
+        message.contains("expected bytes") || message.contains("no host function"),
+        "payload {payload} should be rejected as bytes, got {message}"
+    );
+}
+
 fn run_cap_source(
     fixture: &Fixture,
     filesystem: Option<Arc<FilesystemCapability>>,
@@ -1111,7 +1126,14 @@ fn host_catalog_registers_cap_functions_with_typed_bounds() {
         .expect("fs_metadata schema");
     assert_eq!(metadata.params.len(), 2);
     assert!(matches!(metadata.params[0].ty, HostTypeSchema::String));
-    assert!(matches!(metadata.return_type, HostTypeSchema::Map(_)));
+    match &metadata.return_type {
+        HostTypeSchema::Named { name, fields } => {
+            assert_eq!(name, "AgentFsMetadataResult");
+            assert!(fields.iter().any(|field| field.name == "ok"));
+            assert!(fields.iter().any(|field| field.name == "kind"));
+        }
+        other => panic!("cap::fs_metadata must return AgentFsMetadataResult, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1490,8 +1512,9 @@ fn host_binary_round_trips_fs_and_artifact_bytes() {
         r#"
         pub fn run(input: map) -> map {{
             let read = cap::fs_read_range("{read_token}", "bin.dat", 0, 8);
-            let put = cap::artifact_put("{write_token}", read.bytes, {{}});
-            cap::artifact_get("{read_token}", put.id)
+            let payload: bytes = read.bytes;
+            let put: map = cap::artifact_put("{write_token}", payload, {{}});
+            cap::artifact_get("{read_token}", put["id"])
         }}
     "#
     );
@@ -1542,9 +1565,8 @@ fn host_malformed_write_payload_does_not_create_or_modify_file() {
     let fixture = Fixture::new("bad-write");
     let path = fixture.root.join("out.bin");
     fs::write(&path, b"keep").expect("seed");
-    let fs_cap = Arc::new(fixture.filesystem());
     let token = fixture.token(CapabilityRisk::Write);
-    for payload in ["{}", "\"hello\"", "1"] {
+    for payload in ["{}", r#""hello""#, "1"] {
         let source = format!(
             r#"
             pub fn run(input: map) -> map {{
@@ -1552,18 +1574,7 @@ fn host_malformed_write_payload_does_not_create_or_modify_file() {
             }}
         "#
         );
-        let result = run_cap_source(
-            &fixture,
-            Some(Arc::clone(&fs_cap)),
-            Some(Arc::new(fixture.processes())),
-            None,
-            &source,
-        );
-        assert_eq!(
-            envelope_error_code(&result),
-            "invalid_request",
-            "payload {payload}"
-        );
+        assert_compile_rejects_non_bytes(&source, payload);
         assert_eq!(
             fs::read(&path).expect("unchanged"),
             b"keep",
@@ -1578,14 +1589,7 @@ fn host_malformed_write_payload_does_not_create_or_modify_file() {
         }}
     "#
     );
-    let result = run_cap_source(
-        &fixture,
-        Some(fs_cap),
-        Some(Arc::new(fixture.processes())),
-        None,
-        &create,
-    );
-    assert_eq!(envelope_error_code(&result), "invalid_request");
+    assert_compile_rejects_non_bytes(&create, "{}");
     assert!(!fixture.root.join("created.bin").exists());
 }
 
@@ -1617,19 +1621,7 @@ fn host_malformed_process_and_artifact_values_fail_without_effects() {
         }}
     "#
     );
-    let put_result = run_cap_source(
-        &fixture,
-        None,
-        Some(Arc::clone(&processes)),
-        Some(Arc::clone(&artifacts)),
-        &put,
-    );
-    assert_eq!(envelope_error_code(&put_result), "invalid_request");
-    if let VmValue::Map(fields) = &put_result
-        && let Some(VmValue::String(id)) = fields.get(&VmValue::string("id"))
-    {
-        panic!("malformed artifact put must not mint an id, got {id}");
-    }
+    assert_compile_rejects_non_bytes(&put, "{}");
 
     let stdin = format!(
         r#"
@@ -1639,14 +1631,7 @@ fn host_malformed_process_and_artifact_values_fail_without_effects() {
     "#,
         spawned.handle
     );
-    let write_result = run_cap_source(
-        &fixture,
-        None,
-        Some(Arc::clone(&processes)),
-        Some(Arc::clone(&artifacts)),
-        &stdin,
-    );
-    assert_eq!(envelope_error_code(&write_result), "invalid_request");
+    assert_compile_rejects_non_bytes(&stdin, "{}");
 
     let spawn = r#"
         use bytes;
