@@ -22,6 +22,7 @@ pub mod prompt;
 pub mod registry;
 pub mod runtime;
 pub mod service;
+pub mod sqlite_storage_rows;
 pub mod tool_result;
 pub mod tool_schema;
 
@@ -66,6 +67,7 @@ pub use registry::{
     SchemaValidationError, SchemaValidationErrorKind, ToolRegistry, ToolRegistryEntry,
     ToolRegistryError, ToolRegistrySnapshot, validate_json_schema,
 };
+pub use runtime::cancellation::{CancellationReason, CancellationToken};
 pub use runtime::rss_runner::{
     AgentConfig, AgentError, AgentRunner, MAX_AGENT_SOURCE_BYTES, RUN_EPOCH_CHECK_INTERVAL,
     RUN_EPOCH_DEADLINE_TICKS, Result, RunCancellation, RunDeliveryError, RunError, RunEventSink,

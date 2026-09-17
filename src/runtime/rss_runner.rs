@@ -28,13 +28,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallReturn, CancellationReason, CancellationToken, CompileSourceFileOptions, EpochHandle,
-    HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HttpConfig, HttpHostExt,
-    InvocationError, InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt, SqlitePolicy,
-    Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    CallReturn, CapabilityProfile, CompileSourceFileOptions, EpochHandle, HostAsyncBridge,
+    HostFunctionRegistry, HostFuture, HostFutureOutput, HostModuleDescriptor, HttpConfig,
+    HttpHostExt, InvocationError, InvocationItem, InvocationPoll, SourceFlavor, SqliteHostExt,
+    SqlitePolicy, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
     compile_source_at_path_with_flavor_and_options, compile_source_with_flavor_and_options,
     register_http_builtin_module_from_catalog, register_sqlite_builtin_module_from_catalog,
+    standard_host_modules,
 };
+
+use super::cancellation::{CancellationReason, CancellationToken};
+use super::host_wait::wait_for_host_op_blocking_with_cancel;
 
 use super::agent_host::{
     AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog,
@@ -350,12 +354,35 @@ impl From<std::io::Error> for AgentError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
     pub fuel: Option<u64>,
 }
+
+impl PartialEq for AgentConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.http == other.http
+            && self.fuel == other.fuel
+            && self.sqlite.database_root == other.sqlite.database_root
+            && self.sqlite.allow_unsafe_sql == other.sqlite.allow_unsafe_sql
+            && self.sqlite.limits.max_connections == other.sqlite.limits.max_connections
+            && self.sqlite.limits.max_statements == other.sqlite.limits.max_statements
+            && self.sqlite.limits.max_rows == other.sqlite.limits.max_rows
+            && self.sqlite.limits.max_columns == other.sqlite.limits.max_columns
+            && self.sqlite.limits.max_result_bytes == other.sqlite.limits.max_result_bytes
+            && self.sqlite.limits.max_statement_bytes == other.sqlite.limits.max_statement_bytes
+            && self.sqlite.limits.max_parameters == other.sqlite.limits.max_parameters
+            && self.sqlite.limits.max_parameter_bytes == other.sqlite.limits.max_parameter_bytes
+            && self.sqlite.limits.max_pending_operations
+                == other.sqlite.limits.max_pending_operations
+            && self.sqlite.limits.max_transaction_ms == other.sqlite.limits.max_transaction_ms
+            && self.sqlite.limits.busy_timeout_ms == other.sqlite.limits.busy_timeout_ms
+    }
+}
+
+impl Eq for AgentConfig {}
 
 impl AgentConfig {
     pub fn new(http: HttpConfig) -> Self {
@@ -815,7 +842,8 @@ impl AgentRunner {
         cancellation: Option<&RunCancellation>,
     ) -> std::result::Result<(Vm, Value), RunError> {
         let mut vm = Vm::try_new(self.program.clone()).map_err(RunError::Vm)?;
-        vm.set_async_bridge(Box::new(AgentAsyncBridge::new()));
+        vm.set_async_bridge(Box::new(AgentAsyncBridge::new()))
+            .map_err(RunError::Setup)?;
         vm.configure_http(self.config.http.clone())
             .map_err(RunError::Setup)?;
         vm.configure_sqlite(self.config.sqlite.clone());
@@ -894,7 +922,7 @@ impl AgentRunner {
             match vm.run() {
                 Ok(VmStatus::Halted) => return Ok(()),
                 Ok(VmStatus::Waiting(_)) => {
-                    vm.wait_for_host_op_blocking_with_cancel(|| {
+                    wait_for_host_op_blocking_with_cancel(vm, || {
                         cancellation.is_some_and(|cancel| {
                             cancel.requested().is_some() || cancel.deadline_passed()
                         })
@@ -1005,30 +1033,32 @@ impl AgentRunner {
 /// builtins are intentionally absent from agent execution.
 fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmError> {
     let catalog = agent_host_catalog();
-    let mut registry = HostFunctionRegistry::restricted();
+    // `restricted()` starts from `new()`, which already installs the standard
+    // HTTP/SQLite snapshot. Re-installing those modules from the composed
+    // agent catalog then conflicts on identity (same dispatch shape, different
+    // catalog fingerprint). Start empty and install exactly the compile catalog.
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
     register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    for module in standard_host_modules() {
+        if module.name != "context" {
+            continue;
+        }
+        let descriptor = HostModuleDescriptor {
+            name: "context",
+            functions: module.owned,
+            resources: &[],
+        };
+        descriptor.install_from_catalog(&mut registry, catalog.as_ref())?;
+    }
     register_agent_host_functions(&mut registry, catalog.as_ref())?;
-    for name in [
-        "json::encode",
-        "json::decode",
-        "stream::emit",
-        "bytes::to_utf8",
-        "bytes::to_utf8_lossy",
-        "bytes::to_array_u8",
-        "bytes::from_utf8",
-        "sqlite::open",
-        "sqlite::execute",
-        "sqlite::query",
-        "sqlite::transaction",
-        "sqlite::close",
-        "sqlite::rows_affected",
-        "sqlite::truncated",
-        "sqlite::next_cursor",
-        "http::client::request",
-        "http::client::sse",
-    ] {
-        registry.allow_builtin(name)?;
+    for name in crate::runtime::host_compose::RESTRICTED_STANDARD_BUILTINS {
+        if registry.contains_name(name) {
+            registry.authorize_registered_builtin_import(name);
+        } else {
+            registry.allow_builtin(name)?;
+        }
     }
     Ok(registry)
 }
@@ -1392,5 +1422,17 @@ mod compile_cache_tests {
             let cache = program_cache();
             assert!(cache.entries.contains_key(&digests[0]));
         }
+    }
+}
+
+#[cfg(test)]
+mod restricted_registry_tests {
+    use super::*;
+
+    #[test]
+    fn restricted_registry_installs_stream_emit() {
+        build_restricted_registry().unwrap_or_else(|error| {
+            panic!("registry install failed: {error}");
+        });
     }
 }

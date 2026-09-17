@@ -2325,11 +2325,9 @@ async fn render_event(
 
 /// Reads one delivery cursor row's `last_event_seq` (0 when absent).
 fn cursor_from_rows(data: &Value) -> Option<i64> {
-    data.get("rows")
-        .and_then(Value::as_array)
-        .and_then(|rows| rows.first())
-        .and_then(|row| row.get(2))
-        .and_then(Value::as_i64)
+    crate::sqlite_storage_rows::sqlite_storage_first_row(data)
+        .and_then(|row| row.get(2).cloned())
+        .and_then(|value| value.as_i64())
 }
 
 async fn load_cursor(state: &AgentGatewayState, session_id: &str, consumer: &str) -> i64 {
@@ -2442,19 +2440,16 @@ async fn replay_run_events(
 
 /// Parses one `event.replay` page into (seq, event_type, data) rows.
 fn replay_rows(data: &Value) -> Vec<(i64, String, Value)> {
-    data.get("rows")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    let seq = row.get(0)?.as_i64()?;
-                    let event_type = row.get(3)?.as_str()?.to_string();
-                    let payload = serde_json::from_str(row.get(4)?.as_str()?).ok()?;
-                    Some((seq, event_type, payload))
-                })
-                .collect()
-        })
+    crate::sqlite_storage_rows::sqlite_storage_rows(data)
         .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let seq = row.first()?.as_i64()?;
+            let event_type = row.get(3)?.as_str()?.to_string();
+            let payload = serde_json::from_str(row.get(4)?.as_str()?).ok()?;
+            Some((seq, event_type, payload))
+        })
+        .collect()
 }
 
 #[cfg(test)]

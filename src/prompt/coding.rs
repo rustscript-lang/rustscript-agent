@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustscript_vm::{
+use crate::capabilities::vm_io::{
     ConfinedFileType, ConfinedFsLimits, ConfinedFsRoot, MAX_COMPONENT_BYTES, MAX_READ_BYTES,
 };
 use serde_json::{Map, Value, json};

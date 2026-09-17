@@ -10,10 +10,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiBuilder, HostApiCatalog,
-    HostFunctionRegistry, HostFunctionSchema, HostParamSchema, HostTypeSchema, Program,
-    SourceFlavor, Value, Vm, VmResult, VmStatus, catalog_import_schemas,
-    compile_source_at_path_with_flavor_and_options, standard_host_catalog,
+    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiCatalog, HostFunctionDescriptor,
+    HostFunctionRegistry, HostFunctionSchema, HostModuleDescriptor, HostParamSchema,
+    HostTypeSchema, Program, SourceFlavor, Value, Vm, VmResult, VmStatus,
+    compile_source_at_path_with_flavor_and_options,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -44,54 +44,62 @@ struct ConfigFixtureState {
 pub fn config_fixture_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     Arc::clone(CATALOG.get_or_init(|| {
-        let standard = standard_host_catalog();
-        let mut builder = HostApiBuilder::new();
-        for resource in standard.resources() {
-            builder.resource(resource.clone());
-        }
-        for function in standard.functions() {
-            builder.function(function.clone());
-        }
-        let response = HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown));
-        register_catalog_functions(&mut builder, response);
-        Arc::new(builder.build().expect("config fixture catalog must build"))
+        crate::runtime::host_compose::compose_with_standard(&[config_fixture_module()])
     }))
 }
 
-pub(crate) fn register_catalog_functions(builder: &mut HostApiBuilder, response: HostTypeSchema) {
-    builder.function(HostFunctionSchema::with_return(
+const CONFIG_FIXTURE_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
+    config_load_snapshot_descriptor,
+    config_check_policy_descriptor,
+];
+
+pub fn config_fixture_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "config_fixture",
+        functions: CONFIG_FIXTURE_FUNCTIONS,
+        resources: &[],
+    }
+}
+
+fn fixture_map() -> HostTypeSchema {
+    HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))
+}
+
+fn stack_desc(
+    name: &'static str,
+    params: Vec<HostParamSchema>,
+    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+) -> HostFunctionDescriptor {
+    crate::runtime::host_compose::static_stack_descriptor(
+        HostFunctionSchema::with_return(name, params, fixture_map()),
+        adapter,
+    )
+}
+
+fn config_load_snapshot_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         CONFIG_LOAD_SNAPSHOT,
         vec![HostParamSchema::value("host_home", HostTypeSchema::Unknown)],
-        response.clone(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
+        load_snapshot_adapter,
+    )
+}
+
+fn config_check_policy_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         CONFIG_CHECK_POLICY,
         vec![
             HostParamSchema::value("policy_handle", HostTypeSchema::Unknown),
             HostParamSchema::value("intent", HostTypeSchema::Unknown),
         ],
-        response,
-    ));
+        check_policy_adapter,
+    )
 }
 
 pub(crate) fn register_host_functions(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    register_named(
-        registry,
-        catalog,
-        CONFIG_LOAD_SNAPSHOT,
-        1,
-        load_snapshot_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CONFIG_CHECK_POLICY,
-        2,
-        check_policy_adapter,
-    )?;
+    config_fixture_module().install_from_catalog(registry, catalog)?;
     Ok(())
 }
 
@@ -139,7 +147,7 @@ impl ConfigFixtureHost {
         let mut registry = HostFunctionRegistry::restricted();
         register_host_functions(&mut registry, catalog.as_ref())
             .map_err(|error| error.to_string())?;
-        let mut vm = Vm::try_new_shared(program).map_err(|error| error.to_string())?;
+        let mut vm = Vm::new_shared(program);
         registry
             .bind_vm_cached(&mut vm)
             .map_err(|error| error.to_string())?;
@@ -211,7 +219,7 @@ fn drive_root_frame(vm: &mut Vm) -> Result<(), String> {
         match vm.run() {
             Ok(VmStatus::Halted) => return Ok(()),
             Ok(VmStatus::Waiting(_)) => {
-                vm.wait_for_host_op_blocking_with_cancel(|| false)
+                crate::runtime::host_wait::wait_for_host_op_blocking_with_cancel(vm, || false)
                     .map_err(|error| error.to_string())?;
             }
             Ok(VmStatus::Yielded) => {
@@ -220,21 +228,6 @@ fn drive_root_frame(vm: &mut Vm) -> Result<(), String> {
             Err(error) => return Err(error.to_string()),
         }
     }
-}
-
-fn register_named(
-    registry: &mut HostFunctionRegistry,
-    catalog: &HostApiCatalog,
-    name: &str,
-    arity: u8,
-    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-) -> VmResult<()> {
-    for schema in catalog_import_schemas(catalog, name) {
-        registry.register_exact_static(name, arity, schema, adapter)?;
-    }
-    registry.register_static(name, arity, adapter);
-    registry.allow_builtin(name)?;
-    Ok(())
 }
 
 fn load_snapshot_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {

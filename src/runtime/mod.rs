@@ -1,7 +1,11 @@
 //! RSS run execution and the agent runtime.
 
 pub(crate) mod agent_host;
+pub(crate) mod cancellation;
 pub(crate) mod delivery;
+pub(crate) mod host_compose;
+pub(crate) mod host_types;
+pub(crate) mod host_wait;
 pub(crate) mod module_snapshot;
 pub mod rss_runner;
 

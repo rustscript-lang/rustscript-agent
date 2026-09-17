@@ -224,7 +224,7 @@ mod tests {
             match vm.run() {
                 Ok(VmStatus::Halted) => return,
                 Ok(VmStatus::Waiting(_)) => {
-                    vm.wait_for_host_op_blocking_with_cancel(|| false)
+                    crate::runtime::host_wait::wait_for_host_op_blocking_with_cancel(vm, || false)
                         .unwrap_or_else(|error| panic!("root wait failed: {error}"));
                 }
                 Ok(status) => panic!("unexpected root status: {status:?}"),
@@ -291,7 +291,7 @@ pub fn touch() -> int {
         registry
             .allow_builtin("probe::touch")
             .expect("allow probe::touch");
-        let mut vm = Vm::try_new_shared(Arc::new(program)).expect("probe vm");
+        let mut vm = Vm::new_shared(Arc::new(program));
         registry
             .bind_vm_cached(&mut vm)
             .expect("bind probe registry");

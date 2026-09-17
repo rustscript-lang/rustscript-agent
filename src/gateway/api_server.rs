@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::runtime::cancellation::CancellationReason;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
@@ -30,7 +31,6 @@ use axum::{
 };
 use futures_util::stream::{self, Stream};
 use parking_lot::Mutex;
-use rustscript_vm::CancellationReason;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;

@@ -10,10 +10,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallOutcome, CallReturn, CancellationReason, HostApiBuilder, HostApiCatalog,
-    HostFunctionRegistry, HostFunctionSchema, HostParamSchema, HostTypeSchema, Value, Vm, VmError,
-    VmResult, catalog_import_schemas, standard_host_catalog,
+    CallOutcome, CallReturn, HostApiCatalog, HostFunctionDescriptor, HostFunctionRegistry,
+    HostFunctionSchema, HostModuleDescriptor, HostNamedStruct, HostParamSchema, HostTypeSchema,
+    Value, Vm, VmError, VmResult,
 };
+
+use super::cancellation::CancellationReason;
 use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
@@ -52,178 +54,332 @@ const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: std::sync::OnceLock<Arc<HostApiCatalog>> = std::sync::OnceLock::new();
-    Arc::clone(CATALOG.get_or_init(|| {
-        let standard = standard_host_catalog();
-        let mut builder = HostApiBuilder::new();
-        for resource in standard.resources() {
-            builder.resource(resource.clone());
-        }
-        for function in standard.functions() {
-            builder.function(function.clone());
-        }
-        let response = HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown));
-        builder.function(HostFunctionSchema::with_return(
-            PROVIDER_CALL,
-            vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            SLEEP_MS,
-            vec![HostParamSchema::value("delay_ms", HostTypeSchema::Int)],
-            HostTypeSchema::Int,
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CONTROL_CHECK,
-            vec![],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            TOOL_PREPARE,
-            vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            TOOL_COMMIT,
-            vec![
-                HostParamSchema::value("execution_token", HostTypeSchema::String),
-                HostParamSchema::value("result", HostTypeSchema::Unknown),
-            ],
-            response.clone(),
-        ));
-        let token = HostParamSchema::value("execution_token", HostTypeSchema::String);
-        let path = HostParamSchema::value("path", HostTypeSchema::String);
-        let handle = HostParamSchema::value("handle", HostTypeSchema::String);
-        let offset = HostParamSchema::value("offset", HostTypeSchema::Int);
-        let limit = HostParamSchema::value("limit", HostTypeSchema::Int);
-        let cursor = HostParamSchema::value("cursor", HostTypeSchema::Int);
-        builder.function(HostFunctionSchema::with_return(
-            CAP_FS_METADATA,
-            vec![token.clone(), path.clone()],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_FS_READ_RANGE,
-            vec![token.clone(), path.clone(), offset, limit.clone()],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_FS_LIST,
-            vec![token.clone(), path.clone(), cursor.clone(), limit.clone()],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_FS_WRITE_ATOMIC,
-            vec![
-                token.clone(),
-                path,
-                HostParamSchema::value("expected_hash", HostTypeSchema::String),
-                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_PROCESS_SPAWN,
-            vec![
-                token.clone(),
-                HostParamSchema::value(
-                    "argv",
-                    HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
-                ),
-                HostParamSchema::value("cwd", HostTypeSchema::String),
-                HostParamSchema::value(
-                    "env_names",
-                    HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
-                ),
-                HostParamSchema::value("limits", HostTypeSchema::Unknown),
-                HostParamSchema::value("stdin", HostTypeSchema::Unknown),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_PROCESS_POLL,
-            vec![token.clone(), handle.clone(), cursor.clone(), limit.clone()],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_PROCESS_WAIT,
-            vec![
-                token.clone(),
-                handle.clone(),
-                HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_PROCESS_LOG,
-            vec![token.clone(), handle.clone(), cursor, limit],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_PROCESS_WRITE,
-            vec![
-                token.clone(),
-                handle.clone(),
-                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
-                HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_PROCESS_CLOSE,
-            vec![token.clone(), handle.clone()],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_PROCESS_KILL,
-            vec![token.clone(), handle],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_ARTIFACT_PUT,
-            vec![
-                token.clone(),
-                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
-                HostParamSchema::value("metadata", HostTypeSchema::Unknown),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_ARTIFACT_PUT_RESULT,
-            vec![
-                token.clone(),
-                HostParamSchema::value("bytes", HostTypeSchema::Unknown),
-                HostParamSchema::value("metadata", HostTypeSchema::Unknown),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_ARTIFACT_GET,
-            vec![
-                token.clone(),
-                HostParamSchema::value("id", HostTypeSchema::String),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_ARTIFACT_REFERENCE,
-            vec![
-                token.clone(),
-                HostParamSchema::value("id", HostTypeSchema::String),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            CAP_CLOCK_MONOTONIC_MS,
-            vec![token],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            PARSE_JSON_OBJECT,
-            vec![HostParamSchema::value("text", HostTypeSchema::String)],
-            response,
-        ));
-        Arc::new(builder.build().expect("agent host catalog must build"))
-    }))
+    Arc::clone(
+        CATALOG.get_or_init(|| super::host_compose::compose_with_standard(&[agent_host_module()])),
+    )
+}
+
+const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
+    provider_call_descriptor,
+    sleep_ms_descriptor,
+    control_check_descriptor,
+    tool_prepare_descriptor,
+    tool_commit_descriptor,
+    cap_fs_metadata_descriptor,
+    cap_fs_read_range_descriptor,
+    cap_fs_list_descriptor,
+    cap_fs_write_atomic_descriptor,
+    cap_process_spawn_descriptor,
+    cap_process_poll_descriptor,
+    cap_process_wait_descriptor,
+    cap_process_log_descriptor,
+    cap_process_write_descriptor,
+    cap_process_close_descriptor,
+    cap_process_kill_descriptor,
+    cap_artifact_put_descriptor,
+    cap_artifact_put_result_descriptor,
+    cap_artifact_get_descriptor,
+    cap_artifact_reference_descriptor,
+    cap_clock_monotonic_ms_descriptor,
+    parse_json_object_descriptor,
+];
+
+pub fn agent_host_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "agent",
+        functions: AGENT_HOST_FUNCTIONS,
+        resources: &[],
+    }
+}
+
+fn token_param() -> HostParamSchema {
+    HostParamSchema::value("execution_token", HostTypeSchema::String)
+}
+
+fn stack_desc(
+    name: &'static str,
+    params: Vec<HostParamSchema>,
+    ret: HostTypeSchema,
+    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+) -> HostFunctionDescriptor {
+    super::host_compose::static_stack_descriptor(
+        HostFunctionSchema::with_return(name, params, ret),
+        adapter,
+    )
+}
+
+fn provider_call_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        PROVIDER_CALL,
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        HostTypeSchema::Unknown,
+        provider_call_adapter,
+    )
+}
+
+fn sleep_ms_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        SLEEP_MS,
+        vec![HostParamSchema::value("delay_ms", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
+        sleep_ms_adapter,
+    )
+}
+
+fn control_check_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CONTROL_CHECK,
+        vec![],
+        super::host_types::AgentControlResult::host_type_schema(),
+        control_check_adapter,
+    )
+}
+
+fn tool_prepare_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        TOOL_PREPARE,
+        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        super::host_types::AgentToolEnvelope::host_type_schema(),
+        tool_prepare_adapter,
+    )
+}
+
+fn tool_commit_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        TOOL_COMMIT,
+        vec![
+            token_param(),
+            HostParamSchema::value("result", HostTypeSchema::Unknown),
+        ],
+        super::host_types::AgentToolEnvelope::host_type_schema(),
+        tool_commit_adapter,
+    )
+}
+
+fn cap_fs_metadata_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_FS_METADATA,
+        vec![
+            token_param(),
+            HostParamSchema::value("path", HostTypeSchema::String),
+        ],
+        super::host_types::AgentFsMetadataResult::host_type_schema(),
+        cap_fs_metadata_adapter,
+    )
+}
+
+fn cap_fs_read_range_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_FS_READ_RANGE,
+        vec![
+            token_param(),
+            HostParamSchema::value("path", HostTypeSchema::String),
+            HostParamSchema::value("offset", HostTypeSchema::Int),
+            HostParamSchema::value("limit", HostTypeSchema::Int),
+        ],
+        super::host_types::AgentFsReadResult::host_type_schema(),
+        cap_fs_read_range_adapter,
+    )
+}
+
+fn cap_fs_list_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_FS_LIST,
+        vec![
+            token_param(),
+            HostParamSchema::value("path", HostTypeSchema::String),
+            HostParamSchema::value("cursor", HostTypeSchema::Int),
+            HostParamSchema::value("limit", HostTypeSchema::Int),
+        ],
+        super::host_types::AgentFsListResult::host_type_schema(),
+        cap_fs_list_adapter,
+    )
+}
+
+fn cap_fs_write_atomic_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_FS_WRITE_ATOMIC,
+        vec![
+            token_param(),
+            HostParamSchema::value("path", HostTypeSchema::String),
+            HostParamSchema::value("expected_hash", HostTypeSchema::String),
+            HostParamSchema::value("bytes", HostTypeSchema::Bytes),
+        ],
+        super::host_types::AgentFsWriteResult::host_type_schema(),
+        cap_fs_write_atomic_adapter,
+    )
+}
+
+fn cap_process_spawn_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_PROCESS_SPAWN,
+        vec![
+            token_param(),
+            HostParamSchema::value(
+                "argv",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+            ),
+            HostParamSchema::value("cwd", HostTypeSchema::String),
+            HostParamSchema::value(
+                "env_names",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+            ),
+            HostParamSchema::value(
+                "limits",
+                super::host_types::AgentProcessLimits::host_type_schema(),
+            ),
+            HostParamSchema::value("stdin", HostTypeSchema::Bytes),
+        ],
+        super::host_types::AgentProcessSpawnResult::host_type_schema(),
+        cap_process_spawn_adapter,
+    )
+}
+
+fn cap_process_poll_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_PROCESS_POLL,
+        vec![
+            token_param(),
+            HostParamSchema::value("handle", HostTypeSchema::String),
+            HostParamSchema::value("cursor", HostTypeSchema::Int),
+            HostParamSchema::value("limit", HostTypeSchema::Int),
+        ],
+        super::host_types::AgentProcessSnapshot::host_type_schema(),
+        cap_process_poll_adapter,
+    )
+}
+
+fn cap_process_wait_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_PROCESS_WAIT,
+        vec![
+            token_param(),
+            HostParamSchema::value("handle", HostTypeSchema::String),
+            HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
+        ],
+        super::host_types::AgentProcessSnapshot::host_type_schema(),
+        cap_process_wait_adapter,
+    )
+}
+
+fn cap_process_log_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_PROCESS_LOG,
+        vec![
+            token_param(),
+            HostParamSchema::value("handle", HostTypeSchema::String),
+            HostParamSchema::value("cursor", HostTypeSchema::Int),
+            HostParamSchema::value("limit", HostTypeSchema::Int),
+        ],
+        super::host_types::AgentProcessSnapshot::host_type_schema(),
+        cap_process_log_adapter,
+    )
+}
+
+fn cap_process_write_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_PROCESS_WRITE,
+        vec![
+            token_param(),
+            HostParamSchema::value("handle", HostTypeSchema::String),
+            HostParamSchema::value("bytes", HostTypeSchema::Bytes),
+            HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
+        ],
+        super::host_types::AgentProcessWriteResult::host_type_schema(),
+        cap_process_write_adapter,
+    )
+}
+
+fn cap_process_close_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_PROCESS_CLOSE,
+        vec![
+            token_param(),
+            HostParamSchema::value("handle", HostTypeSchema::String),
+        ],
+        super::host_types::AgentProcessCloseResult::host_type_schema(),
+        cap_process_close_adapter,
+    )
+}
+
+fn cap_process_kill_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_PROCESS_KILL,
+        vec![
+            token_param(),
+            HostParamSchema::value("handle", HostTypeSchema::String),
+        ],
+        super::host_types::AgentProcessCloseResult::host_type_schema(),
+        cap_process_kill_adapter,
+    )
+}
+
+fn cap_artifact_put_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_ARTIFACT_PUT,
+        vec![
+            token_param(),
+            HostParamSchema::value("bytes", HostTypeSchema::Bytes),
+            HostParamSchema::value("metadata", HostTypeSchema::Unknown),
+        ],
+        HostTypeSchema::Unknown,
+        cap_artifact_put_adapter,
+    )
+}
+
+fn cap_artifact_put_result_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_ARTIFACT_PUT_RESULT,
+        vec![
+            token_param(),
+            HostParamSchema::value("bytes", HostTypeSchema::Bytes),
+            HostParamSchema::value("metadata", HostTypeSchema::Unknown),
+        ],
+        HostTypeSchema::Unknown,
+        cap_artifact_put_result_adapter,
+    )
+}
+
+fn cap_artifact_get_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_ARTIFACT_GET,
+        vec![
+            token_param(),
+            HostParamSchema::value("id", HostTypeSchema::String),
+        ],
+        HostTypeSchema::Unknown,
+        cap_artifact_get_adapter,
+    )
+}
+
+fn cap_artifact_reference_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_ARTIFACT_REFERENCE,
+        vec![
+            token_param(),
+            HostParamSchema::value("id", HostTypeSchema::String),
+        ],
+        HostTypeSchema::Unknown,
+        cap_artifact_reference_adapter,
+    )
+}
+
+fn cap_clock_monotonic_ms_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        CAP_CLOCK_MONOTONIC_MS,
+        vec![token_param()],
+        super::host_types::AgentClockResult::host_type_schema(),
+        cap_clock_monotonic_ms_adapter,
+    )
+}
+
+fn parse_json_object_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        PARSE_JSON_OBJECT,
+        vec![HostParamSchema::value("text", HostTypeSchema::String)],
+        HostTypeSchema::Unknown,
+        parse_json_object_adapter,
+    )
 }
 
 const SLEEP_CHUNK_MS: u64 = 10;
@@ -820,139 +976,7 @@ pub fn register_agent_host_functions(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    register_named(registry, catalog, PROVIDER_CALL, 1, provider_call_adapter)?;
-    register_named(registry, catalog, SLEEP_MS, 1, sleep_ms_adapter)?;
-    register_named(registry, catalog, CONTROL_CHECK, 0, control_check_adapter)?;
-    register_named(registry, catalog, TOOL_PREPARE, 1, tool_prepare_adapter)?;
-    register_named(registry, catalog, TOOL_COMMIT, 2, tool_commit_adapter)?;
-    register_named(
-        registry,
-        catalog,
-        CAP_FS_METADATA,
-        2,
-        cap_fs_metadata_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_FS_READ_RANGE,
-        4,
-        cap_fs_read_range_adapter,
-    )?;
-    register_named(registry, catalog, CAP_FS_LIST, 4, cap_fs_list_adapter)?;
-    register_named(
-        registry,
-        catalog,
-        CAP_FS_WRITE_ATOMIC,
-        4,
-        cap_fs_write_atomic_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_PROCESS_SPAWN,
-        6,
-        cap_process_spawn_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_PROCESS_POLL,
-        4,
-        cap_process_poll_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_PROCESS_WAIT,
-        3,
-        cap_process_wait_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_PROCESS_LOG,
-        4,
-        cap_process_log_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_PROCESS_WRITE,
-        4,
-        cap_process_write_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_PROCESS_CLOSE,
-        2,
-        cap_process_close_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_PROCESS_KILL,
-        2,
-        cap_process_kill_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_ARTIFACT_PUT,
-        3,
-        cap_artifact_put_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_ARTIFACT_PUT_RESULT,
-        3,
-        cap_artifact_put_result_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_ARTIFACT_GET,
-        2,
-        cap_artifact_get_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_ARTIFACT_REFERENCE,
-        2,
-        cap_artifact_reference_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        CAP_CLOCK_MONOTONIC_MS,
-        1,
-        cap_clock_monotonic_ms_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        PARSE_JSON_OBJECT,
-        1,
-        parse_json_object_adapter,
-    )?;
-    Ok(())
-}
-
-fn register_named(
-    registry: &mut HostFunctionRegistry,
-    catalog: &HostApiCatalog,
-    name: &str,
-    arity: u8,
-    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-) -> VmResult<()> {
-    for schema in catalog_import_schemas(catalog, name) {
-        registry.register_exact_static(name, arity, schema, adapter)?;
-    }
-    registry.register_static(name, arity, adapter);
-    registry.allow_builtin(name)?;
+    agent_host_module().install_from_catalog(registry, catalog)?;
     Ok(())
 }
 
@@ -975,9 +999,7 @@ fn sleep_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
 fn control_check_adapter(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
-    let result = state
-        .control_error()
-        .unwrap_or_else(|| json!({"ok": true, "error": {}}));
+    let result = state.control_error().unwrap_or_else(|| json!({"ok": true}));
     return_json(result)
 }
 

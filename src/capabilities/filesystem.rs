@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rustscript_vm::{
+use crate::capabilities::vm_io::{
     ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind, ConfinedFsLimits, ConfinedFsRoot,
     ConfinedMetadata, ConfinedPublicationState, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES,
     MAX_READ_BYTES, MAX_WRITE_BYTES,
