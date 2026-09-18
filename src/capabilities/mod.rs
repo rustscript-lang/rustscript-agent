@@ -9,6 +9,7 @@ pub mod types;
 
 mod confined_io;
 mod hash;
+pub(crate) mod vm_io;
 
 pub(crate) use hash::sha256_hex;
 

@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use rustscript_agent::CancellationReason;
 use rustscript_agent::capabilities::{
     AllowAllApproval, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
     CapabilityOwner, DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
@@ -23,7 +24,7 @@ use rustscript_agent::{
     AgentProviderHost, AgentRunner, ControlCheckHook, RunCancellation, RunContext, RunError,
     ScriptedProvider, ToolRegistry, bundled_tool_entries, bundled_tool_registry,
 };
-use rustscript_vm::{CancellationReason, InvocationError, Value};
+use rustscript_vm::{InvocationError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 fn agent_root() -> PathBuf {
@@ -974,7 +975,7 @@ fn loop_cancel_stops_before_provider() {
     provider.push_ok(text_response("should not run"));
     let runner = loop_runner_with(provider.clone(), None);
     let cancellation = rustscript_agent::RunCancellation::new();
-    cancellation.request(rustscript_vm::CancellationReason::Requested);
+    cancellation.request(rustscript_agent::CancellationReason::Requested);
     let mut sink = VecSink::default();
     let result = runner.run_with_context_and_events(
         json_to_vm(&run_context(3, 8, loop_config(false, false), json!([]))),
@@ -1604,14 +1605,13 @@ fn query_rows(result: &JsonValue) -> Vec<JsonMap<String, JsonValue>> {
         .get("columns")
         .and_then(JsonValue::as_array)
         .expect("SQLite query data should contain columns");
-    data.get("rows")
-        .and_then(JsonValue::as_array)
+    rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&data)
         .expect("SQLite query data should contain rows")
-        .iter()
+        .into_iter()
         .map(|row| {
             columns
                 .iter()
-                .zip(row.as_array().expect("SQLite row should be an array"))
+                .zip(row.iter())
                 .map(|(column, value)| {
                     (
                         column
@@ -1849,6 +1849,21 @@ fn durable_history_context(storage: &AgentRunner, db_name: &str) -> JsonValue {
 /// statement matched the pending row (`rows_affected == 1`). `message.compact`
 /// is expected to be a guarded no-op before the commit (it only marks rows
 /// once the compaction is committed) so only a hard failure rejects it.
+fn transaction_rows_affected(result: &JsonValue, index: usize) -> JsonValue {
+    let first = &result["data"]["results"][index];
+    assert_eq!(
+        first["kind"],
+        json!("execute"),
+        "SqliteTransactionResult[{index}] must be kind=execute, got {first}"
+    );
+    let affected = &first["execute"]["rows_affected"];
+    assert!(
+        affected.is_number(),
+        "SqliteTransactionResult[{index}].execute.rows_affected must be present, got {first}"
+    );
+    affected.clone()
+}
+
 fn execute_plan(storage: &AgentRunner, db_name: &str, plan: &JsonValue) -> Result<(), String> {
     let commands = plan["commands"]
         .as_array()
@@ -1871,11 +1886,11 @@ fn execute_plan(storage: &AgentRunner, db_name: &str, plan: &JsonValue) -> Resul
                 }
             }
             "compaction.commit" => {
-                let affected = result["data"]["results"][0]["rows_affected"]
-                    .as_i64()
-                    .unwrap_or(0);
-                if affected == 0 {
-                    return Err("compaction.commit matched no pending compaction".to_string());
+                if transaction_rows_affected(&result, 0) != json!(1) {
+                    return Err(format!(
+                        "compaction.commit matched no pending compaction: {}",
+                        result["data"]["results"][0]
+                    ));
                 }
             }
             "message.compact" => {}
@@ -2016,7 +2031,7 @@ fn compaction_failure_marks_failed_and_preserves_history() {
         "the storage envelope itself succeeds"
     );
     assert_eq!(
-        commit["data"]["results"][0]["rows_affected"],
+        transaction_rows_affected(&commit, 0),
         json!(0),
         "the commit guard must match nothing once the run left compacting"
     );
@@ -2752,7 +2767,7 @@ fn compaction_start_is_idempotent_for_same_pending_payload() {
         1000,
     );
     assert_eq!(
-        again["data"]["results"][0]["rows_affected"],
+        transaction_rows_affected(&again, 0),
         json!(0),
         "a repeated commit must match nothing"
     );
@@ -3153,7 +3168,7 @@ fn restart_recovery_fails_pending_compaction_then_new_start_commits() {
         2000,
     );
     assert_eq!(
-        committed["data"]["results"][0]["rows_affected"],
+        transaction_rows_affected(&committed, 0),
         json!(1),
         "the retry compaction must commit"
     );

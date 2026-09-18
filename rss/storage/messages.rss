@@ -1,10 +1,35 @@
 use json;
 use sqlite;
+
+fn sql_text(value: string) -> SqliteValue {
+    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+}
+
+fn sql_int(value: int) -> SqliteValue {
+    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+}
+
+fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
+    {
+        max_connections: 16,
+        max_statements: 128,
+        max_rows: max_rows,
+        max_columns: 128,
+        max_result_bytes: max_bytes,
+        max_statement_bytes: 1048576,
+        max_parameters: 128,
+        max_parameter_bytes: 1048576,
+        max_pending_operations: 32,
+        max_transaction_ms: 5000,
+        busy_timeout_ms: 5000
+    }
+}
+
 use self::schema as schema;
 use self::existence as existence;
 
-fn messages_query_limits(max_rows: int, max_bytes: int) -> map<int> {
-    { max_rows: max_rows, max_result_bytes: if max_bytes < 4096 => { 4096 } else => { max_bytes } }
+fn messages_query_limits(max_rows: int, max_bytes: int) {
+    sql_limits(max_rows, if max_bytes < 4096 => { 4096 } else => { max_bytes })
 }
 
 /// Canonical content_json is always a JSON array of LlmContentBlock objects.
@@ -12,18 +37,20 @@ fn messages_query_limits(max_rows: int, max_bytes: int) -> map<int> {
 /// rewritten with the same block schema; already-canonical arrays pass
 /// through losslessly. Text fields are UTF-8-safe truncated to 65536
 /// characters so the 1 MiB CHECK cannot split a multi-byte scalar.
-pub fn storage_message_encode_content(db_id: resource<sqlite.connection>, content_json: string) -> string {
+pub fn storage_message_encode_content(content_json: string) -> string {
     let source: string = content_json.copy();
-    let classified: map = sqlite::query(
-        &db_id,
-        "SELECT CASE WHEN json_valid(payload) AND json_type(payload) = 'array' THEN 1 ELSE 0 END, CASE WHEN json_valid(payload) AND json_type(payload) = 'object' AND json_extract(payload, '$.type') IS NOT NULL THEN 1 ELSE 0 END FROM (SELECT ? AS payload)",
-        [&source],
-        { max_rows: 1, max_result_bytes: 4096 }
-    );
-    let class_rows: array = classified["rows"];
-    let class_row: array = class_rows[0];
-    let is_array: int = class_row[0];
-    let is_block: int = class_row[1];
+    let db_id = sqlite::open({
+        path: ":memory:",
+        mode: "memory",
+        root: null,
+        limits: sql_limits(1, 1048576)
+    });
+    let classified: SqliteQueryResult = sqlite::query(&db_id, "SELECT CASE WHEN json_valid(payload) AND json_type(payload) = 'array' THEN 1 ELSE 0 END, CASE WHEN json_valid(payload) AND json_type(payload) = 'object' AND json_extract(payload, '$.type') IS NOT NULL THEN 1 ELSE 0 END FROM (SELECT ? AS payload)", [sql_text(source.copy())], sql_limits(1, 4096));
+    let class_rows: array<SqliteRow> = classified.rows;
+    let class_row: SqliteRow = class_rows[0].copy();
+    let class_cells: array<SqliteValue> = class_row.cells.copy();
+    let is_array: int = class_cells[0].int_value;
+    let is_block: int = class_cells[1].int_value;
     let mut encoded: string = source.copy();
     if is_array.copy() == 1 {
         encoded = source.copy();
@@ -31,17 +58,13 @@ pub fn storage_message_encode_content(db_id: resource<sqlite.connection>, conten
         if is_block.copy() == 1 {
             encoded = "[" + source.copy() + "]";
         } else {
-            let cut: map = sqlite::query(
-                &db_id,
-                "SELECT CASE WHEN length(extracted) > 65536 THEN CAST(json_array(json_object('type', 'text', 'text', substr(extracted, 1, 65536), 'truncated', json('true'))) AS TEXT) ELSE CAST(json_array(json_object('type', 'text', 'text', extracted)) AS TEXT) END AS encoded FROM (SELECT CASE WHEN json_valid(payload) AND json_type(payload) = 'object' AND json_extract(payload, '$.text') IS NOT NULL THEN json_extract(payload, '$.text') WHEN json_valid(payload) AND json_type(payload) = 'text' THEN json_extract(payload, '$') ELSE payload END AS extracted FROM (SELECT ? AS payload))",
-                [&source],
-                { max_rows: 1, max_result_bytes: 1048576 }
-            );
-            let cut_rows: array = cut["rows"];
-            let cut_row: array = cut_rows[0];
-            encoded = cut_row[0];
+            let cut: SqliteQueryResult = sqlite::query(&db_id, "SELECT CASE WHEN length(extracted) > 65536 THEN CAST(json_array(json_object('type', 'text', 'text', substr(extracted, 1, 65536), 'truncated', json('true'))) AS TEXT) ELSE CAST(json_array(json_object('type', 'text', 'text', extracted)) AS TEXT) END AS encoded FROM (SELECT CASE WHEN json_valid(payload) AND json_type(payload) = 'object' AND json_extract(payload, '$.text') IS NOT NULL THEN json_extract(payload, '$.text') WHEN json_valid(payload) AND json_type(payload) = 'text' THEN json_extract(payload, '$') ELSE payload END AS extracted FROM (SELECT ? AS payload))", [sql_text(source.copy())], sql_limits(1, 1048576));
+            let cut_rows: array<SqliteRow> = cut.rows;
+            let cut_row: SqliteRow = cut_rows[0].copy();
+            encoded = cut_row.cells[0].text_value;
         }
     }
+    sqlite::close(db_id);
     encoded
 }
 
@@ -78,59 +101,44 @@ struct MessageCompactInput {
 pub fn storage_message_append(db_id: resource<sqlite.connection>, payload_json: string, max_rows: int, max_bytes: int) -> map {
     let input: MessageAppendInput = json::decode::<MessageAppendInput>(payload_json);
     let mut result = { ok: true, code: "ok", message: "", result: {} };
-    if !existence::session_exists(db_id, input.session_id.copy()) {
+    if !(sqlite::query(&db_id, existence::session_exists_sql(), [sql_text(input.session_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
         result = { ok: false, code: "session_not_found", message: "message append targets an unknown session", result: {} };
     } else {
-        let encoded: string = storage_message_encode_content(db_id, input.content_json.copy());
-        let statements = [
+        let encoded: string = storage_message_encode_content(input.content_json.copy());
+        let statements: array<SqliteStatement> = [
             {
                 sql: "INSERT OR IGNORE INTO messages (id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                params: [&input.id, &input.session_id, &input.role, &encoded, &input.name, &input.tool_call_id, &input.parent_message_id, input.token_estimate.copy(), &input.metadata_json, &input.run_id, &input.finish_reason, input.now_ms.copy(), &input.session_id, &input.id, &input.session_id]
-            },
+                params: [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_text(input.role.copy()), sql_text(encoded), sql_text(input.name.copy()), sql_text(input.tool_call_id.copy()), sql_text(input.parent_message_id.copy()), sql_int(input.token_estimate.copy()), sql_text(input.metadata_json.copy()), sql_text(input.run_id.copy()), sql_text(input.finish_reason.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.id.copy()), sql_text(input.session_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        },
             {
                 sql: "UPDATE sessions SET last_message_seq = COALESCE((SELECT MAX(ordinal) FROM messages WHERE session_id = ?), 0), updated_at_ms = ? WHERE id = ?",
-                params: [&input.session_id, input.now_ms.copy(), &input.session_id]
-            }
+                params: [sql_text(input.session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        }
         ];
         sqlite::transaction(&db_id, statements);
         result = {
             ok: true,
             code: "ok",
             message: "",
-            result: sqlite::query(
-                &db_id,
-                storage_message_select_sql("WHERE id = ? AND session_id = ? LIMIT ?"),
-                [&input.id, &input.session_id, (max_rows)],
-                messages_query_limits(max_rows, max_bytes)
-            )
+            result: sqlite::query(&db_id, storage_message_select_sql("WHERE id = ? AND session_id = ? LIMIT ?"), [sql_text(input.id.copy()), sql_text(input.session_id.copy()), sql_int(max_rows)], messages_query_limits(max_rows, max_bytes))
         };
     }
     result
 }
 
-pub fn storage_message_get(db_id: resource<sqlite.connection>, message_id: string, max_rows: int, max_bytes: int) -> map {
-    sqlite::query(
-        &db_id,
-        storage_message_select_sql("WHERE id = ? LIMIT ?"),
-        [message_id, (max_rows)],
-        messages_query_limits(max_rows, max_bytes)
-    )
+pub fn storage_message_get(db_id: resource<sqlite.connection>, message_id: string, max_rows: int, max_bytes: int) -> SqliteQueryResult {
+    sqlite::query(&db_id, storage_message_select_sql("WHERE id = ? LIMIT ?"), [sql_text(message_id), sql_int(max_rows)], messages_query_limits(max_rows, max_bytes))
 }
 
-pub fn storage_message_list(db_id: resource<sqlite.connection>, session_id: string, after_ordinal: int, max_rows: int, max_bytes: int) -> map {
-    sqlite::query(
-        &db_id,
-        storage_message_select_sql("WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?"),
-        [session_id, after_ordinal, max_rows],
-        messages_query_limits(max_rows, max_bytes)
-    )
+pub fn storage_message_list(db_id: resource<sqlite.connection>, session_id: string, after_ordinal: int, max_rows: int, max_bytes: int) -> SqliteQueryResult {
+    sqlite::query(&db_id, storage_message_select_sql("WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC LIMIT ?"), [sql_text(session_id.copy()), sql_int(after_ordinal), sql_int(max_rows)], messages_query_limits(max_rows, max_bytes))
 }
 
-pub fn storage_message_mark_compacted(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+pub fn storage_message_mark_compacted(db_id: resource<sqlite.connection>, payload_json: string) -> SqliteExecuteResult {
     let input: MessageCompactInput = json::decode::<MessageCompactInput>(payload_json);
-    sqlite::execute(
-        &db_id,
-        "UPDATE messages SET compacted = 1 WHERE session_id = ? AND ordinal >= ? AND ordinal <= ? AND EXISTS (SELECT 1 FROM compactions WHERE session_id = ? AND source_start_ordinal = ? AND source_end_ordinal = ? AND state = 'committed')",
-        [&input.session_id, input.start_ordinal.copy(), input.end_ordinal.copy(), &input.session_id, input.start_ordinal.copy(), input.end_ordinal.copy()]
-    )
+    sqlite::execute(&db_id, "UPDATE messages SET compacted = 1 WHERE session_id = ? AND ordinal >= ? AND ordinal <= ? AND EXISTS (SELECT 1 FROM compactions WHERE session_id = ? AND source_start_ordinal = ? AND source_end_ordinal = ? AND state = 'committed')", [sql_text(input.session_id.copy()), sql_int(input.start_ordinal.copy()), sql_int(input.end_ordinal.copy()), sql_text(input.session_id.copy()), sql_int(input.start_ordinal.copy()), sql_int(input.end_ordinal.copy())])
 }

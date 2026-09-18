@@ -33,9 +33,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
-use rustscript_vm::{
-    CancellationReason, CancellationToken, HttpConfig, InvocationError, Value as VmValue,
-};
+use rustscript_vm::{HttpConfig, InvocationError, Value as VmValue};
+
+use crate::runtime::cancellation::{CancellationReason, CancellationToken};
 use serde_json::{Map, Value as JsonValue, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -2860,16 +2860,12 @@ impl AgentService {
     }
 
     fn finish_durable_replay(&self, data: &JsonValue) -> Result<AdmittedRun, AdmitError> {
-        let run_row = data
-            .get("run")
-            .and_then(|run| run.get("rows"))
-            .and_then(JsonValue::as_array)
-            .and_then(|rows| rows.first())
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .ok_or_else(|| {
-                AdmitError::Persistence("replayed admission omitted the existing run".to_string())
-            })?;
+        let run_row = crate::sqlite_storage_rows::sqlite_storage_first_row(
+            data.get("run").unwrap_or(&JsonValue::Null),
+        )
+        .ok_or_else(|| {
+            AdmitError::Persistence("replayed admission omitted the existing run".to_string())
+        })?;
         let replayed_run_id = admission_run_str(&run_row, ADMISSION_RUN_COL_ID)
             .unwrap_or_default()
             .to_string();
@@ -4041,21 +4037,19 @@ impl AgentService {
         let run_data = persistence
             .run_get(run_id)
             .map_err(|error| RunContextError::Persistence(format!("read run context: {error}")))?;
-        let run_row = run_data
-            .get("rows")
-            .and_then(JsonValue::as_array)
-            .and_then(|rows| rows.first())
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| RunContextError::Missing {
-                run_id: run_id.to_string(),
+        let run_row =
+            crate::sqlite_storage_rows::sqlite_storage_first_row(&run_data).ok_or_else(|| {
+                RunContextError::Missing {
+                    run_id: run_id.to_string(),
+                }
             })?;
-        if admission_run_str(run_row, ADMISSION_RUN_COL_ID) != Some(run_id) {
+        if admission_run_str(&run_row, ADMISSION_RUN_COL_ID) != Some(run_id) {
             return Err(invalid_context_metadata(
                 run_id,
                 "run record id does not match the requested run",
             ));
         }
-        let persisted_input = admission_run_str(run_row, ADMISSION_RUN_COL_INPUT_JSON)
+        let persisted_input = admission_run_str(&run_row, ADMISSION_RUN_COL_INPUT_JSON)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| invalid_context_metadata(run_id, "run context snapshot is missing"))?;
         let envelope: JsonValue = serde_json::from_str(persisted_input).map_err(|error| {
@@ -4087,7 +4081,7 @@ impl AgentService {
                 "run id does not match the persisted context",
             ));
         }
-        let row_session_id = admission_run_str(run_row, ADMISSION_RUN_COL_SESSION_ID)
+        let row_session_id = admission_run_str(&run_row, ADMISSION_RUN_COL_SESSION_ID)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| invalid_context_metadata(run_id, "run session id is missing"))?;
         if context.session_id != row_session_id {
@@ -4108,7 +4102,7 @@ impl AgentService {
                 "provider does not match the run record",
             ));
         }
-        if admission_run_str(run_row, ADMISSION_RUN_COL_MODEL) != Some(context.model.as_str()) {
+        if admission_run_str(&run_row, ADMISSION_RUN_COL_MODEL) != Some(context.model.as_str()) {
             return Err(invalid_context_metadata(
                 run_id,
                 "model does not match the run record",
@@ -4119,7 +4113,7 @@ impl AgentService {
             .get("registry_identity")
             .and_then(JsonValue::as_str)
             .expect("context metadata validation checked registry identity");
-        if admission_run_str(run_row, ADMISSION_RUN_COL_SCRIPT_HASH) != Some(registry_identity) {
+        if admission_run_str(&run_row, ADMISSION_RUN_COL_SCRIPT_HASH) != Some(registry_identity) {
             return Err(invalid_context_metadata(
                 run_id,
                 "registry identity does not match the run record",
@@ -5417,14 +5411,13 @@ fn terminal_commit(
             code: error.code.clone(),
             message: error.message.clone(),
         })?;
-    let rows = data
-        .get("events")
-        .and_then(|events| events.get("rows"))
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| TerminalCommitError {
-            code: "terminal_commit_invalid".to_string(),
-            message: "run.terminal result omitted events".to_string(),
-        })?;
+    let rows = crate::sqlite_storage_rows::sqlite_storage_rows(
+        data.get("events").unwrap_or(&JsonValue::Null),
+    )
+    .map_err(|message| TerminalCommitError {
+        code: "terminal_commit_invalid".to_string(),
+        message,
+    })?;
     if rows.len() < event_count {
         return Err(TerminalCommitError {
             code: "terminal_commit_invalid".to_string(),
@@ -5439,7 +5432,6 @@ fn terminal_commit(
     for (index, event) in events.iter().enumerate() {
         let row = rows
             .get(offset + index)
-            .and_then(JsonValue::as_array)
             .ok_or_else(|| TerminalCommitError {
                 code: "terminal_commit_invalid".to_string(),
                 message: "run.terminal returned a malformed event row".to_string(),

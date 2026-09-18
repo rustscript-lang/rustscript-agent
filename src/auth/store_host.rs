@@ -10,10 +10,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiBuilder, HostApiCatalog,
-    HostFunctionRegistry, HostFunctionSchema, HostParamSchema, HostTypeSchema, Program,
-    SourceFlavor, Value, Vm, VmResult, VmStatus, catalog_import_schemas,
-    compile_source_at_path_with_flavor_and_options, standard_host_catalog,
+    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiCatalog, HostFunctionDescriptor,
+    HostFunctionRegistry, HostFunctionSchema, HostModuleDescriptor, HostParamSchema,
+    HostTypeSchema, Program, SourceFlavor, Value, Vm, VmResult, VmStatus,
+    compile_source_at_path_with_flavor_and_options,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -266,7 +266,7 @@ impl AuthFixtureHost {
         let mut registry = HostFunctionRegistry::restricted();
         register_host_functions(&mut registry, catalog.as_ref())
             .map_err(|error| error.to_string())?;
-        let mut vm = Vm::try_new_shared(program).map_err(|error| error.to_string())?;
+        let mut vm = Vm::new_shared(program);
         registry
             .bind_vm_cached(&mut vm)
             .map_err(|error| error.to_string())?;
@@ -294,116 +294,93 @@ impl Drop for AuthFixtureHost {
 pub fn auth_store_fixture_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     Arc::clone(CATALOG.get_or_init(|| {
-        let standard = standard_host_catalog();
-        let mut builder = HostApiBuilder::new();
-        for resource in standard.resources() {
-            builder.resource(resource.clone());
-        }
-        for function in standard.functions() {
-            builder.function(function.clone());
-        }
-        let response = HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown));
-        register_catalog_functions(&mut builder, response);
-        Arc::new(
-            builder
-                .build()
-                .expect("auth store fixture catalog must build"),
-        )
+        crate::runtime::host_compose::compose_with_standard(&[auth_store_fixture_module()])
     }))
 }
 
-fn register_catalog_functions(builder: &mut HostApiBuilder, response: HostTypeSchema) {
-    let request = vec![HostParamSchema::value("request", HostTypeSchema::Unknown)];
-    builder.function(HostFunctionSchema::with_return(
+const AUTH_STORE_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
+    auth_load_metadata_descriptor,
+    auth_save_if_generation_descriptor,
+    auth_access_handle_descriptor,
+    auth_refresh_handle_descriptor,
+    auth_delete_descriptor,
+    auth_check_handle_descriptor,
+];
+
+pub fn auth_store_fixture_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "auth_store_fixture",
+        functions: AUTH_STORE_FUNCTIONS,
+        resources: &[],
+    }
+}
+
+fn fixture_map() -> HostTypeSchema {
+    HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))
+}
+
+fn stack_desc(
+    name: &'static str,
+    params: Vec<HostParamSchema>,
+    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+) -> HostFunctionDescriptor {
+    crate::runtime::host_compose::static_stack_descriptor(
+        HostFunctionSchema::with_return(name, params, fixture_map()),
+        adapter,
+    )
+}
+
+fn auth_load_metadata_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         AUTH_LOAD_METADATA,
-        request.clone(),
-        response.clone(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        load_metadata_adapter,
+    )
+}
+fn auth_save_if_generation_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         AUTH_SAVE_IF_GENERATION,
-        request.clone(),
-        response.clone(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        save_if_generation_adapter,
+    )
+}
+fn auth_access_handle_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         AUTH_ACCESS_HANDLE,
-        request.clone(),
-        response.clone(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        access_handle_adapter,
+    )
+}
+fn auth_refresh_handle_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         AUTH_REFRESH_HANDLE,
-        request.clone(),
-        response.clone(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        refresh_handle_adapter,
+    )
+}
+fn auth_delete_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         AUTH_DELETE,
-        request,
-        response.clone(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        delete_adapter,
+    )
+}
+fn auth_check_handle_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
         AUTH_CHECK_HANDLE,
         vec![
             HostParamSchema::value("handle", HostTypeSchema::Unknown),
             HostParamSchema::value("intent", HostTypeSchema::Unknown),
         ],
-        response,
-    ));
+        check_handle_adapter,
+    )
 }
 
 fn register_host_functions(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    register_named(
-        registry,
-        catalog,
-        AUTH_LOAD_METADATA,
-        1,
-        load_metadata_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_SAVE_IF_GENERATION,
-        1,
-        save_if_generation_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_ACCESS_HANDLE,
-        1,
-        access_handle_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_REFRESH_HANDLE,
-        1,
-        refresh_handle_adapter,
-    )?;
-    register_named(registry, catalog, AUTH_DELETE, 1, delete_adapter)?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_CHECK_HANDLE,
-        2,
-        check_handle_adapter,
-    )?;
-    Ok(())
-}
-
-fn register_named(
-    registry: &mut HostFunctionRegistry,
-    catalog: &HostApiCatalog,
-    name: &'static str,
-    arity: u8,
-    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-) -> VmResult<()> {
-    for schema in catalog_import_schemas(catalog, name) {
-        registry.register_exact_static(name, arity, schema, adapter)?;
-    }
-    registry.register_static(name, arity, adapter);
-    registry.allow_builtin(name)?;
+    auth_store_fixture_module().install_from_catalog(registry, catalog)?;
     Ok(())
 }
 
@@ -1034,9 +1011,10 @@ fn drive_root_frame(vm: &mut Vm) -> Result<(), String> {
     loop {
         match vm.run() {
             Ok(VmStatus::Halted) => return Ok(()),
-            Ok(VmStatus::Waiting(_)) => vm
-                .wait_for_host_op_blocking_with_cancel(|| false)
-                .map_err(|error| error.to_string())?,
+            Ok(VmStatus::Waiting(_)) => {
+                crate::runtime::host_wait::wait_for_host_op_blocking_with_cancel(vm, || false)
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(VmStatus::Yielded) => {
                 return Err("auth store fixture root frame yielded unexpectedly".to_string());
             }

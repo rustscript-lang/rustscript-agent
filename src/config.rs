@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 
 use crate::runtime::rss_runner::MAX_RUN_TIMEOUT;
 
-use rustscript_vm::{
-    HttpConfig, MAX_ENUM_ENTRIES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, MAX_TIMEOUT, SqlitePolicy,
+use crate::capabilities::vm_io::{
+    MAX_ENUM_ENTRIES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES, MAX_TIMEOUT,
 };
+use rustscript_vm::{HttpConfig, SqlitePolicy};
 use serde_json::{Map, Value, json};
 
 pub use crate::config_file::{AgentPaths, BoundedPublicConfig, ConfigPaths};
@@ -2431,7 +2432,7 @@ mod tests {
             admission_query_column_names(ADMISSION_IDEMPOTENCY_LOOKUP_COLUMNS)
         );
         assert!(
-            source.contains("max_result_bytes: 8192"),
+            source.contains("sql_limits(1, 8192)"),
             "pre-commit idempotency SELECT must keep the 8192-byte budget"
         );
         assert_eq!(ADMISSION_IDEMPOTENCY_QUERY_LIMIT_BYTES, 8192);

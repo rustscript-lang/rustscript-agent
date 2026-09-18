@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustscript_vm::{
+use crate::capabilities::vm_io::{
     BoundedProcess, BoundedProcessError, BoundedProcessHandle, BoundedProcessRequest,
     CancellationToken as ProcessCancel, ConfinedFsLimits, ConfinedFsRoot, LogSnapshot,
     MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_READ_BYTES, MAX_WRITE_BYTES, ProcessStatus,

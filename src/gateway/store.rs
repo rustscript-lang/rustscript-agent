@@ -372,7 +372,7 @@ impl GatewayPersistence {
                     .to_string(),
             });
         }
-        Ok(result.get("data").cloned().unwrap_or(Value::Null))
+        decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
     }
 
     // ------------------------------------------------------------------
@@ -1063,16 +1063,11 @@ impl GatewayStore {
 }
 
 fn load_rows(data: &Value, key: &str) -> Result<Vec<Vec<Value>>, String> {
-    data.get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("load.all result omitted {key} rows"))?
-        .iter()
-        .map(|row| {
-            row.as_array()
-                .cloned()
-                .ok_or_else(|| format!("load.all {key} row is not an array"))
-        })
-        .collect()
+    let nested = data
+        .get(key)
+        .ok_or_else(|| format!("load.all result omitted {key} rows"))?;
+    crate::sqlite_storage_rows::sqlite_storage_rows(nested)
+        .map_err(|error| format!("load.all {key}: {error}"))
 }
 
 fn string_cell(row: &[Value], index: usize, label: &str) -> Result<String, String> {
@@ -1105,19 +1100,39 @@ fn json_cell(row: &[Value], index: usize, label: &str) -> Result<Value, String> 
     }
 }
 
+fn decode_command_data(data: Value) -> Result<Value, StorageError> {
+    if data.get("rows").is_none() {
+        return Ok(data);
+    }
+    let rows =
+        crate::sqlite_storage_rows::sqlite_storage_rows(&data).map_err(|message| StorageError {
+            code: "storage_error".to_string(),
+            message,
+        })?;
+    match data {
+        Value::Object(mut map) => {
+            map.insert("rows".into(), json!(rows));
+            Ok(Value::Object(map))
+        }
+        other => Ok(other),
+    }
+}
+
 fn first_rows_affected(data: &Value) -> i64 {
-    data.get("results")
+    let Some(first) = data
+        .get("results")
         .and_then(Value::as_array)
         .and_then(|rows| rows.first())
-        .and_then(|row| row.get("rows_affected"))
+    else {
+        return 0;
+    };
+    if first.get("kind").and_then(Value::as_str) != Some("execute") {
+        return 0;
+    }
+    first
+        .get("execute")
+        .and_then(|exec| exec.get("rows_affected"))
         .and_then(Value::as_i64)
-        .or_else(|| {
-            data.as_array()
-                .and_then(|rows| rows.first())
-                .and_then(|row| row.get("rows_affected"))
-                .and_then(Value::as_i64)
-        })
-        .or_else(|| data.get("rows_affected").and_then(Value::as_i64))
         .unwrap_or(0)
 }
 

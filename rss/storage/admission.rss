@@ -5,6 +5,39 @@
 // disk, so a restart can never resurrect a half-admitted run.
 use json;
 use sqlite;
+
+fn sql_text(value: string) -> SqliteValue {
+    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+}
+
+fn sql_int(value: int) -> SqliteValue {
+    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+}
+
+fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
+    {
+        max_connections: 16,
+        max_statements: 128,
+        max_rows: max_rows,
+        max_columns: 128,
+        max_result_bytes: max_bytes,
+        max_statement_bytes: 1048576,
+        max_parameters: 128,
+        max_parameter_bytes: 1048576,
+        max_pending_operations: 32,
+        max_transaction_ms: 5000,
+        busy_timeout_ms: 5000
+    }
+}
+
+fn sqlite_query_map(result: SqliteQueryResult) -> map {
+    {
+        columns: result.columns,
+        rows: result.rows,
+        truncated: result.truncated
+    }
+}
+
 use self::existence as existence;
 use self::messages as messages;
 
@@ -37,14 +70,14 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     let mut failure_code: string = "";
     let mut failure_message: string = "";
     if input.session_new.copy() == 0 {
-        if !existence::session_exists(db_id, input.session_id.copy()) {
+        if !(sqlite::query(&db_id, existence::session_exists_sql(), [sql_text(input.session_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
             failed = true;
             failure_code = "session_not_found";
             failure_message = "admission session does not exist";
         }
     }
     if failed == false {
-        if input.parent_run_id.copy() != "" && !existence::run_exists(db_id, input.parent_run_id.copy()) {
+        if input.parent_run_id.copy() != "" && !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.parent_run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
             failed = true;
             failure_code = "parent_not_found";
             failure_message = "parent run does not exist";
@@ -55,17 +88,13 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     let mut existing_run_id: string = "";
     if failed == false {
         if input.idempotency_key.copy() != "" {
-            let existing: map = sqlite::query(
-                &db_id,
-                "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1",
-                [&input.idempotency_scope, &input.idempotency_key],
-                { max_rows: 1, max_result_bytes: 8192 }
-            );
-            let rows: array = existing["rows"];
+            let existing = sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192));
+            let rows = existing.rows;
             if rows.length > 0 {
-                let row: array = rows[0];
-                let existing_hash: string = row[2];
-                let existing_resource: string = row[4];
+                let row: SqliteRow = rows[0].copy();
+                let cells: array<SqliteValue> = row.cells.copy();
+                let existing_hash: string = cells[2].text_value;
+                let existing_resource: string = cells[4].text_value;
                 existing_run_id = existing_resource;
                 if existing_hash == input.request_hash.copy() {
                     replay = true;
@@ -77,58 +106,71 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
     }
     if failed == false {
         if replay == false && conflict == false {
-            let mut statements = [];
+            let mut statements: array<SqliteStatement> = [];
             if input.session_new.copy() == 1 {
                 statements[statements.length] = {
                     sql: "INSERT INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, system_prompt, model, provider, toolset_hash, metadata_json, created_at_ms, updated_at_ms) SELECT ?, ?, ?, ?, '', '', '', 1, ?, ?, ?, '', '{}', ?, ? WHERE NOT EXISTS (SELECT 1 FROM sessions existing WHERE existing.id = ?)",
-                    params: [&input.session_id, &input.profile, &input.platform, &input.account_id, &input.system_prompt, &input.model, &input.provider, input.now_ms.copy(), input.now_ms.copy(), &input.session_id]
-                };
+                    params: [sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.platform.copy()), sql_text(input.account_id.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             } else {
                 statements[statements.length] = {
                     sql: "UPDATE sessions SET model = CASE WHEN ? = '' THEN model ELSE ? END, provider = CASE WHEN ? = '' THEN provider ELSE ? END, system_prompt = CASE WHEN ? = '' THEN system_prompt ELSE ? END, updated_at_ms = ? WHERE id = ?",
-                    params: [&input.model, &input.model, &input.provider, &input.provider, &input.system_prompt, &input.system_prompt, input.now_ms.copy(), &input.session_id]
-                };
+                    params: [sql_text(input.model.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.provider.copy()), sql_text(input.system_prompt.copy()), sql_text(input.system_prompt.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             }
+            let user_content = storage_admission_user_content(input.input_json.copy());
+            let encoded_content = messages::storage_message_encode_content(user_content);
             statements[statements.length] = {
                 sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, 'user', ?, '{}', ?, '', ? FROM messages WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                params: [&input.message_id, &input.session_id, messages::storage_message_encode_content(db_id, storage_admission_user_content(db_id, input.input_json.copy())), &input.message_run_id, input.now_ms.copy(), &input.session_id, &input.message_id, &input.session_id]
-            };
+                params: [sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(encoded_content), sql_text(input.message_run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.message_id.copy()), sql_text(input.session_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             statements[statements.length] = {
                 sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))",
-                params: [&input.run_id, &input.session_id, &input.parent_run_id, &input.input_json, &input.provider, &input.model, &input.script_hash, &input.idempotency_scope, &input.idempotency_key, input.now_ms.copy(), input.now_ms.copy(), input.now_ms.copy(), &input.run_id, &input.session_id, &input.session_id, &input.parent_run_id, &input.parent_run_id]
-            };
+                params: [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             if input.parent_run_id.copy() != "" {
                 statements[statements.length] = {
                     sql: "INSERT INTO child_run_links (parent_run_id, child_run_id, ordinal, relation, state, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), -1) + 1, 'subagent', 'pending', ? FROM child_run_links WHERE parent_run_id = ?",
-                    params: [&input.parent_run_id, &input.run_id, input.now_ms.copy(), &input.parent_run_id]
-                };
+                    params: [sql_text(input.parent_run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.parent_run_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             }
             if input.idempotency_key.copy() != "" {
                 statements[statements.length] = {
                     sql: "INSERT OR IGNORE INTO idempotency_records (scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms) SELECT ?, ?, ?, 'run', ?, 'completed', '{\"run_id\":\"' || ? || '\",\"status\":\"running\"}', ?, ? WHERE ? <> ''",
-                    params: [&input.idempotency_scope, &input.idempotency_key, &input.request_hash, &input.run_id, &input.run_id, input.now_ms.copy(), input.expires_at_ms.copy(), &input.idempotency_key]
-                };
+                    params: [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_text(input.request_hash.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_int(input.expires_at_ms.copy()), sql_text(input.idempotency_key.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             }
             statements[statements.length] = {
                 sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1, ?, 'run.started', '{\"status\":\"running\",\"session_id\":\"' || ? || '\"}', ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?)",
-                params: [&input.run_id, &input.run_id, &input.event_id, &input.session_id, input.now_ms.copy(), &input.run_id]
-            };
+                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id.copy()), sql_text(input.session_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             statements[statements.length] = {
                 sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ?) ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
-                params: [&input.run_id, &input.run_id, &input.run_id, input.now_ms.copy(), &input.run_id]
-            };
+                params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             sqlite::transaction(&db_id, statements);
         }
     }
     let query_run_id: string = if replay => { existing_run_id } else => { input.run_id.copy() };
-    let run_result: map = sqlite::query(
-        &db_id,
-        "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1",
-        [&query_run_id],
-        { max_rows: 1, max_result_bytes: 65536 }
-    );
-    let run_result_copy: map = run_result.copy();
-    let run_rows: array = run_result["rows"];
+    let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(query_run_id.copy())], sql_limits(1, 65536));
+    let run_result_copy: map = sqlite_query_map(run_result);
+    let run_rows = run_result.rows;
     if failed == false {
         if run_rows.length == 0 && replay == false {
             failed = true;
@@ -141,27 +183,12 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             failure_message = "replayed idempotency key references a missing run";
         }
     }
-    let session_result: map = sqlite::query(
-        &db_id,
-        "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms FROM sessions WHERE id = ? LIMIT 1",
-        [&input.session_id],
-        { max_rows: 1, max_result_bytes: 65536 }
-    );
-    let message_result: map = sqlite::query(
-        &db_id,
-        "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
-        [&input.message_id, &input.session_id],
-        { max_rows: 1, max_result_bytes: 65536 }
-    );
+    let session_result = sqlite::query(&db_id, "SELECT id, profile, platform, account_id, chat_id, thread_id, user_id, generation, status, system_prompt, model, provider, toolset_hash, metadata_json, last_message_seq, created_at_ms, updated_at_ms FROM sessions WHERE id = ? LIMIT 1", [sql_text(input.session_id.copy())], sql_limits(1, 65536));
+    let message_result = sqlite::query(&db_id, "SELECT id, session_id, ordinal, role, content_json, name, tool_call_id, parent_message_id, token_estimate, compacted, metadata_json, run_id, finish_reason, created_at_ms FROM messages WHERE id = ? AND session_id = ? LIMIT 1", [sql_text(input.message_id.copy()), sql_text(input.session_id.copy())], sql_limits(1, 65536));
     let idempotency_result: map = if input.idempotency_key.copy() == "" => {
         { columns: [], rows: [] }
     } else => {
-        sqlite::query(
-            &db_id,
-            "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1",
-            [&input.idempotency_scope, &input.idempotency_key],
-            { max_rows: 1, max_result_bytes: 8192 }
-        )
+        sqlite::query(&db_id, "SELECT scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192))
     };
     let mut result = {
         ok: true,
@@ -212,18 +239,20 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
 
 // Prefer the compact envelope's `run_context.input` as the user message body
 // so conversation rows stay canonical; fall back to the raw payload.
-fn storage_admission_user_content(db_id: resource<sqlite.connection>, input_json: string) -> string {
-    let extracted: map = sqlite::query(
-        &db_id,
-        "SELECT CASE WHEN json_valid(?) AND json_extract(?, '$.run_context.input') IS NOT NULL THEN CAST(json_extract(?, '$.run_context.input') AS TEXT) ELSE ? END AS content",
-        [&input_json, &input_json, &input_json, &input_json],
-        { max_rows: 1, max_result_bytes: 1048576 }
-    );
-    let rows: array = extracted["rows"];
+fn storage_admission_user_content(input_json: string) -> string {
+    let db_id = sqlite::open({
+        path: ":memory:",
+        mode: "memory",
+        root: null,
+        limits: sql_limits(1, 1048576)
+    });
+    let extracted = sqlite::query(&db_id, "SELECT CASE WHEN json_valid(?) AND json_extract(?, '$.run_context.input') IS NOT NULL THEN CAST(json_extract(?, '$.run_context.input') AS TEXT) ELSE ? END AS content", [sql_text(input_json), sql_text(input_json), sql_text(input_json), sql_text(input_json)], sql_limits(1, 1048576));
+    let rows = extracted.rows;
     let mut content: string = input_json.copy();
     if rows.length > 0 {
-        let row: array = rows[0].copy();
-        content = row[0];
+        let row = rows[0];
+        content = row.cells[0].text_value;
     }
+    sqlite::close(db_id);
     content
 }

@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustscript_agent::CancellationReason;
 use rustscript_agent::{
     AgentConfig, AgentRunner, RunCancellation, RunDeliveryError, RunError, RunEventSink,
     RunnerPrepareFault, set_after_snapshot_hook,
 };
-use rustscript_vm::{CancellationReason, InvocationError, Value};
+use rustscript_vm::{InvocationError, Value};
 
 fn spawn_fixture() -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
@@ -136,13 +137,29 @@ fn runs_script_owned_http_call_to_completion() {
     let headers = response
         .get(&Value::string("headers"))
         .expect("headers field");
-    let Value::Map(headers) = headers else {
-        panic!("expected response headers map");
+    let Value::Array(headers) = headers else {
+        panic!("expected typed response header array");
     };
-    assert_eq!(
-        headers.get(&Value::string("x-agent")),
-        Some(&Value::string("fixture"))
-    );
+    let agent = headers.iter().find_map(|header| {
+        let Value::Map(header) = header else {
+            return None;
+        };
+        if header.get(&Value::string("name")) != Some(&Value::string("x-agent")) {
+            return None;
+        }
+        let Some(Value::Map(value)) = header.get(&Value::string("value")) else {
+            return None;
+        };
+        assert_eq!(
+            value.get(&Value::string("kind")),
+            Some(&Value::string("text"))
+        );
+        match value.get(&Value::string("text")) {
+            Some(text @ Value::String(_)) => Some(text.clone()),
+            _ => None,
+        }
+    });
+    assert_eq!(agent.as_ref(), Some(&Value::string("fixture")));
 }
 
 #[test]

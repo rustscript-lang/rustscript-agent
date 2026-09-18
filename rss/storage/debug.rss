@@ -1,5 +1,30 @@
 use json;
 use sqlite;
+
+fn sql_text(value: string) -> SqliteValue {
+    { kind: "text", int_value: null, float_value: null, text_value: value, blob_value: null }
+}
+
+fn sql_int(value: int) -> SqliteValue {
+    { kind: "int", int_value: value, float_value: null, text_value: null, blob_value: null }
+}
+
+fn sql_limits(max_rows: int, max_bytes: int) -> SqliteLimits {
+    {
+        max_connections: 16,
+        max_statements: 128,
+        max_rows: max_rows,
+        max_columns: 128,
+        max_result_bytes: max_bytes,
+        max_statement_bytes: 1048576,
+        max_parameters: 128,
+        max_parameter_bytes: 1048576,
+        max_pending_operations: 32,
+        max_transaction_ms: 5000,
+        busy_timeout_ms: 5000
+    }
+}
+
 use self::schema as schema;
 use self::sessions as sessions;
 use self::messages as messages;
@@ -86,18 +111,12 @@ struct CompactionIdInput {
 }
 
 
-fn storage_open_options(db_path: string, db_mode: string, busy_timeout_ms: int, max_rows: int, max_bytes: int) -> StorageOpenOptions {
+fn storage_open_options(db_path: string, db_mode: string, busy_timeout_ms: int, max_rows: int, max_bytes: int) -> SqliteOpenOptions {
     {
         path: db_path,
         mode: db_mode,
-        busy_timeout_ms: busy_timeout_ms,
-        max_connections: 1,
-        limits: {
-            max_rows: schema::max_rows_limit(max_rows),
-            max_bytes: schema::max_bytes_limit(max_bytes),
-            max_statements: 64,
-            max_transaction_ms: 5000
-        }
+        root: null,
+        limits: sql_limits(schema::max_rows_limit(max_rows), schema::max_bytes_limit(max_bytes))
     }
 }
 
@@ -105,24 +124,23 @@ fn storage_apply_migrations(db_id: resource<sqlite.connection>, now_ms: int) {
     sqlite::execute(&db_id, schema::schema_migrations_table_sql(), []);
     let mut migration_index = 0;
     while migration_index < schema::schema_migration_count() {
-        let mut statements = [];
+        let mut statements: array<SqliteStatement> = [];
         let mut statement_index = 0;
         while statement_index < schema::schema_migration_statement_count(migration_index) {
             statements[statements.length] = {
                 sql: schema::schema_migration_statement(migration_index, statement_index),
-                params: []
-            };
+                params: [],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
             statement_index += 1;
         }
         statements[statements.length] = {
             sql: schema::schema_migration_record_sql(),
-            params: [
-                schema::schema_migration_version(migration_index),
-                schema::schema_migration_name(migration_index),
-                schema::schema_migration_checksum(migration_index),
-                now_ms
-            ]
-        };
+            params: [sql_int(schema::schema_migration_version(migration_index)), sql_text(schema::schema_migration_name(migration_index)), sql_text(schema::schema_migration_checksum(migration_index)), sql_int(now_ms)],
+                        query: false,
+                        limits: sql_limits(1000, 4194304)
+                        };
         sqlite::transaction(&db_id, statements);
         migration_index += 1;
     }
@@ -143,11 +161,20 @@ fn storage_ok(request_id: string, op: string, data: map, rows_affected: int, tru
     }
 }
 
-fn storage_raw_ok(request_id: string, op: string, raw_result: map) -> StorageResult {
-    let rows_affected: int = sqlite::rows_affected(raw_result);
-    let truncated: bool = sqlite::truncated(raw_result);
-    let next_cursor: int = sqlite::next_cursor(raw_result);
-    storage_ok(request_id, op, raw_result, rows_affected, truncated, next_cursor)
+fn storage_query_data(result: SqliteQueryResult) -> map {
+    {
+        columns: result.columns,
+        rows: result.rows,
+        truncated: result.truncated
+    }
+}
+
+fn storage_raw_ok(request_id: string, op: string, raw_result: SqliteQueryResult) -> StorageResult {
+    storage_ok(request_id, op, storage_query_data(raw_result), 0, raw_result.truncated, 0)
+}
+
+fn storage_execute_ok(request_id: string, op: string, raw_result: SqliteExecuteResult) -> StorageResult {
+    storage_ok(request_id, op, { rows_affected: raw_result.rows_affected, last_insert_rowid: raw_result.last_insert_rowid }, raw_result.rows_affected, false, 0)
 }
 
 fn storage_host_contract() -> string {
@@ -166,6 +193,20 @@ fn storage_error(request_id: string, op: string, code: string, message: string) 
         truncated: false,
         next_cursor: 0
     }
+}
+
+fn storage_unwrap(request_id: string, op: string, wrapped: map) -> StorageResult {
+    let ok_flag: bool = wrapped["ok"];
+    let mut result = storage_error(request_id, op, "unwrap_missing", "unwrap result missing");
+    if ok_flag == true {
+        let raw: map = wrapped["result"];
+        result = storage_ok(request_id, op, raw, 0, false, 0);
+    } else {
+        let code: string = wrapped["code"];
+        let message: string = wrapped["message"];
+        result = storage_error(request_id, op, code, message);
+    }
+    result
 }
 
 fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand) -> StorageResult {
@@ -201,7 +242,7 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     } else => { null };
 
     if command.op == "message.append" => {
-        result = storage_raw_ok(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
+        result = storage_unwrap(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
         result
     } else => { null };
 
@@ -218,7 +259,7 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     } else => { null };
 
     if command.op == "message.compact" => {
-        result = storage_raw_ok(request_id, op, messages::storage_message_mark_compacted(db_id, command.payload_json));
+        result = storage_execute_ok(request_id, op, messages::storage_message_mark_compacted(db_id, command.payload_json));
         result
     } else => { null };
 

@@ -8,10 +8,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustscript_vm::{
-    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiBuilder, HostApiCatalog,
-    HostFunctionRegistry, HostFunctionSchema, HostParamSchema, HostTypeSchema, Program,
-    SourceFlavor, Value, Vm, VmResult, VmStatus, catalog_import_schemas,
-    compile_source_at_path_with_flavor_and_options, standard_host_catalog,
+    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiCatalog, HostFunctionDescriptor,
+    HostFunctionRegistry, HostFunctionSchema, HostModuleDescriptor, HostParamSchema,
+    HostTypeSchema, Program, SourceFlavor, Value, Vm, VmResult, VmStatus,
+    compile_source_at_path_with_flavor_and_options,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -205,7 +205,7 @@ impl OAuthFixtureHost {
         let mut registry = HostFunctionRegistry::restricted();
         register_host_functions(&mut registry, catalog.as_ref())
             .map_err(|error| error.to_string())?;
-        let mut vm = Vm::try_new_shared(program).map_err(|error| error.to_string())?;
+        let mut vm = Vm::new_shared(program);
         registry
             .bind_vm_cached(&mut vm)
             .map_err(|error| error.to_string())?;
@@ -335,144 +335,145 @@ impl Drop for OAuthFixtureHost {
 pub fn oauth_fixture_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     Arc::clone(CATALOG.get_or_init(|| {
-        let standard = standard_host_catalog();
-        let mut builder = HostApiBuilder::new();
-        for resource in standard.resources() {
-            builder.resource(resource.clone());
-        }
-        for function in standard.functions() {
-            builder.function(function.clone());
-        }
-        let response = HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown));
-        let unknown = HostTypeSchema::Unknown;
-        builder.function(HostFunctionSchema::with_return(
-            OAUTH_PKCE_BEGIN,
-            vec![
-                HostParamSchema::value("policy_handle", unknown.clone()),
-                HostParamSchema::value("public_intent", unknown.clone()),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            OAUTH_CALLBACK_WAIT,
-            vec![HostParamSchema::value("callback_handle", unknown.clone())],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            OAUTH_TRANSPORT,
-            vec![
-                HostParamSchema::value("request", unknown.clone()),
-                HostParamSchema::value("credential_use", unknown.clone()),
-            ],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            OAUTH_WAIT_MS,
-            vec![HostParamSchema::value("millis", HostTypeSchema::Int)],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            OAUTH_TERMINAL,
-            vec![HostParamSchema::value("handle", unknown.clone())],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            AUTH_LOAD_METADATA,
-            vec![HostParamSchema::value("request", unknown.clone())],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            AUTH_SAVE_IF_GENERATION,
-            vec![HostParamSchema::value("request", unknown.clone())],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            AUTH_REFRESH_HANDLE,
-            vec![HostParamSchema::value("request", unknown.clone())],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            AUTH_ACCESS_HANDLE,
-            vec![HostParamSchema::value("request", unknown.clone())],
-            response.clone(),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            AUTH_CHECK_HANDLE,
-            vec![
-                HostParamSchema::value("handle", unknown.clone()),
-                HostParamSchema::value("intent", unknown),
-            ],
-            response,
-        ));
-        Arc::new(builder.build().expect("oauth fixture catalog must build"))
+        crate::runtime::host_compose::compose_with_standard(&[oauth_fixture_module()])
     }))
+}
+
+const OAUTH_FIXTURE_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
+    oauth_pkce_begin_descriptor,
+    oauth_callback_wait_descriptor,
+    oauth_transport_descriptor,
+    oauth_wait_ms_descriptor,
+    oauth_terminal_descriptor,
+    auth_load_metadata_descriptor,
+    auth_save_if_generation_descriptor,
+    auth_refresh_handle_descriptor,
+    auth_access_handle_descriptor,
+    auth_check_handle_descriptor,
+];
+
+pub fn oauth_fixture_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "oauth_fixture",
+        functions: OAUTH_FIXTURE_FUNCTIONS,
+        resources: &[],
+    }
+}
+
+fn fixture_map() -> HostTypeSchema {
+    HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))
+}
+
+fn stack_desc(
+    name: &'static str,
+    params: Vec<HostParamSchema>,
+    ret: HostTypeSchema,
+    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+) -> HostFunctionDescriptor {
+    crate::runtime::host_compose::static_stack_descriptor(
+        HostFunctionSchema::with_return(name, params, ret),
+        adapter,
+    )
+}
+
+fn oauth_pkce_begin_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        OAUTH_PKCE_BEGIN,
+        vec![
+            HostParamSchema::value("policy_handle", HostTypeSchema::Unknown),
+            HostParamSchema::value("public_intent", HostTypeSchema::Unknown),
+        ],
+        fixture_map(),
+        pkce_begin_adapter,
+    )
+}
+fn oauth_callback_wait_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        OAUTH_CALLBACK_WAIT,
+        vec![HostParamSchema::value(
+            "callback_handle",
+            HostTypeSchema::Unknown,
+        )],
+        fixture_map(),
+        callback_wait_adapter,
+    )
+}
+fn oauth_transport_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        OAUTH_TRANSPORT,
+        vec![
+            HostParamSchema::value("request", HostTypeSchema::Unknown),
+            HostParamSchema::value("credential_use", HostTypeSchema::Unknown),
+        ],
+        fixture_map(),
+        transport_adapter,
+    )
+}
+fn oauth_wait_ms_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        OAUTH_WAIT_MS,
+        vec![HostParamSchema::value("millis", HostTypeSchema::Int)],
+        fixture_map(),
+        wait_ms_adapter,
+    )
+}
+fn oauth_terminal_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        OAUTH_TERMINAL,
+        vec![HostParamSchema::value("handle", HostTypeSchema::Unknown)],
+        fixture_map(),
+        terminal_adapter,
+    )
+}
+fn auth_load_metadata_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        AUTH_LOAD_METADATA,
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        fixture_map(),
+        load_metadata_adapter,
+    )
+}
+fn auth_save_if_generation_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        AUTH_SAVE_IF_GENERATION,
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        fixture_map(),
+        save_if_generation_adapter,
+    )
+}
+fn auth_refresh_handle_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        AUTH_REFRESH_HANDLE,
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        fixture_map(),
+        refresh_handle_adapter,
+    )
+}
+fn auth_access_handle_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        AUTH_ACCESS_HANDLE,
+        vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
+        fixture_map(),
+        access_handle_adapter,
+    )
+}
+fn auth_check_handle_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        AUTH_CHECK_HANDLE,
+        vec![
+            HostParamSchema::value("handle", HostTypeSchema::Unknown),
+            HostParamSchema::value("intent", HostTypeSchema::Unknown),
+        ],
+        fixture_map(),
+        check_handle_adapter,
+    )
 }
 
 fn register_host_functions(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    register_named(registry, catalog, OAUTH_PKCE_BEGIN, 2, pkce_begin_adapter)?;
-    register_named(
-        registry,
-        catalog,
-        OAUTH_CALLBACK_WAIT,
-        1,
-        callback_wait_adapter,
-    )?;
-    register_named(registry, catalog, OAUTH_TRANSPORT, 2, transport_adapter)?;
-    register_named(registry, catalog, OAUTH_WAIT_MS, 1, wait_ms_adapter)?;
-    register_named(registry, catalog, OAUTH_TERMINAL, 1, terminal_adapter)?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_LOAD_METADATA,
-        1,
-        load_metadata_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_SAVE_IF_GENERATION,
-        1,
-        save_if_generation_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_REFRESH_HANDLE,
-        1,
-        refresh_handle_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_ACCESS_HANDLE,
-        1,
-        access_handle_adapter,
-    )?;
-    register_named(
-        registry,
-        catalog,
-        AUTH_CHECK_HANDLE,
-        2,
-        check_handle_adapter,
-    )?;
-    Ok(())
-}
-
-fn register_named(
-    registry: &mut HostFunctionRegistry,
-    catalog: &HostApiCatalog,
-    name: &'static str,
-    arity: u8,
-    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-) -> VmResult<()> {
-    for schema in catalog_import_schemas(catalog, name) {
-        registry.register_exact_static(name, arity, schema, adapter)?;
-    }
-    registry.register_static(name, arity, adapter);
-    registry.allow_builtin(name)?;
+    oauth_fixture_module().install_from_catalog(registry, catalog)?;
     Ok(())
 }
 
@@ -1452,9 +1453,10 @@ fn drive_root_frame(vm: &mut Vm) -> Result<(), String> {
     loop {
         match vm.run() {
             Ok(VmStatus::Halted) => return Ok(()),
-            Ok(VmStatus::Waiting(_)) => vm
-                .wait_for_host_op_blocking_with_cancel(|| false)
-                .map_err(|error| error.to_string())?,
+            Ok(VmStatus::Waiting(_)) => {
+                crate::runtime::host_wait::wait_for_host_op_blocking_with_cancel(vm, || false)
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(VmStatus::Yielded) => {
                 return Err("oauth fixture root frame yielded unexpectedly".to_string());
             }

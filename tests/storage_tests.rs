@@ -22,6 +22,7 @@ const STORAGE_FILES: &[&str] = &[
     "load.rss",
     "existence.rss",
     "gateway.rss",
+    "import-test.rss",
 ];
 
 fn storage_root() -> PathBuf {
@@ -89,6 +90,68 @@ fn storage_runner(root: &std::path::Path) -> AgentRunner {
     .expect("production storage entrypoint should compile")
 }
 
+#[test]
+fn sqlite_query_named_result_fields_compile() {
+    let source = r#"
+use sqlite;
+pub fn encode(db_id: resource<sqlite.connection>, content: string) -> string {
+    let classified = sqlite::query(&db_id, "SELECT 1 AS n", [], {});
+    let _n = classified.rows.copy().length;
+    content
+}
+fn helper(db_id: resource<sqlite.connection>) -> int {
+    let first = encode(db_id, "a");
+    let second = encode(db_id, "b");
+    first.length + second.length
+}
+pub fn run(ctx: int) -> int {
+    let db = sqlite::open({ path: ":memory:", mode: "memory" });
+    let result = sqlite::query(&db, "SELECT 1 AS n", [], {});
+    let n = result.rows.copy().length;
+    let cell = result.rows.copy()[0].cells.copy()[0];
+    let _value = cell.int_value;
+    let _via_helper = helper(db);
+    sqlite::close(db);
+    ctx
+}
+"#;
+    AgentRunner::from_source(source, AgentConfig::default())
+        .unwrap_or_else(|error| panic!("minimal sqlite query should compile: {error}"));
+}
+
+#[test]
+fn sqlite_query_named_result_fields_compile_across_modules() {
+    let dir = temporary_root("sqlite-module-resource");
+    std::fs::write(
+        dir.join("helper.rss"),
+        r#"
+use sqlite;
+pub fn q(db_id: resource<sqlite.connection>) -> int {
+    let result = sqlite::query(&db_id, "SELECT 1 AS n", [], {});
+    result.rows.copy().length
+}
+"#,
+    )
+    .expect("write helper");
+    std::fs::write(
+        dir.join("main.rss"),
+        r#"
+use sqlite;
+use helper;
+pub fn run(ctx: int) -> int {
+    let db = sqlite::open({ path: ":memory:", mode: "memory" });
+    let n = helper::q(db);
+    sqlite::close(db);
+    ctx
+}
+"#,
+    )
+    .expect("write main");
+    AgentRunner::from_file(dir.join("main.rss"), AgentConfig::default()).unwrap_or_else(|error| {
+        panic!("cross-module sqlite resource should compile: {error}");
+    });
+}
+
 fn run_storage(
     runner: &AgentRunner,
     db_name: &str,
@@ -117,13 +180,25 @@ fn vm_value_to_json(value: &Value) -> JsonValue {
         Value::Bool(value) => json!(value),
         Value::String(value) => JsonValue::String(value.to_string()),
         Value::Bytes(value) => JsonValue::String(String::from_utf8_lossy(value).into_owned()),
-        Value::Array(values) => JsonValue::Array(values.iter().map(vm_value_to_json).collect()),
-        Value::Map(entries) => JsonValue::Object(
-            entries
+        Value::Array(values) => JsonValue::Array(
+            values
                 .iter()
-                .map(|(key, value)| (vm_map_key_to_string(key), vm_value_to_json(value)))
+                .map(|value| {
+                    let encoded = vm_value_to_json(value);
+                    rustscript_agent::sqlite_storage_rows::sqlite_storage_row(&encoded)
+                        .map(JsonValue::Array)
+                        .unwrap_or(encoded)
+                })
                 .collect(),
         ),
+        Value::Map(entries) => {
+            let object: serde_json::Map<String, JsonValue> = entries
+                .iter()
+                .map(|(key, value)| (vm_map_key_to_string(key), vm_value_to_json(value)))
+                .collect();
+            let encoded = JsonValue::Object(object);
+            rustscript_agent::sqlite_storage_rows::sqlite_storage_cell(&encoded).unwrap_or(encoded)
+        }
         Value::Callable(_) => JsonValue::String("<callable>".to_string()),
     }
 }
@@ -145,11 +220,7 @@ fn first_query_row(result: &JsonValue) -> JsonMap<String, JsonValue> {
         .get("columns")
         .and_then(JsonValue::as_array)
         .expect("SQLite query data should contain columns");
-    let row = data
-        .get("rows")
-        .and_then(JsonValue::as_array)
-        .and_then(|rows| rows.first())
-        .and_then(JsonValue::as_array)
+    let row = rustscript_agent::sqlite_storage_rows::sqlite_storage_first_row(&data)
         .expect("SQLite query data should contain one row");
     columns
         .iter()
@@ -172,14 +243,13 @@ fn query_rows(result: &JsonValue) -> Vec<JsonMap<String, JsonValue>> {
         .get("columns")
         .and_then(JsonValue::as_array)
         .expect("SQLite query data should contain columns");
-    data.get("rows")
-        .and_then(JsonValue::as_array)
+    rustscript_agent::sqlite_storage_rows::sqlite_storage_rows(&data)
         .expect("SQLite query data should contain rows")
-        .iter()
+        .into_iter()
         .map(|row| {
             columns
                 .iter()
-                .zip(row.as_array().expect("SQLite row should be an array"))
+                .zip(row.iter())
                 .map(|(column, value)| {
                     (
                         column
@@ -280,17 +350,35 @@ pub fn run(input: map) -> map {{
     let db = sqlite::open({{
         path: input["db_name"],
         mode: "read_write_create",
+        root: null,
         limits: {{
-            busy_timeout_ms: 1000,
             max_connections: 1,
-            max_rows: 64,
-            max_result_bytes: 65536,
             max_statements: 64,
-            max_transaction_ms: 5000
+            max_rows: 64,
+            max_columns: 128,
+            max_result_bytes: 65536,
+            max_statement_bytes: 1048576,
+            max_parameters: 128,
+            max_parameter_bytes: 1048576,
+            max_pending_operations: 32,
+            max_transaction_ms: 5000,
+            busy_timeout_ms: 1000
         }}
     }});
 {body}
-    let result: map = sqlite::query(&db, "{final_sql}", [], {{ max_rows: 64, max_result_bytes: 65536 }});
+    let result: SqliteQueryResult = sqlite::query(&db, "{final_sql}", [], {{
+        max_connections: 1,
+        max_statements: 64,
+        max_rows: 64,
+        max_columns: 128,
+        max_result_bytes: 65536,
+        max_statement_bytes: 1048576,
+        max_parameters: 128,
+        max_parameter_bytes: 1048576,
+        max_pending_operations: 32,
+        max_transaction_ms: 5000,
+        busy_timeout_ms: 1000
+    }});
     sqlite::close(db);
     result
 }}
@@ -378,13 +466,19 @@ pub fn run(input: map) -> bool {{
     let db = sqlite::open({{
         path: input["db_name"],
         mode: "read_write_create",
+        root: null,
         limits: {{
-            busy_timeout_ms: 1000,
             max_connections: 1,
-            max_rows: 64,
-            max_result_bytes: 65536,
             max_statements: 64,
-            max_transaction_ms: 5000
+            max_rows: 64,
+            max_columns: 128,
+            max_result_bytes: 65536,
+            max_statement_bytes: 1048576,
+            max_parameters: 128,
+            max_parameter_bytes: 1048576,
+            max_pending_operations: 32,
+            max_transaction_ms: 5000,
+            busy_timeout_ms: 1000
         }}
     }});
 {body}
@@ -421,27 +515,39 @@ pub fn run(input: map) -> bool {
     let db = sqlite::open({
         path: input["db_name"],
         mode: "read_write_create",
+        root: null,
         limits: {
-            busy_timeout_ms: 1000,
             max_connections: 1,
-            max_rows: 64,
-            max_result_bytes: 65536,
             max_statements: 64,
-            max_transaction_ms: 5000
+            max_rows: 64,
+            max_columns: 128,
+            max_result_bytes: 65536,
+            max_statement_bytes: 1048576,
+            max_parameters: 128,
+            max_parameter_bytes: 1048576,
+            max_pending_operations: 32,
+            max_transaction_ms: 5000,
+            busy_timeout_ms: 1000
         }
     });
     sqlite::execute(&db, schema::schema_migrations_table_sql(), []);
-    let mut statements = [];
-    let mut statement_index = 0;
-    while statement_index < 11 {
-        statements[statements.length] = { sql: schema::schema_migration_statement(0, statement_index), params: [] };
-        statement_index += 1;
-    }
-    statements[statements.length] = {
-        sql: schema::schema_migration_record_sql(),
-        params: [1, schema::schema_migration_name(0), schema::schema_migration_checksum(0), 1]
-    };
-    sqlite::transaction(&db, statements);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 0), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 1), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 2), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 3), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 4), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 5), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 6), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 7), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 8), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 9), []);
+    sqlite::execute(&db, schema::schema_migration_statement(0, 10), []);
+    sqlite::execute(&db, schema::schema_migration_record_sql(), [
+        { kind: "int", int_value: 1, float_value: null, text_value: null, blob_value: null },
+        { kind: "text", int_value: null, float_value: null, text_value: schema::schema_migration_name(0), blob_value: null },
+        { kind: "text", int_value: null, float_value: null, text_value: schema::schema_migration_checksum(0), blob_value: null },
+        { kind: "int", int_value: 1, float_value: null, text_value: null, blob_value: null }
+    ]);
     sqlite::close(db);
     true
 }
@@ -494,8 +600,8 @@ fn storage_rss_contract_files_are_present_and_use_generic_capabilities() {
         );
         let source = fs::read_to_string(&path).expect("storage module should be readable");
         assert!(
-            source.contains("sqlite::") || *file == "schema.rss",
-            "{} must use the generic sqlite capability or be schema-only",
+            source.contains("sqlite::") || *file == "schema.rss" || *file == "import-test.rss",
+            "{} must use the generic sqlite capability, be schema-only, or be the import fixture",
             path.display()
         );
         assert!(

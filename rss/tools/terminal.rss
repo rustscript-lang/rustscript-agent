@@ -497,7 +497,7 @@ fn execute(context: map) -> map {
         let error: map = types::map_map(control, "error");
         outcome = fail(types::map_string(error, "code", "cancelled"), types::map_string(error, "message", "process was cancelled"), unpublished());
     } else {
-        let limits: map = {
+        let limits: AgentProcessLimits = {
             timeout_ms: timeout_ms,
             stdout_limit: stream_limit,
             stderr_limit: stream_limit,
