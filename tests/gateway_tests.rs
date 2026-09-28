@@ -529,7 +529,8 @@ fn spawn_holding_run_env(
         r#"
         use http;
         pub fn run(input: map) -> string {{
-            http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+            let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+            let response = http::client::request(request);
             "done";
         }}
         "#
@@ -923,7 +924,9 @@ async fn typed_capability_failure_marks_the_run_failed() {
         r#"
         use http;
         pub fn run(input: map) -> map {
-            http::client::request({ method: "GET", url: "http://127.0.0.1:1/" });
+            let request = http::request::new("GET", "http://127.0.0.1:1/");
+            let response = http::client::request(request);
+            { status: http::response::status(&response) };
         }
         "#,
     )
@@ -2002,7 +2005,9 @@ async fn completed_terminal_with_message_is_retried_after_storage_recovers() {
             r#"
             use http;
             pub fn run(input: map) -> map {{
-                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
+                {{ status: http::response::status(&response), body: http::response::body(&response) }};
             }}
             "#
         ),
@@ -4392,7 +4397,8 @@ async fn concurrent_stops_commit_exactly_one_terminal() {
             r#"
             use http;
             pub fn run(input: map) -> string {{
-                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
                 "done";
             }}
             "#
@@ -4560,7 +4566,8 @@ async fn sse_subscriber_lag_emits_typed_error_and_replay_recovers() {
             use http;
             use stream;
             pub fn run(input: map) -> string {{
-                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
                 stream::emit({{"type": "model.delta", "delta": "a"}});
                 stream::emit({{"type": "model.delta", "delta": "b"}});
                 stream::emit({{"type": "model.delta", "delta": "c"}});
@@ -4680,7 +4687,8 @@ async fn storage_worker_shutdown_mid_run_parks_terminal_and_restart_recovers() {
             use stream;
             pub fn run(input: map) -> string {{
                 stream::emit({{"type": "model.delta", "delta": "e1"}});
-                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
                 stream::emit({{"type": "model.delta", "delta": "e2"}});
                 "done";
             }}
@@ -5237,7 +5245,8 @@ async fn combined_guards_gauge_lag_disconnect_and_replay_agree_exactly() {
             use http;
             use stream;
             pub fn run(input: map) -> string {{
-                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
                 stream::emit({{"type": "model.delta", "delta": "a"}});
                 stream::emit({{"type": "model.delta", "delta": "b"}});
                 stream::emit({{"type": "model.delta", "delta": "c"}});

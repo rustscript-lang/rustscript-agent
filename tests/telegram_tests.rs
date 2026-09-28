@@ -1305,7 +1305,8 @@ fn holding_config_and_source(port: u16) -> (AgentGatewayConfig, String) {
         use stream;
         pub fn run(input: map) -> string {{
             stream::emit({{"type": "model.delta", "delta": "before"}});
-            http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+            let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+            let response = http::client::request(request);
             "done";
         }}
         "#
@@ -1325,7 +1326,8 @@ fn park_on_second_source(port: u16) -> String {
             let text: string = input["input"];
             stream::emit({{"type": "model.delta", "delta": text}});
             if text == "second" {{
-                http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
             }}
             "ok";
         }}

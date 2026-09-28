@@ -43,8 +43,26 @@ pub const RESTRICTED_STANDARD_BUILTINS: &[&str] = &[
     "sqlite::query",
     "sqlite::transaction",
     "sqlite::close",
+    "http::request::new",
+    "http::request::set_header",
+    "http::request::set_body_text",
+    "http::request::set_body_bytes",
     "http::client::request",
     "http::client::sse",
+    "http::response::status",
+    "http::response::url",
+    "http::response::header_values",
+    "http::response::header_names",
+    "http::response::body",
+    "http::headers::values",
+    "http::headers::names",
+    "http::sse_summary::outcome",
+    "http::sse_summary::status",
+    "http::sse_summary::url",
+    "http::sse_summary::header_values",
+    "http::sse_summary::header_names",
+    "http::sse_summary::items",
+    "http::sse_summary::bytes_received",
 ];
 
 pub fn static_stack_descriptor(
@@ -202,5 +220,42 @@ mod tests {
         assert!(names.contains(&"http::client::request"));
         assert!(names.contains(&"sqlite::open"));
         assert!(names.contains(&"agent::provider_call"));
+    }
+
+    #[test]
+    fn restricted_http_allowlist_excludes_ambient_core_builtins() {
+        let http: Vec<_> = RESTRICTED_STANDARD_BUILTINS
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with("http::"))
+            .collect();
+        assert_eq!(
+            http,
+            [
+                "http::request::new",
+                "http::request::set_header",
+                "http::request::set_body_text",
+                "http::request::set_body_bytes",
+                "http::client::request",
+                "http::client::sse",
+                "http::response::status",
+                "http::response::url",
+                "http::response::header_values",
+                "http::response::header_names",
+                "http::response::body",
+                "http::headers::values",
+                "http::headers::names",
+                "http::sse_summary::outcome",
+                "http::sse_summary::status",
+                "http::sse_summary::url",
+                "http::sse_summary::header_values",
+                "http::sse_summary::header_names",
+                "http::sse_summary::items",
+                "http::sse_summary::bytes_received",
+            ]
+        );
+        for denied in ["io::open", "io::popen", "runtime::exit", "runtime::sleep"] {
+            assert!(!RESTRICTED_STANDARD_BUILTINS.contains(&denied));
+        }
     }
 }

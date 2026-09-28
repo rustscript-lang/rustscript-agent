@@ -716,7 +716,8 @@ fn holding_source(port: u16) -> String {
         r#"
         use http;
         pub fn run(input: map) -> string {{
-            http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+            let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+            let response = http::client::request(request);
             "done";
         }}
         "#
@@ -1025,7 +1026,9 @@ async fn runs_terminal_by_status_and_run_duration_histogram() {
         r#"
         use http;
         pub fn run(input: map) -> map {
-            http::client::request({ method: "GET", url: "http://127.0.0.1:1/" });
+            let request = http::request::new("GET", "http://127.0.0.1:1/");
+            let response = http::client::request(request);
+            { status: http::response::status(&response) };
         }
         "#,
     )

@@ -111,10 +111,13 @@ fn runs_script_owned_http_call_to_completion() {
         r#"
         use http;
         pub fn run(input: map) -> map {{
-            http::client::request({{
-                method: "GET",
-                url: "http://127.0.0.1:{port}/",
-            }});
+            let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+            let response = http::client::request(request);
+            {{
+                status: http::response::status(&response),
+                body: http::response::body(&response),
+                agent_headers: http::response::header_values(&response, "x-agent")
+            }};
         }}
         "#
     );
@@ -134,32 +137,8 @@ fn runs_script_owned_http_call_to_completion() {
     assert_eq!(status, &Value::Int(200));
     let body = response.get(&Value::string("body")).expect("body field");
     assert_eq!(body, &Value::bytes(b"agent-ok"));
-    let headers = response
-        .get(&Value::string("headers"))
-        .expect("headers field");
-    let Value::Array(headers) = headers else {
-        panic!("expected typed response header array");
-    };
-    let agent = headers.iter().find_map(|header| {
-        let Value::Map(header) = header else {
-            return None;
-        };
-        if header.get(&Value::string("name")) != Some(&Value::string("x-agent")) {
-            return None;
-        }
-        let Some(Value::Map(value)) = header.get(&Value::string("value")) else {
-            return None;
-        };
-        assert_eq!(
-            value.get(&Value::string("kind")),
-            Some(&Value::string("text"))
-        );
-        match value.get(&Value::string("text")) {
-            Some(text @ Value::String(_)) => Some(text.clone()),
-            _ => None,
-        }
-    });
-    assert_eq!(agent.as_ref(), Some(&Value::string("fixture")));
+    let headers = response.get(&Value::string("agent_headers"));
+    assert_eq!(headers, Some(&Value::array(vec![Value::string("fixture")])));
 }
 
 #[test]
@@ -168,7 +147,9 @@ fn default_policy_rejects_http_destination_without_string_parsing() {
         r#"
         use http;
         pub fn run(input: map) -> map {
-            http::client::request({ method: "GET", url: "http://127.0.0.1:1/" });
+            let request = http::request::new("GET", "http://127.0.0.1:1/");
+            let response = http::client::request(request);
+            { status: http::response::status(&response) };
         }
         "#,
         AgentConfig::default(),
