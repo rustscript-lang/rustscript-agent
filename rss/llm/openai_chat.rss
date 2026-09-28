@@ -152,20 +152,17 @@ fn chat_send_complete(
         chat_splice_user_parts(body_text, types::request_array(request, "messages")),
         types::request_array(request, "tools")
     );
-    let response = http::client::request({
-        method: "POST",
-        url: url,
-        headers: [
-            { name: "content-type", value: "application/json" },
-            { name: "authorization", value: "Bearer " + api_key }
-        ],
-        body: { kind: "text", text: body }
-    });
-    let status: int = response.status.copy();
+    let http_request: resource<http.request> = http::request::new("POST", url);
+    http::request::set_header(&http_request, "content-type", "application/json");
+    http::request::set_header(&http_request, "authorization", "Bearer " + api_key);
+    http::request::set_body_text(&http_request, body);
+    let response: resource<http.response> = http::client::request(http_request);
+    let status: int = http::response::status(&response);
+    let body_bytes: bytes = http::response::body(&response);
     if status >= 200 && status < 300 => {
-        chat_parse_response(response, status, provider)
+        chat_parse_response(body_bytes, status, provider)
     } else => {
-        chat_parse_error(response, status)
+        chat_parse_error(body_bytes, status)
     }
 }
 
@@ -463,8 +460,7 @@ fn chat_splice_user_parts(body: string, messages: array) -> string {
 // Response parsing
 // ---------------------------------------------------------------------------
 
-fn chat_parse_response(response: HttpResponse, status: int, provider: string) -> map {
-    let body_bytes: bytes = response.body;
+fn chat_parse_response(body_bytes: bytes, status: int, provider: string) -> map {
     let body_text: string = bytes::to_utf8(body_bytes);
     let body: map = json::decode(body_text);
     chat_parse_response_body(body, status, provider)
@@ -580,8 +576,7 @@ fn chat_parse_tool_calls(tool_calls: array) -> array {
     calls
 }
 
-fn chat_parse_error(response: HttpResponse, status: int) -> map {
-    let body_bytes: bytes = response.body;
+fn chat_parse_error(body_bytes: bytes, status: int) -> map {
     let body_text: string = bytes::to_utf8(body_bytes);
     let payload: map = chat_error_payload(body_text);
     let mut error_type: string = "api_error";
@@ -640,17 +635,16 @@ fn chat_error_payload(body_text: string) -> map {
 // restricted registry (see `src/runtime/rss_runner.rs`).
 //
 // The transport validates status and Content-Type itself: a non-2xx SSE
-// response fails the invocation as a typed host error, so the summary map
+// response fails the invocation as a typed host error, so the summary resource
 // is not inspected for transport-level failures.
 //
-// Fail-closed contract (A3 review P2): the stream summary map carries
-// `outcome` — `"stopped"` when the callback returned `{action: "stop"}`
-// (the `[DONE]` terminator path) and `"eof"` when the server closed the
-// body without a stop (the callback sees the transport terminal
-// `kind: "end"` item and continues). A legal `[DONE]` stream must succeed,
-// so the shared `done` accumulator is set exactly where the callback
-// stops; EOF without `[DONE]` — partial text included — must fail closed
-// as a typed provider error instead of surfacing the partial accumulation
+// Fail-closed contract (A3 review P2): the stream summary carries
+// `outcome` — `"stopped"` when the callback returns `false` (the `[DONE]`
+// terminator path) and `"eof"` when the server closes without a stop.
+// A legal `[DONE]` stream must succeed, so the shared `done` accumulator
+// is set exactly where the callback stops; EOF without `[DONE]` — partial
+// text included — must fail closed as a typed provider error instead of
+// surfacing the partial accumulation
 // as `ok`. Cancellation never reaches this check: it fails the invocation
 // as a typed `Cancelled` error before the summary exists.
 
@@ -694,19 +688,14 @@ fn chat_send_stream(
     let mut total_tokens: int = 0;
     let mut tools: array = [];
     let mut done = false;
-    let stream_result = http::client::sse({
-        method: "POST",
-        url: url,
-        headers: [
-            { name: "content-type", value: "application/json" },
-            { name: "authorization", value: "Bearer " + api_key }
-        ],
-        body: { kind: "text", text: body }
-    }, |item| if item.kind == "event" => {
-        let data: string = item.data.copy();
+    let http_request: resource<http.request> = http::request::new("POST", url);
+    http::request::set_header(&http_request, "content-type", "application/json");
+    http::request::set_header(&http_request, "authorization", "Bearer " + api_key);
+    http::request::set_body_text(&http_request, body);
+    let stream_result: resource<http.sse_summary> = http::client::sse(http_request, |event, data, id, retry_ms| {
         if data == "[DONE]" => {
             done = true;
-            { action: "stop" }
+            false
         } else => {
             let chunk: map = json::decode(data);
             let choices: array = types::request_array(chunk, "choices");
@@ -725,7 +714,7 @@ fn chat_send_stream(
                 if call_deltas.length > 0 {
                     tools = chat_stream_merge_tool_calls(tools, call_deltas);
                 }
-                { action: "continue" }
+                true
             } else => {
                 let usage: map = types::request_map(chunk, "usage");
                 if usage.has("total_tokens") {
@@ -733,14 +722,12 @@ fn chat_send_stream(
                     output_tokens = types::request_int(usage, "completion_tokens", 0);
                     total_tokens = types::request_int(usage, "total_tokens", 0);
                 }
-                { action: "continue" }
+                true
             }
         }
-    } else => {
-        { action: "continue" }
     });
-    let outcome: string = stream_result.outcome.copy();
-    let status: int = stream_result.status.copy();
+    let outcome: string = http::sse_summary::outcome(&stream_result);
+    let status: int = http::sse_summary::status(&stream_result);
     if done && outcome == "stopped" => {
         types::ok(types::response_new(
             text,
