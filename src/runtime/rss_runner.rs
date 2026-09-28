@@ -41,7 +41,7 @@ use super::cancellation::{CancellationReason, CancellationToken};
 use super::host_wait::wait_for_host_op_blocking_with_cancel;
 
 use super::agent_host::{
-    AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog,
+    AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog, agent_host_module,
     register_agent_host_functions,
 };
 use crate::capabilities::sha256_hex;
@@ -1032,6 +1032,14 @@ impl AgentRunner {
 /// bounded agent provider/tool host bridges. Ambient runtime input/emit
 /// builtins are intentionally absent from agent execution.
 fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmError> {
+    build_restricted_registry_with_builtins(
+        crate::runtime::host_compose::RESTRICTED_STANDARD_BUILTINS,
+    )
+}
+
+fn build_restricted_registry_with_builtins(
+    builtins: &[&str],
+) -> std::result::Result<HostFunctionRegistry, VmError> {
     let catalog = agent_host_catalog();
     // `restricted()` starts from `new()`, which already installs the standard
     // HTTP/SQLite snapshot. Re-installing those modules from the composed
@@ -1053,7 +1061,14 @@ fn build_restricted_registry() -> std::result::Result<HostFunctionRegistry, VmEr
         descriptor.install_from_catalog(&mut registry, catalog.as_ref())?;
     }
     register_agent_host_functions(&mut registry, catalog.as_ref())?;
-    for name in crate::runtime::host_compose::RESTRICTED_STANDARD_BUILTINS {
+    // Module installation grants every declared import by default. Reset that
+    // grant before applying the explicit builtin list, so omitted HTTP imports
+    // cannot remain authorized merely because the full module was installed.
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    for descriptor in agent_host_module().descriptors() {
+        registry.authorize_registered_builtin_import(&descriptor.schema.name);
+    }
+    for &name in builtins {
         if registry.contains_name(name) {
             registry.authorize_registered_builtin_import(name);
         } else {
@@ -1434,5 +1449,81 @@ mod restricted_registry_tests {
         build_restricted_registry().unwrap_or_else(|error| {
             panic!("registry install failed: {error}");
         });
+    }
+
+    #[test]
+    fn missing_real_http_import_fails_before_guest_execution() {
+        const MISSING: &str = "http::client::request";
+        let catalog = agent_host_catalog();
+        assert!(
+            catalog
+                .functions()
+                .iter()
+                .any(|function| function.name == MISSING),
+            "the omitted import must exist in the full compile catalog"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("listener address").port();
+        // Use the HTTP call shape published by the pinned Core catalog.
+        // Promote the omitted import to a resource accessor when Core ships it.
+        let source = format!(
+            r#"use http;
+            pub fn run(input: map) -> int {{
+                let response = http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
+                response.status;
+            }}"#
+        );
+        let (program, _) = compiled_source_program(&source)
+            .expect("real HTTP import compiles against the complete catalog");
+        // The pinned Core still publishes the named-struct HTTP contract;
+        // omit future resource names that its catalog has not published yet.
+        let available: Vec<_> = crate::runtime::host_compose::RESTRICTED_STANDARD_BUILTINS
+            .iter()
+            .copied()
+            .filter(|name| {
+                !name.starts_with("http::")
+                    || catalog
+                        .functions()
+                        .iter()
+                        .any(|function| function.name == *name)
+            })
+            .collect();
+        assert!(available.contains(&MISSING));
+        let allowed = build_restricted_registry_with_builtins(&available)
+            .expect("authorized registry from the full catalog");
+        let mut vm = Vm::try_new(program.clone()).expect("authorized VM");
+        allowed
+            .bind_vm_cached(&mut vm)
+            .expect("authorized HTTP import must bind");
+
+        let builtins: Vec<_> = available
+            .iter()
+            .copied()
+            .filter(|name| *name != MISSING)
+            .collect();
+        assert_eq!(builtins.len() + 1, available.len());
+        let denied = build_restricted_registry_with_builtins(&builtins)
+            .expect("limited registry from the same full catalog");
+        let mut vm = Vm::try_new(program).expect("limited VM");
+        let error = denied
+            .bind_vm_cached(&mut vm)
+            .expect_err("missing import must fail bind");
+        assert!(
+            error
+                .to_string()
+                .contains("capability profile does not allow host import"),
+            "expected authorization failure, got {error}"
+        );
+        assert!(
+            error.to_string().contains(MISSING),
+            "unexpected error: {error}"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "the guest must not make a network request"
+        );
     }
 }

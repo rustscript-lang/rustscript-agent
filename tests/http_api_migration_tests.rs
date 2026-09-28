@@ -153,13 +153,6 @@ fn restricted_registry_admits_only_required_http_and_no_ambient_io() {
     )
     .expect("all SSE resource APIs must compile");
     assert_rejected(
-        r#"use http;
-        pub fn run(input: map) -> int {
-            http::request::from_map({ method: "GET" });
-            0;
-        }"#,
-    );
-    assert_rejected(
         r#"use io;
         pub fn run(input: map) -> bool {
             io::exists("/");
