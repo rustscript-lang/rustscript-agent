@@ -1,0 +1,355 @@
+{
+  "exit_code": 0,
+  "start_ref": "a6ebc43e3bc6f788399f16de6bc64ba27d0449e5",
+  "targets": [
+    {
+      "target": "unittests src/lib.rs",
+      "result": {
+        "status": "ok",
+        "passed": 129,
+        "failed": 0,
+        "ignored": 6
+      }
+    },
+    {
+      "target": "unittests src/bin/rustscript-agent.rs",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "unittests src/bin/rustscript-agent-gateway.rs",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/agent_loop_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 62,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/auth_store_rss_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 21,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/auth_store_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 27,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/capability_lifecycle_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 22,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/capability_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 54,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/coding_agent_e2e_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/coding_agent_edge_e2e_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/config_auth_rss_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/config_file_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 21,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/contract_fixtures.rs",
+      "result": {
+        "status": "ok",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/core_repro_driver.rs",
+      "result": {
+        "status": "ok",
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/dependency_pin_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/docs_consistency_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/domain_contract_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/gateway_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 64,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/host_descriptor_architecture_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/http_api_migration_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/metrics_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/oauth_flow_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 30,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/oauth_rss_entry_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 13,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/prompt_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 22,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/provider_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 18,
+        "failed": 0,
+        "ignored": 4
+      }
+    },
+    {
+      "target": "tests/rss_corpus_compile_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/rss_file_tool_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 50,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/rss_mutating_file_tool_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 35,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/rss_process_tool_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 38,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/rss_tool_architecture_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/rss_tool_dispatch_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 13,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/rss_tool_registry_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/run_lifecycle_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 34,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/runner_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 33,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/service_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 65,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/storage_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 37,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/telegram_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "target": "tests/tool_registry_tests.rs",
+      "result": {
+        "status": "ok",
+        "passed": 34,
+        "failed": 0,
+        "ignored": 0
+      }
+    }
+  ],
+  "totals": {
+    "passed": 969,
+    "failed": 0,
+    "ignored": 10
+  },
+  "command": "cargo test --locked --workspace --all-features --all-targets -- --test-threads=1",
+  "core_revision": "d9387f98df78dd88d2d1c04eebac4415f844efaf"
+}
