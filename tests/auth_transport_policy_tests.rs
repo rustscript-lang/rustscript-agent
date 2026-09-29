@@ -2,7 +2,11 @@ use rustscript_agent::{
     RunCancellation,
     auth::{
         host::{AuthHost, auth_host_catalog},
-        oauth::TrustedEndpoint,
+        oauth::{
+            CredentialUse, OAuthError, OAuthHost, ProviderRequest, ScriptedBrowser,
+            ScriptedCallback, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport,
+            TrustedEndpoint,
+        },
     },
 };
 use rustscript_vm::{
@@ -12,7 +16,7 @@ use rustscript_vm::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -92,6 +96,175 @@ fn endpoints(entries: &[(&str, &str)]) -> Vec<TrustedEndpoint> {
             path_prefix: (*path_prefix).to_string(),
         })
         .collect()
+}
+
+fn fake_oauth_host() -> (OAuthHost, Arc<ScriptedHttpsTransport>) {
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let host = OAuthHost::new(
+        transport.clone(),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        Arc::new(ScriptedCancel::new()),
+    );
+    (host, transport)
+}
+
+fn request(path: &str) -> ProviderRequest {
+    ProviderRequest {
+        method: "GET".into(),
+        path: path.into(),
+        public_headers: BTreeMap::new(),
+        public_body: String::new(),
+        credential_id: "fixture-codex".into(),
+    }
+}
+
+#[test]
+fn trailing_slash_base_admits_descendants_only_on_its_authority() {
+    let home = fixture_home();
+    let config_path = home.join("config.yaml");
+    let original = fs::read_to_string(&config_path).expect("config");
+    fs::write(
+        &config_path,
+        original
+            .replace(
+                "https://chatgpt.com/backend-api/codex",
+                "https://api.example.test/api/",
+            )
+            .replace(
+                "issuer: https://auth.openai.com",
+                "issuer: https://api.example.test",
+            ),
+    )
+    .expect("trailing base URL");
+    let host =
+        AuthHost::new(home, RunCancellation::with_timeout(Duration::from_secs(30))).expect("host");
+    let mut vm = vm_for();
+    let issued = policy(&mut vm, &host);
+    let trusted = host
+        .trusted_transport_policy(&mut vm, &issued, "fixture-codex")
+        .expect("host-issued policy");
+    assert!(trusted.endpoints.contains(&TrustedEndpoint {
+        authority: "api.example.test".into(),
+        path_prefix: "/api".into(),
+    }));
+    let (oauth, transport) = fake_oauth_host();
+    transport.push_raw(200, "{}");
+    oauth
+        .transport(&trusted, request("/api/chat"), CredentialUse::None)
+        .expect("admitted descendant");
+    assert_eq!(
+        transport.take_sent()[0].url,
+        "https://api.example.test/api/chat"
+    );
+    assert!(matches!(
+        oauth.transport(&trusted, request("/apiish"), CredentialUse::None),
+        Err(OAuthError::PathDenied { .. })
+    ));
+    assert!(transport.take_sent().is_empty());
+}
+
+#[test]
+fn root_base_admits_descendants_on_only_its_authority() {
+    let home = fixture_home();
+    let config_path = home.join("config.yaml");
+    let original = fs::read_to_string(&config_path).expect("config");
+    fs::write(
+        &config_path,
+        original
+            .replace(
+                "https://chatgpt.com/backend-api/codex",
+                "https://api.example.test/",
+            )
+            .replace("https://auth.openai.com", "https://api.example.test"),
+    )
+    .expect("single-authority root");
+    let host =
+        AuthHost::new(home, RunCancellation::with_timeout(Duration::from_secs(30))).expect("host");
+    let mut vm = vm_for();
+    let issued = policy(&mut vm, &host);
+    let trusted = host
+        .trusted_transport_policy(&mut vm, &issued, "fixture-codex")
+        .expect("single-authority policy");
+    assert_eq!(
+        trusted.endpoints[0],
+        endpoints(&[("api.example.test", "")])[0]
+    );
+    assert!(
+        trusted
+            .endpoints
+            .iter()
+            .all(|e| e.authority == "api.example.test")
+    );
+    let (oauth, transport) = fake_oauth_host();
+    transport.push_raw(200, "{}");
+    oauth
+        .transport(&trusted, request("/v1/chat"), CredentialUse::None)
+        .expect("root descendant");
+    assert_eq!(
+        transport.take_sent()[0].url,
+        "https://api.example.test/v1/chat"
+    );
+}
+
+#[test]
+fn root_base_with_distinct_authority_token_endpoint_is_rejected() {
+    let home = fixture_home();
+    let config_path = home.join("config.yaml");
+    let original = fs::read_to_string(&config_path).expect("config");
+    fs::write(
+        &config_path,
+        original.replace(
+            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/",
+        ),
+    )
+    .expect("root base");
+    let host =
+        AuthHost::new(home, RunCancellation::with_timeout(Duration::from_secs(30))).expect("host");
+    let mut vm = vm_for();
+    let issued = policy(&mut vm, &host);
+    let failure = host
+        .trusted_transport_policy(&mut vm, &issued, "fixture-codex")
+        .expect_err("root overlaps distinct-authority token endpoint");
+    assert!(failure.to_string().contains("transport_endpoint_ambiguous"));
+}
+
+#[test]
+fn trailing_slash_relative_oauth_path_admits_descendants_on_issuer() {
+    let home = fixture_home();
+    let config_path = home.join("config.yaml");
+    let original = fs::read_to_string(&config_path).expect("config");
+    fs::write(
+        &config_path,
+        original.replace(
+            "authorization_path: /codex/device",
+            "authorization_path: /signin/",
+        ),
+    )
+    .expect("relative oauth path");
+    let host =
+        AuthHost::new(home, RunCancellation::with_timeout(Duration::from_secs(30))).expect("host");
+    let mut vm = vm_for();
+    let issued = policy(&mut vm, &host);
+    let trusted = host
+        .trusted_transport_policy(&mut vm, &issued, "fixture-codex")
+        .expect("relative policy");
+    assert!(
+        trusted
+            .endpoints
+            .contains(&endpoints(&[("auth.openai.com", "/signin")])[0])
+    );
+    let (oauth, transport) = fake_oauth_host();
+    transport.push_raw(200, "{}");
+    oauth
+        .transport(&trusted, request("/signin/callback"), CredentialUse::None)
+        .expect("relative descendant");
+    assert_eq!(
+        transport.take_sent()[0].url,
+        "https://auth.openai.com/signin/callback"
+    );
 }
 
 #[test]
@@ -364,7 +537,12 @@ fn multiple_credentials_do_not_aggregate_authorities_and_issuer_falls_back_to_ba
 
 #[test]
 fn same_credential_multi_provider_cross_authority_overlap_is_denied() {
-    for conflicting_path in ["/backend-api/codex", "/backend-api/codex/child"] {
+    for conflicting_path in [
+        "/backend-api/codex",
+        "/backend-api/codex/",
+        "/backend-api/codex/child",
+        "/backend-api/codex/child/",
+    ] {
         let home = fixture_home();
         add_provider(
             &home,
@@ -390,7 +568,7 @@ fn same_credential_duplicate_endpoint_on_same_authority_is_deduplicated() {
     add_provider(
         &home,
         "another",
-        "https://chatgpt.com/backend-api/codex",
+        "https://chatgpt.com/backend-api/codex/",
         "fixture-codex",
         "",
     );

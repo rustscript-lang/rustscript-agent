@@ -321,7 +321,7 @@ impl AuthHost {
                         &mut endpoints,
                         TrustedEndpoint {
                             authority: issuer_authority.clone(),
-                            path_prefix: path.clone(),
+                            path_prefix: trusted_path_prefix(path),
                         },
                     );
                 }
@@ -438,8 +438,12 @@ fn trusted_url_endpoint(value: &str) -> VmResult<TrustedEndpoint> {
     };
     Ok(TrustedEndpoint {
         authority,
-        path_prefix: url.path().to_string(),
+        path_prefix: trusted_path_prefix(url.path()),
     })
+}
+
+fn trusted_path_prefix(path: &str) -> String {
+    path.trim_end_matches('/').to_string()
 }
 
 fn push_endpoint(endpoints: &mut Vec<TrustedEndpoint>, endpoint: TrustedEndpoint) {
