@@ -103,8 +103,8 @@ fn rss_metadata_access_refresh_and_delete_use_admitted_policy() {
           let generation: int = metadata.metadata.generation;
           let access = auth::access_handle("fixture-codex", generation, &policy);
           let refresh = auth::refresh_handle("fixture-codex", generation, &policy);
-          auth::close_access(&access.handle);
-          auth::close_refresh(&refresh.handle);
+          auth::close_access(access.handle);
+          auth::close_refresh(refresh.handle);
           let deleted = auth::delete("fixture-codex", &policy);
           if deleted.deleted => { generation } else => { 0 }
         }"#;
@@ -117,6 +117,11 @@ fn rss_metadata_access_refresh_and_delete_use_admitted_policy() {
     .expect("host");
     let arg = home_arg(host.bind_vm(&mut vm).expect("bind home"));
     assert_eq!(run(&mut vm, &[arg]), Value::Int(4));
+    assert_eq!(
+        vm.host_context().resource_count(),
+        2,
+        "both closed handles release capacity"
+    );
     assert!(
         !fs::read_to_string(home.join("auth.yaml"))
             .expect("auth")
@@ -217,6 +222,59 @@ fn rss_save_rejects_wrong_generation_slot_without_writing() {
     );
 }
 
+#[cfg(feature = "config-fixture")]
+#[test]
+fn rss_real_cas_conflict_retires_both_terminal_slots() {
+    let mut vm = vm_for(SAVE_SOURCE);
+    let home = fixture_home();
+    let auth_path = home.join("auth.yaml");
+    let original = fs::read_to_string(&auth_path).expect("auth");
+    fs::write(
+        &auth_path,
+        original.replace("generation: 4", "generation: 3"),
+    )
+    .expect("lower generation");
+    let host = AuthHost::new(
+        home.clone(),
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+    )
+    .expect("host");
+    let entry = home_arg(host.bind_vm(&mut vm).expect("bind"));
+    let before = fs::read(&auth_path).expect("before");
+    let callable = vm.resolve_exported_callable("run").expect("export");
+    for _ in 0..70 {
+        let access = host
+            .fixture_slot(
+                &mut vm,
+                "fixture-codex",
+                4,
+                false,
+                "SYNTHETIC_CONFLICT_ACCESS",
+            )
+            .expect("access");
+        let refresh = host
+            .fixture_slot(
+                &mut vm,
+                "fixture-codex",
+                4,
+                true,
+                "SYNTHETIC_CONFLICT_REFRESH",
+            )
+            .expect("refresh");
+        let failure = vm
+            .invoke_callable(callable.clone(), &[entry.clone(), access, refresh])
+            .expect_err("real generation conflict");
+        assert!(failure.to_string().contains("save_rejected"));
+        assert!(!failure.to_string().contains("SYNTHETIC_CONFLICT"));
+        assert_eq!(
+            vm.host_context().resource_count(),
+            2,
+            "terminal slots must release arena budget"
+        );
+        assert_eq!(fs::read(&auth_path).expect("unchanged"), before);
+    }
+}
+
 #[test]
 fn refresh_issue_is_single_flight_for_one_credential() {
     let source = "use config; use auth; pub fn run(home: resource<auth.host_home>) -> resource<auth.refresh> { let p = config::load_snapshot(&home).policy_handle; auth::refresh_handle(\"fixture-codex\", 4, &p).handle }";
@@ -269,9 +327,17 @@ fn scope_reset_invalidates_old_home_resource() {
     .expect("host");
     let home = home_arg(host.bind_vm(&mut vm).expect("bind"));
     assert_eq!(run(&mut vm, std::slice::from_ref(&home)), Value::Int(1));
+    assert!(host.bind_vm(&mut vm).is_err(), "duplicate active bind");
+    assert_eq!(vm.host_context().resource_count(), 2);
     vm.reset_for_reuse().expect("reset");
     assert!(matches!(vm.run().expect("root"), VmStatus::Halted));
     let callable = vm.resolve_exported_callable("run").expect("export");
+    assert!(
+        vm.invoke_callable(callable.clone(), std::slice::from_ref(&home))
+            .is_err()
+    );
+    let fresh = home_arg(host.bind_vm(&mut vm).expect("bind after reset"));
+    assert_eq!(run(&mut vm, &[fresh]), Value::Int(1));
     assert!(vm.invoke_callable(callable, &[home]).is_err());
 }
 
@@ -328,7 +394,7 @@ fn reload_changes_only_future_vm_admission() {
 #[test]
 fn live_resource_budget_releases_closed_slots() {
     let mut vm = vm_for(
-        "use auth; pub fn run(slot: resource<auth.secret_slot>) -> int { auth::close_slot(&slot); 1 }",
+        "use auth; pub fn run(slot: resource<auth.secret_slot>) -> int { auth::close_slot(slot); 1 }",
     );
     let host = AuthHost::new(
         fixture_home(),
@@ -348,8 +414,14 @@ fn live_resource_budget_releases_closed_slots() {
         host.fixture_slot(&mut vm, "fixture-codex", 4, false, "SYNTHETIC_SLOT")
             .is_err()
     );
-    assert_eq!(run(&mut vm, &[slots.pop().expect("last")]), Value::Int(1));
+    let closed = slots.pop().expect("last");
+    assert_eq!(run(&mut vm, std::slice::from_ref(&closed)), Value::Int(1));
     assert_eq!(vm.host_context().resource_count(), 63);
+    let callable = vm.resolve_exported_callable("run").expect("export");
+    assert!(
+        vm.invoke_callable(callable, &[closed]).is_err(),
+        "closed handle invalid"
+    );
     host.fixture_slot(&mut vm, "fixture-codex", 4, false, "SYNTHETIC_SLOT")
         .expect("capacity reused");
 }
@@ -367,6 +439,187 @@ fn cancellation_and_deadline_reject_bound_home() {
     assert!(AuthHost::new(fixture_home(), RunCancellation::new()).is_err());
     let expired = RunCancellation::with_timeout(Duration::from_millis(0));
     assert!(AuthHost::new(fixture_home(), expired).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_delete_exits_while_file_lock_is_held() {
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let home = fixture_home();
+    let before = fs::read(home.join("auth.yaml")).expect("before");
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let host = AuthHost::new(home.clone(), cancellation.clone()).expect("host");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join("auth.yaml.lock"))
+        .expect("lock file");
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut vm = vm_for(
+            "use config; use auth; pub fn run(home: resource<auth.host_home>) -> int { let p = config::load_snapshot(&home).policy_handle; auth::delete(\"fixture-codex\", &p); 1 }",
+        );
+        let entry = home_arg(host.bind_vm(&mut vm).expect("bind"));
+        ready_tx.send(()).expect("ready");
+        let callable = vm.resolve_exported_callable("run").expect("export");
+        done_tx
+            .send(vm.invoke_callable(callable, &[entry]).map(|_| ()))
+            .expect("done");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ready");
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "must wait for held lock"
+    );
+    cancellation.request(rustscript_agent::CancellationReason::Requested);
+    let early = done_rx.recv_timeout(Duration::from_secs(2));
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    worker.join().expect("worker");
+    assert!(early.expect("cancellation must release lock wait").is_err());
+    assert_eq!(fs::read(home.join("auth.yaml")).expect("after"), before);
+}
+
+#[cfg(all(unix, feature = "config-fixture"))]
+fn mutation_lock_case(save: bool, invalidation: &str) {
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let home = fixture_home();
+    let before = fs::read(home.join("auth.yaml")).expect("before");
+    let cancellation = RunCancellation::with_timeout(if invalidation == "deadline" {
+        Duration::from_secs(4)
+    } else {
+        Duration::from_secs(30)
+    });
+    let host = Arc::new(AuthHost::new(home.clone(), cancellation.clone()).expect("host"));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join("auth.yaml.lock"))
+        .expect("lock file");
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker_host = Arc::clone(&host);
+    let worker = thread::spawn(move || {
+        let source = if save {
+            SAVE_SOURCE
+        } else {
+            "use config; use auth; pub fn run(home: resource<auth.host_home>) -> int { let p = config::load_snapshot(&home).policy_handle; auth::delete(\"fixture-codex\", &p); 1 }"
+        };
+        let mut vm = vm_for(source);
+        let entry = home_arg(worker_host.bind_vm(&mut vm).expect("bind"));
+        let mut args = vec![entry];
+        if save {
+            args.push(
+                worker_host
+                    .fixture_slot(&mut vm, "fixture-codex", 4, false, "SYNTHETIC_WAIT_ACCESS")
+                    .expect("access"),
+            );
+            args.push(
+                worker_host
+                    .fixture_slot(&mut vm, "fixture-codex", 4, true, "SYNTHETIC_WAIT_REFRESH")
+                    .expect("refresh"),
+            );
+        }
+        ready_tx.send(()).expect("ready");
+        let callable = vm.resolve_exported_callable("run").expect("export");
+        done_tx
+            .send(vm.invoke_callable(callable, &args).map(|_| ()))
+            .expect("done");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ready");
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "must wait for held lock"
+    );
+    match invalidation {
+        "cancel" => cancellation.request(rustscript_agent::CancellationReason::Requested),
+        "revoke" => host.revoke(),
+        "deadline" | "active" => {}
+        _ => panic!("invalid test mode"),
+    }
+    let early = if invalidation == "active" {
+        None
+    } else {
+        Some(done_rx.recv_timeout(Duration::from_secs(5)))
+    };
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    let outcome = if let Some(early) = early {
+        early.expect("invalidated owner must exit while lock remains held")
+    } else {
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("active owner completes")
+    };
+    worker.join().expect("worker");
+    let after = fs::read(home.join("auth.yaml")).expect("after");
+    if invalidation == "active" {
+        assert!(outcome.is_ok(), "active owner mutates");
+        assert_ne!(after, before);
+    } else {
+        let failure = outcome.expect_err("inactive owner rejected");
+        assert!(!failure.to_string().contains("SYNTHETIC_WAIT"));
+        assert_eq!(after, before);
+    }
+}
+
+#[cfg(all(unix, feature = "config-fixture"))]
+#[test]
+fn save_lock_wait_obeys_cancel_revoke_deadline_and_active_control() {
+    for mode in ["cancel", "revoke", "deadline", "active"] {
+        mutation_lock_case(true, mode);
+    }
+}
+
+#[cfg(all(unix, feature = "config-fixture"))]
+#[test]
+fn delete_lock_wait_obeys_revoke_deadline_and_active_control() {
+    for mode in ["revoke", "deadline", "active"] {
+        mutation_lock_case(false, mode);
+    }
+}
+
+#[test]
+fn close_contract_consumes_owned_resource_and_rejects_borrowed_or_reuse() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/config_auth_rss/config.yaml");
+    let compile = |source: &str| {
+        compile_source_at_path_with_flavor_and_options(
+            &path,
+            source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(auth_host_catalog()),
+        )
+    };
+    for (function, key) in [
+        ("close_access", "auth.access"),
+        ("close_refresh", "auth.refresh"),
+        ("close_slot", "auth.secret_slot"),
+    ] {
+        let owned = format!(
+            "use auth; pub fn run(value: resource<{key}>) -> int {{ auth::{function}(value); 1 }}"
+        );
+        assert!(compile(&owned).is_ok(), "owned close: {function}");
+        let borrowed = format!(
+            "use auth; pub fn run(value: resource<{key}>) -> int {{ auth::{function}(&value); 1 }}"
+        );
+        assert!(compile(&borrowed).is_err(), "borrowed close: {function}");
+        let moved = format!(
+            "use auth; pub fn run(value: resource<{key}>) -> int {{ auth::{function}(value); auth::{function}(value); 1 }}"
+        );
+        assert!(compile(&moved).is_err(), "use after move: {function}");
+    }
 }
 
 #[test]

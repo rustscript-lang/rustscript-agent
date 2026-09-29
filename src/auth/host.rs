@@ -23,8 +23,9 @@ use uuid::Uuid;
 
 use crate::auth::config::CredentialConfig;
 use crate::auth::store::{
-    AuthMetadata, AuthStore, OpaqueAccessHandle, OpaqueRefreshHandle, OpaqueSecretSlot,
-    RefreshSecretAction, SaveCredentialRequest as StoreSaveRequest, SecretSlotKind,
+    AuthMetadata, AuthStore, AuthStoreError, OpaqueAccessHandle, OpaqueRefreshHandle,
+    OpaqueSecretSlot, RefreshSecretAction, SaveCredentialRequest as StoreSaveRequest,
+    SecretSlotKind,
 };
 use crate::auth::token::CredentialId;
 use crate::config_file::{AgentPaths, ConfigFile};
@@ -229,7 +230,7 @@ impl AuthHost {
         });
         owner.check()?;
         let mut context = vm.host_context();
-        if context.module_state::<Bound>().is_some() {
+        if context.scope_state::<Bound>().is_some() {
             return Err(error("already_bound"));
         }
         if context.resource_count() >= LIMIT {
@@ -240,7 +241,14 @@ impl AuthHost {
                 owner: owner.clone(),
             })
             .map_err(|_| error("resource_unavailable"))?;
-        context.set_module_state(Bound(owner.clone()));
+        if context
+            .scope_state_or_insert_with(|| Bound(owner.clone()))
+            .is_err()
+        {
+            let _ =
+                context.close_resource::<HostHome>(home.handle(), ResourceCloseReason::Requested);
+            return Err(error("resource_unavailable"));
+        }
         self.owners
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -344,7 +352,7 @@ fn error(code: &str) -> VmError {
 }
 fn bound(vm: &mut Vm) -> VmResult<Arc<Owner>> {
     vm.host_context()
-        .module_state::<Bound>()
+        .scope_state::<Bound>()
         .map(|b| b.0.clone())
         .ok_or_else(|| error("host_unbound"))
 }
@@ -368,7 +376,7 @@ fn borrowed<T: HostResource + HostResourceType + OwnerResource>(
         .map_err(|_| error("resource_invalid"))?;
     let owner = entry.owner();
     let bound = context
-        .module_state::<Bound>()
+        .scope_state::<Bound>()
         .ok_or_else(|| error("host_unbound"))?;
     if !Arc::ptr_eq(&owner, &bound.0) {
         return Err(error("owner_mismatch"));
@@ -736,7 +744,11 @@ fn delete_desc() -> HostFunctionDescriptor {
 fn close_access_desc() -> HostFunctionDescriptor {
     desc(
         "auth::close_access",
-        vec![borrow("handle", key(Access::KEY))],
+        vec![HostParamSchema::with_passing(
+            "handle",
+            key(Access::KEY),
+            HostParamPassing::TakeOwned,
+        )],
         HostTypeSchema::Null,
         close_access,
     )
@@ -744,7 +756,11 @@ fn close_access_desc() -> HostFunctionDescriptor {
 fn close_refresh_desc() -> HostFunctionDescriptor {
     desc(
         "auth::close_refresh",
-        vec![borrow("handle", key(Refresh::KEY))],
+        vec![HostParamSchema::with_passing(
+            "handle",
+            key(Refresh::KEY),
+            HostParamPassing::TakeOwned,
+        )],
         HostTypeSchema::Null,
         close_refresh,
     )
@@ -752,7 +768,11 @@ fn close_refresh_desc() -> HostFunctionDescriptor {
 fn close_slot_desc() -> HostFunctionDescriptor {
     desc(
         "auth::close_slot",
-        vec![borrow("handle", key(SecretSlot::KEY))],
+        vec![HostParamSchema::with_passing(
+            "handle",
+            key(SecretSlot::KEY),
+            HostParamPassing::TakeOwned,
+        )],
         HostTypeSchema::Null,
         close_slot,
     )
@@ -966,6 +986,10 @@ fn save_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         _ => return Err(error("refresh_action_invalid")),
     };
     owner.check()?;
+    let mut candidates = vec![(handle(field(req, "access_slot")?)?, access.clone())];
+    if let RefreshSecretAction::Replace(ref replacement) = refresh {
+        candidates.push((handle(field(req, "refresh_slot")?)?, replacement.clone()));
+    }
     let id = CredentialId::new(id.to_owned()).map_err(|_| error("invalid_credential_id"))?;
     let request = StoreSaveRequest::new(
         id,
@@ -976,22 +1000,22 @@ fn save_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         access,
         refresh,
     );
-    let saved = owner
-        .store
-        .save_if_generation(request)
-        .map_err(|_| error("save_rejected"))?;
-    // CAS (including an adopted newer generation) consumes/revokes the slots.
-    // Retire the Core arena entries too, so aliases and the live budget agree.
-    let access_handle = handle(field(req, "access_slot")?)?;
-    vm.host_context()
-        .close_resource::<SecretSlot>(access_handle, ResourceCloseReason::Requested)
-        .map_err(|_| error("slot_close_failed"))?;
-    if string(field(req, "refresh_action")?)? == "replace" {
-        let refresh_handle = handle(field(req, "refresh_slot")?)?;
-        vm.host_context()
-            .close_resource::<SecretSlot>(refresh_handle, ResourceCloseReason::Requested)
-            .map_err(|_| error("slot_close_failed"))?;
+    let saved = owner.store.save_if_generation_guarded(request, &|| {
+        owner.check().map_err(|_| AuthStoreError::MutationInactive)
+    });
+    // CAS conflict and adoption revoke slots. A guarded rejection leaves live
+    // candidates retryable; only terminal candidates leave the Core arena.
+    for (handle, slot) in candidates {
+        if slot.is_terminal() {
+            let closed = vm
+                .host_context()
+                .close_resource::<SecretSlot>(handle, ResourceCloseReason::Requested);
+            if saved.is_ok() {
+                closed.map_err(|_| error("slot_close_failed"))?;
+            }
+        }
     }
+    let saved = saved.map_err(|_| error("save_rejected"))?;
     meta_result(
         saved.metadata(),
         if saved.is_adopted() {
@@ -1006,7 +1030,9 @@ fn delete_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let owner = policy_owner(vm, &args[1], id)?;
     owner
         .store
-        .delete(id)
+        .delete_guarded(id, &|| {
+            owner.check().map_err(|_| AuthStoreError::MutationInactive)
+        })
         .map_err(|_| error("delete_rejected"))?;
     result(object(vec![
         ("ok", Value::Bool(true)),
