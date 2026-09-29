@@ -41,7 +41,6 @@ fn check_mutation_guard(guard: Option<&MutationGuard<'_>>) -> Result<(), AuthSto
     }
     Ok(())
 }
-#[cfg(any(test, feature = "config-fixture"))]
 const SECRET_SLOT_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// RSS-visible class name for a host-minted access handle.
@@ -156,7 +155,7 @@ impl OpaqueSecretSlot {
                 run_id: run_id.to_string(),
                 bytes: Mutex::new(bytes),
                 state: AtomicU8::new(SLOT_LIVE),
-                expires_at,
+                expires_at: expires_at.min(Instant::now() + SECRET_SLOT_TTL),
             }),
         })
     }
@@ -313,6 +312,36 @@ impl OpaqueSecretSlot {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             bytes.zeroize();
         }
+    }
+}
+
+#[cfg(test)]
+mod secret_slot_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn host_secret_slot_deadline_is_capped_and_shorter_deadline_preserved() {
+        let before = Instant::now();
+        let make_slot = |deadline| {
+            OpaqueSecretSlot::from_host_secret_until(
+                SecretSlotKind::Access,
+                "fixture-codex",
+                0,
+                1,
+                "fixture-run",
+                Zeroizing::new(b"fixture-secret".to_vec()),
+                deadline,
+            )
+            .expect("valid slot")
+        };
+        let long = make_slot(before + Duration::from_secs(10 * 60));
+        let after = Instant::now();
+        assert!(long.inner.expires_at >= before + SECRET_SLOT_TTL);
+        assert!(long.inner.expires_at <= after + SECRET_SLOT_TTL);
+
+        let short_deadline = Instant::now() + Duration::from_secs(20);
+        let short = make_slot(short_deadline);
+        assert_eq!(short.inner.expires_at, short_deadline);
     }
 }
 

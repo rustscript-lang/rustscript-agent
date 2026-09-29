@@ -14,7 +14,7 @@ use rustscript_vm::{
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
 fn fixture_home() -> PathBuf {
     let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned temp"));
@@ -218,6 +218,133 @@ fn rss_no_credential_transport_returns_sanitized_public_body_and_host_slots() {
         Some("application/json")
     );
     assert!(!format!("{:?}", sent[0]).contains("SYNTHETIC_ACCESS_TOKEN"));
+}
+
+struct HostileHeadersTransport {
+    response: rustscript_agent::auth::oauth::RawHttpsResponse,
+}
+
+impl rustscript_agent::auth::oauth::BoundedHttpsTransport for HostileHeadersTransport {
+    fn send(
+        &self,
+        _: &rustscript_agent::auth::oauth::PreparedHttpsRequest,
+        _: &rustscript_agent::auth::oauth::OAuthIoContext,
+    ) -> Result<
+        rustscript_agent::auth::oauth::RawHttpsResponse,
+        rustscript_agent::auth::oauth::OAuthError,
+    > {
+        Ok(self.response.clone())
+    }
+}
+
+#[test]
+fn rss_transport_never_exposes_hostile_response_headers() {
+    let secret = "HEADER_ONLY_SECRET_9c73";
+    for (content_type, retry_after, body, expected_headers, expected_retry, malformed) in [
+        (
+            format!("application/json; charset=\"{secret}\""),
+            secret.to_owned(),
+            r#"{"access_token":"SYNTHETIC_ACCESS_TOKEN","public":"accepted"}"#.to_owned(),
+            true,
+            Value::Null,
+            false,
+        ),
+        (
+            format!("text/plain; boundary={secret}"),
+            "12".to_owned(),
+            r#"{"public":"accepted"}"#.to_owned(),
+            false,
+            Value::Int(12_000),
+            false,
+        ),
+        (
+            format!("\r\napplication/json; charset={secret}"),
+            "12".to_owned(),
+            r#"{"public":"accepted"}"#.to_owned(),
+            false,
+            Value::Int(12_000),
+            false,
+        ),
+        (
+            format!("application/json; charset={secret}"),
+            secret.to_owned(),
+            format!("{{not-json-{secret}}}"),
+            false,
+            Value::Null,
+            true,
+        ),
+    ] {
+        let mut vm = vm();
+        let headers = BTreeMap::from([
+            ("x-access-token".to_owned(), secret.to_owned()),
+            ("Content-Type".to_owned(), content_type),
+            ("Retry-After".to_owned(), retry_after),
+        ]);
+        let transport = Arc::new(HostileHeadersTransport {
+            response: rustscript_agent::auth::oauth::RawHttpsResponse {
+                status: 200,
+                headers,
+                body: body.into_bytes(),
+            },
+        });
+        let oauth = Arc::new(OAuthHost::new(
+            transport,
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        ));
+        let host = AuthHost::new(
+            fixture_home(),
+            RunCancellation::with_timeout(Duration::from_secs(30)),
+        )
+        .expect("host")
+        .with_oauth_host(oauth);
+        let home = field(&host.bind_vm(&mut vm).expect("bind"), "host_home").clone();
+        let run = vm.resolve_exported_callable("run").expect("run");
+        let response = vm.invoke_callable(run, &[home]);
+        if malformed {
+            let failure = response.expect_err("malformed body").to_string();
+            assert!(!failure.contains(secret), "{failure}");
+            assert!(!failure.contains("SYNTHETIC_ACCESS_TOKEN"), "{failure}");
+            continue;
+        }
+        let response = response.expect("JSON body");
+        let debug = format!("{response:?}");
+        assert!(!debug.contains(secret), "{debug}");
+        assert!(!debug.contains("SYNTHETIC_ACCESS_TOKEN"), "{debug}");
+        assert_eq!(field(&response, "status"), &Value::Int(200));
+        if expected_retry == Value::Null {
+            let Value::Map(entries) = &response else {
+                panic!("expected map")
+            };
+            assert!(
+                !entries
+                    .iter()
+                    .any(|(key, _)| key == &Value::string("retry_after_ms"))
+            );
+        } else {
+            assert_eq!(field(&response, "retry_after_ms"), &expected_retry);
+        }
+        let Value::Array(headers) = field(&response, "public_headers") else {
+            panic!("typed headers")
+        };
+        if expected_headers {
+            assert_eq!(headers.len(), 1, "{debug}");
+            assert_eq!(field(&headers[0], "name"), &Value::string("content-type"));
+            assert_eq!(
+                field(&headers[0], "value"),
+                &Value::string("application/json")
+            );
+            assert!(matches!(field(&response, "access_slot"), Value::Int(_)));
+        } else {
+            assert!(headers.is_empty(), "{debug}");
+        }
+        assert_eq!(
+            field(&response, "body_without_secret_fields"),
+            &Value::string(r#"{"public":"accepted"}"#)
+        );
+    }
 }
 
 #[test]

@@ -1114,6 +1114,40 @@ fn optional_field<'a>(value: &'a Value, name: &str) -> VmResult<Option<&'a Value
     }))
 }
 
+fn canonical_json_content_type(value: &str) -> bool {
+    fn token(value: &str) -> bool {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    }
+
+    fn ows(text: &str) -> &str {
+        text.trim_matches([' ', '\t'])
+    }
+    let mut parts = value.split(';');
+    if !parts
+        .next()
+        .is_some_and(|media| ows(media).eq_ignore_ascii_case("application/json"))
+    {
+        return false;
+    }
+    parts.all(|parameter| {
+        let Some((name, value)) = ows(parameter).split_once('=') else {
+            return false;
+        };
+        let value = ows(value);
+        token(ows(name))
+            && (token(value)
+                || (value.len() >= 2
+                    && value.starts_with('"')
+                    && value.ends_with('"')
+                    && value.as_bytes()[1..value.len() - 1]
+                        .iter()
+                        .all(|byte| (0x20..=0x7e).contains(byte) && *byte != b'"')))
+    })
+}
+
 fn revoke_response(oauth: &OAuthHost, response: &SanitizedProviderResponse) {
     if let Some(slot) = &response.access_slot {
         slot.revoke();
@@ -1240,10 +1274,14 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
                     response
                         .public_headers
                         .iter()
-                        .map(|(name, value)| {
+                        .filter(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-type")
+                                && canonical_json_content_type(value)
+                        })
+                        .map(|_| {
                             object(vec![
-                                ("name", Value::string(name)),
-                                ("value", Value::string(value)),
+                                ("name", Value::string("content-type")),
+                                ("value", Value::string("application/json")),
                             ])
                         })
                         .collect(),
