@@ -40,8 +40,34 @@ fn spawn_holding_fixture() -> (
     let port = listener.local_addr().expect("fixture address").port();
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    listener.set_nonblocking(true).expect("nonblocking fixture");
     let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept fixture request");
+        let accept_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match release_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    assert!(
+                        std::time::Instant::now() < accept_deadline,
+                        "fixture request did not arrive"
+                    );
+                }
+                Err(error) => panic!("accept fixture request: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("blocking fixture stream");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("fixture read timeout");
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("fixture write timeout");
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
         loop {
@@ -55,12 +81,28 @@ fn spawn_holding_fixture() -> (
             }
         }
         let _ = arrived_tx.send(());
-        release_rx.recv().expect("wait for release");
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("wait for release");
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Agent: fixture\r\n\r\nagent-ok")
             .expect("write fixture response");
     });
     (port, arrived_rx, release_tx, handle)
+}
+
+#[test]
+fn holding_http_fixture_can_be_released_before_connection() {
+    let (_, _, release_tx, fixture) = spawn_holding_fixture();
+    release_tx.send(()).expect("release unused fixture");
+    let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = joined_tx.send(fixture.join());
+    });
+    joined_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("unused fixture must exit without accepting a connection")
+        .expect("fixture thread");
 }
 
 async fn json_request(
@@ -3233,9 +3275,10 @@ async fn failed_admission_persist_rolls_back_an_existing_sessions_message() {
 
 #[tokio::test]
 async fn legacy_chat_timeout_is_bounded_while_the_worker_is_blocked() {
-    let (_, _arrived_rx, release_tx, fixture, config, source) =
+    let (_, mut arrived_rx, release_tx, fixture, config, source) =
         spawn_holding_run_env(|config| AgentGatewayConfig {
-            run_timeout: std::time::Duration::from_millis(200),
+            // Include cold worker compilation without extending the 3s response bound.
+            run_timeout: std::time::Duration::from_secs(2),
             cancellation_grace: std::time::Duration::from_millis(50),
             ..config
         });
@@ -3276,6 +3319,9 @@ async fn legacy_chat_timeout_is_bounded_while_the_worker_is_blocked() {
     // Unblock the abandoned worker so the fixture thread can exit.
     release_tx.send(()).expect("release the held HTTP call");
     fixture.join().expect("fixture thread");
+    arrived_rx
+        .try_recv()
+        .expect("worker must reach the held HTTP call before timing out");
 }
 
 /// P1 (production path): the gateway's real restart load path fails the
