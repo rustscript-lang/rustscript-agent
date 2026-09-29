@@ -152,10 +152,10 @@ fn chat_send_complete(
         chat_splice_user_parts(body_text, types::request_array(request, "messages")),
         types::request_array(request, "tools")
     );
-    let http_request: resource<http.request> = http::request::new("POST", url);
-    http::request::set_header(&http_request, "content-type", "application/json");
-    http::request::set_header(&http_request, "authorization", "Bearer " + api_key);
-    http::request::set_body_text(&http_request, body);
+    let mut http_request: resource<http.request> = http::request::new("POST", url);
+    http::request::set_header(&mut http_request, "content-type", "application/json");
+    http::request::set_header(&mut http_request, "authorization", "Bearer " + api_key);
+    http::request::set_body_text(&mut http_request, body);
     let response: resource<http.response> = http::client::request(http_request);
     let status: int = http::response::status(&response);
     let body_bytes: bytes = http::response::body(&response);
@@ -688,44 +688,43 @@ fn chat_send_stream(
     let mut total_tokens: int = 0;
     let mut tools: array = [];
     let mut done = false;
-    let http_request: resource<http.request> = http::request::new("POST", url);
-    http::request::set_header(&http_request, "content-type", "application/json");
-    http::request::set_header(&http_request, "authorization", "Bearer " + api_key);
-    http::request::set_body_text(&http_request, body);
-    let stream_result: resource<http.sse_summary> = http::client::sse(http_request, |event, data, id, retry_ms| {
-        if data == "[DONE]" => {
-            done = true;
-            false
-        } else => {
-            let chunk: map = json::decode(data);
-            let choices: array = types::request_array(chunk, "choices");
-            if choices.length > 0 => {
-                let choice: map = types::array_entry(choices, 0);
-                let delta: map = types::request_map(choice, "delta");
-                let content: string = types::request_string(delta, "content");
-                if content != "" {
-                    text = text + content;
-                }
-                let reason: string = types::request_string(choice, "finish_reason");
-                if reason != "" {
-                    stop_reason = reason;
-                }
-                let call_deltas: array = types::request_array(delta, "tool_calls");
-                if call_deltas.length > 0 {
-                    tools = chat_stream_merge_tool_calls(tools, call_deltas);
-                }
-                true
-            } else => {
-                let usage: map = types::request_map(chunk, "usage");
-                if usage.has("total_tokens") {
-                    input_tokens = types::request_int(usage, "prompt_tokens", 0);
-                    output_tokens = types::request_int(usage, "completion_tokens", 0);
-                    total_tokens = types::request_int(usage, "total_tokens", 0);
-                }
-                true
+    let mut http_request: resource<http.request> = http::request::new("POST", url);
+    http::request::set_header(&mut http_request, "content-type", "application/json");
+    http::request::set_header(&mut http_request, "authorization", "Bearer " + api_key);
+    http::request::set_body_text(&mut http_request, body);
+    let on_event: fn(string, string, string, string) -> bool = |event, data, id, retry_ms| if data == "[DONE]" => {
+        done = true;
+        false
+    } else => {
+        let chunk: map = json::decode(data);
+        let choices: array = types::request_array(chunk, "choices");
+        if choices.length > 0 => {
+            let choice: map = types::array_entry(choices, 0);
+            let delta: map = types::request_map(choice, "delta");
+            let content: string = types::request_string(delta, "content");
+            if content != "" {
+                text = text + content;
             }
+            let reason: string = types::request_string(choice, "finish_reason");
+            if reason != "" {
+                stop_reason = reason;
+            }
+            let call_deltas: array = types::request_array(delta, "tool_calls");
+            if call_deltas.length > 0 {
+                tools = chat_stream_merge_tool_calls(tools, call_deltas);
+            }
+            true
+        } else => {
+            let usage: map = types::request_map(chunk, "usage");
+            if usage.has("total_tokens") {
+                input_tokens = types::request_int(usage, "prompt_tokens", 0);
+                output_tokens = types::request_int(usage, "completion_tokens", 0);
+                total_tokens = types::request_int(usage, "total_tokens", 0);
+            }
+            true
         }
-    });
+    };
+    let stream_result: resource<http.sse_summary> = http::client::sse(http_request, on_event);
     let outcome: string = http::sse_summary::outcome(&stream_result);
     let status: int = http::sse_summary::status(&stream_result);
     if done && outcome == "stopped" => {
