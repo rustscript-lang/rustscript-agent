@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustscript_agent::auth::oauth::{
-    BoundedPublicOAuthIntent, BrowserOpener, CallbackMode, CallbackWaiter, CredentialUse,
-    MAX_LIVE_OAUTH_FLOWS, OAuthError, OAuthFlowKind, OAuthHost, OAuthIoContext,
-    OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle, PreparedHttpsRequest, ProviderRequest,
-    RawCallbackInput, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
-    ScriptedHttpsTransport, TrustedEndpoint, TrustedTransportPolicy,
+    BoundedHttpsTransport, BoundedPublicOAuthIntent, BrowserOpener, CallbackMode, CallbackWaiter,
+    CredentialUse, MAX_LIVE_OAUTH_FLOWS, OAuthClock, OAuthError, OAuthFlowKind, OAuthHost,
+    OAuthIoContext, OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle, PreparedHttpsRequest,
+    ProviderRequest, RawCallbackInput, RawHttpsResponse, ScriptedBrowser, ScriptedCallback,
+    ScriptedCancel, ScriptedClock, ScriptedHttpsTransport, TrustedEndpoint, TrustedTransportPolicy,
 };
 use rustscript_agent::auth::pkce::{self, PKCE_CHALLENGE_METHOD};
 use rustscript_agent::auth::store::AuthStore;
@@ -160,6 +160,67 @@ fn begin_code_exchange(host: &OAuthHost) -> (OpaqueAuthorizationCodeHandle, Opaq
         .callback_wait(&begun.callback_handle)
         .expect("callback");
     (waited.code_handle.expect("code"), begun.verifier_handle)
+}
+
+// Advance only the injected host clock, leaving a long policy deadline live.
+struct FlowTtlClock {
+    base: Instant,
+    offset: Mutex<Duration>,
+}
+
+impl FlowTtlClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            offset: Mutex::new(Duration::ZERO),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        *self.offset.lock().expect("clock offset") += duration;
+    }
+
+    fn long_policy(&self) -> TrustedTransportPolicy {
+        let mut policy = policy();
+        policy.deadline = self.base + Duration::from_secs(3600);
+        policy
+    }
+}
+
+impl OAuthClock for FlowTtlClock {
+    fn now(&self) -> Instant {
+        self.base + *self.offset.lock().expect("clock offset")
+    }
+
+    fn unix_ms(&self) -> u64 {
+        1_900_000_000_000
+    }
+}
+
+struct AdvancingTransport {
+    scripted: Arc<ScriptedHttpsTransport>,
+    clock: Arc<FlowTtlClock>,
+    advance_on: &'static str,
+    advance_by: Duration,
+    deadlines: Mutex<Vec<Instant>>,
+}
+
+impl BoundedHttpsTransport for AdvancingTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        self.deadlines
+            .lock()
+            .expect("deadlines")
+            .push(context.deadline());
+        let response = self.scripted.send(request, context);
+        if request.url.ends_with(self.advance_on) {
+            self.clock.advance(self.advance_by);
+        }
+        response
+    }
 }
 
 #[test]
@@ -666,6 +727,171 @@ fn device_poll_pending_then_success_injects_device_id_and_consumes_on_authorize(
 }
 
 #[test]
+fn device_poll_rejects_flow_ttl_crossed_inside_send_and_revokes_session() {
+    for (advance_by, late) in [(Duration::ZERO, false), (Duration::from_secs(901), true)] {
+        let clock = Arc::new(FlowTtlClock::new());
+        let policy = clock.long_policy();
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let transport = Arc::new(AdvancingTransport {
+            scripted: Arc::clone(&scripted),
+            clock: Arc::clone(&clock),
+            advance_on: "/oauth/device/token",
+            advance_by,
+            deadlines: Mutex::new(Vec::new()),
+        });
+        let host = OAuthHost::new(
+            Arc::clone(&transport) as Arc<_>,
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::clone(&clock) as Arc<_>,
+            Arc::new(ScriptedCancel::new()),
+        );
+        scripted.push_json(200, device_start_json());
+        let handle = host
+            .transport(
+                &policy,
+                provider_request("/oauth/device", "client_id=synthetic-client"),
+                CredentialUse::None,
+            )
+            .expect("start")
+            .device_handle
+            .expect("device handle");
+        scripted.push_json(200, token_success_json());
+        let result = host.transport(
+            &policy,
+            provider_request("/oauth/device/token", "grant_type=device_code"),
+            CredentialUse::Device(handle.clone()),
+        );
+        if late {
+            assert_eq!(
+                result.expect_err("flow expired during device poll").code(),
+                "deadline_exceeded"
+            );
+            assert_eq!(
+                host.transport(
+                    &policy,
+                    provider_request("/oauth/device/token", "grant_type=device_code"),
+                    CredentialUse::Device(handle),
+                )
+                .expect_err("expired session revoked")
+                .code(),
+                "handle_revoked"
+            );
+        } else {
+            assert!(result.expect("within flow lifetime").access_slot.is_some());
+            assert_eq!(
+                host.transport(
+                    &policy,
+                    provider_request("/oauth/device/token", "grant_type=device_code"),
+                    CredentialUse::Device(handle),
+                )
+                .expect_err("completed session replay")
+                .code(),
+                "handle_replayed"
+            );
+        }
+        if late {
+            assert_eq!(
+                transport.deadlines.lock().expect("deadlines")[1],
+                clock.base + Duration::from_secs(900)
+            );
+        }
+    }
+}
+
+#[test]
+fn device_terminal_consume_uses_fresh_clock_and_revokes_on_expiry() {
+    struct CompletionClock {
+        inner: FlowTtlClock,
+        reads_until_jump: Mutex<Option<usize>>,
+    }
+    impl OAuthClock for CompletionClock {
+        fn now(&self) -> Instant {
+            let now = self.inner.now();
+            let mut reads = self.reads_until_jump.lock().expect("reads");
+            if let Some(remaining) = *reads {
+                if remaining == 1 {
+                    self.inner.advance(Duration::from_secs(901));
+                    *reads = None;
+                } else {
+                    *reads = Some(remaining - 1);
+                }
+            }
+            now
+        }
+        fn unix_ms(&self) -> u64 {
+            self.inner.unix_ms()
+        }
+    }
+    struct CompletionTransport {
+        scripted: Arc<ScriptedHttpsTransport>,
+        clock: Arc<CompletionClock>,
+    }
+    impl BoundedHttpsTransport for CompletionTransport {
+        fn send(
+            &self,
+            request: &PreparedHttpsRequest,
+            context: &OAuthIoContext,
+        ) -> Result<RawHttpsResponse, OAuthError> {
+            let result = self.scripted.send(request, context);
+            if request.url.ends_with("/oauth/device/token") {
+                // Host checks after send, then after sanitization. Advance just
+                // after the latter returns its in-budget clock reading.
+                *self.clock.reads_until_jump.lock().expect("reads") = Some(2);
+            }
+            result
+        }
+    }
+    let clock = Arc::new(CompletionClock {
+        inner: FlowTtlClock::new(),
+        reads_until_jump: Mutex::new(None),
+    });
+    let policy = clock.inner.long_policy();
+    let scripted = Arc::new(ScriptedHttpsTransport::new());
+    let host = OAuthHost::new(
+        Arc::new(CompletionTransport {
+            scripted: Arc::clone(&scripted),
+            clock: Arc::clone(&clock),
+        }),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::clone(&clock) as Arc<_>,
+        Arc::new(ScriptedCancel::new()),
+    );
+    scripted.push_json(200, device_start_json());
+    let handle = host
+        .transport(
+            &policy,
+            provider_request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("start")
+        .device_handle
+        .expect("device handle");
+    scripted.push_json(200, token_success_json());
+    assert_eq!(
+        host.transport(
+            &policy,
+            provider_request("/oauth/device/token", "grant_type=device_code"),
+            CredentialUse::Device(handle.clone()),
+        )
+        .expect_err("expired at terminal completion")
+        .code(),
+        "handle_expired"
+    );
+    assert_eq!(
+        host.transport(
+            &policy,
+            provider_request("/oauth/device/token", "grant_type=device_code"),
+            CredentialUse::Device(handle),
+        )
+        .expect_err("revoked terminal flow")
+        .code(),
+        "handle_revoked"
+    );
+}
+
+#[test]
 fn device_slow_down_keeps_session_live_until_success() {
     let (host, transport, _, _, _, _) = default_host();
     transport.push_json(200, device_start_json());
@@ -878,6 +1104,75 @@ fn copied_code_and_verifier_exchange_once_and_replay_fails() {
         )
         .expect_err("replay");
     assert_eq!(replay.code(), "handle_replayed");
+}
+
+#[test]
+fn code_exchange_rejects_flow_ttl_crossed_inside_send_and_keeps_replay_consumed() {
+    for (advance_by, late) in [(Duration::ZERO, false), (Duration::from_secs(901), true)] {
+        let clock = Arc::new(FlowTtlClock::new());
+        let policy = clock.long_policy();
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let transport = Arc::new(AdvancingTransport {
+            scripted: Arc::clone(&scripted),
+            clock: Arc::clone(&clock),
+            advance_on: "/oauth/token",
+            advance_by,
+            deadlines: Mutex::new(Vec::new()),
+        });
+        let host = OAuthHost::new(
+            Arc::clone(&transport) as Arc<_>,
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::clone(&clock) as Arc<_>,
+            Arc::new(ScriptedCancel::new()),
+        );
+        let begun = host
+            .pkce_begin(&policy, intent(CallbackMode::Manual))
+            .expect("begin");
+        host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+            .expect("inject");
+        let code = host
+            .callback_wait(&begun.callback_handle)
+            .expect("wait")
+            .code_handle
+            .expect("code");
+        let verifier = begun.verifier_handle;
+        scripted.push_json(200, token_success_json());
+        let result = host.transport(
+            &policy,
+            provider_request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: code.clone(),
+                verifier: verifier.clone(),
+            },
+        );
+        if late {
+            assert_eq!(
+                result
+                    .expect_err("flow expired during code exchange")
+                    .code(),
+                "deadline_exceeded"
+            );
+        } else {
+            assert!(result.expect("within flow lifetime").access_slot.is_some());
+        }
+        if late {
+            assert_eq!(
+                transport.deadlines.lock().expect("deadlines").as_slice(),
+                &[clock.base + Duration::from_secs(900)]
+            );
+        }
+        assert_eq!(
+            host.transport(
+                &policy,
+                provider_request("/oauth/token", "grant_type=authorization_code"),
+                CredentialUse::AuthorizationCode { code, verifier },
+            )
+            .expect_err("consumed after send")
+            .code(),
+            "handle_replayed"
+        );
+    }
 }
 
 #[test]
@@ -1498,6 +1793,120 @@ fn transport_deadline_crossed_inside_send_discards_response() {
         .code(),
         "deadline_exceeded"
     );
+}
+
+#[test]
+fn browser_open_rejects_callback_ttl_crossed_inside_open() {
+    struct AdvancingBrowser {
+        clock: Arc<FlowTtlClock>,
+        advance_by: Duration,
+        deadlines: Mutex<Vec<Instant>>,
+    }
+    impl BrowserOpener for AdvancingBrowser {
+        fn open(&self, _url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+            context.check()?;
+            self.deadlines
+                .lock()
+                .expect("deadlines")
+                .push(context.deadline());
+            self.clock.advance(self.advance_by);
+            Ok(())
+        }
+    }
+    for (advance_by, late) in [(Duration::ZERO, false), (Duration::from_secs(901), true)] {
+        let clock = Arc::new(FlowTtlClock::new());
+        let policy = clock.long_policy();
+        let browser = Arc::new(AdvancingBrowser {
+            clock: Arc::clone(&clock),
+            advance_by,
+            deadlines: Mutex::new(Vec::new()),
+        });
+        let host = OAuthHost::new(
+            Arc::new(ScriptedHttpsTransport::new()),
+            Arc::new(ScriptedCallback::new()),
+            Arc::clone(&browser) as Arc<_>,
+            Arc::clone(&clock) as Arc<_>,
+            Arc::new(ScriptedCancel::new()),
+        );
+        let result = host.pkce_begin(&policy, intent(CallbackMode::Browser));
+        if late {
+            let error = match result {
+                Ok(_) => panic!("expired callback envelope was returned"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), "deadline_exceeded");
+        } else {
+            let begun = result.expect("live callback envelope");
+            host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+                .expect("live flow");
+        }
+        if late {
+            assert_eq!(
+                browser.deadlines.lock().expect("deadlines").as_slice(),
+                &[clock.base + Duration::from_secs(900)]
+            );
+        }
+    }
+}
+
+#[test]
+fn browser_failure_after_callback_expiry_reports_deadline_and_reclaims_cap() {
+    struct FailingExpiringBrowser(Arc<FlowTtlClock>);
+    impl BrowserOpener for FailingExpiringBrowser {
+        fn open(&self, _url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+            context.check()?;
+            self.0.advance(Duration::from_secs(901));
+            Err(OAuthError::Transport {
+                message: "fixture browser failure".into(),
+            })
+        }
+    }
+    let clock = Arc::new(FlowTtlClock::new());
+    let policy = clock.long_policy();
+    let host = OAuthHost::new(
+        Arc::new(ScriptedHttpsTransport::new()),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(FailingExpiringBrowser(Arc::clone(&clock))),
+        Arc::clone(&clock) as Arc<_>,
+        Arc::new(ScriptedCancel::new()),
+    );
+    let error = match host.pkce_begin(&policy, intent(CallbackMode::Browser)) {
+        Ok(_) => panic!("expired callback envelope was returned"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "deadline_exceeded");
+    for _ in 0..MAX_LIVE_OAUTH_FLOWS {
+        host.pkce_begin(&policy, intent(CallbackMode::Manual))
+            .expect("failing browser flow must not occupy cap");
+    }
+}
+
+#[test]
+fn browser_error_after_late_cancel_is_classified_and_flow_revoked() {
+    struct FailingCancellingBrowser(Arc<ScriptedCancel>);
+    impl BrowserOpener for FailingCancellingBrowser {
+        fn open(&self, _url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+            context.check()?;
+            self.0.cancel();
+            Err(OAuthError::Transport {
+                message: "fixture browser failure".into(),
+            })
+        }
+    }
+    let cancel = Arc::new(ScriptedCancel::new());
+    let clock = Arc::new(FlowTtlClock::new());
+    let host = OAuthHost::new(
+        Arc::new(ScriptedHttpsTransport::new()),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(FailingCancellingBrowser(Arc::clone(&cancel))),
+        Arc::clone(&clock) as Arc<_>,
+        cancel,
+    );
+    let error = match host.pkce_begin(&clock.long_policy(), intent(CallbackMode::Browser)) {
+        Ok(_) => panic!("cancelled callback envelope was returned"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "cancelled");
 }
 
 #[test]

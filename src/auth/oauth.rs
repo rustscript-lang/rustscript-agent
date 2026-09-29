@@ -851,13 +851,14 @@ impl OAuthHost {
             device_in_flight: AtomicBool::new(false),
         });
         self.insert_flow(Arc::clone(&flow))?;
-        let context = self.io_context(policy.deadline);
+        let context = self.io_context(flow.expires_at);
         let opened = context.check().and_then(|()| {
             if intent.callback_mode == CallbackMode::Browser {
                 self.inner.browser.open(&authorization_url, &context)?;
             }
-            context.check()
+            Ok(())
         });
+        let opened = context.check().and(opened);
         if let Err(error) = opened {
             self.drop_and_revoke(&flow);
             return Err(error);
@@ -944,7 +945,21 @@ impl OAuthHost {
         })?;
         self.validate_credential_use(policy, credential_id.as_str(), &credential_use)?;
         reject_reserved_form_keys(&body)?;
-        if let Err(error) = self.check_cancel_deadline(policy) {
+        // Capture the flow bound before code/verifier consumption removes its
+        // registry entry. A policy may outlive a callback or device session.
+        let operation_deadline = match &credential_use {
+            CredentialUse::AuthorizationCode { code, .. } => {
+                min_deadline(policy.deadline, self.live_flow(code)?.expires_at)
+            }
+            CredentialUse::Device(handle) => {
+                min_deadline(policy.deadline, self.live_flow(handle)?.expires_at)
+            }
+            CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => {
+                policy.deadline
+            }
+        };
+        let context = self.io_context(operation_deadline);
+        if let Err(error) = context.check() {
             self.revoke_credential_use(&credential_use);
             return Err(error);
         }
@@ -1000,7 +1015,6 @@ impl OAuthHost {
             None => None,
         };
         prepared.body = body;
-        let context = self.io_context(policy.deadline);
         let sent = context
             .check()
             .and_then(|()| self.inner.transport.send(&prepared, &context));
@@ -1036,7 +1050,14 @@ impl OAuthHost {
         }
         match device_session.as_ref() {
             Some(flow) if sanitized.access_slot.is_some() || sanitized.refresh_slot.is_some() => {
-                flow.consume_flag(&flow.device_state, DEVICE_HANDLE_CLASS, now)?;
+                if let Err(error) = flow.consume_flag(
+                    &flow.device_state,
+                    DEVICE_HANDLE_CLASS,
+                    self.inner.clock.now(),
+                ) {
+                    self.drop_and_revoke(flow);
+                    return Err(error);
+                }
                 flow.clear_device_code();
                 self.drop_flow(flow.id);
             }
