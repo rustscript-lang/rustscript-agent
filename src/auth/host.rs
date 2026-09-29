@@ -1160,17 +1160,101 @@ fn revoke_response(oauth: &OAuthHost, response: &SanitizedProviderResponse) {
     }
 }
 
+enum TransportCredential {
+    None,
+    Access(ResourceHandle, OpaqueAccessHandle),
+    Refresh(ResourceHandle, OpaqueRefreshHandle),
+}
+
+impl TransportCredential {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Access(_, handle) => handle.generation(),
+            Self::Refresh(_, handle) => handle.generation(),
+        }
+    }
+
+    fn for_send(&self) -> CredentialUse {
+        match self {
+            Self::None => CredentialUse::None,
+            Self::Access(_, handle) => CredentialUse::Access(handle.clone()),
+            Self::Refresh(_, handle) => CredentialUse::Refresh(handle.clone()),
+        }
+    }
+
+    fn close_if_terminal(&self, vm: &mut Vm) -> VmResult<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::Access(resource, handle) if handle.is_terminal() => vm
+                .host_context()
+                .close_resource::<Access>(*resource, ResourceCloseReason::Requested)
+                .map(|_| ())
+                .map_err(|_| error("resource_invalid")),
+            Self::Refresh(resource, handle) if handle.is_terminal() => vm
+                .host_context()
+                .close_resource::<Refresh>(*resource, ResourceCloseReason::Requested)
+                .map(|_| ())
+                .map_err(|_| error("resource_invalid")),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn transport_credential(
+    vm: &mut Vm,
+    usage: &Value,
+    owner: &Arc<Owner>,
+) -> VmResult<TransportCredential> {
+    let access = optional_field(usage, "access_handle")?;
+    let refresh = optional_field(usage, "refresh_handle")?;
+    match (string(field(usage, "kind")?)?, access, refresh) {
+        ("none", None, None) => Ok(TransportCredential::None),
+        ("access", Some(value), None) => {
+            borrowed::<Access>(vm, value)?;
+            let context = vm.host_context();
+            let entry = context
+                .borrow_resource_with_key::<Access>(
+                    handle(value)?,
+                    &ResourceTypeKey::new(Access::KEY).expect("static key"),
+                )
+                .map_err(|_| error("resource_invalid"))?;
+            if !Arc::ptr_eq(owner, &entry.owner) {
+                return Err(error("owner_mismatch"));
+            }
+            Ok(TransportCredential::Access(
+                handle(value)?,
+                entry.handle.clone(),
+            ))
+        }
+        ("refresh", None, Some(value)) => {
+            borrowed::<Refresh>(vm, value)?;
+            let context = vm.host_context();
+            let entry = context
+                .borrow_resource_with_key::<Refresh>(
+                    handle(value)?,
+                    &ResourceTypeKey::new(Refresh::KEY).expect("static key"),
+                )
+                .map_err(|_| error("resource_invalid"))?;
+            if !Arc::ptr_eq(owner, &entry.owner) {
+                return Err(error("owner_mismatch"));
+            }
+            Ok(TransportCredential::Refresh(
+                handle(value)?,
+                entry.handle.clone(),
+            ))
+        }
+        _ => Err(error("credential_use_unsupported")),
+    }
+}
+
 fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let request = args.first().ok_or_else(|| error("invalid_request"))?;
     let usage = args.get(1).ok_or_else(|| error("invalid_request"))?;
     let id = string(field(request, "credential_id")?)?;
     let owner = policy_owner(vm, field(request, "policy_handle")?, id)?;
-    if string(field(usage, "kind")?)? != "none"
-        || optional_field(usage, "access_handle")?.is_some()
-        || optional_field(usage, "refresh_handle")?.is_some()
-    {
-        return Err(error("credential_use_unsupported"));
-    }
+    let credential = transport_credential(vm, usage, &owner)?;
+    let generation = credential.generation();
     let oauth = owner
         .oauth
         .as_ref()
@@ -1197,19 +1281,22 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
     let policy = transport_policy(&owner, id)?;
     owner.check()?;
-    let response = oauth
-        .transport(
-            &policy,
-            ProviderRequest {
-                method: string(field(request, "method")?)?.to_owned(),
-                path: string(field(request, "path")?)?.to_owned(),
-                public_headers,
-                public_body: string(field(request, "public_body")?)?.to_owned(),
-                credential_id: id.to_owned(),
-            },
-            CredentialUse::None,
-        )
-        .map_err(|failure| error(failure.code()))?;
+    let sent = oauth.transport(
+        &policy,
+        ProviderRequest {
+            method: string(field(request, "method")?)?.to_owned(),
+            path: string(field(request, "path")?)?.to_owned(),
+            public_headers,
+            public_body: string(field(request, "public_body")?)?.to_owned(),
+            credential_id: id.to_owned(),
+        },
+        credential.for_send(),
+    );
+    // A local admission failure keeps the live resource available for retry.
+    // Once the store entry is terminal, close the Core alias even on send errors.
+    let closed = credential.close_if_terminal(vm);
+    let response = sent.map_err(|failure| error(failure.code()))?;
+    closed?;
     let processed = (|| {
         owner.check()?;
         if response.device_handle.is_some() || response.code_handle.is_some() {
@@ -1235,7 +1322,7 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
                 vm,
                 &owner,
                 id,
-                0,
+                generation,
                 SecretSlotKind::Access,
                 slot.clone(),
             )?)
@@ -1243,7 +1330,14 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             None
         };
         let refresh = if let Some(slot) = &response.refresh_slot {
-            match issue_owner_slot(vm, &owner, id, 0, SecretSlotKind::Refresh, slot.clone()) {
+            match issue_owner_slot(
+                vm,
+                &owner,
+                id,
+                generation,
+                SecretSlotKind::Refresh,
+                slot.clone(),
+            ) {
                 Ok(value) => Some(value),
                 Err(failure) => {
                     if let Some(value) = &access {

@@ -220,6 +220,366 @@ fn rss_no_credential_transport_returns_sanitized_public_body_and_host_slots() {
     assert!(!format!("{:?}", sent[0]).contains("SYNTHETIC_ACCESS_TOKEN"));
 }
 
+#[test]
+fn access_transport_injects_bearer_and_preserves_slot_generation() {
+    let mut vm = vm();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(
+        200,
+        r#"{"access_token":"SYNTHETIC_NEW_ACCESS","public":"ok"}"#,
+    );
+    let oauth = Arc::new(OAuthHost::new(
+        transport.clone(),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let host = AuthHost::new(
+        fixture_home(),
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+    )
+    .expect("host")
+    .with_oauth_host(oauth);
+    let home = field(&host.bind_vm(&mut vm).expect("bind"), "host_home").clone();
+    let call = vm
+        .resolve_exported_callable("access_transport")
+        .expect("RSS entry");
+    let response = vm.invoke_callable(call, &[home]).expect("access transport");
+    assert_eq!(field(&response, "status"), &Value::Int(200));
+    assert_eq!(
+        field(&response, "body"),
+        &Value::string(r#"{"public":"ok"}"#)
+    );
+    assert!(matches!(field(&response, "access_slot"), Value::Int(_)));
+    assert!(!format!("{response:?}").contains("SYNTHETIC_NEW_ACCESS"));
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer SYNTHETIC_ACCESS_TOKEN")
+    );
+    assert!(!format!("{:?}", sent[0]).contains("SYNTHETIC_ACCESS_TOKEN"));
+    assert_eq!(vm.host_context().resource_count(), 3);
+}
+
+fn bound_bridge() -> (Vm, AuthHost, Arc<ScriptedHttpsTransport>, Value) {
+    let mut vm = vm();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let oauth = Arc::new(OAuthHost::new(
+        transport.clone(),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let host = AuthHost::new(
+        fixture_home(),
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+    )
+    .expect("host")
+    .with_oauth_host(oauth);
+    let home = field(&host.bind_vm(&mut vm).expect("bind"), "host_home").clone();
+    (vm, host, transport, home)
+}
+
+fn invoke(vm: &mut Vm, name: &str, args: &[Value]) -> Result<Value, rustscript_vm::VmError> {
+    let call = vm.resolve_exported_callable(name).expect("RSS entry");
+    vm.invoke_callable(call, args)
+}
+
+#[test]
+fn refresh_transport_injects_form_once_and_closes_alias() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let refresh = invoke(&mut vm, "issue_refresh", std::slice::from_ref(&policy)).expect("refresh");
+    transport.push_raw(
+        200,
+        r#"{"access_token":"SYNTHETIC_NEW_ACCESS","refresh_token":"SYNTHETIC_NEW_REFRESH"}"#,
+    );
+    let args = [
+        policy.clone(),
+        refresh.clone(),
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("refresh"),
+        Value::string("grant_type=refresh_token"),
+    ];
+    let response = invoke(&mut vm, "send_refresh", &args).expect("refresh send");
+    assert_eq!(field(&response, "status"), &Value::Int(200));
+    assert!(matches!(field(&response, "access_slot"), Value::Int(_)));
+    assert!(matches!(field(&response, "refresh_slot"), Value::Int(_)));
+    assert!(!format!("{response:?}").contains("SYNTHETIC_NEW_REFRESH"));
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].body,
+        "grant_type=refresh_token&refresh_token=SYNTHETIC_REFRESH_TOKEN"
+    );
+    assert!(!format!("{:?}", sent[0]).contains("SYNTHETIC_REFRESH_TOKEN"));
+    assert_eq!(vm.host_context().resource_count(), 4);
+    assert!(invoke(&mut vm, "send_refresh", &args).is_err());
+    assert!(transport.take_sent().is_empty());
+}
+
+#[test]
+fn access_local_rejection_retains_handle_for_retry_then_replay_fails() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    let mut args = [
+        policy,
+        access,
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("access"),
+        Value::string(""),
+    ];
+    for (index, value) in [
+        (2, "unadmitted"),
+        (3, "//evil.example/token"),
+        (4, "refresh"),
+        (5, "refresh_token=forged"),
+    ] {
+        let original = args[index].clone();
+        args[index] = Value::string(value);
+        let failure = invoke(&mut vm, "send_access", &args).expect_err("local denial");
+        assert!(!failure.to_string().contains("SYNTHETIC_ACCESS_TOKEN"));
+        assert_eq!(vm.host_context().resource_count(), 3);
+        assert!(transport.take_sent().is_empty());
+        args[index] = original;
+    }
+    transport.push_raw(200, "{}");
+    assert_eq!(
+        field(
+            &invoke(&mut vm, "send_access", &args).expect("retry"),
+            "status"
+        ),
+        &Value::Int(200)
+    );
+    assert_eq!(vm.host_context().resource_count(), 2);
+    assert_eq!(transport.take_sent().len(), 1);
+    assert!(invoke(&mut vm, "send_access", &args).is_err());
+    assert!(transport.take_sent().is_empty());
+}
+
+#[test]
+fn refresh_rejects_shapes_and_local_form_then_retries() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    let refresh = invoke(&mut vm, "issue_refresh", std::slice::from_ref(&policy)).expect("refresh");
+    let both = [policy.clone(), access, refresh.clone()];
+    assert!(invoke(&mut vm, "send_both", &both).is_err());
+    let mut args = [
+        policy,
+        refresh,
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("refresh"),
+        Value::string("grant_type=refresh_token"),
+    ];
+    for (index, invalid) in [
+        (2, "unadmitted"),
+        (3, "//evil.example/token"),
+        (4, "access"),
+        (5, "refresh_token=forged"),
+    ] {
+        let valid = args[index].clone();
+        args[index] = Value::string(invalid);
+        assert!(invoke(&mut vm, "send_refresh", &args).is_err());
+        assert_eq!(vm.host_context().resource_count(), 4);
+        assert!(transport.take_sent().is_empty());
+        args[index] = valid;
+    }
+    transport.push_raw(200, "{}");
+    assert_eq!(
+        field(
+            &invoke(&mut vm, "send_refresh", &args).expect("retry"),
+            "status"
+        ),
+        &Value::Int(200)
+    );
+    assert_eq!(vm.host_context().resource_count(), 3);
+    assert_eq!(transport.take_sent().len(), 1);
+}
+
+#[test]
+fn foreign_resources_wrong_class_and_generation_fail_before_send() {
+    let (mut origin, _, _, home) = bound_bridge();
+    let policy = invoke(&mut origin, "snapshot_only", &[home]).expect("policy");
+    let access =
+        invoke(&mut origin, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    let refresh =
+        invoke(&mut origin, "issue_refresh", std::slice::from_ref(&policy)).expect("refresh");
+    assert!(
+        invoke(
+            &mut origin,
+            "issue_wrong_generation",
+            std::slice::from_ref(&policy)
+        )
+        .is_err()
+    );
+    let (mut target, _, transport, target_home) = bound_bridge();
+    let target_policy = invoke(&mut target, "snapshot_only", &[target_home]).expect("policy");
+    let defaults = [
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("access"),
+        Value::string(""),
+    ];
+    for (policy_arg, handle_arg) in [
+        (policy.clone(), access.clone()),
+        (target_policy.clone(), access.clone()),
+        (target_policy.clone(), refresh.clone()),
+        (target_policy.clone(), Value::Int(i64::MAX)),
+    ] {
+        let args = [vec![policy_arg, handle_arg], defaults.to_vec()].concat();
+        assert!(invoke(&mut target, "send_access", &args).is_err());
+        assert!(transport.take_sent().is_empty());
+    }
+    let bad = [
+        policy,
+        refresh,
+        defaults[0].clone(),
+        defaults[1].clone(),
+        defaults[2].clone(),
+        defaults[3].clone(),
+    ];
+    assert!(invoke(&mut origin, "send_access", &bad).is_err());
+}
+
+#[test]
+fn send_error_closes_access_and_refresh_resources() {
+    for (issue, send, kind, body) in [
+        ("issue_access", "send_access", "access", ""),
+        (
+            "issue_refresh",
+            "send_refresh",
+            "refresh",
+            "grant_type=refresh_token",
+        ),
+    ] {
+        let (mut vm, _, transport, home) = bound_bridge();
+        let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+        let handle = invoke(&mut vm, issue, std::slice::from_ref(&policy)).expect("issue");
+        let args = [
+            policy,
+            handle,
+            Value::string("fixture-codex"),
+            Value::string("/oauth/token"),
+            Value::string(kind),
+            Value::string(body),
+        ];
+        let failure = invoke(&mut vm, send, &args).expect_err("scripted send failure");
+        assert!(!failure.to_string().contains("SYNTHETIC"));
+        assert_eq!(transport.take_sent().len(), 1);
+        assert_eq!(vm.host_context().resource_count(), 2);
+        assert!(invoke(&mut vm, send, &args).is_err());
+        assert!(transport.take_sent().is_empty());
+    }
+}
+
+#[test]
+fn transport_slot_saves_only_at_issued_generation() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    transport.push_raw(200, r#"{"access_token":"SYNTHETIC_NEW_ACCESS"}"#);
+    let args = [
+        policy.clone(),
+        access,
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("access"),
+        Value::string(""),
+    ];
+    let response = invoke(&mut vm, "send_access", &args).expect("response");
+    let slot = field(&response, "access_slot").clone();
+    let wrong = [policy.clone(), slot.clone(), Value::Int(3)];
+    assert!(invoke(&mut vm, "save_transport_slot", &wrong).is_err());
+    let right = [policy, slot.clone(), Value::Int(4)];
+    assert_eq!(
+        invoke(&mut vm, "save_transport_slot", &right).expect("CAS"),
+        Value::Int(5)
+    );
+    assert!(invoke(&mut vm, "save_transport_slot", &right).is_err());
+    assert_eq!(transport.take_sent().len(), 1);
+    assert_eq!(vm.host_context().resource_count(), 2);
+}
+
+#[test]
+fn terminal_handles_reclaim_resource_budget_across_repeated_requests() {
+    let (mut vm, _, transport, home) = bound_bridge();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    for (issue, send, kind, body) in [
+        ("issue_access", "send_access", "access", ""),
+        (
+            "issue_refresh",
+            "send_refresh",
+            "refresh",
+            "grant_type=refresh_token",
+        ),
+    ] {
+        for _ in 0..70 {
+            let handle =
+                invoke(&mut vm, issue, std::slice::from_ref(&policy)).expect("capacity available");
+            transport.push_raw(200, "{}");
+            let args = [
+                policy.clone(),
+                handle,
+                Value::string("fixture-codex"),
+                Value::string("/oauth/token"),
+                Value::string(kind),
+                Value::string(body),
+            ];
+            assert_eq!(
+                field(&invoke(&mut vm, send, &args).expect("send"), "status"),
+                &Value::Int(200)
+            );
+            assert_eq!(vm.host_context().resource_count(), 2);
+        }
+    }
+    assert_eq!(transport.take_sent().len(), 140);
+}
+
+#[test]
+fn cancellation_after_credential_send_reclaims_handle_without_slots() {
+    let mut vm = vm();
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let transport = Arc::new(CancelAfterSend {
+        cancel: cancellation.clone(),
+        sent: Default::default(),
+    });
+    let oauth = Arc::new(OAuthHost::new(
+        transport.clone(),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let host = AuthHost::new(fixture_home(), cancellation)
+        .expect("host")
+        .with_oauth_host(oauth);
+    let home = field(&host.bind_vm(&mut vm).expect("bind"), "host_home").clone();
+    let policy = invoke(&mut vm, "snapshot_only", &[home]).expect("policy");
+    let access = invoke(&mut vm, "issue_access", std::slice::from_ref(&policy)).expect("access");
+    let args = [
+        policy,
+        access,
+        Value::string("fixture-codex"),
+        Value::string("/oauth/token"),
+        Value::string("access"),
+        Value::string(""),
+    ];
+    let failure = invoke(&mut vm, "send_access", &args).expect_err("cancelled");
+    assert!(!failure.to_string().contains("SYNTHETIC_ACCESS_TOKEN"));
+    assert_eq!(transport.sent.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(vm.host_context().resource_count(), 2);
+    assert!(invoke(&mut vm, "send_access", &args).is_err());
+    assert_eq!(transport.sent.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 struct HostileHeadersTransport {
     response: rustscript_agent::auth::oauth::RawHttpsResponse,
 }

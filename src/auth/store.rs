@@ -433,6 +433,13 @@ impl IssuedHandleInner {
         self.state.load(Ordering::Acquire) == HANDLE_LIVE && !self.is_time_expired()
     }
 
+    fn is_terminal(&self) -> bool {
+        if self.is_time_expired() {
+            self.mark_expired();
+        }
+        self.state.load(Ordering::Acquire) != HANDLE_LIVE
+    }
+
     fn mark_revoked(&self) {
         let previous = self.state.swap(HANDLE_REVOKED, Ordering::AcqRel);
         if previous != HANDLE_USED && previous != HANDLE_REVOKED {
@@ -577,6 +584,10 @@ impl OpaqueAccessHandle {
         self.inner.take_against_store()
     }
 
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
+
     pub fn force_expire(&self) {
         self.inner.force_expire();
     }
@@ -637,6 +648,10 @@ impl OpaqueRefreshHandle {
 
     pub(crate) fn take_for_transport(&self) -> Result<SecretText, AuthStoreError> {
         self.inner.take_against_store()
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
     }
 
     pub fn force_expire(&self) {
