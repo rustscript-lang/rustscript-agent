@@ -1,7 +1,7 @@
 //! Resource-backed, run-scoped config and credential host functions.
 //! The RSS boundary carries only typed public records and Core arena resources.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -23,7 +23,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::auth::config::CredentialConfig;
-use crate::auth::oauth::{TrustedEndpoint, TrustedTransportPolicy};
+use crate::auth::oauth::{
+    CredentialUse, OAuthHost, ProviderRequest, SanitizedProviderResponse, TrustedEndpoint,
+    TrustedTransportPolicy,
+};
 use crate::auth::store::{
     AuthMetadata, AuthStore, AuthStoreError, OpaqueAccessHandle, OpaqueRefreshHandle,
     OpaqueSecretSlot, RefreshSecretAction, SaveCredentialRequest as StoreSaveRequest,
@@ -126,6 +129,7 @@ struct Owner {
     policy: Mutex<Option<ResourceHandle>>,
     snapshot: Arc<Snapshot>,
     store: AuthStore,
+    oauth: Option<Arc<OAuthHost>>,
 }
 impl Owner {
     fn check(&self) -> VmResult<()> {
@@ -156,6 +160,7 @@ pub struct AuthHost {
     published: Mutex<Arc<Snapshot>>,
     next_generation: AtomicU64,
     owners: Mutex<Vec<std::sync::Weak<Owner>>>,
+    oauth: Option<Arc<OAuthHost>>,
 }
 
 impl AuthHost {
@@ -176,7 +181,14 @@ impl AuthHost {
             published: Mutex::new(snapshot),
             next_generation: AtomicU64::new(2),
             owners: Mutex::new(Vec::new()),
+            oauth: None,
         })
+    }
+
+    /// Explicit transport dependency; no implicit network or fixture default.
+    pub fn with_oauth_host(mut self, oauth: Arc<OAuthHost>) -> Self {
+        self.oauth = Some(oauth);
+        self
     }
 
     /// Publish a newly validated snapshot; already bound VMs keep their old admission.
@@ -229,6 +241,7 @@ impl AuthHost {
             policy: Mutex::new(None),
             snapshot,
             store: self.store.clone(),
+            oauth: self.oauth.clone(),
         });
         owner.check()?;
         let mut context = vm.host_context();
@@ -281,75 +294,7 @@ impl AuthHost {
         {
             return Err(error("owner_mismatch"));
         }
-
-        let mut endpoints = Vec::new();
-        for provider in owner.snapshot.config.providers.values() {
-            if provider.auth.as_deref() != Some(credential_id) {
-                continue;
-            }
-            let base = trusted_url_endpoint(&provider.base_url)?;
-            let base_authority = base.authority.clone();
-            push_endpoint(&mut endpoints, base);
-            if let Some(oauth) = &provider.oauth {
-                if let Some(token) = &oauth.token_endpoint {
-                    push_endpoint(&mut endpoints, trusted_url_endpoint(token)?);
-                }
-                let issuer_authority = oauth
-                    .issuer
-                    .as_deref()
-                    .map(trusted_url_endpoint)
-                    .transpose()?
-                    .map_or(base_authority, |issuer| issuer.authority);
-                for path in [
-                    &oauth.authorization_path,
-                    &oauth.device_user_code_path,
-                    &oauth.device_poll_path,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if !path.starts_with('/')
-                        || path.starts_with("//")
-                        || path.contains("..")
-                        || path.contains("://")
-                        || path.contains('?')
-                        || path.contains('#')
-                    {
-                        return Err(error("transport_endpoint_invalid"));
-                    }
-                    push_endpoint(
-                        &mut endpoints,
-                        TrustedEndpoint {
-                            authority: issuer_authority.clone(),
-                            path_prefix: trusted_path_prefix(path),
-                        },
-                    );
-                }
-            }
-        }
-        if endpoints.is_empty() {
-            return Err(error("transport_endpoint_unavailable"));
-        }
-        // OAuthHost selects the first matching prefix without considering authority.
-        // Refuse any path that could select a different authority by list order.
-        for (index, left) in endpoints.iter().enumerate() {
-            for right in &endpoints[index + 1..] {
-                if left.authority != right.authority
-                    && (transport_prefix_matches(&left.path_prefix, &right.path_prefix)
-                        || transport_prefix_matches(&right.path_prefix, &left.path_prefix))
-                {
-                    return Err(error("transport_endpoint_ambiguous"));
-                }
-            }
-        }
-        owner.check()?;
-        Ok(TrustedTransportPolicy {
-            generation: owner.snapshot.generation,
-            run_id: owner.identity.clone(),
-            deadline: owner.deadline,
-            endpoints,
-            allowed_header_names: BTreeSet::from(["accept".into(), "content-type".into()]),
-        })
+        transport_policy(&owner, credential_id)
     }
 
     /// Host-only fixture slot issuer. Never exposed as an RSS host function.
@@ -384,7 +329,7 @@ impl AuthHost {
     }
 
     /// Transport-side insertion; only Rust callers can supply the opaque payload.
-    #[allow(dead_code)] // Consumed by the later OAuth transport adapter.
+    #[allow(dead_code)] // Fixture issuer is feature-gated; the bridge uses issue_owner_slot.
     pub(crate) fn issue_transport_slot(
         &self,
         vm: &mut Vm,
@@ -406,6 +351,90 @@ impl AuthHost {
         {
             return Err(error("owner_mismatch"));
         }
+        issue_owner_slot(vm, &owner, credential_id, expected_generation, kind, slot)
+    }
+}
+
+fn transport_policy(owner: &Arc<Owner>, credential_id: &str) -> VmResult<TrustedTransportPolicy> {
+    let mut endpoints = Vec::new();
+    for provider in owner.snapshot.config.providers.values() {
+        if provider.auth.as_deref() != Some(credential_id) {
+            continue;
+        }
+        let base = trusted_url_endpoint(&provider.base_url)?;
+        let base_authority = base.authority.clone();
+        push_endpoint(&mut endpoints, base);
+        if let Some(oauth) = &provider.oauth {
+            if let Some(token) = &oauth.token_endpoint {
+                push_endpoint(&mut endpoints, trusted_url_endpoint(token)?);
+            }
+            let issuer_authority = oauth
+                .issuer
+                .as_deref()
+                .map(trusted_url_endpoint)
+                .transpose()?
+                .map_or(base_authority, |issuer| issuer.authority);
+            for path in [
+                &oauth.authorization_path,
+                &oauth.device_user_code_path,
+                &oauth.device_poll_path,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !path.starts_with('/')
+                    || path.starts_with("//")
+                    || path.contains("..")
+                    || path.contains("://")
+                    || path.contains('?')
+                    || path.contains('#')
+                {
+                    return Err(error("transport_endpoint_invalid"));
+                }
+                push_endpoint(
+                    &mut endpoints,
+                    TrustedEndpoint {
+                        authority: issuer_authority.clone(),
+                        path_prefix: trusted_path_prefix(path),
+                    },
+                );
+            }
+        }
+    }
+    if endpoints.is_empty() {
+        return Err(error("transport_endpoint_unavailable"));
+    }
+    // OAuthHost selects the first matching prefix without considering authority.
+    // Refuse any path that could select a different authority by list order.
+    for (index, left) in endpoints.iter().enumerate() {
+        for right in &endpoints[index + 1..] {
+            if left.authority != right.authority
+                && (transport_prefix_matches(&left.path_prefix, &right.path_prefix)
+                    || transport_prefix_matches(&right.path_prefix, &left.path_prefix))
+            {
+                return Err(error("transport_endpoint_ambiguous"));
+            }
+        }
+    }
+    owner.check()?;
+    Ok(TrustedTransportPolicy {
+        generation: owner.snapshot.generation,
+        run_id: owner.identity.clone(),
+        deadline: owner.deadline,
+        endpoints,
+        allowed_header_names: BTreeSet::from(["accept".into(), "content-type".into()]),
+    })
+}
+
+fn issue_owner_slot(
+    vm: &mut Vm,
+    owner: &Arc<Owner>,
+    credential_id: &str,
+    expected_generation: u64,
+    kind: SecretSlotKind,
+    slot: OpaqueSecretSlot,
+) -> VmResult<Value> {
+    let issued = (|| {
         owner.authorize(credential_id)?;
         slot.validate_for_request(
             kind,
@@ -415,7 +444,30 @@ impl AuthHost {
             &owner.identity,
         )
         .map_err(|_| error("slot_provenance_invalid"))?;
-        issue(vm, SecretSlot { owner, slot })
+        let value = issue(
+            vm,
+            SecretSlot {
+                owner: owner.clone(),
+                slot: slot.clone(),
+            },
+        )?;
+        if let Err(failure) = owner.check() {
+            close_issued_slot(vm, &value);
+            return Err(failure);
+        }
+        Ok(value)
+    })();
+    if issued.is_err() {
+        slot.revoke();
+    }
+    issued
+}
+
+fn close_issued_slot(vm: &mut Vm, value: &Value) {
+    if let Ok(handle) = handle(value) {
+        let _ = vm
+            .host_context()
+            .close_resource::<SecretSlot>(handle, ResourceCloseReason::Requested);
     }
 }
 
@@ -480,6 +532,7 @@ fn load_snapshot(
 fn error(code: &str) -> VmError {
     VmError::HostError(code.to_string())
 }
+#[allow(dead_code)] // Fixture-only slot issuer borrows the run owner.
 fn bound(vm: &mut Vm) -> VmResult<Arc<Owner>> {
     vm.host_context()
         .scope_state::<Bound>()
@@ -791,6 +844,51 @@ fn save_type() -> HostTypeSchema {
         ],
     )
 }
+fn public_header_type() -> HostTypeSchema {
+    named(
+        "PublicHeader",
+        vec![
+            ("name", HostTypeSchema::String),
+            ("value", HostTypeSchema::String),
+        ],
+    )
+}
+fn transport_request_type() -> HostTypeSchema {
+    named(
+        "TransportPublicRequest",
+        vec![
+            ("policy_handle", key(Policy::KEY)),
+            ("credential_id", HostTypeSchema::String),
+            ("method", HostTypeSchema::String),
+            ("path", HostTypeSchema::String),
+            ("public_headers", array(public_header_type())),
+            ("public_body", HostTypeSchema::String),
+        ],
+    )
+}
+fn transport_use_type() -> HostTypeSchema {
+    named(
+        "TransportCredentialUse",
+        vec![
+            ("kind", HostTypeSchema::String),
+            ("access_handle", opt(key(Access::KEY))),
+            ("refresh_handle", opt(key(Refresh::KEY))),
+        ],
+    )
+}
+fn transport_response_type() -> HostTypeSchema {
+    envelope(
+        "TransportResponseEnvelope",
+        vec![
+            ("status", HostTypeSchema::Int),
+            ("public_headers", array(public_header_type())),
+            ("body_without_secret_fields", HostTypeSchema::String),
+            ("retry_after_ms", opt(HostTypeSchema::Int)),
+            ("access_slot", opt(key(SecretSlot::KEY))),
+            ("refresh_slot", opt(key(SecretSlot::KEY))),
+        ],
+    )
+}
 fn param(n: &'static str, ty: HostTypeSchema) -> HostParamSchema {
     HostParamSchema::value(n, ty)
 }
@@ -815,6 +913,17 @@ fn config_desc() -> HostFunctionDescriptor {
         vec![borrow("host_home", key(HostHome::KEY))],
         config_envelope(),
         config_call,
+    )
+}
+fn transport_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::transport",
+        vec![
+            borrow("request", transport_request_type()),
+            borrow("credential_use", transport_use_type()),
+        ],
+        transport_response_type(),
+        transport_call,
     )
 }
 fn metadata_desc() -> HostFunctionDescriptor {
@@ -927,6 +1036,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
         name: "auth",
         functions: &[
             config_desc,
+            transport_desc,
             metadata_desc,
             access_desc,
             refresh_desc,
@@ -994,6 +1104,170 @@ fn config_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         ),
     ]))
 }
+fn optional_field<'a>(value: &'a Value, name: &str) -> VmResult<Option<&'a Value>> {
+    let Value::Map(entries) = value else {
+        return Err(error("invalid_request"));
+    };
+    Ok(entries.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == name && !matches!(value, Value::Null) => Some(value),
+        _ => None,
+    }))
+}
+
+fn revoke_response(oauth: &OAuthHost, response: &SanitizedProviderResponse) {
+    if let Some(slot) = &response.access_slot {
+        slot.revoke();
+    }
+    if let Some(slot) = &response.refresh_slot {
+        slot.revoke();
+    }
+    if let Some(device) = &response.device_handle {
+        let _ = oauth.terminal(device);
+    }
+}
+
+fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let request = args.first().ok_or_else(|| error("invalid_request"))?;
+    let usage = args.get(1).ok_or_else(|| error("invalid_request"))?;
+    let id = string(field(request, "credential_id")?)?;
+    let owner = policy_owner(vm, field(request, "policy_handle")?, id)?;
+    if string(field(usage, "kind")?)? != "none"
+        || optional_field(usage, "access_handle")?.is_some()
+        || optional_field(usage, "refresh_handle")?.is_some()
+    {
+        return Err(error("credential_use_unsupported"));
+    }
+    let oauth = owner
+        .oauth
+        .as_ref()
+        .ok_or_else(|| error("transport_unavailable"))?
+        .clone();
+    let headers = field(request, "public_headers")?;
+    let Value::Array(headers) = headers else {
+        return Err(error("invalid_request"));
+    };
+    if headers.len() > 64 {
+        return Err(error("request_too_large"));
+    }
+    let mut public_headers = BTreeMap::new();
+    for header in headers.iter() {
+        let name = string(field(header, "name")?)?;
+        let value = string(field(header, "value")?)?;
+        if name.len().saturating_add(value.len()) > 8192
+            || public_headers
+                .insert(name.to_owned(), value.to_owned())
+                .is_some()
+        {
+            return Err(error("invalid_headers"));
+        }
+    }
+    let policy = transport_policy(&owner, id)?;
+    owner.check()?;
+    let response = oauth
+        .transport(
+            &policy,
+            ProviderRequest {
+                method: string(field(request, "method")?)?.to_owned(),
+                path: string(field(request, "path")?)?.to_owned(),
+                public_headers,
+                public_body: string(field(request, "public_body")?)?.to_owned(),
+                credential_id: id.to_owned(),
+            },
+            CredentialUse::None,
+        )
+        .map_err(|failure| error(failure.code()))?;
+    let processed = (|| {
+        owner.check()?;
+        if response.device_handle.is_some() || response.code_handle.is_some() {
+            return Err(error("response_handle_unsupported"));
+        }
+        let body = serde_json::to_string(&response.body_without_secret_fields)
+            .map_err(|_| error("malformed_response"))?;
+        if body.len() > 64 * 1024 {
+            return Err(error("response_too_large"));
+        }
+        if response.public_headers.len() > 64
+            || response
+                .public_headers
+                .iter()
+                .map(|(k, v)| k.len().saturating_add(v.len()))
+                .sum::<usize>()
+                > 64 * 1024
+        {
+            return Err(error("response_too_large"));
+        }
+        let access = if let Some(slot) = &response.access_slot {
+            Some(issue_owner_slot(
+                vm,
+                &owner,
+                id,
+                0,
+                SecretSlotKind::Access,
+                slot.clone(),
+            )?)
+        } else {
+            None
+        };
+        let refresh = if let Some(slot) = &response.refresh_slot {
+            match issue_owner_slot(vm, &owner, id, 0, SecretSlotKind::Refresh, slot.clone()) {
+                Ok(value) => Some(value),
+                Err(failure) => {
+                    if let Some(value) = &access {
+                        close_issued_slot(vm, value);
+                    }
+                    return Err(failure);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(failure) = owner.check() {
+            if let Some(value) = &access {
+                close_issued_slot(vm, value);
+            }
+            if let Some(value) = &refresh {
+                close_issued_slot(vm, value);
+            }
+            return Err(failure);
+        }
+        result(object(vec![
+            ("ok", Value::Bool(true)),
+            ("error", Value::Null),
+            ("status", Value::Int(i64::from(response.status))),
+            (
+                "public_headers",
+                Value::array(
+                    response
+                        .public_headers
+                        .iter()
+                        .map(|(name, value)| {
+                            object(vec![
+                                ("name", Value::string(name)),
+                                ("value", Value::string(value)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("body_without_secret_fields", Value::string(body)),
+            (
+                "retry_after_ms",
+                response
+                    .retry_after_ms
+                    .and_then(|n| i64::try_from(n).ok())
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+            ),
+            ("access_slot", access.unwrap_or(Value::Null)),
+            ("refresh_slot", refresh.unwrap_or(Value::Null)),
+        ]))
+    })();
+    if processed.is_err() {
+        revoke_response(&oauth, &response);
+    }
+    processed
+}
+
 fn metadata_value(meta: &AuthMetadata) -> Value {
     json_to_vm_value(
         &json!({"credential_id":meta.credential_id,"provider":meta.provider,"kind":meta.kind,"source":meta.source,"token_type":meta.token_type,"expires_at_ms":meta.expires_at_ms,"scopes":meta.scopes,"account_id":meta.account_id,"generation":meta.generation,"status":meta.status,"last_refresh_at_ms":meta.last_refresh_at_ms,"has_refresh_token":meta.has_refresh_token}),
