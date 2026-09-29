@@ -1,6 +1,7 @@
 //! Authentication configuration, token, and secure-store modules.
 
 pub mod config;
+pub mod host;
 pub mod oauth;
 #[cfg(feature = "config-fixture")]
 pub mod oauth_host;
