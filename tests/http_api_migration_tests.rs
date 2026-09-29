@@ -74,10 +74,14 @@ fn production_and_embedded_http_sources_have_no_map_transport() {
     );
 }
 
-fn assert_rejected(source: &str) {
+fn assert_rejected(source: &str) -> String {
     match AgentRunner::from_source(source, AgentConfig::default()) {
         Ok(_) => panic!("invalid resource call compiled: {source}"),
-        Err(error) => assert!(!error.to_string().is_empty(), "empty compile diagnostic"),
+        Err(error) => {
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.is_empty(), "empty compile diagnostic");
+            diagnostic
+        }
     }
 }
 
@@ -192,14 +196,28 @@ fn wrong_resource_key_fails_at_compile_time() {
 #[test]
 fn request_cannot_be_used_after_send() {
     assert_resource_api_available();
-    assert_rejected(
+    AgentRunner::from_source(
         r#"use http;
         pub fn run(input: map) -> int {
-            let request = http::request::new("GET", "https://example.com/");
-            let response = http::client::request(request);
-            http::request::set_header(&request, "x-test", "late");
+            let mut request = http::request::new("GET", "https://example.com/");
+            http::request::set_header(&mut request, "x-test", "late");
             0;
         }"#,
+        AgentConfig::default(),
+    )
+    .expect("the same mutable borrow must compile before the request is sent");
+    let diagnostic = assert_rejected(
+        r#"use http;
+        pub fn run(input: map) -> int {
+            let mut request = http::request::new("GET", "https://example.com/");
+            let response = http::client::request(request);
+            http::request::set_header(&mut request, "x-test", "late");
+            0;
+        }"#,
+    );
+    assert!(
+        diagnostic.contains("local 'request' was moved earlier"),
+        "expected ownership diagnostic, got {diagnostic}"
     );
 }
 
