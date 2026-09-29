@@ -1160,6 +1160,19 @@ fn revoke_response(oauth: &OAuthHost, response: &SanitizedProviderResponse) {
     }
 }
 
+fn finalize_transport_response(
+    oauth: &OAuthHost,
+    sent: Result<SanitizedProviderResponse, crate::auth::oauth::OAuthError>,
+    closed: VmResult<()>,
+) -> VmResult<SanitizedProviderResponse> {
+    let response = sent.map_err(|failure| error(failure.code()))?;
+    if let Err(failure) = closed {
+        revoke_response(oauth, &response);
+        return Err(failure);
+    }
+    Ok(response)
+}
+
 enum TransportCredential {
     None,
     Access(ResourceHandle, OpaqueAccessHandle),
@@ -1295,8 +1308,7 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     // A local admission failure keeps the live resource available for retry.
     // Once the store entry is terminal, close the Core alias even on send errors.
     let closed = credential.close_if_terminal(vm);
-    let response = sent.map_err(|failure| error(failure.code()))?;
-    closed?;
+    let response = finalize_transport_response(&oauth, sent, closed)?;
     let processed = (|| {
         owner.check()?;
         if response.device_handle.is_some() || response.code_handle.is_some() {
@@ -1596,4 +1608,123 @@ fn close_slot(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         .close_resource::<SecretSlot>(handle(&args[0])?, ResourceCloseReason::Requested)
         .map_err(|_| error("resource_invalid"))?;
     result(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::oauth::{
+        ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport,
+    };
+    use std::time::Duration;
+    use zeroize::Zeroizing;
+
+    fn scripted_oauth() -> OAuthHost {
+        OAuthHost::new(
+            Arc::new(ScriptedHttpsTransport::new()),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(0)),
+            Arc::new(ScriptedCancel::new()),
+        )
+    }
+
+    #[test]
+    fn transport_close_failure_revokes_response_slots() {
+        let oauth = scripted_oauth();
+        let secret = "synthetic-close-error-secret";
+        let slot = |kind| {
+            OpaqueSecretSlot::from_host_secret_until(
+                kind,
+                "credential",
+                1,
+                2,
+                "run",
+                Zeroizing::new(secret.as_bytes().to_vec()),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("host slot")
+        };
+        let access = slot(SecretSlotKind::Access);
+        let refresh = slot(SecretSlotKind::Refresh);
+        for (kind, slot) in [
+            (SecretSlotKind::Access, &access),
+            (SecretSlotKind::Refresh, &refresh),
+        ] {
+            assert!(
+                slot.validate_for_request(kind, "credential", 1, 2, "run")
+                    .is_ok()
+            );
+        }
+        let response = SanitizedProviderResponse {
+            status: 200,
+            public_headers: BTreeMap::new(),
+            body_without_secret_fields: json!({}),
+            retry_after_ms: None,
+            access_slot: Some(access.clone()),
+            refresh_slot: Some(refresh.clone()),
+            device_handle: None,
+            code_handle: None,
+        };
+        let failure =
+            finalize_transport_response(&oauth, Ok(response), Err(error("resource_invalid")))
+                .expect_err("failed close must reject the response");
+        assert!(matches!(&failure, VmError::HostError(code) if code == "resource_invalid"));
+        assert!(!failure.to_string().contains(secret));
+        for (kind, slot) in [
+            (SecretSlotKind::Access, &access),
+            (SecretSlotKind::Refresh, &refresh),
+        ] {
+            assert!(
+                slot.validate_for_request(kind, "credential", 1, 2, "run")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn transport_clean_close_returns_live_response_slot() {
+        let oauth = scripted_oauth();
+        let access = OpaqueSecretSlot::from_host_secret_until(
+            SecretSlotKind::Access,
+            "credential",
+            1,
+            2,
+            "run",
+            Zeroizing::new(b"synthetic-access".to_vec()),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("host slot");
+        let response = SanitizedProviderResponse {
+            status: 200,
+            public_headers: BTreeMap::new(),
+            body_without_secret_fields: json!({}),
+            retry_after_ms: None,
+            access_slot: Some(access.clone()),
+            refresh_slot: None,
+            device_handle: None,
+            code_handle: None,
+        };
+        let returned = finalize_transport_response(&oauth, Ok(response), Ok(())).expect("response");
+        assert_eq!(returned.status, 200);
+        assert!(
+            returned
+                .access_slot
+                .expect("access slot")
+                .validate_for_request(SecretSlotKind::Access, "credential", 1, 2, "run")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transport_failure_precedes_close_failure() {
+        let failure = finalize_transport_response(
+            &scripted_oauth(),
+            Err(crate::auth::oauth::OAuthError::Cancelled),
+            Err(error("resource_invalid")),
+        )
+        .expect_err("transport failure");
+        assert!(failure.to_string().contains("cancelled"));
+        assert!(!failure.to_string().contains("resource_invalid"));
+    }
 }
