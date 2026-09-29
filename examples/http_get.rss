@@ -1,7 +1,7 @@
 use http;
 
-let request = http::request::new("GET", "https://api.example.com/health");
-http::request::set_header(&request, "accept", "application/json");
+let mut request = http::request::new("GET", "https://api.example.com/health");
+http::request::set_header(&mut request, "accept", "application/json");
 let response = http::client::request(request);
 let status = http::response::status(&response);
 let body = http::response::body(&response);
