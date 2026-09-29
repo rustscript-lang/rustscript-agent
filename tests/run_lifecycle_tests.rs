@@ -538,41 +538,55 @@ async fn deadline_terminates_child_process_without_residue() {
 async fn deadline_is_cumulative_from_admission() {
     let provider = ScriptedProvider::new();
     provider.push_hang();
-    let timeout = Duration::from_millis(400);
-    let state = loop_service(short_config(timeout), &provider);
+    let state = loop_service(short_config(Duration::from_millis(400)), &provider);
     let service = state.service();
     let admitted = service
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let remaining = service
+    let cancellation = service
         .handle(&admitted.run_id)
         .expect("live handle")
         .cancellation()
-        .remaining_deadline()
-        .expect("deadline");
-    assert!(
-        remaining < timeout,
-        "remaining deadline {remaining:?} must be less than the original {timeout:?}"
-    );
-    assert!(remaining > Duration::from_millis(20));
-    let started = Instant::now();
-    service
-        .clone()
-        .run_worker(admitted.run_id.clone(), "ignored".to_string())
-        .await;
-    let elapsed = started.elapsed();
+        .clone();
+    let admitted_deadline = cancellation.deadline_instant().expect("admission deadline");
+    let preparation_observed = Arc::new(AtomicBool::new(false));
+    service.inject_agent_compile_lookup_observer(Arc::new({
+        let cancellation = cancellation.clone();
+        let preparation_observed = Arc::clone(&preparation_observed);
+        move || {
+            preparation_observed.store(true, Ordering::SeqCst);
+            assert_eq!(cancellation.deadline_instant(), Some(admitted_deadline));
+            // Consume the admitted budget during preparation. A worker must
+            // not gain a new budget when it finally starts the RSS invocation.
+            thread::sleep(admitted_deadline.saturating_duration_since(Instant::now()));
+            assert_eq!(cancellation.remaining_deadline(), Some(Duration::ZERO));
+        }
+    }));
+    // Preserve the queue delay as well as preparation time in the same budget.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("expired worker and cleanup must finish within the outer bound");
 
+    assert!(preparation_observed.load(Ordering::SeqCst));
+    assert_eq!(cancellation.deadline_instant(), Some(admitted_deadline));
     assert_eq!(
         terminal_events(&service, &admitted.run_id),
         vec!["run.cancelled".to_string()]
     );
     assert_eq!(cancel_reason(&service, &admitted.run_id), "deadline");
-    assert!(
-        elapsed < timeout,
-        "worker should observe remaining deadline, not a fresh {timeout:?}: {elapsed:?}"
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "preparation exhausted the admission deadline before provider work"
     );
+    assert!(service.capability_host_closed(&admitted.run_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
