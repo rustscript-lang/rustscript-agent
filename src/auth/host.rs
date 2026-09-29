@@ -19,9 +19,11 @@ use rustscript_vm::{
     VmResult,
 };
 use serde_json::{Value as Json, json};
+use url::Url;
 use uuid::Uuid;
 
 use crate::auth::config::CredentialConfig;
+use crate::auth::oauth::{TrustedEndpoint, TrustedTransportPolicy};
 use crate::auth::store::{
     AuthMetadata, AuthStore, AuthStoreError, OpaqueAccessHandle, OpaqueRefreshHandle,
     OpaqueSecretSlot, RefreshSecretAction, SaveCredentialRequest as StoreSaveRequest,
@@ -259,6 +261,97 @@ impl AuthHost {
         )]))
     }
 
+    /// Derive a host-only OAuth transport view from a live, host-issued policy.
+    pub fn trusted_transport_policy(
+        &self,
+        vm: &mut Vm,
+        policy: &Value,
+        credential_id: &str,
+    ) -> VmResult<TrustedTransportPolicy> {
+        let owner = policy_owner(vm, policy, credential_id)?;
+        if !self
+            .owners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|weak| {
+                weak.upgrade()
+                    .is_some_and(|candidate| Arc::ptr_eq(&candidate, &owner))
+            })
+        {
+            return Err(error("owner_mismatch"));
+        }
+
+        let mut endpoints = Vec::new();
+        for provider in owner.snapshot.config.providers.values() {
+            if provider.auth.as_deref() != Some(credential_id) {
+                continue;
+            }
+            let base = trusted_url_endpoint(&provider.base_url)?;
+            let base_authority = base.authority.clone();
+            push_endpoint(&mut endpoints, base);
+            if let Some(oauth) = &provider.oauth {
+                if let Some(token) = &oauth.token_endpoint {
+                    push_endpoint(&mut endpoints, trusted_url_endpoint(token)?);
+                }
+                let issuer_authority = oauth
+                    .issuer
+                    .as_deref()
+                    .map(trusted_url_endpoint)
+                    .transpose()?
+                    .map_or(base_authority, |issuer| issuer.authority);
+                for path in [
+                    &oauth.authorization_path,
+                    &oauth.device_user_code_path,
+                    &oauth.device_poll_path,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !path.starts_with('/')
+                        || path.starts_with("//")
+                        || path.contains("..")
+                        || path.contains("://")
+                        || path.contains('?')
+                        || path.contains('#')
+                    {
+                        return Err(error("transport_endpoint_invalid"));
+                    }
+                    push_endpoint(
+                        &mut endpoints,
+                        TrustedEndpoint {
+                            authority: issuer_authority.clone(),
+                            path_prefix: path.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        if endpoints.is_empty() {
+            return Err(error("transport_endpoint_unavailable"));
+        }
+        // OAuthHost selects the first matching prefix without considering authority.
+        // Refuse any path that could select a different authority by list order.
+        for (index, left) in endpoints.iter().enumerate() {
+            for right in &endpoints[index + 1..] {
+                if left.authority != right.authority
+                    && (transport_prefix_matches(&left.path_prefix, &right.path_prefix)
+                        || transport_prefix_matches(&right.path_prefix, &left.path_prefix))
+                {
+                    return Err(error("transport_endpoint_ambiguous"));
+                }
+            }
+        }
+        owner.check()?;
+        Ok(TrustedTransportPolicy {
+            generation: owner.snapshot.generation,
+            run_id: owner.identity.clone(),
+            deadline: owner.deadline,
+            endpoints,
+            allowed_header_names: BTreeSet::from(["accept".into(), "content-type".into()]),
+        })
+    }
+
     /// Host-only fixture slot issuer. Never exposed as an RSS host function.
     #[cfg(any(test, feature = "config-fixture"))]
     pub fn fixture_slot(
@@ -324,6 +417,39 @@ impl AuthHost {
         .map_err(|_| error("slot_provenance_invalid"))?;
         issue(vm, SecretSlot { owner, slot })
     }
+}
+
+fn trusted_url_endpoint(value: &str) -> VmResult<TrustedEndpoint> {
+    let url = Url::parse(value).map_err(|_| error("transport_endpoint_invalid"))?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(error("transport_endpoint_invalid"));
+    }
+    let host = url
+        .host()
+        .ok_or_else(|| error("transport_endpoint_invalid"))?;
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Ok(TrustedEndpoint {
+        authority,
+        path_prefix: url.path().to_string(),
+    })
+}
+
+fn push_endpoint(endpoints: &mut Vec<TrustedEndpoint>, endpoint: TrustedEndpoint) {
+    if !endpoints.contains(&endpoint) {
+        endpoints.push(endpoint);
+    }
+}
+
+fn transport_prefix_matches(prefix: &str, path: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
 fn load_snapshot(
