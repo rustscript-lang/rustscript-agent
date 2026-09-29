@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rustscript_agent::{AgentConfig, AgentRunner};
+use rustscript_agent::{AgentConfig, AgentRunner, RunError};
+use rustscript_vm::Value;
 
 fn source_files(dir: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read source directory") {
@@ -113,10 +114,10 @@ fn restricted_registry_admits_only_required_http_and_no_ambient_io() {
         r#"use http;
         use bytes;
         pub fn run(input: map) -> bool {
-            let request = http::request::new("GET", "https://example.com/");
-            http::request::set_header(&request, "accept", "text/plain");
-            http::request::set_body_text(&request, "hello");
-            http::request::set_body_bytes(&request, bytes::from_utf8("hello"));
+            let mut request = http::request::new("GET", "https://example.com/");
+            http::request::set_header(&mut request, "accept", "text/plain");
+            http::request::set_body_text(&mut request, "hello");
+            http::request::set_body_bytes(&mut request, bytes::from_utf8("hello"));
             let response = http::client::request(request);
             let status = http::response::status(&response);
             let url = http::response::url(&response);
@@ -130,33 +131,48 @@ fn restricted_registry_admits_only_required_http_and_no_ambient_io() {
     .expect("all buffered resource APIs must compile");
     AgentRunner::from_source(
         r#"use http;
+        fn on_open(status: int, headers: resource<http.headers>, url: string) -> bool {
+            let values = http::headers::values(&headers, "content-type");
+            let names = http::headers::names(&headers);
+            true
+        }
         pub fn run(input: map) -> string {
             let request = http::request::new("GET", "https://example.com/");
             let summary = http::client::sse(
                 request,
                 |event, data, id, retry_ms| true,
-                |status, url, headers| {
-                    let values = http::headers::values(&headers, "content-type");
-                    let names = http::headers::names(&headers);
-                    true
-                }
+                on_open
             );
             let status = http::sse_summary::status(&summary);
             let url = http::sse_summary::url(&summary);
-            let values = http::sse_summary::header_values(&summary, "content-type");
-            let names = http::sse_summary::header_names(&summary);
+            let headers = http::sse_summary::headers(&summary);
+            let values = http::headers::values(&headers, "content-type");
+            let names = http::headers::names(&headers);
             let items = http::sse_summary::items(&summary);
             let received = http::sse_summary::bytes_received(&summary);
+            let sent = http::sse_summary::bytes_sent(&summary);
             http::sse_summary::outcome(&summary);
         }"#,
         AgentConfig::default(),
     )
     .expect("all SSE resource APIs must compile");
-    assert_rejected(
+    let ungranted = AgentRunner::from_source(
         r#"use io;
         pub fn run(input: map) -> bool {
             io::exists("/");
         }"#,
+        AgentConfig::default(),
+    )
+    .expect("compile before capability binding");
+    let error = ungranted
+        .run_with_context(Value::map(vec![]))
+        .expect_err("ungranted IO import must fail during VM binding");
+    assert!(matches!(error, RunError::Setup(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("capability profile does not allow builtin 'io_exists'"),
+        "{error}"
     );
 }
 

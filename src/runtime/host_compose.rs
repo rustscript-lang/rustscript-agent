@@ -58,11 +58,11 @@ pub const RESTRICTED_STANDARD_BUILTINS: &[&str] = &[
     "http::headers::names",
     "http::sse_summary::outcome",
     "http::sse_summary::status",
+    "http::sse_summary::headers",
     "http::sse_summary::url",
-    "http::sse_summary::header_values",
-    "http::sse_summary::header_names",
     "http::sse_summary::items",
     "http::sse_summary::bytes_received",
+    "http::sse_summary::bytes_sent",
 ];
 
 pub fn static_stack_descriptor(
@@ -247,11 +247,11 @@ mod tests {
                 "http::headers::names",
                 "http::sse_summary::outcome",
                 "http::sse_summary::status",
+                "http::sse_summary::headers",
                 "http::sse_summary::url",
-                "http::sse_summary::header_values",
-                "http::sse_summary::header_names",
                 "http::sse_summary::items",
                 "http::sse_summary::bytes_received",
+                "http::sse_summary::bytes_sent",
             ]
         );
         for denied in ["io::open", "io::popen", "runtime::exit", "runtime::sleep"] {

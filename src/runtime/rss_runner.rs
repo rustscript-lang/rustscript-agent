@@ -1467,30 +1467,18 @@ mod restricted_registry_tests {
             .set_nonblocking(true)
             .expect("nonblocking listener");
         let port = listener.local_addr().expect("listener address").port();
-        // Use the HTTP call shape published by the pinned Core catalog.
-        // Promote the omitted import to a resource accessor when Core ships it.
+        // Use the resource call shape published by the pinned Core catalog.
         let source = format!(
             r#"use http;
             pub fn run(input: map) -> int {{
-                let response = http::client::request({{ method: "GET", url: "http://127.0.0.1:{port}/" }});
-                response.status;
+                let request = http::request::new("GET", "http://127.0.0.1:{port}/");
+                let response = http::client::request(request);
+                http::response::status(&response);
             }}"#
         );
         let (program, _) = compiled_source_program(&source)
             .expect("real HTTP import compiles against the complete catalog");
-        // The pinned Core still publishes the named-struct HTTP contract;
-        // omit future resource names that its catalog has not published yet.
-        let available: Vec<_> = crate::runtime::host_compose::RESTRICTED_STANDARD_BUILTINS
-            .iter()
-            .copied()
-            .filter(|name| {
-                !name.starts_with("http::")
-                    || catalog
-                        .functions()
-                        .iter()
-                        .any(|function| function.name == *name)
-            })
-            .collect();
+        let available: Vec<_> = crate::runtime::host_compose::RESTRICTED_STANDARD_BUILTINS.to_vec();
         assert!(available.contains(&MISSING));
         let allowed = build_restricted_registry_with_builtins(&available)
             .expect("authorized registry from the full catalog");
