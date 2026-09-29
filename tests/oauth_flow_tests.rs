@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use rustscript_agent::auth::oauth::{
     BoundedPublicOAuthIntent, BrowserOpener, CallbackMode, CallbackWaiter, CredentialUse,
-    MAX_LIVE_OAUTH_FLOWS, OAuthError, OAuthFlowKind, OAuthHost, OpaqueAuthorizationCodeHandle,
-    OpaqueVerifierHandle, PreparedHttpsRequest, ProviderRequest, RawCallbackInput, ScriptedBrowser,
-    ScriptedCallback, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport, TrustedEndpoint,
-    TrustedTransportPolicy,
+    MAX_LIVE_OAUTH_FLOWS, OAuthError, OAuthFlowKind, OAuthHost, OAuthIoContext,
+    OpaqueAuthorizationCodeHandle, OpaqueVerifierHandle, PreparedHttpsRequest, ProviderRequest,
+    RawCallbackInput, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
+    ScriptedHttpsTransport, TrustedEndpoint, TrustedTransportPolicy,
 };
 use rustscript_agent::auth::pkce::{self, PKCE_CHALLENGE_METHOD};
 use rustscript_agent::auth::store::AuthStore;
@@ -1023,7 +1023,7 @@ fn percent_decode_form(value: &str) -> String {
 struct FailBrowser;
 
 impl BrowserOpener for FailBrowser {
-    fn open(&self, _url: &str) -> Result<(), OAuthError> {
+    fn open(&self, _url: &str, _context: &OAuthIoContext) -> Result<(), OAuthError> {
         Err(OAuthError::Transport {
             message: "synthetic browser open failed".to_string(),
         })
@@ -1036,7 +1036,7 @@ struct RaceCallback {
 }
 
 impl CallbackWaiter for RaceCallback {
-    fn wait_one(&self) -> Result<RawCallbackInput, OAuthError> {
+    fn wait_one(&self, _context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
         (self.on_wait)();
         self.queued
             .lock()
@@ -1262,6 +1262,16 @@ fn callback_finish_rechecks_cancel_and_deadline_after_wait() {
         .callback_wait(&begun.callback_handle)
         .expect_err("cancel during wait");
     assert_eq!(cancelled.code(), "callback_cancelled");
+    assert_eq!(
+        host.callback_wait(&begun.callback_handle)
+            .expect_err("cancel replay")
+            .code(),
+        "callback_cancelled"
+    );
+    assert!(
+        host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+            .is_err()
+    );
 
     let wait_clock = Arc::clone(&clock);
     let expire_host = OAuthHost::new(
@@ -1284,6 +1294,284 @@ fn callback_finish_rechecks_cancel_and_deadline_after_wait() {
         .callback_wait(&timed.callback_handle)
         .expect_err("expire during wait");
     assert_eq!(expired.code(), "callback_timeout");
+    assert!(
+        expire_host
+            .inject_matching_callback(&timed.callback_handle, AUTH_CODE)
+            .is_err()
+    );
+    assert!(expire_host.callback_wait(&timed.callback_handle).is_err());
+}
+
+#[test]
+fn concurrent_callback_reserves_wait_before_native_call() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Sender};
+
+    struct ReleaseOnDrop(Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    struct BlockingCallback {
+        entered: Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+        queued: Mutex<VecDeque<RawCallbackInput>>,
+    }
+    impl CallbackWaiter for BlockingCallback {
+        fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
+            context.check()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(()).expect("entered receiver");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release wait");
+            self.queued
+                .lock()
+                .expect("queue")
+                .pop_front()
+                .ok_or(OAuthError::CallbackTimeout)
+        }
+        fn inject(&self, input: RawCallbackInput) -> Result<(), OAuthError> {
+            self.queued.lock().expect("queue").push_back(input);
+            Ok(())
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release = ReleaseOnDrop(release_tx);
+    let callback = Arc::new(BlockingCallback {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        calls: AtomicUsize::new(0),
+        queued: Mutex::new(VecDeque::new()),
+    });
+    let host = Arc::new(OAuthHost::new(
+        Arc::new(ScriptedHttpsTransport::new()),
+        Arc::clone(&callback) as Arc<_>,
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(0)),
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let begun = host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("begin");
+    host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+        .expect("inject");
+    let first_host = Arc::clone(&host);
+    let first_handle = begun.callback_handle.clone();
+    let first = std::thread::spawn(move || first_host.callback_wait(&first_handle));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native entered");
+    assert_eq!(
+        host.callback_wait(&begun.callback_handle)
+            .expect_err("second wait")
+            .code(),
+        "handle_replayed"
+    );
+    assert_eq!(callback.calls.load(Ordering::SeqCst), 1);
+    drop(release);
+    let waited = first.join().expect("join").expect("first succeeds");
+    assert!(waited.code_handle.is_some());
+}
+
+#[test]
+fn callback_error_after_cancellation_reports_cancel_and_revokes() {
+    struct LateFailure(Arc<ScriptedCancel>);
+    impl CallbackWaiter for LateFailure {
+        fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
+            assert!(context.remaining().is_ok());
+            self.0.cancel();
+            Err(OAuthError::Transport {
+                message: "fixture failure".into(),
+            })
+        }
+    }
+    let cancel = Arc::new(ScriptedCancel::new());
+    let host = OAuthHost::new(
+        Arc::new(ScriptedHttpsTransport::new()),
+        Arc::new(LateFailure(Arc::clone(&cancel))),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(0)),
+        cancel,
+    );
+    let begun = host
+        .pkce_begin(&policy(), intent(CallbackMode::Manual))
+        .expect("begin");
+    assert_eq!(
+        host.callback_wait(&begun.callback_handle)
+            .expect_err("late cancel")
+            .code(),
+        "callback_cancelled"
+    );
+    assert!(
+        host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+            .is_err()
+    );
+}
+
+#[test]
+fn callback_waiter_error_revokes_flow_and_replay() {
+    struct FailingWaiter(Instant);
+    impl CallbackWaiter for FailingWaiter {
+        fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
+            assert!(context.remaining().is_ok());
+            assert!(context.deadline() <= self.0 + Duration::from_secs(15 * 60));
+            assert_eq!(context.max_request_body_bytes(), 64 * 1024);
+            assert_eq!(context.max_response_body_bytes(), 64 * 1024);
+            Err(OAuthError::Transport {
+                message: "fixture callback failure".into(),
+            })
+        }
+    }
+    let clock = Arc::new(ScriptedClock::new(0));
+    let start = rustscript_agent::auth::oauth::OAuthClock::now(clock.as_ref());
+    let host = OAuthHost::new(
+        Arc::new(ScriptedHttpsTransport::new()),
+        Arc::new(FailingWaiter(start)),
+        Arc::new(ScriptedBrowser::new()),
+        clock,
+        Arc::new(ScriptedCancel::new()),
+    );
+    let mut long_policy = policy();
+    long_policy.deadline = Instant::now() + Duration::from_secs(3600);
+    let begun = host
+        .pkce_begin(&long_policy, intent(CallbackMode::Manual))
+        .expect("begin");
+    assert_eq!(
+        host.callback_wait(&begun.callback_handle)
+            .expect_err("wait failure")
+            .code(),
+        "transport_error"
+    );
+    assert_eq!(
+        host.callback_wait(&begun.callback_handle)
+            .expect_err("replay")
+            .code(),
+        "handle_revoked"
+    );
+    assert!(
+        host.inject_matching_callback(&begun.callback_handle, AUTH_CODE)
+            .is_err()
+    );
+}
+
+#[test]
+fn transport_deadline_crossed_inside_send_discards_response() {
+    use rustscript_agent::auth::oauth::{BoundedHttpsTransport, RawHttpsResponse};
+    struct ExpiringTransport(Arc<ScriptedClock>);
+    impl BoundedHttpsTransport for ExpiringTransport {
+        fn send(
+            &self,
+            _request: &PreparedHttpsRequest,
+            context: &OAuthIoContext,
+        ) -> Result<RawHttpsResponse, OAuthError> {
+            assert!(context.remaining().is_ok());
+            assert_eq!(context.max_response_body_bytes(), 64 * 1024);
+            self.0.expire();
+            Ok(RawHttpsResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: token_success_json().to_string().into_bytes(),
+            })
+        }
+    }
+    let clock = Arc::new(ScriptedClock::new(0));
+    let host = OAuthHost::new(
+        Arc::new(ExpiringTransport(Arc::clone(&clock))),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        clock,
+        Arc::new(ScriptedCancel::new()),
+    );
+    assert_eq!(
+        host.transport(
+            &policy(),
+            provider_request("/oauth/token", ""),
+            CredentialUse::None
+        )
+        .expect_err("late deadline")
+        .code(),
+        "deadline_exceeded"
+    );
+}
+
+#[test]
+fn browser_open_observes_context_and_late_cancel_discards_begin() {
+    struct CancellingBrowser(Arc<ScriptedCancel>);
+    impl BrowserOpener for CancellingBrowser {
+        fn open(&self, _url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+            assert!(context.remaining().is_ok());
+            assert_eq!(context.max_request_body_bytes(), 64 * 1024);
+            self.0.cancel();
+            Ok(())
+        }
+    }
+    let cancel = Arc::new(ScriptedCancel::new());
+    let host = OAuthHost::new(
+        Arc::new(ScriptedHttpsTransport::new()),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(CancellingBrowser(Arc::clone(&cancel))),
+        Arc::new(ScriptedClock::new(0)),
+        cancel,
+    );
+    assert_eq!(
+        host.pkce_begin(&policy(), intent(CallbackMode::Browser))
+            .expect_err("late browser cancellation")
+            .code(),
+        "cancelled"
+    );
+}
+
+#[test]
+fn cancelled_during_transport_discards_response_and_keeps_send_consumed() {
+    use rustscript_agent::auth::oauth::{BoundedHttpsTransport, RawHttpsResponse};
+
+    struct CancellingTransport(Arc<ScriptedCancel>);
+    impl BoundedHttpsTransport for CancellingTransport {
+        fn send(
+            &self,
+            _request: &PreparedHttpsRequest,
+            context: &OAuthIoContext,
+        ) -> Result<RawHttpsResponse, OAuthError> {
+            assert!(context.remaining().is_ok());
+            self.0.cancel();
+            Ok(RawHttpsResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: token_success_json().to_string().into_bytes(),
+            })
+        }
+    }
+
+    let root = tempfile_home("late-cancel");
+    let store = open_store(&root);
+    seed_credential(&store);
+    let access = store
+        .issue_access_handle("primary", 1, 1, "oauth-primitive-run")
+        .expect("access handle");
+    let cancel = Arc::new(ScriptedCancel::new());
+    let host = OAuthHost::new(
+        Arc::new(CancellingTransport(Arc::clone(&cancel))),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        cancel,
+    );
+    let result = host.transport(
+        &policy(),
+        provider_request("/v1/me", ""),
+        CredentialUse::Access(access.clone()),
+    );
+    assert_eq!(result.expect_err("cancel after send").code(), "cancelled");
+    assert_eq!(
+        access.consume().expect_err("consumed").code(),
+        "handle_replayed"
+    );
 }
 
 #[test]

@@ -259,12 +259,19 @@ pub enum RawCallbackInput {
 
 /// Injected bounded HTTPS transport.
 pub trait BoundedHttpsTransport: Send + Sync {
-    fn send(&self, request: &PreparedHttpsRequest) -> Result<RawHttpsResponse, OAuthError>;
+    /// Check the context at every blocking step and bound reads by its caps.
+    /// A synchronous implementation cannot be preempted by this interface.
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError>;
 }
 
 /// Injected one-shot callback waiter.
 pub trait CallbackWaiter: Send + Sync {
-    fn wait_one(&self) -> Result<RawCallbackInput, OAuthError>;
+    /// Bound the native wait by `remaining()` and observe cancellation while waiting.
+    fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError>;
 
     fn inject(&self, input: RawCallbackInput) -> Result<(), OAuthError> {
         let _ = input;
@@ -276,7 +283,9 @@ pub trait CallbackWaiter: Send + Sync {
 
 /// Injected browser opener. Command policy is not implemented here.
 pub trait BrowserOpener: Send + Sync {
-    fn open(&self, url: &str) -> Result<(), OAuthError>;
+    /// Bound each blocking browser-launch step by the context; do not detach an
+    /// unbounded worker to simulate cancellation of synchronous code.
+    fn open(&self, url: &str, context: &OAuthIoContext) -> Result<(), OAuthError>;
 }
 
 /// Injected clock used for deadlines.
@@ -288,6 +297,56 @@ pub trait OAuthClock: Send + Sync {
 /// Injected cancellation flag.
 pub trait OAuthCancel: Send + Sync {
     fn is_cancelled(&self) -> bool;
+}
+
+/// Immutable host-issued I/O budget. Implementations must use its remaining
+/// time and cancellation at every blocking step; the host checks again after
+/// the call. The context itself does not preempt arbitrary synchronous code.
+pub struct OAuthIoContext {
+    deadline: Instant,
+    clock: Arc<dyn OAuthClock>,
+    cancel: Arc<dyn OAuthCancel>,
+}
+
+impl OAuthIoContext {
+    fn new(deadline: Instant, clock: Arc<dyn OAuthClock>, cancel: Arc<dyn OAuthCancel>) -> Self {
+        Self {
+            deadline,
+            clock,
+            cancel,
+        }
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub fn max_request_body_bytes(&self) -> usize {
+        MAX_REQUEST_BODY_BYTES
+    }
+    pub fn max_response_body_bytes(&self) -> usize {
+        MAX_RESPONSE_BODY_BYTES
+    }
+
+    pub fn check(&self) -> Result<(), OAuthError> {
+        if self.cancel.is_cancelled() {
+            return Err(OAuthError::Cancelled);
+        }
+        if self.clock.now() >= self.deadline {
+            return Err(OAuthError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    pub fn remaining(&self) -> Result<Duration, OAuthError> {
+        if self.cancel.is_cancelled() {
+            return Err(OAuthError::Cancelled);
+        }
+        let now = self.clock.now();
+        if now >= self.deadline {
+            return Err(OAuthError::DeadlineExceeded);
+        }
+        Ok(self.deadline.duration_since(now))
+    }
 }
 
 /// Typed primitive failure. Codes are transport/security facts, not business policy.
@@ -792,9 +851,14 @@ impl OAuthHost {
             device_in_flight: AtomicBool::new(false),
         });
         self.insert_flow(Arc::clone(&flow))?;
-        if intent.callback_mode == CallbackMode::Browser
-            && let Err(error) = self.inner.browser.open(&authorization_url)
-        {
+        let context = self.io_context(policy.deadline);
+        let opened = context.check().and_then(|()| {
+            if intent.callback_mode == CallbackMode::Browser {
+                self.inner.browser.open(&authorization_url, &context)?;
+            }
+            context.check()
+        });
+        if let Err(error) = opened {
             self.drop_and_revoke(&flow);
             return Err(error);
         }
@@ -819,9 +883,40 @@ impl OAuthHost {
             return Err(OAuthError::CallbackCancelled);
         }
         let now = self.inner.clock.now();
-        flow.check_flag(&flow.callback, CALLBACK_HANDLE_CLASS, now)?;
-        let input = self.inner.callbacks.wait_one()?;
-        self.finish_callback(&flow, input)
+        if let Err(error) = flow.consume_flag(&flow.callback, CALLBACK_HANDLE_CLASS, now) {
+            if error.code() == "handle_expired" {
+                self.drop_and_revoke(&flow);
+            }
+            return Err(error);
+        }
+        let context = self.io_context(flow.expires_at);
+        let result = context
+            .check()
+            .and_then(|()| self.inner.callbacks.wait_one(&context));
+        let post = context.check();
+        let result = post.and(result);
+        match result {
+            Ok(input) => {
+                let finished = self.finish_callback(&flow, input)?;
+                if let Err(error) = context.check() {
+                    self.drop_and_revoke(&flow);
+                    return Err(match error {
+                        OAuthError::Cancelled => OAuthError::CallbackCancelled,
+                        OAuthError::DeadlineExceeded => OAuthError::CallbackTimeout,
+                        other => other,
+                    });
+                }
+                Ok(finished)
+            }
+            Err(error) => {
+                self.drop_and_revoke(&flow);
+                Err(match error {
+                    OAuthError::Cancelled => OAuthError::CallbackCancelled,
+                    OAuthError::DeadlineExceeded => OAuthError::CallbackTimeout,
+                    other => other,
+                })
+            }
+        }
     }
 
     pub fn transport(
@@ -905,7 +1000,17 @@ impl OAuthHost {
             None => None,
         };
         prepared.body = body;
-        let raw = self.inner.transport.send(&prepared)?;
+        let context = self.io_context(policy.deadline);
+        let sent = context
+            .check()
+            .and_then(|()| self.inner.transport.send(&prepared, &context));
+        if let Err(error) = context.check() {
+            if let Some(flow) = device_session.as_ref() {
+                self.drop_and_revoke(flow);
+            }
+            return Err(error);
+        }
+        let raw = sent?;
         if raw.body.len() > MAX_RESPONSE_BODY_BYTES {
             return Err(OAuthError::ResponseTooLarge {
                 max_bytes: MAX_RESPONSE_BODY_BYTES,
@@ -918,6 +1023,17 @@ impl OAuthHost {
             policy,
             expected_generation,
         )?;
+        if let Err(error) = context.check() {
+            if let Some(flow) = device_session.as_ref() {
+                self.drop_and_revoke(flow);
+            }
+            if let Some(handle) = sanitized.device_handle.as_ref()
+                && let Ok(flow) = self.live_flow(handle)
+            {
+                self.drop_and_revoke(&flow);
+            }
+            return Err(error);
+        }
         match device_session.as_ref() {
             Some(flow) if sanitized.access_slot.is_some() || sanitized.refresh_slot.is_some() => {
                 flow.consume_flag(&flow.device_state, DEVICE_HANDLE_CLASS, now)?;
@@ -1140,10 +1256,10 @@ impl OAuthHost {
             self.drop_and_revoke(flow);
             return Err(OAuthError::StateMismatch);
         }
-        if let Err(error) = flow.consume_flag(&flow.callback, CALLBACK_HANDLE_CLASS, now) {
-            self.drop_and_revoke(flow);
-            return Err(error);
-        }
+        flow.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         *flow
             .code
             .lock()
@@ -1206,13 +1322,15 @@ impl OAuthHost {
     }
 
     fn check_cancel_deadline(&self, policy: &TrustedTransportPolicy) -> Result<(), OAuthError> {
-        if self.inner.cancel.is_cancelled() {
-            return Err(OAuthError::Cancelled);
-        }
-        if self.inner.clock.now() >= policy.deadline {
-            return Err(OAuthError::DeadlineExceeded);
-        }
-        Ok(())
+        self.io_context(policy.deadline).check()
+    }
+
+    fn io_context(&self, deadline: Instant) -> OAuthIoContext {
+        OAuthIoContext::new(
+            deadline,
+            Arc::clone(&self.inner.clock),
+            Arc::clone(&self.inner.cancel),
+        )
     }
 }
 
@@ -1725,7 +1843,12 @@ impl Default for ScriptedHttpsTransport {
 }
 
 impl BoundedHttpsTransport for ScriptedHttpsTransport {
-    fn send(&self, request: &PreparedHttpsRequest) -> Result<RawHttpsResponse, OAuthError> {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        context.check()?;
         self.sent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1767,7 +1890,8 @@ impl Default for ScriptedCallback {
 }
 
 impl CallbackWaiter for ScriptedCallback {
-    fn wait_one(&self) -> Result<RawCallbackInput, OAuthError> {
+    fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
+        context.check()?;
         self.queued
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1808,7 +1932,8 @@ impl Default for ScriptedBrowser {
 }
 
 impl BrowserOpener for ScriptedBrowser {
-    fn open(&self, url: &str) -> Result<(), OAuthError> {
+    fn open(&self, url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+        context.check()?;
         self.opened
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
