@@ -45,6 +45,7 @@ zeroize = "1"
 ring = "0.17"
 
 [dev-dependencies]
+rcgen = "0.14.10"
 tracing-core = "0.1"
 
 [features]

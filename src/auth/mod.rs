@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod host;
+pub mod native_https;
 pub mod oauth;
 #[cfg(feature = "config-fixture")]
 pub mod oauth_host;

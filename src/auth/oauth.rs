@@ -302,6 +302,7 @@ pub trait OAuthCancel: Send + Sync {
 /// Immutable host-issued I/O budget. Implementations must use its remaining
 /// time and cancellation at every blocking step; the host checks again after
 /// the call. The context itself does not preempt arbitrary synchronous code.
+#[derive(Clone)]
 pub struct OAuthIoContext {
     deadline: Instant,
     clock: Arc<dyn OAuthClock>,
@@ -309,7 +310,11 @@ pub struct OAuthIoContext {
 }
 
 impl OAuthIoContext {
-    fn new(deadline: Instant, clock: Arc<dyn OAuthClock>, cancel: Arc<dyn OAuthCancel>) -> Self {
+    pub(crate) fn new(
+        deadline: Instant,
+        clock: Arc<dyn OAuthClock>,
+        cancel: Arc<dyn OAuthCancel>,
+    ) -> Self {
         Self {
             deadline,
             clock,
