@@ -39,6 +39,8 @@ use crate::runtime::rss_runner::RunCancellation;
 
 const LIMIT: usize = 64;
 
+mod flow;
+
 macro_rules! resource {
     ($name:ident, $key:literal, $description:literal) => {
         impl HostResource for $name {
@@ -130,6 +132,7 @@ struct Owner {
     snapshot: Arc<Snapshot>,
     store: AuthStore,
     oauth: Option<Arc<OAuthHost>>,
+    oauth_callback_fixture: bool,
 }
 impl Owner {
     fn check(&self) -> VmResult<()> {
@@ -161,6 +164,7 @@ pub struct AuthHost {
     next_generation: AtomicU64,
     owners: Mutex<Vec<std::sync::Weak<Owner>>>,
     oauth: Option<Arc<OAuthHost>>,
+    oauth_callback_fixture: bool,
 }
 
 impl AuthHost {
@@ -182,12 +186,20 @@ impl AuthHost {
             next_generation: AtomicU64::new(2),
             owners: Mutex::new(Vec::new()),
             oauth: None,
+            oauth_callback_fixture: false,
         })
     }
 
     /// Explicit transport dependency; no implicit network or fixture default.
     pub fn with_oauth_host(mut self, oauth: Arc<OAuthHost>) -> Self {
         self.oauth = Some(oauth);
+        self
+    }
+
+    /// Explicitly enable the synthetic callback bridge for fixture tests only.
+    #[cfg(any(test, feature = "config-fixture"))]
+    pub fn with_oauth_callback_fixture(mut self) -> Self {
+        self.oauth_callback_fixture = true;
         self
     }
 
@@ -205,6 +217,9 @@ impl AuthHost {
         owners.retain(|weak| {
             if let Some(owner) = weak.upgrade() {
                 owner.revoked.store(true, Ordering::Release);
+                if let Some(oauth) = &owner.oauth {
+                    oauth.revoke_run(&owner.identity);
+                }
                 true
             } else {
                 false
@@ -242,6 +257,7 @@ impl AuthHost {
             snapshot,
             store: self.store.clone(),
             oauth: self.oauth.clone(),
+            oauth_callback_fixture: self.oauth_callback_fixture,
         });
         owner.check()?;
         let mut context = vm.host_context();
@@ -326,6 +342,56 @@ impl AuthHost {
             )
             .map_err(|_| error("slot_invalid"))?;
         self.issue_transport_slot(vm, credential_id, expected_generation, kind, slot)
+    }
+
+    /// Host-only fixture callback injection; no raw callback payload enters RSS.
+    #[cfg(any(test, feature = "config-fixture"))]
+    pub fn fixture_inject_matching_callback(
+        &self,
+        vm: &mut Vm,
+        callback: &Value,
+        code: &str,
+    ) -> VmResult<()> {
+        let owner = bound(vm)?;
+        owner.check()?;
+        self.ensure_owned_owner(&owner)?;
+        flow::fixture_inject_matching_callback(vm, callback, code, &owner)
+    }
+
+    /// Host-only fixture assertion for OAuth primitive flow cleanup.
+    #[cfg(any(test, feature = "config-fixture"))]
+    pub fn fixture_live_oauth_flow_count(&self) -> VmResult<usize> {
+        self.oauth
+            .as_ref()
+            .map(|oauth| oauth.live_flow_count())
+            .ok_or_else(|| error("callback_unavailable"))
+    }
+
+    /// Host-only fixture assertion for an admitted run's frozen generation.
+    #[cfg(any(test, feature = "config-fixture"))]
+    pub fn fixture_policy_generation(&self, vm: &mut Vm) -> VmResult<u64> {
+        let owner = bound(vm)?;
+        self.ensure_owned_owner(&owner)?;
+        owner.check()?;
+        Ok(owner.snapshot.generation)
+    }
+
+    #[cfg(any(test, feature = "config-fixture"))]
+    fn ensure_owned_owner(&self, owner: &Arc<Owner>) -> VmResult<()> {
+        if self
+            .owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|weak| {
+                weak.upgrade()
+                    .is_some_and(|candidate| Arc::ptr_eq(&candidate, owner))
+            })
+        {
+            Ok(())
+        } else {
+            Err(error("owner_mismatch"))
+        }
     }
 
     /// Transport-side insertion; only Rust callers can supply the opaque payload.
@@ -1045,6 +1111,11 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             close_access_desc,
             close_refresh_desc,
             close_slot_desc,
+            flow::pkce_begin_desc,
+            flow::callback_wait_desc,
+            flow::close_callback_desc,
+            flow::close_verifier_desc,
+            flow::close_code_desc,
         ],
         resources: &[
             host_home_meta,
@@ -1052,6 +1123,9 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             access_meta,
             refresh_meta,
             slot_meta,
+            flow::callback_meta,
+            flow::verifier_meta,
+            flow::code_meta,
         ],
     }
 }

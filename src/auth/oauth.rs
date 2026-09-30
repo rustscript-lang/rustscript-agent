@@ -299,6 +299,17 @@ pub trait OAuthCancel: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
 
+struct CombinedOAuthCancel {
+    host: Arc<dyn OAuthCancel>,
+    owner: Arc<dyn OAuthCancel>,
+}
+
+impl OAuthCancel for CombinedOAuthCancel {
+    fn is_cancelled(&self) -> bool {
+        self.host.is_cancelled() || self.owner.is_cancelled()
+    }
+}
+
 /// Immutable host-issued I/O budget. Implementations must use its remaining
 /// time and cancellation at every blocking step; the host checks again after
 /// the call. The context itself does not preempt arbitrary synchronous code.
@@ -469,6 +480,8 @@ struct FlowInner {
     verifier: Mutex<Zeroizing<String>>,
     redirect_uri: String,
     callback: AtomicU8,
+    callback_succeeded: AtomicBool,
+    revoked: AtomicBool,
     verifier_state: AtomicU8,
     code_state: AtomicU8,
     code: Mutex<Option<String>>,
@@ -500,6 +513,8 @@ impl FlowInner {
             verifier: Mutex::new(Zeroizing::new(String::new())),
             redirect_uri: String::new(),
             callback: AtomicU8::new(HANDLE_LIVE),
+            callback_succeeded: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
             verifier_state: AtomicU8::new(HANDLE_LIVE),
             code_state: AtomicU8::new(HANDLE_LIVE),
             code: Mutex::new(None),
@@ -670,6 +685,7 @@ impl FlowInner {
     }
 
     fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
         self.callback.store(HANDLE_REVOKED, Ordering::Release);
         self.verifier_state.store(HANDLE_REVOKED, Ordering::Release);
         self.code_state.store(HANDLE_REVOKED, Ordering::Release);
@@ -848,6 +864,8 @@ impl OAuthHost {
             verifier: Mutex::new(Zeroizing::new(verifier.as_str().to_string())),
             redirect_uri: redirect_uri.clone(),
             callback: AtomicU8::new(HANDLE_LIVE),
+            callback_succeeded: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
             verifier_state: AtomicU8::new(HANDLE_LIVE),
             code_state: AtomicU8::new(HANDLE_LIVE),
             code: Mutex::new(None),
@@ -883,19 +901,61 @@ impl OAuthHost {
         &self,
         handle: &OpaqueCallbackHandle,
     ) -> Result<CallbackEnvelope, OAuthError> {
+        self.callback_wait_inner(None, handle, None)
+    }
+
+    pub(crate) fn callback_wait_scoped(
+        &self,
+        policy: &TrustedTransportPolicy,
+        handle: &OpaqueCallbackHandle,
+        owner_cancel: Arc<dyn OAuthCancel>,
+    ) -> Result<CallbackEnvelope, OAuthError> {
+        self.callback_wait_inner(Some(policy), handle, Some(owner_cancel))
+    }
+
+    fn callback_wait_inner(
+        &self,
+        policy: Option<&TrustedTransportPolicy>,
+        handle: &OpaqueCallbackHandle,
+        owner_cancel: Option<Arc<dyn OAuthCancel>>,
+    ) -> Result<CallbackEnvelope, OAuthError> {
         let flow = self.live_flow(handle)?;
         if self.inner.cancel.is_cancelled() {
             self.drop_and_revoke(&flow);
             return Err(OAuthError::CallbackCancelled);
         }
+        if flow.revoked.load(Ordering::Acquire) {
+            return Err(OAuthError::HandleRevoked {
+                class: CALLBACK_HANDLE_CLASS.to_string(),
+            });
+        }
+        if let Some(policy) = policy
+            && let Err(error) =
+                flow.check_binding(policy, &flow.credential_id, CALLBACK_HANDLE_CLASS)
+        {
+            self.drop_and_revoke(&flow);
+            return Err(error);
+        }
+        let deadline = policy.map_or(flow.expires_at, |policy| {
+            min_deadline(flow.expires_at, policy.deadline)
+        });
+        let context = match owner_cancel {
+            Some(owner_cancel) => self.io_context_with_cancel(deadline, owner_cancel),
+            None => self.io_context(deadline),
+        };
+        if policy.is_some()
+            && let Err(error) = context.check()
+        {
+            self.drop_and_revoke(&flow);
+            return Err(callback_wait_error(error));
+        }
         let now = self.inner.clock.now();
         if let Err(error) = flow.consume_flag(&flow.callback, CALLBACK_HANDLE_CLASS, now) {
-            if error.code() == "handle_expired" {
+            if error.code() == "handle_expired" || flow.revoked.load(Ordering::Acquire) {
                 self.drop_and_revoke(&flow);
             }
             return Err(error);
         }
-        let context = self.io_context(flow.expires_at);
         let result = context
             .check()
             .and_then(|()| self.inner.callbacks.wait_one(&context));
@@ -906,21 +966,13 @@ impl OAuthHost {
                 let finished = self.finish_callback(&flow, input)?;
                 if let Err(error) = context.check() {
                     self.drop_and_revoke(&flow);
-                    return Err(match error {
-                        OAuthError::Cancelled => OAuthError::CallbackCancelled,
-                        OAuthError::DeadlineExceeded => OAuthError::CallbackTimeout,
-                        other => other,
-                    });
+                    return Err(callback_wait_error(error));
                 }
                 Ok(finished)
             }
             Err(error) => {
                 self.drop_and_revoke(&flow);
-                Err(match error {
-                    OAuthError::Cancelled => OAuthError::CallbackCancelled,
-                    OAuthError::DeadlineExceeded => OAuthError::CallbackTimeout,
-                    other => other,
-                })
+                Err(callback_wait_error(error))
             }
         }
     }
@@ -1100,6 +1152,78 @@ impl OAuthHost {
         )
     }
 
+    pub(crate) fn revoke_callback_flow(
+        &self,
+        handle: &OpaqueCallbackHandle,
+    ) -> Result<(), OAuthError> {
+        let flow = self.live_flow(handle)?;
+        self.drop_and_revoke(&flow);
+        Ok(())
+    }
+
+    pub(crate) fn callback_result_live(&self, handle: &OpaqueCallbackHandle) -> bool {
+        let Ok(flow) = self.live_flow(handle) else {
+            return false;
+        };
+        let now = self.inner.clock.now();
+        flow.callback_succeeded.load(Ordering::Acquire)
+            && !flow.revoked.load(Ordering::Acquire)
+            && flow
+                .check_flag(&flow.code_state, CODE_HANDLE_CLASS, now)
+                .is_ok()
+            && flow
+                .check_flag(&flow.verifier_state, VERIFIER_HANDLE_CLASS, now)
+                .is_ok()
+    }
+
+    pub(crate) fn close_callback_resource(
+        &self,
+        handle: &OpaqueCallbackHandle,
+    ) -> Result<(), OAuthError> {
+        let flow = self.live_flow(handle)?;
+        if !self.callback_result_live(handle) {
+            self.drop_and_revoke(&flow);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close_verifier_resource(
+        &self,
+        handle: &OpaqueVerifierHandle,
+    ) -> Result<(), OAuthError> {
+        let flow = self.live_flow(handle)?;
+        self.drop_and_revoke(&flow);
+        Ok(())
+    }
+
+    pub(crate) fn close_code_resource(
+        &self,
+        handle: &OpaqueAuthorizationCodeHandle,
+    ) -> Result<(), OAuthError> {
+        let flow = self.live_flow(handle)?;
+        self.drop_and_revoke(&flow);
+        Ok(())
+    }
+
+    pub(crate) fn revoke_run(&self, run_id: &str) {
+        let mut flows = self.lock_flows();
+        flows.retain(|_, flow| {
+            if flow.run_id == run_id {
+                flow.revoke();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    #[cfg(any(test, feature = "config-fixture"))]
+    pub(crate) fn live_flow_count(&self) -> usize {
+        let mut flows = self.lock_flows();
+        self.sweep_locked(&mut flows);
+        flows.len()
+    }
+
     pub fn forged_callback_handle(&self) -> OpaqueCallbackHandle {
         OpaqueCallbackHandle::from_inner(FlowInner::forged())
     }
@@ -1212,6 +1336,8 @@ impl OAuthHost {
             verifier: Mutex::new(Zeroizing::new(String::new())),
             redirect_uri: String::new(),
             callback: AtomicU8::new(HANDLE_REVOKED),
+            callback_succeeded: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
             verifier_state: AtomicU8::new(HANDLE_REVOKED),
             code_state: AtomicU8::new(HANDLE_REVOKED),
             code: Mutex::new(None),
@@ -1245,6 +1371,11 @@ impl OAuthHost {
         flow: &Arc<FlowInner>,
         input: RawCallbackInput,
     ) -> Result<CallbackEnvelope, OAuthError> {
+        if flow.revoked.load(Ordering::Acquire) {
+            return Err(OAuthError::HandleRevoked {
+                class: CALLBACK_HANDLE_CLASS.to_string(),
+            });
+        }
         let now = self.inner.clock.now();
         if self.inner.cancel.is_cancelled() {
             self.drop_and_revoke(flow);
@@ -1290,6 +1421,7 @@ impl OAuthHost {
             .code
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(code);
+        flow.callback_succeeded.store(true, Ordering::Release);
         Ok(CallbackEnvelope {
             outcome: CallbackOutcome::Success,
             code_handle: Some(OpaqueAuthorizationCodeHandle::from_inner(Arc::clone(flow))),
@@ -1358,6 +1490,21 @@ impl OAuthHost {
             Arc::clone(&self.inner.cancel),
         )
     }
+
+    fn io_context_with_cancel(
+        &self,
+        deadline: Instant,
+        owner_cancel: Arc<dyn OAuthCancel>,
+    ) -> OAuthIoContext {
+        OAuthIoContext::new(
+            deadline,
+            Arc::clone(&self.inner.clock),
+            Arc::new(CombinedOAuthCancel {
+                host: Arc::clone(&self.inner.cancel),
+                owner: owner_cancel,
+            }),
+        )
+    }
 }
 
 impl Drop for OAuthHost {
@@ -1402,6 +1549,21 @@ impl FlowHandle for OpaqueCallbackHandle {
 impl FlowHandle for OpaqueAuthorizationCodeHandle {
     fn class(&self) -> &'static str {
         CODE_HANDLE_CLASS
+    }
+    fn flow_id(&self) -> u64 {
+        self.flow_id()
+    }
+    fn same_host(&self, host: &Arc<HostInner>) -> bool {
+        self.same_host(host)
+    }
+    fn flow_inner(&self) -> Arc<FlowInner> {
+        self.flow_inner()
+    }
+}
+
+impl FlowHandle for OpaqueVerifierHandle {
+    fn class(&self) -> &'static str {
+        VERIFIER_HANDLE_CLASS
     }
     fn flow_id(&self) -> u64 {
         self.flow_id()
@@ -1514,6 +1676,14 @@ fn admit_headers(
         admitted.insert(lowered, value.clone());
     }
     Ok(admitted)
+}
+
+fn callback_wait_error(error: OAuthError) -> OAuthError {
+    match error {
+        OAuthError::Cancelled => OAuthError::CallbackCancelled,
+        OAuthError::DeadlineExceeded => OAuthError::CallbackTimeout,
+        other => other,
+    }
 }
 
 fn min_deadline(left: Instant, right: Instant) -> Instant {
