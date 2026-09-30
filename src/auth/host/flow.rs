@@ -15,8 +15,8 @@ use crate::auth::oauth::{
 };
 
 use super::{
-    Bound, LIMIT, Owner, OwnerResource, borrow, desc, envelope, error, field, handle, issue, key,
-    named, object, opt, policy_owner, result, string, transport_policy,
+    Bound, LIMIT, Owner, OwnerResource, TrustedTransportPolicy, borrow, desc, envelope, error,
+    field, handle, issue, key, named, object, opt, policy_owner, result, string, transport_policy,
 };
 
 const CALLBACK_KEY: &str = "oauth.callback";
@@ -353,7 +353,7 @@ fn callback_wait_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         return Err(failure);
     }
     if !owner.oauth_callback_fixture || owner.snapshot.generation != flow.policy_generation {
-        revoke_flow(&flow);
+        rollback_resources(vm, &flow);
         return Err(error("policy_inactive"));
     }
     let oauth = owner
@@ -361,17 +361,7 @@ fn callback_wait_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         .as_ref()
         .ok_or_else(|| error("callback_unavailable"))?
         .clone();
-    let policy = match transport_policy(owner, &flow.credential_id) {
-        Ok(policy) if policy.generation == flow.policy_generation => policy,
-        Ok(_) => {
-            revoke_flow(&flow);
-            return Err(error("policy_inactive"));
-        }
-        Err(failure) => {
-            revoke_flow(&flow);
-            return Err(failure);
-        }
-    };
+    let policy = revalidate_callback_policy(vm, &flow)?;
     let cancellation: Arc<dyn OAuthCancel> = Arc::new(OwnerCancellation(owner.clone()));
     let waited = oauth.callback_wait_scoped(&policy, &flow.callback, cancellation);
     let waited = match waited {
@@ -428,6 +418,23 @@ fn callback_wait_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         ("outcome", Value::string("success")),
         ("code_handle", code_value),
     ]))
+}
+
+fn revalidate_callback_policy(
+    vm: &mut Vm,
+    flow: &FlowResources,
+) -> VmResult<TrustedTransportPolicy> {
+    match transport_policy(&flow.owner, &flow.credential_id) {
+        Ok(policy) if policy.generation == flow.policy_generation => Ok(policy),
+        Ok(_) => {
+            rollback_resources(vm, flow);
+            Err(error("policy_inactive"))
+        }
+        Err(failure) => {
+            rollback_resources(vm, flow);
+            Err(failure)
+        }
+    }
 }
 
 fn close_callback_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -676,4 +683,229 @@ pub(super) fn fixture_inject_matching_callback(
         .ok_or_else(|| error("callback_unavailable"))?
         .inject_matching_callback(&flow.callback, code)
         .map_err(|failure| error(failure.code()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use rustscript_vm::{
+        CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm, VmStatus,
+        compile_source_at_path_with_flavor_and_options,
+    };
+
+    use crate::{
+        CancellationReason, RunCancellation,
+        auth::{host::AuthHost, oauth::OAuthHost},
+    };
+
+    use super::*;
+
+    struct FixtureHome(PathBuf);
+
+    impl FixtureHome {
+        fn new() -> Self {
+            let base =
+                PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned temp"));
+            let path = base.join(format!(
+                "oauth-callback-policy-revalidation-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&path).expect("create private fixture home");
+            let fixture =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config_auth_rss");
+            fs::copy(fixture.join("config.yaml"), path.join("config.yaml"))
+                .expect("copy fixture config");
+            let auth = fs::read_to_string(fixture.join("auth.yaml"))
+                .expect("read fixture auth")
+                .replace("1788440000000", "1900000000000");
+            fs::write(path.join("auth.yaml"), auth).expect("write private fixture auth");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("restrict fixture home");
+                for name in ["config.yaml", "auth.yaml"] {
+                    fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600))
+                        .expect("restrict fixture file");
+                }
+            }
+            Self(path)
+        }
+    }
+
+    impl AsRef<Path> for FixtureHome {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FixtureHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn field(value: &Value, name: &str) -> Value {
+        let Value::Map(entries) = value else {
+            panic!("expected named result, got {value:?}");
+        };
+        entries
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::String(key) if key.as_ref() == name => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {name} in {value:?}"))
+    }
+
+    fn fixture_intent() -> Value {
+        Value::map(vec![
+            (
+                Value::string("credential_id"),
+                Value::string("fixture-codex"),
+            ),
+            (Value::string("path"), Value::string("/codex/device")),
+            (
+                Value::string("flow"),
+                Value::string("authorization_code_pkce"),
+            ),
+            (Value::string("callback_mode"), Value::string("manual")),
+            (
+                Value::string("scopes"),
+                Value::array(vec![Value::string("scope.synthetic")]),
+            ),
+            (
+                Value::string("public_query"),
+                Value::array(vec![
+                    Value::map(vec![
+                        (Value::string("name"), Value::string("client_id")),
+                        (Value::string("value"), Value::string("public-client-id")),
+                    ]),
+                    Value::map(vec![
+                        (Value::string("name"), Value::string("response_type")),
+                        (Value::string("value"), Value::string("code")),
+                    ]),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn policy_revalidation_cancellation_reclaims_callback_resources() {
+        let home = FixtureHome::new();
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+        let oauth = Arc::new(OAuthHost::new(
+            Arc::new(crate::auth::oauth::ScriptedHttpsTransport::new()),
+            Arc::new(crate::auth::oauth::ScriptedCallback::new()),
+            Arc::new(crate::auth::oauth::ScriptedBrowser::new()),
+            Arc::new(crate::auth::oauth::ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(crate::auth::oauth::ScriptedCancel::new()),
+        ));
+        let auth = AuthHost::new(home.0.clone(), cancellation.clone())
+            .expect("synthetic auth host")
+            .with_oauth_host(oauth)
+            .with_oauth_callback_fixture();
+
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config_auth_rss");
+        let rss_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/callback_contract.rss");
+        let source = fs::read_to_string(&rss_path).expect("read production callback contract");
+        let compiled = compile_source_at_path_with_flavor_and_options(
+            fixture.join("config.yaml"),
+            &source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default()
+                .with_host_api_catalog(crate::auth::host::auth_host_catalog()),
+        )
+        .expect("compile against exact auth catalog");
+        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        let mut registry = HostFunctionRegistry::restricted();
+        auth.register(
+            &mut registry,
+            crate::auth::host::auth_host_catalog().as_ref(),
+        )
+        .expect("register exact catalog");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind restricted exact catalog");
+        assert!(matches!(vm.run().expect("run RSS root"), VmStatus::Halted));
+
+        let host_home = auth.bind_vm(&mut vm).expect("bind host owner");
+        let begin = vm.resolve_exported_callable("begin").expect("RSS begin");
+        let begun = vm
+            .invoke_callable(begin, &[field(&host_home, "host_home"), fixture_intent()])
+            .expect("invoke real RSS begin");
+        let callback = field(&begun, "callback_handle");
+        let verifier = field(&begun, "verifier_handle");
+        let flow = flow_for_callback(&mut vm, &callback).expect("borrow callback flow");
+        let previous_count = vm.host_context().resource_count();
+        assert_eq!(previous_count, 4, "home, policy, callback, and verifier");
+        assert!(callback_owner_check(&flow.owner, &flow.credential_id).is_ok());
+        assert_eq!(
+            auth.fixture_live_oauth_flow_count().expect("native flow"),
+            1
+        );
+
+        cancellation.request(CancellationReason::Requested);
+        let failure = revalidate_callback_policy(&mut vm, &flow)
+            .expect_err("revalidation must reject the requested cancellation");
+        assert_eq!(
+            failure.to_string(),
+            error("policy_inactive").to_string(),
+            "preserve Owner::check's existing typed error"
+        );
+        assert_eq!(
+            auth.fixture_live_oauth_flow_count().expect("revoked flow"),
+            0
+        );
+        assert_eq!(vm.host_context().resource_count(), previous_count - 2);
+        assert_eq!(
+            vm.host_context().resource_count(),
+            2,
+            "retain home and policy"
+        );
+
+        assert!(flow_for_callback(&mut vm, &callback).is_err());
+        let verifier_handle = handle(&verifier).expect("verifier handle");
+        {
+            let context = vm.host_context();
+            let verifier_borrow = context.borrow_resource_with_key::<VerifierResource>(
+                verifier_handle,
+                &ResourceTypeKey::new(VERIFIER_KEY).expect("verifier key"),
+            );
+            assert!(verifier_borrow.is_err(), "verifier alias must be reclaimed");
+        }
+
+        let home_handle = handle(&field(&host_home, "host_home")).expect("home handle");
+        let policy_handle = flow
+            .owner
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("RSS policy resource remains");
+        let context = vm.host_context();
+        assert!(
+            context
+                .borrow_resource_with_key::<super::super::HostHome>(
+                    home_handle,
+                    &ResourceTypeKey::new("auth.host_home").expect("home key"),
+                )
+                .is_ok()
+        );
+        assert!(
+            context
+                .borrow_resource_with_key::<super::super::Policy>(
+                    policy_handle,
+                    &ResourceTypeKey::new("auth.policy").expect("policy key"),
+                )
+                .is_ok()
+        );
+    }
 }
