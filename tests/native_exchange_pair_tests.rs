@@ -485,6 +485,100 @@ fn malformed_or_ambiguous_pair_controls_fail_closed_and_revoke_only_the_device()
 }
 
 #[test]
+fn parent_empty_userinfo_is_rejected_before_send_and_preserves_retry() {
+    let (host, transport) = default_host();
+    let policy = policy();
+    let device = start_device_session(&host, &transport, &policy);
+    transport.push_json(
+        200,
+        serde_json::json!({
+            "authorization_code": AUTHORIZATION_CODE_SECRET,
+            "code_verifier": CODE_VERIFIER_SECRET
+        }),
+    );
+    let error = host
+        .transport_exchange_pair(
+            &policy,
+            request("/oauth/device/token", "grant_type=device_code"),
+            device.clone(),
+            OpaqueExchangeResponseIntent {
+                code_field: ExchangeCodeField::AuthorizationCode,
+                redirect_uri: "https://@redirect.example.test/callback".to_string(),
+            },
+        )
+        .expect_err("explicit empty userinfo must be rejected before I/O");
+    assert_eq!(error.code(), "invalid_intent");
+    assert_eq!(transport.take_sent().len(), 1, "only start sent");
+    let retry = host
+        .transport_exchange_pair(
+            &policy,
+            request("/oauth/device/token", "grant_type=device_code"),
+            device,
+            capture_intent(),
+        )
+        .expect("submitted device remains retryable");
+    assert!(retry.pair.is_some());
+    assert_eq!(transport.take_sent().len(), 1, "only valid retry sent");
+}
+
+#[test]
+fn path_and_query_at_signs_reach_the_existing_exchange_unchanged() {
+    let cases = [
+        (
+            "https://redirect.example.test/callback/@path",
+            "https%3A%2F%2Fredirect.example.test%2Fcallback%2F%40path",
+        ),
+        (
+            "HTTPS://redirect.example.test/callback?return=@query",
+            "HTTPS%3A%2F%2Fredirect.example.test%2Fcallback%3Freturn%3D%40query",
+        ),
+    ];
+
+    for (redirect_uri, encoded_redirect_uri) in cases {
+        let (host, transport) = default_host();
+        let policy = policy();
+        let device = start_device_session(&host, &transport, &policy);
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "authorization_code": AUTHORIZATION_CODE_SECRET,
+                "code_verifier": CODE_VERIFIER_SECRET
+            }),
+        );
+        let captured = host
+            .transport_exchange_pair(
+                &policy,
+                request("/oauth/device/token", "grant_type=device_code"),
+                device,
+                OpaqueExchangeResponseIntent {
+                    code_field: ExchangeCodeField::AuthorizationCode,
+                    redirect_uri: redirect_uri.to_string(),
+                },
+            )
+            .expect("raw @ in path/query is not authority userinfo");
+        let pair = captured.pair.expect("opaque pair");
+
+        transport.push_json(200, serde_json::json!({"ok": true}));
+        host.transport(
+            &policy,
+            request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: pair.code_handle,
+                verifier: pair.verifier_handle,
+            },
+        )
+        .expect("existing exchange uses the admitted redirect URI");
+        let sent = transport.take_sent();
+        assert_eq!(sent.len(), 3);
+        assert!(
+            sent[2]
+                .body
+                .contains(&format!("redirect_uri={encoded_redirect_uri}"))
+        );
+    }
+}
+
+#[test]
 fn invalid_redirect_intents_do_not_send_or_consume_device_session() {
     let (host, transport) = default_host();
     let policy = policy();
@@ -496,6 +590,10 @@ fn invalid_redirect_intents_do_not_send_or_consume_device_session() {
         "http://attacker.example/callback".to_string(),
         "ftp://auth.example.test/callback".to_string(),
         "https://user:password@auth.example.test/callback".to_string(),
+        "https://@redirect.example.test/callback".to_string(),
+        "http://@127.0.0.1:43127/callback".to_string(),
+        "HTTPS://@redirect.example.test/callback".to_string(),
+        "https://redirect.example.test\\callback".to_string(),
         "https://auth.example.test/callback#fragment".to_string(),
         "https://auth.example.test/callback\n".to_string(),
         too_long,

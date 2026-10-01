@@ -1946,8 +1946,28 @@ fn validate_exchange_response_intent(
     if uri.is_empty() || uri.len() > 2048 || uri.chars().any(char::is_control) {
         return Err(invalid());
     }
+    let Some((raw_scheme, after_scheme)) = uri.split_once("://") else {
+        return Err(invalid());
+    };
+    if !(raw_scheme.eq_ignore_ascii_case("https") || raw_scheme.eq_ignore_ascii_case("http"))
+        || uri.contains('\\')
+    {
+        return Err(invalid());
+    }
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let raw_authority = &after_scheme[..authority_end];
+    if raw_authority.is_empty() || raw_authority.contains('@') {
+        return Err(invalid());
+    }
+
     let parsed = url::Url::parse(uri).map_err(|_| invalid())?;
-    if parsed.username() != "" || parsed.password().is_some() || parsed.fragment().is_some() {
+    if !raw_scheme.eq_ignore_ascii_case(parsed.scheme())
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(invalid());
     }
     match parsed.scheme() {
