@@ -1041,7 +1041,10 @@ impl OAuthHost {
         response_slot_generation_override: Option<u64>,
     ) -> Result<SanitizedProviderResponse, OAuthError> {
         if response_slot_generation_override.is_some()
-            && !matches!(&credential_use, CredentialUse::AuthorizationCode { .. })
+            && !matches!(
+                &credential_use,
+                CredentialUse::AuthorizationCode { .. } | CredentialUse::Device(_)
+            )
         {
             return Err(OAuthError::HandleProvenance {
                 class: CODE_HANDLE_CLASS.to_string(),
@@ -1149,19 +1152,38 @@ impl OAuthHost {
             }
             return Err(error);
         }
-        let raw = sent?;
+        let raw = match sent {
+            Ok(raw) => raw,
+            Err(error) => {
+                if let Some(flow) = device_session.as_ref() {
+                    self.drop_and_revoke(flow);
+                }
+                return Err(error);
+            }
+        };
         if raw.body.len() > MAX_RESPONSE_BODY_BYTES {
+            if let Some(flow) = device_session.as_ref() {
+                self.drop_and_revoke(flow);
+            }
             return Err(OAuthError::ResponseTooLarge {
                 max_bytes: MAX_RESPONSE_BODY_BYTES,
             });
         }
-        let sanitized = sanitize_response(
+        let sanitized = match sanitize_response(
             self,
             &raw,
             credential_id.as_str(),
             policy,
             expected_generation,
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(flow) = device_session.as_ref() {
+                    self.drop_and_revoke(flow);
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = context.check() {
             if let Some(flow) = device_session.as_ref() {
                 self.drop_and_revoke(flow);
@@ -1423,6 +1445,57 @@ impl OAuthHost {
         let flow = self.live_flow(handle)?;
         self.drop_and_revoke(&flow);
         Ok(())
+    }
+
+    pub(crate) fn device_session_matches_binding(
+        &self,
+        handle: &OpaqueDeviceSessionHandle,
+        policy_generation: u64,
+        run_id: &str,
+        credential_id: &str,
+    ) -> bool {
+        if !handle.same_host(&self.inner) {
+            return false;
+        }
+        let Ok(flow) = self.live_flow(handle) else {
+            return false;
+        };
+        flow.policy_generation == policy_generation
+            && flow.run_id == run_id
+            && flow.credential_id == credential_id
+    }
+
+    pub(crate) fn device_session_live(
+        &self,
+        handle: &OpaqueDeviceSessionHandle,
+        policy_generation: u64,
+        run_id: &str,
+        credential_id: &str,
+    ) -> bool {
+        if !self.device_session_matches_binding(handle, policy_generation, run_id, credential_id) {
+            return false;
+        }
+        let Ok(flow) = self.live_flow(handle) else {
+            return false;
+        };
+        if flow
+            .check_flag(
+                &flow.device_state,
+                DEVICE_HANDLE_CLASS,
+                self.inner.clock.now(),
+            )
+            .is_err()
+            || flow
+                .device_code
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            return false;
+        }
+        self.lock_flows()
+            .get(&flow.id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &flow))
     }
 
     /// Fixture wait primitive. Checks cancel; does not busy-poll.
@@ -2271,5 +2344,40 @@ impl Default for ScriptedCancel {
 impl OAuthCancel for ScriptedCancel {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod device_poll_tests {
+    use super::*;
+
+    #[test]
+    fn single_flight_rejects_overlap_then_releases_live_device_session() {
+        let now = Instant::now();
+        let mut flow = FlowInner::forged();
+        let flow = Arc::get_mut(&mut flow).expect("exclusive fixture flow");
+        flow.expires_at = now + Duration::from_secs(60);
+        flow.device_code = Mutex::new(Zeroizing::new("fixture-device".to_string()));
+        flow.device_state.store(HANDLE_LIVE, Ordering::Release);
+
+        let first_poll = flow.begin_device_poll(now).expect("first poll admitted");
+        assert!(matches!(
+            flow.begin_device_poll(now),
+            Err(OAuthError::HandleReplayed { .. })
+        ));
+        assert!(flow.device_in_flight.load(Ordering::Acquire));
+        assert_eq!(flow.device_state.load(Ordering::Acquire), HANDLE_LIVE);
+        assert_eq!(
+            flow.device_id().expect("first poll keeps session"),
+            "fixture-device"
+        );
+
+        drop(first_poll);
+        let retry = flow
+            .begin_device_poll(now)
+            .expect("retry after first completes");
+        assert_eq!(flow.device_state.load(Ordering::Acquire), HANDLE_LIVE);
+        assert!(!flow.revoked.load(Ordering::Acquire));
+        drop(retry);
     }
 }

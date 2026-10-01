@@ -39,6 +39,7 @@ use crate::runtime::rss_runner::RunCancellation;
 
 const LIMIT: usize = 64;
 
+mod device;
 mod flow;
 
 macro_rules! resource {
@@ -948,6 +949,7 @@ fn transport_use_type() -> HostTypeSchema {
             ("refresh_handle", opt(key(Refresh::KEY))),
             ("code_handle", opt(key("oauth.authorization_code"))),
             ("verifier_handle", opt(key("oauth.verifier"))),
+            ("device_handle", opt(key(device::DEVICE_KEY))),
         ],
     )
 }
@@ -961,6 +963,7 @@ fn transport_response_type() -> HostTypeSchema {
             ("retry_after_ms", opt(HostTypeSchema::Int)),
             ("access_slot", opt(key(SecretSlot::KEY))),
             ("refresh_slot", opt(key(SecretSlot::KEY))),
+            ("device_handle", opt(key(device::DEVICE_KEY))),
         ],
     )
 }
@@ -1120,6 +1123,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             close_access_desc,
             close_refresh_desc,
             close_slot_desc,
+            device::close_desc,
             flow::pkce_begin_desc,
             flow::callback_wait_desc,
             flow::close_callback_desc,
@@ -1132,6 +1136,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             access_meta,
             refresh_meta,
             slot_meta,
+            device::meta,
             flow::callback_meta,
             flow::verifier_meta,
             flow::code_meta,
@@ -1268,6 +1273,7 @@ enum TransportCredential {
     Access(ResourceHandle, OpaqueAccessHandle),
     Refresh(ResourceHandle, OpaqueRefreshHandle),
     CodeVerifier(flow::TransportFlowPair),
+    Device(device::TransportDevice),
 }
 
 impl TransportCredential {
@@ -1277,6 +1283,7 @@ impl TransportCredential {
             Self::Access(_, handle) => handle.generation(),
             Self::Refresh(_, handle) => handle.generation(),
             Self::CodeVerifier(pair) => pair.credential_generation(),
+            Self::Device(device) => device.generation(),
         }
     }
 
@@ -1286,12 +1293,14 @@ impl TransportCredential {
             Self::Access(_, handle) => CredentialUse::Access(handle.clone()),
             Self::Refresh(_, handle) => CredentialUse::Refresh(handle.clone()),
             Self::CodeVerifier(pair) => pair.for_send(),
+            Self::Device(device) => device.for_send(),
         }
     }
 
     fn slot_generation_override(&self) -> Option<u64> {
         match self {
             Self::CodeVerifier(pair) => Some(pair.credential_generation()),
+            Self::Device(device) => Some(device.generation()),
             Self::None | Self::Access(_, _) | Self::Refresh(_, _) => None,
         }
     }
@@ -1313,6 +1322,7 @@ impl TransportCredential {
                 pair.rollback(vm);
                 Ok(())
             }
+            Self::Device(device) => device.close_if_terminal(vm),
             Self::Access(_, _) | Self::Refresh(_, _) | Self::CodeVerifier(_) => Ok(()),
         }
     }
@@ -1329,15 +1339,17 @@ fn transport_credential(
     let refresh = optional_field(usage, "refresh_handle")?;
     let code = optional_field(usage, "code_handle")?;
     let verifier = optional_field(usage, "verifier_handle")?;
+    let device = optional_field(usage, "device_handle")?;
     match (
         string(field(usage, "kind")?)?,
         access,
         refresh,
         code,
         verifier,
+        device,
     ) {
-        ("none", None, None, None, None) => Ok(TransportCredential::None),
-        ("access", Some(value), None, None, None) => {
+        ("none", None, None, None, None, None) => Ok(TransportCredential::None),
+        ("access", Some(value), None, None, None, None) => {
             borrowed::<Access>(vm, value)?;
             let context = vm.host_context();
             let entry = context
@@ -1354,7 +1366,7 @@ fn transport_credential(
                 entry.handle.clone(),
             ))
         }
-        ("refresh", None, Some(value), None, None) => {
+        ("refresh", None, Some(value), None, None, None) => {
             borrowed::<Refresh>(vm, value)?;
             let context = vm.host_context();
             let entry = context
@@ -1371,10 +1383,13 @@ fn transport_credential(
                 entry.handle.clone(),
             ))
         }
-        ("code_verifier", None, None, Some(code), Some(verifier)) => {
+        ("code_verifier", None, None, Some(code), Some(verifier), None) => {
             let policy_generation = owner.snapshot.generation;
             flow::transport_pair(vm, code, verifier, owner, credential_id, policy_generation)
                 .map(TransportCredential::CodeVerifier)
+        }
+        ("device_session", None, None, None, None, Some(value)) => {
+            device::transport(vm, value, owner, credential_id).map(TransportCredential::Device)
         }
         _ => Err(error("credential_use_unsupported")),
     }
@@ -1426,10 +1441,14 @@ fn admit_transport(
     match prepared {
         Ok(prepared) => Ok(prepared),
         Err(failure) => {
-            if let TransportCredential::CodeVerifier(pair) = credential
-                && pair.owner_inactive()
-            {
-                pair.rollback(vm);
+            if owner.check().is_err() {
+                match credential {
+                    TransportCredential::CodeVerifier(pair) => pair.rollback(vm),
+                    TransportCredential::Device(device) => {
+                        let _ = device.terminate(vm);
+                    }
+                    _ => {}
+                }
             }
             Err(failure)
         }
@@ -1448,7 +1467,12 @@ fn validate_transport_use_keys(usage: &Value) -> VmResult<()> {
         let name = key.as_str();
         if !matches!(
             name,
-            "kind" | "access_handle" | "refresh_handle" | "code_handle" | "verifier_handle"
+            "kind"
+                | "access_handle"
+                | "refresh_handle"
+                | "code_handle"
+                | "verifier_handle"
+                | "device_handle"
         ) || !seen.insert(name)
         {
             return Err(error("credential_use_unsupported"));
@@ -1465,6 +1489,7 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         Ok(owner) => owner,
         Err(failure) => {
             cleanup_inactive_code_pair(vm, request, usage, id);
+            device::cleanup_inactive(vm, request, usage, id);
             return Err(failure);
         }
     };
@@ -1483,10 +1508,26 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let closed = credential.close_if_terminal(vm);
     let owner_inactive = owner.check().is_err();
     let response = finalize_transport_response(&oauth, owner_inactive, sent, closed)?;
+    let mut access = None;
+    let mut refresh = None;
+    let mut device_handle = None;
     let processed = (|| {
         owner.check()?;
-        if response.device_handle.is_some() || response.code_handle.is_some() {
+        if response.code_handle.is_some() {
+            if let TransportCredential::Device(device) = &credential {
+                let _ = device.terminate(vm);
+            }
             return Err(error("response_handle_unsupported"));
+        }
+        if response.device_handle.is_some() {
+            match &credential {
+                TransportCredential::None => {}
+                TransportCredential::Device(device) => {
+                    let _ = device.terminate(vm);
+                    return Err(error("response_handle_unsupported"));
+                }
+                _ => return Err(error("response_handle_unsupported")),
+            }
         }
         let body = serde_json::to_string(&response.body_without_secret_fields)
             .map_err(|_| error("malformed_response"))?;
@@ -1503,47 +1544,30 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         {
             return Err(error("response_too_large"));
         }
-        let access = if let Some(slot) = &response.access_slot {
-            Some(issue_owner_slot(
+        if let Some(slot) = &response.access_slot {
+            access = Some(issue_owner_slot(
                 vm,
                 &owner,
                 id,
                 generation,
                 SecretSlotKind::Access,
                 slot.clone(),
-            )?)
-        } else {
-            None
-        };
-        let refresh = if let Some(slot) = &response.refresh_slot {
-            match issue_owner_slot(
+            )?);
+        }
+        if let Some(slot) = &response.refresh_slot {
+            refresh = Some(issue_owner_slot(
                 vm,
                 &owner,
                 id,
                 generation,
                 SecretSlotKind::Refresh,
                 slot.clone(),
-            ) {
-                Ok(value) => Some(value),
-                Err(failure) => {
-                    if let Some(value) = &access {
-                        close_issued_slot(vm, value);
-                    }
-                    return Err(failure);
-                }
-            }
-        } else {
-            None
-        };
-        if let Err(failure) = owner.check() {
-            if let Some(value) = &access {
-                close_issued_slot(vm, value);
-            }
-            if let Some(value) = &refresh {
-                close_issued_slot(vm, value);
-            }
-            return Err(failure);
+            )?);
         }
+        if let Some(native) = &response.device_handle {
+            device_handle = Some(device::issue(vm, &owner, id, native.clone())?);
+        }
+        owner.check()?;
         result(object(vec![
             ("ok", Value::Bool(true)),
             ("error", Value::Null),
@@ -1576,11 +1600,27 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
                     .map(Value::Int)
                     .unwrap_or(Value::Null),
             ),
-            ("access_slot", access.unwrap_or(Value::Null)),
-            ("refresh_slot", refresh.unwrap_or(Value::Null)),
+            ("access_slot", access.clone().unwrap_or(Value::Null)),
+            ("refresh_slot", refresh.clone().unwrap_or(Value::Null)),
+            (
+                "device_handle",
+                device_handle.clone().unwrap_or(Value::Null),
+            ),
         ]))
     })();
     if processed.is_err() {
+        if let TransportCredential::Device(device) = &credential {
+            let _ = device.terminate(vm);
+        }
+        if let Some(value) = &access {
+            close_issued_slot(vm, value);
+        }
+        if let Some(value) = &refresh {
+            close_issued_slot(vm, value);
+        }
+        if let Some(value) = &device_handle {
+            device::close_issued(vm, value);
+        }
         revoke_response(&oauth, &response);
     }
     processed
@@ -1646,7 +1686,14 @@ fn cleanup_inactive_code_pair(vm: &mut Vm, request: &Value, usage: &Value, id: &
     ) else {
         return;
     };
-    if access.is_some() || refresh.is_some() || validate_transport_use_keys(usage).is_err() {
+    let Ok(device) = optional_field(usage, "device_handle") else {
+        return;
+    };
+    if access.is_some()
+        || refresh.is_some()
+        || device.is_some()
+        || validate_transport_use_keys(usage).is_err()
+    {
         return;
     }
     let Ok(policy) = field(request, "policy_handle") else {
