@@ -1,7 +1,7 @@
 //! Generic OAuth primitives: PKCE session records, callback wait, and bounded
 //! HTTPS transport. RSS owns flow sequencing, retry, and business errors.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 #[allow(deprecated)]
 use ring::constant_time;
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use zeroize::Zeroizing;
 
@@ -18,6 +19,7 @@ use crate::auth::token::CredentialId;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+const MAX_EXCHANGE_CODE_BYTES: usize = 4096;
 const MAX_PUBLIC_QUERY_ENTRIES: usize = 32;
 const MAX_PUBLIC_QUERY_BYTES: usize = 2048;
 const MAX_JSON_DEPTH: usize = 8;
@@ -46,6 +48,7 @@ const SECRET_JSON_KEYS: &[&str] = &[
     "device_auth_id",
     "device_id",
     "code_verifier",
+    "authorization_code",
     "verifier",
     "client_secret",
     "password",
@@ -206,6 +209,45 @@ impl fmt::Debug for SanitizedProviderResponse {
             .field("code_handle", &self.code_handle)
             .finish()
     }
+}
+
+/// Which root-level response field contains a native authorization code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeCodeField {
+    Code,
+    AuthorizationCode,
+}
+
+/// Opt-in instructions for capturing an exchange pair without exposing its bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpaqueExchangeResponseIntent {
+    pub code_field: ExchangeCodeField,
+    pub redirect_uri: String,
+}
+
+/// Same-flow opaque handles promoted from a device response.
+#[derive(Debug)]
+pub struct OpaqueExchangePair {
+    pub code_handle: OpaqueAuthorizationCodeHandle,
+    pub verifier_handle: OpaqueVerifierHandle,
+}
+
+/// Sanitized public transport response and optional native exchange pair.
+#[derive(Debug)]
+pub struct OpaqueExchangeResponse {
+    pub response: SanitizedProviderResponse,
+    pub pair: Option<OpaqueExchangePair>,
+}
+
+struct PendingExchangePair {
+    code: Zeroizing<String>,
+    verifier: Zeroizing<String>,
+}
+
+struct ExchangeCaptureContext<'a> {
+    intent: &'a OpaqueExchangeResponseIntent,
+    device_flow: &'a Arc<FlowInner>,
+    io: &'a OAuthIoContext,
 }
 
 /// Prepared HTTPS request at the host boundary. Tests may inspect it host-side.
@@ -484,7 +526,7 @@ struct FlowInner {
     revoked: AtomicBool,
     verifier_state: AtomicU8,
     code_state: AtomicU8,
-    code: Mutex<Option<String>>,
+    code: Mutex<Option<Zeroizing<String>>>,
     device_code: Mutex<Zeroizing<String>>,
     device_state: AtomicU8,
     device_in_flight: AtomicBool,
@@ -597,7 +639,10 @@ impl FlowInner {
         Ok(())
     }
 
-    fn consume_exchange(&self, now: Instant) -> Result<(String, Zeroizing<String>), OAuthError> {
+    fn consume_exchange(
+        &self,
+        now: Instant,
+    ) -> Result<(Zeroizing<String>, Zeroizing<String>), OAuthError> {
         self.check_flag(&self.code_state, CODE_HANDLE_CLASS, now)?;
         self.check_flag(&self.verifier_state, VERIFIER_HANDLE_CLASS, now)?;
         let raw_code = self
@@ -1016,7 +1061,8 @@ impl OAuthHost {
         request: ProviderRequest,
         credential_use: CredentialUse,
     ) -> Result<SanitizedProviderResponse, OAuthError> {
-        self.transport_inner(policy, request, credential_use, None, None)
+        self.transport_inner(policy, request, credential_use, None, None, None)
+            .map(|result| result.response)
     }
 
     pub(crate) fn transport_scoped(
@@ -1031,6 +1077,45 @@ impl OAuthHost {
             policy,
             request,
             credential_use,
+            None,
+            Some(owner_cancel),
+            response_slot_generation_override,
+        )
+        .map(|result| result.response)
+    }
+
+    pub fn transport_exchange_pair(
+        &self,
+        policy: &TrustedTransportPolicy,
+        request: ProviderRequest,
+        device: OpaqueDeviceSessionHandle,
+        intent: OpaqueExchangeResponseIntent,
+    ) -> Result<OpaqueExchangeResponse, OAuthError> {
+        self.transport_inner(
+            policy,
+            request,
+            CredentialUse::Device(device),
+            Some(intent),
+            None,
+            None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transport_exchange_pair_scoped(
+        &self,
+        policy: &TrustedTransportPolicy,
+        request: ProviderRequest,
+        device: OpaqueDeviceSessionHandle,
+        intent: OpaqueExchangeResponseIntent,
+        owner_cancel: Arc<dyn OAuthCancel>,
+        response_slot_generation_override: Option<u64>,
+    ) -> Result<OpaqueExchangeResponse, OAuthError> {
+        self.transport_inner(
+            policy,
+            request,
+            CredentialUse::Device(device),
+            Some(intent),
             Some(owner_cancel),
             response_slot_generation_override,
         )
@@ -1041,9 +1126,18 @@ impl OAuthHost {
         policy: &TrustedTransportPolicy,
         request: ProviderRequest,
         credential_use: CredentialUse,
+        capture_intent: Option<OpaqueExchangeResponseIntent>,
         owner_cancel: Option<Arc<dyn OAuthCancel>>,
         response_slot_generation_override: Option<u64>,
-    ) -> Result<SanitizedProviderResponse, OAuthError> {
+    ) -> Result<OpaqueExchangeResponse, OAuthError> {
+        if let Some(intent) = capture_intent.as_ref() {
+            if !matches!(&credential_use, CredentialUse::Device(_)) {
+                return Err(OAuthError::HandleProvenance {
+                    class: DEVICE_HANDLE_CLASS.to_string(),
+                });
+            }
+            validate_exchange_response_intent(intent)?;
+        }
         if response_slot_generation_override.is_some()
             && !matches!(
                 &credential_use,
@@ -1126,7 +1220,7 @@ impl OAuthHost {
                         return Err(error);
                     }
                 };
-                append_form(&mut body, "code", &raw_code);
+                append_form(&mut body, "code", raw_code.as_str());
                 append_form(&mut body, "code_verifier", raw_verifier.as_str());
                 append_form(&mut body, "redirect_uri", &flow.redirect_uri);
                 self.drop_flow(flow.id);
@@ -1173,13 +1267,36 @@ impl OAuthHost {
                 max_bytes: MAX_RESPONSE_BODY_BYTES,
             });
         }
-        let sanitized = match sanitize_response(
-            self,
-            &raw,
-            credential_id.as_str(),
-            policy,
-            expected_generation,
-        ) {
+        let sanitized_result = match capture_intent.as_ref() {
+            Some(intent) => {
+                let Some(device_flow) = device_session.as_ref() else {
+                    return Err(OAuthError::HandleInvalid {
+                        class: DEVICE_HANDLE_CLASS.to_string(),
+                    });
+                };
+                sanitize_exchange_response(
+                    self,
+                    &raw,
+                    credential_id.as_str(),
+                    policy,
+                    expected_generation,
+                    ExchangeCaptureContext {
+                        intent,
+                        device_flow,
+                        io: &context,
+                    },
+                )
+            }
+            None => sanitize_response(
+                self,
+                &raw,
+                credential_id.as_str(),
+                policy,
+                expected_generation,
+            )
+            .map(|response| (response, None)),
+        };
+        let (sanitized, pair) = match sanitized_result {
             Ok(response) => response,
             Err(error) => {
                 if let Some(flow) = device_session.as_ref() {
@@ -1197,24 +1314,34 @@ impl OAuthHost {
             {
                 self.drop_and_revoke(&flow);
             }
+            if let Some(pair) = pair.as_ref() {
+                self.drop_and_revoke(&pair.code_handle.flow_inner());
+            }
             return Err(error);
         }
-        match device_session.as_ref() {
-            Some(flow) if sanitized.access_slot.is_some() || sanitized.refresh_slot.is_some() => {
-                if let Err(error) = flow.consume_flag(
-                    &flow.device_state,
-                    DEVICE_HANDLE_CLASS,
-                    self.inner.clock.now(),
-                ) {
-                    self.drop_and_revoke(flow);
-                    return Err(error);
+        if pair.is_none() {
+            match device_session.as_ref() {
+                Some(flow)
+                    if sanitized.access_slot.is_some() || sanitized.refresh_slot.is_some() =>
+                {
+                    if let Err(error) = flow.consume_flag(
+                        &flow.device_state,
+                        DEVICE_HANDLE_CLASS,
+                        self.inner.clock.now(),
+                    ) {
+                        self.drop_and_revoke(flow);
+                        return Err(error);
+                    }
+                    flow.clear_device_code();
+                    self.drop_flow(flow.id);
                 }
-                flow.clear_device_code();
-                self.drop_flow(flow.id);
+                _ => {}
             }
-            _ => {}
         }
-        Ok(sanitized)
+        Ok(OpaqueExchangeResponse {
+            response: sanitized,
+            pair,
+        })
     }
 
     pub fn inject_callback(
@@ -1443,6 +1570,79 @@ impl OAuthHost {
         Ok(OpaqueDeviceSessionHandle::from_inner(flow))
     }
 
+    fn promote_device_session(
+        &self,
+        device_flow: &Arc<FlowInner>,
+        policy: &TrustedTransportPolicy,
+        redirect_uri: &str,
+        code: Zeroizing<String>,
+        verifier: Zeroizing<String>,
+        context: &OAuthIoContext,
+    ) -> Result<OpaqueExchangePair, OAuthError> {
+        if let Err(error) = context.check() {
+            self.drop_and_revoke(device_flow);
+            return Err(error);
+        }
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let exchange_flow = Arc::new(FlowInner {
+            id,
+            host: Arc::downgrade(&self.inner),
+            policy_generation: device_flow.policy_generation,
+            run_id: device_flow.run_id.clone(),
+            credential_id: device_flow.credential_id.clone(),
+            expires_at: min_deadline(device_flow.expires_at, policy.deadline),
+            state: Mutex::new(Zeroizing::new(String::new())),
+            verifier: Mutex::new(verifier),
+            redirect_uri: redirect_uri.to_string(),
+            callback: AtomicU8::new(HANDLE_REVOKED),
+            callback_succeeded: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+            verifier_state: AtomicU8::new(HANDLE_LIVE),
+            code_state: AtomicU8::new(HANDLE_LIVE),
+            code: Mutex::new(Some(code)),
+            device_code: Mutex::new(Zeroizing::new(String::new())),
+            device_state: AtomicU8::new(HANDLE_REVOKED),
+            device_in_flight: AtomicBool::new(false),
+        });
+        let publication = {
+            let mut flows = self.lock_flows();
+            self.sweep_locked(&mut flows);
+            let source_is_registered = flows
+                .get(&device_flow.id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, device_flow));
+            if !source_is_registered
+                || device_flow.revoked.load(Ordering::Acquire)
+                || device_flow.device_state.load(Ordering::Acquire) != HANDLE_LIVE
+            {
+                Err(OAuthError::HandleRevoked {
+                    class: DEVICE_HANDLE_CLASS.to_string(),
+                })
+            } else if let Err(error) = context.check() {
+                Err(error)
+            } else {
+                device_flow.revoke();
+                flows.remove(&device_flow.id);
+                flows.insert(exchange_flow.id, Arc::clone(&exchange_flow));
+                match context.check() {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        flows.remove(&exchange_flow.id);
+                        Err(error)
+                    }
+                }
+            }
+        };
+        if let Err(error) = publication {
+            self.drop_and_revoke(device_flow);
+            self.drop_and_revoke(&exchange_flow);
+            return Err(error);
+        }
+        Ok(OpaqueExchangePair {
+            code_handle: OpaqueAuthorizationCodeHandle::from_inner(Arc::clone(&exchange_flow)),
+            verifier_handle: OpaqueVerifierHandle::from_inner(exchange_flow),
+        })
+    }
+
     /// RSS-owned terminal action. Host revokes and drops without interpreting
     /// provider error strings.
     pub fn terminal(&self, handle: &OpaqueDeviceSessionHandle) -> Result<(), OAuthError> {
@@ -1565,7 +1765,7 @@ impl OAuthHost {
         *flow
             .code
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(code);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Zeroizing::new(code));
         flow.callback_succeeded.store(true, Ordering::Release);
         Ok(CallbackEnvelope {
             outcome: CallbackOutcome::Success,
@@ -1733,6 +1933,39 @@ impl FlowHandle for OpaqueDeviceSessionHandle {
     }
     fn flow_inner(&self) -> Arc<FlowInner> {
         self.flow_inner()
+    }
+}
+
+fn validate_exchange_response_intent(
+    intent: &OpaqueExchangeResponseIntent,
+) -> Result<(), OAuthError> {
+    let uri = intent.redirect_uri.as_str();
+    let invalid = || OAuthError::InvalidIntent {
+        reason: "redirect URI is not an admitted absolute URI".to_string(),
+    };
+    if uri.is_empty() || uri.len() > 2048 || uri.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    let parsed = url::Url::parse(uri).map_err(|_| invalid())?;
+    if parsed.username() != "" || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err(invalid());
+    }
+    match parsed.scheme() {
+        "https" if parsed.host_str().is_some() => Ok(()),
+        "http" => {
+            let loopback = parsed.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+            if loopback && parsed.port().is_some() {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -1945,6 +2178,137 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+struct StrictJsonSeed {
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.depth > MAX_JSON_DEPTH {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "response JSON exceeds depth",
+            ));
+        }
+        deserializer.deserialize_any(StrictJsonVisitor { depth: self.depth })
+    }
+}
+
+struct StrictJsonVisitor {
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value with unique object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::String(value))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(StrictJsonSeed {
+            depth: self.depth + 1,
+        })? {
+            values.push(value);
+        }
+        Ok(JsonValue::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = JsonMap::new();
+        let mut seen = HashSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(<A::Error as serde::de::Error>::custom(
+                    "response JSON contains a duplicate object key",
+                ));
+            }
+            let value = object.next_value_seed(StrictJsonSeed {
+                depth: self.depth + 1,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(JsonValue::Object(values))
+    }
+}
+
+fn parse_strict_json(text: &str) -> Result<JsonValue, OAuthError> {
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let parsed = StrictJsonSeed { depth: 1 }
+        .deserialize(&mut deserializer)
+        .map_err(|error| OAuthError::MalformedResponse {
+            reason: error.to_string(),
+        })?;
+    deserializer
+        .end()
+        .map_err(|error| OAuthError::MalformedResponse {
+            reason: error.to_string(),
+        })?;
+    Ok(parsed)
+}
+
 fn sanitize_response(
     host: &OAuthHost,
     raw: &RawHttpsResponse,
@@ -1953,16 +2317,7 @@ fn sanitize_response(
     expected_generation: u64,
 ) -> Result<SanitizedProviderResponse, OAuthError> {
     if raw.body.is_empty() {
-        return Ok(SanitizedProviderResponse {
-            status: raw.status,
-            public_headers: public_headers(&raw.headers),
-            body_without_secret_fields: JsonValue::Object(JsonMap::new()),
-            retry_after_ms: retry_after_ms(&raw.headers),
-            access_slot: None,
-            refresh_slot: None,
-            device_handle: None,
-            code_handle: None,
-        });
+        return Ok(empty_sanitized_response(raw));
     }
     let text = std::str::from_utf8(&raw.body).map_err(|_| OAuthError::MalformedResponse {
         reason: "response is not UTF-8".to_string(),
@@ -1976,6 +2331,84 @@ fn sanitize_response(
             reason: "response JSON exceeds depth".to_string(),
         });
     }
+    sanitize_parsed_response(
+        host,
+        raw,
+        parsed,
+        credential_id,
+        policy,
+        expected_generation,
+    )
+}
+
+fn sanitize_exchange_response(
+    host: &OAuthHost,
+    raw: &RawHttpsResponse,
+    credential_id: &str,
+    policy: &TrustedTransportPolicy,
+    expected_generation: u64,
+    capture: ExchangeCaptureContext<'_>,
+) -> Result<(SanitizedProviderResponse, Option<OpaqueExchangePair>), OAuthError> {
+    if raw.body.is_empty() {
+        return Ok((empty_sanitized_response(raw), None));
+    }
+    let text = std::str::from_utf8(&raw.body).map_err(|_| OAuthError::MalformedResponse {
+        reason: "response is not UTF-8".to_string(),
+    })?;
+    let mut parsed = parse_strict_json(text)?;
+    let pending_pair = if (200..300).contains(&raw.status) {
+        take_exchange_pair(&mut parsed, capture.intent.code_field)?
+    } else {
+        None
+    };
+    if pending_pair.is_some() && contains_new_exchange_controls(&parsed) {
+        return Err(OAuthError::MalformedResponse {
+            reason: "exchange response combined a pair with newly issued credentials".to_string(),
+        });
+    }
+    let response = sanitize_parsed_response(
+        host,
+        raw,
+        parsed,
+        credential_id,
+        policy,
+        expected_generation,
+    )?;
+    let pair = match pending_pair {
+        Some(pair) => Some(host.promote_device_session(
+            capture.device_flow,
+            policy,
+            &capture.intent.redirect_uri,
+            pair.code,
+            pair.verifier,
+            capture.io,
+        )?),
+        None => None,
+    };
+    Ok((response, pair))
+}
+
+fn empty_sanitized_response(raw: &RawHttpsResponse) -> SanitizedProviderResponse {
+    SanitizedProviderResponse {
+        status: raw.status,
+        public_headers: public_headers(&raw.headers),
+        body_without_secret_fields: JsonValue::Object(JsonMap::new()),
+        retry_after_ms: retry_after_ms(&raw.headers),
+        access_slot: None,
+        refresh_slot: None,
+        device_handle: None,
+        code_handle: None,
+    }
+}
+
+fn sanitize_parsed_response(
+    host: &OAuthHost,
+    raw: &RawHttpsResponse,
+    parsed: JsonValue,
+    credential_id: &str,
+    policy: &TrustedTransportPolicy,
+    expected_generation: u64,
+) -> Result<SanitizedProviderResponse, OAuthError> {
     let mut sink = SecretSink {
         access: None,
         refresh: None,
@@ -1997,6 +2430,90 @@ fn sanitize_response(
         device_handle,
         code_handle: None,
     })
+}
+
+fn take_exchange_pair(
+    value: &mut JsonValue,
+    code_field: ExchangeCodeField,
+) -> Result<Option<PendingExchangePair>, OAuthError> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let code_keys = object
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case("code"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let authorization_code_keys = object
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case("authorization_code"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let verifier_keys = object
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case("code_verifier"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let malformed = || OAuthError::MalformedResponse {
+        reason: "exchange response contains ambiguous or invalid controls".to_string(),
+    };
+    if code_keys.len() > 1
+        || authorization_code_keys.len() > 1
+        || verifier_keys.len() > 1
+        || (!code_keys.is_empty() && !authorization_code_keys.is_empty())
+    {
+        return Err(malformed());
+    }
+    let selected_code_key = match code_field {
+        ExchangeCodeField::Code => code_keys.first(),
+        ExchangeCodeField::AuthorizationCode => authorization_code_keys.first(),
+    };
+    let has_any_code = !code_keys.is_empty() || !authorization_code_keys.is_empty();
+    let verifier_key = verifier_keys.first();
+    if selected_code_key.is_none() && verifier_key.is_none() && !has_any_code {
+        return Ok(None);
+    }
+    let (Some(code_key), Some(verifier_key)) = (selected_code_key, verifier_key) else {
+        return Err(malformed());
+    };
+    let code = match object.remove(code_key) {
+        Some(JsonValue::String(code)) => Zeroizing::new(code),
+        _ => return Err(malformed()),
+    };
+    let verifier = match object.remove(verifier_key) {
+        Some(JsonValue::String(verifier)) => Zeroizing::new(verifier),
+        _ => return Err(malformed()),
+    };
+    if code.is_empty()
+        || code.len() > MAX_EXCHANGE_CODE_BYTES
+        || code.chars().any(char::is_control)
+        || !(43..=128).contains(&verifier.len())
+        || !verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(malformed());
+    }
+    Ok(Some(PendingExchangePair { code, verifier }))
+}
+
+fn contains_new_exchange_controls(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Object(object) => {
+            object.keys().any(|key| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "access_token"
+                        | "refresh_token"
+                        | "device_code"
+                        | "device_id"
+                        | "device_auth_id"
+                )
+            }) || object.values().any(contains_new_exchange_controls)
+        }
+        JsonValue::Array(values) => values.iter().any(contains_new_exchange_controls),
+        _ => false,
+    }
 }
 
 struct SecretSink {
