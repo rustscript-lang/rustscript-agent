@@ -1,0 +1,16 @@
+use config;
+use auth;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
+    let loaded = config::load_snapshot(&home);
+    loaded.policy_handle
+}
+
+pub fn now(policy: resource<auth.policy>) -> int {
+    oauth::now_ms(&policy)
+}
+
+pub fn wait(policy: resource<auth.policy>, millis: int) -> null {
+    oauth::wait_ms(&policy, millis)
+}

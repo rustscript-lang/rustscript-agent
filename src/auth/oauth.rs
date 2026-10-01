@@ -812,6 +812,10 @@ impl OAuthHost {
         }
     }
 
+    pub(crate) fn clock_now_ms(&self) -> u64 {
+        self.inner.clock.unix_ms()
+    }
+
     pub fn pkce_begin(
         &self,
         policy: &TrustedTransportPolicy,

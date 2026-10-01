@@ -41,6 +41,8 @@ const LIMIT: usize = 64;
 
 mod device;
 mod flow;
+mod public_json;
+mod timing;
 
 macro_rules! resource {
     ($name:ident, $key:literal, $description:literal) => {
@@ -1115,6 +1117,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
         functions: &[
             config_desc,
             transport_desc,
+            public_json::public_json_field_desc,
             metadata_desc,
             access_desc,
             refresh_desc,
@@ -1124,6 +1127,8 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             close_refresh_desc,
             close_slot_desc,
             device::close_desc,
+            timing::now_ms_desc,
+            timing::wait_ms_desc,
             flow::pkce_begin_desc,
             flow::callback_wait_desc,
             flow::close_callback_desc,
