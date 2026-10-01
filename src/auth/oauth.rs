@@ -1259,26 +1259,8 @@ impl OAuthHost {
             }
         })?;
         self.validate_credential_use(policy, credential_id.as_str(), &credential_use)?;
-        validate_native_body_selection(request_body_intent, &credential_use)?;
         if request_body_intent.is_none() {
             reject_reserved_form_keys(&request.public_body)?;
-        }
-        if let Some(intent) = request_body_intent {
-            let canonical = intent.encoding.content_type();
-            match headers.get("content-type") {
-                Some(value) if value.trim().eq_ignore_ascii_case(canonical) => {
-                    headers.insert("content-type".to_string(), canonical.to_string());
-                }
-                Some(_) => {
-                    return Err(OAuthError::InvalidIntent {
-                        reason: "selected request body content type does not match encoding"
-                            .to_string(),
-                    });
-                }
-                None => {
-                    headers.insert("content-type".to_string(), canonical.to_string());
-                }
-            }
         }
         let submitted_flow = match &credential_use {
             CredentialUse::AuthorizationCode { code, .. } => Some(self.live_flow(code)?),
@@ -1294,6 +1276,31 @@ impl OAuthHost {
             Some(owner_cancel) => self.io_context_with_cancel(operation_deadline, owner_cancel),
             None => self.io_context(operation_deadline),
         };
+        if let Some(intent) = request_body_intent {
+            let admission = (|| {
+                validate_native_body_selection(Some(intent), &credential_use)?;
+                let canonical = intent.encoding.content_type();
+                match headers.get("content-type") {
+                    Some(value) if value.trim().eq_ignore_ascii_case(canonical) => {
+                        headers.insert("content-type".to_string(), canonical.to_string());
+                    }
+                    Some(_) => {
+                        return Err(OAuthError::InvalidIntent {
+                            reason: "selected request body content type does not match encoding"
+                                .to_string(),
+                        });
+                    }
+                    None => {
+                        headers.insert("content-type".to_string(), canonical.to_string());
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = admission {
+                self.revoke_submitted_if_context_inactive(&context, submitted_flow.as_ref());
+                return Err(error);
+            }
+        }
         if let Err(error) = context.check() {
             self.revoke_credential_use(&credential_use);
             return Err(error);
@@ -3504,6 +3511,326 @@ mod native_selected_cleanup_tests {
             }),
             exchange_response: None,
         }
+    }
+
+    #[test]
+    fn cancelled_owner_selection_rejection_reclaims_only_admitted_device() {
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let owner_cancel = Arc::new(ScriptedCancel::new());
+        let host = OAuthHost::new(
+            scripted.clone(),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        );
+        let policy = policy();
+        let device = start_device(&host, &scripted, &policy);
+        let sibling = start_device(&host, &scripted, &policy);
+        assert_eq!(host.live_flow_count(), 2);
+        scripted.take_sent();
+        owner_cancel.cancel();
+        let mut intents = selected_device_intents();
+        intents.request_body.as_mut().unwrap().secret_fields = SecretBodyFieldSelection::None;
+        let error = host
+            .transport_with_intents_scoped(
+                &policy,
+                request("/oauth/device/token", "{}"),
+                CredentialUse::Device(device.clone()),
+                intents,
+                owner_cancel,
+                None,
+            )
+            .expect_err("local selector mismatch");
+        assert_eq!(error.code(), "invalid_intent");
+        assert!(scripted.take_sent().is_empty());
+        assert!(host.device_session_live(&sibling, policy.generation, &policy.run_id, "primary"));
+        assert!(!host.device_session_live(&device, policy.generation, &policy.run_id, "primary"));
+        assert_eq!(host.live_flow_count(), 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum EarlyRejection {
+        Selection,
+        ContentType,
+    }
+
+    #[derive(Clone, Copy)]
+    enum OwnerState {
+        Active,
+        Cancelled,
+        Deadline,
+    }
+
+    enum AdmittedFamily {
+        Device(OpaqueDeviceSessionHandle),
+        Pair(OpaqueExchangePair),
+    }
+
+    impl AdmittedFamily {
+        fn credential(&self) -> CredentialUse {
+            match self {
+                Self::Device(device) => CredentialUse::Device(device.clone()),
+                Self::Pair(pair) => CredentialUse::AuthorizationCode {
+                    code: pair.code_handle.clone(),
+                    verifier: pair.verifier_handle.clone(),
+                },
+            }
+        }
+
+        fn intents(&self) -> NativeTransportIntents {
+            match self {
+                Self::Device(_) => selected_device_intents(),
+                Self::Pair(_) => NativeTransportIntents {
+                    request_body: Some(NativeRequestBodyIntent {
+                        encoding: RequestBodyEncoding::JsonObject,
+                        secret_fields: SecretBodyFieldSelection::AuthorizationCode {
+                            code_field: ExchangeCodeField::Code,
+                        },
+                    }),
+                    exchange_response: None,
+                },
+            }
+        }
+
+        fn is_live(&self, host: &OAuthHost, policy: &TrustedTransportPolicy) -> bool {
+            match self {
+                Self::Device(device) => {
+                    host.device_session_live(device, policy.generation, &policy.run_id, "primary")
+                }
+                Self::Pair(pair) => host.exchange_pair_live(
+                    &pair.code_handle,
+                    &pair.verifier_handle,
+                    policy.generation,
+                    &policy.run_id,
+                    "primary",
+                ),
+            }
+        }
+    }
+
+    fn assert_early_admission(code_pair: bool, rejection: EarlyRejection, state: OwnerState) {
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let owner_cancel = Arc::new(ScriptedCancel::new());
+        let host = OAuthHost::new(
+            scripted.clone(),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        );
+        let mut policy = policy();
+        policy
+            .allowed_header_names
+            .insert("content-type".to_string());
+        let device = start_device(&host, &scripted, &policy);
+        let family = if code_pair {
+            scripted.push_json(
+                200,
+                serde_json::json!({
+                    "authorization_code": "CLEANUP_CODE_MARKER",
+                    "code_verifier": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                }),
+            );
+            AdmittedFamily::Pair(
+                host.transport_exchange_pair(
+                    &policy,
+                    request("/oauth/device/token", "grant_type=device_code"),
+                    device,
+                    OpaqueExchangeResponseIntent {
+                        code_field: ExchangeCodeField::AuthorizationCode,
+                        redirect_uri: "https://redirect.example.test/callback".to_string(),
+                    },
+                )
+                .expect("native promoted pair")
+                .pair
+                .expect("opaque native pair"),
+            )
+        } else {
+            AdmittedFamily::Device(device)
+        };
+        let sibling = start_device(&host, &scripted, &policy);
+        assert!(family.is_live(&host, &policy));
+        assert_eq!(host.live_flow_count(), 2);
+        scripted.take_sent();
+        let mut call_policy = policy.clone();
+        match state {
+            OwnerState::Active => {}
+            OwnerState::Cancelled => owner_cancel.cancel(),
+            OwnerState::Deadline => {
+                call_policy.deadline = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        let mut intents = family.intents();
+        let mut rejected_request = request("/oauth/token", "{}");
+        match rejection {
+            EarlyRejection::Selection => {
+                intents.request_body.as_mut().unwrap().secret_fields =
+                    SecretBodyFieldSelection::None;
+            }
+            EarlyRejection::ContentType => {
+                rejected_request
+                    .public_headers
+                    .insert("content-type".to_string(), "text/plain".to_string());
+            }
+        }
+        let error = host
+            .transport_with_intents_scoped(
+                &call_policy,
+                rejected_request,
+                family.credential(),
+                intents,
+                owner_cancel.clone(),
+                None,
+            )
+            .expect_err("original structural admission error");
+        assert_eq!(error.code(), "invalid_intent");
+        assert!(scripted.take_sent().is_empty());
+        assert!(host.device_session_live(&sibling, policy.generation, &policy.run_id, "primary"));
+        match state {
+            OwnerState::Active => {
+                assert!(family.is_live(&host, &policy));
+                assert_eq!(host.live_flow_count(), 2);
+                scripted.push_raw(200, "{}");
+                host.transport_with_intents_scoped(
+                    &policy,
+                    request("/oauth/token", "{}"),
+                    family.credential(),
+                    family.intents(),
+                    owner_cancel,
+                    None,
+                )
+                .expect("corrected local input retries same live family");
+                let sent = scripted.take_sent();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].headers["content-type"], "application/json");
+                let body: JsonValue = serde_json::from_str(&sent[0].body).unwrap();
+                if code_pair {
+                    assert_eq!(body["code"], "CLEANUP_CODE_MARKER");
+                    assert!(!family.is_live(&host, &policy));
+                    assert_eq!(host.live_flow_count(), 1);
+                } else {
+                    assert_eq!(body["device_code"], "CLEANUP_DEVICE_MARKER");
+                    assert!(family.is_live(&host, &policy));
+                }
+            }
+            OwnerState::Cancelled | OwnerState::Deadline => {
+                assert!(!family.is_live(&host, &policy));
+                assert_eq!(host.live_flow_count(), 1);
+            }
+        }
+        assert!(host.device_session_live(&sibling, policy.generation, &policy.run_id, "primary"));
+    }
+
+    #[test]
+    fn cancelled_owner_content_type_rejection_reclaims_device_and_native_pair() {
+        for code_pair in [false, true] {
+            assert_early_admission(
+                code_pair,
+                EarlyRejection::ContentType,
+                OwnerState::Cancelled,
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_owner_selection_rejection_reclaims_native_pair() {
+        assert_early_admission(true, EarlyRejection::Selection, OwnerState::Cancelled);
+    }
+
+    #[test]
+    fn policy_deadline_rejections_reclaim_only_admitted_device_or_pair() {
+        for code_pair in [false, true] {
+            for rejection in [EarlyRejection::Selection, EarlyRejection::ContentType] {
+                assert_early_admission(code_pair, rejection, OwnerState::Deadline);
+            }
+        }
+    }
+
+    #[test]
+    fn active_early_admission_errors_allow_same_device_and_pair_retry() {
+        for code_pair in [false, true] {
+            for rejection in [EarlyRejection::Selection, EarlyRejection::ContentType] {
+                assert_early_admission(code_pair, rejection, OwnerState::Active);
+            }
+        }
+    }
+
+    #[test]
+    fn inactive_owner_cannot_reclaim_foreign_host_family() {
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let make_host = || {
+            OAuthHost::new(
+                scripted.clone(),
+                Arc::new(ScriptedCallback::new()),
+                Arc::new(ScriptedBrowser::new()),
+                Arc::new(ScriptedClock::new(1_900_000_000_000)),
+                Arc::new(ScriptedCancel::new()),
+            )
+        };
+        let origin = make_host();
+        let receiver = make_host();
+        let policy = policy();
+        let foreign = start_device(&origin, &scripted, &policy);
+        let receiver_sibling = start_device(&receiver, &scripted, &policy);
+        scripted.take_sent();
+        let owner_cancel = Arc::new(ScriptedCancel::new());
+        owner_cancel.cancel();
+        let mut intents = selected_device_intents();
+        intents.request_body.as_mut().unwrap().secret_fields = SecretBodyFieldSelection::None;
+        let error = receiver
+            .transport_with_intents_scoped(
+                &policy,
+                request("/oauth/token", "{}"),
+                CredentialUse::Device(foreign.clone()),
+                intents,
+                owner_cancel,
+                None,
+            )
+            .expect_err("foreign provenance rejected before family cleanup");
+        assert_eq!(error.code(), "handle_invalid");
+        assert!(scripted.take_sent().is_empty());
+        assert!(origin.device_session_live(&foreign, policy.generation, &policy.run_id, "primary"));
+        assert!(receiver.device_session_live(
+            &receiver_sibling,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+        assert_eq!(origin.live_flow_count(), 1);
+        assert_eq!(receiver.live_flow_count(), 1);
+    }
+
+    #[test]
+    fn absent_intent_retains_legacy_reserved_form_error_precedence() {
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let host = OAuthHost::new(
+            scripted.clone(),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        );
+        let policy = policy();
+        let device = start_device(&host, &scripted, &policy);
+        scripted.take_sent();
+        let owner_cancel = Arc::new(ScriptedCancel::new());
+        owner_cancel.cancel();
+        let expected = reject_reserved_form_keys("code=synthetic-public").unwrap_err();
+        let error = host
+            .transport_with_intents_scoped(
+                &policy,
+                request("/oauth/token", "code=synthetic-public"),
+                CredentialUse::Device(device.clone()),
+                NativeTransportIntents::default(),
+                owner_cancel,
+                None,
+            )
+            .expect_err("legacy form admission before owner check");
+        assert_eq!(error.code(), expected.code());
+        assert!(scripted.take_sent().is_empty());
+        assert!(host.device_session_live(&device, policy.generation, &policy.run_id, "primary"));
+        assert_eq!(host.live_flow_count(), 1);
     }
 
     struct OwnerCancelAfterPoll {
