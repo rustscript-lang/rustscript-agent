@@ -1380,6 +1380,62 @@ fn transport_credential(
     }
 }
 
+fn admit_transport(
+    vm: &mut Vm,
+    owner: &Arc<Owner>,
+    credential: &TransportCredential,
+    request: &Value,
+    id: &str,
+) -> VmResult<(Arc<OAuthHost>, TrustedTransportPolicy, ProviderRequest)> {
+    let prepared = (|| {
+        let oauth = owner
+            .oauth
+            .as_ref()
+            .ok_or_else(|| error("transport_unavailable"))?
+            .clone();
+        let headers = field(request, "public_headers")?;
+        let Value::Array(headers) = headers else {
+            return Err(error("invalid_request"));
+        };
+        if headers.len() > 64 {
+            return Err(error("request_too_large"));
+        }
+        let mut public_headers = BTreeMap::new();
+        for header in headers.iter() {
+            let name = string(field(header, "name")?)?;
+            let value = string(field(header, "value")?)?;
+            if name.len().saturating_add(value.len()) > 8192
+                || public_headers
+                    .insert(name.to_owned(), value.to_owned())
+                    .is_some()
+            {
+                return Err(error("invalid_headers"));
+            }
+        }
+        let policy = transport_policy(owner, id)?;
+        owner.check()?;
+        let public_request = ProviderRequest {
+            method: string(field(request, "method")?)?.to_owned(),
+            path: string(field(request, "path")?)?.to_owned(),
+            public_headers,
+            public_body: string(field(request, "public_body")?)?.to_owned(),
+            credential_id: id.to_owned(),
+        };
+        Ok((oauth, policy, public_request))
+    })();
+    match prepared {
+        Ok(prepared) => Ok(prepared),
+        Err(failure) => {
+            if let TransportCredential::CodeVerifier(pair) = credential
+                && pair.owner_inactive()
+            {
+                pair.rollback(vm);
+            }
+            Err(failure)
+        }
+    }
+}
+
 fn validate_transport_use_keys(usage: &Value) -> VmResult<()> {
     let Value::Map(entries) = usage else {
         return Err(error("invalid_request"));
@@ -1414,44 +1470,10 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     };
     let credential = transport_credential(vm, usage, &owner, id)?;
     let generation = credential.generation();
-    let oauth = owner
-        .oauth
-        .as_ref()
-        .ok_or_else(|| error("transport_unavailable"))?
-        .clone();
-    let headers = field(request, "public_headers")?;
-    let Value::Array(headers) = headers else {
-        return Err(error("invalid_request"));
-    };
-    if headers.len() > 64 {
-        return Err(error("request_too_large"));
-    }
-    let mut public_headers = BTreeMap::new();
-    for header in headers.iter() {
-        let name = string(field(header, "name")?)?;
-        let value = string(field(header, "value")?)?;
-        if name.len().saturating_add(value.len()) > 8192
-            || public_headers
-                .insert(name.to_owned(), value.to_owned())
-                .is_some()
-        {
-            return Err(error("invalid_headers"));
-        }
-    }
-    let policy = transport_policy(&owner, id)?;
-    if let Err(failure) = owner.check() {
-        credential.close_if_terminal(vm)?;
-        return Err(failure);
-    }
+    let (oauth, policy, public_request) = admit_transport(vm, &owner, &credential, request, id)?;
     let sent = oauth.transport_scoped(
         &policy,
-        ProviderRequest {
-            method: string(field(request, "method")?)?.to_owned(),
-            path: string(field(request, "path")?)?.to_owned(),
-            public_headers,
-            public_body: string(field(request, "public_body")?)?.to_owned(),
-            credential_id: id.to_owned(),
-        },
+        public_request,
         credential.for_send(),
         flow::owner_cancellation(&owner),
         credential.slot_generation_override(),
@@ -1828,10 +1850,15 @@ fn close_slot(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CancellationReason;
     use crate::auth::oauth::{
         ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport,
     };
-    use std::time::Duration;
+    use rustscript_vm::{
+        CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, VmStatus,
+        compile_source_at_path_with_flavor_and_options,
+    };
+    use std::{fs, path::PathBuf, time::Duration};
     use zeroize::Zeroizing;
 
     fn scripted_oauth() -> OAuthHost {
@@ -1842,6 +1869,260 @@ mod tests {
             Arc::new(ScriptedClock::new(0)),
             Arc::new(ScriptedCancel::new()),
         )
+    }
+
+    struct PrivateAuthHome(PathBuf);
+
+    impl PrivateAuthHome {
+        fn new() -> Self {
+            let root = PathBuf::from(
+                std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned private test temp"),
+            );
+            let path = root.join(format!("sc01-inactive-owner-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create private auth home");
+            let fixture =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config_auth_rss");
+            fs::copy(fixture.join("config.yaml"), path.join("config.yaml"))
+                .expect("copy synthetic config");
+            let auth = fs::read_to_string(fixture.join("auth.yaml"))
+                .expect("read synthetic auth fixture")
+                .replace("1788440000000", "1900000000000");
+            fs::write(path.join("auth.yaml"), auth).expect("copy synthetic auth");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("private auth home mode");
+                for name in ["config.yaml", "auth.yaml"] {
+                    fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600))
+                        .expect("private auth file mode");
+                }
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for PrivateAuthHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn code_exchange_vm(auth: &AuthHost) -> Vm {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/code_exchange_contract.rss");
+        let source = fs::read_to_string(&path).expect("read actual code exchange RSS");
+        let catalog = auth_host_catalog();
+        let compiled = compile_source_at_path_with_flavor_and_options(
+            &path,
+            &source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+        )
+        .expect("compile code exchange RSS against exact auth catalog");
+        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        let mut registry = HostFunctionRegistry::restricted();
+        auth.register(&mut registry, catalog.as_ref())
+            .expect("register exact auth catalog");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind exact auth catalog");
+        assert!(matches!(vm.run().expect("run RSS root"), VmStatus::Halted));
+        vm
+    }
+
+    fn test_field(value: &Value, name: &str) -> Value {
+        let Value::Map(entries) = value else {
+            panic!("expected RSS record");
+        };
+        entries
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::String(key) if key.as_ref() == name => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing RSS field {name}"))
+    }
+
+    fn test_record(fields: Vec<(&str, Value)>) -> Value {
+        Value::map(
+            fields
+                .into_iter()
+                .map(|(name, value)| (Value::string(name), value))
+                .collect(),
+        )
+    }
+
+    fn call_rss(vm: &mut Vm, name: &str, args: &[Value]) -> Value {
+        let entry = vm.resolve_exported_callable(name).expect("RSS export");
+        vm.invoke_callable(entry, args).expect("RSS call")
+    }
+
+    fn ready_code_pair(
+        auth: &AuthHost,
+        vm: &mut Vm,
+        policy: &Value,
+        credential_id: &str,
+    ) -> (Value, Value, Value) {
+        let intent = test_record(vec![
+            ("credential_id", Value::string(credential_id)),
+            ("path", Value::string("/codex/device")),
+            ("flow", Value::string("authorization_code_pkce")),
+            ("callback_mode", Value::string("manual")),
+            (
+                "scopes",
+                Value::array(vec![Value::string("scope.synthetic")]),
+            ),
+            (
+                "public_query",
+                Value::array(vec![
+                    test_record(vec![
+                        ("name", Value::string("client_id")),
+                        ("value", Value::string("public-client-id")),
+                    ]),
+                    test_record(vec![
+                        ("name", Value::string("response_type")),
+                        ("value", Value::string("code")),
+                    ]),
+                ]),
+            ),
+        ]);
+        let begun = call_rss(vm, "begin", &[policy.clone(), intent]);
+        let callback = test_field(&begun, "callback_handle");
+        let verifier = test_field(&begun, "verifier_handle");
+        auth.fixture_inject_matching_callback(vm, &callback, "SC01_SYNTHETIC_CALLBACK_CODE")
+            .expect("inject synthetic callback");
+        let waited = call_rss(vm, "wait", std::slice::from_ref(&callback));
+        let code = test_field(&waited, "code_handle");
+        (callback, code, verifier)
+    }
+
+    fn transport_request(policy: &Value, credential_id: &str) -> Value {
+        test_record(vec![
+            ("policy_handle", policy.clone()),
+            ("credential_id", Value::string(credential_id)),
+            ("method", Value::string("POST")),
+            ("path", Value::string("/oauth/token")),
+            ("public_headers", Value::array(vec![])),
+            ("public_body", Value::string("client_id=synthetic")),
+        ])
+    }
+
+    fn transport_usage(code: &Value, verifier: &Value) -> Value {
+        test_record(vec![
+            ("kind", Value::string("code_verifier")),
+            ("code_handle", code.clone()),
+            ("verifier_handle", verifier.clone()),
+        ])
+    }
+
+    #[test]
+    fn inactive_owner_admission_failure_rolls_back_only_submitted_code_flow() {
+        const CREDENTIAL_ID: &str = "fixture-codex";
+        let home = PrivateAuthHome::new();
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+        let oauth = Arc::new(OAuthHost::new(
+            transport.clone(),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        ));
+        let auth = AuthHost::new(home.0.clone(), cancellation.clone())
+            .expect("auth host")
+            .with_oauth_host(oauth)
+            .with_oauth_callback_fixture();
+        let mut vm = code_exchange_vm(&auth);
+        let bound = auth.bind_vm(&mut vm).expect("bind VM owner");
+        let snapshot = call_rss(&mut vm, "snapshot", &[test_field(&bound, "host_home")]);
+        let policy = test_field(&snapshot, "policy_handle");
+        let (callback, code, verifier) = ready_code_pair(&auth, &mut vm, &policy, CREDENTIAL_ID);
+        let (_other_callback, other_code, other_verifier) =
+            ready_code_pair(&auth, &mut vm, &policy, CREDENTIAL_ID);
+        let request = transport_request(&policy, CREDENTIAL_ID);
+        let usage = transport_usage(&code, &verifier);
+        let other_usage = transport_usage(&other_code, &other_verifier);
+
+        let owner = policy_owner(&mut vm, &policy, CREDENTIAL_ID).expect("active policy owner");
+        assert!(Arc::ptr_eq(
+            &owner,
+            &policy_owner(&mut vm, &policy, CREDENTIAL_ID).expect("same policy owner")
+        ));
+        let credential = transport_credential(&mut vm, &usage, &owner, CREDENTIAL_ID)
+            .expect("valid same-owner code/verifier pair");
+        let other_credential = transport_credential(&mut vm, &other_usage, &owner, CREDENTIAL_ID)
+            .expect("independent same-owner code/verifier pair");
+        assert!(matches!(&credential, TransportCredential::CodeVerifier(_)));
+        assert!(matches!(
+            &other_credential,
+            TransportCredential::CodeVerifier(_)
+        ));
+        assert!(transport_policy(&owner, CREDENTIAL_ID).is_ok());
+        assert_eq!(vm.host_context().resource_count(), 8);
+        assert_eq!(
+            auth.fixture_live_oauth_flow_count().expect("native flows"),
+            2
+        );
+        assert!(transport.take_sent().is_empty());
+
+        owner.cancellation.request(CancellationReason::Requested);
+        assert!(
+            matches!(owner.check(), Err(VmError::HostError(code)) if code == "policy_inactive")
+        );
+        let failure = match admit_transport(&mut vm, &owner, &credential, &request, CREDENTIAL_ID) {
+            Err(failure) => failure,
+            Ok(_) => panic!("inactive owner must fail transport admission"),
+        };
+        assert!(matches!(&failure, VmError::HostError(code) if code == "policy_inactive"));
+        assert_eq!(
+            vm.host_context().resource_count(),
+            5,
+            "only the submitted callback/code/verifier family is reclaimed"
+        );
+        assert_eq!(
+            auth.fixture_live_oauth_flow_count().expect("native flows"),
+            1
+        );
+        assert!(
+            transport.take_sent().is_empty(),
+            "no native send before admission"
+        );
+        for (name, handle) in [
+            ("close_callback", &callback),
+            ("close_code", &code),
+            ("close_verifier", &verifier),
+        ] {
+            let entry = vm
+                .resolve_exported_callable(name)
+                .expect("RSS close export");
+            let failure = vm
+                .invoke_callable(entry, std::slice::from_ref(handle))
+                .expect_err("reclaimed aliases cannot be closed again");
+            let failure = failure.to_string();
+            assert!(
+                failure.contains("resource_invalid") || failure.contains("resource_already_closed"),
+                "{name} must report a closed resource, got {failure}"
+            );
+        }
+
+        let other_credential = transport_credential(&mut vm, &other_usage, &owner, CREDENTIAL_ID)
+            .expect("unrelated same-VM flow remains live");
+        let TransportCredential::CodeVerifier(other_pair) = other_credential else {
+            panic!("second flow keeps the code/verifier credential kind");
+        };
+        assert!(other_pair.callback_result_live());
+        assert_eq!(vm.host_context().resource_count(), 5);
+        assert_eq!(
+            auth.fixture_live_oauth_flow_count().expect("native flows"),
+            1
+        );
+        other_pair.rollback(&mut vm);
+        assert_eq!(vm.host_context().resource_count(), 2);
+        assert_eq!(
+            auth.fixture_live_oauth_flow_count().expect("native flows"),
+            0
+        );
     }
 
     #[test]
