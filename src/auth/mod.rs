@@ -7,6 +7,7 @@ pub mod oauth;
 #[cfg(feature = "config-fixture")]
 pub mod oauth_host;
 pub mod pkce;
+pub mod request_body;
 pub mod store;
 #[cfg(feature = "config-fixture")]
 pub mod store_host;
