@@ -1,11 +1,9 @@
-use std::{fmt, io};
-
-use serde::{
-    Serialize,
-    de::{DeserializeSeed, MapAccess, SeqAccess, Visitor},
-    ser::SerializeMap,
+use std::{
+    collections::HashSet,
+    fmt,
+    io::{self, Write},
 };
-use serde_json::{Map, Value};
+
 use zeroize::Zeroizing;
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -356,20 +354,241 @@ fn append_bounded(output: &mut Zeroizing<String>, value: &str) -> Result<(), Req
 }
 
 const MAX_JSON_DEPTH: usize = 8;
-const JSON_DEPTH_MARKER: &str = "request_body_json_depth_limit";
-const JSON_DUPLICATE_MARKER: &str = "request_body_duplicate_json_key";
+
+enum JsonPublicValue<'a> {
+    Scalar(&'a str),
+    Array(Vec<JsonPublicValue<'a>>),
+    Object(Vec<(String, JsonPublicValue<'a>)>),
+}
+
+struct JsonParser<'a> {
+    input: &'a str,
+    cursor: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, cursor: 0 }
+    }
+
+    fn parse_document(mut self) -> Result<JsonPublicValue<'a>, RequestBodyError> {
+        self.skip_whitespace();
+        let value = self.parse_value(0)?;
+        self.skip_whitespace();
+        if self.cursor != self.input.len() {
+            return Err(RequestBodyError::InvalidJson);
+        }
+        Ok(value)
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<JsonPublicValue<'a>, RequestBodyError> {
+        match self.peek_byte() {
+            Some(b'{') => self.parse_object(depth),
+            Some(b'[') => self.parse_array(depth),
+            Some(b'"') => Ok(JsonPublicValue::Scalar(self.parse_string_token()?)),
+            Some(b't') => Ok(JsonPublicValue::Scalar(self.parse_literal("true")?)),
+            Some(b'f') => Ok(JsonPublicValue::Scalar(self.parse_literal("false")?)),
+            Some(b'n') => Ok(JsonPublicValue::Scalar(self.parse_literal("null")?)),
+            Some(b'-' | b'0'..=b'9') => Ok(JsonPublicValue::Scalar(self.parse_number_token()?)),
+            _ => Err(RequestBodyError::InvalidJson),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<JsonPublicValue<'a>, RequestBodyError> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(RequestBodyError::JsonDepthExceeded);
+        }
+        self.cursor += 1;
+        self.skip_whitespace();
+        if self.peek_byte() == Some(b'}') {
+            self.cursor += 1;
+            return Ok(JsonPublicValue::Object(Vec::new()));
+        }
+
+        let mut seen_keys = HashSet::new();
+        let mut entries = Vec::new();
+        loop {
+            let raw_key = self.parse_string_token()?;
+            let key = serde_json::from_str::<String>(raw_key)
+                .map_err(|_| RequestBodyError::InvalidJson)?;
+            if !seen_keys.insert(key.clone()) {
+                return Err(RequestBodyError::DuplicateJsonKey);
+            }
+            self.skip_whitespace();
+            if self.peek_byte() != Some(b':') {
+                return Err(RequestBodyError::InvalidJson);
+            }
+            self.cursor += 1;
+            self.skip_whitespace();
+            let value = self.parse_value(depth + 1)?;
+            entries.push((key, value));
+            self.skip_whitespace();
+            match self.peek_byte() {
+                Some(b',') => {
+                    self.cursor += 1;
+                    self.skip_whitespace();
+                }
+                Some(b'}') => {
+                    self.cursor += 1;
+                    break;
+                }
+                _ => return Err(RequestBodyError::InvalidJson),
+            }
+        }
+        Ok(JsonPublicValue::Object(entries))
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<JsonPublicValue<'a>, RequestBodyError> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(RequestBodyError::JsonDepthExceeded);
+        }
+        self.cursor += 1;
+        self.skip_whitespace();
+        if self.peek_byte() == Some(b']') {
+            self.cursor += 1;
+            return Ok(JsonPublicValue::Array(Vec::new()));
+        }
+
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_value(depth + 1)?);
+            self.skip_whitespace();
+            match self.peek_byte() {
+                Some(b',') => {
+                    self.cursor += 1;
+                    self.skip_whitespace();
+                }
+                Some(b']') => {
+                    self.cursor += 1;
+                    break;
+                }
+                _ => return Err(RequestBodyError::InvalidJson),
+            }
+        }
+        Ok(JsonPublicValue::Array(values))
+    }
+
+    fn parse_string_token(&mut self) -> Result<&'a str, RequestBodyError> {
+        if self.peek_byte() != Some(b'"') {
+            return Err(RequestBodyError::InvalidJson);
+        }
+        let start = self.cursor;
+        self.cursor += 1;
+        while let Some(byte) = self.peek_byte() {
+            match byte {
+                b'"' => {
+                    self.cursor += 1;
+                    let token = self
+                        .input
+                        .get(start..self.cursor)
+                        .ok_or(RequestBodyError::InvalidJson)?;
+                    serde_json::from_str::<String>(token)
+                        .map_err(|_| RequestBodyError::InvalidJson)?;
+                    return Ok(token);
+                }
+                b'\\' => {
+                    self.cursor += 1;
+                    if self.cursor == self.input.len() {
+                        return Err(RequestBodyError::InvalidJson);
+                    }
+                    self.cursor += 1;
+                }
+                0x00..=0x1f => return Err(RequestBodyError::InvalidJson),
+                _ => self.cursor += 1,
+            }
+        }
+        Err(RequestBodyError::InvalidJson)
+    }
+
+    fn parse_literal(&mut self, expected: &'static str) -> Result<&'a str, RequestBodyError> {
+        let start = self.cursor;
+        if !self
+            .input
+            .get(self.cursor..)
+            .is_some_and(|remaining| remaining.starts_with(expected))
+        {
+            return Err(RequestBodyError::InvalidJson);
+        }
+        self.cursor += expected.len();
+        self.input
+            .get(start..self.cursor)
+            .ok_or(RequestBodyError::InvalidJson)
+    }
+
+    fn parse_number_token(&mut self) -> Result<&'a str, RequestBodyError> {
+        let start = self.cursor;
+        if self.peek_byte() == Some(b'-') {
+            self.cursor += 1;
+        }
+
+        match self.peek_byte() {
+            Some(b'0') => {
+                self.cursor += 1;
+                if matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                    return Err(RequestBodyError::InvalidJson);
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.cursor += 1;
+                while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                    self.cursor += 1;
+                }
+            }
+            _ => return Err(RequestBodyError::InvalidJson),
+        }
+
+        if self.peek_byte() == Some(b'.') {
+            self.cursor += 1;
+            let fraction_start = self.cursor;
+            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                self.cursor += 1;
+            }
+            if self.cursor == fraction_start {
+                return Err(RequestBodyError::InvalidJson);
+            }
+        }
+
+        if matches!(self.peek_byte(), Some(b'e' | b'E')) {
+            self.cursor += 1;
+            if matches!(self.peek_byte(), Some(b'+' | b'-')) {
+                self.cursor += 1;
+            }
+            let exponent_start = self.cursor;
+            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                self.cursor += 1;
+            }
+            if self.cursor == exponent_start {
+                return Err(RequestBodyError::InvalidJson);
+            }
+        }
+
+        self.input
+            .get(start..self.cursor)
+            .ok_or(RequestBodyError::InvalidJson)
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek_byte(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            self.cursor += 1;
+        }
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.cursor).copied()
+    }
+}
 
 fn encode_json_object(
     public_body: &str,
     fields: &[SecretField],
 ) -> Result<SecretRequestBody, RequestBodyError> {
     let public_value = if public_body.is_empty() {
-        Value::Object(Map::new())
+        JsonPublicValue::Object(Vec::new())
     } else {
-        parse_json_value(public_body)?
+        JsonParser::new(public_body).parse_document()?
     };
     let public_object = match &public_value {
-        Value::Object(object) => object,
+        JsonPublicValue::Object(object) => object,
         _ => return Err(RequestBodyError::JsonTopLevelNotObject),
     };
     validate_json_keys(&public_value, fields)?;
@@ -380,20 +599,14 @@ fn encode_json_object(
             encoded: &mut encoded,
             exceeded: false,
         };
-        let result = serde_json::to_writer(
-            &mut writer,
-            &JsonObjectWithSecrets {
-                public: public_object,
-                fields,
-            },
-        );
+        let result = write_json_object(&mut writer, public_object, fields);
         (result, writer.exceeded)
     };
 
     if serialization.1 {
         return Err(RequestBodyError::OutputTooLarge);
     }
-    serialization.0.map_err(|_| RequestBodyError::InvalidJson)?;
+    serialization.0?;
 
     let serialized =
         std::str::from_utf8(encoded.as_slice()).map_err(|_| RequestBodyError::InvalidJson)?;
@@ -401,30 +614,12 @@ fn encode_json_object(
     Ok(SecretRequestBody { body })
 }
 
-fn parse_json_value(public_body: &str) -> Result<Value, RequestBodyError> {
-    let mut deserializer = serde_json::Deserializer::from_str(public_body);
-    let value = match (JsonValueSeed { depth: 0 }).deserialize(&mut deserializer) {
-        Ok(value) => value,
-        Err(error) => {
-            let message = error.to_string();
-            if message.contains(JSON_DEPTH_MARKER) {
-                return Err(RequestBodyError::JsonDepthExceeded);
-            }
-            if message.contains(JSON_DUPLICATE_MARKER) {
-                return Err(RequestBodyError::DuplicateJsonKey);
-            }
-            return Err(RequestBodyError::InvalidJson);
-        }
-    };
-    deserializer
-        .end()
-        .map_err(|_| RequestBodyError::InvalidJson)?;
-    Ok(value)
-}
-
-fn validate_json_keys(value: &Value, fields: &[SecretField]) -> Result<(), RequestBodyError> {
+fn validate_json_keys(
+    value: &JsonPublicValue<'_>,
+    fields: &[SecretField],
+) -> Result<(), RequestBodyError> {
     match value {
-        Value::Object(object) => {
+        JsonPublicValue::Object(object) => {
             for (key, nested) in object {
                 if is_reserved_public_key(key, fields) {
                     return Err(RequestBodyError::ReservedPublicKey);
@@ -432,134 +627,82 @@ fn validate_json_keys(value: &Value, fields: &[SecretField]) -> Result<(), Reque
                 validate_json_keys(nested, fields)?;
             }
         }
-        Value::Array(values) => {
+        JsonPublicValue::Array(values) => {
             for nested in values {
                 validate_json_keys(nested, fields)?;
             }
         }
-        _ => {}
+        JsonPublicValue::Scalar(_) => {}
     }
     Ok(())
 }
 
-struct JsonValueSeed {
-    depth: usize,
+fn write_json_object(
+    writer: &mut BoundedJsonWriter<'_>,
+    public: &[(String, JsonPublicValue<'_>)],
+    fields: &[SecretField],
+) -> Result<(), RequestBodyError> {
+    write_json_bytes(writer, b"{")?;
+    let mut first = true;
+    for (key, value) in public {
+        if !first {
+            write_json_bytes(writer, b",")?;
+        }
+        write_json_string(writer, key)?;
+        write_json_bytes(writer, b":")?;
+        write_json_value(writer, value)?;
+        first = false;
+    }
+    for field in fields {
+        if !first {
+            write_json_bytes(writer, b",")?;
+        }
+        write_json_string(writer, &field.name)?;
+        write_json_bytes(writer, b":")?;
+        write_json_string(writer, field.value.as_str())?;
+        first = false;
+    }
+    write_json_bytes(writer, b"}")
 }
 
-impl<'de> DeserializeSeed<'de> for JsonValueSeed {
-    type Value = Value;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(JsonValueVisitor { depth: self.depth })
-    }
-}
-
-struct JsonValueVisitor {
-    depth: usize,
-}
-
-impl<'de> Visitor<'de> for JsonValueVisitor {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value within the configured nesting limit")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(Value::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(Value::Number(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("invalid JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(Value::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(Value::String(value))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        if self.depth >= MAX_JSON_DEPTH {
-            return Err(serde::de::Error::custom(JSON_DEPTH_MARKER));
-        }
-        let child_depth = self.depth + 1;
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(JsonValueSeed { depth: child_depth })? {
-            values.push(value);
-        }
-        Ok(Value::Array(values))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        if self.depth >= MAX_JSON_DEPTH {
-            return Err(serde::de::Error::custom(JSON_DEPTH_MARKER));
-        }
-        let child_depth = self.depth + 1;
-        let mut values = Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if values.contains_key(&key) {
-                return Err(serde::de::Error::custom(JSON_DUPLICATE_MARKER));
+fn write_json_value(
+    writer: &mut BoundedJsonWriter<'_>,
+    value: &JsonPublicValue<'_>,
+) -> Result<(), RequestBodyError> {
+    match value {
+        JsonPublicValue::Scalar(token) => write_json_bytes(writer, token.as_bytes()),
+        JsonPublicValue::Array(values) => {
+            write_json_bytes(writer, b"[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    write_json_bytes(writer, b",")?;
+                }
+                write_json_value(writer, value)?;
             }
-            let value = map.next_value_seed(JsonValueSeed { depth: child_depth })?;
-            values.insert(key, value);
+            write_json_bytes(writer, b"]")
         }
-        Ok(Value::Object(values))
+        JsonPublicValue::Object(entries) => write_json_object(writer, entries, &[]),
     }
 }
 
-struct JsonObjectWithSecrets<'a> {
-    public: &'a Map<String, Value>,
-    fields: &'a [SecretField],
+fn write_json_string(
+    writer: &mut BoundedJsonWriter<'_>,
+    value: &str,
+) -> Result<(), RequestBodyError> {
+    if serde_json::to_writer(&mut *writer, value).is_err() {
+        return Err(writer.failure());
+    }
+    Ok(())
 }
 
-impl Serialize for JsonObjectWithSecrets<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut object =
-            serializer.serialize_map(Some(self.public.len().saturating_add(self.fields.len())))?;
-        for (key, value) in self.public {
-            object.serialize_entry(key, value)?;
-        }
-        for field in self.fields {
-            object.serialize_entry(&field.name, field.value.as_str())?;
-        }
-        object.end()
+fn write_json_bytes(
+    writer: &mut BoundedJsonWriter<'_>,
+    bytes: &[u8],
+) -> Result<(), RequestBodyError> {
+    if writer.write_all(bytes).is_err() {
+        return Err(writer.failure());
     }
+    Ok(())
 }
 
 struct BoundedJsonWriter<'a> {
@@ -582,5 +725,15 @@ impl io::Write for BoundedJsonWriter<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+impl BoundedJsonWriter<'_> {
+    fn failure(&self) -> RequestBodyError {
+        if self.exceeded {
+            RequestBodyError::OutputTooLarge
+        } else {
+            RequestBodyError::InvalidJson
+        }
     }
 }

@@ -337,3 +337,95 @@ fn errors_and_debug_redact_secrets_and_borrowed_inputs_survive_failure() {
     assert_eq!(public, "PRIVATE_VALUE=caller-marker");
     assert!(!body.as_str_for_transport().is_empty());
 }
+
+#[test]
+fn parent_public_decimal_value_is_not_rounded_during_json_injection() {
+    let fields = [field("private_value", "synthetic-secret")];
+    let body = encode_injected_body(
+        r#"{"public_decimal":9007199254740993.0}"#,
+        RequestBodyEncoding::JsonObject,
+        &fields,
+    )
+    .expect("valid JSON decimal");
+    let output = body.as_str_for_transport();
+    println!("native encoder output: {output}");
+    assert!(
+        output.contains("\"public_decimal\":9007199254740993.0"),
+        "public decimal must remain exact; output was {output}"
+    );
+}
+
+#[test]
+fn json_preserves_public_number_lexemes_at_precision_and_exponent_boundaries() {
+    let secret = "quote \" slash \\\n\u{1}";
+    let fields = [field("private_value", secret)];
+    let escaped_secret = serde_json::to_string(secret).expect("secret string serialization");
+    for number in [
+        "9007199254740993.0",
+        "-9007199254740993.0",
+        "0.123456789012345678901234567890123456789",
+        "18446744073709551616",
+        "-9223372036854775809",
+        "1.2300e+0009",
+        "1E+999999",
+        "1e-999999",
+        "-0.0",
+    ] {
+        let public = format!(r#"{{"number":{number}}}"#);
+        let body = encode_injected_body(&public, RequestBodyEncoding::JsonObject, &fields)
+            .expect("valid JSON number lexeme");
+        let output = body.as_str_for_transport();
+        assert!(
+            output.contains(&format!("\"number\":{number}")),
+            "number lexeme {number} was not preserved in {output}"
+        );
+        assert!(
+            output.contains(&format!("\"private_value\":{escaped_secret}")),
+            "native secret was not escaped and serialized as a JSON string: {output}"
+        );
+    }
+}
+
+#[test]
+fn json_preserves_nested_public_number_lexemes_verbatim() {
+    let public = r#"{"nested":[{"positive":9007199254740993,"wide":18446744073709551616},-0.0,1.2300e+0009,1e-999999]}"#;
+    let body = encode_injected_body(
+        public,
+        RequestBodyEncoding::JsonObject,
+        &[field("private_value", "synthetic-secret")],
+    )
+    .expect("valid nested JSON numbers");
+    let output = body.as_str_for_transport();
+
+    for fragment in [
+        r#""positive":9007199254740993"#,
+        r#""wide":18446744073709551616"#,
+        "-0.0",
+        "1.2300e+0009",
+        "1e-999999",
+    ] {
+        assert!(
+            output.contains(fragment),
+            "nested number fragment {fragment} was not preserved in {output}"
+        );
+    }
+    assert!(output.ends_with(",\"private_value\":\"synthetic-secret\"}"));
+}
+
+#[test]
+fn json_rejects_invalid_number_grammar_and_trailing_tokens() {
+    for number in [
+        "01", "-01", "+1", "-", "1.", "1e", "1e+", "1e-", "1e++2", "1e2x", "1 2",
+    ] {
+        let public = format!(r#"{{"number":{number}}}"#);
+        assert_eq!(
+            error(encode_injected_body(
+                &public,
+                RequestBodyEncoding::JsonObject,
+                &[]
+            )),
+            RequestBodyError::InvalidJson,
+            "invalid JSON number {number} was accepted"
+        );
+    }
+}
