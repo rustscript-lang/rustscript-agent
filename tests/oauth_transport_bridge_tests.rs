@@ -920,11 +920,17 @@ fn expired_bound_policy_never_sends() {
 }
 
 #[test]
-fn unsupported_device_handle_is_terminalized_with_accompanying_slots() {
-    let mut vm = vm();
+fn supported_device_handle_and_accompanying_slots_close_without_leaks() {
+    const DEVICE_CODE: &str = "SYNTHETIC_DEVICE_CODE";
+    const ACCESS_TOKEN: &str = "SYNTHETIC_ACCESS_TOKEN";
+    const REFRESH_TOKEN: &str = "SYNTHETIC_REFRESH_TOKEN";
+
     let transport = Arc::new(ScriptedHttpsTransport::new());
+    let response_body = format!(
+        r#"{{"device_code":"{DEVICE_CODE}","access_token":"{ACCESS_TOKEN}","refresh_token":"{REFRESH_TOKEN}"}}"#
+    );
     for _ in 0..65 {
-        transport.push_raw(200, r#"{"device_code":"SYNTHETIC_DEVICE_CODE","access_token":"SYNTHETIC_ACCESS_TOKEN","refresh_token":"SYNTHETIC_REFRESH_TOKEN"}"#);
+        transport.push_raw(200, &response_body);
     }
     let oauth = Arc::new(OAuthHost::new(
         transport.clone(),
@@ -933,23 +939,130 @@ fn unsupported_device_handle_is_terminalized_with_accompanying_slots() {
         Arc::new(ScriptedClock::new(1_900_000_000_000)),
         Arc::new(ScriptedCancel::new()),
     ));
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/auth/device_contract.rss");
+    let mut source = fs::read_to_string(&path).expect("real typed device RSS");
+    source.push_str(
+        r#"
+pub fn close_slots(access: resource<auth.secret_slot>, refresh: resource<auth.secret_slot>) -> null {
+    auth::close_slot(access);
+    auth::close_slot(refresh)
+}
+"#,
+    );
+    let catalog = auth_host_catalog();
+    let compiled = compile_source_at_path_with_flavor_and_options(
+        &path,
+        &source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+    )
+    .expect("compile real typed device RSS and slot-close wrapper");
+    let mut vm = Vm::new_shared(Arc::new(compiled.program));
     let host = AuthHost::new(
         fixture_home(),
         RunCancellation::with_timeout(Duration::from_secs(30)),
     )
     .expect("host")
     .with_oauth_host(oauth);
-    let home = field(&host.bind_vm(&mut vm).expect("bind"), "host_home").clone();
-    let run = vm.resolve_exported_callable("run").expect("run");
+    let mut registry = HostFunctionRegistry::restricted();
+    host.register(&mut registry, catalog.as_ref())
+        .expect("register exact catalog");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("bind exact catalog");
+    assert!(matches!(vm.run().expect("run RSS root"), VmStatus::Halted));
+    let home = field(&host.bind_vm(&mut vm).expect("bind home"), "host_home").clone();
+    let snapshot = vm.resolve_exported_callable("snapshot").expect("snapshot");
+    let policy = vm
+        .invoke_callable(snapshot, &[home])
+        .expect("snapshot policy");
+    let start = vm.resolve_exported_callable("start").expect("start");
+    let close_device = vm.resolve_exported_callable("close").expect("device close");
+    let close_slots = vm
+        .resolve_exported_callable("close_slots")
+        .expect("slot close wrapper");
+    let mut sent_count = 0;
+
     for _ in 0..65 {
-        let failure = vm
-            .invoke_callable(run.clone(), std::slice::from_ref(&home))
-            .expect_err("device handle unsupported");
-        assert!(failure.to_string().contains("response_handle_unsupported"));
-        assert!(!failure.to_string().contains("SYNTHETIC_DEVICE_CODE"));
+        let started = vm
+            .invoke_callable(
+                start.clone(),
+                &[
+                    policy.clone(),
+                    Value::string("fixture-codex"),
+                    Value::string("/oauth/token"),
+                    Value::string(""),
+                ],
+            )
+            .expect("typed device start");
+        assert_eq!(field(&started, "status"), &Value::Int(200));
+        assert_eq!(field(&started, "ok"), &Value::Bool(true));
+        let device = field(&started, "device_handle").clone();
+        let access = field(&started, "access_slot").clone();
+        let refresh = field(&started, "refresh_slot").clone();
+        assert!(matches!(device, Value::Int(_)), "typed device capability");
+        assert!(matches!(access, Value::Int(_)), "typed access slot");
+        assert!(matches!(refresh, Value::Int(_)), "typed refresh slot");
+        let visible = format!("{started:?}");
+        for secret in [DEVICE_CODE, ACCESS_TOKEN, REFRESH_TOKEN] {
+            assert!(!visible.contains(secret), "RSS response exposed {secret}");
+        }
+        assert_eq!(
+            field(&started, "body_without_secret_fields"),
+            &Value::string("{}")
+        );
+        assert_eq!(vm.host_context().resource_count(), 5);
+        #[cfg(feature = "config-fixture")]
+        assert_eq!(host.fixture_live_oauth_flow_count().expect("live flow"), 1);
+
+        let device_alias = device.clone();
+        let access_alias = access.clone();
+        let refresh_alias = refresh.clone();
+        vm.invoke_callable(close_device.clone(), &[device])
+            .expect("real RSS device close");
+        assert_eq!(vm.host_context().resource_count(), 4);
+        #[cfg(feature = "config-fixture")]
+        assert_eq!(
+            host.fixture_live_oauth_flow_count().expect("closed flow"),
+            0
+        );
+        vm.invoke_callable(close_slots.clone(), &[access, refresh])
+            .expect("real RSS secret-slot closes");
         assert_eq!(vm.host_context().resource_count(), 2);
+
+        let device_replay = vm
+            .invoke_callable(close_device.clone(), &[device_alias])
+            .expect_err("closed device alias rejected");
+        let slots_replay = vm
+            .invoke_callable(close_slots.clone(), &[access_alias, refresh_alias])
+            .expect_err("closed slot aliases rejected");
+        for failure in [device_replay.to_string(), slots_replay.to_string()] {
+            for secret in [DEVICE_CODE, ACCESS_TOKEN, REFRESH_TOKEN] {
+                assert!(!failure.contains(secret), "close error exposed {secret}");
+            }
+        }
+        assert_eq!(vm.host_context().resource_count(), 2);
+        #[cfg(feature = "config-fixture")]
+        assert_eq!(
+            host.fixture_live_oauth_flow_count().expect("replay flow"),
+            0
+        );
+
+        let sent = transport.take_sent();
+        assert_eq!(sent.len(), 1, "only the start request may send");
+        assert_eq!(sent[0].method, "POST");
+        assert_eq!(sent[0].url, "https://auth.openai.com/oauth/token");
+        let sent_debug = format!("{:?}", sent[0]);
+        for secret in [DEVICE_CODE, ACCESS_TOKEN, REFRESH_TOKEN] {
+            assert!(
+                !sent_debug.contains(secret),
+                "transport debug exposed {secret}"
+            );
+        }
+        sent_count += sent.len();
     }
-    assert_eq!(transport.take_sent().len(), 65);
+    assert_eq!(sent_count, 65, "exactly 65 native starts");
 }
 
 #[cfg(feature = "config-fixture")]
