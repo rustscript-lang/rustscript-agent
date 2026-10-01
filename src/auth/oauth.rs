@@ -14,6 +14,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use zeroize::Zeroizing;
 
 use crate::auth::pkce::{self, PKCE_CHALLENGE_METHOD, PkceError};
+use crate::auth::request_body::{self, SecretField};
 use crate::auth::store::{AuthStoreError, OpaqueRefreshHandle, OpaqueSecretSlot, SecretSlotKind};
 use crate::auth::token::CredentialId;
 
@@ -223,6 +224,46 @@ pub enum ExchangeCodeField {
 pub struct OpaqueExchangeResponseIntent {
     pub code_field: ExchangeCodeField,
     pub redirect_uri: String,
+}
+
+/// Closed native aliases for a selected device-session identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceIdField {
+    DeviceCode,
+    DeviceAuthId,
+    DeviceId,
+}
+
+/// Closed native selection of credentials to encode in a request body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretBodyFieldSelection {
+    None,
+    Device { field: DeviceIdField },
+    AuthorizationCode { code_field: ExchangeCodeField },
+}
+
+/// Request-body encoding and native-only field selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeRequestBodyIntent {
+    pub encoding: crate::auth::request_body::RequestBodyEncoding,
+    pub secret_fields: SecretBodyFieldSelection,
+}
+
+/// Optional native body serialization and exchange-response capture intents.
+#[derive(Clone, Default)]
+pub struct NativeTransportIntents {
+    pub request_body: Option<NativeRequestBodyIntent>,
+    pub exchange_response: Option<OpaqueExchangeResponseIntent>,
+}
+
+impl fmt::Debug for NativeTransportIntents {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeTransportIntents")
+            .field("request_body", &self.request_body)
+            .field("has_exchange_response", &self.exchange_response.is_some())
+            .finish()
+    }
 }
 
 /// Same-flow opaque handles promoted from a device response.
@@ -639,7 +680,7 @@ impl FlowInner {
         Ok(())
     }
 
-    fn consume_exchange(
+    fn preview_exchange(
         &self,
         now: Instant,
     ) -> Result<(Zeroizing<String>, Zeroizing<String>), OAuthError> {
@@ -663,6 +704,14 @@ impl FlowInner {
                 class: VERIFIER_HANDLE_CLASS.to_string(),
             });
         }
+        Ok((raw_code, raw_verifier))
+    }
+
+    fn consume_exchange(
+        &self,
+        now: Instant,
+    ) -> Result<(Zeroizing<String>, Zeroizing<String>), OAuthError> {
+        let (raw_code, raw_verifier) = self.preview_exchange(now)?;
         if self
             .code_state
             .compare_exchange(
@@ -710,7 +759,7 @@ impl FlowInner {
         })
     }
 
-    fn device_id(&self) -> Result<String, OAuthError> {
+    fn device_id(&self) -> Result<Zeroizing<String>, OAuthError> {
         let device_code = self
             .device_code
             .lock()
@@ -720,7 +769,7 @@ impl FlowInner {
                 class: DEVICE_HANDLE_CLASS.to_string(),
             });
         }
-        Ok(device_code.as_str().to_string())
+        Ok(Zeroizing::new(device_code.as_str().to_string()))
     }
 
     fn clear_device_code(&self) {
@@ -1061,8 +1110,45 @@ impl OAuthHost {
         request: ProviderRequest,
         credential_use: CredentialUse,
     ) -> Result<SanitizedProviderResponse, OAuthError> {
-        self.transport_inner(policy, request, credential_use, None, None, None)
-            .map(|result| result.response)
+        self.transport_inner(
+            policy,
+            request,
+            credential_use,
+            NativeTransportIntents::default(),
+            None,
+            None,
+        )
+        .map(|result| result.response)
+    }
+
+    pub fn transport_with_intents(
+        &self,
+        policy: &TrustedTransportPolicy,
+        request: ProviderRequest,
+        credential_use: CredentialUse,
+        intents: NativeTransportIntents,
+    ) -> Result<OpaqueExchangeResponse, OAuthError> {
+        self.transport_inner(policy, request, credential_use, intents, None, None)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn transport_with_intents_scoped(
+        &self,
+        policy: &TrustedTransportPolicy,
+        request: ProviderRequest,
+        credential_use: CredentialUse,
+        intents: NativeTransportIntents,
+        owner_cancel: Arc<dyn OAuthCancel>,
+        response_slot_generation_override: Option<u64>,
+    ) -> Result<OpaqueExchangeResponse, OAuthError> {
+        self.transport_inner(
+            policy,
+            request,
+            credential_use,
+            intents,
+            Some(owner_cancel),
+            response_slot_generation_override,
+        )
     }
 
     pub(crate) fn transport_scoped(
@@ -1077,7 +1163,7 @@ impl OAuthHost {
             policy,
             request,
             credential_use,
-            None,
+            NativeTransportIntents::default(),
             Some(owner_cancel),
             response_slot_generation_override,
         )
@@ -1095,7 +1181,10 @@ impl OAuthHost {
             policy,
             request,
             CredentialUse::Device(device),
-            Some(intent),
+            NativeTransportIntents {
+                request_body: None,
+                exchange_response: Some(intent),
+            },
             None,
             None,
         )
@@ -1115,7 +1204,10 @@ impl OAuthHost {
             policy,
             request,
             CredentialUse::Device(device),
-            Some(intent),
+            NativeTransportIntents {
+                request_body: None,
+                exchange_response: Some(intent),
+            },
             Some(owner_cancel),
             response_slot_generation_override,
         )
@@ -1126,10 +1218,12 @@ impl OAuthHost {
         policy: &TrustedTransportPolicy,
         request: ProviderRequest,
         credential_use: CredentialUse,
-        capture_intent: Option<OpaqueExchangeResponseIntent>,
+        intents: NativeTransportIntents,
         owner_cancel: Option<Arc<dyn OAuthCancel>>,
         response_slot_generation_override: Option<u64>,
     ) -> Result<OpaqueExchangeResponse, OAuthError> {
+        let request_body_intent = intents.request_body;
+        let capture_intent = intents.exchange_response;
         if let Some(intent) = capture_intent.as_ref() {
             if !matches!(&credential_use, CredentialUse::Device(_)) {
                 return Err(OAuthError::HandleProvenance {
@@ -1158,28 +1252,44 @@ impl OAuthHost {
             });
         }
         let endpoint = admit_path(policy, &request.path)?;
-        let headers = admit_headers(policy, &request.public_headers)?;
-        let mut body = request.public_body.clone();
+        let mut headers = admit_headers(policy, &request.public_headers)?;
         let credential_id = CredentialId::new(request.credential_id.clone()).map_err(|_| {
             OAuthError::InvalidIntent {
                 reason: "credential ID is invalid".to_string(),
             }
         })?;
         self.validate_credential_use(policy, credential_id.as_str(), &credential_use)?;
-        reject_reserved_form_keys(&body)?;
+        validate_native_body_selection(request_body_intent, &credential_use)?;
+        if request_body_intent.is_none() {
+            reject_reserved_form_keys(&request.public_body)?;
+        }
+        if let Some(intent) = request_body_intent {
+            let canonical = intent.encoding.content_type();
+            match headers.get("content-type") {
+                Some(value) if value.trim().eq_ignore_ascii_case(canonical) => {
+                    headers.insert("content-type".to_string(), canonical.to_string());
+                }
+                Some(_) => {
+                    return Err(OAuthError::InvalidIntent {
+                        reason: "selected request body content type does not match encoding"
+                            .to_string(),
+                    });
+                }
+                None => {
+                    headers.insert("content-type".to_string(), canonical.to_string());
+                }
+            }
+        }
+        let submitted_flow = match &credential_use {
+            CredentialUse::AuthorizationCode { code, .. } => Some(self.live_flow(code)?),
+            CredentialUse::Device(handle) => Some(self.live_flow(handle)?),
+            CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => None,
+        };
         // Capture the flow bound before code/verifier consumption removes its
         // registry entry. A policy may outlive a callback or device session.
-        let operation_deadline = match &credential_use {
-            CredentialUse::AuthorizationCode { code, .. } => {
-                min_deadline(policy.deadline, self.live_flow(code)?.expires_at)
-            }
-            CredentialUse::Device(handle) => {
-                min_deadline(policy.deadline, self.live_flow(handle)?.expires_at)
-            }
-            CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => {
-                policy.deadline
-            }
-        };
+        let operation_deadline = submitted_flow.as_ref().map_or(policy.deadline, |flow| {
+            min_deadline(policy.deadline, flow.expires_at)
+        });
         let context = match owner_cancel {
             Some(owner_cancel) => self.io_context_with_cancel(operation_deadline, owner_cancel),
             None => self.io_context(operation_deadline),
@@ -1196,7 +1306,77 @@ impl OAuthHost {
             headers,
             body: String::new(),
         };
-        let mut device_session = None;
+        let device_session = if matches!(&credential_use, CredentialUse::Device(_)) {
+            submitted_flow.clone()
+        } else {
+            None
+        };
+        let mut selected_poll_guard = None;
+        if matches!(
+            request_body_intent.map(|intent| intent.secret_fields),
+            Some(SecretBodyFieldSelection::Device { .. })
+        ) {
+            let flow = submitted_flow.as_ref().expect("validated device flow");
+            match flow.begin_device_poll(self.inner.clock.now()) {
+                Ok(guard) => selected_poll_guard = Some(guard),
+                Err(error) => {
+                    self.revoke_submitted_if_context_inactive(&context, submitted_flow.as_ref());
+                    return Err(error);
+                }
+            }
+        }
+        let selected_body = if let Some(intent) = request_body_intent {
+            let prepared_body = (|| {
+                let mut fields = Vec::new();
+                match intent.secret_fields {
+                    SecretBodyFieldSelection::None => {}
+                    SecretBodyFieldSelection::Device { field } => {
+                        let flow = submitted_flow.as_ref().ok_or_else(invalid_native_body)?;
+                        let value = flow.device_id()?;
+                        fields.push(
+                            SecretField::new(device_field_name(field), value.as_str().to_string())
+                                .map_err(map_request_body_error)?,
+                        );
+                    }
+                    SecretBodyFieldSelection::AuthorizationCode { code_field } => {
+                        let flow = submitted_flow.as_ref().ok_or_else(invalid_native_body)?;
+                        let (code, verifier) = flow.preview_exchange(self.inner.clock.now())?;
+                        fields.push(
+                            SecretField::new(exchange_code_field_name(code_field), code.as_str())
+                                .map_err(map_request_body_error)?,
+                        );
+                        fields.push(
+                            SecretField::new("code_verifier", verifier.as_str())
+                                .map_err(map_request_body_error)?,
+                        );
+                        fields.push(
+                            SecretField::new("redirect_uri", flow.redirect_uri.clone())
+                                .map_err(map_request_body_error)?,
+                        );
+                    }
+                }
+                request_body::encode_injected_body(&request.public_body, intent.encoding, &fields)
+                    .map_err(map_request_body_error)
+            })();
+            match prepared_body {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    self.revoke_submitted_if_context_inactive(&context, submitted_flow.as_ref());
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = context.check() {
+            if let Some(flow) = submitted_flow.as_ref() {
+                self.drop_and_revoke(flow);
+            }
+            return Err(error);
+        }
+        let mut body = selected_body.map_or(request.public_body, |encoded| {
+            encoded.as_str_for_transport().to_string()
+        });
         match credential_use {
             CredentialUse::None => {}
             CredentialUse::Access(handle) => {
@@ -1220,25 +1400,30 @@ impl OAuthHost {
                         return Err(error);
                     }
                 };
-                append_form(&mut body, "code", raw_code.as_str());
-                append_form(&mut body, "code_verifier", raw_verifier.as_str());
-                append_form(&mut body, "redirect_uri", &flow.redirect_uri);
+                if request_body_intent.is_none() {
+                    append_form(&mut body, "code", raw_code.as_str());
+                    append_form(&mut body, "code_verifier", raw_verifier.as_str());
+                    append_form(&mut body, "redirect_uri", &flow.redirect_uri);
+                }
                 self.drop_flow(flow.id);
                 let _ = verifier;
             }
-            CredentialUse::Device(handle) => {
-                device_session = Some(self.live_flow(&handle)?);
-            }
+            CredentialUse::Device(_handle) => {}
         }
-        let now = self.inner.clock.now();
-        let _poll_guard = match device_session.as_ref() {
-            Some(flow) => {
-                let guard = flow.begin_device_poll(now)?;
-                let device_id = flow.device_id()?;
-                append_form(&mut body, "device_code", &device_id);
-                Some(guard)
+        let _poll_guard = if let Some(guard) = selected_poll_guard {
+            Some(guard)
+        } else if request_body_intent.is_none() {
+            match device_session.as_ref() {
+                Some(flow) => {
+                    let guard = flow.begin_device_poll(self.inner.clock.now())?;
+                    let device_id = flow.device_id()?;
+                    append_form(&mut body, "device_code", device_id.as_str());
+                    Some(guard)
+                }
+                None => None,
             }
-            None => None,
+        } else {
+            None
         };
         prepared.body = body;
         let sent = context
@@ -1342,6 +1527,65 @@ impl OAuthHost {
             response: sanitized,
             pair,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn exchange_pair_matches_binding(
+        &self,
+        code: &OpaqueAuthorizationCodeHandle,
+        verifier: &OpaqueVerifierHandle,
+        policy_generation: u64,
+        run_id: &str,
+        credential_id: &str,
+    ) -> bool {
+        code.same_host(&self.inner)
+            && verifier.same_host(&self.inner)
+            && Arc::ptr_eq(&code.inner, &verifier.inner)
+            && code.inner.policy_generation == policy_generation
+            && code.inner.run_id == run_id
+            && code.inner.credential_id == credential_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn exchange_pair_live(
+        &self,
+        code: &OpaqueAuthorizationCodeHandle,
+        verifier: &OpaqueVerifierHandle,
+        policy_generation: u64,
+        run_id: &str,
+        credential_id: &str,
+    ) -> bool {
+        if !self.exchange_pair_matches_binding(
+            code,
+            verifier,
+            policy_generation,
+            run_id,
+            credential_id,
+        ) {
+            return false;
+        }
+        let flow = &code.inner;
+        if self.inner.clock.now() >= flow.expires_at
+            || flow.revoked.load(Ordering::Acquire)
+            || flow.code_state.load(Ordering::Acquire) != HANDLE_LIVE
+            || flow.verifier_state.load(Ordering::Acquire) != HANDLE_LIVE
+            || flow
+                .code
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .is_none_or(|value| value.is_empty())
+            || flow
+                .verifier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            return false;
+        }
+        self.lock_flows()
+            .get(&flow.id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, flow))
     }
 
     pub fn inject_callback(
@@ -1530,6 +1774,18 @@ impl OAuthHost {
                 }
             }
             CredentialUse::None | CredentialUse::Access(_) | CredentialUse::Refresh(_) => {}
+        }
+    }
+
+    fn revoke_submitted_if_context_inactive(
+        &self,
+        context: &OAuthIoContext,
+        submitted_flow: Option<&Arc<FlowInner>>,
+    ) {
+        if context.check().is_err()
+            && let Some(flow) = submitted_flow
+        {
+            self.drop_and_revoke(flow);
         }
     }
 
@@ -1933,6 +2189,67 @@ impl FlowHandle for OpaqueDeviceSessionHandle {
     }
     fn flow_inner(&self) -> Arc<FlowInner> {
         self.flow_inner()
+    }
+}
+
+fn validate_native_body_selection(
+    intent: Option<NativeRequestBodyIntent>,
+    credential_use: &CredentialUse,
+) -> Result<(), OAuthError> {
+    let Some(intent) = intent else {
+        return Ok(());
+    };
+    let matches = match intent.secret_fields {
+        SecretBodyFieldSelection::None => {
+            matches!(
+                credential_use,
+                CredentialUse::None | CredentialUse::Access(_)
+            )
+        }
+        SecretBodyFieldSelection::Device { .. } => {
+            matches!(credential_use, CredentialUse::Device(_))
+        }
+        SecretBodyFieldSelection::AuthorizationCode { .. } => {
+            matches!(credential_use, CredentialUse::AuthorizationCode { .. })
+        }
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(OAuthError::InvalidIntent {
+            reason: "selected request body does not match credential use".to_string(),
+        })
+    }
+}
+
+fn device_field_name(field: DeviceIdField) -> &'static str {
+    match field {
+        DeviceIdField::DeviceCode => "device_code",
+        DeviceIdField::DeviceAuthId => "device_auth_id",
+        DeviceIdField::DeviceId => "device_id",
+    }
+}
+
+fn exchange_code_field_name(field: ExchangeCodeField) -> &'static str {
+    match field {
+        ExchangeCodeField::Code => "code",
+        ExchangeCodeField::AuthorizationCode => "authorization_code",
+    }
+}
+
+fn invalid_native_body() -> OAuthError {
+    OAuthError::InvalidIntent {
+        reason: "selected request body is invalid".to_string(),
+    }
+}
+
+fn map_request_body_error(error: request_body::RequestBodyError) -> OAuthError {
+    match error {
+        request_body::RequestBodyError::InputTooLarge
+        | request_body::RequestBodyError::OutputTooLarge => OAuthError::RequestTooLarge {
+            max_bytes: MAX_REQUEST_BODY_BYTES,
+        },
+        _ => invalid_native_body(),
     }
 }
 
@@ -2889,6 +3206,439 @@ impl OAuthCancel for ScriptedCancel {
 }
 
 #[cfg(test)]
+mod exchange_pair_binding_tests {
+    use super::*;
+
+    fn policy() -> TrustedTransportPolicy {
+        TrustedTransportPolicy {
+            generation: 41,
+            run_id: "pair-binding-native-test".to_string(),
+            deadline: Instant::now() + Duration::from_secs(120),
+            endpoints: vec![TrustedEndpoint {
+                authority: "auth.example.test".to_string(),
+                path_prefix: "/oauth".to_string(),
+            }],
+            allowed_header_names: BTreeSet::new(),
+        }
+    }
+
+    fn request(path: &str, body: &str) -> ProviderRequest {
+        ProviderRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            public_headers: BTreeMap::new(),
+            public_body: body.to_string(),
+            credential_id: "primary".to_string(),
+        }
+    }
+
+    fn start_device(
+        host: &OAuthHost,
+        transport: &ScriptedHttpsTransport,
+        policy: &TrustedTransportPolicy,
+    ) -> OpaqueDeviceSessionHandle {
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "device_code": "PAIR_BINDING_DEVICE_MARKER",
+                "user_code": "SYNTHETIC-USER-CODE",
+                "verification_uri": "https://auth.example.test/device",
+                "expires_in": 900,
+                "interval": 5
+            }),
+        );
+        host.transport(
+            policy,
+            request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("native device start")
+        .device_handle
+        .expect("native device handle")
+    }
+
+    fn capture_pair(
+        host: &OAuthHost,
+        transport: &ScriptedHttpsTransport,
+        policy: &TrustedTransportPolicy,
+    ) -> OpaqueExchangePair {
+        let device = start_device(host, transport, policy);
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "authorization_code": "PAIR_BINDING_CODE_MARKER",
+                "code_verifier": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            }),
+        );
+        host.transport_exchange_pair(
+            policy,
+            request("/oauth/device/token", "grant_type=device_code"),
+            device,
+            OpaqueExchangeResponseIntent {
+                code_field: ExchangeCodeField::AuthorizationCode,
+                redirect_uri: "https://redirect.example.test/callback".to_string(),
+            },
+        )
+        .expect("native device pair capture")
+        .pair
+        .expect("native pair")
+    }
+
+    fn make_host() -> (OAuthHost, Arc<ScriptedHttpsTransport>, Arc<ScriptedClock>) {
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let host = OAuthHost::new(
+            Arc::clone(&transport) as Arc<_>,
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::clone(&clock) as Arc<_>,
+            Arc::new(ScriptedCancel::new()),
+        );
+        (host, transport, clock)
+    }
+
+    #[test]
+    fn native_promoted_pairs_require_exact_host_and_binding_and_remain_live_until_used() {
+        let (host, transport, _) = make_host();
+        let policy = policy();
+        let pair = capture_pair(&host, &transport, &policy);
+        assert!(host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+        assert!(host.exchange_pair_live(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+        assert!(!host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation + 1,
+            &policy.run_id,
+            "primary",
+        ));
+        assert!(!host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            "another-run",
+            "primary",
+        ));
+        assert!(!host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "another-credential",
+        ));
+
+        let other_pair = capture_pair(&host, &transport, &policy);
+        assert!(!host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &other_pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+        let (other_host, _, _) = make_host();
+        assert!(!other_host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+
+        let mut callback_policy = policy.clone();
+        callback_policy.run_id = "callback-pair-binding-test".to_string();
+        let callback_begin = host
+            .pkce_begin(
+                &callback_policy,
+                BoundedPublicOAuthIntent {
+                    flow: OAuthFlowKind::AuthorizationCodePkce,
+                    callback_mode: CallbackMode::None,
+                    path: "/oauth/authorize".to_string(),
+                    scopes: Vec::new(),
+                    public_query: BTreeMap::new(),
+                    credential_id: "primary".to_string(),
+                },
+            )
+            .expect("native PKCE begin");
+        host.inject_matching_callback(&callback_begin.callback_handle, "CALLBACK_CODE_MARKER")
+            .expect("native callback input");
+        let callback_code = host
+            .callback_wait(&callback_begin.callback_handle)
+            .expect("native callback result")
+            .code_handle
+            .expect("native callback code handle");
+        assert!(host.exchange_pair_live(
+            &callback_code,
+            &callback_begin.verifier_handle,
+            callback_policy.generation,
+            &callback_policy.run_id,
+            "primary",
+        ));
+    }
+
+    #[test]
+    fn expired_native_pair_remains_structurally_bound_but_is_not_live() {
+        let (host, transport, clock) = make_host();
+        let policy = policy();
+        let pair = capture_pair(&host, &transport, &policy);
+        clock.expire();
+
+        assert!(host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+        assert!(!host.exchange_pair_live(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+    }
+
+    #[test]
+    fn binding_remains_structural_after_one_use_while_liveness_closes() {
+        let (host, transport, _) = make_host();
+        let policy = policy();
+        let pair = capture_pair(&host, &transport, &policy);
+        transport.push_raw(200, "{}");
+        host.transport(
+            &policy,
+            request("/oauth/token", "grant_type=authorization_code"),
+            CredentialUse::AuthorizationCode {
+                code: pair.code_handle.clone(),
+                verifier: pair.verifier_handle.clone(),
+            },
+        )
+        .expect("native one-use exchange");
+        assert!(host.exchange_pair_matches_binding(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+        assert!(!host.exchange_pair_live(
+            &pair.code_handle,
+            &pair.verifier_handle,
+            policy.generation,
+            &policy.run_id,
+            "primary",
+        ));
+    }
+}
+
+#[cfg(test)]
+mod native_selected_cleanup_tests {
+    use super::*;
+    use crate::auth::request_body::RequestBodyEncoding;
+
+    fn policy() -> TrustedTransportPolicy {
+        TrustedTransportPolicy {
+            generation: 52,
+            run_id: "native-selected-cleanup-test".to_string(),
+            deadline: Instant::now() + Duration::from_secs(120),
+            endpoints: vec![TrustedEndpoint {
+                authority: "auth.example.test".to_string(),
+                path_prefix: "/oauth".to_string(),
+            }],
+            allowed_header_names: BTreeSet::new(),
+        }
+    }
+
+    fn request(path: &str, body: &str) -> ProviderRequest {
+        ProviderRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            public_headers: BTreeMap::new(),
+            public_body: body.to_string(),
+            credential_id: "primary".to_string(),
+        }
+    }
+
+    fn start_device(
+        host: &OAuthHost,
+        transport: &ScriptedHttpsTransport,
+        policy: &TrustedTransportPolicy,
+    ) -> OpaqueDeviceSessionHandle {
+        transport.push_json(
+            200,
+            serde_json::json!({
+                "device_code": "CLEANUP_DEVICE_MARKER",
+                "user_code": "SYNTHETIC-USER-CODE",
+                "verification_uri": "https://auth.example.test/device",
+                "expires_in": 900,
+                "interval": 5
+            }),
+        );
+        host.transport(
+            policy,
+            request("/oauth/device", "client_id=synthetic-client"),
+            CredentialUse::None,
+        )
+        .expect("native device start")
+        .device_handle
+        .expect("native device handle")
+    }
+
+    fn selected_device_intents() -> NativeTransportIntents {
+        NativeTransportIntents {
+            request_body: Some(NativeRequestBodyIntent {
+                encoding: RequestBodyEncoding::JsonObject,
+                secret_fields: SecretBodyFieldSelection::Device {
+                    field: DeviceIdField::DeviceCode,
+                },
+            }),
+            exchange_response: None,
+        }
+    }
+
+    struct OwnerCancelAfterPoll {
+        scripted: Arc<ScriptedHttpsTransport>,
+        owner_cancel: Arc<ScriptedCancel>,
+    }
+
+    impl BoundedHttpsTransport for OwnerCancelAfterPoll {
+        fn send(
+            &self,
+            request: &PreparedHttpsRequest,
+            context: &OAuthIoContext,
+        ) -> Result<RawHttpsResponse, OAuthError> {
+            let response = self.scripted.send(request, context)?;
+            if request.url.ends_with("/oauth/device/token") {
+                self.owner_cancel.cancel();
+            }
+            Ok(response)
+        }
+    }
+
+    struct ExpireClockAfterPoll {
+        scripted: Arc<ScriptedHttpsTransport>,
+        clock: Arc<ScriptedClock>,
+    }
+
+    impl BoundedHttpsTransport for ExpireClockAfterPoll {
+        fn send(
+            &self,
+            request: &PreparedHttpsRequest,
+            context: &OAuthIoContext,
+        ) -> Result<RawHttpsResponse, OAuthError> {
+            let response = self.scripted.send(request, context)?;
+            if request.url.ends_with("/oauth/device/token") {
+                self.clock.expire();
+            }
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn owner_cancel_and_original_flow_deadline_revoke_only_the_submitted_family() {
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let owner_cancel = Arc::new(ScriptedCancel::new());
+        let host = OAuthHost::new(
+            Arc::new(OwnerCancelAfterPoll {
+                scripted: Arc::clone(&scripted),
+                owner_cancel: Arc::clone(&owner_cancel),
+            }),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        );
+        let policy = policy();
+        let device = start_device(&host, &scripted, &policy);
+        let sibling = start_device(&host, &scripted, &policy);
+        scripted.push_json(200, serde_json::json!({"status": "waiting"}));
+        let error = host
+            .transport_with_intents_scoped(
+                &policy,
+                request("/oauth/device/token", r#"{"grant_type":"device_code"}"#),
+                CredentialUse::Device(device.clone()),
+                selected_device_intents(),
+                Arc::clone(&owner_cancel) as Arc<_>,
+                None,
+            )
+            .expect_err("owner cancellation after I/O");
+        assert_eq!(error.code(), "cancelled");
+        assert_eq!(
+            host.transport(
+                &policy,
+                request("/oauth/device/token", "grant_type=device_code"),
+                CredentialUse::Device(device),
+            )
+            .expect_err("submitted device family revoked")
+            .code(),
+            "handle_revoked"
+        );
+
+        scripted.push_json(200, serde_json::json!({"status": "waiting"}));
+        host.transport(
+            &policy,
+            request("/oauth/device/token", "grant_type=device_code"),
+            CredentialUse::Device(sibling),
+        )
+        .expect("sibling remains live after scoped owner cancellation");
+        let sent = scripted.take_sent();
+        assert_eq!(sent.len(), 4);
+        let selected_body: serde_json::Value =
+            serde_json::from_str(&sent[2].body).expect("selected request reached I/O");
+        assert_eq!(selected_body["device_code"], "CLEANUP_DEVICE_MARKER");
+
+        let scripted = Arc::new(ScriptedHttpsTransport::new());
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let host = OAuthHost::new(
+            Arc::new(ExpireClockAfterPoll {
+                scripted: Arc::clone(&scripted),
+                clock: Arc::clone(&clock),
+            }),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::clone(&clock) as Arc<_>,
+            Arc::new(ScriptedCancel::new()),
+        );
+        let mut deadline_policy = self::policy();
+        deadline_policy.deadline = Instant::now() + Duration::from_secs(48 * 60 * 60);
+        let device = start_device(&host, &scripted, &deadline_policy);
+        scripted.push_json(200, serde_json::json!({"status": "waiting"}));
+        let error = host
+            .transport_with_intents_scoped(
+                &deadline_policy,
+                request("/oauth/device/token", r#"{"grant_type":"device_code"}"#),
+                CredentialUse::Device(device.clone()),
+                selected_device_intents(),
+                Arc::new(ScriptedCancel::new()),
+                None,
+            )
+            .expect_err("submitted device original expiry bounds I/O");
+        assert_eq!(error.code(), "deadline_exceeded");
+        assert_eq!(
+            host.transport(
+                &deadline_policy,
+                request("/oauth/device/token", "grant_type=device_code"),
+                CredentialUse::Device(device),
+            )
+            .expect_err("deadline cleanup revokes submitted family")
+            .code(),
+            "handle_revoked"
+        );
+        assert_eq!(scripted.take_sent().len(), 2);
+    }
+}
+
+#[cfg(test)]
 mod device_poll_tests {
     use super::*;
 
@@ -2909,7 +3659,7 @@ mod device_poll_tests {
         assert!(flow.device_in_flight.load(Ordering::Acquire));
         assert_eq!(flow.device_state.load(Ordering::Acquire), HANDLE_LIVE);
         assert_eq!(
-            flow.device_id().expect("first poll keeps session"),
+            flow.device_id().expect("first poll keeps session").as_str(),
             "fixture-device"
         );
 
