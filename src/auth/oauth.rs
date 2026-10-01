@@ -817,7 +817,30 @@ impl OAuthHost {
         policy: &TrustedTransportPolicy,
         intent: BoundedPublicOAuthIntent,
     ) -> Result<PkceBeginEnvelope, OAuthError> {
-        self.check_cancel_deadline(policy)?;
+        self.pkce_begin_inner(policy, intent, None)
+    }
+
+    pub(crate) fn pkce_begin_scoped(
+        &self,
+        policy: &TrustedTransportPolicy,
+        intent: BoundedPublicOAuthIntent,
+        owner_cancel: Arc<dyn OAuthCancel>,
+    ) -> Result<PkceBeginEnvelope, OAuthError> {
+        self.pkce_begin_inner(policy, intent, Some(owner_cancel))
+    }
+
+    fn pkce_begin_inner(
+        &self,
+        policy: &TrustedTransportPolicy,
+        intent: BoundedPublicOAuthIntent,
+        owner_cancel: Option<Arc<dyn OAuthCancel>>,
+    ) -> Result<PkceBeginEnvelope, OAuthError> {
+        if let Some(owner_cancel) = owner_cancel.as_ref() {
+            self.io_context_with_cancel(policy.deadline, Arc::clone(owner_cancel))
+                .check()?;
+        } else {
+            self.check_cancel_deadline(policy)?;
+        }
         if intent.flow == OAuthFlowKind::DeviceCode {
             return Err(OAuthError::InvalidIntent {
                 reason: "device_code flow does not use pkce_begin".to_string(),
@@ -874,7 +897,13 @@ impl OAuthHost {
             device_in_flight: AtomicBool::new(false),
         });
         self.insert_flow(Arc::clone(&flow))?;
-        let context = self.io_context(flow.expires_at);
+        let context = match owner_cancel {
+            Some(owner_cancel) => self.io_context_with_cancel(
+                min_deadline(flow.expires_at, policy.deadline),
+                owner_cancel,
+            ),
+            None => self.io_context(flow.expires_at),
+        };
         let opened = context.check().and_then(|()| {
             if intent.callback_mode == CallbackMode::Browser {
                 self.inner.browser.open(&authorization_url, &context)?;

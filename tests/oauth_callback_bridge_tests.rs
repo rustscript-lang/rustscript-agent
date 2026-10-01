@@ -10,8 +10,11 @@ use std::{
     collections::VecDeque,
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
+    time::Instant,
 };
 
 #[cfg(feature = "config-fixture")]
@@ -19,7 +22,9 @@ use rustscript_agent::auth::oauth::OAuthHost;
 #[cfg(feature = "config-fixture")]
 use rustscript_agent::{
     CancellationReason,
-    auth::oauth::{CallbackWaiter, OAuthError, OAuthIoContext, RawCallbackInput},
+    auth::oauth::{
+        BrowserOpener, CallbackWaiter, OAuthCancel, OAuthError, OAuthIoContext, RawCallbackInput,
+    },
 };
 use rustscript_agent::{
     RunCancellation,
@@ -80,6 +85,98 @@ impl CallbackWaiter for CountingCallback {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(input);
         Ok(())
+    }
+}
+
+#[cfg(feature = "config-fixture")]
+struct CooperativeBrowser {
+    entered: mpsc::Sender<()>,
+    observed_cancelled: Arc<AtomicBool>,
+    observed_code: Arc<Mutex<Option<&'static str>>>,
+    rescued: Arc<AtomicBool>,
+    rescue_after: Duration,
+}
+
+#[cfg(feature = "config-fixture")]
+impl BrowserOpener for CooperativeBrowser {
+    fn open(&self, _url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+        let _ = self.entered.send(());
+        let rescue_deadline = Instant::now() + self.rescue_after;
+        loop {
+            match context.check() {
+                Ok(()) => {}
+                Err(error @ OAuthError::Cancelled) => {
+                    self.observed_cancelled.store(true, Ordering::Release);
+                    *self
+                        .observed_code
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.code());
+                    return Err(error);
+                }
+                Err(error) => {
+                    *self
+                        .observed_code
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.code());
+                    return Err(error);
+                }
+            }
+            if Instant::now() >= rescue_deadline {
+                self.rescued.store(true, Ordering::Release);
+                return Err(OAuthError::Transport {
+                    message: "fixture browser rescue expired".to_string(),
+                });
+            }
+            thread::yield_now();
+        }
+    }
+}
+
+#[cfg(feature = "config-fixture")]
+struct BeginOutcome {
+    failure: Option<String>,
+    resource_count: usize,
+}
+
+#[cfg(feature = "config-fixture")]
+struct BrowserBeginWorker {
+    entered: mpsc::Receiver<()>,
+    join: Option<thread::JoinHandle<BeginOutcome>>,
+    cancellation: RunCancellation,
+    auth: Arc<AuthHost>,
+    finished: bool,
+}
+
+#[cfg(feature = "config-fixture")]
+impl BrowserBeginWorker {
+    fn wait_until_browser_opened(&self) {
+        self.entered
+            .recv_timeout(Duration::from_secs(20))
+            .expect("real RSS begin reached the injected browser");
+    }
+
+    fn finish(&mut self) -> BeginOutcome {
+        let outcome = self
+            .join
+            .take()
+            .expect("browser begin worker")
+            .join()
+            .expect("browser begin worker completed");
+        self.finished = true;
+        outcome
+    }
+}
+
+#[cfg(feature = "config-fixture")]
+impl Drop for BrowserBeginWorker {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancellation.request(CancellationReason::Requested);
+            self.auth.revoke();
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
     }
 }
 
@@ -239,16 +336,20 @@ fn public_intent_with_scopes(
     ])
 }
 
-fn fixture_intent() -> Value {
+fn fixture_intent_with_mode(mode: &str) -> Value {
     public_intent(
         "/codex/device",
         "authorization_code_pkce",
-        "manual",
+        mode,
         vec![
             public_query("client_id", "public-client-id"),
             public_query("response_type", "code"),
         ],
     )
+}
+
+fn fixture_intent() -> Value {
+    fixture_intent_with_mode("manual")
 }
 
 #[test]
@@ -1340,6 +1441,183 @@ fn owner_cancellation_revokes_wait_and_returns_fixed_cancellation_error() {
     assert_eq!(auth.fixture_live_oauth_flow_count().expect("flow count"), 0);
     assert_eq!(vm.host_context().resource_count(), 2);
     assert_eq!(callback_waiter.wait_count(), 0);
+}
+
+#[cfg(feature = "config-fixture")]
+fn owner_cancel_during_rss_browser_begin(revoke_owner: bool, name: &str) {
+    use rustscript_agent::auth::oauth::{
+        OAuthHost, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport,
+    };
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let observed_cancelled = Arc::new(AtomicBool::new(false));
+    let observed_code = Arc::new(Mutex::new(None));
+    let rescued = Arc::new(AtomicBool::new(false));
+    let browser = Arc::new(CooperativeBrowser {
+        entered: entered_tx,
+        observed_cancelled: observed_cancelled.clone(),
+        observed_code: observed_code.clone(),
+        rescued: rescued.clone(),
+        rescue_after: Duration::from_millis(750),
+    });
+    let host_cancel = Arc::new(ScriptedCancel::new());
+    let callback_waiter = Arc::new(CountingCallback::new(None));
+    let oauth = Arc::new(OAuthHost::new(
+        Arc::new(ScriptedHttpsTransport::new()),
+        callback_waiter,
+        browser,
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        host_cancel.clone(),
+    ));
+
+    let home_b = TempHome::new(&format!("{name}-owner-b"));
+    let mut vm_b = compile_contract(&contract_source());
+    let auth_b = Arc::new(
+        AuthHost::new(
+            home_b.0.clone(),
+            RunCancellation::with_timeout(Duration::from_secs(30)),
+        )
+        .expect("owner B host")
+        .with_oauth_host(oauth.clone())
+        .with_oauth_callback_fixture(),
+    );
+    let owner_b = auth_b.bind_vm(&mut vm_b).expect("bind owner B");
+    let begun_b = invoke(
+        &mut vm_b,
+        "begin",
+        &[field(&owner_b, "host_home"), fixture_intent()],
+    );
+    let callback_b = field(&begun_b, "callback_handle");
+    let verifier_b = field(&begun_b, "verifier_handle");
+
+    let home_a = TempHome::new(&format!("{name}-owner-a"));
+    let cancellation_a = RunCancellation::with_timeout(Duration::from_secs(30));
+    let auth_a = Arc::new(
+        AuthHost::new(home_a.0.clone(), cancellation_a.clone())
+            .expect("owner A host")
+            .with_oauth_host(oauth.clone())
+            .with_oauth_callback_fixture(),
+    );
+    let worker_auth = auth_a.clone();
+    let join = thread::spawn(move || {
+        let mut vm = compile_contract(&contract_source());
+        let owner = worker_auth.bind_vm(&mut vm).expect("bind owner A");
+        let callable = vm.resolve_exported_callable("begin").expect("RSS begin");
+        let args = [
+            field(&owner, "host_home"),
+            fixture_intent_with_mode("browser"),
+        ];
+        let failure = vm
+            .invoke_callable(callable, &args)
+            .err()
+            .map(|failure| failure.to_string());
+        BeginOutcome {
+            failure,
+            resource_count: vm.host_context().resource_count(),
+        }
+    });
+    let mut worker = BrowserBeginWorker {
+        entered: entered_rx,
+        join: Some(join),
+        cancellation: cancellation_a.clone(),
+        auth: auth_a.clone(),
+        finished: false,
+    };
+
+    worker.wait_until_browser_opened();
+    assert_eq!(
+        auth_a
+            .fixture_live_oauth_flow_count()
+            .expect("two live flows"),
+        2
+    );
+    if revoke_owner {
+        auth_a.revoke();
+    } else {
+        cancellation_a.request(CancellationReason::Requested);
+    }
+    let outcome = worker.finish();
+
+    assert!(
+        observed_cancelled.load(Ordering::Acquire),
+        "browser I/O context did not observe owner cancellation"
+    );
+    let cancellation_code = OAuthError::Cancelled.code();
+    assert_eq!(
+        *observed_code
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        Some(cancellation_code)
+    );
+    assert!(
+        outcome
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains(cancellation_code)),
+        "RSS begin did not return the primitive cancellation code"
+    );
+    assert!(!rescued.load(Ordering::Acquire));
+    assert_eq!(outcome.resource_count, 2);
+    assert_eq!(
+        auth_a
+            .fixture_live_oauth_flow_count()
+            .expect("owner A removed"),
+        1
+    );
+    assert_eq!(
+        auth_b
+            .fixture_live_oauth_flow_count()
+            .expect("owner B retained"),
+        1
+    );
+    assert!(!host_cancel.is_cancelled());
+
+    auth_b
+        .fixture_inject_matching_callback(&mut vm_b, &callback_b, SYNTHETIC_CODE)
+        .expect("inject matching callback for owner B");
+    let waited_b = invoke(&mut vm_b, "wait", std::slice::from_ref(&callback_b));
+    assert_eq!(field(&waited_b, "outcome"), Value::string("success"));
+    let code_b = field(&waited_b, "code_handle");
+    assert!(matches!(code_b, Value::Int(_)));
+    assert!(matches!(verifier_b, Value::Int(_)));
+    assert_eq!(
+        auth_b
+            .fixture_live_oauth_flow_count()
+            .expect("owner B live"),
+        1
+    );
+
+    invoke(
+        &mut vm_b,
+        "close_callback",
+        std::slice::from_ref(&callback_b),
+    );
+    invoke(
+        &mut vm_b,
+        "close_verifier",
+        std::slice::from_ref(&verifier_b),
+    );
+    invoke(&mut vm_b, "close_code", std::slice::from_ref(&code_b));
+    assert_eq!(vm_b.host_context().resource_count(), 2);
+    drop(vm_b);
+    assert_eq!(
+        auth_a
+            .fixture_live_oauth_flow_count()
+            .expect("all VM flows removed"),
+        0
+    );
+}
+
+#[cfg(feature = "config-fixture")]
+#[test]
+fn requested_cancellation_reaches_browser_io_during_real_rss_begin() {
+    owner_cancel_during_rss_browser_begin(false, "requested-cancellation");
+}
+
+#[cfg(feature = "config-fixture")]
+#[test]
+fn auth_host_revoke_reaches_browser_io_during_real_rss_begin() {
+    owner_cancel_during_rss_browser_begin(true, "auth-host-revoke");
 }
 
 #[test]

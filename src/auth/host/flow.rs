@@ -282,8 +282,9 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         }
     }
 
+    let cancellation: Arc<dyn OAuthCancel> = Arc::new(OwnerCancellation(owner.clone()));
     let begun = oauth
-        .pkce_begin(&policy, intent)
+        .pkce_begin_scoped(&policy, intent, cancellation)
         .map_err(|failure| error(failure.code()))?;
     if let Err(failure) = owner.check() {
         let _ = oauth.revoke_callback_flow(&begun.callback_handle);
