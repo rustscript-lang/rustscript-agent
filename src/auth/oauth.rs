@@ -1012,6 +1012,41 @@ impl OAuthHost {
         request: ProviderRequest,
         credential_use: CredentialUse,
     ) -> Result<SanitizedProviderResponse, OAuthError> {
+        self.transport_inner(policy, request, credential_use, None, None)
+    }
+
+    pub(crate) fn transport_scoped(
+        &self,
+        policy: &TrustedTransportPolicy,
+        request: ProviderRequest,
+        credential_use: CredentialUse,
+        owner_cancel: Arc<dyn OAuthCancel>,
+        response_slot_generation_override: Option<u64>,
+    ) -> Result<SanitizedProviderResponse, OAuthError> {
+        self.transport_inner(
+            policy,
+            request,
+            credential_use,
+            Some(owner_cancel),
+            response_slot_generation_override,
+        )
+    }
+
+    fn transport_inner(
+        &self,
+        policy: &TrustedTransportPolicy,
+        request: ProviderRequest,
+        credential_use: CredentialUse,
+        owner_cancel: Option<Arc<dyn OAuthCancel>>,
+        response_slot_generation_override: Option<u64>,
+    ) -> Result<SanitizedProviderResponse, OAuthError> {
+        if response_slot_generation_override.is_some()
+            && !matches!(&credential_use, CredentialUse::AuthorizationCode { .. })
+        {
+            return Err(OAuthError::HandleProvenance {
+                class: CODE_HANDLE_CLASS.to_string(),
+            });
+        }
         let method = request.method.to_ascii_uppercase();
         if method != "GET" && method != "POST" {
             return Err(OAuthError::MethodDenied { method });
@@ -1044,12 +1079,16 @@ impl OAuthHost {
                 policy.deadline
             }
         };
-        let context = self.io_context(operation_deadline);
+        let context = match owner_cancel {
+            Some(owner_cancel) => self.io_context_with_cancel(operation_deadline, owner_cancel),
+            None => self.io_context(operation_deadline),
+        };
         if let Err(error) = context.check() {
             self.revoke_credential_use(&credential_use);
             return Err(error);
         }
-        let expected_generation = credential_expected_generation(&credential_use);
+        let expected_generation = response_slot_generation_override
+            .unwrap_or_else(|| credential_expected_generation(&credential_use));
         let mut prepared = PreparedHttpsRequest {
             method,
             url: format!("https://{}{}", endpoint.authority, request.path),

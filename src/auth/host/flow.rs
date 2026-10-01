@@ -10,8 +10,8 @@ use rustscript_vm::{
 };
 
 use crate::auth::oauth::{
-    BoundedPublicOAuthIntent, CallbackMode, CallbackOutcome, OAuthCancel, OAuthFlowKind,
-    OpaqueAuthorizationCodeHandle, OpaqueCallbackHandle, OpaqueVerifierHandle,
+    BoundedPublicOAuthIntent, CallbackMode, CallbackOutcome, CredentialUse, OAuthCancel,
+    OAuthFlowKind, OpaqueAuthorizationCodeHandle, OpaqueCallbackHandle, OpaqueVerifierHandle,
 };
 
 use super::{
@@ -32,6 +32,7 @@ struct FlowResources {
     owner: Arc<Owner>,
     credential_id: String,
     policy_generation: u64,
+    credential_generation: u64,
     callback: OpaqueCallbackHandle,
     verifier: OpaqueVerifierHandle,
     code: Mutex<Option<OpaqueAuthorizationCodeHandle>>,
@@ -137,6 +138,105 @@ impl OAuthCancel for OwnerCancellation {
     fn is_cancelled(&self) -> bool {
         self.0.revoked.load(Ordering::Acquire) || self.0.cancellation.token().is_cancelled()
     }
+}
+
+pub(super) fn owner_cancellation(owner: &Arc<Owner>) -> Arc<dyn OAuthCancel> {
+    Arc::new(OwnerCancellation(owner.clone()))
+}
+
+pub(super) struct TransportFlowPair {
+    flow: Arc<FlowResources>,
+    code: OpaqueAuthorizationCodeHandle,
+    verifier: OpaqueVerifierHandle,
+}
+
+impl TransportFlowPair {
+    pub(super) fn credential_generation(&self) -> u64 {
+        self.flow.credential_generation
+    }
+
+    pub(super) fn for_send(&self) -> CredentialUse {
+        CredentialUse::AuthorizationCode {
+            code: self.code.clone(),
+            verifier: self.verifier.clone(),
+        }
+    }
+
+    pub(super) fn callback_result_live(&self) -> bool {
+        self.flow
+            .owner
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.callback_result_live(&self.flow.callback))
+    }
+
+    pub(super) fn owner_inactive(&self) -> bool {
+        self.flow.owner.check().is_err()
+    }
+
+    pub(super) fn rollback(&self, vm: &mut Vm) {
+        rollback_resources(vm, &self.flow);
+    }
+}
+
+pub(super) fn transport_pair(
+    vm: &mut Vm,
+    code_value: &Value,
+    verifier_value: &Value,
+    owner: &Arc<Owner>,
+    credential_id: &str,
+    policy_generation: u64,
+) -> VmResult<TransportFlowPair> {
+    let code_flow = {
+        let context = vm.host_context();
+        context
+            .borrow_resource_with_key::<CodeResource>(
+                handle(code_value)?,
+                &ResourceTypeKey::new(CODE_KEY).expect("static code key"),
+            )
+            .map_err(|_| error("resource_invalid"))?
+            .flow
+            .clone()
+    };
+    let verifier_flow = {
+        let context = vm.host_context();
+        context
+            .borrow_resource_with_key::<VerifierResource>(
+                handle(verifier_value)?,
+                &ResourceTypeKey::new(VERIFIER_KEY).expect("static verifier key"),
+            )
+            .map_err(|_| error("resource_invalid"))?
+            .flow
+            .clone()
+    };
+    let bound_owner = vm
+        .host_context()
+        .scope_state::<Bound>()
+        .map(|bound| Arc::clone(&bound.0))
+        .ok_or_else(|| error("host_unbound"))?;
+    if !Arc::ptr_eq(owner, &bound_owner)
+        || !Arc::ptr_eq(owner, &code_flow.owner)
+        || !Arc::ptr_eq(owner, &verifier_flow.owner)
+    {
+        return Err(error("owner_mismatch"));
+    }
+    if !Arc::ptr_eq(&code_flow, &verifier_flow)
+        || code_flow.credential_id != credential_id
+        || code_flow.policy_generation != policy_generation
+    {
+        return Err(error("handle_provenance"));
+    }
+    let code = code_flow
+        .code
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .ok_or_else(|| error("resource_invalid"))?;
+    Ok(TransportFlowPair {
+        flow: code_flow.clone(),
+        code,
+        verifier: code_flow.verifier.clone(),
+    })
 }
 
 pub(super) fn callback_meta() -> HostResourceTypeMeta {
@@ -268,6 +368,12 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     if !owner.oauth_callback_fixture {
         return Err(error("callback_unavailable"));
     }
+    let credential_generation = owner
+        .snapshot
+        .credential_generations
+        .get(&credential_id)
+        .copied()
+        .ok_or_else(|| error("credential_unavailable"))?;
     let oauth = owner
         .oauth
         .as_ref()
@@ -294,6 +400,7 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         owner: owner.clone(),
         credential_id,
         policy_generation: policy.generation,
+        credential_generation,
         callback: begun.callback_handle,
         verifier: begun.verifier_handle,
         code: Mutex::new(None),

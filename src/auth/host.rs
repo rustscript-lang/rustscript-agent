@@ -121,6 +121,7 @@ impl HostResourceType for SecretSlot {
 struct Snapshot {
     config: ConfigFile,
     allowed: BTreeSet<String>,
+    credential_generations: BTreeMap<String, u64>,
     generation: u64,
 }
 struct Owner {
@@ -589,9 +590,15 @@ fn load_snapshot(
         .values()
         .filter_map(|provider| provider.auth.clone())
         .collect();
+    let credential_generations = auth
+        .credentials
+        .iter()
+        .map(|(id, credential)| (id.clone(), credential.generation))
+        .collect();
     Ok(Snapshot {
         config,
         allowed,
+        credential_generations,
         generation,
     })
 }
@@ -939,6 +946,8 @@ fn transport_use_type() -> HostTypeSchema {
             ("kind", HostTypeSchema::String),
             ("access_handle", opt(key(Access::KEY))),
             ("refresh_handle", opt(key(Refresh::KEY))),
+            ("code_handle", opt(key("oauth.authorization_code"))),
+            ("verifier_handle", opt(key("oauth.verifier"))),
         ],
     )
 }
@@ -1236,10 +1245,17 @@ fn revoke_response(oauth: &OAuthHost, response: &SanitizedProviderResponse) {
 
 fn finalize_transport_response(
     oauth: &OAuthHost,
+    owner_inactive: bool,
     sent: Result<SanitizedProviderResponse, crate::auth::oauth::OAuthError>,
     closed: VmResult<()>,
 ) -> VmResult<SanitizedProviderResponse> {
-    let response = sent.map_err(|failure| error(failure.code()))?;
+    let response = sent.map_err(|failure| {
+        if failure.code() == "cancelled" && owner_inactive {
+            error("policy_inactive")
+        } else {
+            error(failure.code())
+        }
+    })?;
     if let Err(failure) = closed {
         revoke_response(oauth, &response);
         return Err(failure);
@@ -1251,6 +1267,7 @@ enum TransportCredential {
     None,
     Access(ResourceHandle, OpaqueAccessHandle),
     Refresh(ResourceHandle, OpaqueRefreshHandle),
+    CodeVerifier(flow::TransportFlowPair),
 }
 
 impl TransportCredential {
@@ -1259,6 +1276,7 @@ impl TransportCredential {
             Self::None => 0,
             Self::Access(_, handle) => handle.generation(),
             Self::Refresh(_, handle) => handle.generation(),
+            Self::CodeVerifier(pair) => pair.credential_generation(),
         }
     }
 
@@ -1267,6 +1285,14 @@ impl TransportCredential {
             Self::None => CredentialUse::None,
             Self::Access(_, handle) => CredentialUse::Access(handle.clone()),
             Self::Refresh(_, handle) => CredentialUse::Refresh(handle.clone()),
+            Self::CodeVerifier(pair) => pair.for_send(),
+        }
+    }
+
+    fn slot_generation_override(&self) -> Option<u64> {
+        match self {
+            Self::CodeVerifier(pair) => Some(pair.credential_generation()),
+            Self::None | Self::Access(_, _) | Self::Refresh(_, _) => None,
         }
     }
 
@@ -1283,7 +1309,11 @@ impl TransportCredential {
                 .close_resource::<Refresh>(*resource, ResourceCloseReason::Requested)
                 .map(|_| ())
                 .map_err(|_| error("resource_invalid")),
-            _ => Ok(()),
+            Self::CodeVerifier(pair) if pair.owner_inactive() || !pair.callback_result_live() => {
+                pair.rollback(vm);
+                Ok(())
+            }
+            Self::Access(_, _) | Self::Refresh(_, _) | Self::CodeVerifier(_) => Ok(()),
         }
     }
 }
@@ -1292,12 +1322,22 @@ fn transport_credential(
     vm: &mut Vm,
     usage: &Value,
     owner: &Arc<Owner>,
+    credential_id: &str,
 ) -> VmResult<TransportCredential> {
+    validate_transport_use_keys(usage)?;
     let access = optional_field(usage, "access_handle")?;
     let refresh = optional_field(usage, "refresh_handle")?;
-    match (string(field(usage, "kind")?)?, access, refresh) {
-        ("none", None, None) => Ok(TransportCredential::None),
-        ("access", Some(value), None) => {
+    let code = optional_field(usage, "code_handle")?;
+    let verifier = optional_field(usage, "verifier_handle")?;
+    match (
+        string(field(usage, "kind")?)?,
+        access,
+        refresh,
+        code,
+        verifier,
+    ) {
+        ("none", None, None, None, None) => Ok(TransportCredential::None),
+        ("access", Some(value), None, None, None) => {
             borrowed::<Access>(vm, value)?;
             let context = vm.host_context();
             let entry = context
@@ -1314,7 +1354,7 @@ fn transport_credential(
                 entry.handle.clone(),
             ))
         }
-        ("refresh", None, Some(value)) => {
+        ("refresh", None, Some(value), None, None) => {
             borrowed::<Refresh>(vm, value)?;
             let context = vm.host_context();
             let entry = context
@@ -1331,16 +1371,48 @@ fn transport_credential(
                 entry.handle.clone(),
             ))
         }
+        ("code_verifier", None, None, Some(code), Some(verifier)) => {
+            let policy_generation = owner.snapshot.generation;
+            flow::transport_pair(vm, code, verifier, owner, credential_id, policy_generation)
+                .map(TransportCredential::CodeVerifier)
+        }
         _ => Err(error("credential_use_unsupported")),
     }
+}
+
+fn validate_transport_use_keys(usage: &Value) -> VmResult<()> {
+    let Value::Map(entries) = usage else {
+        return Err(error("invalid_request"));
+    };
+    let mut seen = BTreeSet::new();
+    for (key, _) in entries.iter() {
+        let Value::String(key) = key else {
+            return Err(error("credential_use_unsupported"));
+        };
+        let name = key.as_str();
+        if !matches!(
+            name,
+            "kind" | "access_handle" | "refresh_handle" | "code_handle" | "verifier_handle"
+        ) || !seen.insert(name)
+        {
+            return Err(error("credential_use_unsupported"));
+        }
+    }
+    Ok(())
 }
 
 fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let request = args.first().ok_or_else(|| error("invalid_request"))?;
     let usage = args.get(1).ok_or_else(|| error("invalid_request"))?;
     let id = string(field(request, "credential_id")?)?;
-    let owner = policy_owner(vm, field(request, "policy_handle")?, id)?;
-    let credential = transport_credential(vm, usage, &owner)?;
+    let owner = match policy_owner(vm, field(request, "policy_handle")?, id) {
+        Ok(owner) => owner,
+        Err(failure) => {
+            cleanup_inactive_code_pair(vm, request, usage, id);
+            return Err(failure);
+        }
+    };
+    let credential = transport_credential(vm, usage, &owner, id)?;
     let generation = credential.generation();
     let oauth = owner
         .oauth
@@ -1367,8 +1439,11 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         }
     }
     let policy = transport_policy(&owner, id)?;
-    owner.check()?;
-    let sent = oauth.transport(
+    if let Err(failure) = owner.check() {
+        credential.close_if_terminal(vm)?;
+        return Err(failure);
+    }
+    let sent = oauth.transport_scoped(
         &policy,
         ProviderRequest {
             method: string(field(request, "method")?)?.to_owned(),
@@ -1378,11 +1453,14 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
             credential_id: id.to_owned(),
         },
         credential.for_send(),
+        flow::owner_cancellation(&owner),
+        credential.slot_generation_override(),
     );
     // A local admission failure keeps the live resource available for retry.
     // Once the store entry is terminal, close the Core alias even on send errors.
     let closed = credential.close_if_terminal(vm);
-    let response = finalize_transport_response(&oauth, sent, closed)?;
+    let owner_inactive = owner.check().is_err();
+    let response = finalize_transport_response(&oauth, owner_inactive, sent, closed)?;
     let processed = (|| {
         owner.check()?;
         if response.device_handle.is_some() || response.code_handle.is_some() {
@@ -1504,6 +1582,69 @@ fn policy_owner(vm: &mut Vm, value: &Value, id: &str) -> VmResult<Arc<Owner>> {
     owner.authorize(id)?;
     Ok(owner)
 }
+
+fn policy_owner_for_cleanup(vm: &mut Vm, value: &Value) -> VmResult<Arc<Owner>> {
+    let owner = {
+        let context = vm.host_context();
+        let entry = context
+            .borrow_resource_with_key::<Policy>(
+                handle(value)?,
+                &ResourceTypeKey::new(Policy::KEY).expect("static key"),
+            )
+            .map_err(|_| error("resource_invalid"))?;
+        entry.owner.clone()
+    };
+    let bound = vm
+        .host_context()
+        .scope_state::<Bound>()
+        .map(|bound| Arc::clone(&bound.0))
+        .ok_or_else(|| error("host_unbound"))?;
+    if !Arc::ptr_eq(&owner, &bound) {
+        return Err(error("owner_mismatch"));
+    }
+    Ok(owner)
+}
+
+fn cleanup_inactive_code_pair(vm: &mut Vm, request: &Value, usage: &Value, id: &str) {
+    let Ok(kind) = field(usage, "kind") else {
+        return;
+    };
+    if string(kind).ok() != Some("code_verifier") {
+        return;
+    }
+    let Ok(access) = optional_field(usage, "access_handle") else {
+        return;
+    };
+    let Ok(refresh) = optional_field(usage, "refresh_handle") else {
+        return;
+    };
+    let (Some(code), Some(verifier)) = (
+        optional_field(usage, "code_handle").ok().flatten(),
+        optional_field(usage, "verifier_handle").ok().flatten(),
+    ) else {
+        return;
+    };
+    if access.is_some() || refresh.is_some() || validate_transport_use_keys(usage).is_err() {
+        return;
+    }
+    let Ok(policy) = field(request, "policy_handle") else {
+        return;
+    };
+    let Ok(owner) = policy_owner_for_cleanup(vm, policy) else {
+        return;
+    };
+    if owner.check().is_ok() {
+        return;
+    }
+    let Ok(pair) = flow::transport_pair(vm, code, verifier, &owner, id, owner.snapshot.generation)
+    else {
+        return;
+    };
+    if pair.owner_inactive() {
+        pair.rollback(vm);
+    }
+}
+
 fn metadata_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let id = string(&args[0])?;
     let owner = policy_owner(vm, &args[1], id)?;
@@ -1740,9 +1881,13 @@ mod tests {
             device_handle: None,
             code_handle: None,
         };
-        let failure =
-            finalize_transport_response(&oauth, Ok(response), Err(error("resource_invalid")))
-                .expect_err("failed close must reject the response");
+        let failure = finalize_transport_response(
+            &oauth,
+            false,
+            Ok(response),
+            Err(error("resource_invalid")),
+        )
+        .expect_err("failed close must reject the response");
         assert!(matches!(&failure, VmError::HostError(code) if code == "resource_invalid"));
         assert!(!failure.to_string().contains(secret));
         for (kind, slot) in [
@@ -1779,7 +1924,8 @@ mod tests {
             device_handle: None,
             code_handle: None,
         };
-        let returned = finalize_transport_response(&oauth, Ok(response), Ok(())).expect("response");
+        let returned =
+            finalize_transport_response(&oauth, false, Ok(response), Ok(())).expect("response");
         assert_eq!(returned.status, 200);
         assert!(
             returned
@@ -1791,9 +1937,22 @@ mod tests {
     }
 
     #[test]
+    fn owner_cancelled_transport_keeps_policy_inactive_error() {
+        let failure = finalize_transport_response(
+            &scripted_oauth(),
+            true,
+            Err(crate::auth::oauth::OAuthError::Cancelled),
+            Ok(()),
+        )
+        .expect_err("inactive owner cancellation");
+        assert!(matches!(&failure, VmError::HostError(code) if code == "policy_inactive"));
+    }
+
+    #[test]
     fn transport_failure_precedes_close_failure() {
         let failure = finalize_transport_response(
             &scripted_oauth(),
+            false,
             Err(crate::auth::oauth::OAuthError::Cancelled),
             Err(error("resource_invalid")),
         )
