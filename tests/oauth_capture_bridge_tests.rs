@@ -1,6 +1,5 @@
 #[cfg(feature = "config-fixture")]
 use rustscript_agent::CancellationReason;
-#[cfg(feature = "config-fixture")]
 use rustscript_agent::auth::oauth::{
     BoundedHttpsTransport, OAuthError, OAuthIoContext, PreparedHttpsRequest, RawHttpsResponse,
 };
@@ -19,7 +18,16 @@ use rustscript_vm::{
     CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm, VmStatus,
     compile_source_at_path_with_flavor_and_options,
 };
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 struct FixtureHome(PathBuf);
 
@@ -79,6 +87,313 @@ impl BoundedHttpsTransport for CancelAfterCaptureResponse {
             body: body.to_vec(),
         })
     }
+}
+
+const FAILURE_DEVICE: &str = "CAPTURE_FAILURE_DEVICE_PRIVATE_621e";
+const FAILURE_CODE: &str = "CAPTURE_FAILURE_CODE_PRIVATE_70b9";
+const FAILURE_VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+const FAILURE_MARKER: &str = "CAPTURE_FAILURE_PROVIDER_PRIVATE_93c4";
+
+#[derive(Clone, Copy)]
+enum CaptureSendHook {
+    None,
+    ExpireDeadline,
+    RevokeOwner,
+}
+
+/// Only the provider boundary is scripted; parsing, promotion, host rollback and
+/// Core resource ownership run through the real restricted RSS capture export.
+struct CaptureFailureTransport {
+    response: Mutex<Option<Result<RawHttpsResponse, OAuthError>>>,
+    hook: CaptureSendHook,
+    clock: Arc<ScriptedClock>,
+    owner: Mutex<Weak<AuthHost>>,
+    calls: AtomicUsize,
+}
+
+impl BoundedHttpsTransport for CaptureFailureTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        context.check()?;
+        match self.calls.fetch_add(1, Ordering::AcqRel) {
+            0 => Ok(capture_raw_response(
+                format!(r#"{{"device_code":"{FAILURE_DEVICE}","user_code":"SYNTHETIC-USER","verification_uri":"https://auth.example.test/device","expires_in":900,"interval":5}}"#).into_bytes(),
+            )),
+            1 => {
+                let wire: serde_json::Value =
+                    serde_json::from_str(&request.body).expect("native selected request JSON");
+                assert_eq!(wire["device_id"], FAILURE_DEVICE);
+                assert_eq!(wire["grant_type"], "device_code");
+                assert_eq!(request.url, "https://auth.example.test/oauth/token");
+                match self.hook {
+                    CaptureSendHook::None => {}
+                    CaptureSendHook::ExpireDeadline => self.clock.expire(),
+                    CaptureSendHook::RevokeOwner => self
+                        .owner
+                        .lock()
+                        .expect("owner hook")
+                        .upgrade()
+                        .expect("live auth host")
+                        .revoke(),
+                }
+                self.response
+                    .lock()
+                    .expect("scripted response")
+                    .take()
+                    .expect("exactly one capture send")
+            }
+            _ => panic!("terminal device alias must never reach another send"),
+        }
+    }
+}
+
+fn capture_raw_response(body: Vec<u8>) -> RawHttpsResponse {
+    RawHttpsResponse {
+        status: 200,
+        headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+        body,
+    }
+}
+
+fn valid_capture_raw_response() -> RawHttpsResponse {
+    capture_raw_response(
+        format!(r#"{{"code":"{FAILURE_CODE}","code_verifier":"{FAILURE_VERIFIER}","public":"accepted"}}"#).into_bytes(),
+    )
+}
+
+fn failure_capture_args(policy: &Value, device: &Value) -> [Value; 4] {
+    [
+        request(
+            policy.clone(),
+            "/oauth/token",
+            r#"{"grant_type":"device_code"}"#,
+        ),
+        record(vec![
+            ("kind", Value::string("device_session")),
+            ("device_handle", device.clone()),
+        ]),
+        record(vec![
+            ("encoding", Value::string("json_object")),
+            ("secret_fields", Value::string("device")),
+            ("device_field", Value::string("device_id")),
+        ]),
+        record(vec![
+            ("code_field", Value::string("code")),
+            (
+                "redirect_uri",
+                Value::string("https://auth.example.test/callback"),
+            ),
+        ]),
+    ]
+}
+
+fn assert_capture_failure_is_public(failure: &rustscript_vm::VmError, category: &str) {
+    assert!(failure.to_string().ends_with(category), "{failure:?}");
+    let public = format!("{failure}\n{failure:?}");
+    for secret in [
+        FAILURE_DEVICE,
+        FAILURE_CODE,
+        FAILURE_VERIFIER,
+        FAILURE_MARKER,
+    ] {
+        assert!(
+            !public.contains(secret),
+            "capture error exposed private provider data"
+        );
+    }
+}
+
+fn assert_terminal_capture_failure(
+    response: Result<RawHttpsResponse, OAuthError>,
+    hook: CaptureSendHook,
+    category: &str,
+) {
+    let home = FixtureHome::new();
+    let config_path = home.0.join("config.yaml");
+    let config = fs::read_to_string(&config_path)
+        .expect("fixture config")
+        .replace("https://auth.openai.com", "https://auth.example.test");
+    fs::write(config_path, config).expect("synthetic .test OAuth endpoint");
+    let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+    let transport = Arc::new(CaptureFailureTransport {
+        response: Mutex::new(Some(response)),
+        hook,
+        clock: clock.clone(),
+        owner: Mutex::new(Weak::new()),
+        calls: AtomicUsize::new(0),
+    });
+    let oauth = Arc::new(OAuthHost::new(
+        transport.clone(),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        clock,
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let auth = Arc::new(
+        AuthHost::new(
+            home.0.clone(),
+            RunCancellation::with_timeout(Duration::from_secs(30)),
+        )
+        .expect("auth host")
+        .with_oauth_host(oauth),
+    );
+    *transport.owner.lock().expect("install weak owner hook") = Arc::downgrade(&auth);
+    let mut vm = vm_for(&auth);
+    let owner = auth.bind_vm(&mut vm).expect("bind owner");
+    let snapshot = call(&mut vm, "snapshot", &[field(&owner, "host_home")]);
+    let policy = field(&snapshot, "policy_handle");
+    let roots = vm.host_context().resource_count();
+    assert_eq!(roots, 2);
+    #[cfg(feature = "config-fixture")]
+    assert_eq!(
+        auth.fixture_live_oauth_flow_count()
+            .expect("native baseline"),
+        0
+    );
+    let access = call(&mut vm, "issue_access", std::slice::from_ref(&policy));
+    assert_eq!(vm.host_context().resource_count(), roots + 1);
+    let started = call(&mut vm, "start_device", std::slice::from_ref(&policy));
+    let device = field(&started, "device_handle");
+    let before_capture = transport.calls.load(Ordering::Acquire);
+    assert_eq!(before_capture, 1);
+    assert_eq!(vm.host_context().resource_count(), roots + 2);
+    #[cfg(feature = "config-fixture")]
+    assert_eq!(
+        auth.fixture_live_oauth_flow_count().expect("live device"),
+        1
+    );
+
+    let args = failure_capture_args(&policy, &device);
+    let failure = call_result(&mut vm, "capture", &args).expect_err("terminal capture failure");
+    assert_capture_failure_is_public(&failure, category);
+    assert_eq!(transport.calls.load(Ordering::Acquire) - before_capture, 1);
+    assert!(
+        transport
+            .response
+            .lock()
+            .expect("response consumed")
+            .is_none()
+    );
+    assert_eq!(
+        vm.host_context().resource_count(),
+        roots + 1,
+        "terminal device Core alias closes without issuing pair halves or secret slots; unrelated access and roots remain",
+    );
+    #[cfg(feature = "config-fixture")]
+    assert_eq!(
+        auth.fixture_live_oauth_flow_count()
+            .expect("terminal native cleanup"),
+        0,
+        "unpublished native capture pair must be revoked",
+    );
+
+    let alias_failure = call_result(&mut vm, "capture", &args)
+        .expect_err("terminal device alias cannot capture again");
+    let public = format!("{alias_failure:?}");
+    for secret in [
+        FAILURE_DEVICE,
+        FAILURE_CODE,
+        FAILURE_VERIFIER,
+        FAILURE_MARKER,
+    ] {
+        assert!(!public.contains(secret));
+    }
+    assert!(
+        call_result(&mut vm, "close_device", &[device]).is_err(),
+        "submitted Core alias is closed"
+    );
+    assert_eq!(transport.calls.load(Ordering::Acquire), before_capture + 1);
+    assert_eq!(vm.host_context().resource_count(), roots + 1);
+    if matches!(hook, CaptureSendHook::RevokeOwner) {
+        // Revocation invalidates unrelated owner capabilities too, but capture
+        // must not close their Core charges while reclaiming its device.
+        let failure = call_result(&mut vm, "close_access", &[access])
+            .expect_err("revoked owner cannot authorize access operations");
+        assert_capture_failure_is_public(&failure, "policy_inactive");
+        assert_eq!(vm.host_context().resource_count(), roots + 1);
+    } else {
+        call(&mut vm, "close_access", &[access]);
+        assert_eq!(vm.host_context().resource_count(), roots);
+    }
+    assert_eq!(transport.calls.load(Ordering::Acquire), before_capture + 1);
+    #[cfg(feature = "config-fixture")]
+    assert_eq!(
+        auth.fixture_live_oauth_flow_count()
+            .expect("final native baseline"),
+        0
+    );
+}
+
+#[test]
+fn post_native_header_bound_rejection_revokes_unpublished_capture_pair() {
+    let mut response = valid_capture_raw_response();
+    for index in 0..64 {
+        response
+            .headers
+            .insert(format!("x-public-{index:02}"), "ordinary".to_owned());
+    }
+    assert_eq!(response.headers.len(), 65);
+    // Native sanitization promotes this valid pair and retains these public
+    // headers. The host rejects the header count before the VM pair publisher.
+    assert_terminal_capture_failure(Ok(response), CaptureSendHook::None, "response_too_large");
+}
+
+#[test]
+fn capture_malformed_incomplete_and_ambiguous_provider_controls_are_terminal() {
+    // These are raw provider JSON keys, not canonicalized VmMap record keys.
+    let cases = [
+        ("invalid JSON", format!(r#"{{"code":"{FAILURE_CODE}","private":"{FAILURE_MARKER}""#).into_bytes()),
+        ("invalid UTF-8", vec![0xff, 0xfe]),
+        ("missing code", format!(r#"{{"code_verifier":"{FAILURE_VERIFIER}"}}"#).into_bytes()),
+        ("missing verifier", format!(r#"{{"code":"{FAILURE_CODE}"}}"#).into_bytes()),
+        ("wrong code type", format!(r#"{{"code":{{"private":"{FAILURE_MARKER}"}},"code_verifier":"{FAILURE_VERIFIER}"}}"#).into_bytes()),
+        ("bad verifier grammar", format!(r#"{{"code":"{FAILURE_CODE}","code_verifier":"{FAILURE_VERIFIER}!"}}"#).into_bytes()),
+        ("ambiguous code selectors", format!(r#"{{"code":"{FAILURE_CODE}","authorization_code":"{FAILURE_CODE}","code_verifier":"{FAILURE_VERIFIER}"}}"#).into_bytes()),
+        ("case-variant code duplicate", format!(r#"{{"code":"{FAILURE_CODE}","CODE":"{FAILURE_CODE}","code_verifier":"{FAILURE_VERIFIER}"}}"#).into_bytes()),
+        ("raw duplicate selected key", format!(r#"{{"code":"{FAILURE_CODE}","code":"{FAILURE_CODE}","code_verifier":"{FAILURE_VERIFIER}"}}"#).into_bytes()),
+    ];
+    for (case, body) in cases {
+        assert!(!body.is_empty(), "{case}");
+        assert_terminal_capture_failure(
+            Ok(capture_raw_response(body)),
+            CaptureSendHook::None,
+            "malformed_response",
+        );
+    }
+}
+
+#[test]
+fn capture_provider_send_error_is_secret_free_and_reclaims_terminal_device() {
+    assert_terminal_capture_failure(
+        Err(OAuthError::Transport {
+            message: format!(
+                "{FAILURE_MARKER}: {FAILURE_DEVICE} {FAILURE_CODE} {FAILURE_VERIFIER}"
+            ),
+        }),
+        CaptureSendHook::None,
+        "transport_error",
+    );
+}
+
+#[test]
+fn deadline_expiring_during_capture_send_prevents_pair_publication() {
+    assert_terminal_capture_failure(
+        Ok(valid_capture_raw_response()),
+        CaptureSendHook::ExpireDeadline,
+        "deadline_exceeded",
+    );
+}
+
+#[test]
+fn owner_revoked_during_capture_send_prevents_pair_publication() {
+    assert_terminal_capture_failure(
+        Ok(valid_capture_raw_response()),
+        CaptureSendHook::RevokeOwner,
+        "policy_inactive",
+    );
 }
 
 impl Drop for FixtureHome {
