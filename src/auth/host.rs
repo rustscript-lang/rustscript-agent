@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::auth::config::CredentialConfig;
 use crate::auth::oauth::{
-    CredentialUse, OAuthHost, ProviderRequest, SanitizedProviderResponse, TrustedEndpoint,
-    TrustedTransportPolicy,
+    CredentialUse, NativeTransportIntents, OAuthHost, ProviderRequest, SanitizedProviderResponse,
+    TrustedEndpoint, TrustedTransportPolicy,
 };
 use crate::auth::store::{
     AuthMetadata, AuthStore, AuthStoreError, OpaqueAccessHandle, OpaqueRefreshHandle,
@@ -41,6 +41,7 @@ const LIMIT: usize = 64;
 
 mod device;
 mod flow;
+mod payload;
 mod public_json;
 mod timing;
 
@@ -1006,6 +1007,18 @@ fn transport_desc() -> HostFunctionDescriptor {
         transport_call,
     )
 }
+fn transport_payload_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::transport_payload",
+        vec![
+            borrow("request", transport_request_type()),
+            borrow("credential_use", transport_use_type()),
+            param("payload", payload::intent_type()),
+        ],
+        transport_response_type(),
+        transport_payload_call,
+    )
+}
 fn metadata_desc() -> HostFunctionDescriptor {
     desc(
         "auth::load_metadata",
@@ -1117,6 +1130,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
         functions: &[
             config_desc,
             transport_desc,
+            transport_payload_desc,
             public_json::public_json_field_desc,
             metadata_desc,
             access_desc,
@@ -1487,6 +1501,19 @@ fn validate_transport_use_keys(usage: &Value) -> VmResult<()> {
 }
 
 fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    transport_call_shared(vm, args, None)
+}
+
+fn transport_payload_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let payload = args.get(2).ok_or_else(|| error("invalid_request"))?;
+    transport_call_shared(vm, args, Some(payload))
+}
+
+fn transport_call_shared(
+    vm: &mut Vm,
+    args: &[Value],
+    payload: Option<&Value>,
+) -> VmResult<CallOutcome> {
     let request = args.first().ok_or_else(|| error("invalid_request"))?;
     let usage = args.get(1).ok_or_else(|| error("invalid_request"))?;
     let id = string(field(request, "credential_id")?)?;
@@ -1501,13 +1528,39 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let credential = transport_credential(vm, usage, &owner, id)?;
     let generation = credential.generation();
     let (oauth, policy, public_request) = admit_transport(vm, &owner, &credential, request, id)?;
-    let sent = oauth.transport_scoped(
-        &policy,
-        public_request,
-        credential.for_send(),
-        flow::owner_cancellation(&owner),
-        credential.slot_generation_override(),
-    );
+    let request_body = match payload {
+        Some(raw) => match payload::parse(raw) {
+            Ok(intent) => Some(intent),
+            Err(failure) => {
+                cleanup_inactive_transport_credential(vm, &owner, &credential);
+                return Err(failure);
+            }
+        },
+        None => None,
+    };
+    let sent = if let Some(request_body) = request_body {
+        oauth
+            .transport_with_intents_scoped(
+                &policy,
+                public_request,
+                credential.for_send(),
+                NativeTransportIntents {
+                    request_body: Some(request_body),
+                    exchange_response: None,
+                },
+                flow::owner_cancellation(&owner),
+                credential.slot_generation_override(),
+            )
+            .map(|exchange| exchange.response)
+    } else {
+        oauth.transport_scoped(
+            &policy,
+            public_request,
+            credential.for_send(),
+            flow::owner_cancellation(&owner),
+            credential.slot_generation_override(),
+        )
+    };
     // A local admission failure keeps the live resource available for retry.
     // Once the store entry is terminal, close the Core alias even on send errors.
     let closed = credential.close_if_terminal(vm);
@@ -1629,6 +1682,25 @@ fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         revoke_response(&oauth, &response);
     }
     processed
+}
+
+fn cleanup_inactive_transport_credential(
+    vm: &mut Vm,
+    owner: &Arc<Owner>,
+    credential: &TransportCredential,
+) {
+    if owner.check().is_ok() {
+        return;
+    }
+    match credential {
+        TransportCredential::CodeVerifier(pair) => pair.rollback(vm),
+        TransportCredential::Device(device) => {
+            let _ = device.terminate(vm);
+        }
+        TransportCredential::None
+        | TransportCredential::Access(_, _)
+        | TransportCredential::Refresh(_, _) => {}
+    }
 }
 
 fn metadata_value(meta: &AuthMetadata) -> Value {
