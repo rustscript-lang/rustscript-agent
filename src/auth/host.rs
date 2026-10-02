@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::auth::config::CredentialConfig;
 use crate::auth::oauth::{
-    CredentialUse, NativeTransportIntents, OAuthHost, ProviderRequest, SanitizedProviderResponse,
-    TrustedEndpoint, TrustedTransportPolicy,
+    CredentialUse, NativeTransportIntents, OAuthHost, OpaqueExchangePair, ProviderRequest,
+    SanitizedProviderResponse, TrustedEndpoint, TrustedTransportPolicy,
 };
 use crate::auth::store::{
     AuthMetadata, AuthStore, AuthStoreError, OpaqueAccessHandle, OpaqueRefreshHandle,
@@ -39,6 +39,7 @@ use crate::runtime::rss_runner::RunCancellation;
 
 const LIMIT: usize = 64;
 
+mod capture;
 mod device;
 mod flow;
 mod payload;
@@ -1019,6 +1020,19 @@ fn transport_payload_desc() -> HostFunctionDescriptor {
         transport_payload_call,
     )
 }
+fn transport_capture_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::transport_capture",
+        vec![
+            borrow("request", transport_request_type()),
+            borrow("credential_use", transport_use_type()),
+            param("payload", payload::intent_type()),
+            param("capture", capture::intent_type()),
+        ],
+        capture::envelope_type(),
+        transport_capture_call,
+    )
+}
 fn metadata_desc() -> HostFunctionDescriptor {
     desc(
         "auth::load_metadata",
@@ -1131,6 +1145,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             config_desc,
             transport_desc,
             transport_payload_desc,
+            transport_capture_desc,
             public_json::public_json_field_desc,
             metadata_desc,
             access_desc,
@@ -1501,18 +1516,25 @@ fn validate_transport_use_keys(usage: &Value) -> VmResult<()> {
 }
 
 fn transport_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    transport_call_shared(vm, args, None)
+    transport_call_shared(vm, args, None, None)
 }
 
 fn transport_payload_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let payload = args.get(2).ok_or_else(|| error("invalid_request"))?;
-    transport_call_shared(vm, args, Some(payload))
+    transport_call_shared(vm, args, Some(payload), None)
+}
+
+fn transport_capture_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let payload = args.get(2).ok_or_else(|| error("invalid_request"))?;
+    let capture_intent = args.get(3).ok_or_else(|| error("invalid_request"))?;
+    transport_call_shared(vm, args, Some(payload), Some(capture_intent))
 }
 
 fn transport_call_shared(
     vm: &mut Vm,
     args: &[Value],
     payload: Option<&Value>,
+    capture_value: Option<&Value>,
 ) -> VmResult<CallOutcome> {
     let request = args.first().ok_or_else(|| error("invalid_request"))?;
     let usage = args.get(1).ok_or_else(|| error("invalid_request"))?;
@@ -1538,20 +1560,39 @@ fn transport_call_shared(
         },
         None => None,
     };
-    let sent = if let Some(request_body) = request_body {
+    let capture_intent = match capture_value {
+        Some(raw) => match capture::parse(raw) {
+            Ok(intent) => Some(intent),
+            Err(failure) => {
+                cleanup_inactive_transport_credential(vm, &owner, &credential);
+                return Err(failure);
+            }
+        },
+        None => None,
+    };
+    if capture_intent.is_some() && !capture::compatible(&credential, request_body) {
+        cleanup_inactive_transport_credential(vm, &owner, &credential);
+        return Err(error("capture_intent_invalid"));
+    }
+
+    let mut native_pair: Option<OpaqueExchangePair> = None;
+    let sent = if request_body.is_some() || capture_intent.is_some() {
         oauth
             .transport_with_intents_scoped(
                 &policy,
                 public_request,
                 credential.for_send(),
                 NativeTransportIntents {
-                    request_body: Some(request_body),
-                    exchange_response: None,
+                    request_body,
+                    exchange_response: capture_intent,
                 },
                 flow::owner_cancellation(&owner),
                 credential.slot_generation_override(),
             )
-            .map(|exchange| exchange.response)
+            .map(|exchange| {
+                native_pair = exchange.pair;
+                exchange.response
+            })
     } else {
         oauth.transport_scoped(
             &policy,
@@ -1565,10 +1606,19 @@ fn transport_call_shared(
     // Once the store entry is terminal, close the Core alias even on send errors.
     let closed = credential.close_if_terminal(vm);
     let owner_inactive = owner.check().is_err();
-    let response = finalize_transport_response(&oauth, owner_inactive, sent, closed)?;
+    let response = match finalize_transport_response(&oauth, owner_inactive, sent, closed) {
+        Ok(response) => response,
+        Err(failure) => {
+            if let Some(pair) = native_pair.take() {
+                capture::revoke_native_pair(&oauth, pair);
+            }
+            return Err(failure);
+        }
+    };
     let mut access = None;
     let mut refresh = None;
     let mut device_handle = None;
+    let mut published_pair: Option<flow::PublishedExchangePair> = None;
     let processed = (|| {
         owner.check()?;
         if response.code_handle.is_some() {
@@ -1626,7 +1676,7 @@ fn transport_call_shared(
             device_handle = Some(device::issue(vm, &owner, id, native.clone())?);
         }
         owner.check()?;
-        result(object(vec![
+        let public_response = object(vec![
             ("ok", Value::Bool(true)),
             ("error", Value::Null),
             ("status", Value::Int(i64::from(response.status))),
@@ -1664,7 +1714,30 @@ fn transport_call_shared(
                 "device_handle",
                 device_handle.clone().unwrap_or(Value::Null),
             ),
-        ]))
+        ]);
+        if capture_value.is_none() {
+            return result(public_response);
+        }
+
+        let (code_handle, verifier_handle) = if let Some(pair) = native_pair.take() {
+            let published = flow::publish_exchange_pair(vm, &owner, id, generation, pair)?;
+            let code = published.code_handle.clone();
+            let verifier = published.verifier_handle.clone();
+            published_pair = Some(published);
+            (code, verifier)
+        } else {
+            (Value::Null, Value::Null)
+        };
+        owner.check()?;
+        let envelope = object(vec![
+            ("ok", Value::Bool(true)),
+            ("error", Value::Null),
+            ("response", public_response),
+            ("code_handle", code_handle),
+            ("verifier_handle", verifier_handle),
+        ]);
+        owner.check()?;
+        result(envelope)
     })();
     if processed.is_err() {
         if let TransportCredential::Device(device) = &credential {
@@ -1680,6 +1753,12 @@ fn transport_call_shared(
             device::close_issued(vm, value);
         }
         revoke_response(&oauth, &response);
+        if let Some(pair) = native_pair.take() {
+            capture::revoke_native_pair(&oauth, pair);
+        }
+        if let Some(pair) = &published_pair {
+            pair.rollback(vm);
+        }
     }
     processed
 }
