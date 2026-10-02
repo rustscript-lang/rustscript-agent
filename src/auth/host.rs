@@ -166,6 +166,7 @@ pub struct AuthHost {
     paths: AgentPaths,
     store: AuthStore,
     cancellation: RunCancellation,
+    enrollment_credential_id: Option<String>,
     published: Mutex<Arc<Snapshot>>,
     next_generation: AtomicU64,
     owners: Mutex<Vec<std::sync::Weak<Owner>>>,
@@ -175,19 +176,44 @@ pub struct AuthHost {
 
 impl AuthHost {
     pub fn new(home: impl Into<PathBuf>, cancellation: RunCancellation) -> Result<Self, String> {
+        Self::construct(home.into(), cancellation, None)
+    }
+
+    /// Trusted native opt-in to enroll one explicitly configured credential.
+    pub fn new_for_enrollment(
+        home: impl Into<PathBuf>,
+        cancellation: RunCancellation,
+        credential_id: impl Into<String>,
+    ) -> Result<Self, String> {
+        let credential_id = credential_id.into();
+        CredentialId::new(credential_id.clone()).map_err(|_| "invalid_credential_id")?;
+        Self::construct(home.into(), cancellation, Some(credential_id))
+    }
+
+    fn construct(
+        home: PathBuf,
+        cancellation: RunCancellation,
+        enrollment_credential_id: Option<String>,
+    ) -> Result<Self, String> {
         let deadline = cancellation
             .deadline_instant()
             .ok_or("finite_deadline_required")?;
         if deadline <= Instant::now() || cancellation.has_deadline_overflow() {
             return Err("finite_deadline_required".into());
         }
-        let paths = AgentPaths::from_home(home.into()).map_err(|_| "invalid_host_home")?;
+        let paths = AgentPaths::from_home(home).map_err(|_| "invalid_host_home")?;
         let store = AuthStore::open(paths.clone()).map_err(|_| "auth_store_unavailable")?;
-        let snapshot = Arc::new(load_snapshot(&paths, &store, 1)?);
+        let snapshot = Arc::new(load_snapshot(
+            &paths,
+            &store,
+            1,
+            enrollment_credential_id.as_deref(),
+        )?);
         Ok(Self {
             paths,
             store,
             cancellation,
+            enrollment_credential_id,
             published: Mutex::new(snapshot),
             next_generation: AtomicU64::new(2),
             owners: Mutex::new(Vec::new()),
@@ -212,7 +238,12 @@ impl AuthHost {
     /// Publish a newly validated snapshot; already bound VMs keep their old admission.
     pub fn reload(&self) -> Result<u64, String> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let snapshot = Arc::new(load_snapshot(&self.paths, &self.store, generation)?);
+        let snapshot = Arc::new(load_snapshot(
+            &self.paths,
+            &self.store,
+            generation,
+            self.enrollment_credential_id.as_deref(),
+        )?);
         *self.published.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
         Ok(generation)
     }
@@ -584,22 +615,50 @@ fn load_snapshot(
     paths: &AgentPaths,
     store: &AuthStore,
     generation: u64,
+    enrollment_credential_id: Option<&str>,
 ) -> Result<Snapshot, String> {
     let config = ConfigFile::load(&paths.config).map_err(|_| "config_invalid")?;
     let auth = store.load().map_err(|_| "auth_invalid")?;
-    config
-        .validate_auth_references(&auth)
-        .map_err(|_| "credential_reference_invalid")?;
-    let allowed = config
+    let mut allowed: BTreeSet<String> = config
         .providers
         .values()
         .filter_map(|provider| provider.auth.clone())
         .collect();
-    let credential_generations = auth
+    if let Some(id) = enrollment_credential_id {
+        if !allowed.contains(id) {
+            return Err("credential_not_admitted".into());
+        }
+        if !auth.credentials.contains_key(id) {
+            // Exempt only the selected absent reference during validation.
+            // Keep the published config intact for public and transport policy.
+            let mut validation_config = config.clone();
+            for provider in validation_config.providers.values_mut() {
+                if provider.auth.as_deref() == Some(id) {
+                    provider.auth = None;
+                }
+            }
+            validation_config
+                .validate_auth_references(&auth)
+                .map_err(|_| "credential_reference_invalid")?;
+        } else {
+            config
+                .validate_auth_references(&auth)
+                .map_err(|_| "credential_reference_invalid")?;
+        }
+        allowed = BTreeSet::from([id.to_owned()]);
+    } else {
+        config
+            .validate_auth_references(&auth)
+            .map_err(|_| "credential_reference_invalid")?;
+    }
+    let mut credential_generations: BTreeMap<String, u64> = auth
         .credentials
         .iter()
         .map(|(id, credential)| (id.clone(), credential.generation))
         .collect();
+    if let Some(id) = enrollment_credential_id {
+        credential_generations.entry(id.to_owned()).or_insert(0);
+    }
     Ok(Snapshot {
         config,
         allowed,
