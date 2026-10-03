@@ -230,6 +230,73 @@ fn native_result_slots(vm: &mut Vm, policy: &Value) -> Value {
     field(&exchanged, "value").clone()
 }
 
+fn native_enrollment_host(
+    private_home: &PrivateHome,
+    transport: Arc<ScriptedHttpsTransport>,
+) -> AuthHost {
+    fs::write(
+        private_home.0.join("auth.yaml"),
+        b"version: 1\ncredentials: {}\n",
+    )
+    .expect("empty enrollment store");
+    AuthHost::new_for_enrollment(
+        private_home.0.clone(),
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+        "fixture-codex",
+    )
+    .expect("native enrollment host")
+    .with_oauth_host(Arc::new(OAuthHost::new(
+        transport,
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        Arc::new(ScriptedCancel::new()),
+    )))
+}
+
+fn native_post_request(policy: &Value, body: &str, path: &str) -> Value {
+    record(vec![
+        ("policy_handle", policy.clone()),
+        ("credential_id", Value::string("fixture-codex")),
+        ("method", Value::string("POST")),
+        ("path", Value::string(path)),
+        (
+            "public_headers",
+            Value::array(vec![record(vec![
+                ("name", Value::string("content-type")),
+                ("value", Value::string("application/json")),
+            ])]),
+        ),
+        ("public_body", Value::string(body)),
+    ])
+}
+
+fn native_capture_args(policy: &Value, device_handle: Value) -> [Value; 4] {
+    [
+        native_post_request(
+            policy,
+            r#"{"grant_type":"device_code"}"#,
+            "/api/accounts/deviceauth/token",
+        ),
+        record(vec![
+            ("kind", Value::string("device_session")),
+            ("device_handle", device_handle),
+        ]),
+        record(vec![
+            ("encoding", Value::string("json_object")),
+            ("secret_fields", Value::string("device")),
+            ("device_field", Value::string("device_id")),
+        ]),
+        record(vec![
+            ("code_field", Value::string("authorization_code")),
+            (
+                "redirect_uri",
+                Value::string("https://auth.example.test/callback"),
+            ),
+        ]),
+    ]
+}
+
 #[test]
 fn actual_malformed_transport_is_readable_but_legacy_call_still_traps() {
     const RESPONSE_MARKER: &str = "AUTH_FALLIBLE_RESPONSE_PRIVATE_MARKER_4d8e";
@@ -1427,4 +1494,312 @@ fn native_capture_exchange_and_save_result_commits_generation_zero_once() {
         );
         assert_eq!(vm.host_context().resource_count(), 2);
     }
+}
+
+#[test]
+fn native_capture_failures_return_null_and_rollback_capabilities() {
+    const DEVICE_MARKER: &str = "FALLIBLE_CAPTURE_DEVICE_PRIVATE_4ac1";
+    const CODE_MARKER: &str = "FALLIBLE_CAPTURE_CODE_PRIVATE_39df";
+    const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+    const MALFORMED_MARKER: &str = "FALLIBLE_CAPTURE_MALFORMED_PRIVATE_b1e3";
+
+    #[derive(Clone, Copy)]
+    enum Case {
+        Malformed,
+        PairPublicationQuota,
+    }
+
+    for case in [Case::Malformed, Case::PairPublicationQuota] {
+        let private_home = PrivateHome::new();
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        transport.push_raw(
+            200,
+            &format!(
+                r#"{{"device_code":"{DEVICE_MARKER}","user_code":"SYNTHETIC-USER","verification_uri":"https://auth.example.test/device","expires_in":900,"interval":5}}"#
+            ),
+        );
+        let expected_error = match case {
+            Case::Malformed => {
+                transport.push_raw(200, &format!("{MALFORMED_MARKER}{{"));
+                "malformed_response"
+            }
+            Case::PairPublicationQuota => {
+                transport.push_raw(
+                    200,
+                    &format!(
+                        r#"{{"authorization_code":"{CODE_MARKER}","code_verifier":"{VERIFIER}","public":"captured"}}"#
+                    ),
+                );
+                "resource_limit"
+            }
+        };
+        let host = native_enrollment_host(&private_home, transport.clone());
+        let catalog = auth_host_catalog();
+        let mut vm = vm(&host, catalog.as_ref());
+        let context = host.bind_vm(&mut vm).expect("bind native owner");
+        let policy = invoke(&mut vm, "snapshot", &[field(&context, "host_home").clone()])
+            .expect("native enrollment policy");
+        let started = invoke(
+            &mut vm,
+            "start_device_result",
+            std::slice::from_ref(&policy),
+        )
+        .expect("native device start");
+        assert_eq!(field(&started, "ok"), &Value::Bool(true));
+        let device = field(field(&started, "value"), "device_handle").clone();
+        let start_sent = transport.take_sent();
+        assert_eq!(start_sent.len(), 1, "device start sends once");
+        assert_eq!(
+            start_sent[0].url,
+            "https://auth.example.test/api/accounts/deviceauth/usercode"
+        );
+
+        let unrelated_count = match case {
+            Case::Malformed => 1,
+            Case::PairPublicationQuota => 61,
+        };
+        let unrelated = (0..unrelated_count)
+            .map(|_| issue_unrelated(&mut vm))
+            .collect::<Vec<_>>();
+        let occupancy_before_capture = vm.host_context().resource_count();
+        assert_eq!(
+            occupancy_before_capture,
+            if unrelated_count == 61 { 64 } else { 4 }
+        );
+
+        let failure = invoke(
+            &mut vm,
+            "capture_result",
+            &native_capture_args(&policy, device.clone()),
+        )
+        .expect("native capture failure result");
+        assert_eq!(field(&failure, "ok"), &Value::Bool(false));
+        assert!(matches!(field(&failure, "value"), Value::Null));
+        assert_eq!(
+            field(field(&failure, "error"), "code"),
+            &Value::string(expected_error)
+        );
+        let output = format!("{failure:?}");
+        for marker in [DEVICE_MARKER, CODE_MARKER, VERIFIER, MALFORMED_MARKER] {
+            assert!(!output.contains(marker), "result leaked marker {marker}");
+        }
+        let expected_resources = 2 + unrelated_count;
+        assert_eq!(
+            vm.host_context().resource_count(),
+            expected_resources,
+            "device alias and unpublished native pair are rolled back"
+        );
+        #[cfg(feature = "config-fixture")]
+        assert_eq!(
+            host.fixture_live_oauth_flow_count()
+                .expect("native capture failure flow count"),
+            0,
+            "failed capture leaves no native flow"
+        );
+        let capture_sent = transport.take_sent();
+        assert_eq!(capture_sent.len(), 1, "failed capture sends exactly once");
+        assert_eq!(
+            capture_sent[0].url,
+            "https://auth.example.test/api/accounts/deviceauth/token"
+        );
+        let capture_wire: serde_json::Value =
+            serde_json::from_str(&capture_sent[0].body).expect("native capture request JSON");
+        assert_eq!(capture_wire["grant_type"], "device_code");
+        assert_eq!(capture_wire["device_id"], DEVICE_MARKER);
+
+        assert!(
+            invoke(
+                &mut vm,
+                "capture_result",
+                &native_capture_args(&policy, device.clone()),
+            )
+            .is_err(),
+            "retired device alias cannot be replayed"
+        );
+        assert!(
+            transport.take_sent().is_empty(),
+            "device replay sends nothing"
+        );
+        assert_eq!(vm.host_context().resource_count(), expected_resources);
+        for handle in &unrelated {
+            assert_unrelated_live(&mut vm, *handle);
+        }
+
+        assert_eq!(
+            invoke(&mut vm, "cleanup", std::slice::from_ref(&policy))
+                .expect("native capture cleanup"),
+            Value::Null
+        );
+        assert_eq!(vm.host_context().resource_count(), expected_resources);
+        for handle in &unrelated {
+            assert_unrelated_live(&mut vm, *handle);
+        }
+        assert_eq!(
+            invoke(&mut vm, "cleanup", std::slice::from_ref(&policy))
+                .expect("repeated native capture cleanup"),
+            Value::Null
+        );
+        assert_eq!(vm.host_context().resource_count(), expected_resources);
+        for handle in &unrelated {
+            assert_unrelated_live(&mut vm, *handle);
+        }
+    }
+}
+
+#[test]
+fn native_selected_exchange_malformed_response_returns_null_and_rolls_back_capabilities() {
+    const DEVICE_MARKER: &str = "FALLIBLE_EXCHANGE_DEVICE_PRIVATE_5a21";
+    const CODE_MARKER: &str = "FALLIBLE_EXCHANGE_CODE_PRIVATE_637b";
+    const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+    const MALFORMED_MARKER: &str = "FALLIBLE_EXCHANGE_MALFORMED_PRIVATE_4c03";
+
+    let private_home = PrivateHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(
+        200,
+        &format!(
+            r#"{{"device_code":"{DEVICE_MARKER}","user_code":"SYNTHETIC-USER","verification_uri":"https://auth.example.test/device","expires_in":900,"interval":5}}"#
+        ),
+    );
+    transport.push_raw(
+        200,
+        &format!(
+            r#"{{"authorization_code":"{CODE_MARKER}","code_verifier":"{VERIFIER}","public":"captured"}}"#
+        ),
+    );
+    transport.push_raw(200, &format!("{MALFORMED_MARKER}{{"));
+    let host = native_enrollment_host(&private_home, transport.clone());
+    let catalog = auth_host_catalog();
+    let mut vm = vm(&host, catalog.as_ref());
+    let context = host.bind_vm(&mut vm).expect("bind native owner");
+    let policy = invoke(&mut vm, "snapshot", &[field(&context, "host_home").clone()])
+        .expect("native enrollment policy");
+    let started = invoke(
+        &mut vm,
+        "start_device_result",
+        std::slice::from_ref(&policy),
+    )
+    .expect("native device start");
+    assert_eq!(field(&started, "ok"), &Value::Bool(true));
+    let device = field(field(&started, "value"), "device_handle").clone();
+    let start_sent = transport.take_sent();
+    assert_eq!(start_sent.len(), 1, "device start sends once");
+    assert_eq!(
+        start_sent[0].url,
+        "https://auth.example.test/api/accounts/deviceauth/usercode"
+    );
+
+    let capture = invoke(
+        &mut vm,
+        "capture_result",
+        &native_capture_args(&policy, device),
+    )
+    .expect("native capture result");
+    assert_eq!(field(&capture, "ok"), &Value::Bool(true));
+    let captured_value = field(&capture, "value");
+    let code = field(captured_value, "code_handle").clone();
+    let verifier = field(captured_value, "verifier_handle").clone();
+    let capture_sent = transport.take_sent();
+    assert_eq!(capture_sent.len(), 1, "native capture sends once");
+    assert_eq!(
+        capture_sent[0].url,
+        "https://auth.example.test/api/accounts/deviceauth/token"
+    );
+    let capture_wire: serde_json::Value =
+        serde_json::from_str(&capture_sent[0].body).expect("native capture request JSON");
+    assert_eq!(capture_wire["device_id"], DEVICE_MARKER);
+
+    let unrelated = issue_unrelated(&mut vm);
+    assert_eq!(vm.host_context().resource_count(), 5);
+    let exchange_request = native_post_request(
+        &policy,
+        r#"{"grant_type":"authorization_code"}"#,
+        "/oauth/token",
+    );
+    let exchange_use = record(vec![
+        ("kind", Value::string("code_verifier")),
+        ("code_handle", code.clone()),
+        ("verifier_handle", verifier.clone()),
+    ]);
+    let exchange_payload = record(vec![
+        ("encoding", Value::string("json_object")),
+        ("secret_fields", Value::string("authorization_code")),
+        ("code_field", Value::string("authorization_code")),
+    ]);
+    let failure = invoke(
+        &mut vm,
+        "exchange_selected_result",
+        &[
+            exchange_request.clone(),
+            exchange_use.clone(),
+            exchange_payload.clone(),
+        ],
+    )
+    .expect("native selected exchange failure result");
+    assert_eq!(field(&failure, "ok"), &Value::Bool(false));
+    assert!(matches!(field(&failure, "value"), Value::Null));
+    assert_eq!(
+        field(field(&failure, "error"), "code"),
+        &Value::string("malformed_response")
+    );
+    let output = format!("{failure:?}");
+    for marker in [DEVICE_MARKER, CODE_MARKER, VERIFIER, MALFORMED_MARKER] {
+        assert!(!output.contains(marker), "result leaked marker {marker}");
+    }
+    assert_eq!(
+        vm.host_context().resource_count(),
+        3,
+        "consumed pair aliases close and no token slots publish"
+    );
+    #[cfg(feature = "config-fixture")]
+    assert_eq!(
+        host.fixture_live_oauth_flow_count()
+            .expect("native exchange failure flow count"),
+        0,
+        "failed exchange leaves no native flow"
+    );
+    let exchange_sent = transport.take_sent();
+    assert_eq!(exchange_sent.len(), 1, "failed exchange sends exactly once");
+    assert_eq!(
+        exchange_sent[0].url,
+        "https://auth.example.test/oauth/token"
+    );
+    let exchange_wire: serde_json::Value =
+        serde_json::from_str(&exchange_sent[0].body).expect("native exchange request JSON");
+    assert_eq!(exchange_wire["authorization_code"], CODE_MARKER);
+    assert_eq!(exchange_wire["code_verifier"], VERIFIER);
+    assert_eq!(
+        exchange_wire["redirect_uri"],
+        "https://auth.example.test/callback"
+    );
+
+    assert!(
+        invoke(
+            &mut vm,
+            "exchange_selected_result",
+            &[exchange_request, exchange_use, exchange_payload],
+        )
+        .is_err(),
+        "consumed selected-exchange aliases cannot be replayed"
+    );
+    assert!(
+        transport.take_sent().is_empty(),
+        "pair replay sends nothing"
+    );
+    assert_eq!(vm.host_context().resource_count(), 3);
+    assert_unrelated_live(&mut vm, unrelated);
+
+    assert_eq!(
+        invoke(&mut vm, "cleanup", std::slice::from_ref(&policy)).expect("native exchange cleanup"),
+        Value::Null
+    );
+    assert_eq!(vm.host_context().resource_count(), 3);
+    assert_unrelated_live(&mut vm, unrelated);
+    assert_eq!(
+        invoke(&mut vm, "cleanup", std::slice::from_ref(&policy))
+            .expect("repeated native exchange cleanup"),
+        Value::Null
+    );
+    assert_eq!(vm.host_context().resource_count(), 3);
+    assert_unrelated_live(&mut vm, unrelated);
 }
