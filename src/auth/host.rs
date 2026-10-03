@@ -41,10 +41,12 @@ const LIMIT: usize = 64;
 
 mod capture;
 mod device;
+mod fallible;
 mod flow;
 mod payload;
 mod public_json;
 mod timing;
+mod transients;
 
 macro_rules! resource {
     ($name:ident, $key:literal, $description:literal) => {
@@ -732,15 +734,32 @@ impl OwnerResource for SecretSlot {
         self.owner.clone()
     }
 }
-fn issue<T: HostResource>(vm: &mut Vm, resource: T) -> VmResult<Value> {
-    let mut context = vm.host_context();
-    if context.resource_count() >= LIMIT {
-        return Err(error("resource_limit"));
+fn issue<T: HostResource + HostResourceType + OwnerResource>(
+    vm: &mut Vm,
+    resource: T,
+) -> VmResult<Value> {
+    let track = transients::tracks(T::KEY);
+    if track {
+        transients::prepare(vm)?;
     }
-    let token = context
-        .push_resource(resource)
-        .map_err(|_| error("resource_unavailable"))?;
-    Ok(Value::Int(token.handle().raw() as i64))
+    let owner = resource.owner();
+    let handle = {
+        let mut context = vm.host_context();
+        if context.resource_count() >= LIMIT {
+            return Err(error("resource_limit"));
+        }
+        let token = context
+            .push_resource(resource)
+            .map_err(|_| error("resource_unavailable"))?;
+        token.handle()
+    };
+    if track && let Err(failure) = transients::register::<T>(vm, handle, Arc::downgrade(&owner)) {
+        let _ = vm
+            .host_context()
+            .close_resource::<T>(handle, ResourceCloseReason::Requested);
+        return Err(failure);
+    }
+    Ok(Value::Int(handle.raw() as i64))
 }
 fn object(fields: Vec<(&str, Value)>) -> Value {
     Value::map(
@@ -1205,6 +1224,14 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             transport_desc,
             transport_payload_desc,
             transport_capture_desc,
+            fallible::transport_result_desc,
+            fallible::transport_payload_result_desc,
+            fallible::transport_capture_result_desc,
+            fallible::save_if_generation_result_desc,
+            fallible::now_ms_result_desc,
+            fallible::wait_ms_result_desc,
+            fallible::public_json_field_result_desc,
+            transients::cleanup_desc,
             public_json::public_json_field_desc,
             metadata_desc,
             access_desc,

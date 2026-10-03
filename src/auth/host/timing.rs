@@ -11,8 +11,8 @@ const MAX_WAIT_MS: i64 = 60_000;
 const WAIT_CHUNK: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
-struct WaitProbe {
-    ready: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+pub(super) struct WaitProbe {
+    pub(super) ready: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 pub(super) fn now_ms_desc() -> HostFunctionDescriptor {
@@ -36,7 +36,7 @@ pub(super) fn wait_ms_desc() -> HostFunctionDescriptor {
     )
 }
 
-fn now_ms_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+pub(super) fn now_ms_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let owner = borrowed::<Policy>(vm, args.first().ok_or_else(|| error("invalid_request"))?)?;
     owner.check()?;
     let now_ms = match &owner.oauth {
@@ -71,7 +71,7 @@ fn notify_wait_probe(vm: &mut Vm) {
     }
 }
 
-fn wait_ms_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+pub(super) fn wait_ms_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let owner = borrowed::<Policy>(vm, args.first().ok_or_else(|| error("invalid_request"))?)?;
     owner.check()?;
     let Value::Int(millis) = args.get(1).ok_or_else(|| error("invalid_request"))? else {

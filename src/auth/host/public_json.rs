@@ -439,7 +439,7 @@ fn resolve_pointer<'a>(document: &'a Json, tokens: &[String]) -> Option<&'a Json
     Some(current)
 }
 
-fn public_json_field_type() -> HostTypeSchema {
+pub(super) fn public_json_field_type() -> HostTypeSchema {
     named(
         "PublicJsonFieldEnvelope",
         vec![
@@ -495,7 +495,7 @@ fn empty_envelope(kind: &str) -> Value {
     )
 }
 
-fn public_json_field_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+pub(super) fn public_json_field_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let policy_value = args.first().ok_or_else(|| error("invalid_request"))?;
     let owner = super::borrowed::<Policy>(vm, policy_value)?;
     let json_text = super::string(args.get(1).ok_or_else(|| error("invalid_request"))?)?;
