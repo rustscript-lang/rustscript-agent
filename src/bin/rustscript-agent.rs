@@ -1,5 +1,6 @@
 use std::env;
 use std::fmt::{self, Write as FmtWrite};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -50,12 +51,22 @@ async fn main() -> ExitCode {
 }
 
 async fn run_with_owned_signal(invocation: CliInvocation) -> ExitCode {
+    let output = run_with_owned_signal_driver(invocation, install_sigint_watcher).await;
+    emit_output(output)
+}
+
+async fn run_with_owned_signal_driver<I, InstallFuture>(
+    invocation: CliInvocation,
+    install_watcher: I,
+) -> CliOutput
+where
+    I: FnOnce(RunCancellation) -> InstallFuture,
+    InstallFuture: Future<Output = Result<tokio::task::JoinHandle<()>, ()>> + Send,
+{
     let cancellation = RunCancellation::with_timeout(INVOCATION_BUDGET);
-    let watcher = match install_sigint_watcher(cancellation.clone()).await {
+    let watcher = match install_watcher(cancellation.clone()).await {
         Ok(watcher) => watcher,
-        Err(()) => {
-            return emit_output(code_output("cli_signal_unavailable", 1));
-        }
+        Err(()) => return code_output("cli_signal_unavailable", 1),
     };
 
     let worker_cancellation = cancellation;
@@ -67,34 +78,40 @@ async fn run_with_owned_signal(invocation: CliInvocation) -> ExitCode {
     let _ = watcher.await;
 
     match result {
-        Ok(output) => emit_output(output),
-        Err(_) => emit_output(code_output("agent_run_failed", 1)),
+        Ok(output) => output,
+        Err(_) => code_output("agent_run_failed", 1),
+    }
+}
+
+async fn install_ctrl_c_watcher<F>(
+    cancellation: RunCancellation,
+    ctrl_c: F,
+) -> Result<tokio::task::JoinHandle<()>, ()>
+where
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    let mut ctrl_c = Box::pin(ctrl_c);
+    let first_poll =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(ctrl_c.as_mut().poll(cx))).await;
+
+    match first_poll {
+        std::task::Poll::Pending => Ok(tokio::spawn(async move {
+            if ctrl_c.await.is_ok() {
+                cancellation.request(CancellationReason::Requested);
+            }
+        })),
+        std::task::Poll::Ready(Err(_)) => Err(()),
+        std::task::Poll::Ready(Ok(())) => {
+            cancellation.request(CancellationReason::Requested);
+            Ok(tokio::spawn(async {}))
+        }
     }
 }
 
 async fn install_sigint_watcher(
     cancellation: RunCancellation,
 ) -> Result<tokio::task::JoinHandle<()>, ()> {
-    #[cfg(unix)]
-    {
-        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .map_err(|_| ())?;
-        Ok(tokio::spawn(async move {
-            if signal.recv().await.is_some() {
-                cancellation.request(CancellationReason::Requested);
-            }
-        }))
-    }
-    #[cfg(not(unix))]
-    {
-        let watcher = tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                cancellation.request(CancellationReason::Requested);
-            }
-        });
-        tokio::task::yield_now().await;
-        Ok(watcher)
-    }
+    install_ctrl_c_watcher(cancellation, tokio::signal::ctrl_c()).await
 }
 
 fn execute_invocation(invocation: CliInvocation, cancellation: RunCancellation) -> CliOutput {
@@ -252,4 +269,121 @@ fn emit_static_error(code: &str) -> ExitCode {
         .write_all(format!("{code}\n").as_bytes())
         .and_then(|()| stderr.flush());
     ExitCode::from(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll};
+
+    struct GuestScript(PathBuf);
+
+    impl GuestScript {
+        fn successful() -> (Self, CliInvocation) {
+            Self::with_source("pub fn run(input: string?) -> string { \"real-driver-success\"; }")
+        }
+
+        fn looping() -> (Self, CliInvocation) {
+            Self::with_source("pub fn run(input: string?) -> int { while true { 1; } 0; }")
+        }
+
+        fn with_source(source: &str) -> (Self, CliInvocation) {
+            let temp = PathBuf::from(
+                env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned Task6 TEMP"),
+            );
+            let root = temp.join(format!("f001-real-driver-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).expect("create isolated RSS root");
+            let path = root.join("main.rss");
+            fs::write(&path, source).expect("write isolated RSS guest");
+            let invocation = CliInvocation::Run {
+                script: path.clone(),
+                allowed_hosts: vec!["fixture.invalid".to_owned()],
+            };
+            (Self(path), invocation)
+        }
+    }
+
+    impl Drop for GuestScript {
+        fn drop(&mut self) {
+            if let Some(root) = self.0.parent() {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    struct PendingCtrlC(Arc<AtomicUsize>);
+
+    impl Future for PendingCtrlC {
+        type Output = io::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.get_mut().0.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    struct ReadyCtrlC(Arc<AtomicUsize>);
+
+    impl Future for ReadyCtrlC {
+        type Output = io::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let previous = self.get_mut().0.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(previous, 0, "completed ctrl_c future was polled again");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_ctrl_c_future_runs_the_real_guest_and_keeps_its_watcher_owned() {
+        let (_script, invocation) = GuestScript::successful();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let future_polls = Arc::clone(&polls);
+        let output = run_with_owned_signal_driver(invocation, move |cancellation| {
+            install_ctrl_c_watcher(cancellation, PendingCtrlC(future_polls))
+        })
+        .await;
+
+        assert_eq!(output.exit_code, 0, "real guest output: {output:?}");
+        assert!(output.stdout.contains("real-driver-success"));
+        assert!(polls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctrl_c_registration_error_prevents_the_real_guest_driver() {
+        let (_script, invocation) = GuestScript::successful();
+        let output = run_with_owned_signal_driver(invocation, |cancellation| {
+            install_ctrl_c_watcher(
+                cancellation,
+                std::future::ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "synthetic registration failure",
+                ))),
+            )
+        })
+        .await;
+
+        assert_eq!(output, code_output("cli_signal_unavailable", 1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn already_ready_ctrl_c_requests_cancellation_without_repolling_future() {
+        let (_script, invocation) = GuestScript::looping();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let future_polls = Arc::clone(&polls);
+        let output = run_with_owned_signal_driver(invocation, move |cancellation| {
+            install_ctrl_c_watcher(cancellation, ReadyCtrlC(future_polls))
+        })
+        .await;
+
+        assert_eq!(output, code_output("agent_cancelled", 130));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
 }
