@@ -164,11 +164,17 @@ impl Owner {
 struct Bound(Arc<Owner>);
 
 /// Trusted home and immutable admission snapshots. Reload affects future binds only.
+enum AdmissionMode {
+    Strict,
+    Enrollment(String),
+    Commands,
+}
+
 pub struct AuthHost {
     paths: AgentPaths,
     store: AuthStore,
     cancellation: RunCancellation,
-    enrollment_credential_id: Option<String>,
+    admission: AdmissionMode,
     published: Mutex<Arc<Snapshot>>,
     next_generation: AtomicU64,
     owners: Mutex<Vec<std::sync::Weak<Owner>>>,
@@ -178,7 +184,7 @@ pub struct AuthHost {
 
 impl AuthHost {
     pub fn new(home: impl Into<PathBuf>, cancellation: RunCancellation) -> Result<Self, String> {
-        Self::construct(home.into(), cancellation, None)
+        Self::construct(home.into(), cancellation, AdmissionMode::Strict)
     }
 
     /// Trusted native opt-in to enroll one explicitly configured credential.
@@ -189,13 +195,25 @@ impl AuthHost {
     ) -> Result<Self, String> {
         let credential_id = credential_id.into();
         CredentialId::new(credential_id.clone()).map_err(|_| "invalid_credential_id")?;
-        Self::construct(home.into(), cancellation, Some(credential_id))
+        Self::construct(
+            home.into(),
+            cancellation,
+            AdmissionMode::Enrollment(credential_id),
+        )
+    }
+
+    /// Trusted native opt-in for bounded auth-command diagnostics and mutations.
+    pub fn new_for_commands(
+        home: impl Into<PathBuf>,
+        cancellation: RunCancellation,
+    ) -> Result<Self, String> {
+        Self::construct(home.into(), cancellation, AdmissionMode::Commands)
     }
 
     fn construct(
         home: PathBuf,
         cancellation: RunCancellation,
-        enrollment_credential_id: Option<String>,
+        admission: AdmissionMode,
     ) -> Result<Self, String> {
         let deadline = cancellation
             .deadline_instant()
@@ -205,17 +223,12 @@ impl AuthHost {
         }
         let paths = AgentPaths::from_home(home).map_err(|_| "invalid_host_home")?;
         let store = AuthStore::open(paths.clone()).map_err(|_| "auth_store_unavailable")?;
-        let snapshot = Arc::new(load_snapshot(
-            &paths,
-            &store,
-            1,
-            enrollment_credential_id.as_deref(),
-        )?);
+        let snapshot = Arc::new(load_snapshot(&paths, &store, 1, &admission)?);
         Ok(Self {
             paths,
             store,
             cancellation,
-            enrollment_credential_id,
+            admission,
             published: Mutex::new(snapshot),
             next_generation: AtomicU64::new(2),
             owners: Mutex::new(Vec::new()),
@@ -244,7 +257,7 @@ impl AuthHost {
             &self.paths,
             &self.store,
             generation,
-            self.enrollment_credential_id.as_deref(),
+            &self.admission,
         )?);
         *self.published.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
         Ok(generation)
@@ -617,49 +630,64 @@ fn load_snapshot(
     paths: &AgentPaths,
     store: &AuthStore,
     generation: u64,
-    enrollment_credential_id: Option<&str>,
+    admission: &AdmissionMode,
 ) -> Result<Snapshot, String> {
     let config = ConfigFile::load(&paths.config).map_err(|_| "config_invalid")?;
     let auth = store.load().map_err(|_| "auth_invalid")?;
-    let mut allowed: BTreeSet<String> = config
+    let configured: BTreeSet<String> = config
         .providers
         .values()
         .filter_map(|provider| provider.auth.clone())
         .collect();
-    if let Some(id) = enrollment_credential_id {
-        if !allowed.contains(id) {
-            return Err("credential_not_admitted".into());
-        }
-        if !auth.credentials.contains_key(id) {
-            // Exempt only the selected absent reference during validation.
-            // Keep the published config intact for public and transport policy.
-            let mut validation_config = config.clone();
-            for provider in validation_config.providers.values_mut() {
-                if provider.auth.as_deref() == Some(id) {
-                    provider.auth = None;
-                }
-            }
-            validation_config
-                .validate_auth_references(&auth)
-                .map_err(|_| "credential_reference_invalid")?;
-        } else {
+    let allowed = match admission {
+        AdmissionMode::Strict => {
             config
                 .validate_auth_references(&auth)
                 .map_err(|_| "credential_reference_invalid")?;
+            configured
         }
-        allowed = BTreeSet::from([id.to_owned()]);
-    } else {
-        config
-            .validate_auth_references(&auth)
-            .map_err(|_| "credential_reference_invalid")?;
-    }
+        AdmissionMode::Enrollment(id) => {
+            if !configured.contains(id) {
+                return Err("credential_not_admitted".into());
+            }
+            if !auth.credentials.contains_key(id) {
+                // Exempt only the selected absent reference during validation.
+                // Keep the published config intact for public and transport policy.
+                let mut validation_config = config.clone();
+                for provider in validation_config.providers.values_mut() {
+                    if provider.auth.as_deref() == Some(id) {
+                        provider.auth = None;
+                    }
+                }
+                validation_config
+                    .validate_auth_references(&auth)
+                    .map_err(|_| "credential_reference_invalid")?;
+            } else {
+                config
+                    .validate_auth_references(&auth)
+                    .map_err(|_| "credential_reference_invalid")?;
+            }
+            BTreeSet::from([id.clone()])
+        }
+        AdmissionMode::Commands => {
+            let mut union = configured;
+            union.extend(auth.credentials.keys().cloned());
+            if union.len() > LIMIT {
+                return Err("credential_limit_exceeded".into());
+            }
+            for id in &union {
+                CredentialId::new(id.clone()).map_err(|_| "invalid_credential_id")?;
+            }
+            union
+        }
+    };
     let mut credential_generations: BTreeMap<String, u64> = auth
         .credentials
         .iter()
         .map(|(id, credential)| (id.clone(), credential.generation))
         .collect();
-    if let Some(id) = enrollment_credential_id {
-        credential_generations.entry(id.to_owned()).or_insert(0);
+    for id in &allowed {
+        credential_generations.entry(id.clone()).or_insert(0);
     }
     Ok(Snapshot {
         config,
@@ -1228,6 +1256,8 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             fallible::transport_payload_result_desc,
             fallible::transport_capture_result_desc,
             fallible::save_if_generation_result_desc,
+            fallible::load_metadata_result_desc,
+            fallible::delete_result_desc,
             fallible::now_ms_result_desc,
             fallible::wait_ms_result_desc,
             fallible::public_json_field_result_desc,
@@ -1966,6 +1996,24 @@ fn metadata_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     owner.check()?;
     meta_result(&meta, "loaded")
 }
+
+fn metadata_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let id = string(args.first().ok_or_else(|| error("invalid_request"))?)?;
+    let policy = args.get(1).ok_or_else(|| error("invalid_request"))?;
+    let owner = policy_owner(vm, policy, id)?;
+    let metadata = owner.store.load_metadata(id).map_err(|failure| {
+        error(
+            if matches!(&failure, AuthStoreError::CredentialNotFound { .. }) {
+                "credential_not_found"
+            } else {
+                failure.code()
+            },
+        )
+    })?;
+    owner.check()?;
+    meta_result(&metadata, "loaded")
+}
+
 fn access_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let id = string(&args[0])?;
     let generation = natural(&args[1])?;

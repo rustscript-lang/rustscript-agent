@@ -196,6 +196,44 @@ pub(super) fn save_if_generation_result_desc() -> HostFunctionDescriptor {
     )
 }
 
+pub(super) fn load_metadata_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "auth::load_metadata_result",
+        vec![
+            super::param("credential_id", HostTypeSchema::String),
+            borrow("policy_handle", key(super::Policy::KEY)),
+        ],
+        result_type("AuthMetadataResultEnvelope", super::metadata_envelope()),
+        load_metadata_result_call,
+    )
+}
+
+fn load_metadata_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let policy = args.get(1).ok_or_else(|| error("invalid_request"))?;
+    let owner = policy_owner_for_cleanup(vm, policy)?;
+    let outcome = super::metadata_result_call(vm, args);
+    wrap_value(owner, outcome)
+}
+
+pub(super) fn delete_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "auth::delete_result",
+        vec![
+            super::param("credential_id", HostTypeSchema::String),
+            borrow("policy_handle", key(super::Policy::KEY)),
+        ],
+        result_type("AuthDeleteResultEnvelope", super::mutation_envelope()),
+        delete_result_call,
+    )
+}
+
+fn delete_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let policy = args.get(1).ok_or_else(|| error("invalid_request"))?;
+    let owner = policy_owner_for_cleanup(vm, policy)?;
+    let outcome = super::delete_call(vm, args);
+    wrap_value(owner, outcome)
+}
+
 fn save_if_generation_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let owner = request_owner(vm, args)?;
     let outcome = super::save_call(vm, args);
