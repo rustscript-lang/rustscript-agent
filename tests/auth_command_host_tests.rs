@@ -13,7 +13,12 @@ use rustscript_vm::{
     CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm, VmStatus,
     compile_source_at_path_with_flavor_and_options,
 };
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 const MISSING: [&str; 3] = ["cmd-missing-a", "cmd-missing-b", "cmd-missing-c"];
 const SNAPSHOT_RSS: &str = r#"
@@ -180,6 +185,21 @@ impl Drop for FixtureHome {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn directory_entries(path: &Path) -> Vec<String> {
+    let mut entries: Vec<String> = fs::read_dir(path)
+        .expect("read fixture directory")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    entries.sort();
+    entries
 }
 
 fn field(value: &Value, name: &str) -> Value {
@@ -396,15 +416,17 @@ fn delete_result_removes_an_orphan_through_atomic_store_and_preserves_other_cred
     let home = FixtureHome::with_missing_references(&MISSING);
     home.add_stored_credential(PEER);
     let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes before");
-    let store = AuthStore::from_home(&home.0).expect("real auth store");
-    let peer_before = store
-        .load_metadata(PEER)
-        .expect("unrelated stored credential");
+    let entries_before = directory_entries(&home.0);
+    assert!(!home.0.join("auth.yaml.lock").exists());
     let auth = AuthHost::new_for_commands(home.0.clone(), cancellation()).expect("commands host");
     let mut vm = compile_vm(&auth, DELETE_RSS);
     let bound = auth.bind_vm(&mut vm).expect("bind real host-home resource");
     let snapshot = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
     let policy = field(&snapshot, "policy_handle");
+    assert!(
+        !home.0.join("auth.yaml.lock").exists(),
+        "constructor and snapshot are read-only"
+    );
 
     let deleted = invoke(
         &mut vm,
@@ -417,18 +439,26 @@ fn delete_result_removes_an_orphan_through_atomic_store_and_preserves_other_cred
     assert_eq!(field(&value, "deleted"), Value::Bool(true));
     assert!(!format!("{deleted:?}").contains("SYNTHETIC_ACCESS_TOKEN"));
     assert!(!format!("{deleted:?}").contains("SYNTHETIC_REFRESH_TOKEN"));
+    let store = AuthStore::from_home(&home.0).expect("real auth store after delete");
     assert!(
         store.load_metadata("fixture-codex").is_err(),
         "the selected orphan is removed from the actual store",
     );
-    assert_eq!(
-        store.load_metadata(PEER).expect("peer remains"),
-        peer_before
-    );
+    let peer = store.load_metadata(PEER).expect("peer remains");
+    assert_eq!(peer.generation, 4);
+    assert!(peer.has_refresh_token);
     assert_eq!(
         fs::read(home.0.join("config.yaml")).expect("config unchanged"),
         config_before,
     );
+    assert!(
+        home.0.join("auth.yaml.lock").exists(),
+        "delete initializes the mutation lock"
+    );
+    let mut expected_entries = entries_before;
+    expected_entries.push("auth.yaml.lock".into());
+    expected_entries.sort();
+    assert_eq!(directory_entries(&home.0), expected_entries);
     assert_eq!(vm.host_context().resource_count(), 2);
 }
 
@@ -443,8 +473,12 @@ fn commands_snapshot_saves_a_generation_zero_native_flow_and_reload_stays_frozen
     let target = MISSING[0];
     let home = FixtureHome::with_missing_references(&MISSING);
     let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes before");
-    let store = AuthStore::from_home(&home.0).expect("real auth store");
-    assert!(store.load_metadata(target).is_err(), "target starts absent");
+    let entries_before = directory_entries(&home.0);
+    assert!(!home.0.join("auth.yaml.lock").exists());
+    let target_present = fs::read_to_string(home.0.join("auth.yaml"))
+        .expect("initial auth document")
+        .contains(target);
+    assert!(!target_present, "target is not stored before enrollment");
     let transport = Arc::new(ScriptedHttpsTransport::new());
     let auth = AuthHost::new_for_commands(home.0.clone(), cancellation())
         .expect("trusted command mode")
@@ -456,6 +490,10 @@ fn commands_snapshot_saves_a_generation_zero_native_flow_and_reload_stays_frozen
     let snapshot = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
     assert_eq!(field(&snapshot, "policy_generation"), Value::Int(1));
     let policy = field(&snapshot, "policy_handle");
+    assert!(
+        !home.0.join("auth.yaml.lock").exists(),
+        "constructor and snapshot are read-only"
+    );
 
     transport.push_raw(
         200,
@@ -576,6 +614,15 @@ fn commands_snapshot_saves_a_generation_zero_native_flow_and_reload_stays_frozen
         Value::Int(1),
         "a native save admitted at generation zero commits generation one",
     );
+    assert!(
+        home.0.join("auth.yaml.lock").exists(),
+        "save initializes the mutation lock"
+    );
+    let mut expected_entries = entries_before;
+    expected_entries.push("auth.yaml.lock".into());
+    expected_entries.sort();
+    assert_eq!(directory_entries(&home.0), expected_entries);
+    let store = AuthStore::from_home(&home.0).expect("real auth store after save");
     assert_eq!(
         store
             .load_metadata(target)
@@ -670,13 +717,17 @@ fn delete_result_removes_configured_credential_and_preserves_peer_and_config_byt
     let home = FixtureHome::with_missing_references(&["fixture-codex"]);
     home.add_stored_credential(PEER);
     let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
-    let store = AuthStore::from_home(&home.0).expect("real auth store");
-    let peer_before = store.load_metadata(PEER).expect("peer credential");
+    let entries_before = directory_entries(&home.0);
+    assert!(!home.0.join("auth.yaml.lock").exists());
     let auth = AuthHost::new_for_commands(home.0.clone(), cancellation()).expect("commands host");
     let mut vm = compile_vm(&auth, DELETE_RSS);
     let bound = auth.bind_vm(&mut vm).expect("bind real host-home resource");
     let snapshot = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
     let policy = field(&snapshot, "policy_handle");
+    assert!(
+        !home.0.join("auth.yaml.lock").exists(),
+        "constructor and snapshot are read-only"
+    );
 
     let deleted = invoke(
         &mut vm,
@@ -688,15 +739,23 @@ fn delete_result_removes_configured_credential_and_preserves_peer_and_config_byt
         field(&field(&deleted, "value"), "deleted"),
         Value::Bool(true)
     );
+    let store = AuthStore::from_home(&home.0).expect("store after mutation");
     assert!(store.load_metadata("fixture-codex").is_err());
-    assert_eq!(
-        store.load_metadata(PEER).expect("peer preserved"),
-        peer_before
-    );
+    let peer = store.load_metadata(PEER).expect("peer preserved");
+    assert_eq!(peer.generation, 4);
+    assert!(peer.has_refresh_token);
     assert_eq!(
         fs::read(home.0.join("config.yaml")).expect("config unchanged"),
         config_before
     );
+    assert!(
+        home.0.join("auth.yaml.lock").exists(),
+        "delete initializes mutation lock"
+    );
+    let mut expected_entries = entries_before;
+    expected_entries.push("auth.yaml.lock".into());
+    expected_entries.sort();
+    assert_eq!(directory_entries(&home.0), expected_entries);
     assert_eq!(vm.host_context().resource_count(), 2);
 }
 
@@ -875,9 +934,12 @@ fn cancelled_and_deadline_command_owners_cannot_delete_credentials() {
         let home = FixtureHome::with_missing_references(&MISSING);
         let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
         let auth_before = fs::read(home.0.join("auth.yaml")).expect("auth bytes");
+        let entries_before = directory_entries(&home.0);
+        assert!(!home.0.join("auth.yaml.lock").exists());
         let registration =
             AuthHost::new_for_commands(home.0.clone(), cancellation()).expect("registration host");
         let mut vm = compile_vm(&registration, DELETE_RSS);
+        assert!(!home.0.join("auth.yaml.lock").exists());
         let cancellation = RunCancellation::with_timeout(if deadline {
             Duration::from_millis(600)
         } else {
@@ -888,6 +950,10 @@ fn cancelled_and_deadline_command_owners_cannot_delete_credentials() {
         let bound = auth.bind_vm(&mut vm).expect("bind mutation owner");
         let snapshot = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
         let policy = field(&snapshot, "policy_handle");
+        assert!(
+            !home.0.join("auth.yaml.lock").exists(),
+            "constructor and snapshot are read-only"
+        );
         if deadline {
             std::thread::sleep(Duration::from_millis(650));
         } else {
@@ -906,21 +972,15 @@ fn cancelled_and_deadline_command_owners_cannot_delete_credentials() {
         assert_eq!(field(&failure, "cancelled"), Value::Bool(!deadline));
         assert_eq!(field(&failure, "deadline_exceeded"), Value::Bool(deadline));
         assert_eq!(
-            AuthStore::from_home(&home.0)
-                .expect("store")
-                .load_metadata("fixture-codex")
-                .expect("credential remains")
-                .generation,
-            4,
+            fs::read(home.0.join("auth.yaml")).expect("auth unchanged"),
+            auth_before
         );
         assert_eq!(
             fs::read(home.0.join("config.yaml")).expect("config unchanged"),
             config_before
         );
-        assert_eq!(
-            fs::read(home.0.join("auth.yaml")).expect("auth unchanged"),
-            auth_before
-        );
+        assert!(!home.0.join("auth.yaml.lock").exists());
+        assert_eq!(directory_entries(&home.0), entries_before);
         assert_eq!(vm.host_context().resource_count(), 2);
     }
 }
@@ -980,6 +1040,7 @@ fn commands_constructor_rejects_corrupt_config_and_auth_files() {
     let corrupt_auth = FixtureHome::with_missing_references(&MISSING);
     let corrupt_source = "version: 1\ncredentials: [\n";
     fs::write(corrupt_auth.0.join("auth.yaml"), corrupt_source).expect("corrupt auth YAML");
+    let corrupt_entries = directory_entries(&corrupt_auth.0);
     let auth_failure = AuthHost::new_for_commands(corrupt_auth.0.clone(), cancellation())
         .err()
         .expect("corrupt auth rejected");
@@ -988,6 +1049,7 @@ fn commands_constructor_rejects_corrupt_config_and_auth_files() {
         fs::read(corrupt_auth.0.join("auth.yaml")).expect("corrupt auth remains"),
         corrupt_source.as_bytes(),
     );
+    assert_eq!(directory_entries(&corrupt_auth.0), corrupt_entries);
 }
 
 #[cfg(unix)]
@@ -999,6 +1061,7 @@ fn commands_constructor_rejects_insecure_auth_permissions() {
     let auth_before = fs::read(home.0.join("auth.yaml")).expect("auth bytes");
     fs::set_permissions(home.0.join("auth.yaml"), fs::Permissions::from_mode(0o644))
         .expect("make synthetic auth fixture insecure");
+    let entries_before = directory_entries(&home.0);
     let rejection = AuthHost::new_for_commands(home.0.clone(), cancellation())
         .err()
         .expect("insecure auth permissions rejected");
@@ -1008,6 +1071,7 @@ fn commands_constructor_rejects_insecure_auth_permissions() {
         fs::read(home.0.join("auth.yaml")).expect("auth unchanged"),
         auth_before
     );
+    assert_eq!(directory_entries(&home.0), entries_before);
     assert_eq!(
         fs::metadata(home.0.join("auth.yaml"))
             .expect("auth metadata")
@@ -1016,4 +1080,188 @@ fn commands_constructor_rejects_insecure_auth_permissions() {
             & 0o777,
         0o644,
     );
+}
+
+#[test]
+fn command_diagnostic_reads_and_reload_leave_a_lock_free_home_unchanged() {
+    let home = FixtureHome::with_missing_references(&MISSING);
+    let entries_before = directory_entries(&home.0);
+    let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
+    let auth_before = fs::read(home.0.join("auth.yaml")).expect("auth bytes");
+    assert!(!home.0.join("auth.yaml.lock").exists());
+
+    let auth = AuthHost::new_for_commands(home.0.clone(), cancellation()).expect("commands host");
+    let mut vm = compile_vm(&auth, METADATA_RSS);
+    let bound = auth
+        .bind_vm(&mut vm)
+        .expect("bind native host-home resource");
+    let snapshot = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
+    let policy = field(&snapshot, "policy_handle");
+    let metadata = invoke(
+        &mut vm,
+        "metadata_result",
+        &[policy.clone(), Value::string("fixture-codex")],
+    );
+    assert_eq!(field(&metadata, "ok"), Value::Bool(true));
+    assert_eq!(auth.reload().expect("read-only reload"), 2);
+    let reloaded_read = invoke(
+        &mut vm,
+        "metadata_result",
+        &[policy, Value::string("fixture-codex")],
+    );
+    assert_eq!(field(&reloaded_read, "ok"), Value::Bool(true));
+    assert_eq!(directory_entries(&home.0), entries_before);
+    assert_eq!(
+        fs::read(home.0.join("config.yaml")).expect("config unchanged"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(home.0.join("auth.yaml")).expect("auth unchanged"),
+        auth_before
+    );
+}
+
+#[test]
+fn commands_constructor_does_not_create_missing_home_or_parent_directories() {
+    let root = PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned TEMP"));
+    let parent = root.join(format!("missing-command-home-{}", uuid::Uuid::new_v4()));
+    let home = parent.join("nested").join("agent");
+    assert!(!parent.exists());
+    let result = AuthHost::new_for_commands(home.clone(), cancellation());
+    let created = parent.exists() || home.exists();
+    let _ = fs::remove_dir_all(&parent);
+    assert!(result.is_err(), "missing command home is rejected");
+    assert!(
+        !created,
+        "constructor must leave every missing path component absent"
+    );
+}
+
+#[test]
+fn command_snapshot_and_reload_keep_absent_auth_and_lock_absent() {
+    let home = FixtureHome::with_missing_references(&MISSING);
+    fs::remove_file(home.0.join("auth.yaml")).expect("remove auth fixture");
+    let entries_before = directory_entries(&home.0);
+    let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
+    let auth = AuthHost::new_for_commands(home.0.clone(), cancellation()).expect("commands host");
+    let mut vm = compile_vm(&auth, SNAPSHOT_RSS);
+    let bound = auth
+        .bind_vm(&mut vm)
+        .expect("bind native host-home resource");
+    let snapshot = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
+    assert_eq!(
+        field(&snapshot, "credential_refs"),
+        Value::array(MISSING.iter().copied().map(Value::string).collect())
+    );
+    assert_eq!(auth.reload().expect("reload empty auth"), 2);
+    assert_eq!(directory_entries(&home.0), entries_before);
+    assert_eq!(
+        fs::read(home.0.join("config.yaml")).expect("config unchanged"),
+        config_before
+    );
+    assert!(!home.0.join("auth.yaml").exists());
+    assert!(!home.0.join("auth.yaml.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn command_reads_use_a_present_secure_lock_and_reject_bad_lock_paths() {
+    use std::os::unix::{fs::PermissionsExt, fs::symlink};
+
+    let valid = FixtureHome::with_missing_references(&MISSING);
+    fs::write(valid.0.join("auth.yaml.lock"), b"").expect("create valid lock");
+    fs::set_permissions(
+        valid.0.join("auth.yaml.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("secure lock mode");
+    let valid_entries = directory_entries(&valid.0);
+    let auth = AuthHost::new_for_commands(valid.0.clone(), cancellation()).expect("valid lock");
+    let mut vm = compile_vm(&auth, SNAPSHOT_RSS);
+    let bound = auth.bind_vm(&mut vm).expect("bind command home");
+    let _ = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
+    assert_eq!(directory_entries(&valid.0), valid_entries);
+
+    let insecure = FixtureHome::with_missing_references(&MISSING);
+    fs::write(insecure.0.join("auth.yaml.lock"), b"").expect("create insecure lock");
+    fs::set_permissions(
+        insecure.0.join("auth.yaml.lock"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("make lock insecure");
+    let insecure_entries = directory_entries(&insecure.0);
+    assert!(AuthHost::new_for_commands(insecure.0.clone(), cancellation()).is_err());
+    assert_eq!(directory_entries(&insecure.0), insecure_entries);
+
+    let linked = FixtureHome::with_missing_references(&MISSING);
+    symlink(linked.0.join("auth.yaml"), linked.0.join("auth.yaml.lock"))
+        .expect("symlink lock to auth file");
+    let linked_entries = directory_entries(&linked.0);
+    assert!(AuthHost::new_for_commands(linked.0.clone(), cancellation()).is_err());
+    assert_eq!(directory_entries(&linked.0), linked_entries);
+
+    let nonregular = FixtureHome::with_missing_references(&MISSING);
+    fs::create_dir(nonregular.0.join("auth.yaml.lock")).expect("directory lock");
+    let nonregular_entries = directory_entries(&nonregular.0);
+    assert!(AuthHost::new_for_commands(nonregular.0.clone(), cancellation()).is_err());
+    assert_eq!(directory_entries(&nonregular.0), nonregular_entries);
+
+    let symlink_auth = FixtureHome::with_missing_references(&MISSING);
+    fs::remove_file(symlink_auth.0.join("auth.yaml")).expect("remove auth");
+    symlink(
+        symlink_auth.0.join("config.yaml"),
+        symlink_auth.0.join("auth.yaml"),
+    )
+    .expect("symlink auth file");
+    let auth_entries = directory_entries(&symlink_auth.0);
+    assert!(AuthHost::new_for_commands(symlink_auth.0.clone(), cancellation()).is_err());
+    assert_eq!(directory_entries(&symlink_auth.0), auth_entries);
+
+    let insecure_home = FixtureHome::with_missing_references(&MISSING);
+    fs::set_permissions(insecure_home.0.clone(), fs::Permissions::from_mode(0o755))
+        .expect("make home insecure");
+    let home_entries = directory_entries(&insecure_home.0);
+    assert!(AuthHost::new_for_commands(insecure_home.0.clone(), cancellation()).is_err());
+    assert_eq!(directory_entries(&insecure_home.0), home_entries);
+
+    let actual_home = FixtureHome::with_missing_references(&MISSING);
+    let alias = actual_home
+        .0
+        .with_file_name(format!("command-home-link-{}", uuid::Uuid::new_v4()));
+    symlink(&actual_home.0, &alias).expect("symlink home");
+    assert!(AuthHost::new_for_commands(alias.clone(), cancellation()).is_err());
+    fs::remove_file(alias).expect("remove symlink home");
+}
+
+#[cfg(unix)]
+#[test]
+fn command_corrupt_read_does_not_create_backup_and_preserves_directory_bytes() {
+    let home = FixtureHome::with_missing_references(&MISSING);
+    let entries_before = directory_entries(&home.0);
+    let auth = AuthHost::new_for_commands(home.0.clone(), cancellation()).expect("commands host");
+    let mut vm = compile_vm(&auth, METADATA_RSS);
+    let bound = auth
+        .bind_vm(&mut vm)
+        .expect("bind native host-home resource");
+    let snapshot = invoke(&mut vm, "snapshot", &[field(&bound, "host_home")]);
+    let policy = field(&snapshot, "policy_handle");
+    let corrupt_bytes = b"version: 1\ncredentials: [malformed\n";
+    fs::write(home.0.join("auth.yaml"), corrupt_bytes).expect("corrupt auth after owner bind");
+
+    let failed = invoke(
+        &mut vm,
+        "metadata_result",
+        &[policy, Value::string("fixture-codex")],
+    );
+    assert_eq!(field(&failed, "ok"), Value::Bool(false));
+    assert_eq!(
+        field(&field(&failed, "error"), "code"),
+        Value::string("corrupt_file")
+    );
+    assert_eq!(
+        fs::read(home.0.join("auth.yaml")).expect("corrupt bytes unchanged"),
+        corrupt_bytes
+    );
+    assert_eq!(directory_entries(&home.0), entries_before);
+    assert_eq!(vm.host_context().resource_count(), 2);
 }

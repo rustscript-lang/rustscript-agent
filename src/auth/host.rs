@@ -222,7 +222,11 @@ impl AuthHost {
             return Err("finite_deadline_required".into());
         }
         let paths = AgentPaths::from_home(home).map_err(|_| "invalid_host_home")?;
-        let store = AuthStore::open(paths.clone()).map_err(|_| "auth_store_unavailable")?;
+        let store = match &admission {
+            AdmissionMode::Commands => AuthStore::open_for_commands(paths.clone()),
+            AdmissionMode::Strict | AdmissionMode::Enrollment(_) => AuthStore::open(paths.clone()),
+        }
+        .map_err(|_| "auth_store_unavailable")?;
         let snapshot = Arc::new(load_snapshot(&paths, &store, 1, &admission)?);
         Ok(Self {
             paths,

@@ -1189,6 +1189,8 @@ pub trait CredentialStore {
 struct StoreInner {
     paths: AgentPaths,
     process_lock: Mutex<()>,
+    /// Command diagnostics never initialize read-side control or recovery files.
+    non_creating_reads: bool,
     /// In-process issued-handle table. Lock order: `process_lock`, then the
     /// filesystem advisory lock, then `handle_registry`. Never hold
     /// `handle_registry` across filesystem I/O. This table can only govern
@@ -1296,11 +1298,27 @@ impl AuthStore {
     /// Opens a confined store and creates the home directory and lock file when
     /// they do not exist. A missing `auth.yaml` is a fresh empty document.
     pub fn open(paths: AgentPaths) -> Result<Self, AuthStoreError> {
+        Self::open_with_read_policy(paths, false)
+    }
+
+    /// Opens a command store without creating read-side files or directories.
+    pub(crate) fn open_for_commands(paths: AgentPaths) -> Result<Self, AuthStoreError> {
+        Self::open_with_read_policy(paths, true)
+    }
+
+    fn open_with_read_policy(
+        paths: AgentPaths,
+        non_creating_reads: bool,
+    ) -> Result<Self, AuthStoreError> {
         validate_paths(&paths)?;
         #[cfg(unix)]
         {
-            let home = unix::open_home(&paths.home)?;
-            unix::ensure_lock_file(&home, &paths.auth_lock)?;
+            let home = unix::open_home(&paths.home, !non_creating_reads)?;
+            if non_creating_reads {
+                drop(unix::lock_file_if_present(&home, &paths.auth_lock)?);
+            } else {
+                unix::ensure_lock_file(&home, &paths.auth_lock)?;
+            }
             if let Some(auth_file) = unix::open_auth_file(&home, &paths.auth)? {
                 drop(auth_file);
             }
@@ -1308,6 +1326,7 @@ impl AuthStore {
                 inner: Arc::new(StoreInner {
                     paths,
                     process_lock: Mutex::new(()),
+                    non_creating_reads,
                     handle_registry: Mutex::new(HandleRegistry::default()),
                     home,
                 }),
@@ -1315,7 +1334,7 @@ impl AuthStore {
         }
         #[cfg(not(unix))]
         {
-            let _ = paths;
+            let _ = (paths, non_creating_reads);
             Err(AuthStoreError::BackendUnavailable {
                 operation: "open".to_string(),
                 message: "confined no-follow storage requires Unix primitives".to_string(),
@@ -1724,8 +1743,11 @@ impl AuthStore {
             match parse_stored_yaml(&self.inner.paths.auth, &bytes) {
                 Ok(document) => Ok(document),
                 Err(error) => {
-                    let artifact =
-                        unix::preserve_corrupt(&self.inner.home, &self.inner.paths.home, &bytes);
+                    let artifact = if self.inner.non_creating_reads {
+                        None
+                    } else {
+                        unix::preserve_corrupt(&self.inner.home, &self.inner.paths.home, &bytes)
+                    };
                     Err(AuthStoreError::CorruptFile {
                         path: self.inner.paths.auth.clone(),
                         artifact,
@@ -1769,7 +1791,14 @@ impl AuthStore {
         operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
     ) -> Result<T, AuthStoreError> {
         #[cfg(unix)]
-        let file_guard = unix::lock_file(&self.inner.home, &self.inner.paths.auth_lock)?;
+        let file_guard = if self.inner.non_creating_reads {
+            unix::lock_file_if_present(&self.inner.home, &self.inner.paths.auth_lock)?
+        } else {
+            Some(unix::lock_file(
+                &self.inner.home,
+                &self.inner.paths.auth_lock,
+            )?)
+        };
         let result = operation(self);
         #[cfg(unix)]
         drop(file_guard);
@@ -1805,7 +1834,19 @@ impl AuthStore {
         guard: Option<&MutationGuard<'_>>,
         operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
     ) -> Result<T, AuthStoreError> {
+        check_mutation_guard(guard)?;
+        #[cfg(unix)]
+        if self.inner.non_creating_reads {
+            unix::ensure_lock_file(&self.inner.home, &self.inner.paths.auth_lock)?;
+        }
         if guard.is_none() {
+            #[cfg(unix)]
+            if self.inner.non_creating_reads {
+                let file_guard = unix::lock_file(&self.inner.home, &self.inner.paths.auth_lock)?;
+                let result = operation(self);
+                drop(file_guard);
+                return result;
+            }
             return self.with_file_lock(operation);
         }
         #[cfg(unix)]
@@ -2107,7 +2148,7 @@ mod unix {
 
     use super::{AuthStoreError, MAX_AUTH_STORE_BYTES};
 
-    pub(super) fn open_home(path: &Path) -> Result<OwnedFd, AuthStoreError> {
+    pub(super) fn open_home(path: &Path, create_missing: bool) -> Result<OwnedFd, AuthStoreError> {
         let root = CString::new("/").expect("root has no NUL");
         let fd = unsafe {
             libc::open(
@@ -2147,7 +2188,7 @@ mod unix {
                 continue;
             }
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENOENT) {
+            if error.raw_os_error() != Some(libc::ENOENT) || !create_missing {
                 return Err(map_path_error(path, error));
             }
             let created = unsafe {
@@ -2258,7 +2299,17 @@ mod unix {
     }
 
     pub(super) fn lock_file(home: &OwnedFd, path: &Path) -> Result<File, AuthStoreError> {
-        lock_file_impl(home, path, None)
+        lock_file_impl(home, path, None, false)?.ok_or_else(|| AuthStoreError::Lock {
+            path: path.to_path_buf(),
+            message: "required lock file is absent".to_string(),
+        })
+    }
+
+    pub(super) fn lock_file_if_present(
+        home: &OwnedFd,
+        path: &Path,
+    ) -> Result<Option<File>, AuthStoreError> {
+        lock_file_impl(home, path, None, true)
     }
 
     pub(super) fn lock_file_guarded(
@@ -2266,14 +2317,18 @@ mod unix {
         path: &Path,
         guard: Option<&super::MutationGuard<'_>>,
     ) -> Result<File, AuthStoreError> {
-        lock_file_impl(home, path, guard)
+        lock_file_impl(home, path, guard, false)?.ok_or_else(|| AuthStoreError::Lock {
+            path: path.to_path_buf(),
+            message: "required lock file is absent".to_string(),
+        })
     }
 
     fn lock_file_impl(
         home: &OwnedFd,
         path: &Path,
         guard: Option<&super::MutationGuard<'_>>,
-    ) -> Result<File, AuthStoreError> {
+        allow_missing: bool,
+    ) -> Result<Option<File>, AuthStoreError> {
         super::check_mutation_guard(guard)?;
         let name = CString::new(super::AUTH_LOCK_FILE_NAME).expect("constant has no NUL");
         if is_symlink_at(home.as_raw_fd(), super::AUTH_LOCK_FILE_NAME.as_bytes()) {
@@ -2289,9 +2344,13 @@ mod unix {
             )
         };
         if fd < 0 {
+            let error = io::Error::last_os_error();
+            if allow_missing && error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
             return Err(AuthStoreError::Lock {
                 path: path.to_path_buf(),
-                message: io::Error::last_os_error().to_string(),
+                message: error.to_string(),
             });
         }
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -2316,7 +2375,7 @@ mod unix {
             });
         }
         super::check_mutation_guard(guard)?;
-        Ok(File::from(owned))
+        Ok(Some(File::from(owned)))
     }
 
     pub(super) fn read_bounded(
