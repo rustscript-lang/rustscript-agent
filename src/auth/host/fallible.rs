@@ -106,7 +106,7 @@ const STATIC_ERROR_CODES: &[&str] = &[
     "wait_out_of_range",
 ];
 
-fn failure_type() -> HostTypeSchema {
+pub(super) fn failure_type() -> HostTypeSchema {
     named(
         "AuthBridgeFailure",
         vec![
@@ -118,7 +118,7 @@ fn failure_type() -> HostTypeSchema {
     )
 }
 
-fn result_type(name: &str, value_type: HostTypeSchema) -> HostTypeSchema {
+pub(super) fn result_type(name: &str, value_type: HostTypeSchema) -> HostTypeSchema {
     named(
         name,
         vec![

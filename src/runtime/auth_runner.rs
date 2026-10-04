@@ -23,7 +23,9 @@ use rustscript_vm::{
     compile_source_with_flavor_and_options, parse_source_with_dialect,
 };
 
-use crate::auth::host::{AuthHost, auth_host_catalog, auth_host_module};
+use crate::auth::host::{
+    AuthHost, ConfigPathHost, PATH_IMPORT_NAME, auth_host_catalog, auth_host_module,
+};
 use crate::auth::oauth::OAuthHost;
 use crate::runtime::cancellation::CancellationReason;
 use crate::runtime::host_wait::wait_for_host_op_blocking_with_cancel;
@@ -145,6 +147,15 @@ impl Drop for CancellationDisarm<'_> {
 struct AuthHostRevoke<'a>(&'a AuthHost);
 
 impl Drop for AuthHostRevoke<'_> {
+    fn drop(&mut self) {
+        self.0.revoke();
+    }
+}
+
+/// Revokes all path owners issued by this invocation on every exit path.
+struct ConfigPathHostRevoke<'a>(&'a ConfigPathHost);
+
+impl Drop for ConfigPathHostRevoke<'_> {
     fn drop(&mut self) {
         self.0.revoke();
     }
@@ -277,10 +288,58 @@ impl AuthEntryRunner {
         cancellation: &RunCancellation,
     ) -> Result<Value, AuthEntryError> {
         let _revoke_guard = AuthHostRevoke(&auth_host);
-
         let registry =
             restricted_auth_registry(&auth_host, self.catalog.as_ref(), self.bundle_json_encode)
                 .map_err(|error| setup_failure(cancellation, error))?;
+        self.run_with_registry(
+            registry,
+            input,
+            cancellation,
+            |vm| auth_host.bind_vm(vm),
+            validate_output,
+        )
+    }
+
+    /// Run the same RSS entry engine with a no-store, path-only native host.
+    pub fn run_with_path_host_factory<F>(
+        &self,
+        input: AuthCommandInput,
+        cancellation: &RunCancellation,
+        build_host: F,
+    ) -> Result<Value, AuthEntryError>
+    where
+        F: FnOnce(RunCancellation) -> Result<ConfigPathHost, String>,
+    {
+        let invocation_cancellation = cancellation.child();
+        let _cancellation_guard = CancellationDisarm(&invocation_cancellation);
+        validate_input(&input)?;
+        ensure_finite_active(&invocation_cancellation)?;
+        let path_host = build_host(invocation_cancellation.clone())
+            .map_err(|_| setup_failure(&invocation_cancellation, AuthEntryError::HostSetup))?;
+        let _revoke_guard = ConfigPathHostRevoke(&path_host);
+        let registry =
+            restricted_path_registry(&path_host, self.catalog.as_ref(), self.bundle_json_encode)
+                .map_err(|error| setup_failure(&invocation_cancellation, error))?;
+        self.run_with_registry(
+            registry,
+            input,
+            &invocation_cancellation,
+            |vm| path_host.bind_vm(vm),
+            validate_path_output,
+        )
+    }
+
+    fn run_with_registry<F>(
+        &self,
+        registry: HostFunctionRegistry,
+        input: AuthCommandInput,
+        cancellation: &RunCancellation,
+        bind_host: F,
+        validate_result: fn(&Value) -> Result<(), AuthEntryError>,
+    ) -> Result<Value, AuthEntryError>
+    where
+        F: FnOnce(&mut Vm) -> rustscript_vm::VmResult<Value>,
+    {
         let mut vm = Vm::try_new(self.program.clone())
             .map_err(|_| setup_failure(cancellation, AuthEntryError::VmSetup))?;
         let mut vm_drain = VmDrainGuard::new(&mut vm);
@@ -295,9 +354,7 @@ impl AuthEntryRunner {
                     .bind_vm_cached(vm)
                     .map_err(|_| setup_failure(cancellation, AuthEntryError::RegistrySetup))?;
 
-                // Bind the trusted host-home resource before the source root can run.
-                let bound = auth_host
-                    .bind_vm(vm)
+                let bound = bind_host(vm)
                     .map_err(|_| setup_failure(cancellation, AuthEntryError::HomeBind))?;
                 let home_resource = map_field(&bound, "host_home")
                     .cloned()
@@ -317,7 +374,14 @@ impl AuthEntryRunner {
                     return Err(setup_failure(cancellation, AuthEntryError::EntryArity));
                 }
 
-                invoke_entry(vm, callable, home_resource, input, cancellation)
+                invoke_entry(
+                    vm,
+                    callable,
+                    home_resource,
+                    input,
+                    cancellation,
+                    validate_result,
+                )
             })()
         };
         let drain = vm_drain.drain();
@@ -370,8 +434,30 @@ fn restricted_auth_registry(
         .map_err(|_| AuthEntryError::RegistrySetup)?;
     registry.set_capability_profile(CapabilityProfile::deny_all());
     for descriptor in auth_host_module().descriptors() {
-        registry.authorize_registered_builtin_import(&descriptor.schema.name);
+        if descriptor.schema.name != PATH_IMPORT_NAME {
+            registry.authorize_registered_builtin_import(&descriptor.schema.name);
+        }
     }
+    if allow_json_encode {
+        registry
+            .allow_builtin("json::encode")
+            .map_err(|_| AuthEntryError::RegistrySetup)?;
+    }
+    Ok(registry)
+}
+
+fn restricted_path_registry(
+    path_host: &ConfigPathHost,
+    catalog: &HostApiCatalog,
+    allow_json_encode: bool,
+) -> Result<HostFunctionRegistry, AuthEntryError> {
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    path_host
+        .register(&mut registry, catalog)
+        .map_err(|_| AuthEntryError::RegistrySetup)?;
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    registry.authorize_registered_builtin_import(PATH_IMPORT_NAME);
     if allow_json_encode {
         registry
             .allow_builtin("json::encode")
@@ -495,6 +581,7 @@ fn invoke_entry(
     home: Value,
     input: AuthCommandInput,
     cancellation: &RunCancellation,
+    validate_result: fn(&Value) -> Result<(), AuthEntryError>,
 ) -> Result<Value, AuthEntryError> {
     let mut invocation = vm
         .start_invocation(callable, vec![home, command_value(input)])
@@ -514,7 +601,7 @@ fn invoke_entry(
                 return Err(setup_failure(cancellation, AuthEntryError::Invocation));
             }
             InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(value)))) => {
-                validate_output(&value)?;
+                validate_result(&value)?;
                 return Ok(value);
             }
             InvocationPoll::Ready(Some(Err(InvocationError::Cancelled(reason)))) => {
@@ -566,6 +653,50 @@ fn validate_output(value: &Value) -> Result<(), AuthEntryError> {
         || fields.iter().any(|(key, _)| {
             !matches!(key, Value::String(name) if ["ok", "operation", "credential_id", "generation", "status", "error"].contains(&name.as_str()))
         })
+    {
+        return Err(AuthEntryError::OutputInvalid);
+    }
+    Ok(())
+}
+
+fn validate_path_output(value: &Value) -> Result<(), AuthEntryError> {
+    let Value::Map(fields) = value else {
+        return Err(AuthEntryError::OutputInvalid);
+    };
+    if fields.len() != 3
+        || fields.iter().any(|(key, _)| {
+            !matches!(key, Value::String(name) if ["ok", "error", "value"].contains(&name.as_str()))
+        })
+    {
+        return Err(AuthEntryError::OutputInvalid);
+    }
+    let (Some(Value::Bool(ok)), Some(error), Some(output)) = (
+        map_field(value, "ok"),
+        map_field(value, "error"),
+        map_field(value, "value"),
+    ) else {
+        return Err(AuthEntryError::OutputInvalid);
+    };
+    if *ok {
+        if !matches!(error, Value::Null) || !matches!(output, Value::String(_)) {
+            return Err(AuthEntryError::OutputInvalid);
+        }
+        return Ok(());
+    }
+    if !matches!(output, Value::Null) {
+        return Err(AuthEntryError::OutputInvalid);
+    }
+    let Value::Map(failure) = error else {
+        return Err(AuthEntryError::OutputInvalid);
+    };
+    if failure.len() != 4
+        || failure.iter().any(|(key, _)| {
+            !matches!(key, Value::String(name) if ["code", "cancelled", "deadline_exceeded", "revoked"].contains(&name.as_str()))
+        })
+        || !matches!(map_field(error, "code"), Some(Value::String(code)) if ["host_unbound", "resource_invalid", "owner_mismatch", "policy_inactive", "invalid_path"].contains(&code.as_str()))
+        || !matches!(map_field(error, "cancelled"), Some(Value::Bool(_)))
+        || !matches!(map_field(error, "deadline_exceeded"), Some(Value::Bool(_)))
+        || !matches!(map_field(error, "revoked"), Some(Value::Bool(_)))
     {
         return Err(AuthEntryError::OutputInvalid);
     }

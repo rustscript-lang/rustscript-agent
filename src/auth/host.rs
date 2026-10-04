@@ -44,6 +44,7 @@ mod cli_io;
 mod device;
 mod fallible;
 mod flow;
+mod paths;
 mod payload;
 mod public_json;
 mod timing;
@@ -53,6 +54,8 @@ pub use cli_io::{
     DeviceInstructionSender, PublicDeviceInstruction, RunOAuthCancel, SystemOAuthClock,
     device_instruction_channel,
 };
+pub use paths::ConfigPathHost;
+pub(crate) use paths::PATH_IMPORT_NAME;
 
 macro_rules! resource {
     ($name:ident, $key:literal, $description:literal) => {
@@ -333,7 +336,9 @@ impl AuthHost {
         });
         owner.check()?;
         let mut context = vm.host_context();
-        if context.scope_state::<Bound>().is_some() {
+        if context.scope_state::<Bound>().is_some()
+            || context.scope_state::<paths::BoundPaths>().is_some()
+        {
             return Err(error("already_bound"));
         }
         if context.resource_count() >= LIMIT {
@@ -1269,6 +1274,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
         name: "auth",
         functions: &[
             config_desc,
+            paths::resolved_path_result_desc,
             transport_desc,
             transport_payload_desc,
             transport_capture_desc,
@@ -1303,6 +1309,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
         ],
         resources: &[
             host_home_meta,
+            paths::home_meta,
             policy_meta,
             access_meta,
             refresh_meta,
