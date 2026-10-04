@@ -1,9 +1,11 @@
 //! In-memory, auth-only entry compilation and execution.
 //!
 //! Import admission is an embedding boundary: Core owns RSS parsing, source
-//! semantics, and host-module loading. This runner rejects every structured
-//! import path outside the auth host module's single-root catalog before
-//! asking Core to compile source.
+//! semantics, and host-module loading. The legacy single-source constructor
+//! keeps its auth-root allowlist; the private bundle constructor admits only a
+//! closed in-memory source graph plus its narrowly authorized JSON builtin.
+
+mod bundle;
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -123,10 +125,11 @@ impl Display for AuthEntryError {
 
 impl Error for AuthEntryError {}
 
-/// Compiled RSS source admitted against only the auth host catalog.
+/// Compiled auth RSS entry bound to one catalog snapshot.
 pub struct AuthEntryRunner {
     program: rustscript_vm::Program,
     catalog: Arc<HostApiCatalog>,
+    bundle_json_encode: bool,
 }
 
 /// Disarms the run's epoch watcher on success, error, setup failure, or unwind.
@@ -226,6 +229,7 @@ impl AuthEntryRunner {
         Ok(Self {
             program: compiled.program,
             catalog,
+            bundle_json_encode: false,
         })
     }
 
@@ -238,30 +242,45 @@ impl AuthEntryRunner {
         cancellation: &RunCancellation,
         oauth: Option<Arc<OAuthHost>>,
     ) -> Result<Value, AuthEntryError> {
+        self.run_with_host_factory(input, cancellation, move |child_cancellation| {
+            AuthHost::new(home, child_cancellation).map(|auth_host| match oauth {
+                Some(oauth) => auth_host.with_oauth_host(oauth),
+                None => auth_host,
+            })
+        })
+    }
+
+    /// Run one invocation with a trusted native host built from its child
+    /// cancellation token. Input and deadline checks precede factory effects.
+    pub fn run_with_host_factory<F>(
+        &self,
+        input: AuthCommandInput,
+        cancellation: &RunCancellation,
+        build_host: F,
+    ) -> Result<Value, AuthEntryError>
+    where
+        F: FnOnce(RunCancellation) -> Result<AuthHost, String>,
+    {
         let invocation_cancellation = cancellation.child();
         let _cancellation_guard = CancellationDisarm(&invocation_cancellation);
         validate_input(&input)?;
         ensure_finite_active(&invocation_cancellation)?;
-        self.run_inner(home, input, &invocation_cancellation, oauth)
+        let auth_host = build_host(invocation_cancellation.clone())
+            .map_err(|_| setup_failure(&invocation_cancellation, AuthEntryError::HostSetup))?;
+        self.run_inner(auth_host, input, &invocation_cancellation)
     }
 
     fn run_inner(
         &self,
-        home: PathBuf,
+        auth_host: AuthHost,
         input: AuthCommandInput,
         cancellation: &RunCancellation,
-        oauth: Option<Arc<OAuthHost>>,
     ) -> Result<Value, AuthEntryError> {
-        let auth_host = AuthHost::new(home, cancellation.clone())
-            .map_err(|_| setup_failure(cancellation, AuthEntryError::HostSetup))?;
-        let auth_host = match oauth {
-            Some(oauth) => auth_host.with_oauth_host(oauth),
-            None => auth_host,
-        };
         let _revoke_guard = AuthHostRevoke(&auth_host);
 
-        let registry = restricted_auth_registry(&auth_host, self.catalog.as_ref())
-            .map_err(|error| setup_failure(cancellation, error))?;
+        let registry =
+            restricted_auth_registry(&auth_host, self.catalog.as_ref(), self.bundle_json_encode)
+                .map_err(|error| setup_failure(cancellation, error))?;
         let mut vm = Vm::try_new(self.program.clone())
             .map_err(|_| setup_failure(cancellation, AuthEntryError::VmSetup))?;
         let mut vm_drain = VmDrainGuard::new(&mut vm);
@@ -342,6 +361,7 @@ fn preflight_imports(source: &str) -> Result<(), AuthEntryError> {
 fn restricted_auth_registry(
     auth_host: &AuthHost,
     catalog: &HostApiCatalog,
+    allow_json_encode: bool,
 ) -> Result<HostFunctionRegistry, AuthEntryError> {
     let mut registry = HostFunctionRegistry::empty();
     registry.set_capability_profile(CapabilityProfile::deny_all());
@@ -351,6 +371,11 @@ fn restricted_auth_registry(
     registry.set_capability_profile(CapabilityProfile::deny_all());
     for descriptor in auth_host_module().descriptors() {
         registry.authorize_registered_builtin_import(&descriptor.schema.name);
+    }
+    if allow_json_encode {
+        registry
+            .allow_builtin("json::encode")
+            .map_err(|_| AuthEntryError::RegistrySetup)?;
     }
     Ok(registry)
 }
