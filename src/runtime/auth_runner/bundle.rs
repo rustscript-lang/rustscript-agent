@@ -189,9 +189,8 @@ fn preflight_bundle(
     for (importer, imports) in imports {
         for import in imports {
             let (root, first_index) = first_import_identifier(&import.path)?;
-            if host_roots.contains(root) {
-                if first_index == 0
-                    && import.path.len() == 1
+            if first_index == 0 && host_roots.contains(root) {
+                if import.path.len() == 1
                     && matches!(
                         import.clause,
                         ImportClause::AllPublic | ImportClause::Namespace(_)

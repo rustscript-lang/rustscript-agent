@@ -250,6 +250,97 @@ fn in_memory_bundle_resolves_nested_imports_and_executes_typed_auth_business_cal
 }
 
 #[test]
+fn relative_auth_and_config_host_root_names_resolve_inside_the_supplied_tree() {
+    let sources = [
+        (
+            "rss/auth/runner.rss",
+            r#"use auth;
+use self::auth as local_auth;
+struct AuthCommandInput {
+    operation: string,
+    provider: string?,
+    credential_id: string?
+}
+struct AuthEntryResult {
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+}
+pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
+    local_auth::metadata(home, command)
+}
+"#,
+        ),
+        (
+            "rss/auth/auth.rss",
+            r#"use auth;
+use super::config as local_config;
+struct AuthCommandInput {
+    operation: string,
+    provider: string?,
+    credential_id: string?
+}
+struct AuthEntryResult {
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+}
+pub fn metadata(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
+    let snapshot = local_config::load(home);
+    let loaded = auth::load_metadata("fixture-codex", &snapshot.policy_handle);
+    let metadata = loaded.metadata.copy();
+    {
+        ok: snapshot.ok && loaded.ok,
+        operation: command.operation,
+        credential_id: metadata.credential_id,
+        generation: metadata.generation,
+        status: metadata.status,
+        error: loaded.error
+    }
+}
+"#,
+        ),
+        (
+            "rss/config.rss",
+            r#"use config;
+pub fn load(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
+    config::load_snapshot(&home)
+}
+"#,
+        ),
+    ];
+    let result = AuthEntryRunner::from_bundle("rss/auth/runner.rss", &sources);
+    assert!(
+        result.is_ok(),
+        "nested relative imports were rejected: {:?}",
+        result.err().map(|error| error.code())
+    );
+    let runner = result.expect("nested source modules compile from supplied bytes");
+    let home = FixtureHome::new("relative-host-root", false);
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let value = runner
+        .run_with_host_factory(input("metadata", Some("fixture-codex")), &cancellation, {
+            let home = home.0.clone();
+            move |child| AuthHost::new(home, child)
+        })
+        .expect("execute actual config and auth host calls through source modules");
+    assert_eq!(field(&value, "ok"), &Value::Bool(true));
+    assert_eq!(
+        field(&value, "credential_id"),
+        &Value::string("fixture-codex")
+    );
+    assert_eq!(field(&value, "generation"), &Value::Int(4));
+    assert_eq!(field(&value, "status"), &Value::string("active"));
+    assert!(!cancellation.watcher_is_armed());
+}
+
+#[test]
 fn enrollment_factory_runs_bundle_against_generation_zero_without_provider_selection() {
     let runner = AuthEntryRunner::from_bundle(ENTRY_PATH, SOURCES).expect("compile command bundle");
     let home = FixtureHome::new("enrollment", true);
@@ -403,9 +494,9 @@ fn preflight_rejects_unreachable_transitive_edges_escape_and_host_shadowing() {
             &[
                 (
                     "main.rss",
-                    "use auth::shadow; pub fn run(home: resource<auth.host_home>, command: map) -> int { 1 }",
+                    "use auth::helper; pub fn run(home: resource<auth.host_home>, command: map) -> int { 1 }",
                 ),
-                ("auth/shadow.rss", "pub fn side_effect() -> int { 7 }"),
+                ("auth/helper.rss", "pub fn side_effect() -> int { 7 }"),
             ],
         ),
         (
