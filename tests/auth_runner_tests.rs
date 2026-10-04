@@ -452,6 +452,12 @@ fn run_cpu_case_in_helper(case: &str) {
     } else {
         root_loop
     };
+    // Compile the real root/entry infinite CPU-loop source and create its fixture home
+    // BEFORE constructing the parent cancellation, so the 750ms deadline budget below
+    // measures execution (watcher arm + run) and not fixture compile/I/O setup. The
+    // reused-parent branch stays after parent creation and keeps sharing this parent.
+    let runner = Arc::new(AuthEntryRunner::from_source(source).expect("compile CPU loop"));
+    let home = fixture_home("cpu-child", 4);
     let parent = if case.starts_with("deadline-") {
         RunCancellation::with_deadline(Instant::now() + Duration::from_millis(750))
     } else {
@@ -476,8 +482,6 @@ fn run_cpu_case_in_helper(case: &str) {
         cleanup_home(&home);
     }
 
-    let runner = Arc::new(AuthEntryRunner::from_source(source).expect("compile CPU loop"));
-    let home = fixture_home("cpu-child", 4);
     if concurrent {
         run_concurrent_cpu_cases(runner, home, parent);
         return;
