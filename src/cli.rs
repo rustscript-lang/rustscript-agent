@@ -168,36 +168,16 @@ pub fn cli_usage() -> &'static str {
     "Usage:\n  rustscript-agent --script PATH --allow-host HOST [--allow-host HOST ...]\n  rustscript-agent run --script PATH --allow-host HOST [--allow-host HOST ...]\n  rustscript-agent auth login PROVIDER\n  rustscript-agent auth status [PROVIDER]\n  rustscript-agent auth logout ID\n  rustscript-agent config path\n  rustscript-agent config check"
 }
 
-fn is_help_flag(argument: &OsString) -> bool {
-    matches!(argument.to_str(), Some("--help" | "-h"))
-}
-
 pub fn parse_cli_args(args: impl IntoIterator<Item = OsString>) -> Result<CliInvocation, CliError> {
     let args: Vec<OsString> = args.into_iter().collect();
-    if args.len() == 1 && is_help_flag(&args[0]) {
-        return Ok(CliInvocation::Help);
-    }
     if args.is_empty() {
         return Err(CliError::InvalidArguments);
     }
 
-    if args[0].to_str() == Some("run") {
-        return if args[1..].iter().any(is_help_flag) {
-            Ok(CliInvocation::Help)
-        } else {
-            parse_run(&args[1..])
-        };
-    }
     match args[0].to_str() {
+        Some("run") => parse_run(&args[1..]),
         Some("auth") => parse_auth(&args[1..]),
         Some("config") => parse_config(&args[1..]),
-        Some("--script" | "--allow-host" | "--help" | "-h") => {
-            if args[1..].iter().any(is_help_flag) {
-                Ok(CliInvocation::Help)
-            } else {
-                parse_run(&args)
-            }
-        }
         _ => parse_run(&args),
     }
 }
@@ -208,9 +188,10 @@ fn parse_run(args: &[OsString]) -> Result<CliInvocation, CliError> {
     let mut index = 0;
     while index < args.len() {
         match args[index].to_str() {
+            Some("--help" | "-h") => return Ok(CliInvocation::Help),
             Some("--script") => {
                 let value = args.get(index + 1).ok_or(CliError::InvalidArguments)?;
-                if value.is_empty() || looks_like_option(value) {
+                if value.is_empty() {
                     return Err(CliError::InvalidArguments);
                 }
                 script = Some(PathBuf::from(value));
@@ -219,7 +200,7 @@ fn parse_run(args: &[OsString]) -> Result<CliInvocation, CliError> {
             Some("--allow-host") => {
                 let value = args.get(index + 1).ok_or(CliError::InvalidArguments)?;
                 let host = value.to_str().ok_or(CliError::InvalidArguments)?;
-                if host.is_empty() || looks_like_option(value) {
+                if host.is_empty() {
                     return Err(CliError::InvalidArguments);
                 }
                 allowed_hosts.push(host.to_owned());
@@ -286,11 +267,4 @@ fn required_selector(value: &OsString) -> Result<String, CliError> {
 
 fn valid_selector(value: &str) -> bool {
     !value.is_empty() && value.len() <= 2048 && !value.chars().any(char::is_control)
-}
-
-fn looks_like_option(value: &std::ffi::OsStr) -> bool {
-    matches!(
-        value.to_str(),
-        Some("--script" | "--allow-host" | "--help" | "-h")
-    )
 }

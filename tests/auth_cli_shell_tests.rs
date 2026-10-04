@@ -122,6 +122,115 @@ fn legacy_and_explicit_run_forward_the_same_real_rss_script_and_hosts() {
 }
 
 #[test]
+fn literal_help_named_scripts_run_through_the_native_stream_path() {
+    let temp = TestDir::new("literal-help-child");
+    for (mode, script_name) in [("legacy", "-h"), ("explicit", "--help")] {
+        let child_dir = temp.0.join(mode);
+        fs::create_dir_all(&child_dir).expect("create isolated child working directory");
+        fs::write(
+            child_dir.join(script_name),
+            "use stream; pub fn run(input: map) -> string { stream::emit(\"literal-help-event\"); \"literal-help-result\" }",
+        )
+        .expect("write RSS script under its literal help flag name");
+
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "literal_help_script_child_process",
+                "--nocapture",
+            ])
+            .env("AUTH_CLI_LITERAL_HELP_CHILD", mode)
+            .env(
+                "RUSTSCRIPT_AGENT_TEST_TMP",
+                std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned TEMP"),
+            )
+            .current_dir(&child_dir)
+            .output()
+            .expect("run CLI regression in an isolated child working directory");
+        assert!(
+            output.status.success(),
+            "literal script child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    for (args, expected_script, expected_host) in [
+        (
+            ["--script", "--script", "--allow-host", "--allow-host"].as_slice(),
+            "--script",
+            "--allow-host",
+        ),
+        (
+            [
+                "run",
+                "--script",
+                "--allow-host",
+                "--allow-host",
+                "--script",
+            ]
+            .as_slice(),
+            "--allow-host",
+            "--script",
+        ),
+    ] {
+        let invocation = parse(args).expect("option-looking values are consumed literally");
+        assert_eq!(
+            invocation,
+            CliInvocation::Run {
+                script: PathBuf::from(expected_script),
+                allowed_hosts: vec![expected_host.to_owned()],
+            }
+        );
+    }
+}
+
+#[test]
+fn literal_help_script_child_process() {
+    let Ok(mode) = std::env::var("AUTH_CLI_LITERAL_HELP_CHILD") else {
+        return;
+    };
+    let (args, script_name, host) = match mode.as_str() {
+        "legacy" => (
+            ["--script", "-h", "--allow-host", "--help"].as_slice(),
+            "-h",
+            "--help",
+        ),
+        "explicit" => (
+            ["run", "--script", "--help", "--allow-host", "-h"].as_slice(),
+            "--help",
+            "-h",
+        ),
+        _ => panic!("unknown literal-help child mode"),
+    };
+    let invocation = parse(args).expect("parse literal help-looking script and host values");
+    let CliInvocation::Run {
+        script,
+        allowed_hosts,
+    } = invocation
+    else {
+        panic!("literal help-looking values must produce a run invocation");
+    };
+    assert_eq!(script, PathBuf::from(script_name));
+    assert_eq!(allowed_hosts, [host]);
+
+    let source = fs::read_to_string(&script).expect("read literal help-named RSS script");
+    let runner = AgentRunner::from_source(
+        &source,
+        AgentConfig::for_hosts(allowed_hosts.iter().map(String::as_str)),
+    )
+    .expect("compile literal help-named RSS script");
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let mut sink = RecordingSink::default();
+    let result = runner
+        .run_with_context_and_events(Value::map(vec![]), &mut sink, &cancellation)
+        .expect("execute literal help-named RSS script and collect events");
+    assert!(!cancellation.watcher_is_armed());
+    assert_eq!(result, Value::string("literal-help-result"));
+    assert_eq!(sink.0, [Value::string("literal-help-event")]);
+}
+
+#[test]
 fn last_script_value_wins_without_reordering_hosts() {
     let dir = TestDir::new("last-script");
     let first = dir.0.join("first.rss");
@@ -162,6 +271,12 @@ fn admin_commands_map_to_the_exact_generic_auth_envelope() {
             Some("provider/name:Case"),
             None,
         ),
+        (
+            &["auth", "login", "--help"][..],
+            "auth.login",
+            Some("--help"),
+            None,
+        ),
         (&["auth", "status"], "auth.status", None, None),
         (
             &["auth", "status", "unlisted-provider"],
@@ -170,10 +285,22 @@ fn admin_commands_map_to_the_exact_generic_auth_envelope() {
             None,
         ),
         (
+            &["auth", "status", "--help"],
+            "auth.status",
+            Some("--help"),
+            None,
+        ),
+        (
             &["auth", "logout", "opaque-id/unchanged"],
             "auth.logout",
             None,
             Some("opaque-id/unchanged"),
+        ),
+        (
+            &["auth", "logout", "-h"][..],
+            "auth.logout",
+            None,
+            Some("-h"),
         ),
         (&["config", "path"], "config.path", None, None),
         (&["config", "check"], "config.check", None, None),
@@ -201,6 +328,7 @@ fn malformed_and_unsafe_argv_is_rejected_without_echoing_values() {
         &[][..],
         &["unknown"][..],
         &["unknown", "--help"][..],
+        &["--script", "path.rss", "--unknown", "--help"][..],
         &["run"][..],
         &["run", "auth", "login", "provider-name"][..],
         &["--script"][..],
@@ -224,6 +352,10 @@ fn malformed_and_unsafe_argv_is_rejected_without_echoing_values() {
     assert!(parse(&["--help"]).is_ok());
     assert!(parse(&["-h"]).is_ok());
     assert!(parse(&["run", "--help"]).is_ok());
+    assert!(matches!(
+        parse(&["--script", "path.rss", "--help"]),
+        Ok(CliInvocation::Help)
+    ));
     assert!(matches!(
         parse(&[
             "--script",
