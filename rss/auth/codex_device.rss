@@ -57,7 +57,6 @@ struct DeviceEndpointChoice {
 
 struct DeviceClockCheck {
     ok: bool,
-    timed_out: bool,
     now_ms: int,
     failure: CodexDeviceLoginResult
 }
@@ -417,14 +416,12 @@ fn clock_check_value(read: OAuthNowResultEnvelope, deadline_ms: int, previous_ms
     if !read.ok => {
         {
             ok: false,
-            timed_out: false,
             now_ms: previous_ms,
             failure: static_failure(read.error, "clock_unavailable", "The login clock is unavailable.")
         }
     } else if read.value.copy() == null => {
         {
             ok: false,
-            timed_out: false,
             now_ms: previous_ms,
             failure: failed("clock_unavailable", "The login clock is unavailable.")
         }
@@ -433,29 +430,19 @@ fn clock_check_value(read: OAuthNowResultEnvelope, deadline_ms: int, previous_ms
         if current_ms < 0 || current_ms < previous_ms => {
             {
                 ok: false,
-                timed_out: false,
                 now_ms: current_ms,
                 failure: failed("clock_unavailable", "The login clock is unavailable.")
             }
         } else if current_ms >= deadline_ms => {
             {
                 ok: false,
-                timed_out: true,
                 now_ms: current_ms,
                 failure: failed("timeout", "Codex device login timed out.")
             }
         } else => {
-            {ok: true, timed_out: false, now_ms: current_ms, failure: failed("", "")}
+            {ok: true, now_ms: current_ms, failure: failed("", "")}
         }
     }
-}
-
-fn clock_check(policy: resource<auth.policy>, deadline_ms: int, previous_ms: int) -> DeviceClockCheck {
-    clock_check_value(oauth::now_ms_result(&policy), deadline_ms, previous_ms)
-}
-
-fn read_public_field(policy: resource<auth.policy>, body: string, pointer: string) -> PublicJsonFieldResultEnvelope {
-    oauth::public_json_field_result(&policy, body, pointer)
 }
 
 fn interval_from_field(field: PublicJsonFieldResultEnvelope) -> DeviceInterval {
