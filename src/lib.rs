@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod capabilities;
+pub mod cli;
 pub mod config;
 pub mod config_file;
 #[cfg(feature = "config-fixture")]
