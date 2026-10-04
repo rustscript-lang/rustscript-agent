@@ -1,0 +1,36 @@
+version: 1
+agent:
+  source: bundled:coding
+  max_turns: 64
+  max_tool_calls: 128
+  max_tool_output_bytes: 1048576
+model:
+  provider: openai-codex
+  model: gpt-5-codex
+providers:
+  openai-codex:
+    protocol: codex-responses
+    base_url: https://api.example.test/backend
+    auth: fixture-codex
+    oauth:
+      flow: codex-device
+      issuer: https://auth.example.test
+      client_id: synthetic-public-client
+      device_user_code_path: /api/accounts/deviceauth/usercode
+      device_poll_path: /api/accounts/deviceauth/token
+      authorization_path: /codex/device
+      token_endpoint: https://auth.example.test/oauth/token
+      redirect_uri: https://auth.example.test/deviceauth/callback
+      refresh_skew_seconds: 120
+workspaces:
+  allowed_roots:
+    - /assigned/test/workspace
+  default: /assigned/test/workspace
+approvals:
+  read: allow
+  write: ask
+  process: ask
+compaction:
+  enabled: true
+  max_context_messages: 120
+  retained_tail: 32
