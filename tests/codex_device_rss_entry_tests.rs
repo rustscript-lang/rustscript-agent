@@ -1638,6 +1638,59 @@ fn start_instruction_expiry_is_capped_by_remaining_fixed_deadline() {
 }
 
 #[test]
+fn low_retry_after_values_preserve_exponential_floor_and_pending_reset() {
+    const PROVIDER_POLL_PATH: &str = "/api/accounts/deviceauth/token";
+    for retry_after_ms in [0, 1, 1_000] {
+        let mut first_429 = ResponseSpec::poll(429);
+        first_429.retry_after_ms = Some(retry_after_ms);
+        let plan = Plan {
+            responses: VecDeque::from([
+                ResponseSpec::start(json!({"user_code":"SYNTHETIC-CODE-74","interval":5})),
+                first_429,
+                ResponseSpec::poll(429),
+                ResponseSpec::poll(404),
+                ResponseSpec::poll(200),
+                ResponseSpec::exchange(json!({"expires_in":3600}), false),
+            ]),
+            ..Plan::default()
+        };
+        let (mut vm, state, _, unrelated, secondary, result) = run_plan(plan);
+        let result = result.expect("low Retry-After flow reaches one-shot save");
+        assert_eq!(
+            field(&result, "ok"),
+            &Value::Bool(true),
+            "retry_after_ms={retry_after_ms}"
+        );
+        assert_eq!(field(&result, "code"), &Value::string("ok"));
+        let receipts = state.0.lock().expect("scripted receipts").receipts.clone();
+        assert_eq!(wait_receipts(&receipts), vec![10_000, 20_000, 5_000]);
+        assert_eq!(
+            request_receipts(&receipts)
+                .iter()
+                .map(|request| request.1.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/api/accounts/deviceauth/usercode",
+                PROVIDER_POLL_PATH,
+                PROVIDER_POLL_PATH,
+                PROVIDER_POLL_PATH,
+                PROVIDER_POLL_PATH,
+                "/oauth/token",
+            ]
+        );
+        assert_eq!(request_receipts(&receipts).len(), 6);
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| matches!(receipt, Receipt::Save { .. }))
+                .count(),
+            1
+        );
+        assert_terminal_resources(&mut vm, &state, unrelated, &secondary);
+    }
+}
+
+#[test]
 fn retry_after_backoff_caps_and_pending_resets_to_base_interval() {
     let mut retry_after = ResponseSpec::poll(429);
     retry_after.retry_after_ms = Some(90_000);
@@ -1914,6 +1967,103 @@ fn cancellation_at_each_boundary_stops_later_stages_and_still_cleans() {
         );
         assert_terminal_resources(&mut vm, &state, unrelated, &secondary);
     }
+}
+
+#[test]
+fn poll_provider_error_body_stays_out_of_public_result_and_receipts() {
+    let marker = "SCRIPTED_POLL_PROVIDER_BODY_PRIVATE_68c1";
+    let mut poll = ResponseSpec::poll(500);
+    poll.body = json!({"error":{"message":marker},"message":marker}).to_string();
+    let plan = Plan {
+        responses: VecDeque::from([
+            ResponseSpec::start(json!({"user_code":"SYNTHETIC-CODE-74","interval":1})),
+            poll,
+        ]),
+        ..Plan::default()
+    };
+    let (mut vm, state, _, unrelated, secondary, result) = run_plan(plan);
+    let result = result.expect("poll provider failure returns static typed result");
+    assert_eq!(result_code(&result), "poll_rejected");
+    assert!(!text(field(&result, "code")).contains(marker));
+    assert!(!text(field(&result, "message")).contains(marker));
+    let receipts = state.0.lock().expect("scripted receipts").receipts.clone();
+    assert_eq!(request_receipts(&receipts).len(), 2);
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| !matches!(receipt, Receipt::Save { .. }))
+    );
+    let rendered = format!("{result:?}{receipts:?}");
+    assert!(
+        !rendered.contains(marker),
+        "provider poll body remains private"
+    );
+    for private_resource_marker in [
+        DEVICE_PRIVATE,
+        CODE_PRIVATE,
+        VERIFIER_PRIVATE,
+        ACCESS_PRIVATE,
+        REFRESH_PRIVATE,
+    ] {
+        assert!(!rendered.contains(private_resource_marker));
+    }
+    assert_terminal_resources(&mut vm, &state, unrelated, &secondary);
+}
+
+#[test]
+fn exchange_provider_error_body_stays_out_of_public_result_and_receipts() {
+    let marker = "SCRIPTED_EXCHANGE_PROVIDER_BODY_PRIVATE_7d24";
+    let mut exchange =
+        ResponseSpec::exchange(json!({"error":{"message":marker},"message":marker}), false);
+    exchange.status = 429;
+    let plan = Plan {
+        responses: VecDeque::from([
+            ResponseSpec::start(json!({"user_code":"SYNTHETIC-CODE-74","interval":1})),
+            ResponseSpec::poll(200),
+            exchange,
+        ]),
+        ..Plan::default()
+    };
+    let (mut vm, state, _, unrelated, secondary, result) = run_plan(plan);
+    let result = result.expect("exchange provider failure returns static typed result");
+    assert_eq!(result_code(&result), "exchange_rejected");
+    assert!(!text(field(&result, "code")).contains(marker));
+    assert!(!text(field(&result, "message")).contains(marker));
+    let receipts = state.0.lock().expect("scripted receipts").receipts.clone();
+    let requests = request_receipts(&receipts);
+    assert_eq!(
+        requests.len(),
+        3,
+        "exchange is issued once and never retried"
+    );
+    assert_eq!(requests[2].1, "/oauth/token");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.1 == "/oauth/token")
+            .count(),
+        1
+    );
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| !matches!(receipt, Receipt::Save { .. }))
+    );
+    let rendered = format!("{result:?}{receipts:?}");
+    assert!(
+        !rendered.contains(marker),
+        "provider exchange body remains private"
+    );
+    for private_resource_marker in [
+        DEVICE_PRIVATE,
+        CODE_PRIVATE,
+        VERIFIER_PRIVATE,
+        ACCESS_PRIVATE,
+        REFRESH_PRIVATE,
+    ] {
+        assert!(!rendered.contains(private_resource_marker));
+    }
+    assert_terminal_resources(&mut vm, &state, unrelated, &secondary);
 }
 
 #[test]
