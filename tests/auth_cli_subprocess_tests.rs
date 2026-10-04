@@ -19,7 +19,7 @@ impl TestArea {
         let root = PathBuf::from(
             std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned Task6 TEMP"),
         );
-        let root = root.join(format!("task6-cli-{label}-{}", uuid::Uuid::new_v4()));
+        let root = root.join(format!("cli-subprocess-{label}-{}", uuid::Uuid::new_v4()));
         let caller = root.join("outside-repository");
         fs::create_dir_all(&caller).expect("create isolated caller directory");
         #[cfg(unix)]
@@ -110,7 +110,7 @@ impl TestArea {
         let evidence = PathBuf::from(
             std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned Task6 TEMP"),
         )
-        .join("task6-cli-subprocess-evidence");
+        .join("cli-subprocess-evidence");
         fs::create_dir_all(&evidence).expect("create persistent evidence directory");
         #[cfg(unix)]
         {

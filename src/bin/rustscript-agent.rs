@@ -298,7 +298,7 @@ mod tests {
             let temp = PathBuf::from(
                 env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned Task6 TEMP"),
             );
-            let root = temp.join(format!("f001-real-driver-{}", uuid::Uuid::new_v4()));
+            let root = temp.join(format!("cli-signal-driver-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&root).expect("create isolated RSS root");
             let path = root.join("main.rss");
             fs::write(&path, source).expect("write isolated RSS guest");

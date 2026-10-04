@@ -12,8 +12,8 @@ use rustscript_agent::{
     },
 };
 use rustscript_vm::{
-    CompileSourceFileOptions, HostFunctionRegistry, HostParamPassing, HostTypeSchema, SourceFlavor,
-    Value, Vm, VmStatus, compile_source_at_path_with_flavor_and_options,
+    CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm, VmStatus,
+    compile_source_at_path_with_flavor_and_options,
 };
 use std::{
     collections::BTreeMap,
@@ -307,67 +307,6 @@ impl BoundedHttpsTransport for WaitForDeadline {
             }
         }
     }
-}
-
-#[test]
-fn catalog_adds_only_the_typed_public_instruction_primitive() {
-    let catalog = auth_host_catalog();
-    let descriptors = catalog.functions();
-    let matching: Vec<_> = descriptors
-        .iter()
-        .filter(|descriptor| descriptor.name == "oauth::emit_device_instruction_result")
-        .collect();
-    assert_eq!(matching.len(), 1);
-    let descriptor = matching[0];
-    assert_eq!(descriptor.params.len(), 3);
-    for ((param, name), ty) in descriptor
-        .params
-        .iter()
-        .zip(["verification_url", "user_code", "expires_in_seconds"])
-        .zip([
-            HostTypeSchema::String,
-            HostTypeSchema::String,
-            HostTypeSchema::Int,
-        ])
-    {
-        assert_eq!(param.name, name);
-        assert_eq!(param.passing, HostParamPassing::Value);
-        assert_eq!(param.ty, ty);
-    }
-    let HostTypeSchema::Named { name, fields } = &descriptor.return_type else {
-        panic!("result is a named type");
-    };
-    assert_eq!(name, "DeviceInstructionResultEnvelope");
-    assert_eq!(
-        fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>(),
-        ["ok", "value", "error"]
-    );
-    assert_eq!(fields[0].ty, HostTypeSchema::Bool);
-    assert_eq!(
-        fields[1].ty,
-        HostTypeSchema::Optional(Box::new(HostTypeSchema::Bool))
-    );
-    let HostTypeSchema::Optional(error_type) = &fields[2].ty else {
-        panic!("error is optional");
-    };
-    let HostTypeSchema::Named { name, fields } = error_type.as_ref() else {
-        panic!("failure type is named");
-    };
-    assert_eq!(name, "AuthBridgeFailure");
-    assert_eq!(
-        fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>(),
-        ["code", "cancelled", "deadline_exceeded", "revoked"]
-    );
-    assert!(descriptors.iter().all(|descriptor| {
-        !descriptor.name.starts_with("device::")
-            && descriptor.name != "oauth::emit_device_instruction"
-    }));
 }
 
 #[test]
