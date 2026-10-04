@@ -98,6 +98,10 @@ const STATIC_ERROR_CODES: &[&str] = &[
     "transport_endpoint_unavailable",
     "transport_error",
     "transport_unavailable",
+    "ui_instruction_invalid",
+    "ui_sink_closed",
+    "ui_sink_full",
+    "ui_unavailable",
     "wait_deadline_exceeded",
     "wait_out_of_range",
 ];
@@ -274,6 +278,65 @@ fn wait_ms_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let owner = policy_owner(vm, args)?;
     let outcome = super::timing::wait_ms_call(vm, args);
     wrap_without_value(owner, outcome)
+}
+
+pub(super) fn emit_device_instruction_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::emit_device_instruction_result",
+        vec![
+            super::param("verification_url", HostTypeSchema::String),
+            super::param("user_code", HostTypeSchema::String),
+            super::param("expires_in_seconds", HostTypeSchema::Int),
+        ],
+        named(
+            "DeviceInstructionResultEnvelope",
+            vec![
+                ("ok", HostTypeSchema::Bool),
+                ("value", opt(HostTypeSchema::Bool)),
+                ("error", opt(failure_type())),
+            ],
+        ),
+        emit_device_instruction_result_call,
+    )
+}
+
+fn emit_device_instruction_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let owner = match super::bound(vm) {
+        Ok(owner) => owner,
+        Err(VmError::HostError(code)) => return device_instruction_failure(None, &code),
+        Err(failure) => return Err(failure),
+    };
+    match super::cli_io::emit_device_instruction_call(vm, args, &owner) {
+        Ok(CallOutcome::Return(CallReturn::One(Value::Bool(true)))) => result(object(vec![
+            ("ok", Value::Bool(true)),
+            ("value", Value::Bool(true)),
+            ("error", Value::Null),
+        ])),
+        Ok(_) => Err(VmError::InvalidFrameState(
+            "device instruction adapter returned an unexpected outcome",
+        )),
+        Err(VmError::HostError(code)) => device_instruction_failure(Some(&owner), &code),
+        Err(failure) => Err(failure),
+    }
+}
+
+fn device_instruction_failure(owner: Option<&Owner>, code: &str) -> VmResult<CallOutcome> {
+    let failure = owner
+        .map(|owner| failure_value(owner, code))
+        .unwrap_or_else(|| {
+            let code = recognized_code(code);
+            object(vec![
+                ("code", Value::string(code)),
+                ("cancelled", Value::Bool(false)),
+                ("deadline_exceeded", Value::Bool(false)),
+                ("revoked", Value::Bool(false)),
+            ])
+        });
+    result(object(vec![
+        ("ok", Value::Bool(false)),
+        ("value", Value::Null),
+        ("error", failure),
+    ]))
 }
 
 pub(super) fn public_json_field_result_desc() -> HostFunctionDescriptor {

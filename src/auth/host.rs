@@ -40,6 +40,7 @@ use crate::runtime::rss_runner::RunCancellation;
 const LIMIT: usize = 64;
 
 mod capture;
+mod cli_io;
 mod device;
 mod fallible;
 mod flow;
@@ -47,6 +48,11 @@ mod payload;
 mod public_json;
 mod timing;
 mod transients;
+
+pub use cli_io::{
+    DeviceInstructionSender, PublicDeviceInstruction, RunOAuthCancel, SystemOAuthClock,
+    device_instruction_channel,
+};
 
 macro_rules! resource {
     ($name:ident, $key:literal, $description:literal) => {
@@ -141,6 +147,7 @@ struct Owner {
     store: AuthStore,
     oauth: Option<Arc<OAuthHost>>,
     oauth_callback_fixture: bool,
+    device_instruction_sender: Option<DeviceInstructionSender>,
 }
 impl Owner {
     fn check(&self) -> VmResult<()> {
@@ -180,6 +187,7 @@ pub struct AuthHost {
     owners: Mutex<Vec<std::sync::Weak<Owner>>>,
     oauth: Option<Arc<OAuthHost>>,
     oauth_callback_fixture: bool,
+    device_instruction_sender: Option<DeviceInstructionSender>,
 }
 
 impl AuthHost {
@@ -238,12 +246,19 @@ impl AuthHost {
             owners: Mutex::new(Vec::new()),
             oauth: None,
             oauth_callback_fixture: false,
+            device_instruction_sender: None,
         })
     }
 
     /// Explicit transport dependency; no implicit network or fixture default.
     pub fn with_oauth_host(mut self, oauth: Arc<OAuthHost>) -> Self {
         self.oauth = Some(oauth);
+        self
+    }
+
+    /// Attach an explicitly supplied bounded native device-instruction queue.
+    pub fn with_device_instruction_sender(mut self, sender: DeviceInstructionSender) -> Self {
+        self.device_instruction_sender = Some(sender);
         self
     }
 
@@ -314,6 +329,7 @@ impl AuthHost {
             store: self.store.clone(),
             oauth: self.oauth.clone(),
             oauth_callback_fixture: self.oauth_callback_fixture,
+            device_instruction_sender: self.device_instruction_sender.clone(),
         });
         owner.check()?;
         let mut context = vm.host_context();
@@ -1264,6 +1280,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             fallible::delete_result_desc,
             fallible::now_ms_result_desc,
             fallible::wait_ms_result_desc,
+            fallible::emit_device_instruction_result_desc,
             fallible::public_json_field_result_desc,
             transients::cleanup_desc,
             public_json::public_json_field_desc,
