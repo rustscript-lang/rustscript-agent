@@ -270,6 +270,24 @@ impl BoundedHttpsTransport for CancelDuringTransport {
     }
 }
 
+struct TokenOnlyCancelDuringTransport {
+    cancellation: RunCancellation,
+    calls: AtomicUsize,
+}
+
+impl BoundedHttpsTransport for TokenOnlyCancelDuringTransport {
+    fn send(
+        &self,
+        _: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.cancellation.token().cancel();
+        context.check()?;
+        unreachable!("token-only cancellation is observed by the OAuth I/O context")
+    }
+}
+
 struct WaitForDeadline {
     calls: AtomicUsize,
 }
@@ -697,16 +715,17 @@ fn real_rss_system_clock_and_invocation_cancel_adapter_drive_oauth_context() {
     assert_eq!(field(&now, "error"), &Value::Null);
 
     let process_cancellation = RunCancellation::new();
+    let owner_cancellation = standard_cancellation();
     let cancel_transport = Arc::new(CancelDuringTransport {
         cancellation: process_cancellation.clone(),
         calls: AtomicUsize::new(0),
     });
     let transport_home = TempHome::new("cancel-context");
-    let transport_auth = AuthHost::new(transport_home.0.clone(), standard_cancellation())
+    let transport_auth = AuthHost::new(transport_home.0.clone(), owner_cancellation.clone())
         .expect("transport auth host")
         .with_oauth_host(test_oauth_host(
             cancel_transport.clone(),
-            process_cancellation,
+            process_cancellation.clone(),
         ));
     let (mut transport_vm, host_home) = bound_vm(&transport_auth);
     let policy = invoke(&mut transport_vm, "snapshot", &[host_home]);
@@ -724,6 +743,50 @@ fn real_rss_system_clock_and_invocation_cancel_adapter_drive_oauth_context() {
         field(field(&cancelled, "error"), "deadline_exceeded"),
         &Value::Bool(false)
     );
+    assert!(process_cancellation.requested().is_some());
+    assert!(process_cancellation.token().is_cancelled());
+    assert!(owner_cancellation.requested().is_none());
+    assert!(!owner_cancellation.token().is_cancelled());
+
+    let token_only_cancellation = RunCancellation::new();
+    let token_only_owner_cancellation = standard_cancellation();
+    let token_only_transport = Arc::new(TokenOnlyCancelDuringTransport {
+        cancellation: token_only_cancellation.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let token_only_home = TempHome::new("token-only-cancel-context");
+    let token_only_auth = AuthHost::new(
+        token_only_home.0.clone(),
+        token_only_owner_cancellation.clone(),
+    )
+    .expect("token-only transport auth host")
+    .with_oauth_host(test_oauth_host(
+        token_only_transport.clone(),
+        token_only_cancellation.clone(),
+    ));
+    let (mut token_only_vm, host_home) = bound_vm(&token_only_auth);
+    let policy = invoke(&mut token_only_vm, "snapshot", &[host_home]);
+    let token_only_started = Instant::now();
+    let token_only_result = invoke(&mut token_only_vm, "send_result", &[policy]);
+    assert!(token_only_started.elapsed() < Duration::from_secs(1));
+    assert_eq!(token_only_transport.calls.load(Ordering::Acquire), 1);
+    assert_eq!(field(&token_only_result, "ok"), &Value::Bool(false));
+    assert_eq!(
+        text(field(field(&token_only_result, "error"), "code")),
+        "cancelled"
+    );
+    assert_eq!(
+        field(field(&token_only_result, "error"), "cancelled"),
+        &Value::Bool(true)
+    );
+    assert_eq!(
+        field(field(&token_only_result, "error"), "deadline_exceeded"),
+        &Value::Bool(false)
+    );
+    assert!(token_only_cancellation.requested().is_none());
+    assert!(token_only_cancellation.token().is_cancelled());
+    assert!(token_only_owner_cancellation.requested().is_none());
+    assert!(!token_only_owner_cancellation.token().is_cancelled());
 
     let deadline_transport = Arc::new(WaitForDeadline {
         calls: AtomicUsize::new(0),

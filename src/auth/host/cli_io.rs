@@ -84,9 +84,10 @@ impl RunOAuthCancel {
 
 impl OAuthCancel for RunOAuthCancel {
     fn is_cancelled(&self) -> bool {
-        // A deadline is checked separately by OAuthIoContext. `requested` is
-        // shared with the parent invocation; the child owns its own watcher.
-        self.invocation.requested().is_some()
+        // `requested` is shared with the parent invocation; the child owns its own watcher.
+        // The token can be cancelled independently of a typed run request.
+        // OAuthIoContext checks the deadline separately.
+        self.invocation.token().is_cancelled() || self.invocation.requested().is_some()
     }
 }
 
