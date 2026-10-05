@@ -1,5 +1,6 @@
 //! Native device-instruction output adapters.
 
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 
 #[cfg(unix)]
@@ -32,6 +33,7 @@ const SECRET_QUERY_KEYS: &[&str] = &[
 
 /// A bounded Unix descriptor sink for public device-login instructions.
 pub struct NativeDeviceInstructionOutput {
+    #[cfg(unix)]
     fd: OwnedFd,
     #[cfg(unix)]
     close_on_exec_ready: bool,
@@ -39,12 +41,11 @@ pub struct NativeDeviceInstructionOutput {
 
 impl NativeDeviceInstructionOutput {
     /// Take ownership of an explicitly selected native output descriptor.
+    #[cfg(unix)]
     pub fn from_fd(fd: OwnedFd) -> Self {
-        #[cfg(unix)]
         let close_on_exec_ready = ensure_close_on_exec(fd.as_raw_fd());
         Self {
             fd,
-            #[cfg(unix)]
             close_on_exec_ready,
         }
     }
@@ -109,7 +110,6 @@ impl DeviceInstructionSink for NativeDeviceInstructionOutput {
         context: &OAuthIoContext,
     ) -> Result<(), OAuthError> {
         context.check()?;
-        let _owned_descriptor = &self.fd;
         Err(output_failure())
     }
 }
