@@ -177,6 +177,7 @@ struct Bound(Arc<Owner>);
 enum AdmissionMode {
     Strict,
     Enrollment(String),
+    Login,
     Commands,
 }
 
@@ -213,6 +214,14 @@ impl AuthHost {
         )
     }
 
+    /// Trusted native opt-in for login using configured credential references only.
+    pub fn new_for_login(
+        home: impl Into<PathBuf>,
+        cancellation: RunCancellation,
+    ) -> Result<Self, String> {
+        Self::construct(home.into(), cancellation, AdmissionMode::Login)
+    }
+
     /// Trusted native opt-in for bounded auth-command diagnostics and mutations.
     pub fn new_for_commands(
         home: impl Into<PathBuf>,
@@ -234,7 +243,10 @@ impl AuthHost {
         }
         let paths = AgentPaths::from_home(home).map_err(|_| "invalid_host_home")?;
         let store = match &admission {
-            AdmissionMode::Commands => AuthStore::open_for_commands(paths.clone()),
+            AdmissionMode::Commands | AdmissionMode::Login => {
+                // Login must inspect config before RSS decides whether to save credentials.
+                AuthStore::open_for_commands(paths.clone())
+            }
             AdmissionMode::Strict | AdmissionMode::Enrollment(_) => AuthStore::open(paths.clone()),
         }
         .map_err(|_| "auth_store_unavailable")?;
@@ -693,6 +705,16 @@ fn load_snapshot(
                     .map_err(|_| "credential_reference_invalid")?;
             }
             BTreeSet::from([id.clone()])
+        }
+        AdmissionMode::Login => {
+            if configured.len() > LIMIT {
+                return Err("credential_limit_exceeded".into());
+            }
+            for id in &configured {
+                CredentialId::new(id.clone()).map_err(|_| "invalid_credential_id")?;
+            }
+            // Login admission is config-scoped; only Commands includes orphan store entries.
+            configured
         }
         AdmissionMode::Commands => {
             let mut union = configured;
