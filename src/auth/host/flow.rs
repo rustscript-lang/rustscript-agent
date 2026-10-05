@@ -512,12 +512,33 @@ pub(super) fn pkce_begin_desc() -> HostFunctionDescriptor {
     )
 }
 
+pub(super) fn pkce_begin_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::pkce_begin_result",
+        vec![
+            borrow("policy_handle", key("auth.policy")),
+            super::param("public_intent", public_intent_type()),
+        ],
+        super::fallible::result_type("PkceBeginResultEnvelope", pkce_begin_envelope()),
+        pkce_begin_result_call,
+    )
+}
+
 pub(super) fn callback_wait_desc() -> HostFunctionDescriptor {
     desc(
         "oauth::callback_wait",
         vec![borrow("callback_handle", resource(CALLBACK_KEY))],
         callback_envelope(),
         callback_wait_call,
+    )
+}
+
+pub(super) fn callback_wait_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::callback_wait_result",
+        vec![borrow("callback_handle", resource(CALLBACK_KEY))],
+        super::fallible::result_type("CallbackResultEnvelope", callback_envelope()),
+        callback_wait_result_call,
     )
 }
 
@@ -551,6 +572,13 @@ pub(super) fn close_verifier_desc() -> HostFunctionDescriptor {
 
 pub(super) fn close_code_desc() -> HostFunctionDescriptor {
     close_desc("oauth::close_code", CODE_KEY, close_code_call)
+}
+
+fn pkce_begin_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let policy_value = args.first().ok_or_else(|| error("invalid_request"))?;
+    let owner = super::policy_owner_for_cleanup(vm, policy_value)?;
+    let outcome = pkce_begin_call(vm, args);
+    super::fallible::wrap_value(owner, outcome)
 }
 
 fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
@@ -642,6 +670,13 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         ("callback_handle", callback_value),
         ("verifier_handle", verifier_value),
     ]))
+}
+
+fn callback_wait_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let callback_value = args.first().ok_or_else(|| error("invalid_request"))?;
+    let owner = owner_for_cleanup::<CallbackResource>(vm, callback_value)?;
+    let outcome = callback_wait_call(vm, args);
+    super::fallible::wrap_value(owner, outcome)
 }
 
 fn callback_wait_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {

@@ -408,7 +408,7 @@ fn failure_value(owner: &Owner, code: &str) -> Value {
     ])
 }
 
-fn wrap_value(
+pub(super) fn wrap_value(
     owner: std::sync::Arc<Owner>,
     outcome: VmResult<CallOutcome>,
 ) -> VmResult<CallOutcome> {

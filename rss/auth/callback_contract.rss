@@ -26,3 +26,15 @@ pub fn close_verifier(verifier_handle: resource<oauth.verifier>) -> null {
 pub fn close_code(code_handle: resource<oauth.authorization_code>) -> null {
     oauth::close_code(code_handle)
 }
+
+pub fn begin_result(
+    home: resource<auth.host_home>,
+    intent: BoundedPublicOAuthIntent
+) -> PkceBeginResultEnvelope {
+    let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
+    oauth::pkce_begin_result(&snapshot.policy_handle, intent)
+}
+
+pub fn wait_result(callback_handle: resource<oauth.callback>) -> CallbackResultEnvelope {
+    oauth::callback_wait_result(&callback_handle)
+}
