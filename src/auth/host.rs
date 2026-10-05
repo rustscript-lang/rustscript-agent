@@ -50,9 +50,10 @@ mod public_json;
 mod timing;
 mod transients;
 
+pub use crate::auth::device_output::NativeDeviceInstructionOutput;
 pub use cli_io::{
-    DeviceInstructionSender, PublicDeviceInstruction, RunOAuthCancel, SystemOAuthClock,
-    device_instruction_channel,
+    DeviceInstructionSender, DeviceInstructionSink, PublicDeviceInstruction, RunOAuthCancel,
+    SystemOAuthClock, device_instruction_channel,
 };
 pub use paths::ConfigPathHost;
 pub(crate) use paths::PATH_IMPORT_NAME;
