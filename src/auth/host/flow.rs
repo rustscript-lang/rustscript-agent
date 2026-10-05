@@ -558,7 +558,7 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let public_intent = args.get(1).ok_or_else(|| error("invalid_request"))?;
     let (intent, credential_id) = parse_public_intent(public_intent)?;
     let owner = policy_owner(vm, policy_value, &credential_id)?;
-    if !owner.oauth_callback_fixture {
+    if !owner.oauth_callback_available() {
         return Err(error("callback_unavailable"));
     }
     let credential_generation = owner
@@ -653,7 +653,7 @@ fn callback_wait_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         rollback_resources(vm, &flow);
         return Err(failure);
     }
-    if !owner.oauth_callback_fixture || owner.snapshot.generation != flow.policy_generation {
+    if !owner.oauth_callback_available() || owner.snapshot.generation != flow.policy_generation {
         rollback_resources(vm, &flow);
         return Err(error("policy_inactive"));
     }

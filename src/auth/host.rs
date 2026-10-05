@@ -151,6 +151,7 @@ struct Owner {
     store: AuthStore,
     oauth: Option<Arc<OAuthHost>>,
     oauth_callback_fixture: bool,
+    oauth_callback_native: bool,
     device_instruction_sender: Option<DeviceInstructionSender>,
 }
 impl Owner {
@@ -170,6 +171,9 @@ impl Owner {
         }
         CredentialId::new(id.to_owned()).map_err(|_| error("invalid_credential_id"))?;
         Ok(())
+    }
+    fn oauth_callback_available(&self) -> bool {
+        self.oauth_callback_fixture || self.oauth_callback_native
     }
 }
 struct Bound(Arc<Owner>);
@@ -335,6 +339,10 @@ impl AuthHost {
             .cancellation
             .deadline_instant()
             .ok_or_else(|| error("finite_deadline_required"))?;
+        let oauth = self.oauth.clone();
+        let oauth_callback_native = oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.has_native_callbacks());
         let owner = Arc::new(Owner {
             identity: Uuid::new_v4().to_string(),
             deadline,
@@ -343,8 +351,9 @@ impl AuthHost {
             policy: Mutex::new(None),
             snapshot,
             store: self.store.clone(),
-            oauth: self.oauth.clone(),
+            oauth,
             oauth_callback_fixture: self.oauth_callback_fixture,
+            oauth_callback_native,
             device_instruction_sender: self.device_instruction_sender.clone(),
         });
         owner.check()?;
