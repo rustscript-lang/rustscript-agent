@@ -39,6 +39,7 @@ use crate::runtime::rss_runner::RunCancellation;
 
 const LIMIT: usize = 64;
 
+mod authorization_io;
 mod capture;
 mod cli_io;
 mod device;
@@ -49,6 +50,11 @@ mod payload;
 mod public_json;
 mod timing;
 mod transients;
+
+pub use authorization_io::{
+    AuthorizationInstructionSender, PublicAuthorizationInstruction,
+    authorization_instruction_channel,
+};
 
 pub use crate::auth::device_output::NativeDeviceInstructionOutput;
 pub use cli_io::{
@@ -153,6 +159,7 @@ struct Owner {
     oauth_callback_fixture: bool,
     oauth_callback_native: bool,
     device_instruction_sender: Option<DeviceInstructionSender>,
+    authorization_instruction_sender: Option<AuthorizationInstructionSender>,
 }
 impl Owner {
     fn check(&self) -> VmResult<()> {
@@ -197,6 +204,7 @@ pub struct AuthHost {
     oauth: Option<Arc<OAuthHost>>,
     oauth_callback_fixture: bool,
     device_instruction_sender: Option<DeviceInstructionSender>,
+    authorization_instruction_sender: Option<AuthorizationInstructionSender>,
 }
 
 impl AuthHost {
@@ -267,6 +275,7 @@ impl AuthHost {
             oauth: None,
             oauth_callback_fixture: false,
             device_instruction_sender: None,
+            authorization_instruction_sender: None,
         })
     }
 
@@ -279,6 +288,15 @@ impl AuthHost {
     /// Attach an explicitly supplied bounded native device-instruction queue.
     pub fn with_device_instruction_sender(mut self, sender: DeviceInstructionSender) -> Self {
         self.device_instruction_sender = Some(sender);
+        self
+    }
+
+    /// Attach a native bounded authorization-instruction queue explicitly.
+    pub fn with_authorization_instruction_sender(
+        mut self,
+        sender: AuthorizationInstructionSender,
+    ) -> Self {
+        self.authorization_instruction_sender = Some(sender);
         self
     }
 
@@ -355,6 +373,7 @@ impl AuthHost {
             oauth_callback_fixture: self.oauth_callback_fixture,
             oauth_callback_native,
             device_instruction_sender: self.device_instruction_sender.clone(),
+            authorization_instruction_sender: self.authorization_instruction_sender.clone(),
         });
         owner.check()?;
         let mut context = vm.host_context();
@@ -1324,6 +1343,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             fallible::now_ms_result_desc,
             fallible::wait_ms_result_desc,
             fallible::emit_device_instruction_result_desc,
+            fallible::emit_authorization_instruction_result_desc,
             fallible::public_json_field_result_desc,
             transients::cleanup_desc,
             public_json::public_json_field_desc,
