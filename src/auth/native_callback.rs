@@ -1,5 +1,7 @@
 //! Owned, bounded loopback callback sessions for native OAuth flows.
 
+pub mod manual_input;
+
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
