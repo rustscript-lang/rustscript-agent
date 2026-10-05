@@ -173,7 +173,7 @@ impl NativePreparedCallbackSession {
                         state.parsed = Some(Err(invalid("callback request exceeds limit")));
                         Step::Pending
                     } else {
-                        let mut bytes = [0_u8; READ_CHUNK_BYTES];
+                        let mut bytes = Zeroizing::new([0_u8; READ_CHUNK_BYTES]);
                         let read_limit = remaining.min(bytes.len());
                         let stream = state.stream.as_mut().expect("accepted stream");
                         match stream.read(&mut bytes[..read_limit]) {
