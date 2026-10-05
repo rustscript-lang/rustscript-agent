@@ -4,9 +4,17 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
-use rustscript_agent::auth::host::{AuthHost, ConfigPathHost};
+use rustscript_agent::auth::host::{
+    AuthHost, ConfigPathHost, DeviceInstructionSender, NativeDeviceInstructionOutput,
+    RunOAuthCancel, SystemOAuthClock,
+};
+use rustscript_agent::auth::native_https::NativeHttpsTransport;
+use rustscript_agent::auth::oauth::{
+    BrowserOpener, CallbackWaiter, OAuthError, OAuthHost, OAuthIoContext, RawCallbackInput,
+};
 use rustscript_agent::cli::{
     CliInvocation, CliOutput, cli_usage, execute_auth_cli, execute_config_path_cli, parse_cli_args,
     resolve_cli_paths,
@@ -146,6 +154,28 @@ fn execute_invocation(invocation: CliInvocation, cancellation: RunCancellation) 
     }
 }
 
+struct UnavailableCallbackWaiter;
+
+impl CallbackWaiter for UnavailableCallbackWaiter {
+    fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
+        context.check()?;
+        Err(OAuthError::Transport {
+            message: "callback unavailable in this CLI".to_owned(),
+        })
+    }
+}
+
+struct UnavailableBrowserOpener;
+
+impl BrowserOpener for UnavailableBrowserOpener {
+    fn open(&self, _url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+        context.check()?;
+        Err(OAuthError::Transport {
+            message: "browser unavailable in this CLI".to_owned(),
+        })
+    }
+}
+
 fn execute_auth(
     input: rustscript_agent::runtime::AuthCommandInput,
     cancellation: &RunCancellation,
@@ -161,7 +191,21 @@ fn execute_auth(
     let configured_login = input.operation == "auth.login";
     execute_auth_cli(&runner, input, cancellation, move |child| {
         if configured_login {
-            AuthHost::new_for_login(paths.home, child)
+            let host = AuthHost::new_for_login(paths.home, child.clone())?;
+            let oauth = Arc::new(OAuthHost::new(
+                Arc::new(NativeHttpsTransport::new()),
+                Arc::new(UnavailableCallbackWaiter),
+                Arc::new(UnavailableBrowserOpener),
+                Arc::new(SystemOAuthClock),
+                Arc::new(RunOAuthCancel::new(child.clone())),
+            ));
+            let host = host.with_oauth_host(oauth);
+            Ok(match NativeDeviceInstructionOutput::stderr() {
+                Ok(output) => host.with_device_instruction_sender(
+                    DeviceInstructionSender::from_sink(Arc::new(output)),
+                ),
+                Err(_) => host,
+            })
         } else {
             AuthHost::new_for_commands(paths.home, child)
         }

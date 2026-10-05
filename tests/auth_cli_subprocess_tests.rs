@@ -1,10 +1,22 @@
 use std::fs;
-#[cfg(all(feature = "default", not(feature = "config-fixture")))]
-use std::io::Read;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+#[cfg(unix)]
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::process::Child;
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc,
+};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 const ACCESS_TOKEN: &str = "SYNTHETIC_ACCESS_TOKEN";
 const REFRESH_TOKEN: &str = "SYNTHETIC_REFRESH_TOKEN";
 const BACKEND_SECRET_MARKER: &str = "acct_synthetic";
@@ -1360,6 +1372,583 @@ fn parser_help_and_literal_values_are_redacted_without_home_resolution() {
     assert_eq!(literal_script.status.code(), Some(1));
     assert_eq!(literal_script.stderr, b"agent_compile_failed\n");
     assert!(!String::from_utf8_lossy(&literal_script.stdout).contains("Usage:"));
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum TrustServerEvent {
+    TcpAccepted,
+    Handshake {
+        inbound_bytes: usize,
+        outbound_bytes: usize,
+        completed: bool,
+    },
+}
+
+#[cfg(target_os = "linux")]
+struct ObservedTcpStream {
+    stream: tokio::net::TcpStream,
+    inbound_bytes: Arc<AtomicUsize>,
+    outbound_bytes: Arc<AtomicUsize>,
+}
+
+#[cfg(target_os = "linux")]
+impl tokio::io::AsyncRead for ObservedTcpStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut this.stream).poll_read(context, buffer);
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            this.inbound_bytes
+                .fetch_add(buffer.filled().len() - before, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl tokio::io::AsyncWrite for ObservedTcpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.stream).poll_write(context, bytes) {
+            std::task::Poll::Ready(Ok(written)) => {
+                this.outbound_bytes.fetch_add(written, Ordering::Relaxed);
+                std::task::Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn untrusted_tls_server_config() -> Arc<rustls::ServerConfig> {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+        .expect("generate local self-signed certificate");
+    Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                    .into(),
+            )
+            .expect("configure local TLS server"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_trust_server(
+    listener: TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> (
+    mpsc::Receiver<TrustServerEvent>,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let (sender, receiver) = mpsc::sync_channel(2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let worker = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create bounded local TLS fixture runtime");
+        runtime.block_on(async move {
+            let accept_deadline = Instant::now() + Duration::from_secs(10);
+            let tcp = loop {
+                if worker_stop.load(Ordering::Acquire) || Instant::now() >= accept_deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((tcp, _)) => break tcp,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(_) => return,
+                }
+            };
+            let accepted_at = Instant::now();
+            let _ = sender.send(TrustServerEvent::TcpAccepted);
+            if tcp.set_nonblocking(true).is_err() {
+                return;
+            }
+            let Ok(stream) = tokio::net::TcpStream::from_std(tcp) else {
+                return;
+            };
+            let inbound_bytes = Arc::new(AtomicUsize::new(0));
+            let outbound_bytes = Arc::new(AtomicUsize::new(0));
+            let observed = ObservedTcpStream {
+                stream,
+                inbound_bytes: Arc::clone(&inbound_bytes),
+                outbound_bytes: Arc::clone(&outbound_bytes),
+            };
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+            let deadline = tokio::time::Instant::from_std(accepted_at + Duration::from_secs(10));
+            let handshake = tokio::time::timeout_at(deadline, acceptor.accept(observed)).await;
+            let _ = sender.send(TrustServerEvent::Handshake {
+                inbound_bytes: inbound_bytes.load(Ordering::Relaxed),
+                outbound_bytes: outbound_bytes.load(Ordering::Relaxed),
+                completed: matches!(handshake, Ok(Ok(_))),
+            });
+        });
+    });
+    (receiver, stop, worker)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum StallServerEvent {
+    TcpAccepted,
+    ClientHello([u8; 5]),
+    PeerClosed { closed: bool, trailing_bytes: usize },
+    ReadFailed,
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_stalled_tls_server(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+) -> (mpsc::Receiver<StallServerEvent>, thread::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::sync_channel(3);
+    let worker = thread::spawn(move || {
+        let accept_deadline = Instant::now() + Duration::from_secs(10);
+        let mut tcp = loop {
+            if stop.load(Ordering::Acquire) || Instant::now() >= accept_deadline {
+                return;
+            }
+            match listener.accept() {
+                Ok((tcp, _)) => break tcp,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        };
+        let accepted_at = Instant::now();
+        let _ = sender.send(StallServerEvent::TcpAccepted);
+        if tcp.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+            let _ = sender.send(StallServerEvent::ReadFailed);
+            return;
+        }
+        let mut client_hello_record = [0u8; 5];
+        if tcp.read_exact(&mut client_hello_record).is_err() {
+            let _ = sender.send(StallServerEvent::ReadFailed);
+            return;
+        }
+        let _ = sender.send(StallServerEvent::ClientHello(client_hello_record));
+
+        let mut trailing_bytes = 0usize;
+        let close_deadline = accepted_at + Duration::from_secs(10);
+        let mut buffer = [0u8; 1024];
+        let closed = loop {
+            let remaining = close_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            if tcp.set_read_timeout(Some(remaining)).is_err() {
+                break false;
+            }
+            match tcp.read(&mut buffer) {
+                Ok(0) => break true,
+                Ok(read) => {
+                    trailing_bytes = trailing_bytes.saturating_add(read);
+                    if trailing_bytes > 64 * 1024 {
+                        break false;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break false;
+                }
+                Err(_) => break false,
+            }
+        };
+        let _ = sender.send(StallServerEvent::PeerClosed {
+            closed,
+            trailing_bytes,
+        });
+    });
+    (receiver, worker)
+}
+
+#[cfg(target_os = "linux")]
+fn local_listener() -> TcpListener {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback listener");
+    listener
+        .set_nonblocking(true)
+        .expect("make loopback listener nonblocking");
+    listener
+}
+
+#[cfg(target_os = "linux")]
+fn device_login_home(area: &TestArea, label: &str, port: u16) -> PathBuf {
+    let home = area.root.join(label);
+    fs::create_dir(&home).expect("create fresh local-login home");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_device/config.yaml");
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(fixture).expect("read device-login fixture"))
+            .expect("parse device-login fixture");
+    let authority = format!("https://localhost:{port}");
+    config["providers"]["openai-codex"]["oauth"]["issuer"] =
+        serde_yaml::Value::String(authority.clone());
+    config["providers"]["openai-codex"]["oauth"]["token_endpoint"] =
+        serde_yaml::Value::String(format!("{authority}/oauth/token"));
+    config["providers"]["openai-codex"]["oauth"]["redirect_uri"] =
+        serde_yaml::Value::String(format!("{authority}/deviceauth/callback"));
+    fs::write(
+        home.join("config.yaml"),
+        serde_yaml::to_string(&config).expect("serialize local device-login config"),
+    )
+    .expect("write local device-login config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+            .expect("restrict local-login home");
+        fs::set_permissions(home.join("config.yaml"), fs::Permissions::from_mode(0o600))
+            .expect("restrict local-login config");
+    }
+    home
+}
+
+#[cfg(target_os = "linux")]
+fn copied_binary(area: &TestArea) -> PathBuf {
+    let copied = area.caller.join("rustscript-agent");
+    fs::copy(area.binary(), &copied).expect("stage actual Cargo executable outside checkout");
+    copied
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_copied_login(area: &TestArea, binary: &Path, home: &Path) -> (Child, Vec<String>, i32) {
+    use std::os::unix::process::CommandExt;
+
+    let args = ["auth", "login", "openai-codex"];
+    let argv: Vec<String> = std::iter::once(binary.to_string_lossy().into_owned())
+        .chain(args.iter().map(|arg| (*arg).to_owned()))
+        .collect();
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .env("RUSTSCRIPT_AGENT_HOME", home)
+        .env("HOME", area.root.join("isolated-default-home"))
+        .env_remove("USERPROFILE")
+        .current_dir(&area.caller)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let child = command.spawn().expect("spawn copied auth.login executable");
+    let process_group = unsafe { libc::getpgid(child.id() as libc::pid_t) };
+    assert_eq!(
+        process_group,
+        child.id() as i32,
+        "CLI owns its process group"
+    );
+    (child, argv, process_group)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll copied CLI child").is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_copied_child(
+    area: &TestArea,
+    mut child: Child,
+    argv: &[String],
+    process_group: i32,
+    timeout: Duration,
+) -> Output {
+    let exited = wait_for_child_exit(&mut child, timeout);
+    if !exited {
+        // SAFETY: the isolated process group is owned by this test invocation.
+        let _ = unsafe { libc::kill(-(process_group as libc::pid_t), libc::SIGKILL) };
+        let reaped = wait_for_child_exit(&mut child, Duration::from_secs(2));
+        assert!(reaped, "timed-out copied CLI process group was not reaped");
+    }
+    let pid = child.id();
+    let output = child
+        .wait_with_output()
+        .expect("collect bounded copied CLI output");
+    area.record(argv, pid, &output, process_group);
+    output
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_trust_event(
+    receiver: &mpsc::Receiver<TrustServerEvent>,
+    child: &mut Child,
+    stop: &AtomicBool,
+) -> Option<TrustServerEvent> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => return Some(event),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if child.try_wait().expect("poll copied CLI startup").is_some() {
+            stop.store(true, Ordering::Release);
+            return None;
+        }
+        if Instant::now() >= deadline {
+            stop.store(true, Ordering::Release);
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_stall_event(
+    receiver: &mpsc::Receiver<StallServerEvent>,
+    child: &mut Child,
+    stop: &AtomicBool,
+) -> Option<StallServerEvent> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => return Some(event),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if child.try_wait().expect("poll copied CLI startup").is_some() {
+            stop.store(true, Ordering::Release);
+            return None;
+        }
+        if Instant::now() >= deadline {
+            stop.store(true, Ordering::Release);
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn copied_login_reaches_untrusted_local_tls_and_keeps_home_unchanged() {
+    let area = TestArea::new("login-untrusted-local-tls");
+    assert!(!area.caller.starts_with(env!("CARGO_MANIFEST_DIR")));
+    let copied = copied_binary(&area);
+    let tls_config = untrusted_tls_server_config();
+    let listener = local_listener();
+    let port = listener.local_addr().expect("local TLS port").port();
+    let home = device_login_home(&area, "fresh-home", port);
+    let config_before = fs::read(home.join("config.yaml")).expect("snapshot local config");
+    let entries_before = directory_entries(&home);
+    assert_eq!(entries_before, ["config.yaml"]);
+    let (receiver, stop, server) = spawn_trust_server(listener, tls_config);
+    let (mut child, argv, process_group) = spawn_copied_login(&area, &copied, &home);
+
+    let accepted = wait_for_trust_event(&receiver, &mut child, &stop);
+    match accepted {
+        Some(TrustServerEvent::TcpAccepted) => (),
+        other => {
+            let output =
+                finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+            stop.store(true, Ordering::Release);
+            server.join().expect("join stopped trust server");
+            assert_eq!(output.status.code(), Some(1));
+            assert_eq!(output.stdout, b"start_transport_failed\n");
+            assert_eq!(output.stderr, b"start_transport_failed\n");
+            panic!("copied login had no real local TCP acceptance: {other:?}")
+        }
+    }
+
+    let handshake = receiver.recv_timeout(Duration::from_secs(10));
+    let output = finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+    server.join().expect("join completed untrusted TLS server");
+    let handshake = match handshake {
+        Ok(TrustServerEvent::Handshake {
+            inbound_bytes,
+            outbound_bytes,
+            completed,
+        }) => (inbound_bytes, outbound_bytes, completed),
+        other => panic!("missing bounded TLS handshake evidence: {other:?}; {output:?}"),
+    };
+    let (inbound_bytes, outbound_bytes, completed) = handshake;
+    assert!(inbound_bytes > 0, "server received actual TLS client bytes");
+    assert!(
+        outbound_bytes > 0,
+        "server sent its self-signed TLS certificate"
+    );
+    assert!(
+        !completed,
+        "public-root client rejected the self-signed certificate"
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"start_transport_failed\n");
+    assert_eq!(output.stderr, b"start_transport_failed\n");
+    assert_redacted(&output, &home);
+    assert_eq!(directory_entries(&home), entries_before);
+    assert_eq!(
+        fs::read(home.join("config.yaml")).expect("local config remains unchanged"),
+        config_before
+    );
+    assert!(!home.join("auth.yaml").exists());
+    assert!(!home.join("auth.yaml.lock").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn copied_login_sigint_after_tls_client_hello_returns_auth_cancelled_and_reaps_child() {
+    let area = TestArea::new("login-tls-sigint");
+    assert!(!area.caller.starts_with(env!("CARGO_MANIFEST_DIR")));
+    let copied = copied_binary(&area);
+    let listener = local_listener();
+    let port = listener
+        .local_addr()
+        .expect("local stalled TLS port")
+        .port();
+    let home = device_login_home(&area, "fresh-home", port);
+    let config_before = fs::read(home.join("config.yaml")).expect("snapshot local config");
+    let entries_before = directory_entries(&home);
+    assert_eq!(entries_before, ["config.yaml"]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (receiver, server) = spawn_stalled_tls_server(listener, Arc::clone(&stop));
+    let (mut child, argv, process_group) = spawn_copied_login(&area, &copied, &home);
+    let child_pid = child.id();
+
+    let event = wait_for_stall_event(&receiver, &mut child, &stop);
+    match event {
+        Some(StallServerEvent::TcpAccepted) => (),
+        other => {
+            let output =
+                finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+            stop.store(true, Ordering::Release);
+            server.join().expect("join stopped stalled TLS server");
+            assert_eq!(output.status.code(), Some(130));
+            assert_eq!(output.stdout, b"");
+            assert_eq!(output.stderr, b"auth_cancelled\n");
+            panic!("copied login had no local TCP acceptance before SIGINT: {other:?}")
+        }
+    }
+    let hello = receiver.recv_timeout(Duration::from_secs(5));
+    let hello = match hello {
+        Ok(event) => event,
+        Err(error) => {
+            let output =
+                finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+            server
+                .join()
+                .expect("join stalled TLS server after ClientHello timeout");
+            panic!("timed out waiting for TLS ClientHello: {error}; {output:?}")
+        }
+    };
+    let StallServerEvent::ClientHello(record) = hello else {
+        let output =
+            finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+        server
+            .join()
+            .expect("join stalled TLS server after read failure");
+        assert_eq!(output.status.code(), Some(130));
+        assert_eq!(output.stderr, b"auth_cancelled\n");
+        panic!("local server did not receive TLS ClientHello bytes")
+    };
+    if record[0] != 0x16 || record[1] != 0x03 {
+        let output =
+            finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+        let _ = receiver.recv_timeout(Duration::from_secs(10));
+        server
+            .join()
+            .expect("join stalled TLS server after malformed client record");
+        panic!("local server received non-TLS bytes {record:?}: {output:?}")
+    }
+
+    // SAFETY: SIGINT is sent only after the owned server accepted TCP and read TLS bytes.
+    let signal_result = unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGINT) };
+    if signal_result != 0 {
+        let output =
+            finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+        server
+            .join()
+            .expect("join stalled TLS server after signal failure");
+        panic!("failed to deliver SIGINT to copied CLI: {output:?}");
+    }
+
+    let output = finish_copied_child(&area, child, &argv, process_group, Duration::from_secs(10));
+    let closed = receiver.recv_timeout(Duration::from_secs(10));
+    server
+        .join()
+        .expect("join stalled TLS server after peer close");
+    let closed = match closed {
+        Ok(event) => event,
+        Err(error) => panic!("missing bounded peer-close observation: {error}; {output:?}"),
+    };
+    let StallServerEvent::PeerClosed {
+        closed: peer_closed,
+        trailing_bytes,
+    } = closed
+    else {
+        panic!("stalled TLS server did not observe child socket cleanup")
+    };
+    assert!(
+        peer_closed,
+        "cancelled native transport closed its TCP socket"
+    );
+    assert!(trailing_bytes <= 64 * 1024, "bounded TLS teardown bytes");
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"auth_cancelled\n");
+    assert_redacted(&output, &home);
+    assert_eq!(directory_entries(&home), entries_before);
+    assert_eq!(
+        fs::read(home.join("config.yaml")).expect("local config remains unchanged"),
+        config_before
+    );
+    assert!(!home.join("auth.yaml").exists());
+    assert!(!home.join("auth.yaml.lock").exists());
+    assert!(
+        !Path::new(&format!("/proc/{child_pid}")).exists(),
+        "copied CLI process was reaped"
+    );
+    assert_eq!(
+        unsafe { libc::kill(-(process_group as libc::pid_t), 0) },
+        -1,
+        "no child process remains in the isolated process group"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 
 #[cfg(target_os = "linux")]
