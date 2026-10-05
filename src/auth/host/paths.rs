@@ -65,11 +65,6 @@ impl PathOwner {
             revoked: self.revoked.load(Ordering::Acquire),
         }
     }
-
-    fn active(&self) -> bool {
-        let flags = self.flags();
-        !(flags.cancelled || flags.deadline_exceeded || flags.revoked)
-    }
 }
 
 pub(super) struct BoundPaths(Arc<PathOwner>);
@@ -212,7 +207,7 @@ fn resolved_path_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
         return failure("host_unbound", OwnerFlags::default());
     };
     let flags = owner.flags();
-    if !owner.active() {
+    if flags.cancelled || flags.deadline_exceeded || flags.revoked {
         return failure("policy_inactive", flags);
     }
     let Some(value) = args.first() else {
