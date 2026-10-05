@@ -945,6 +945,11 @@ fn config_type() -> HostTypeSchema {
             ("token_endpoint", opt(s.clone())),
             ("redirect_uri", opt(s.clone())),
             ("refresh_skew_seconds", i.clone()),
+            ("scopes", opt(array(s.clone()))),
+            (
+                "authorization_parameters",
+                opt(array(flow::public_query_entry_type())),
+            ),
         ],
     );
     named(

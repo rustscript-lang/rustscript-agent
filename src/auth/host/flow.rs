@@ -452,7 +452,7 @@ fn array(ty: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Array(Box::new(ty))
 }
 
-fn public_query_entry_type() -> HostTypeSchema {
+pub(super) fn public_query_entry_type() -> HostTypeSchema {
     named(
         "PublicQueryEntry",
         vec![
