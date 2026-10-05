@@ -9,10 +9,8 @@ use rustscript_agent::auth::oauth::{
 use rustscript_agent::auth::store::AuthStore;
 use rustscript_agent::cli::{CliOutput, execute_auth_cli};
 use rustscript_agent::runtime::{AuthCommandInput, AuthEntryError, AuthEntryRunner};
-use rustscript_vm::{
-    CompileSourceFileOptions, ParserDialect, SharedParserOptions, SourceFlavor, Value,
-    compile_source_at_path_with_flavor_and_options, parse_source_with_dialect,
-};
+use rustscript_vm::Value;
+use serde_yaml::Value as YamlValue;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +20,8 @@ const ENTRY_PATH: &str = "rss/auth/login.rss";
 const CODEX_PATH: &str = "rss/auth/codex_device.rss";
 const TYPES_PATH: &str = "rss/auth/types.rss";
 const CREDENTIAL_ID: &str = "fixture-codex";
+const UNRELATED_CREDENTIAL_ID: &str = "unrelated-configured";
+const ORPHAN_CREDENTIAL_ID: &str = "orphan-existing";
 const START_MS: u64 = 1_900_000_000_000;
 const DEVICE_SECRET: &str = "SYNTHETIC_DEVICE_SECRET_61c4";
 const CODE_SECRET: &str = "SYNTHETIC_AUTH_CODE_SECRET_28b1";
@@ -87,14 +87,101 @@ impl FixtureHome {
         fs::read(self.0.join("config.yaml")).expect("read config fixture bytes")
     }
 
+    fn add_provider(&self, alias: &str, auth: Option<YamlValue>) {
+        let mut config: YamlValue =
+            serde_yaml::from_slice(&self.config_bytes()).expect("parse config fixture");
+        let selected_alias = config["model"]["provider"]
+            .as_str()
+            .expect("selected fixture provider")
+            .to_owned();
+        let mut provider = config["providers"][selected_alias.as_str()].clone();
+        let fields = provider.as_mapping_mut().expect("provider fixture mapping");
+        let auth_key = YamlValue::String("auth".to_owned());
+        match auth {
+            Some(value) => {
+                fields.insert(auth_key, value);
+            }
+            None => {
+                fields.remove(&auth_key);
+            }
+        }
+        config["providers"][alias] = provider;
+        self.write_config_document(&config);
+    }
+
+    fn write_config_document(&self, config: &YamlValue) {
+        fs::write(
+            self.0.join("config.yaml"),
+            serde_yaml::to_string(config).expect("serialize config fixture"),
+        )
+        .expect("write config fixture");
+    }
+
+    fn write_auth_document(&self, auth: &YamlValue) {
+        fs::write(
+            self.0.join("auth.yaml"),
+            serde_yaml::to_string(auth).expect("serialize auth fixture"),
+        )
+        .expect("write auth fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(self.0.join("auth.yaml"), fs::Permissions::from_mode(0o600))
+                .expect("secure auth fixture");
+        }
+    }
+
+    fn auth_bytes(&self) -> Vec<u8> {
+        fs::read(self.0.join("auth.yaml")).expect("read auth fixture bytes")
+    }
+
+    fn auth_lock_exists(&self) -> bool {
+        self.0.join("auth.yaml.lock").exists()
+    }
+
+    fn auth_lock_bytes(&self) -> Vec<u8> {
+        fs::read(self.0.join("auth.yaml.lock")).expect("read auth lock bytes")
+    }
+
+    fn entry_names(&self) -> Vec<String> {
+        let mut names = fs::read_dir(&self.0)
+            .expect("read fixture home entries")
+            .map(|entry| {
+                entry
+                    .expect("fixture home entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 fixture entry name")
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn prepare_enrollment(&self) {
+        AuthHost::new_for_enrollment(
+            &self.0,
+            RunCancellation::with_timeout(Duration::from_secs(30)),
+            CREDENTIAL_ID,
+        )
+        .expect("prepare native enrollment fixture");
+    }
+
     fn auth_exists(&self) -> bool {
         self.0.join("auth.yaml").exists()
     }
 
     fn stored_metadata(&self) -> Option<rustscript_agent::auth::store::AuthMetadata> {
+        self.stored_metadata_for(CREDENTIAL_ID)
+    }
+
+    fn stored_metadata_for(
+        &self,
+        credential_id: &str,
+    ) -> Option<rustscript_agent::auth::store::AuthMetadata> {
         AuthStore::from_home(&self.0)
             .ok()?
-            .load_metadata(CREDENTIAL_ID)
+            .load_metadata(credential_id)
             .ok()
     }
 }
@@ -103,6 +190,42 @@ impl Drop for FixtureHome {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn auth_fixture_document() -> YamlValue {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config_auth_rss/auth.yaml");
+    serde_yaml::from_slice(&fs::read(path).expect("read native auth fixture"))
+        .expect("parse native auth fixture")
+}
+
+fn auth_credential_value(auth_bytes: &[u8], credential_id: &str) -> Option<YamlValue> {
+    let auth: YamlValue = serde_yaml::from_slice(auth_bytes).expect("parse stored auth bytes");
+    auth["credentials"]
+        .as_mapping()?
+        .get(YamlValue::String(credential_id.to_owned()))
+        .cloned()
+}
+
+fn assert_credential_preserved(
+    home: &FixtureHome,
+    credential_id: &str,
+    credential_before: &YamlValue,
+    metadata_before: &rustscript_agent::auth::store::AuthMetadata,
+) {
+    let credential_after = auth_credential_value(&home.auth_bytes(), credential_id)
+        .expect("preserved credential remains in auth store");
+    assert!(
+        credential_after.eq(credential_before),
+        "unrelated credential data changed"
+    );
+    let metadata_after = home
+        .stored_metadata_for(credential_id)
+        .expect("preserved credential metadata remains loadable");
+    assert!(
+        metadata_after.eq(metadata_before),
+        "unrelated credential metadata changed"
+    );
 }
 
 fn command(operation: &str, provider: Option<&str>) -> AuthCommandInput {
@@ -258,62 +381,6 @@ fn assert_failure(value: &Value, code: &str) {
     assert_eq!(text(field(value, "error")), code);
 }
 
-struct DiagnosticDialect;
-
-impl ParserDialect for DiagnosticDialect {
-    fn allow_let_mut_binding(&self) -> bool {
-        true
-    }
-    fn allow_macro_calls(&self) -> bool {
-        true
-    }
-    fn allow_plus_equal_operator(&self) -> bool {
-        true
-    }
-    fn allow_for_in_loop(&self) -> bool {
-        true
-    }
-}
-
-#[test]
-fn diagnostic_login_rss_parse() {
-    for (path, source) in LOGIN_SOURCES {
-        let parsed = parse_source_with_dialect(
-            source,
-            &DiagnosticDialect,
-            SharedParserOptions {
-                source_id: 0,
-                allow_implicit_externs: true,
-                allow_implicit_semicolons: false,
-                enforce_mutable_bindings: false,
-                import_scan_mode: true,
-            },
-        );
-        assert!(parsed.is_ok(), "{path}: {parsed:?}");
-    }
-}
-
-#[test]
-fn diagnostic_login_rss_compile() {
-    let catalog = rustscript_agent::auth::host::auth_host_catalog();
-    let mut options =
-        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
-    for (path, source) in LOGIN_SOURCES {
-        options.set_module_override_source(
-            format!("/__rustscript_agent_auth_bundle__/{path}"),
-            *source,
-        );
-    }
-    let entry_path = Path::new("/__rustscript_agent_auth_bundle__/rss/auth/login.rss");
-    let result = compile_source_at_path_with_flavor_and_options(
-        entry_path,
-        LOGIN_SOURCES[0].1,
-        SourceFlavor::RustScript,
-        options,
-    );
-    result.unwrap_or_else(|error| panic!("{error:?}"));
-}
-
 #[test]
 fn guest_login_baseline_reports_unsupported_operation() {
     let result = run_starter(command("auth.login", None));
@@ -338,6 +405,90 @@ fn login_requires_explicit_provider() {
     assert!(!home.auth_exists());
 }
 
+#[test]
+fn missing_and_null_selected_provider_auth_fail_without_store_mutation() {
+    let runner = login_runner();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    for (alias, auth) in [
+        ("selected-no-auth", None),
+        ("selected-null-auth", Some(YamlValue::Null)),
+    ] {
+        let home = FixtureHome::new(None, "codex-device");
+        home.add_provider(alias, auth);
+        // Native enrollment setup owns creation of its required lock file.
+        // Snapshot after setup so this checks the RSS path for file mutation.
+        home.prepare_enrollment();
+        let config_before = home.config_bytes();
+        let entries_before = home.entry_names();
+        let lock_before = home.auth_lock_bytes();
+        assert!(!home.auth_exists());
+
+        let result = run_value(
+            &runner,
+            &home,
+            transport.clone(),
+            None,
+            command("auth.login", Some(alias)),
+        )
+        .expect("missing selected auth result");
+        assert_failure(&result, "credential_id_required");
+        assert_eq!(
+            result_map_generation(&result),
+            1,
+            "missing-auth errors report the policy snapshot generation"
+        );
+        assert!(transport.take_sent().is_empty());
+        assert!(!home.auth_exists());
+        assert!(home.auth_lock_exists());
+        assert!(home.auth_lock_bytes() == lock_before, "auth lock changed");
+        assert!(home.config_bytes() == config_before, "config bytes changed");
+        assert_eq!(home.entry_names(), entries_before);
+    }
+}
+
+#[test]
+fn empty_selected_provider_auth_is_rejected_by_native_config_validation() {
+    let alias = "selected-empty-auth";
+    let home = FixtureHome::new(None, "codex-device");
+    home.add_provider(alias, Some(YamlValue::String(String::new())));
+    let config_before = home.config_bytes();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+
+    let native_error = match AuthHost::new_for_enrollment(
+        &home.0,
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+        CREDENTIAL_ID,
+    ) {
+        Ok(_) => panic!("empty auth must fail native config validation"),
+        Err(error) => error,
+    };
+    assert_eq!(native_error, "config_invalid");
+    assert!(!native_error.contains(alias));
+    assert!(!home.auth_exists());
+    assert!(home.auth_lock_exists());
+    let entries_before_run = home.entry_names();
+    let lock_before_run = home.auth_lock_bytes();
+
+    let runner_error = run_value(
+        &login_runner(),
+        &home,
+        transport.clone(),
+        None,
+        command("auth.login", Some(alias)),
+    )
+    .expect_err("native host setup rejects the invalid config before RSS");
+    assert_eq!(runner_error, AuthEntryError::HostSetup);
+    assert!(!runner_error.to_string().contains(alias));
+    assert!(transport.take_sent().is_empty());
+    assert!(!home.auth_exists());
+    assert!(home.config_bytes() == config_before, "config bytes changed");
+    assert!(
+        home.auth_lock_bytes() == lock_before_run,
+        "auth lock changed"
+    );
+    assert_eq!(home.entry_names(), entries_before_run);
+}
+
 fn result_map_generation(value: &Value) -> i64 {
     match field(value, "generation") {
         Value::Int(value) => *value,
@@ -346,9 +497,74 @@ fn result_map_generation(value: &Value) -> i64 {
 }
 
 #[test]
+fn existing_credential_provider_mismatch_fails_before_transport_or_mutation() {
+    let home = FixtureHome::new(Some(ALIAS), "codex-device");
+    let mut auth = auth_fixture_document();
+    auth["credentials"][CREDENTIAL_ID]["expires_at_ms"] =
+        serde_yaml::to_value(START_MS + 3_600_000).expect("fixture expiry");
+    auth["credentials"][CREDENTIAL_ID]["last_refresh_at_ms"] =
+        serde_yaml::to_value(START_MS - 1_000).expect("fixture refresh time");
+    home.write_auth_document(&auth);
+    home.prepare_enrollment();
+    let auth_before = home.auth_bytes();
+    let config_before = home.config_bytes();
+    let entries_before = home.entry_names();
+    let lock_before = home.auth_lock_bytes();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+
+    let result = run_value(
+        &login_runner(),
+        &home,
+        transport.clone(),
+        None,
+        command("auth.login", Some(ALIAS)),
+    )
+    .expect("provider mismatch result");
+    assert_failure(&result, "credential_provider_mismatch");
+    assert_eq!(result_map_generation(&result), 4);
+    assert!(transport.take_sent().is_empty());
+    assert!(home.auth_bytes() == auth_before, "auth bytes changed");
+    assert!(home.config_bytes() == config_before, "config bytes changed");
+    assert_eq!(home.entry_names(), entries_before);
+    assert!(home.auth_lock_bytes() == lock_before, "auth lock changed");
+    assert_no_secret(&format!("{result:?}"));
+}
+
+#[test]
 fn alias_device_flow_saves_native_credentials_and_renders_only_redacted_metadata() {
     let home = FixtureHome::new(Some(ALIAS), "codex-device");
+    home.add_provider(
+        "unrelated-anchor",
+        Some(YamlValue::String(UNRELATED_CREDENTIAL_ID.to_owned())),
+    );
+    let mut auth = auth_fixture_document();
+    let template = auth["credentials"][CREDENTIAL_ID].clone();
+    let mut unrelated = template.clone();
+    unrelated["account_id"] = YamlValue::String("acct_unrelated_synthetic".to_owned());
+    let mut orphan = template;
+    orphan["account_id"] = YamlValue::String("acct_orphan_synthetic".to_owned());
+    let mut credentials = serde_yaml::Mapping::new();
+    credentials.insert(
+        YamlValue::String(UNRELATED_CREDENTIAL_ID.to_owned()),
+        unrelated,
+    );
+    credentials.insert(YamlValue::String(ORPHAN_CREDENTIAL_ID.to_owned()), orphan);
+    auth["credentials"] = YamlValue::Mapping(credentials);
+    home.write_auth_document(&auth);
+    home.prepare_enrollment();
     let config_before = home.config_bytes();
+    let auth_before = home.auth_bytes();
+    let unrelated_before = auth_credential_value(&auth_before, UNRELATED_CREDENTIAL_ID)
+        .expect("configured unrelated credential fixture");
+    let orphan_before = auth_credential_value(&auth_before, ORPHAN_CREDENTIAL_ID)
+        .expect("orphan credential fixture");
+    let unrelated_metadata_before = home
+        .stored_metadata_for(UNRELATED_CREDENTIAL_ID)
+        .expect("configured unrelated metadata fixture");
+    let orphan_metadata_before = home
+        .stored_metadata_for(ORPHAN_CREDENTIAL_ID)
+        .expect("orphan metadata fixture");
+    assert!(auth_credential_value(&auth_before, CREDENTIAL_ID).is_none());
     let transport = Arc::new(ScriptedHttpsTransport::new());
     queue_success(&transport);
     let (sender, receiver) = device_instruction_channel();
@@ -376,6 +592,7 @@ fn alias_device_flow_saves_native_credentials_and_renders_only_redacted_metadata
     let instruction: PublicDeviceInstruction =
         receiver.try_recv().expect("native queue instruction");
     assert_eq!(instruction.user_code, USER_CODE);
+    assert_no_secret(&format!("{instruction:?}"));
     assert_eq!(
         instruction.verification_url,
         "https://auth.example.test/codex/device"
@@ -395,6 +612,18 @@ fn alias_device_flow_saves_native_credentials_and_renders_only_redacted_metadata
     assert_eq!(first_metadata.source, "codex-device");
     assert_no_secret(&first.stdout);
     assert_no_secret(&first.stderr);
+    assert_credential_preserved(
+        &home,
+        UNRELATED_CREDENTIAL_ID,
+        &unrelated_before,
+        &unrelated_metadata_before,
+    );
+    assert_credential_preserved(
+        &home,
+        ORPHAN_CREDENTIAL_ID,
+        &orphan_before,
+        &orphan_metadata_before,
+    );
 
     queue_success(&transport);
     let (sender, receiver) = device_instruction_channel();
@@ -407,10 +636,9 @@ fn alias_device_flow_saves_native_credentials_and_renders_only_redacted_metadata
     );
     assert_eq!(second.exit_code, 0, "{}", second.stderr);
     assert_eq!(cli_row(&second)["generation"], 2);
-    assert_eq!(
-        receiver.try_recv().expect("second instruction").user_code,
-        USER_CODE
-    );
+    let second_instruction = receiver.try_recv().expect("second instruction");
+    assert_eq!(second_instruction.user_code, USER_CODE);
+    assert_no_secret(&format!("{second_instruction:?}"));
     assert_eq!(transport.take_sent().len(), 3);
     assert_eq!(home.config_bytes(), config_before);
     assert_eq!(
@@ -421,6 +649,18 @@ fn alias_device_flow_saves_native_credentials_and_renders_only_redacted_metadata
     );
     assert_no_secret(&second.stdout);
     assert_no_secret(&second.stderr);
+    assert_credential_preserved(
+        &home,
+        UNRELATED_CREDENTIAL_ID,
+        &unrelated_before,
+        &unrelated_metadata_before,
+    );
+    assert_credential_preserved(
+        &home,
+        ORPHAN_CREDENTIAL_ID,
+        &orphan_before,
+        &orphan_metadata_before,
+    );
 }
 
 #[test]
@@ -511,6 +751,105 @@ fn unavailable_and_closed_instruction_queues_stop_after_start_without_saving() {
     assert_eq!(transport.take_sent().len(), 1);
     assert!(!home.auth_exists());
     assert_no_secret(&format!("{unavailable:?}{closed:?}"));
+}
+
+#[test]
+fn full_public_instruction_channel_stops_at_start_without_store_mutation() {
+    let home = FixtureHome::new(None, "codex-device");
+    home.prepare_enrollment();
+    let runner = login_runner();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let (sender, receiver) = device_instruction_channel();
+
+    for generation in 1..=4 {
+        queue_success(&transport);
+        let output = run_cli(
+            &runner,
+            &home,
+            transport.clone(),
+            Some(sender.clone()),
+            command("auth.login", Some("openai-codex")),
+        );
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(cli_row(&output)["generation"], generation);
+        assert_eq!(transport.take_sent().len(), 3, "start, poll, exchange");
+        assert_eq!(
+            home.stored_metadata()
+                .expect("successful public-channel login save")
+                .generation,
+            generation as u64
+        );
+    }
+
+    let saved_home_auth = home.auth_bytes();
+    let saved_home_config = home.config_bytes();
+    let saved_home_entries = home.entry_names();
+    let saved_home_lock = home.auth_lock_bytes();
+
+    let fresh_home = FixtureHome::new(None, "codex-device");
+    fresh_home.prepare_enrollment();
+    let fresh_config = fresh_home.config_bytes();
+    let fresh_entries = fresh_home.entry_names();
+    let fresh_lock = fresh_home.auth_lock_bytes();
+    assert!(!fresh_home.auth_exists());
+    let fifth_transport = Arc::new(ScriptedHttpsTransport::new());
+    fifth_transport.push_raw(
+        200,
+        &format!(
+            r#"{{"device_auth_id":"{DEVICE_SECRET}","user_code":"{USER_CODE}","expires_in":900,"interval":"0"}}"#
+        ),
+    );
+    let full = run_value(
+        &runner,
+        &fresh_home,
+        fifth_transport.clone(),
+        Some(sender),
+        command("auth.login", Some("openai-codex")),
+    )
+    .expect("full channel result");
+    assert_failure(&full, "ui_sink_full");
+    assert_eq!(fifth_transport.take_sent().len(), 1, "start only");
+    assert!(!fresh_home.auth_exists());
+    assert!(
+        fresh_home.config_bytes() == fresh_config,
+        "fresh config changed"
+    );
+    assert_eq!(fresh_home.entry_names(), fresh_entries);
+    assert!(
+        fresh_home.auth_lock_bytes() == fresh_lock,
+        "fresh auth lock changed"
+    );
+    assert!(
+        home.auth_bytes() == saved_home_auth,
+        "previous auth bytes changed"
+    );
+    assert!(
+        home.config_bytes() == saved_home_config,
+        "previous config bytes changed"
+    );
+    assert_eq!(home.entry_names(), saved_home_entries);
+    assert!(
+        home.auth_lock_bytes() == saved_home_lock,
+        "previous auth lock changed"
+    );
+    assert_eq!(
+        home.stored_metadata()
+            .expect("previous saved credential remains")
+            .generation,
+        4
+    );
+    assert_no_secret(&format!("{full:?}"));
+
+    for _ in 0..4 {
+        let instruction: PublicDeviceInstruction = receiver
+            .try_recv()
+            .expect("one of four public queued instructions");
+        assert_no_secret(&format!("{instruction:?}"));
+    }
+    assert!(
+        receiver.try_recv().is_err(),
+        "the failed fifth run queued nothing"
+    );
 }
 
 #[test]
