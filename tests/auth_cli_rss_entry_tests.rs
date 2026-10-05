@@ -1,4 +1,9 @@
-use rustscript_agent::auth::host::AuthHost;
+use rustscript_agent::auth::host::{AuthHost, PublicDeviceInstruction, device_instruction_channel};
+use rustscript_agent::auth::oauth::{
+    OAuthHost, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
+    ScriptedHttpsTransport,
+};
+use rustscript_agent::cli::execute_auth_cli;
 use rustscript_agent::runtime::{AuthCommandInput, AuthEntryRunner};
 use rustscript_agent::{CancellationReason, RunCancellation};
 use rustscript_vm::{
@@ -16,7 +21,21 @@ const SOURCES: &[(&str, &str)] = &[
         "rss/config/selection.rss",
         include_str!("../rss/config/selection.rss"),
     ),
+    ("rss/auth/login.rss", include_str!("../rss/auth/login.rss")),
+    (
+        "rss/auth/codex_device.rss",
+        include_str!("../rss/auth/codex_device.rss"),
+    ),
+    ("rss/auth/types.rss", include_str!("../rss/auth/types.rss")),
 ];
+
+const LOGIN_ACCESS: &str = "SYNTHETIC_UNIFIED_ACCESS_TOKEN";
+const LOGIN_REFRESH: &str = "SYNTHETIC_UNIFIED_REFRESH_TOKEN";
+const LOGIN_DEVICE: &str = "SYNTHETIC_UNIFIED_DEVICE_ID";
+const LOGIN_CODE: &str = "SYNTHETIC_UNIFIED_AUTH_CODE";
+const LOGIN_VERIFIER: &str = "synthetic-unified-verifier-abcdefghijklmnopqrstuvwxyz";
+const LOGIN_USER_CODE: &str = "PUBLIC-UNIFIED-7QK";
+const LOGIN_NOW_MS: u64 = 1_900_000_000_000;
 
 struct FixtureHome(PathBuf);
 
@@ -231,6 +250,118 @@ fn rss_command_bundle_compiles_with_the_registered_auth_catalog() {
         options,
     );
     assert!(compiled.is_ok(), "{:?}", compiled.err());
+}
+
+#[test]
+fn unified_commands_rss_runs_injected_login_and_relogin_with_redacted_output() {
+    let home = FixtureHome::new("unified-login");
+    let configured_login =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_device/config.yaml");
+    fs::copy(configured_login, home.0.join("config.yaml"))
+        .expect("install configured device-login fixture");
+    fs::remove_file(home.0.join("auth.yaml")).expect("start without credential store");
+    let config_before = home.file_bytes("config.yaml");
+    let runner = AuthEntryRunner::from_bundle(ENTRY_PATH, SOURCES)
+        .expect("compile the unified five-source production RSS graph");
+
+    for generation in [1, 2] {
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        transport.push_raw(
+            200,
+            &format!(
+                r#"{{"device_auth_id":"{LOGIN_DEVICE}","user_code":"{LOGIN_USER_CODE}","expires_in":900,"interval":"0"}}"#
+            ),
+        );
+        transport.push_raw(
+            200,
+            &format!(
+                r#"{{"authorization_code":"{LOGIN_CODE}","code_verifier":"{LOGIN_VERIFIER}","public":"poll-ok"}}"#
+            ),
+        );
+        transport.push_raw(
+            200,
+            &format!(
+                r#"{{"access_token":"{LOGIN_ACCESS}","refresh_token":"{LOGIN_REFRESH}","token_type":"Bearer","expires_in":3600,"public":"exchange-ok"}}"#
+            ),
+        );
+        let (sender, receiver) = device_instruction_channel();
+        let home_path = home.0.clone();
+        let oauth_transport = Arc::clone(&transport);
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+        let output = execute_auth_cli(
+            &runner,
+            command("auth.login", Some("openai-codex"), None),
+            &cancellation,
+            move |child| {
+                let oauth = Arc::new(OAuthHost::new(
+                    oauth_transport,
+                    Arc::new(ScriptedCallback::new()),
+                    Arc::new(ScriptedBrowser::new()),
+                    Arc::new(ScriptedClock::new(LOGIN_NOW_MS)),
+                    Arc::new(ScriptedCancel::new()),
+                ));
+                Ok(AuthHost::new_for_login(home_path, child)?
+                    .with_oauth_host(oauth)
+                    .with_device_instruction_sender(sender))
+            },
+        );
+
+        assert_eq!(output.exit_code, 0, "stderr={}", output.stderr);
+        assert!(output.stderr.is_empty());
+        let row: serde_json::Value =
+            serde_json::from_str(output.stdout.trim()).expect("redacted login metadata row");
+        assert_eq!(row["provider"], "openai-codex");
+        assert_eq!(row["credential_id"], "fixture-codex");
+        assert_eq!(row["status"], "active");
+        assert_eq!(row["generation"], generation);
+        assert_eq!(row["source"], "codex-device");
+        for secret in [
+            LOGIN_ACCESS,
+            LOGIN_REFRESH,
+            LOGIN_DEVICE,
+            LOGIN_CODE,
+            LOGIN_VERIFIER,
+        ] {
+            assert!(
+                !output.stdout.contains(secret),
+                "login output leaked private material"
+            );
+            assert!(
+                !output.stderr.contains(secret),
+                "login error leaked private material"
+            );
+        }
+
+        let instruction: PublicDeviceInstruction = receiver
+            .try_recv()
+            .expect("native instruction acknowledged");
+        assert_eq!(instruction.user_code, LOGIN_USER_CODE);
+        assert_eq!(
+            instruction.verification_url,
+            "https://auth.example.test/codex/device"
+        );
+        assert_eq!(instruction.expires_in_seconds, 900);
+        assert!(
+            receiver.try_recv().is_err(),
+            "one public instruction per login"
+        );
+        assert_eq!(transport.take_sent().len(), 3, "start, poll, exchange");
+        assert_eq!(home.file_bytes("config.yaml"), config_before);
+
+        let stored = home.yaml("auth.yaml");
+        assert_eq!(
+            stored["credentials"]["fixture-codex"]["generation"],
+            generation
+        );
+        assert_eq!(
+            stored["credentials"]["fixture-codex"]["access_token"],
+            LOGIN_ACCESS
+        );
+        assert_eq!(
+            stored["credentials"]["fixture-codex"]["refresh_token"],
+            LOGIN_REFRESH
+        );
+    }
 }
 
 #[test]
@@ -731,18 +862,15 @@ fn admin_invalid_fields_unsupported_commands_and_control_ids_are_safe() {
         assert_eq!(field(&result, "error"), &Value::string(expected));
     }
 
-    for operation in ["auth.login", "config.path"] {
+    for (operation, expected) in [
+        ("auth.login", "provider_required"),
+        ("config.path", "unsupported_operation"),
+    ] {
         let result = run_command(&home.0, command(operation, None, None))
-            .expect("preserve pending command as unsupported");
+            .expect("run the command-specific business validation");
         assert_eq!(field(&result, "ok"), &Value::Bool(false));
-        assert_eq!(
-            field(&result, "status"),
-            &Value::string("unsupported_operation")
-        );
-        assert_eq!(
-            field(&result, "error"),
-            &Value::string("unsupported_operation")
-        );
+        assert_eq!(field(&result, "status"), &Value::string(expected));
+        assert_eq!(field(&result, "error"), &Value::string(expected));
     }
 
     let control_id = "orphan\r\ncredential";

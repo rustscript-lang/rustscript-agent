@@ -2,6 +2,7 @@ use auth;
 use config;
 use json;
 use super::config::selection;
+use self::login::{run as login_run};
 
 struct AuthCommandInput {
     operation: string,
@@ -174,7 +175,9 @@ fn logout_report(credential_id: string, status: string) -> string {
 
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     let operation: string = command.operation.copy();
-    if operation.copy() == "auth.status" => {
+    if operation.copy() == "auth.login" => {
+        login_run(home, command)
+    } else if operation.copy() == "auth.status" => {
         if command.credential_id.copy() != null => {
             entry(false, operation.copy(), null, 0, "invalid_command", "invalid_command")
         } else => {

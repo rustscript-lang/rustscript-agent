@@ -132,6 +132,7 @@ pub struct AuthEntryRunner {
     program: rustscript_vm::Program,
     catalog: Arc<HostApiCatalog>,
     bundle_json_encode: bool,
+    entry_name: Option<String>,
 }
 
 /// Disarms the run's epoch watcher on success, error, setup failure, or unwind.
@@ -241,6 +242,7 @@ impl AuthEntryRunner {
             program: compiled.program,
             catalog,
             bundle_json_encode: false,
+            entry_name: Some("run".to_owned()),
         })
     }
 
@@ -354,8 +356,12 @@ impl AuthEntryRunner {
 
                 drive_root_frame(vm, cancellation)?;
                 ensure_finite_active(cancellation)?;
+                let entry_name = self
+                    .entry_name
+                    .as_deref()
+                    .ok_or_else(|| setup_failure(cancellation, AuthEntryError::NoEntry))?;
                 let callable = vm
-                    .resolve_exported_callable("run")
+                    .resolve_exported_callable(entry_name)
                     .map_err(|_| setup_failure(cancellation, AuthEntryError::NoEntry))?;
                 let arity = callable_arity(&self.program, &callable)
                     .ok_or_else(|| setup_failure(cancellation, AuthEntryError::NoEntry))?;

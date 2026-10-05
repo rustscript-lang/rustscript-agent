@@ -1,7 +1,9 @@
 use rustscript_agent::auth::host::AuthHost;
+use rustscript_agent::auth::host::{PublicDeviceInstruction, device_instruction_channel};
 use rustscript_agent::auth::oauth::{
     BoundedHttpsTransport, OAuthError, OAuthHost, OAuthIoContext, PreparedHttpsRequest,
     RawHttpsResponse, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
+    ScriptedHttpsTransport,
 };
 use rustscript_agent::runtime::{
     AuthCommandInput, AuthEntryError, AuthEntryRunner, MAX_AGENT_SOURCE_BYTES,
@@ -878,4 +880,267 @@ fn epoch_watcher_count() -> usize {
                 .is_ok_and(|name| name.starts_with("run-epoch"))
         })
         .count()
+}
+
+#[test]
+fn aliased_public_login_run_executes_in_the_closed_bundle_and_returns_auth_metadata() {
+    const ACCESS: &str = "SYNTHETIC_BUNDLE_ACCESS_TOKEN";
+    const REFRESH: &str = "SYNTHETIC_BUNDLE_REFRESH_TOKEN";
+    const DEVICE: &str = "SYNTHETIC_BUNDLE_DEVICE_ID";
+    const CODE: &str = "SYNTHETIC_BUNDLE_AUTH_CODE";
+    const VERIFIER: &str = "synthetic-bundle-verifier-abcdefghijklmnopqrstuvwxyz";
+    const USER_CODE: &str = "PUBLIC-BUNDLE-7QK";
+    const NOW_MS: u64 = 1_900_000_000_000;
+    const ENTRY: &str = "rss/auth/commands.rss";
+    const SOURCES: &[(&str, &str)] = &[
+        (ENTRY, include_str!("../rss/auth/commands.rss")),
+        (
+            "rss/config/selection.rss",
+            include_str!("../rss/config/selection.rss"),
+        ),
+        ("rss/auth/login.rss", include_str!("../rss/auth/login.rss")),
+        (
+            "rss/auth/codex_device.rss",
+            include_str!("../rss/auth/codex_device.rss"),
+        ),
+        ("rss/auth/types.rss", include_str!("../rss/auth/types.rss")),
+    ];
+
+    let runner = AuthEntryRunner::from_bundle(ENTRY, SOURCES)
+        .expect("the real aliased login sibling compiles in the supplied bundle");
+    let admin_home = FixtureHome::new("entry-run-with-login-sibling", false);
+    let admin_cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let admin_value = runner
+        .run_with_host_factory(input("auth.status", None), &admin_cancellation, {
+            let home = admin_home.0.clone();
+            move |child| AuthHost::new_for_commands(home, child)
+        })
+        .expect("the bundle entry run remains callable beside the sibling run export");
+    assert_eq!(field(&admin_value, "ok"), &Value::Bool(true));
+    assert_eq!(
+        field(&admin_value, "operation"),
+        &Value::string("auth.status")
+    );
+    assert!(!admin_cancellation.watcher_is_armed());
+
+    let home = FixtureHome::new("real-login-bundle", false);
+    let configured_login =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_device/config.yaml");
+    fs::copy(configured_login, home.0.join("config.yaml"))
+        .expect("install configured device-login fixture");
+    fs::remove_file(home.0.join("auth.yaml")).expect("start without credential store");
+    let config_before = fs::read(home.0.join("config.yaml")).expect("snapshot config bytes");
+
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(
+        200,
+        &format!(
+            r#"{{"device_auth_id":"{DEVICE}","user_code":"{USER_CODE}","expires_in":900,"interval":"0"}}"#
+        ),
+    );
+    transport.push_raw(
+        200,
+        &format!(
+            r#"{{"authorization_code":"{CODE}","code_verifier":"{VERIFIER}","public":"poll-ok"}}"#
+        ),
+    );
+    transport.push_raw(
+        200,
+        &format!(
+            r#"{{"access_token":"{ACCESS}","refresh_token":"{REFRESH}","token_type":"Bearer","expires_in":3600,"public":"exchange-ok"}}"#
+        ),
+    );
+    let sent_transport = Arc::clone(&transport);
+    let inspect_transport = Arc::clone(&transport);
+    let home_path = home.0.clone();
+    let (sender, receiver) = device_instruction_channel();
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let value = runner
+        .run_with_host_factory(
+            AuthCommandInput {
+                operation: "auth.login".to_owned(),
+                provider: Some("openai-codex".to_owned()),
+                credential_id: None,
+            },
+            &cancellation,
+            move |child| {
+                let oauth = Arc::new(OAuthHost::new(
+                    sent_transport,
+                    Arc::new(ScriptedCallback::new()),
+                    Arc::new(ScriptedBrowser::new()),
+                    Arc::new(ScriptedClock::new(NOW_MS)),
+                    Arc::new(ScriptedCancel::new()),
+                ));
+                Ok(AuthHost::new_for_login(home_path, child)?
+                    .with_oauth_host(oauth)
+                    .with_device_instruction_sender(sender))
+            },
+        )
+        .expect("run the typed aliased auth.login entry through its native host");
+
+    assert_eq!(field(&value, "ok"), &Value::Bool(true));
+    assert_eq!(field(&value, "operation"), &Value::string("auth.login"));
+    assert_eq!(
+        field(&value, "credential_id"),
+        &Value::string("fixture-codex")
+    );
+    assert_eq!(field(&value, "generation"), &Value::Int(1));
+    let status = match field(&value, "status") {
+        Value::String(status) => {
+            serde_json::from_str::<serde_json::Value>(status).expect("serialized login metadata")
+        }
+        other => panic!("expected serialized login metadata, got {other:?}"),
+    };
+    assert_eq!(
+        status,
+        serde_json::json!({
+            "credential_id": "fixture-codex",
+            "generation": 1,
+            "provider": "openai-codex",
+            "source": "codex-device",
+            "status": "active"
+        })
+    );
+    assert_eq!(
+        fs::read(home.0.join("config.yaml")).expect("config unchanged"),
+        config_before
+    );
+    let auth = fs::read_to_string(home.0.join("auth.yaml")).expect("native factory saved auth");
+    assert!(auth.contains(ACCESS));
+    assert!(auth.contains(REFRESH));
+    for secret in [ACCESS, REFRESH, DEVICE, CODE, VERIFIER] {
+        assert!(!format!("{value:?}").contains(secret));
+    }
+    let instruction: PublicDeviceInstruction = receiver.try_recv().expect("native instruction");
+    assert_eq!(instruction.user_code, USER_CODE);
+    assert_eq!(
+        instruction.verification_url,
+        "https://auth.example.test/codex/device"
+    );
+    assert_eq!(inspect_transport.take_sent().len(), 3);
+    assert!(!cancellation.watcher_is_armed());
+}
+
+fn bundle_with_sibling_deleting_run(root_functions: &str) -> AuthEntryRunner {
+    const ENTRY: &str = "rss/auth/commands.rss";
+    const SIBLING: &str = "rss/auth/sibling.rss";
+    const SIBLING_SOURCE: &str = r#"use auth;
+use config;
+pub fn run(home: resource<auth.host_home>, command: map) -> int {
+    let policy = config::load_snapshot(&home).policy_handle;
+    auth::delete("fixture-codex", &policy);
+    17
+}
+"#;
+    let entry_source = format!("use self::sibling::{{run as sibling_run}};\n{root_functions}");
+    AuthEntryRunner::from_bundle(ENTRY, &[(ENTRY, &entry_source), (SIBLING, SIBLING_SOURCE)])
+        .expect("closed bundle with root and sibling run exports")
+}
+
+fn run_and_expect_entry_error(
+    runner: &AuthEntryRunner,
+    label: &str,
+    expected: AuthEntryError,
+    expected_code: &str,
+) {
+    let home = FixtureHome::new(label, false);
+    let initial_auth = fs::read(home.0.join("auth.yaml")).expect("read initial auth bytes");
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let error = runner
+        .run_with_host_factory(input("auth.status", None), &cancellation, {
+            let home = home.0.clone();
+            move |child| AuthHost::new_for_commands(home, child)
+        })
+        .expect_err("a sibling export cannot serve as the root auth entry");
+    assert_eq!(error, expected);
+    assert_eq!(error.code(), expected_code);
+    assert_eq!(
+        fs::read(home.0.join("auth.yaml")).expect("read auth after failed entry selection"),
+        initial_auth,
+        "sibling business effects must not run"
+    );
+    assert!(!cancellation.watcher_is_armed());
+}
+
+#[test]
+fn missing_or_private_root_run_never_invokes_sibling_business_effects() {
+    for (label, root_functions) in [
+        ("missing-root-run", "pub fn helper() -> int { 1 }"),
+        (
+            "private-root-run",
+            "fn run(home: resource<auth.host_home>, command: map) -> int { 1 }",
+        ),
+    ] {
+        let runner = bundle_with_sibling_deleting_run(root_functions);
+        run_and_expect_entry_error(
+            &runner,
+            label,
+            AuthEntryError::NoEntry,
+            "auth_entry_missing",
+        );
+    }
+}
+
+#[test]
+fn wrong_arity_root_run_is_reported_before_sibling_business_effects() {
+    let runner = bundle_with_sibling_deleting_run("pub fn run() -> int { 1 }");
+    run_and_expect_entry_error(
+        &runner,
+        "wrong-arity-root-run",
+        AuthEntryError::EntryArity,
+        "auth_entry_arity",
+    );
+}
+
+#[test]
+fn named_imports_remain_bounded_by_closed_tree_preflight() {
+    const ROOT: &str = "pub fn run(home: resource<auth.host_home>, command: map) -> int { 1 }";
+    let missing_sibling = [(
+        "main.rss",
+        "use self::missing::{run as missing_run}; pub fn run(home: resource<auth.host_home>, command: map) -> int { 1 }",
+    )];
+    let root_escape = [(
+        "main.rss",
+        "use super::outside::{run as escaped_run}; pub fn run(home: resource<auth.host_home>, command: map) -> int { 1 }",
+    )];
+    let host_named = [(
+        "main.rss",
+        "use auth::{load_metadata as host_load}; pub fn run(home: resource<auth.host_home>, command: map) -> int { 1 }",
+    )];
+    let unreachable_transitive = [
+        ("main.rss", ROOT),
+        (
+            "unused.rss",
+            "use self::missing::{run as missing_run}; pub fn unused() -> int { 2 }",
+        ),
+    ];
+
+    for (entry, sources) in [
+        ("main.rss", &missing_sibling[..]),
+        ("main.rss", &root_escape[..]),
+        ("main.rss", &host_named[..]),
+        ("main.rss", &unreachable_transitive[..]),
+    ] {
+        let error = bundle_error(
+            AuthEntryRunner::from_bundle(entry, sources),
+            "named imports still require explicit in-bundle targets and cannot reach host roots",
+        );
+        assert_eq!(error.code(), "auth_import_denied");
+    }
+}
+
+#[test]
+fn named_import_of_private_sibling_export_fails_core_compilation() {
+    let sources = [
+        (
+            "main.rss",
+            "use self::private::{hidden as hidden_run}; pub fn run(home: resource<auth.host_home>, command: map) -> int { hidden_run() }",
+        ),
+        ("private.rss", "fn hidden() -> int { 7 }"),
+    ];
+    let error = bundle_error(
+        AuthEntryRunner::from_bundle("main.rss", &sources),
+        "private sibling functions are not made public by named-import admission",
+    );
+    assert_eq!(error.code(), "auth_compile_failed");
 }

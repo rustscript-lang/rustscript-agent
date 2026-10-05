@@ -13,6 +13,20 @@ use std::time::{Duration, Instant};
 
 const ENTRY_PATH: &str = "rss/config/path.rss";
 const SOURCES: &[(&str, &str)] = &[(ENTRY_PATH, include_str!("../rss/config/path.rss"))];
+const AUTH_ENTRY_PATH: &str = "rss/auth/commands.rss";
+const AUTH_SOURCES: &[(&str, &str)] = &[
+    (AUTH_ENTRY_PATH, include_str!("../rss/auth/commands.rss")),
+    (
+        "rss/config/selection.rss",
+        include_str!("../rss/config/selection.rss"),
+    ),
+    ("rss/auth/login.rss", include_str!("../rss/auth/login.rss")),
+    (
+        "rss/auth/codex_device.rss",
+        include_str!("../rss/auth/codex_device.rss"),
+    ),
+    ("rss/auth/types.rss", include_str!("../rss/auth/types.rss")),
+];
 
 struct TempArea(PathBuf);
 
@@ -445,20 +459,8 @@ fn valid_auth_entry_report_wire_is_shared_with_the_path_validator() {
         }
     }
 
-    let auth_runner = AuthEntryRunner::from_bundle(
-        "rss/auth/commands.rss",
-        &[
-            (
-                "rss/auth/commands.rss",
-                include_str!("../rss/auth/commands.rss"),
-            ),
-            (
-                "rss/config/selection.rss",
-                include_str!("../rss/config/selection.rss"),
-            ),
-        ],
-    )
-    .expect("compile real auth bundle");
+    let auth_runner = AuthEntryRunner::from_bundle(AUTH_ENTRY_PATH, AUTH_SOURCES)
+        .expect("compile real auth bundle");
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
     let report = auth_runner
         .run_with_host_factory(command("config.check", None, None), &cancellation, {

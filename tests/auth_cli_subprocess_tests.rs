@@ -66,7 +66,6 @@ impl TestArea {
         self.invoke_configured(&binary, Some(home), args)
     }
 
-    #[cfg(all(feature = "default", not(feature = "config-fixture")))]
     fn invoke_binary(&self, binary: &Path, home: &Path, args: &[&str]) -> Output {
         self.invoke_configured(binary, Some(home), args)
     }
@@ -268,6 +267,106 @@ fn assert_redacted(output: &Output, home: &Path) {
         !stderr.contains(home.as_ref()),
         "stderr leaked the private home path"
     );
+}
+
+#[test]
+fn copied_binary_runs_login_pre_oauth_gates_outside_checkout_without_auth_mutation() {
+    let area = TestArea::new("login-pre-oauth-outside-checkout");
+    assert!(!area.caller.starts_with(env!("CARGO_MANIFEST_DIR")));
+    let copied_binary = area.caller.join("rustscript-agent");
+    fs::copy(area.binary(), &copied_binary).expect("copy the actual executable outside checkout");
+
+    let unknown = area.home("unknown-provider-home");
+    fs::remove_file(unknown.join("auth.yaml")).expect("remove auth fixture");
+
+    let unsupported = area.home("unsupported-flow-home");
+    fs::remove_file(unsupported.join("auth.yaml")).expect("remove auth fixture");
+    let mut unsupported_config: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(unsupported.join("config.yaml")).expect("read config"))
+            .expect("parse config");
+    unsupported_config["providers"]["openai-codex"]["oauth"]["flow"] =
+        serde_yaml::Value::String("browser".into());
+    fs::write(
+        unsupported.join("config.yaml"),
+        serde_yaml::to_string(&unsupported_config).expect("serialize unsupported flow"),
+    )
+    .expect("write unsupported flow");
+
+    let missing_auth = area.home("missing-auth-home");
+    fs::remove_file(missing_auth.join("auth.yaml")).expect("remove auth fixture");
+    let mut missing_config: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(missing_auth.join("config.yaml")).expect("read config"))
+            .expect("parse config");
+    let mut missing_provider = missing_config["providers"]["openai-codex"].clone();
+    missing_provider
+        .as_mapping_mut()
+        .expect("provider mapping")
+        .remove(serde_yaml::Value::String("auth".into()));
+    missing_config["providers"]
+        .as_mapping_mut()
+        .expect("providers mapping")
+        .insert(
+            serde_yaml::Value::String("secondary-missing-auth".into()),
+            missing_provider,
+        );
+    fs::write(
+        missing_auth.join("config.yaml"),
+        serde_yaml::to_string(&missing_config).expect("serialize missing auth provider"),
+    )
+    .expect("write missing auth provider");
+
+    let null_auth = area.home("null-auth-home");
+    fs::remove_file(null_auth.join("auth.yaml")).expect("remove auth fixture");
+    let mut null_config: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(null_auth.join("config.yaml")).expect("read config"))
+            .expect("parse config");
+    let mut null_provider = null_config["providers"]["openai-codex"].clone();
+    null_provider["auth"] = serde_yaml::Value::Null;
+    null_config["providers"]
+        .as_mapping_mut()
+        .expect("providers mapping")
+        .insert(
+            serde_yaml::Value::String("secondary-null-auth".into()),
+            null_provider,
+        );
+    fs::write(
+        null_auth.join("config.yaml"),
+        serde_yaml::to_string(&null_config).expect("serialize null auth provider"),
+    )
+    .expect("write null auth provider");
+
+    for (home, provider, expected) in [
+        (&unknown, "unknown-provider", "provider_not_found"),
+        (&unsupported, "openai-codex", "login_flow_unsupported"),
+        (
+            &missing_auth,
+            "secondary-missing-auth",
+            "credential_id_required",
+        ),
+        (&null_auth, "secondary-null-auth", "credential_id_required"),
+    ] {
+        let config_before = fs::read(home.join("config.yaml")).expect("snapshot config bytes");
+        let entries_before = directory_entries(home);
+        assert_eq!(entries_before, ["config.yaml"]);
+        let output = area.invoke_binary(&copied_binary, home, &["auth", "login", provider]);
+        assert_eq!(output.status.code(), Some(1), "stderr={:?}", output.stderr);
+        assert_eq!(output.stdout, format!("{expected}\n").as_bytes());
+        assert_eq!(output.stderr, format!("{expected}\n").as_bytes());
+        assert_redacted(&output, home);
+        assert_eq!(directory_entries(home), entries_before);
+        assert_eq!(
+            fs::read(home.join("config.yaml")).expect("config unchanged"),
+            config_before
+        );
+        assert!(
+            !home.join("auth.yaml").exists(),
+            "pre-OAuth failure created auth.yaml"
+        );
+        assert!(
+            !home.join("auth.yaml.lock").exists(),
+            "pre-OAuth failure created auth lock"
+        );
+    }
 }
 
 #[test]
@@ -1238,8 +1337,8 @@ fn parser_help_and_literal_values_are_redacted_without_home_resolution() {
     let literal_home = area.home("literal-selector-home");
     let literal_selector = area.invoke(&literal_home, &["auth", "login", "--help"]);
     assert_eq!(literal_selector.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&literal_selector.stdout).contains("unsupported_operation"));
-    assert!(String::from_utf8_lossy(&literal_selector.stderr).contains("unsupported_operation"));
+    assert_eq!(literal_selector.stdout, b"provider_not_found\n");
+    assert_eq!(literal_selector.stderr, b"provider_not_found\n");
     assert!(!String::from_utf8_lossy(&literal_selector.stdout).contains("Usage:"));
 
     let config_path = area.invoke(&literal_home, &["config", "path"]);

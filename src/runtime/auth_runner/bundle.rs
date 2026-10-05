@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use rustscript_vm::{
     CompileSourceFileOptions, ImportClause, SharedParserOptions, SourceFlavor, UsePathSegment,
-    compile_source_at_path_with_flavor_and_options, parse_source_with_dialect,
+    analyze_source_from_string_with_options, compile_source_at_path_with_flavor_and_options,
+    parse_source_with_dialect,
 };
 
 use super::{AUTH_ENTRY_PARSER_DIALECT, AuthEntryError, AuthEntryRunner, MAX_AGENT_SOURCE_BYTES};
@@ -66,17 +67,67 @@ impl AuthEntryRunner {
             options.set_module_override_source(virtual_path.to_string_lossy().into_owned(), source);
         }
         let entry_virtual_path = virtual_path(entry_path);
-        let compiled = compile_source_at_path_with_flavor_and_options(
-            &entry_virtual_path,
-            entry,
-            SourceFlavor::RustScript,
-            options,
-        )
-        .map_err(|_| AuthEntryError::CompileFailed)?;
+        let analysis_path = entry_virtual_path.clone();
+        let analysis_source = entry.clone();
+        let analysis_options = options.clone();
+        let (semantic_model, compiled) = std::thread::scope(|scope| {
+            let analysis = scope.spawn(move || {
+                analyze_source_from_string_with_options(
+                    analysis_path,
+                    &analysis_source,
+                    analysis_options,
+                )
+            });
+            let compiled = compile_source_at_path_with_flavor_and_options(
+                &entry_virtual_path,
+                entry,
+                SourceFlavor::RustScript,
+                options,
+            );
+            let semantic_model = analysis
+                .join()
+                .map_err(|_| AuthEntryError::CompileFailed)?
+                .map_err(|_| AuthEntryError::CompileFailed)?;
+            let compiled = compiled.map_err(|_| AuthEntryError::CompileFailed)?;
+            Ok::<_, AuthEntryError>((semantic_model, compiled))
+        })?;
+        let module_graph = semantic_model
+            .module_graph()
+            .ok_or(AuthEntryError::CompileFailed)?;
+        let root_module = module_graph
+            .module_id_for_identity(&entry_virtual_path)
+            .ok_or(AuthEntryError::CompileFailed)?;
+        let entry_name = match module_graph.symbol_for_export(root_module, "run") {
+            Some(symbol) => {
+                let mut declarations = semantic_model
+                    .ir()
+                    .functions
+                    .iter()
+                    .filter(|function| function.symbol == Some(symbol));
+                let function = declarations.next().ok_or(AuthEntryError::CompileFailed)?;
+                if declarations.next().is_some() {
+                    return Err(AuthEntryError::CompileFailed);
+                }
+                Some(function.name.clone())
+            }
+            None => None,
+        };
+        if let Some(entry_name) = entry_name.as_deref() {
+            let matching_exports = compiled
+                .program
+                .exported_callables
+                .iter()
+                .filter(|callable| callable.name.as_str() == entry_name)
+                .count();
+            if matching_exports != 1 {
+                return Err(AuthEntryError::CompileFailed);
+            }
+        }
         Ok(Self {
             program: compiled.program,
             catalog,
             bundle_json_encode: true,
+            entry_name,
         })
     }
 }
@@ -168,7 +219,7 @@ fn scan_imports(source: &str) -> Result<Vec<BundleImport>, AuthEntryError> {
         .map(|declaration| {
             if matches!(
                 declaration.clause,
-                ImportClause::AllPublic | ImportClause::Namespace(_)
+                ImportClause::AllPublic | ImportClause::Named(_) | ImportClause::Namespace(_)
             ) {
                 Ok(BundleImport {
                     path: declaration.path,

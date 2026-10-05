@@ -26,6 +26,18 @@ const AUTH_SOURCES: &[(&str, &str)] = &[
         "rss/config/selection.rss",
         include_str!("../../rss/config/selection.rss"),
     ),
+    (
+        "rss/auth/login.rss",
+        include_str!("../../rss/auth/login.rss"),
+    ),
+    (
+        "rss/auth/codex_device.rss",
+        include_str!("../../rss/auth/codex_device.rss"),
+    ),
+    (
+        "rss/auth/types.rss",
+        include_str!("../../rss/auth/types.rss"),
+    ),
 ];
 const PATH_ENTRY_PATH: &str = "rss/config/path.rss";
 const PATH_SOURCES: &[(&str, &str)] =
@@ -146,8 +158,13 @@ fn execute_auth(
         Ok(runner) => runner,
         Err(_) => return code_output("agent_compile_failed", 1),
     };
+    let configured_login = input.operation == "auth.login";
     execute_auth_cli(&runner, input, cancellation, move |child| {
-        AuthHost::new_for_commands(paths.home, child)
+        if configured_login {
+            AuthHost::new_for_login(paths.home, child)
+        } else {
+            AuthHost::new_for_commands(paths.home, child)
+        }
     })
 }
 
