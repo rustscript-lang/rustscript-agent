@@ -76,12 +76,31 @@ impl TestArea {
         self.invoke_configured(&binary, None, args)
     }
 
+    /// Invokes the actual executable with the override variables removed, so home
+    /// resolution falls through to a real `$HOME/.rustscript-agent` default. This is
+    /// deliberately distinct from `invoke_without_home`, which sets an empty override.
+    fn invoke_absent_override(&self, args: &[&str]) -> Output {
+        let binary = self.binary();
+        let argv: Vec<String> = std::iter::once(binary.to_string_lossy().into_owned())
+            .chain(args.iter().map(|arg| (*arg).to_owned()))
+            .collect();
+        let mut command = Command::new(&binary);
+        command
+            .args(args)
+            .env("HOME", self.root.join("isolated-default-home"))
+            .env_remove("RUSTSCRIPT_AGENT_HOME")
+            .env_remove("USERPROFILE")
+            .current_dir(&self.caller)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.run_recorded(command, &argv)
+    }
+
     fn invoke_configured(&self, binary: &Path, home: Option<&Path>, args: &[&str]) -> Output {
         let binary = binary.to_path_buf();
         let argv: Vec<String> = std::iter::once(binary.to_string_lossy().into_owned())
             .chain(args.iter().map(|arg| (*arg).to_owned()))
             .collect();
-        let group = unsafe { libc::getpgid(0) };
         let mut command = Command::new(&binary);
         command
             .args(args)
@@ -95,6 +114,11 @@ impl TestArea {
         } else {
             command.env("RUSTSCRIPT_AGENT_HOME", "");
         }
+        self.run_recorded(command, &argv)
+    }
+
+    fn run_recorded(&self, mut command: Command, argv: &[String]) -> Output {
+        let group = unsafe { libc::getpgid(0) };
         let child = command
             .spawn()
             .expect("spawn actual rustscript-agent executable");
@@ -102,7 +126,7 @@ impl TestArea {
         let output = child
             .wait_with_output()
             .expect("wait for actual CLI process");
-        self.record(&argv, pid, &output, group);
+        self.record(argv, pid, &output, group);
         output
     }
 
@@ -297,6 +321,212 @@ fn installed_config_path_reports_lexical_path_without_reading_or_creating_config
         !missing_home.parent().expect("missing parent").exists(),
         "config path must not create missing parents"
     );
+    assert!(!area.root.join("isolated-default-home").exists());
+}
+
+#[test]
+fn installed_config_path_succeeds_over_corrupt_and_directory_config_without_traversal() {
+    let area = TestArea::new("config-path-opaque");
+
+    // Corrupt, non-UTF-8 config.yaml and auth.yaml must not affect the lexical path.
+    let corrupt = area.root.join("corrupt-home");
+    fs::create_dir_all(&corrupt).expect("corrupt home");
+    fs::write(corrupt.join("config.yaml"), b"invalid: [config\xffbytes").expect("corrupt config");
+    fs::write(corrupt.join("auth.yaml"), b"invalid: [auth\xfebytes").expect("corrupt auth");
+    let config_before = fs::read(corrupt.join("config.yaml")).expect("snapshot config");
+    let auth_before = fs::read(corrupt.join("auth.yaml")).expect("snapshot auth");
+    let entries_before = directory_entries(&corrupt);
+
+    let output = area.invoke(&corrupt, &["config", "path"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "corrupt path stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", corrupt.join("config.yaml").to_string_lossy()).into_bytes()
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout.windows(7).any(|w| w == b"config\xff"));
+    assert_eq!(directory_entries(&corrupt), entries_before);
+    assert_eq!(
+        fs::read(corrupt.join("config.yaml")).expect("config unchanged"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(corrupt.join("auth.yaml")).expect("auth unchanged"),
+        auth_before
+    );
+
+    // An opaque directory occupying the config.yaml entry must also succeed with no
+    // content traversal and no entry changes.
+    let opaque = area.root.join("opaque-home");
+    fs::create_dir_all(opaque.join("config.yaml")).expect("directory-shaped config");
+    fs::create_dir_all(opaque.join("auth.yaml")).expect("directory-shaped auth");
+    let opaque_entries_before = directory_entries(&opaque);
+    let opaque = opaque
+        .canonicalize()
+        .expect("canonical opaque home for lexical check");
+
+    let output = area.invoke(&opaque, &["config", "path"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "opaque directory path stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", opaque.join("config.yaml").to_string_lossy()).into_bytes()
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(directory_entries(&opaque), opaque_entries_before);
+    assert!(opaque.join("config.yaml").is_dir());
+    assert!(opaque.join("auth.yaml").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_config_path_reports_symlink_home_lexically_without_canonicalizing() {
+    let area = TestArea::new("config-path-symlink");
+    let target = area.root.join("target-home");
+    fs::create_dir_all(&target).expect("symlink target home");
+    fs::write(target.join("config.yaml"), b"opaque: [target bytes").expect("target config");
+    let target_config_before = fs::read(target.join("config.yaml")).expect("target config bytes");
+    let target_entries_before = directory_entries(&target);
+
+    let link = area.root.join("alias-home");
+    std::os::unix::fs::symlink(&target, &link).expect("create symlink home");
+
+    let output = area.invoke(&link, &["config", "path"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "symlink path stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The exact symlink spelling is reported, with no realpath canonicalization.
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", link.join("config.yaml").to_string_lossy()).into_bytes()
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(directory_entries(&target), target_entries_before);
+    assert_eq!(
+        fs::read(target.join("config.yaml")).expect("target config unchanged"),
+        target_config_before
+    );
+}
+
+#[test]
+fn installed_config_path_resolves_absent_override_to_default_home() {
+    let area = TestArea::new("config-path-absent-override");
+    let default_home = area.root.join("isolated-default-home");
+
+    // An absent RUSTSCRIPT_AGENT_HOME override falls through to HOME/.rustscript-agent.
+    let output = area.invoke_absent_override(&["config", "path"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "absent override stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!(
+            "{}\n",
+            default_home
+                .join(".rustscript-agent")
+                .join("config.yaml")
+                .to_string_lossy()
+        )
+        .into_bytes()
+    );
+    assert!(output.stderr.is_empty());
+    assert!(
+        !default_home.exists(),
+        "absent-override default lookup must not create the default home"
+    );
+    assert!(!default_home.join(".rustscript-agent").exists());
+
+    // An empty override is a distinct static failure and must not fall back to HOME.
+    let empty = area.invoke_without_home(&["config", "path"]);
+    assert_eq!(empty.status.code(), Some(1));
+    assert!(empty.stdout.is_empty());
+    assert_eq!(empty.stderr, b"cli_home_invalid\n");
+    assert!(
+        !default_home.exists(),
+        "empty-override failure must not create the default home"
+    );
+}
+
+#[test]
+fn installed_config_path_rejects_invalid_home_and_path_without_creation() {
+    let area = TestArea::new("config-path-invalid");
+
+    for home in [
+        PathBuf::from("relative-home"),
+        PathBuf::from("/root/../outside"),
+    ] {
+        let output = area.invoke(&home, &["config", "path"]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "invalid home {home:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"cli_home_invalid\n");
+    }
+
+    // Native text bounds reject control characters, oversize and non-UTF-8 paths with
+    // the static invalid_path failure and no echoed bytes or created homes.
+    let control_home = area.root.join(format!("line{}break", '\n'));
+    let control = area.invoke(&control_home, &["config", "path"]);
+    assert_eq!(control.status.code(), Some(1));
+    assert!(control.stdout.is_empty());
+    assert_eq!(control.stderr, b"invalid_path\n");
+    assert!(!String::from_utf8_lossy(&control.stderr).contains("line"));
+
+    let long_home = (0..11).fold(area.root.clone(), |path, _| path.join("x".repeat(220)));
+    assert!(long_home.join("config.yaml").as_os_str().len() > 2048);
+    let long = area.invoke(&long_home, &["config", "path"]);
+    assert_eq!(long.status.code(), Some(1));
+    assert!(long.stdout.is_empty());
+    assert_eq!(long.stderr, b"invalid_path\n");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = area.root.as_os_str().as_encoded_bytes().to_vec();
+        bytes.extend_from_slice(b"/invalid-\xff-home");
+        let invalid_utf8 = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        let report = area.invoke(&invalid_utf8, &["config", "path"]);
+        assert_eq!(report.status.code(), Some(1));
+        assert!(report.stdout.is_empty());
+        assert_eq!(report.stderr, b"invalid_path\n");
+        assert!(!String::from_utf8_lossy(&report.stderr).contains("invalid-"));
+    }
+
+    assert!(!area.root.join("isolated-default-home").exists());
+}
+
+#[test]
+fn installed_config_path_rejects_malformed_argv_without_resolving_home() {
+    let area = TestArea::new("config-path-argv");
+    let home = area.home("home");
+    let before_entries = directory_entries(&home);
+
+    // `config path` with a trailing argument is an argv-shape failure before any home
+    // or path resolution: exit 2 with the static usage error and no side effects.
+    let output = area.invoke(&home, &["config", "path", "extra"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("cli_arguments_invalid\nUsage:"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("extra"));
+    assert_eq!(directory_entries(&home), before_entries);
     assert!(!area.root.join("isolated-default-home").exists());
 }
 

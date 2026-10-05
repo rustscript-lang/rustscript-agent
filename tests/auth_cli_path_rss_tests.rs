@@ -321,33 +321,51 @@ pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> Confi
         .expect_err("raw primitive envelope is not a valid report wire");
     assert_eq!(error, AuthEntryError::OutputInvalid);
 
-    // A guest report that omits required fields is rejected without partial output.
+    // A valid typed path guest that reaches the real native getter and then returns a
+    // report missing the mandatory operation/generation wire fields must be rejected
+    // precisely by the shared validator, not by an early binding/shape failure.
     let truncated = r#"
+use config;
+
 struct AuthCommandInput {
     operation: string,
     provider: string?,
     credential_id: string?
 }
 
-pub fn run(home: int, command: AuthCommandInput) -> map {
-    {ok: true, status: "incomplete"}
+pub fn run(home: resource<config.path_home>, command: AuthCommandInput) -> map {
+    let native = config::resolved_path_result(&home);
+    {ok: true, status: native.value.copy()}
 }
 "#;
     let truncated_runner = AuthEntryRunner::from_bundle("main.rss", &[("main.rss", truncated)])
-        .expect("truncated bundle compiles");
+        .expect("typed malformed-report bundle compiles");
     let error = run_path_once(&truncated_runner, &home, command("config.path", None, None))
-        .expect_err("truncated report is rejected");
-    assert!(
-        matches!(
-            error,
-            AuthEntryError::OutputInvalid
-                | AuthEntryError::HomeBind
-                | AuthEntryError::HomeCarrier
-                | AuthEntryError::EntryArity
-                | AuthEntryError::NoEntry
-        ),
-        "unexpected truncated-report error: {error:?}"
+        .expect_err("typed missing-field report is rejected");
+    // EXACT: the guest ran through the real resource and only the shared report
+    // validator may reject it. No binding/arity/entry alternative is accepted.
+    assert_eq!(error, AuthEntryError::OutputInvalid);
+    assert_eq!(error.code(), "auth_output_invalid");
+
+    // The exact validator error maps through the CLI adapter to a static business
+    // failure with empty stdout, using the looked-up production code string.
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let adapter = execute_config_path_cli(
+        &truncated_runner,
+        command("config.path", None, None),
+        &cancellation,
+        {
+            let home = home.clone();
+            move |child| ConfigPathHost::new(home, child)
+        },
     );
+    assert_eq!(adapter.exit_code, 1);
+    assert!(adapter.stdout.is_empty(), "stdout={:?}", adapter.stdout);
+    assert_eq!(
+        adapter.stderr,
+        format!("{}\n", AuthEntryError::OutputInvalid.code())
+    );
+    assert!(!cancellation.watcher_is_armed());
 }
 
 #[test]
