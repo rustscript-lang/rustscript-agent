@@ -274,7 +274,7 @@ fn build_host(
     transport: Arc<ScriptedHttpsTransport>,
     sender: Option<DeviceInstructionSender>,
 ) -> Result<AuthHost, String> {
-    let mut host = AuthHost::new_for_enrollment(home, child, CREDENTIAL_ID)?;
+    let mut host = AuthHost::new_for_login(home, child)?;
     host = host.with_oauth_host(oauth_host(transport));
     if let Some(sender) = sender {
         host = host.with_device_instruction_sender(sender);
@@ -314,7 +314,7 @@ fn run_starter(input: AuthCommandInput) -> Value {
     let home = FixtureHome::new(None, "codex-device");
     let transport = Arc::new(ScriptedHttpsTransport::new());
     run_value(&starter_runner(), &home, transport, None, input)
-        .expect("execute guest baseline with the native enrollment host")
+        .expect("execute guest baseline with the configured-login host")
 }
 
 fn queue_success(transport: &ScriptedHttpsTransport) {
@@ -379,6 +379,93 @@ fn assert_failure(value: &Value, code: &str) {
     assert_eq!(field(value, "ok"), &Value::Bool(false));
     assert_eq!(text(field(value, "status")), code);
     assert_eq!(text(field(value, "error")), code);
+}
+
+fn assert_fresh_home_unchanged(
+    home: &FixtureHome,
+    config_before: &[u8],
+    entries_before: &[String],
+) {
+    assert!(!home.auth_exists(), "auth.yaml was created");
+    assert!(!home.auth_lock_exists(), "auth lock was created");
+    assert_eq!(home.config_bytes(), config_before, "config bytes changed");
+    assert_eq!(home.entry_names(), entries_before, "home entries changed");
+}
+
+#[test]
+fn pre_oauth_rejections_leave_fresh_home_without_auth_store_or_lock() {
+    let runner = login_runner();
+    let missing_provider = FixtureHome::new(None, "codex-device");
+    let empty_provider = FixtureHome::new(None, "codex-device");
+    let credential_override = FixtureHome::new(None, "codex-device");
+    let unknown_provider = FixtureHome::new(None, "codex-device");
+    let missing_auth = FixtureHome::new(None, "codex-device");
+    missing_auth.add_provider("selected-no-auth", None);
+    let null_auth = FixtureHome::new(None, "codex-device");
+    null_auth.add_provider("selected-null-auth", Some(YamlValue::Null));
+    let unsupported_flow = FixtureHome::new(None, "browser");
+
+    let cases = [
+        (
+            &missing_provider,
+            command("auth.login", None),
+            "provider_required",
+            0,
+        ),
+        (
+            &empty_provider,
+            command("auth.login", Some("")),
+            "provider_required",
+            0,
+        ),
+        (
+            &credential_override,
+            command_with_credential("auth.login", Some("openai-codex"), Some("untrusted-id")),
+            "invalid_command",
+            0,
+        ),
+        (
+            &unknown_provider,
+            command("auth.login", Some("untrusted-provider-marker")),
+            "provider_not_found",
+            1,
+        ),
+        (
+            &missing_auth,
+            command("auth.login", Some("selected-no-auth")),
+            "credential_id_required",
+            1,
+        ),
+        (
+            &null_auth,
+            command("auth.login", Some("selected-null-auth")),
+            "credential_id_required",
+            1,
+        ),
+        (
+            &unsupported_flow,
+            command("auth.login", Some("openai-codex")),
+            "login_flow_unsupported",
+            1,
+        ),
+    ];
+
+    for (home, input, code, generation) in cases {
+        let entries_before = home.entry_names();
+        assert_eq!(entries_before, ["config.yaml"]);
+        assert!(!home.auth_exists());
+        assert!(!home.auth_lock_exists());
+        let config_before = home.config_bytes();
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+
+        let result = run_value(&runner, home, transport.clone(), None, input)
+            .expect("pre-OAuth login rejection result");
+        assert_failure(&result, code);
+        assert_eq!(result_map_generation(&result), generation);
+        assert!(transport.take_sent().is_empty(), "OAuth transport was used");
+        assert_fresh_home_unchanged(home, &config_before, &entries_before);
+        assert_no_secret(&format!("{result:?}"));
+    }
 }
 
 #[test]
@@ -751,6 +838,37 @@ fn unavailable_and_closed_instruction_queues_stop_after_start_without_saving() {
     assert_eq!(transport.take_sent().len(), 1);
     assert!(!home.auth_exists());
     assert_no_secret(&format!("{unavailable:?}{closed:?}"));
+}
+
+#[test]
+fn fresh_ui_unavailable_failure_does_not_create_auth_or_lock() {
+    let home = FixtureHome::new(None, "codex-device");
+    let config_before = home.config_bytes();
+    let entries_before = home.entry_names();
+    assert_eq!(entries_before, ["config.yaml"]);
+    assert!(!home.auth_exists());
+    assert!(!home.auth_lock_exists());
+
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(
+        200,
+        &format!(
+            r#"{{"device_auth_id":"{DEVICE_SECRET}","user_code":"{USER_CODE}","expires_in":900,"interval":"0"}}"#
+        ),
+    );
+    let result = run_value(
+        &login_runner(),
+        &home,
+        transport.clone(),
+        None,
+        command("auth.login", Some("openai-codex")),
+    )
+    .expect("unavailable UI result on fresh home");
+
+    assert_failure(&result, "ui_unavailable");
+    assert_eq!(transport.take_sent().len(), 1, "start only");
+    assert_fresh_home_unchanged(&home, &config_before, &entries_before);
+    assert_no_secret(&format!("{result:?}"));
 }
 
 #[test]
