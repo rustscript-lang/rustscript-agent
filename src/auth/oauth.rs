@@ -443,6 +443,17 @@ impl OAuthIoContext {
         }
     }
 
+    pub(crate) fn with_additional_cancel(&self, extra: Arc<dyn OAuthCancel>) -> Self {
+        Self {
+            deadline: self.deadline,
+            clock: Arc::clone(&self.clock),
+            cancel: Arc::new(CombinedOAuthCancel {
+                host: Arc::clone(&self.cancel),
+                owner: extra,
+            }),
+        }
+    }
+
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -955,6 +966,22 @@ impl OAuthHost {
         cancel: Arc<dyn OAuthCancel>,
     ) -> Self {
         Self::with_callbacks(transport, callbacks, browser, clock, cancel, false)
+    }
+
+    /// Construct a native callback host with private per-flow FD inputs.
+    pub fn new_with_native_inputs(
+        transport: Arc<dyn BoundedHttpsTransport>,
+        browser: Arc<dyn BrowserOpener>,
+        manual_input: Option<std::os::fd::OwnedFd>,
+        clock: Arc<dyn OAuthClock>,
+        cancel: Arc<dyn OAuthCancel>,
+    ) -> Result<Self, OAuthError> {
+        let callbacks = Arc::new(
+            crate::auth::native_callback::composite::NativeCallbackInputs::new(manual_input)?,
+        );
+        Ok(Self::with_callbacks(
+            transport, callbacks, browser, clock, cancel, true,
+        ))
     }
 
     /// Construct an OAuth host with owned native loopback callback sessions.

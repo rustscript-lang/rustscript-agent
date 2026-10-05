@@ -1,5 +1,6 @@
 //! Owned, bounded loopback callback sessions for native OAuth flows.
 
+pub mod composite;
 pub mod manual_input;
 
 use std::io::{Read, Write};
