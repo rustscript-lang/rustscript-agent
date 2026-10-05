@@ -232,6 +232,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::{Duration, Instant};
@@ -1198,5 +1200,1182 @@ mod tests {
             200
         );
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    const DEVICE_USER_CODE: &str = "PUBLIC-CODE-7QK";
+    #[cfg(unix)]
+    const DEVICE_START_PATH: &str = "/api/accounts/deviceauth/usercode";
+    #[cfg(unix)]
+    const DEVICE_POLL_PATH: &str = "/api/accounts/deviceauth/token";
+    #[cfg(unix)]
+    const DEVICE_TOKEN_PATH: &str = "/oauth/token";
+    #[cfg(unix)]
+    const DEVICE_CLIENT_ID: &str = "synthetic-public-client";
+
+    #[cfg(unix)]
+    const COMMANDS_SOURCES: &[(&str, &str)] = &[
+        (
+            "rss/auth/commands.rss",
+            include_str!("../../rss/auth/commands.rss"),
+        ),
+        (
+            "rss/config/selection.rss",
+            include_str!("../../rss/config/selection.rss"),
+        ),
+        (
+            "rss/auth/login.rss",
+            include_str!("../../rss/auth/login.rss"),
+        ),
+        (
+            "rss/auth/codex_device.rss",
+            include_str!("../../rss/auth/codex_device.rss"),
+        ),
+        (
+            "rss/auth/types.rss",
+            include_str!("../../rss/auth/types.rss"),
+        ),
+    ];
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct DeviceFlowSecrets {
+        device_auth_id: String,
+        authorization_code: String,
+        code_verifier: String,
+        access_token: String,
+        refresh_token: String,
+    }
+
+    #[cfg(unix)]
+    impl DeviceFlowSecrets {
+        fn generated() -> Self {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            Self {
+                device_auth_id: format!("SYNTHETIC_DEVICE_AUTH_ID_{id}"),
+                authorization_code: format!("SYNTHETIC_AUTH_CODE_{id}"),
+                code_verifier: format!(
+                    "{id}abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                ),
+                access_token: format!("SYNTHETIC_ACCESS_TOKEN_{id}"),
+                refresh_token: format!("SYNTHETIC_REFRESH_TOKEN_{id}"),
+            }
+        }
+
+        fn private_values(&self) -> [&str; 5] {
+            [
+                &self.device_auth_id,
+                &self.authorization_code,
+                &self.code_verifier,
+                &self.access_token,
+                &self.refresh_token,
+            ]
+        }
+    }
+
+    #[cfg(unix)]
+    struct DevicePipeObservation {
+        attempt: usize,
+        bytes: Vec<u8>,
+        ttl_seconds: u64,
+        completed_at: Instant,
+    }
+
+    #[cfg(unix)]
+    struct DeviceTlsRequest {
+        method: String,
+        path: String,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+        received_at: Instant,
+        recorded_at: Instant,
+        pipe_completed_at: Option<Instant>,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum DeviceTlsStage {
+        Start,
+        Poll,
+        Exchange,
+        Unexpected,
+    }
+
+    #[cfg(unix)]
+    struct DeviceTlsSequence {
+        issuer: String,
+        roots: rustls::RootCertStore,
+        output_sender: mpsc::Sender<DevicePipeObservation>,
+        shutdown: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<Result<Vec<DeviceTlsRequest>, &'static str>>>,
+        started_at: Instant,
+    }
+
+    #[cfg(unix)]
+    impl DeviceTlsSequence {
+        fn start(secrets: Vec<DeviceFlowSecrets>, complete: bool) -> Self {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+                .expect("generate the owned localhost test certificate");
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(certified.cert.der().clone())
+                .expect("trust the owned test CA");
+            let tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![certified.cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()).into(),
+                )
+                .expect("build the owned localhost TLS server");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback TLS");
+            listener
+                .set_nonblocking(true)
+                .expect("make listener bounded");
+            let issuer = format!(
+                "https://localhost:{}",
+                listener.local_addr().unwrap().port()
+            );
+            let device_url = format!("{issuer}/codex/device");
+            let (output_sender, output_receiver) = mpsc::channel();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let worker_shutdown = Arc::clone(&shutdown);
+            let started_at = Instant::now();
+            let worker = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "TLS fixture runtime setup failed")?;
+                runtime.block_on(run_device_tls_sequence(
+                    listener,
+                    Arc::new(tls),
+                    secrets,
+                    complete,
+                    device_url,
+                    output_receiver,
+                    worker_shutdown,
+                    started_at,
+                ))
+            });
+            Self {
+                issuer,
+                roots,
+                output_sender,
+                shutdown,
+                worker: Some(worker),
+                started_at,
+            }
+        }
+
+        fn device_url(&self) -> String {
+            format!("{}/codex/device", self.issuer)
+        }
+
+        fn roots(&self) -> rustls::RootCertStore {
+            self.roots.clone()
+        }
+
+        fn observe_pipe(
+            &self,
+            read_fd: std::os::fd::OwnedFd,
+            attempt: usize,
+        ) -> std::thread::JoinHandle<Result<DevicePipeObservation, &'static str>> {
+            let sender = self.output_sender.clone();
+            let url = self.device_url();
+            std::thread::spawn(move || {
+                let observed = read_completed_device_instruction(read_fd, attempt, &url)?;
+                sender
+                    .send(DevicePipeObservation {
+                        attempt: observed.attempt,
+                        bytes: observed.bytes.clone(),
+                        ttl_seconds: observed.ttl_seconds,
+                        completed_at: observed.completed_at,
+                    })
+                    .map_err(|_| "TLS fixture output gate closed")?;
+                Ok(observed)
+            })
+        }
+
+        fn finish(&mut self) -> Result<Vec<DeviceTlsRequest>, &'static str> {
+            let worker = self.worker.take().expect("TLS worker is owned");
+            let result = worker.join();
+            self.shutdown.store(true, Ordering::Release);
+            result.map_err(|_| "TLS fixture worker panicked")?
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DeviceTlsSequence {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn commands_runner() -> crate::runtime::AuthEntryRunner {
+        crate::runtime::AuthEntryRunner::from_bundle("rss/auth/commands.rss", COMMANDS_SOURCES)
+            .expect("compile the complete production auth command bundle")
+    }
+
+    #[cfg(unix)]
+    struct UnavailableCallback;
+
+    #[cfg(unix)]
+    impl crate::auth::oauth::CallbackWaiter for UnavailableCallback {
+        fn wait_one(
+            &self,
+            context: &OAuthIoContext,
+        ) -> Result<crate::auth::oauth::RawCallbackInput, OAuthError> {
+            context.check()?;
+            Err(OAuthError::Transport {
+                message: "composition test callback unavailable".to_owned(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    struct UnavailableBrowser;
+
+    #[cfg(unix)]
+    impl crate::auth::oauth::BrowserOpener for UnavailableBrowser {
+        fn open(&self, _: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
+            context.check()?;
+            Err(OAuthError::Transport {
+                message: "composition test browser unavailable".to_owned(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_native_login(
+        runner: &crate::runtime::AuthEntryRunner,
+        home: &std::path::Path,
+        roots: rustls::RootCertStore,
+        sender: crate::auth::host::DeviceInstructionSender,
+        cancellation: &crate::runtime::RunCancellation,
+    ) -> Result<rustscript_vm::Value, crate::runtime::AuthEntryError> {
+        let home = home.to_path_buf();
+        runner.run_with_host_factory(
+            crate::runtime::AuthCommandInput {
+                operation: "auth.login".to_owned(),
+                provider: Some("openai-codex".to_owned()),
+                credential_id: None,
+            },
+            cancellation,
+            move |child| {
+                let oauth = Arc::new(crate::auth::oauth::OAuthHost::new(
+                    Arc::new(NativeHttpsTransport::with_roots(roots)),
+                    Arc::new(UnavailableCallback),
+                    Arc::new(UnavailableBrowser),
+                    Arc::new(crate::auth::host::SystemOAuthClock),
+                    Arc::new(crate::auth::host::RunOAuthCancel::new(child.clone())),
+                ));
+                Ok(crate::auth::host::AuthHost::new_for_login(home, child)?
+                    .with_oauth_host(oauth)
+                    .with_device_instruction_sender(sender))
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    struct DeviceLoginHome(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl DeviceLoginHome {
+        fn configured(issuer: &str, seed_unrelated: bool) -> Self {
+            let assigned = std::path::PathBuf::from(
+                std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP")
+                    .expect("assigned Task6 test TEMP is configured"),
+            );
+            std::fs::create_dir_all(&assigned).expect("create assigned test TEMP");
+            let home = assigned.join(format!("native-https-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&home).expect("create isolated login home");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+                .expect("protect isolated login home");
+
+            let mut config =
+                include_str!("../../tests/fixtures/codex_device/config.yaml").to_owned();
+            for (old, new) in [
+                (
+                    "issuer: https://auth.example.test",
+                    format!("issuer: {issuer}"),
+                ),
+                (
+                    "token_endpoint: https://auth.example.test/oauth/token",
+                    format!("token_endpoint: {issuer}/oauth/token"),
+                ),
+                (
+                    "redirect_uri: https://auth.example.test/deviceauth/callback",
+                    format!("redirect_uri: {issuer}/deviceauth/callback"),
+                ),
+            ] {
+                assert_eq!(
+                    config.matches(old).count(),
+                    1,
+                    "rewrite one configured OAuth URL"
+                );
+                config = config.replace(old, &new);
+            }
+            if seed_unrelated {
+                let marker = "      refresh_skew_seconds: 120\n";
+                assert_eq!(
+                    config.matches(marker).count(),
+                    1,
+                    "retain one OAuth provider block"
+                );
+                config = config.replace(
+                    marker,
+                    "      refresh_skew_seconds: 120\n  unrelated-provider:\n    protocol: codex-responses\n    base_url: https://other.example.test/backend\n    auth: unrelated-primary\n",
+                );
+            }
+            let config_path = home.join("config.yaml");
+            std::fs::write(&config_path, config).expect("write private configured OAuth policy");
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                .expect("protect configured OAuth policy");
+            if seed_unrelated {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                let auth = format!(
+                    "version: 1\ncredentials:\n  unrelated-primary:\n    provider: unrelated-provider\n    kind: oauth\n    source: fixture\n    token_type: Bearer\n    access_token: SYNTHETIC_UNRELATED_ACCESS_{id}\n    refresh_token: SYNTHETIC_UNRELATED_REFRESH_{id}\n    expires_at_ms: 1900000000000\n    scopes: [scope.fixture]\n    account_id: unrelated.synthetic\n    generation: 7\n    status: active\n"
+                );
+                let auth_path = home.join("auth.yaml");
+                std::fs::write(&auth_path, auth).expect("seed configured unrelated credential");
+                std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+                    .expect("protect unrelated credential record");
+            }
+            Self(home)
+        }
+
+        fn entries(&self) -> Vec<String> {
+            let mut entries = std::fs::read_dir(&self.0)
+                .expect("read isolated home entries")
+                .map(|entry| {
+                    entry
+                        .expect("read isolated home entry")
+                        .file_name()
+                        .into_string()
+                        .expect("UTF-8 isolated home entry")
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DeviceLoginHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn native_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` has room for the two descriptors returned by pipe2.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: pipe2 returned two newly owned descriptors.
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_completed_device_instruction(
+        read_fd: std::os::fd::OwnedFd,
+        attempt: usize,
+        expected_url: &str,
+    ) -> Result<DevicePipeObservation, &'static str> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut bytes = Vec::new();
+        while bytes.iter().filter(|byte| **byte == b'\n').count() < 3 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("native pipe output timed out");
+            }
+            let mut descriptor = libc::pollfd {
+                fd: read_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().clamp(1, 50) as libc::c_int;
+            // SAFETY: descriptor points to one valid pollfd and uses a finite timeout.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err("native pipe poll failed");
+            }
+            if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0
+                || descriptor.revents & libc::POLLHUP != 0 && descriptor.revents & libc::POLLIN == 0
+            {
+                return Err("native pipe closed before instruction completion");
+            }
+            let mut chunk = [0u8; 256];
+            // SAFETY: chunk is writable and read_fd remains owned by this function.
+            let count =
+                unsafe { libc::read(read_fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            if count <= 0 {
+                return Err("native pipe read failed");
+            }
+            bytes.extend_from_slice(&chunk[..count as usize]);
+            if bytes.len() > 4096 {
+                return Err("native instruction exceeded its output bound");
+            }
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| "native instruction was not UTF-8")?;
+        let lines = text.lines().collect::<Vec<_>>();
+        if lines.len() != 3
+            || lines[0] != format!("Open {expected_url}")
+            || lines[1] != format!("Code: {DEVICE_USER_CODE}")
+        {
+            return Err("native instruction lines did not match public login data");
+        }
+        let ttl = lines[2]
+            .strip_prefix("Expires in ")
+            .and_then(|line| line.strip_suffix(" seconds"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=900).contains(value))
+            .ok_or("native instruction TTL was invalid")?;
+        if text
+            != format!("Open {expected_url}\nCode: {DEVICE_USER_CODE}\nExpires in {ttl} seconds\n")
+        {
+            return Err("native instruction was not exactly three completed lines");
+        }
+        Ok(DevicePipeObservation {
+            attempt,
+            bytes,
+            ttl_seconds: ttl,
+            completed_at: Instant::now(),
+        })
+    }
+
+    #[cfg(unix)]
+    async fn run_device_tls_sequence(
+        listener: TcpListener,
+        tls: Arc<rustls::ServerConfig>,
+        secrets: Vec<DeviceFlowSecrets>,
+        complete: bool,
+        device_url: String,
+        output_receiver: mpsc::Receiver<DevicePipeObservation>,
+        shutdown: Arc<AtomicBool>,
+        started_at: Instant,
+    ) -> Result<Vec<DeviceTlsRequest>, &'static str> {
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|_| "TLS fixture listener setup failed")?;
+        let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(tls));
+        let output_receiver = Arc::new(std::sync::Mutex::new(output_receiver));
+        let expected_count = if complete { secrets.len() * 3 } else { 1 };
+        let mut records = Vec::with_capacity(expected_count);
+        for request_index in 0..expected_count {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let tcp = accept_device_connection(&listener, &shutdown, deadline)
+                .await?
+                .ok_or("TLS fixture did not receive the expected request")?;
+            let flow = request_index / 3;
+            let stage = if !complete {
+                DeviceTlsStage::Start
+            } else {
+                match request_index % 3 {
+                    0 => DeviceTlsStage::Start,
+                    1 => DeviceTlsStage::Poll,
+                    _ => DeviceTlsStage::Exchange,
+                }
+            };
+            records.push(
+                serve_device_tls_request(
+                    tcp,
+                    Arc::clone(&acceptor),
+                    stage,
+                    flow,
+                    &secrets[flow],
+                    &device_url,
+                    &output_receiver,
+                    &shutdown,
+                    started_at,
+                )
+                .await?,
+            );
+        }
+        if !complete {
+            let absence_deadline = Instant::now() + Duration::from_millis(1300);
+            if let Some(tcp) =
+                accept_device_connection(&listener, &shutdown, absence_deadline).await?
+            {
+                let unexpected = serve_device_tls_request(
+                    tcp,
+                    Arc::clone(&acceptor),
+                    DeviceTlsStage::Unexpected,
+                    0,
+                    &secrets[0],
+                    &device_url,
+                    &output_receiver,
+                    &shutdown,
+                    started_at,
+                )
+                .await?;
+                records.push(unexpected);
+                return Err("an unexpected native request followed output failure");
+            }
+        }
+        Ok(records)
+    }
+
+    #[cfg(unix)]
+    async fn accept_device_connection(
+        listener: &tokio::net::TcpListener,
+        shutdown: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Option<tokio::net::TcpStream>, &'static str> {
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return Err("TLS fixture stopped during accept");
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::select! {
+                accepted = listener.accept() => {
+                    return accepted
+                        .map(|(stream, _)| Some(stream))
+                        .map_err(|_| "TLS fixture accept failed");
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn serve_device_tls_request(
+        tcp: tokio::net::TcpStream,
+        acceptor: Arc<tokio_rustls::TlsAcceptor>,
+        stage: DeviceTlsStage,
+        flow: usize,
+        secrets: &DeviceFlowSecrets,
+        expected_url: &str,
+        output_receiver: &Arc<std::sync::Mutex<mpsc::Receiver<DevicePipeObservation>>>,
+        shutdown: &Arc<AtomicBool>,
+        started_at: Instant,
+    ) -> Result<DeviceTlsRequest, &'static str> {
+        let tls = tokio::time::timeout(Duration::from_secs(2), acceptor.accept(tcp))
+            .await
+            .map_err(|_| "TLS fixture handshake timed out")?
+            .map_err(|_| "TLS fixture handshake failed")?;
+        let output = match stage {
+            DeviceTlsStage::Start => format!(
+                "{{\"device_auth_id\":\"{}\",\"user_code\":\"{DEVICE_USER_CODE}\",\"expires_in\":900,\"interval\":1}}",
+                secrets.device_auth_id
+            ),
+            DeviceTlsStage::Poll => format!(
+                "{{\"authorization_code\":\"{}\",\"code_verifier\":\"{}\",\"public\":\"poll-ok\"}}",
+                secrets.authorization_code, secrets.code_verifier
+            ),
+            DeviceTlsStage::Exchange => format!(
+                "{{\"access_token\":\"{}\",\"refresh_token\":\"{}\",\"token_type\":\"Bearer\",\"expires_in\":3600,\"public\":\"exchange-ok\"}}",
+                secrets.access_token, secrets.refresh_token
+            ),
+            DeviceTlsStage::Unexpected => String::new(),
+        };
+        let status = if stage == DeviceTlsStage::Unexpected {
+            500
+        } else {
+            200
+        };
+        let result_slot = Arc::new(std::sync::Mutex::new(None));
+        let service_slot = Arc::clone(&result_slot);
+        let service_receiver = Arc::clone(output_receiver);
+        let expected_url = expected_url.to_owned();
+        let response_body = output.into_bytes();
+        let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+            let slot = Arc::clone(&service_slot);
+            let receiver = Arc::clone(&service_receiver);
+            let expected_url = expected_url.clone();
+            let response_body = response_body.clone();
+            async move {
+                let result = read_device_tls_request(
+                    request,
+                    stage,
+                    flow,
+                    &expected_url,
+                    &receiver,
+                    started_at,
+                )
+                .await;
+                let successful = result.is_ok();
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+                let response = Response::builder()
+                    .status(if successful { status } else { 500 })
+                    .header(hyper::header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(response_body)))
+                    .expect("build bounded TLS fixture response");
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let connection = http1::Builder::new().serve_connection(TokioIo::new(tls), service);
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_secs(3), connection) => {},
+            _ = wait_for_device_shutdown(shutdown) => return Err("TLS fixture stopped during HTTP"),
+        }
+        result_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or("TLS fixture did not receive an HTTP request")?
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_device_shutdown(shutdown: &AtomicBool) {
+        while !shutdown.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn read_device_tls_request(
+        request: Request<hyper::body::Incoming>,
+        stage: DeviceTlsStage,
+        flow: usize,
+        expected_url: &str,
+        output_receiver: &Arc<std::sync::Mutex<mpsc::Receiver<DevicePipeObservation>>>,
+        _started_at: Instant,
+    ) -> Result<DeviceTlsRequest, &'static str> {
+        let received_at = Instant::now();
+        let (parts, mut body) = request.into_parts();
+        let method = parts.method.as_str().to_owned();
+        let path = parts
+            .uri
+            .path_and_query()
+            .map(|path| path.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        let mut headers = BTreeMap::new();
+        for (name, value) in &parts.headers {
+            if headers
+                .insert(
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .map_err(|_| "TLS fixture received a non-text header")?
+                        .to_owned(),
+                )
+                .is_some()
+            {
+                return Err("TLS fixture received a duplicate request header");
+            }
+        }
+        let mut request_body = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|_| "TLS fixture request body failed")?;
+            if let Some(data) = frame.data_ref() {
+                if request_body.len().saturating_add(data.len()) > 64 * 1024 {
+                    return Err("TLS fixture request body exceeded its bound");
+                }
+                request_body.extend_from_slice(data);
+            }
+        }
+        let pipe_completed_at = if stage == DeviceTlsStage::Poll {
+            let observation = output_receiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(|_| "TLS fixture did not observe completed native output")?;
+            if observation.attempt != flow
+                || public_device_instruction_ttl(&observation.bytes, expected_url)
+                    != Some(observation.ttl_seconds)
+            {
+                return Err("TLS fixture observed mismatched native output");
+            }
+            Some(observation.completed_at)
+        } else {
+            None
+        };
+        let recorded_at = Instant::now();
+        Ok(DeviceTlsRequest {
+            method,
+            path,
+            headers,
+            body: request_body,
+            received_at,
+            recorded_at,
+            pipe_completed_at,
+        })
+    }
+
+    #[cfg(unix)]
+    fn public_device_instruction_ttl(bytes: &[u8], expected_url: &str) -> Option<u64> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let lines = text.lines().collect::<Vec<_>>();
+        if lines.len() != 3
+            || lines[0] != format!("Open {expected_url}")
+            || lines[1] != format!("Code: {DEVICE_USER_CODE}")
+        {
+            return None;
+        }
+        let ttl = lines[2]
+            .strip_prefix("Expires in ")?
+            .strip_suffix(" seconds")?
+            .parse::<u64>()
+            .ok()?;
+        if !(1..=900).contains(&ttl)
+            || text
+                != format!(
+                    "Open {expected_url}\nCode: {DEVICE_USER_CODE}\nExpires in {ttl} seconds\n"
+                )
+        {
+            return None;
+        }
+        Some(ttl)
+    }
+
+    #[cfg(unix)]
+    fn assert_login_succeeded(result: &rustscript_vm::Value, generation: i64) {
+        assert!(matches!(
+            vm_field(result, "ok"),
+            rustscript_vm::Value::Bool(true)
+        ));
+        assert!(
+            matches!(vm_field(result, "generation"), rustscript_vm::Value::Int(value) if *value == generation)
+        );
+        let rustscript_vm::Value::String(status) = vm_field(result, "status") else {
+            panic!("RSS login returned a non-string status");
+        };
+        let row: serde_json::Value =
+            serde_json::from_str(status).expect("parse sanitized RSS login report");
+        assert!(row["status"] == "active", "RSS login status was not active");
+        assert!(
+            row["generation"] == generation,
+            "RSS report generation differed from the native store"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_login_failed(result: &rustscript_vm::Value, code: &str) {
+        assert!(matches!(
+            vm_field(result, "ok"),
+            rustscript_vm::Value::Bool(false)
+        ));
+        for field in ["status", "error"] {
+            let rustscript_vm::Value::String(value) = vm_field(result, field) else {
+                panic!("RSS login failure returned a non-string {field}");
+            };
+            assert_eq!(value.as_ref(), code, "RSS login failure field {field}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn vm_field<'a>(value: &'a rustscript_vm::Value, name: &str) -> &'a rustscript_vm::Value {
+        let rustscript_vm::Value::Map(fields) = value else {
+            panic!("RSS result is not a record");
+        };
+        fields
+            .iter()
+            .find_map(|(key, value)| match key {
+                rustscript_vm::Value::String(key) if key.as_ref() == name => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("RSS result omitted a required field"))
+    }
+
+    #[cfg(unix)]
+    fn assert_private_values_absent(value: &str, secrets: &[DeviceFlowSecrets]) {
+        for secret in secrets {
+            for private in secret.private_values() {
+                assert!(
+                    !value.contains(private),
+                    "private OAuth material leaked from the native boundary"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_native_store_contents(
+        stored: &[u8],
+        secrets: &[DeviceFlowSecrets],
+        current_generation: usize,
+    ) {
+        let contains = |value: &str| {
+            stored
+                .windows(value.len())
+                .any(|candidate| candidate == value.as_bytes())
+        };
+        let current = &secrets[current_generation];
+        for transient in [
+            &current.device_auth_id,
+            &current.authorization_code,
+            &current.code_verifier,
+        ] {
+            assert!(
+                !contains(transient),
+                "transient OAuth material was persisted"
+            );
+        }
+        assert!(
+            contains(&current.access_token),
+            "native store omitted access token"
+        );
+        assert!(
+            contains(&current.refresh_token),
+            "native store omitted refresh token"
+        );
+        for previous in &secrets[..current_generation] {
+            assert!(
+                !contains(&previous.access_token),
+                "older access token remained active"
+            );
+            assert!(
+                !contains(&previous.refresh_token),
+                "older refresh token remained active"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_device_request_records(
+        records: &[DeviceTlsRequest],
+        secrets: &[DeviceFlowSecrets],
+        issuer: &str,
+        pipes: &[DevicePipeObservation],
+    ) {
+        assert_eq!(
+            records.len(),
+            secrets.len() * 3,
+            "the local TLS service saw exactly three requests per invocation"
+        );
+        for (flow, secret) in secrets.iter().enumerate() {
+            let start = &records[flow * 3];
+            let poll = &records[flow * 3 + 1];
+            let exchange = &records[flow * 3 + 2];
+            assert!(
+                start.method == "POST" && start.path == DEVICE_START_PATH,
+                "device start request path or method differed"
+            );
+            assert!(
+                poll.method == "POST" && poll.path == DEVICE_POLL_PATH,
+                "device poll request path or method differed"
+            );
+            assert!(
+                exchange.method == "POST" && exchange.path == DEVICE_TOKEN_PATH,
+                "token exchange request path or method differed"
+            );
+            assert!(
+                start
+                    .headers
+                    .get("content-type")
+                    .is_some_and(|v| v == "application/json")
+            );
+            assert!(
+                poll.headers
+                    .get("content-type")
+                    .is_some_and(|v| v == "application/json")
+            );
+            assert!(
+                exchange
+                    .headers
+                    .get("content-type")
+                    .is_some_and(|v| v == "application/x-www-form-urlencoded")
+            );
+            assert!(
+                start
+                    .headers
+                    .get("host")
+                    .is_some_and(|v| v == issuer.trim_start_matches("https://"))
+            );
+            assert!(
+                poll.headers
+                    .get("host")
+                    .is_some_and(|v| v == issuer.trim_start_matches("https://"))
+            );
+            assert!(
+                exchange
+                    .headers
+                    .get("host")
+                    .is_some_and(|v| v == issuer.trim_start_matches("https://"))
+            );
+            assert!(
+                !start.headers.contains_key("authorization")
+                    && !poll.headers.contains_key("authorization")
+                    && !exchange.headers.contains_key("authorization")
+            );
+            assert!(
+                start.body.len() <= 64 * 1024
+                    && poll.body.len() <= 64 * 1024
+                    && exchange.body.len() <= 64 * 1024
+            );
+            let start_json: serde_json::Value =
+                serde_json::from_slice(&start.body).expect("parse bounded start JSON");
+            assert!(
+                start_json.as_object().is_some_and(|map| map.len() == 1
+                    && map.get("client_id").is_some_and(|v| v == DEVICE_CLIENT_ID)),
+                "device start body did not retain the configured client id"
+            );
+            let poll_json: serde_json::Value =
+                serde_json::from_slice(&poll.body).expect("parse bounded poll JSON");
+            assert!(
+                poll_json.as_object().is_some_and(|map| map.len() == 2
+                    && map
+                        .get("user_code")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|v| v == DEVICE_USER_CODE)
+                    && map
+                        .get("device_auth_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|v| v == secret.device_auth_id)),
+                "device poll did not carry the native opaque device credential"
+            );
+            let expected_exchange = format!(
+                "grant_type=authorization_code&client_id={DEVICE_CLIENT_ID}&code={}&code_verifier={}&redirect_uri=https%3A%2F%2Flocalhost%3A{}%2Fdeviceauth%2Fcallback",
+                secret.authorization_code,
+                secret.code_verifier,
+                issuer
+                    .trim_start_matches("https://")
+                    .strip_prefix("localhost:")
+                    .unwrap_or_default(),
+            );
+            assert!(
+                exchange.body == expected_exchange.as_bytes(),
+                "token exchange form did not carry the opaque code/verifier pair and configured redirect URI"
+            );
+            let output = &pipes[flow];
+            assert!(
+                poll.pipe_completed_at == Some(output.completed_at)
+                    && poll.recorded_at >= output.completed_at,
+                "the TLS service recorded/permitted poll before observing completed native pipe bytes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn print_device_request_evidence(
+        records: &[DeviceTlsRequest],
+        start: Instant,
+        outputs: &[DevicePipeObservation],
+    ) {
+        for (index, request) in records.iter().enumerate() {
+            let elapsed_ms = request.received_at.duration_since(start).as_millis();
+            let host = request
+                .headers
+                .get("host")
+                .map(String::as_str)
+                .unwrap_or("missing");
+            let content_type = request
+                .headers
+                .get("content-type")
+                .map(String::as_str)
+                .unwrap_or("missing");
+            let pipe_elapsed_ms = request
+                .pipe_completed_at
+                .map(|completed| completed.duration_since(start).as_millis());
+            println!(
+                "P_NATIVE_TLS_RECORD request={index} method={} path={} host={} content_type={} bounded_body_bytes={} received_ms={} recorded_ms={} pipe_completed_ms={pipe_elapsed_ms:?}",
+                request.method,
+                request.path,
+                host,
+                content_type,
+                request.body.len(),
+                elapsed_ms,
+                request.recorded_at.duration_since(start).as_millis(),
+            );
+        }
+        for output in outputs {
+            println!(
+                "P_NATIVE_PIPE_COMPLETED attempt={} lines=3 ttl_seconds={} elapsed_ms={}",
+                output.attempt,
+                output.ttl_seconds,
+                output.completed_at.duration_since(start).as_millis(),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_unrelated_record_unchanged(before: &[u8], after: &[u8]) {
+        let before =
+            crate::auth::config::parse_stored_yaml(std::path::Path::new("before auth"), before)
+                .expect("parse seeded auth YAML");
+        let after =
+            crate::auth::config::parse_stored_yaml(std::path::Path::new("after auth"), after)
+                .expect("parse persisted auth YAML");
+        let before_record = before.credentials.get("unrelated-primary");
+        let after_record = after.credentials.get("unrelated-primary");
+        assert!(
+            before_record.is_some() && before_record == after_record,
+            "complete unrelated credential record changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_commands_tls_pipe_completion_and_native_store_relogin_generations() {
+        let runner = commands_runner();
+        let secrets = vec![
+            DeviceFlowSecrets::generated(),
+            DeviceFlowSecrets::generated(),
+        ];
+        let mut server = DeviceTlsSequence::start(secrets.clone(), true);
+        let home = DeviceLoginHome::configured(&server.issuer, true);
+        let config_before =
+            std::fs::read(home.0.join("config.yaml")).expect("configured policy bytes");
+        let auth_before =
+            std::fs::read(home.0.join("auth.yaml")).expect("unrelated credential bytes");
+        let before_store = crate::auth::store::AuthStore::from_home(&home.0)
+            .expect("open configured native store");
+        let unrelated_before = before_store
+            .load_metadata("unrelated-primary")
+            .expect("load configured unrelated metadata");
+        drop(before_store);
+
+        let mut pipe_observations = Vec::new();
+        for attempt in 0..2 {
+            let (read_fd, write_fd) = native_pipe();
+            let reader = server.observe_pipe(read_fd, attempt);
+            let sink: Arc<dyn crate::auth::host::DeviceInstructionSink> = Arc::new(
+                crate::auth::host::NativeDeviceInstructionOutput::from_fd(write_fd),
+            );
+            let sender = crate::auth::host::DeviceInstructionSender::from_sink(sink);
+            let cancellation =
+                crate::runtime::RunCancellation::with_timeout(Duration::from_secs(10));
+            let result = run_native_login(&runner, &home.0, server.roots(), sender, &cancellation)
+                .expect("execute the actual auth.login command entry");
+            let output = reader
+                .join()
+                .expect("join owned native pipe reader")
+                .expect("observe completed three-line output");
+            assert_eq!(output.attempt, attempt);
+            assert!(
+                public_device_instruction_ttl(&output.bytes, &server.device_url())
+                    == Some(output.ttl_seconds)
+            );
+            let rendered =
+                String::from_utf8(output.bytes.clone()).expect("public pipe output is UTF-8");
+            assert_private_values_absent(&rendered, &secrets);
+            assert_login_succeeded(&result, (attempt + 1) as i64);
+            assert_private_values_absent(&format!("{result:?}"), &secrets);
+            let store = crate::auth::store::AuthStore::from_home(&home.0)
+                .expect("open native store after completed login");
+            let metadata = store
+                .load_metadata("fixture-codex")
+                .expect("read native credential generation");
+            assert_eq!(metadata.generation, (attempt + 1) as u64);
+            let stored = std::fs::read(home.0.join("auth.yaml"))
+                .expect("read only the native store after login completion");
+            assert_native_store_contents(&stored, &secrets, attempt);
+            pipe_observations.push(output);
+        }
+
+        let records = server.finish().expect("join finite local TLS sequence");
+        print_device_request_evidence(&records, server.started_at, &pipe_observations);
+        assert_device_request_records(&records, &secrets, &server.issuer, &pipe_observations);
+        assert_eq!(
+            std::fs::read(home.0.join("config.yaml"))
+                .expect("configuration remains byte-identical"),
+            config_before
+        );
+        let auth_after =
+            std::fs::read(home.0.join("auth.yaml")).expect("native auth store after two logins");
+        assert_unrelated_record_unchanged(&auth_before, &auth_after);
+        let store =
+            crate::auth::store::AuthStore::from_home(&home.0).expect("reopen native auth store");
+        let first = store
+            .load_metadata("fixture-codex")
+            .expect("read generation two from native store");
+        let unrelated_after = store
+            .load_metadata("unrelated-primary")
+            .expect("read preserved unrelated metadata");
+        assert_eq!(first.generation, 2);
+        assert_eq!(unrelated_after, unrelated_before);
+        assert_eq!(
+            store
+                .load_all_metadata()
+                .expect("read configured records")
+                .len(),
+            2
+        );
+        assert!(
+            auth_after
+                .windows(secrets[1].access_token.len())
+                .any(|bytes| bytes == secrets[1].access_token.as_bytes())
+        );
+        assert!(
+            auth_after
+                .windows(secrets[1].refresh_token.len())
+                .any(|bytes| bytes == secrets[1].refresh_token.as_bytes())
+        );
+        assert_private_values_absent(&format!("{first:?}{unrelated_after:?}"), &secrets);
+    }
+
+    #[cfg(unix)]
+    fn assert_device_start_record(record: &DeviceTlsRequest, issuer: &str) {
+        assert_eq!(record.method, "POST");
+        assert_eq!(record.path, DEVICE_START_PATH);
+        assert_eq!(
+            record.headers.get("host").map(String::as_str),
+            Some(issuer.trim_start_matches("https://"))
+        );
+        assert_eq!(
+            record.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&record.body).expect("parse bounded device start JSON");
+        assert!(body.as_object().is_some_and(|object| {
+            object.len() == 1
+                && object.get("client_id").and_then(serde_json::Value::as_str)
+                    == Some(DEVICE_CLIENT_ID)
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dev_full_stops_real_commands_tls_login_after_device_start_without_store_mutation() {
+        let runner = commands_runner();
+        let secret = DeviceFlowSecrets::generated();
+        let mut server = DeviceTlsSequence::start(vec![secret.clone()], false);
+        let home = DeviceLoginHome::configured(&server.issuer, false);
+        let config_path = home.0.join("config.yaml");
+        let config_before = std::fs::read(&config_path).expect("configured local provider bytes");
+        let entries_before = home.entries();
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open the assigned Unix full device");
+        let sink: Arc<dyn crate::auth::host::DeviceInstructionSink> = Arc::new(
+            crate::auth::host::NativeDeviceInstructionOutput::from_fd(output.into()),
+        );
+        let sender = crate::auth::host::DeviceInstructionSender::from_sink(sink);
+        let cancellation = crate::runtime::RunCancellation::with_timeout(Duration::from_secs(10));
+
+        let result = run_native_login(&runner, &home.0, server.roots(), sender, &cancellation)
+            .expect("RSS returns the native output failure as a sanitized result");
+        assert_login_failed(&result, "ui_sink_closed");
+        assert_private_values_absent(&format!("{result:?}"), &[secret]);
+        let records = server
+            .finish()
+            .expect("finish the bounded no-more-requests observation");
+        print_device_request_evidence(&records, server.started_at, &[]);
+        assert_eq!(
+            records.len(),
+            1,
+            "TLS served only the actual device-start operation"
+        );
+        assert_device_start_record(&records[0], &server.issuer);
+        assert_eq!(
+            std::fs::read(&config_path).expect("configuration remains unchanged"),
+            config_before
+        );
+        assert_eq!(
+            home.entries(),
+            entries_before,
+            "output failure created no auth store or lock"
+        );
+        assert!(!home.0.join("auth.yaml").exists());
+        assert!(!home.0.join("auth.yaml.lock").exists());
     }
 }
