@@ -1,0 +1,264 @@
+use auth;
+use config;
+use json;
+use oauth;
+use self::codex_device;
+use self::types;
+
+struct AuthCommandInput {
+    operation: string,
+    provider: string?,
+    credential_id: string?
+}
+
+struct AuthEntryResult {
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+}
+
+struct CodexDeviceLoginRequest {
+    policy_handle: resource<auth.policy>,
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int
+}
+
+struct CodexDeviceInstruction {
+    verification_url: string,
+    user_code: string,
+    expires_in_seconds: int
+}
+
+struct CodexDeviceLoginResult {
+    ok: bool,
+    code: string,
+    message: string,
+    metadata: AuthMetadataEnvelope?
+}
+
+struct ProviderSelection {
+    found: bool,
+    provider: ProviderEntry
+}
+
+struct MetadataSelection {
+    ok: bool,
+    expected_generation: int,
+    error: string
+}
+
+struct LoginReportRow {
+    provider: string,
+    credential_id: string,
+    status: string,
+    generation: int,
+    source: string
+}
+
+fn entry(
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+) -> AuthEntryResult {
+    {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
+}
+
+fn failed(operation: string, code: string, credential_id: string?, generation: int) -> AuthEntryResult {
+    entry(false, operation, credential_id, generation, code.copy(), code.copy())
+}
+
+fn empty_provider() -> ProviderEntry {
+    {name: "", protocol: "", base_url: "", auth: null, oauth: null}
+}
+
+fn provider_selection(public_config: BoundedPublicConfig, requested: string) -> ProviderSelection {
+    let providers = public_config.providers.copy();
+    let mut found: bool = false;
+    let mut provider: ProviderEntry = empty_provider();
+    let mut index: int = 0;
+    while index < providers.length && !found {
+        let candidate: ProviderEntry = providers[index].copy();
+        if candidate.name.copy() == requested.copy() {
+            found = true;
+            provider = candidate;
+        }
+        index += 1;
+    }
+    {found: found, provider: provider}
+}
+
+fn metadata_selection(
+    loaded: AuthMetadataResultEnvelope,
+    credential_id: string,
+    provider: string
+) -> MetadataSelection {
+    if loaded.ok.copy() && loaded.error.copy() == null && loaded.value.copy() != null => {
+        let envelope: AuthMetadataEnvelope = loaded.value.copy();
+        if envelope.ok.copy() && envelope.error.copy() == null && envelope.outcome.copy() == "loaded" => {
+            let metadata: AuthMetadata = envelope.metadata.copy();
+            if metadata.credential_id.copy() != credential_id.copy() || metadata.generation.copy() < 0 => {
+                {ok: false, expected_generation: 0, error: "host_failure"}
+            } else if metadata.provider.copy() != provider.copy() => {
+                {ok: false, expected_generation: metadata.generation.copy(), error: "credential_provider_mismatch"}
+            } else => {
+                {ok: true, expected_generation: metadata.generation.copy(), error: ""}
+            }
+        } else => {
+            {ok: false, expected_generation: 0, error: "host_failure"}
+        }
+    } else if !loaded.ok.copy() && loaded.error.copy() != null && loaded.value.copy() == null => {
+        let failure: AuthBridgeFailure = loaded.error.copy();
+        let code: string = failure.code.copy();
+        if code.copy() == "credential_not_found" => {
+            {ok: true, expected_generation: 0, error: ""}
+        } else => {
+            {ok: false, expected_generation: 0, error: code.copy()}
+        }
+    } else => {
+        {ok: false, expected_generation: 0, error: "host_failure"}
+    }
+}
+
+fn emit_device_instruction(instruction: CodexDeviceInstruction) -> DeviceInstructionResultEnvelope {
+    oauth::emit_device_instruction_result(
+        instruction.verification_url,
+        instruction.user_code,
+        instruction.expires_in_seconds
+    )
+}
+
+fn report_row(provider: string, credential_id: string, status: string, generation: int, source: string) -> string {
+    let row: LoginReportRow = {
+        provider: provider,
+        credential_id: credential_id,
+        status: status,
+        generation: generation,
+        source: source
+    };
+    json::encode(row) + "\n"
+}
+
+fn empty_auth_metadata() -> AuthMetadataEnvelope {
+    {
+        ok: false,
+        error: null,
+        metadata: {credential_id: "", provider: "", kind: "", source: "", token_type: "", expires_at_ms: 0, scopes: [], account_id: null, generation: 0, status: "", last_refresh_at_ms: null, has_refresh_token: false},
+        outcome: ""
+    }
+}
+
+fn workflow_result(
+    result: CodexDeviceLoginResult,
+    operation: string,
+    provider: string,
+    credential_id: string,
+    expected_generation: int
+) -> AuthEntryResult {
+    if !result.ok.copy() => {
+        if result.code.copy() != "" => {
+            failed(operation.copy(), result.code.copy(), credential_id.copy(), expected_generation.copy())
+        } else => {
+            failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+        }
+    } else if result.code.copy() == "ok" => {
+        let optional_metadata: AuthMetadataEnvelope? = result.metadata;
+        let envelope: AuthMetadataEnvelope = optional_metadata.unwrap_or(empty_auth_metadata());
+        if envelope.ok.copy() && envelope.error.copy() == null &&
+           (envelope.outcome.copy() == "committed" || envelope.outcome.copy() == "adopted") => {
+            let metadata: AuthMetadata = envelope.metadata.copy();
+            if metadata.credential_id.copy() != credential_id.copy() ||
+               metadata.provider.copy() != provider.copy() || metadata.generation.copy() < 0 => {
+                failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+            } else => {
+                entry(
+                    true,
+                    operation.copy(),
+                    metadata.credential_id.copy(),
+                    metadata.generation.copy(),
+                    report_row(
+                        metadata.provider.copy(),
+                        metadata.credential_id.copy(),
+                        metadata.status.copy(),
+                        metadata.generation.copy(),
+                        metadata.source.copy()
+                    ),
+                    null
+                )
+            }
+        } else => {
+            failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+        }
+    } else => {
+        failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+    }
+}
+
+pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
+    let operation: string = command.operation.copy();
+    if operation.copy() != "auth.login" => {
+        failed(operation.copy(), "unsupported_operation", null, 0)
+    } else if command.credential_id.copy() != null => {
+        failed(operation.copy(), "invalid_command", null, 0)
+    } else if command.provider.copy() == null || command.provider.copy() == "" => {
+        failed(operation.copy(), "provider_required", null, 0)
+    } else => {
+        let requested_provider: string = command.provider.copy();
+        let snapshot = config::load_snapshot(&home);
+        let snapshot_generation: int = snapshot.policy_generation;
+        if !snapshot.ok || snapshot.error != null || snapshot_generation < 0 => {
+            failed(operation.copy(), "host_failure", null, 0)
+        } else => {
+            let policy: resource<auth.policy> = snapshot.policy_handle;
+            let public_config: BoundedPublicConfig = snapshot.public_config;
+            let selected: ProviderSelection = provider_selection(public_config, requested_provider.copy());
+            if !selected.found.copy() => {
+                failed(operation.copy(), "provider_not_found", null, snapshot_generation.copy())
+            } else => {
+                let provider: ProviderEntry = selected.provider.copy();
+                if provider.auth.copy() == null || provider.auth.copy() == "" => {
+                    failed(operation.copy(), "credential_id_required", null, snapshot_generation.copy())
+                } else if provider.oauth.copy() == null => {
+                    failed(operation.copy(), "login_flow_unsupported", provider.auth.copy(), snapshot_generation.copy())
+                } else => {
+                    let oauth_config: OAuthConfig = provider.oauth.copy();
+                    if oauth_config.flow.copy() != "codex-device" => {
+                        failed(operation.copy(), "login_flow_unsupported", provider.auth.copy(), snapshot_generation.copy())
+                    } else => {
+                        let credential_id: string = provider.auth.copy();
+                        let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
+                        let metadata: MetadataSelection = metadata_selection(loaded, credential_id.copy(), provider.name.copy());
+                        if !metadata.ok.copy() => {
+                            failed(operation.copy(), metadata.error.copy(), credential_id.copy(), metadata.expected_generation.copy())
+                        } else => {
+                            let expected_generation: int = metadata.expected_generation.copy();
+                            let request: CodexDeviceLoginRequest = {
+                                policy_handle: policy,
+                                provider: provider,
+                                credential_id: credential_id.copy(),
+                                expected_generation: expected_generation.copy()
+                            };
+                            let result: CodexDeviceLoginResult = codex_device::login_with_instruction_result(
+                                request,
+                                emit_device_instruction
+                            );
+                            workflow_result(
+                                result,
+                                operation.copy(),
+                                requested_provider.copy(),
+                                credential_id.copy(),
+                                expected_generation.copy()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

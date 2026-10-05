@@ -25,6 +25,7 @@ struct CodexDeviceLoginResult {
 }
 
 
+
 struct DeviceUrlParts {
     ok: bool,
     authority: string,
@@ -1044,7 +1045,37 @@ fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoic
     }
 }
 
-fn login_inner(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> null) -> DeviceLoginOutcome {
+fn instruction_acknowledged(result: DeviceInstructionResultEnvelope) -> bool {
+    if result.has("ok") && result.ok.copy() &&
+       (!result.has("error") || result.error.copy() == null) &&
+       result.has("value") && result.value.copy() != null => {
+        let acknowledged: bool = result.value.copy();
+        acknowledged
+    } else => {
+        false
+    }
+}
+
+fn instruction_failure(result: DeviceInstructionResultEnvelope) -> CodexDeviceLoginResult {
+    if result.has("ok") && !result.ok.copy() && result.has("value") &&
+       result.value.copy() == null && result.has("error") && result.error.copy() != null => {
+        let failure: AuthBridgeFailure = result.error.copy();
+        let code: string = failure.code.copy();
+        if code.copy() == "ui_unavailable" || code.copy() == "ui_sink_full" ||
+           code.copy() == "ui_sink_closed" || code.copy() == "ui_instruction_invalid" => {
+            failed(code.copy(), "The device login instruction could not be displayed.")
+        } else if code.copy() == "policy_inactive" || code.copy() == "wait_deadline_exceeded" ||
+                  code.copy() == "clock_unavailable" => {
+            static_failure(result.error.copy(), "instruction_failed", "The device login instruction could not be delivered.")
+        } else => {
+            failed("host_failure", "The device login instruction could not be delivered.")
+        }
+    } else => {
+        failed("host_failure", "The device login instruction could not be delivered.")
+    }
+}
+
+fn login_inner(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> DeviceInstructionResultEnvelope) -> DeviceLoginOutcome {
     let details: DeviceLoginDetails = {
         provider: request.provider,
         credential_id: request.credential_id,
@@ -1097,18 +1128,22 @@ fn login_inner(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceI
                             user_code: instruction.user_code,
                             expires_in_seconds: bounded_expiry
                         };
-                        on_instruction(bounded_instruction);
-                        let poll_state: DevicePollState = {
-                            policy_handle: started.policy_handle,
-                            device_handle: started.device_handle,
-                            user_code: poll_user_code,
-                            interval_ms: poll_interval_ms
-                        };
-                        let polled: DevicePoll = poll_until_complete(poll_state, poll_details.credential_id, poll_endpoints, deadline_ms, after_start.now_ms);
-                        if !polled.ok => {
-                            {policy_handle: polled.policy_handle, result: polled.failure}
+                        let instruction_result: DeviceInstructionResultEnvelope = on_instruction(bounded_instruction);
+                        if instruction_acknowledged(instruction_result.copy()) => {
+                            let poll_state: DevicePollState = {
+                                policy_handle: started.policy_handle,
+                                device_handle: started.device_handle,
+                                user_code: poll_user_code,
+                                interval_ms: poll_interval_ms
+                            };
+                            let polled: DevicePoll = poll_until_complete(poll_state, poll_details.credential_id, poll_endpoints, deadline_ms, after_start.now_ms);
+                            if !polled.ok => {
+                                {policy_handle: polled.policy_handle, result: polled.failure}
+                            } else => {
+                                exchange_and_save(exchange_details, exchange_endpoints, polled.policy_handle, polled.last_ms, polled.code_handle, polled.verifier_handle, deadline_ms)
+                            }
                         } else => {
-                            exchange_and_save(exchange_details, exchange_endpoints, polled.policy_handle, polled.last_ms, polled.code_handle, polled.verifier_handle, deadline_ms)
+                            {policy_handle: started.policy_handle, result: instruction_failure(instruction_result.copy())}
                         }
                     }
                 }
@@ -1117,8 +1152,25 @@ fn login_inner(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceI
     }
 }
 
-pub fn login(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> null) -> CodexDeviceLoginResult {
+pub fn login_with_instruction_result(
+    request: CodexDeviceLoginRequest,
+    on_instruction: fn(CodexDeviceInstruction) -> DeviceInstructionResultEnvelope
+) -> CodexDeviceLoginResult {
     let outcome: DeviceLoginOutcome = login_inner(request, on_instruction);
     auth::cleanup_transients(&outcome.policy_handle);
     outcome.result
+}
+
+fn legacy_instruction_ack(
+    instruction: CodexDeviceInstruction,
+    on_instruction: fn(CodexDeviceInstruction) -> null
+) -> DeviceInstructionResultEnvelope {
+    on_instruction(instruction);
+    {ok: true, value: true, error: null}
+}
+
+pub fn login(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> null) -> CodexDeviceLoginResult {
+    let adapter: fn(CodexDeviceInstruction) -> DeviceInstructionResultEnvelope =
+        |instruction| legacy_instruction_ack(instruction, on_instruction.copy());
+    login_with_instruction_result(request, adapter)
 }
