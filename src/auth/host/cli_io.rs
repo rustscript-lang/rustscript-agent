@@ -7,29 +7,13 @@ use std::sync::{
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustscript_vm::{CallOutcome, Value, Vm, VmResult};
-use url::Url;
 
-use crate::auth::oauth::{OAuthCancel, OAuthClock};
+use crate::auth::oauth::{OAuthCancel, OAuthClock, OAuthError, OAuthIoContext};
 use crate::runtime::RunCancellation;
 
 use super::{Bound, Owner, error, result};
 
 const DEVICE_INSTRUCTION_QUEUE_CAPACITY: usize = 4;
-const MAX_VERIFICATION_URL_BYTES: usize = 2048;
-const MAX_USER_CODE_BYTES: usize = 128;
-const SECRET_QUERY_KEYS: &[&str] = &[
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "client_secret",
-    "device_code",
-    "device_id",
-    "device_auth_id",
-    "authorization_code",
-    "code_verifier",
-    "code",
-    "state",
-];
 
 /// Explicitly public device authorization instructions for a native UI.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,17 +23,48 @@ pub struct PublicDeviceInstruction {
     pub expires_in_seconds: u64,
 }
 
-/// Opaque sender for one bounded device-instruction queue.
+/// Native implementations must honor the finite context during every blocking
+/// step and acknowledge only after output completes. The host cannot preempt an
+/// arbitrary synchronous sink that ignores this contract.
+pub trait DeviceInstructionSink: Send + Sync {
+    fn emit(
+        &self,
+        instruction: &PublicDeviceInstruction,
+        context: &OAuthIoContext,
+    ) -> Result<(), OAuthError>;
+}
+
+/// Opaque sender for one bounded device-instruction delivery path.
 #[derive(Clone)]
 pub struct DeviceInstructionSender {
-    sender: SyncSender<PublicDeviceInstruction>,
+    delivery: DeviceInstructionDelivery,
+}
+
+#[derive(Clone)]
+enum DeviceInstructionDelivery {
+    Queued(SyncSender<PublicDeviceInstruction>),
+    Direct(Arc<dyn DeviceInstructionSink>),
+}
+
+impl DeviceInstructionSender {
+    /// Create a direct sink whose return acknowledges completed native output.
+    pub fn from_sink(sink: Arc<dyn DeviceInstructionSink>) -> Self {
+        Self {
+            delivery: DeviceInstructionDelivery::Direct(sink),
+        }
+    }
 }
 
 /// Create a native queue with a fixed capacity of four instructions.
 pub fn device_instruction_channel() -> (DeviceInstructionSender, Receiver<PublicDeviceInstruction>)
 {
     let (sender, receiver) = sync_channel(DEVICE_INSTRUCTION_QUEUE_CAPACITY);
-    (DeviceInstructionSender { sender }, receiver)
+    (
+        DeviceInstructionSender {
+            delivery: DeviceInstructionDelivery::Queued(sender),
+        },
+        receiver,
+    )
 }
 
 /// Production wall clock for generic OAuth primitives.
@@ -91,6 +106,16 @@ impl OAuthCancel for RunOAuthCancel {
     }
 }
 
+struct OwnerOAuthCancel(Arc<Owner>);
+
+impl OAuthCancel for OwnerOAuthCancel {
+    fn is_cancelled(&self) -> bool {
+        self.0.revoked.load(std::sync::atomic::Ordering::Acquire)
+            || self.0.cancellation.token().is_cancelled()
+            || self.0.cancellation.requested().is_some()
+    }
+}
+
 pub(super) fn emit_device_instruction_call(
     vm: &mut Vm,
     args: &[Value],
@@ -105,10 +130,29 @@ pub(super) fn emit_device_instruction_call(
     let instruction = parse_instruction(args)?;
     check_current_owner(vm, owner)?;
     owner.check()?;
-    match sender.sender.try_send(instruction) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => return Err(error("ui_sink_full")),
-        Err(TrySendError::Disconnected(_)) => return Err(error("ui_sink_closed")),
+
+    match &sender.delivery {
+        DeviceInstructionDelivery::Queued(sender) => match sender.try_send(instruction) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(error("ui_sink_full")),
+            Err(TrySendError::Disconnected(_)) => return Err(error("ui_sink_closed")),
+        },
+        DeviceInstructionDelivery::Direct(sink) => {
+            let context = OAuthIoContext::new(
+                owner.deadline,
+                Arc::new(SystemOAuthClock),
+                Arc::new(OwnerOAuthCancel(Arc::clone(owner))),
+            );
+            owner.check()?;
+            context.check().map_err(|_| error("policy_inactive"))?;
+            let emitted = sink.emit(&instruction, &context);
+            check_current_owner(vm, owner)?;
+            owner.check()?;
+            context.check().map_err(|_| error("policy_inactive"))?;
+            if emitted.is_err() {
+                return Err(error("ui_sink_closed"));
+            }
+        }
     }
 
     check_current_owner(vm, owner)?;
@@ -139,28 +183,12 @@ fn parse_instruction(args: &[Value]) -> VmResult<PublicDeviceInstruction> {
         return Err(error("ui_instruction_invalid"));
     };
 
-    if verification_url.is_empty()
-        || verification_url.len() > MAX_VERIFICATION_URL_BYTES
-        || verification_url.chars().any(char::is_control)
-        || user_code.is_empty()
-        || user_code.len() > MAX_USER_CODE_BYTES
-        || user_code.chars().any(char::is_control)
-        || *expires_in_seconds <= 0
-    {
-        return Err(error("ui_instruction_invalid"));
-    }
-
-    let parsed = Url::parse(verification_url).map_err(|_| error("ui_instruction_invalid"))?;
-    if parsed.scheme() != "https"
-        || parsed.host().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.fragment().is_some()
-        || parsed.query_pairs().any(|(name, _)| {
-            SECRET_QUERY_KEYS
-                .iter()
-                .any(|secret| name.eq_ignore_ascii_case(secret))
-        })
+    if *expires_in_seconds <= 0
+        || !crate::auth::device_output::valid_public_instruction(
+            verification_url,
+            user_code,
+            *expires_in_seconds as u64,
+        )
     {
         return Err(error("ui_instruction_invalid"));
     }

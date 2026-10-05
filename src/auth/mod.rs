@@ -1,6 +1,7 @@
 //! Authentication configuration, token, and secure-store modules.
 
 pub mod config;
+pub mod device_output;
 pub mod host;
 pub mod native_https;
 pub mod oauth;
