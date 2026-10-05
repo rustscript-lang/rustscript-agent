@@ -57,13 +57,17 @@ fn runner_from(source: &str) -> AuthEntryRunner {
         .unwrap_or_else(|error| panic!("path ABI source must pass admission: {error:?}"))
 }
 
+const PATH_ENTRY_PATH: &str = "rss/config/path.rss";
+const PATH_SOURCES: &[(&str, &str)] = &[(PATH_ENTRY_PATH, include_str!("../rss/config/path.rss"))];
+
 fn runner() -> AuthEntryRunner {
-    runner_from(RSS)
+    AuthEntryRunner::from_bundle(PATH_ENTRY_PATH, PATH_SOURCES)
+        .expect("compile the production closed path bundle")
 }
 
 fn command() -> AuthCommandInput {
     AuthCommandInput {
-        operation: "resolve_path".into(),
+        operation: "config.path".into(),
         provider: None,
         credential_id: None,
     }
@@ -151,7 +155,7 @@ fn invoke_native_path_value(
 
 fn command_value() -> Value {
     Value::map(vec![
-        (Value::string("operation"), Value::string("resolve_path")),
+        (Value::string("operation"), Value::string("config.path")),
         (Value::string("provider"), Value::Null),
         (Value::string("credential_id"), Value::Null),
     ])
@@ -170,29 +174,38 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing result field {name}"))
 }
 
-fn assert_path_error(value: &Value, code: &str) {
-    assert_eq!(field(value, "ok"), &Value::Bool(false));
-    assert_eq!(field(value, "value"), &Value::Null);
-    assert_eq!(field(field(value, "error"), "code"), &Value::string(code));
-    assert_eq!(
-        field(field(value, "error"), "cancelled"),
-        &Value::Bool(false)
-    );
-    assert_eq!(
-        field(field(value, "error"), "deadline_exceeded"),
-        &Value::Bool(false)
-    );
-    assert_eq!(field(field(value, "error"), "revoked"), &Value::Bool(false));
+fn optional_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    let Value::Map(entries) = value else {
+        panic!("expected result map, got {value:?}");
+    };
+    entries.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == name => Some(value),
+        _ => None,
+    })
 }
 
-#[test]
-fn path_primitive_is_advertised_to_real_rss_compilation() {
-    compile_source_with_flavor_and_options(
-        RSS,
-        SourceFlavor::RustScript,
-        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&auth_host_catalog())),
-    )
-    .expect("native config-path descriptor and typed resource must compile in real RSS");
+fn assert_absent_or_null(value: &Value, name: &str) {
+    assert!(
+        optional_field(value, name).is_none_or(|value| matches!(value, Value::Null)),
+        "field {name} must be absent or null in {value:?}"
+    );
+}
+
+fn assert_path_error(value: &Value, code: &str) {
+    assert_eq!(field(value, "ok"), &Value::Bool(false));
+    assert_eq!(field(value, "status"), &Value::string(""));
+    assert_eq!(field(value, "error"), &Value::string(code));
+    assert_eq!(field(value, "generation"), &Value::Int(0));
+    assert_absent_or_null(value, "credential_id");
+}
+
+fn assert_path_status(value: &Value, expected: &str) {
+    assert_eq!(field(value, "ok"), &Value::Bool(true));
+    assert_eq!(field(value, "status"), &Value::string(expected));
+    assert_eq!(field(value, "operation"), &Value::string("config.path"));
+    assert_eq!(field(value, "generation"), &Value::Int(0));
+    assert_absent_or_null(value, "credential_id");
+    assert_absent_or_null(value, "error");
 }
 
 #[test]
@@ -223,16 +236,12 @@ fn rss_native_path_invocation_reads_no_config_or_auth_files() {
     let symlink_before = fs::read_link(&linked_home).expect("read home symlink");
 
     let output = run_path(&runner(), linked_home.clone()).expect("path-only RSS run");
-    assert_eq!(field(&output, "ok"), &Value::Bool(true));
-    assert_eq!(field(&output, "error"), &Value::Null);
-    assert_eq!(
-        field(&output, "value"),
-        &Value::string(
-            linked_home
-                .join("config.yaml")
-                .to_str()
-                .expect("UTF-8 expected path")
-        )
+    assert_path_status(
+        &output,
+        linked_home
+            .join("config.yaml")
+            .to_str()
+            .expect("UTF-8 expected path"),
     );
     assert_eq!(
         fs::read(real_home.join("config.yaml")).expect("config remains readable"),
@@ -260,11 +269,7 @@ fn missing_nested_home_is_reported_lexically_without_creation() {
     let base = temp_path("missing");
     let missing_home = base.join("nested").join("absent home");
     let output = run_path(&runner(), missing_home.clone()).expect("missing home remains valid");
-    assert_eq!(field(&output, "ok"), &Value::Bool(true));
-    assert_eq!(
-        field(&output, "value"),
-        &Value::string(missing_home.join("config.yaml").to_str().unwrap())
-    );
+    assert_path_status(&output, missing_home.join("config.yaml").to_str().unwrap());
     assert!(
         !base.exists(),
         "path lookup must not create the missing home or parents"
@@ -276,11 +281,7 @@ fn legal_path_bytes_are_preserved_and_invalid_paths_return_static_failures() {
     let root = temp_path("legal");
     let legal_home = root.join(r#"space "quoted" and \backslash"#);
     let output = run_path(&runner(), legal_home.clone()).expect("legal path run");
-    assert_eq!(field(&output, "ok"), &Value::Bool(true));
-    assert_eq!(
-        field(&output, "value"),
-        &Value::string(legal_home.join("config.yaml").to_str().unwrap())
-    );
+    assert_path_status(&output, legal_home.join("config.yaml").to_str().unwrap());
 
     let control_home = root.join(format!("line{}break", '\n'));
     let output = run_path(&runner(), control_home.clone()).expect("control path envelope");
@@ -360,33 +361,26 @@ fn invocation_rejects_invalid_cancellation_before_path_factory_effects() {
 
 #[test]
 fn json_builtin_is_granted_only_for_bundle_path_execution() {
-    let json_source = r#"
-use config;
-use json;
-
-struct AuthCommandInput {
-    operation: string,
-    provider: string?,
-    credential_id: string?
-}
-
-pub fn run(
-    home: resource<config.path_home>,
-    command: AuthCommandInput
-) -> ConfigPathResultEnvelope {
-    let encoded: string = json::encode(command.operation);
-    config::resolved_path_result(&home)
-}
-"#;
+    let production = include_str!("../rss/config/path.rss");
+    let json_source = production.replacen(
+        "    if operation.copy() == \"config.path\" => {",
+        "    let encoded: string = json::encode(command.operation.copy());\n    if operation.copy() == \"config.path\" => {",
+        1,
+    );
+    let json_source = json_source.replacen("use config;", "use config;\nuse json;", 1);
+    assert_ne!(
+        json_source, production,
+        "production path.rss must carry the scoped JSON insertion anchor"
+    );
     assert!(matches!(
-        AuthEntryRunner::from_source(json_source),
+        AuthEntryRunner::from_source(&json_source),
         Err(AuthEntryError::ImportDenied)
     ));
-    let bundled = AuthEntryRunner::from_bundle("main.rss", &[("main.rss", json_source)])
+    let bundled = AuthEntryRunner::from_bundle("main.rss", &[("main.rss", &json_source)])
         .expect("the existing bundle JSON opt-in compiles");
     let missing_home = temp_path("bundle-json");
     let output = run_path(&bundled, missing_home.clone()).expect("bundle path with JSON builtin");
-    assert_eq!(field(&output, "ok"), &Value::Bool(true));
+    assert_path_status(&output, missing_home.join("config.yaml").to_str().unwrap());
     assert!(!missing_home.exists());
 }
 

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use rustscript_vm::Value;
 
 use crate::AgentPaths;
-use crate::auth::host::AuthHost;
+use crate::auth::host::{AuthHost, ConfigPathHost};
 use crate::runtime::{AuthCommandInput, AuthEntryError, AuthEntryRunner, RunCancellation};
 
 const MAX_STATUS_BYTES: usize = 256 * 1024;
@@ -20,6 +20,7 @@ pub enum CliInvocation {
         allowed_hosts: Vec<String>,
     },
     Auth(AuthCommandInput),
+    ConfigPath(AuthCommandInput),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,7 +70,23 @@ pub fn execute_auth_cli<F>(
 where
     F: FnOnce(RunCancellation) -> Result<AuthHost, String>,
 {
-    match runner.run_with_host_factory(input, cancellation, build_host) {
+    cli_result_output(runner.run_with_host_factory(input, cancellation, build_host))
+}
+
+pub fn execute_config_path_cli<F>(
+    runner: &AuthEntryRunner,
+    input: AuthCommandInput,
+    cancellation: &RunCancellation,
+    build_host: F,
+) -> CliOutput
+where
+    F: FnOnce(RunCancellation) -> Result<ConfigPathHost, String>,
+{
+    cli_result_output(runner.run_with_path_host_factory(input, cancellation, build_host))
+}
+
+fn cli_result_output(result: Result<Value, AuthEntryError>) -> CliOutput {
+    match result {
         Ok(value) => render_result(&value).unwrap_or_else(output_error),
         Err(error) => {
             let exit_code = match &error {
@@ -245,16 +262,23 @@ fn parse_auth(args: &[OsString]) -> Result<CliInvocation, CliError> {
 }
 
 fn parse_config(args: &[OsString]) -> Result<CliInvocation, CliError> {
-    let operation = match args {
-        [command] if command.to_str() == Some("path") => "config.path",
-        [command] if command.to_str() == Some("check") => "config.check",
-        _ => return Err(CliError::InvalidArguments),
-    };
-    Ok(CliInvocation::Auth(AuthCommandInput {
-        operation: operation.to_owned(),
-        provider: None,
-        credential_id: None,
-    }))
+    match args {
+        [command] if command.to_str() == Some("path") => {
+            Ok(CliInvocation::ConfigPath(AuthCommandInput {
+                operation: "config.path".to_owned(),
+                provider: None,
+                credential_id: None,
+            }))
+        }
+        [command] if command.to_str() == Some("check") => {
+            Ok(CliInvocation::Auth(AuthCommandInput {
+                operation: "config.check".to_owned(),
+                provider: None,
+                credential_id: None,
+            }))
+        }
+        _ => Err(CliError::InvalidArguments),
+    }
 }
 
 fn required_selector(value: &OsString) -> Result<String, CliError> {

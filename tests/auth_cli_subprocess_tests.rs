@@ -247,6 +247,60 @@ fn assert_redacted(output: &Output, home: &Path) {
 }
 
 #[test]
+fn installed_config_path_reports_lexical_path_without_reading_or_creating_config() {
+    let area = TestArea::new("config-path-lexical");
+    let home = area.home("existing-home");
+    let before_entries = directory_entries(&home);
+    let before_config = fs::read(home.join("config.yaml")).expect("snapshot config bytes");
+    let before_auth = fs::read(home.join("auth.yaml")).expect("snapshot auth bytes");
+
+    let existing = area.invoke(&home, &["config", "path"]);
+    assert_eq!(
+        existing.status.code(),
+        Some(0),
+        "config path stderr={}",
+        String::from_utf8_lossy(&existing.stderr)
+    );
+    assert_eq!(
+        existing.stdout,
+        format!("{}\n", home.join("config.yaml").to_string_lossy()).into_bytes()
+    );
+    assert!(existing.stderr.is_empty());
+    assert_eq!(directory_entries(&home), before_entries);
+    assert_eq!(
+        fs::read(home.join("config.yaml")).expect("config remains unchanged"),
+        before_config
+    );
+    assert_eq!(
+        fs::read(home.join("auth.yaml")).expect("auth remains unchanged"),
+        before_auth
+    );
+
+    let missing_home = area.root.join("nested").join("absent home");
+    let missing = area.invoke(&missing_home, &["config", "path"]);
+    assert_eq!(
+        missing.status.code(),
+        Some(0),
+        "config path stderr={}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert_eq!(
+        missing.stdout,
+        format!("{}\n", missing_home.join("config.yaml").to_string_lossy()).into_bytes()
+    );
+    assert!(missing.stderr.is_empty());
+    assert!(
+        !missing_home.exists(),
+        "config path must not create the missing home"
+    );
+    assert!(
+        !missing_home.parent().expect("missing parent").exists(),
+        "config path must not create missing parents"
+    );
+    assert!(!area.root.join("isolated-default-home").exists());
+}
+
+#[test]
 fn installed_status_and_config_check_forward_to_the_embedded_guest() {
     let area = TestArea::new("status-config");
     let home = area.home("selected-home");
@@ -302,6 +356,21 @@ fn installed_binary_matches_cargo_artifact_and_runs_outside_the_repository() {
     assert_eq!(status.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&status.stdout).contains("\"status\":\"active\""));
     assert_redacted(&status, &home);
+
+    let before_entries = directory_entries(&home);
+    let before_config = fs::read(home.join("config.yaml")).expect("snapshot config");
+    let path = area.invoke_binary(&installed, &home, &["config", "path"]);
+    assert_eq!(path.status.code(), Some(0));
+    assert_eq!(
+        path.stdout,
+        format!("{}\n", home.join("config.yaml").to_string_lossy()).into_bytes()
+    );
+    assert!(path.stderr.is_empty());
+    assert_eq!(directory_entries(&home), before_entries);
+    assert_eq!(
+        fs::read(home.join("config.yaml")).expect("config unchanged"),
+        before_config
+    );
 }
 
 #[test]
@@ -840,13 +909,13 @@ fn parser_help_and_literal_values_are_redacted_without_home_resolution() {
     assert!(!String::from_utf8_lossy(&literal_selector.stdout).contains("Usage:"));
 
     let config_path = area.invoke(&literal_home, &["config", "path"]);
-    assert_eq!(config_path.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&config_path.stdout).contains("unsupported_operation"));
-    assert!(String::from_utf8_lossy(&config_path.stderr).contains("unsupported_operation"));
-    assert!(
-        !String::from_utf8_lossy(&config_path.stdout)
-            .contains(&literal_home.to_string_lossy().to_string())
+    assert_eq!(config_path.status.code(), Some(0));
+    assert_eq!(
+        config_path.stdout,
+        format!("{}\n", literal_home.join("config.yaml").to_string_lossy()).into_bytes()
     );
+    assert!(config_path.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&config_path.stdout).contains("Usage:"));
 
     fs::write(
         area.caller.join("--help"),

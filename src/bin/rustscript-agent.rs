@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use rustscript_agent::auth::host::AuthHost;
+use rustscript_agent::auth::host::{AuthHost, ConfigPathHost};
 use rustscript_agent::cli::{
-    CliInvocation, CliOutput, cli_usage, execute_auth_cli, parse_cli_args, resolve_cli_paths,
+    CliInvocation, CliOutput, cli_usage, execute_auth_cli, execute_config_path_cli, parse_cli_args,
+    resolve_cli_paths,
 };
 use rustscript_agent::runtime::{AuthEntryRunner, RunCancellation};
 use rustscript_agent::{
@@ -26,6 +27,9 @@ const AUTH_SOURCES: &[(&str, &str)] = &[
         include_str!("../../rss/config/selection.rss"),
     ),
 ];
+const PATH_ENTRY_PATH: &str = "rss/config/path.rss";
+const PATH_SOURCES: &[(&str, &str)] =
+    &[(PATH_ENTRY_PATH, include_str!("../../rss/config/path.rss"))];
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -126,6 +130,7 @@ fn execute_invocation(invocation: CliInvocation, cancellation: RunCancellation) 
             allowed_hosts,
         } => execute_legacy_run(script, allowed_hosts, &cancellation),
         CliInvocation::Auth(input) => execute_auth(input, &cancellation),
+        CliInvocation::ConfigPath(input) => execute_config_path(input, &cancellation),
     }
 }
 
@@ -143,6 +148,23 @@ fn execute_auth(
     };
     execute_auth_cli(&runner, input, cancellation, move |child| {
         AuthHost::new_for_commands(paths.home, child)
+    })
+}
+
+fn execute_config_path(
+    input: rustscript_agent::runtime::AuthCommandInput,
+    cancellation: &RunCancellation,
+) -> CliOutput {
+    let paths = match resolve_cli_paths() {
+        Ok(paths) => paths,
+        Err(error) => return code_output(error.code(), 1),
+    };
+    let runner = match AuthEntryRunner::from_bundle(PATH_ENTRY_PATH, PATH_SOURCES) {
+        Ok(runner) => runner,
+        Err(_) => return code_output("agent_compile_failed", 1),
+    };
+    execute_config_path_cli(&runner, input, cancellation, move |child| {
+        ConfigPathHost::new(paths.home, child)
     })
 }
 

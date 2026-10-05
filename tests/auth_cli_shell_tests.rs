@@ -5,10 +5,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rustscript_agent::auth::host::AuthHost;
+use rustscript_agent::auth::host::{AuthHost, ConfigPathHost};
 use rustscript_agent::cli::{
-    CliError, CliInvocation, CliOutput, cli_usage, execute_auth_cli, parse_cli_args,
-    resolve_cli_paths,
+    CliError, CliInvocation, CliOutput, cli_usage, execute_auth_cli, execute_config_path_cli,
+    parse_cli_args, resolve_cli_paths,
 };
 use rustscript_agent::runtime::{AuthCommandInput, AuthEntryRunner, RunCancellation};
 use rustscript_agent::{
@@ -302,7 +302,6 @@ fn admin_commands_map_to_the_exact_generic_auth_envelope() {
             None,
             Some("-h"),
         ),
-        (&["config", "path"], "config.path", None, None),
         (&["config", "check"], "config.check", None, None),
     ];
 
@@ -320,6 +319,48 @@ fn admin_commands_map_to_the_exact_generic_auth_envelope() {
             }
         );
     }
+}
+
+#[test]
+fn config_path_tag_executes_the_real_path_bundle_and_renders_the_lexical_path() {
+    let home = TestDir::new("config-path-runtime");
+    let invocation = parse(&["config", "path"]).expect("parse config path");
+    assert_eq!(
+        invocation,
+        CliInvocation::ConfigPath(AuthCommandInput {
+            operation: "config.path".to_owned(),
+            provider: None,
+            credential_id: None,
+        })
+    );
+    let CliInvocation::ConfigPath(input) = invocation else {
+        panic!("config path must produce the structural ConfigPath tag");
+    };
+
+    let runner = AuthEntryRunner::from_bundle(
+        "rss/config/path.rss",
+        &[(
+            "rss/config/path.rss",
+            include_str!("../rss/config/path.rss"),
+        )],
+    )
+    .expect("compile production path bundle");
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let home_path = home.0.clone();
+    let output = execute_config_path_cli(&runner, input, &cancellation, move |child| {
+        ConfigPathHost::new(home_path, child)
+    });
+
+    assert_eq!(
+        output,
+        CliOutput {
+            exit_code: 0,
+            stdout: format!("{}\n", home.0.join("config.yaml").to_string_lossy()),
+            stderr: String::new(),
+        }
+    );
+    assert!(!cancellation.watcher_is_armed());
+    assert_eq!(fs::read_dir(&home.0).expect("read home").count(), 0);
 }
 
 #[test]
