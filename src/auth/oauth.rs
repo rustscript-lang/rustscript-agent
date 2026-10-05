@@ -332,12 +332,30 @@ pub struct RawHttpsResponse {
 }
 
 /// Injected callback payload. State comparison stays host-side.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum RawCallbackInput {
     Query { state: String, code: String },
     ManualUrl(String),
     Timeout,
     Cancelled,
+}
+
+impl fmt::Debug for RawCallbackInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Query { .. } => formatter.write_str("Query { <redacted> }"),
+            Self::ManualUrl(_) => formatter.write_str("ManualUrl(<redacted>)"),
+            Self::Timeout => formatter.write_str("Timeout"),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+        }
+    }
+}
+
+/// Per-flow native callback resource prepared before the authorization URL is opened.
+pub trait PreparedCallbackSession: Send + Sync {
+    fn redirect_uri(&self) -> &str;
+    fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError>;
+    fn revoke(&self);
 }
 
 /// Injected bounded HTTPS transport.
@@ -353,6 +371,15 @@ pub trait BoundedHttpsTransport: Send + Sync {
 
 /// Injected one-shot callback waiter.
 pub trait CallbackWaiter: Send + Sync {
+    /// Prepare an owned callback resource for one flow, if supported.
+    fn prepare(
+        &self,
+        _mode: CallbackMode,
+        _context: &OAuthIoContext,
+    ) -> Result<Option<Arc<dyn PreparedCallbackSession>>, OAuthError> {
+        Ok(None)
+    }
+
     /// Bound the native wait by `remaining()` and observe cancellation while waiting.
     fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError>;
 
@@ -562,6 +589,7 @@ struct FlowInner {
     state: Mutex<Zeroizing<String>>,
     verifier: Mutex<Zeroizing<String>>,
     redirect_uri: String,
+    prepared_callback: Option<Arc<dyn PreparedCallbackSession>>,
     callback: AtomicU8,
     callback_succeeded: AtomicBool,
     revoked: AtomicBool,
@@ -595,6 +623,7 @@ impl FlowInner {
             state: Mutex::new(Zeroizing::new("forged".to_string())),
             verifier: Mutex::new(Zeroizing::new(String::new())),
             redirect_uri: String::new(),
+            prepared_callback: None,
             callback: AtomicU8::new(HANDLE_LIVE),
             callback_succeeded: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
@@ -785,6 +814,9 @@ impl FlowInner {
         self.code_state.store(HANDLE_REVOKED, Ordering::Release);
         self.device_state.store(HANDLE_REVOKED, Ordering::Release);
         self.device_in_flight.store(false, Ordering::Release);
+        if let Some(session) = &self.prepared_callback {
+            session.revoke();
+        }
         if let Ok(mut verifier) = self.verifier.lock() {
             verifier.clear();
         }
@@ -810,6 +842,14 @@ impl FlowInner {
             && !flag_live(&self.verifier_state)
             && !flag_live(&self.code_state)
             && !flag_live(&self.device_state)
+    }
+}
+
+impl Drop for FlowInner {
+    fn drop(&mut self) {
+        if let Some(session) = &self.prepared_callback {
+            session.revoke();
+        }
     }
 }
 
@@ -876,8 +916,29 @@ struct HostInner {
     browser: Arc<dyn BrowserOpener>,
     clock: Arc<dyn OAuthClock>,
     cancel: Arc<dyn OAuthCancel>,
+    native_callbacks: bool,
     flows: Mutex<HashMap<u64, Arc<FlowInner>>>,
     next_id: AtomicU64,
+}
+
+struct PreparedCallbackGuard(Option<Arc<dyn PreparedCallbackSession>>);
+
+impl PreparedCallbackGuard {
+    fn new(session: Option<Arc<dyn PreparedCallbackSession>>) -> Self {
+        Self(session)
+    }
+
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for PreparedCallbackGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.0.take() {
+            session.revoke();
+        }
+    }
 }
 
 /// Injected OAuth primitive host. It is not a login/refresh state machine.
@@ -893,6 +954,34 @@ impl OAuthHost {
         clock: Arc<dyn OAuthClock>,
         cancel: Arc<dyn OAuthCancel>,
     ) -> Self {
+        Self::with_callbacks(transport, callbacks, browser, clock, cancel, false)
+    }
+
+    /// Construct an OAuth host with owned native loopback callback sessions.
+    pub fn new_with_native_callbacks(
+        transport: Arc<dyn BoundedHttpsTransport>,
+        browser: Arc<dyn BrowserOpener>,
+        clock: Arc<dyn OAuthClock>,
+        cancel: Arc<dyn OAuthCancel>,
+    ) -> Self {
+        Self::with_callbacks(
+            transport,
+            Arc::new(crate::auth::native_callback::NativeLoopbackCallbacks),
+            browser,
+            clock,
+            cancel,
+            true,
+        )
+    }
+
+    fn with_callbacks(
+        transport: Arc<dyn BoundedHttpsTransport>,
+        callbacks: Arc<dyn CallbackWaiter>,
+        browser: Arc<dyn BrowserOpener>,
+        clock: Arc<dyn OAuthClock>,
+        cancel: Arc<dyn OAuthCancel>,
+        native_callbacks: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(HostInner {
                 transport,
@@ -900,10 +989,16 @@ impl OAuthHost {
                 browser,
                 clock,
                 cancel,
+                native_callbacks,
                 flows: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// Reports whether this host was explicitly constructed with native callbacks.
+    pub fn has_native_callbacks(&self) -> bool {
+        self.inner.native_callbacks
     }
 
     pub(crate) fn clock_now_ms(&self) -> u64 {
@@ -949,7 +1044,27 @@ impl OAuthHost {
         let material = pkce::generate()?;
         let (challenge, verifier, state) = material.into_parts();
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let redirect_uri = format!("http://127.0.0.1:{}/callback", 10_000 + (id % 50_000));
+        let expires_at = min_deadline(policy.deadline, self.inner.clock.now() + CALLBACK_TTL);
+        let context = match owner_cancel {
+            Some(owner_cancel) => self.io_context_with_cancel(expires_at, owner_cancel),
+            None => self.io_context(expires_at),
+        };
+        context.check()?;
+        let prepared_callback = self
+            .inner
+            .callbacks
+            .prepare(intent.callback_mode, &context)?;
+        let mut prepared_guard = PreparedCallbackGuard::new(prepared_callback.clone());
+        context.check()?;
+        if self.inner.native_callbacks && prepared_callback.is_none() {
+            return Err(OAuthError::Transport {
+                message: "native callback session preparation failed".to_string(),
+            });
+        }
+        let redirect_uri = prepared_callback.as_ref().map_or_else(
+            || format!("http://127.0.0.1:{}/callback", 10_000 + (id % 50_000)),
+            |session| session.redirect_uri().to_string(),
+        );
         let mut query = BTreeMap::new();
         for (key, value) in &intent.public_query {
             query.insert(key.clone(), value.clone());
@@ -964,16 +1079,12 @@ impl OAuthHost {
             PKCE_CHALLENGE_METHOD.to_string(),
         );
         query.insert("redirect_uri".to_string(), redirect_uri.clone());
-        // Use the admitted exact path. `path_prefix` is the policy matcher, not
-        // the request path. The loopback redirect is synthetic fixture-only;
-        // Task 4 owns production bind/exposure.
         let authorization_url = format!(
             "https://{}{}?{}",
             endpoint.authority,
             intent.path,
             encode_query(&query)
         );
-        let expires_at = min_deadline(policy.deadline, self.inner.clock.now() + CALLBACK_TTL);
         let flow = Arc::new(FlowInner {
             id,
             host: Arc::downgrade(&self.inner),
@@ -984,6 +1095,7 @@ impl OAuthHost {
             state: Mutex::new(Zeroizing::new(state.as_str().to_string())),
             verifier: Mutex::new(Zeroizing::new(verifier.as_str().to_string())),
             redirect_uri: redirect_uri.clone(),
+            prepared_callback: prepared_callback.clone(),
             callback: AtomicU8::new(HANDLE_LIVE),
             callback_succeeded: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
@@ -995,13 +1107,7 @@ impl OAuthHost {
             device_in_flight: AtomicBool::new(false),
         });
         self.insert_flow(Arc::clone(&flow))?;
-        let context = match owner_cancel {
-            Some(owner_cancel) => self.io_context_with_cancel(
-                min_deadline(flow.expires_at, policy.deadline),
-                owner_cancel,
-            ),
-            None => self.io_context(flow.expires_at),
-        };
+        prepared_guard.disarm();
         let opened = context.check().and_then(|()| {
             if intent.callback_mode == CallbackMode::Browser {
                 self.inner.browser.open(&authorization_url, &context)?;
@@ -1083,9 +1189,13 @@ impl OAuthHost {
             }
             return Err(error);
         }
-        let result = context
-            .check()
-            .and_then(|()| self.inner.callbacks.wait_one(&context));
+        let result = context.check().and_then(|()| {
+            if let Some(session) = &flow.prepared_callback {
+                session.wait_one(&context)
+            } else {
+                self.inner.callbacks.wait_one(&context)
+            }
+        });
         let post = context.check();
         let result = post.and(result);
         match result {
@@ -1819,6 +1929,7 @@ impl OAuthHost {
             state: Mutex::new(Zeroizing::new(String::new())),
             verifier: Mutex::new(Zeroizing::new(String::new())),
             redirect_uri: String::new(),
+            prepared_callback: None,
             callback: AtomicU8::new(HANDLE_REVOKED),
             callback_succeeded: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
@@ -1857,6 +1968,7 @@ impl OAuthHost {
             state: Mutex::new(Zeroizing::new(String::new())),
             verifier: Mutex::new(verifier),
             redirect_uri: redirect_uri.to_string(),
+            prepared_callback: None,
             callback: AtomicU8::new(HANDLE_REVOKED),
             callback_succeeded: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
