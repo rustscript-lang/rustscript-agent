@@ -3,6 +3,8 @@
 pub mod config;
 pub mod device_output;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub mod native_browser;
 pub mod native_callback;
 pub mod native_https;
 pub mod oauth;
