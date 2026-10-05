@@ -300,7 +300,31 @@ fn installed_config_path_reports_lexical_path_without_reading_or_creating_config
         before_auth
     );
 
-    let missing_home = area.root.join("nested").join("absent home");
+    // An isolated existing-but-empty home must report the exact lexical path with no
+    // fixture copied in and no entries created.
+    let empty_home = area.root.join("empty-existing-home");
+    fs::create_dir(&empty_home).expect("create isolated empty home");
+    let empty_before = directory_entries(&empty_home);
+    assert!(empty_before.is_empty(), "empty home starts empty");
+
+    let empty = area.invoke(&empty_home, &["config", "path"]);
+    assert_eq!(
+        empty.status.code(),
+        Some(0),
+        "empty home stderr={}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    assert_eq!(
+        empty.stdout,
+        format!("{}\n", empty_home.join("config.yaml").to_string_lossy()).into_bytes()
+    );
+    assert!(empty.stderr.is_empty());
+    assert_eq!(directory_entries(&empty_home), empty_before);
+
+    // A legal lexical name with spaces, a quote and a backslash must stay byte-exact;
+    // the missing home and its missing parent are never created.
+    let missing_parent = area.root.join("nested-legal");
+    let missing_home = missing_parent.join(r#"space "quoted" and \backslash"#);
     let missing = area.invoke(&missing_home, &["config", "path"]);
     assert_eq!(
         missing.status.code(),
@@ -310,7 +334,14 @@ fn installed_config_path_reports_lexical_path_without_reading_or_creating_config
     );
     assert_eq!(
         missing.stdout,
-        format!("{}\n", missing_home.join("config.yaml").to_string_lossy()).into_bytes()
+        format!(
+            "{}\n",
+            missing_home
+                .join("config.yaml")
+                .to_str()
+                .expect("legal UTF-8 home")
+        )
+        .into_bytes()
     );
     assert!(missing.stderr.is_empty());
     assert!(
@@ -318,7 +349,7 @@ fn installed_config_path_reports_lexical_path_without_reading_or_creating_config
         "config path must not create the missing home"
     );
     assert!(
-        !missing_home.parent().expect("missing parent").exists(),
+        !missing_parent.exists(),
         "config path must not create missing parents"
     );
     assert!(!area.root.join("isolated-default-home").exists());
@@ -399,6 +430,8 @@ fn installed_config_path_reports_symlink_home_lexically_without_canonicalizing()
 
     let link = area.root.join("alias-home");
     std::os::unix::fs::symlink(&target, &link).expect("create symlink home");
+    let link_target_before =
+        fs::read_link(&link).expect("snapshot symlink target before invocation");
 
     let output = area.invoke(&link, &["config", "path"]);
     assert_eq!(
@@ -413,6 +446,11 @@ fn installed_config_path_reports_symlink_home_lexically_without_canonicalizing()
         format!("{}\n", link.join("config.yaml").to_string_lossy()).into_bytes()
     );
     assert!(output.stderr.is_empty());
+    // The link still resolves to the identical target; it was not replaced or retargeted.
+    assert_eq!(
+        fs::read_link(&link).expect("symlink target after invocation"),
+        link_target_before
+    );
     assert_eq!(directory_entries(&target), target_entries_before);
     assert_eq!(
         fs::read(target.join("config.yaml")).expect("target config unchanged"),
@@ -465,49 +503,105 @@ fn installed_config_path_resolves_absent_override_to_default_home() {
 #[test]
 fn installed_config_path_rejects_invalid_home_and_path_without_creation() {
     let area = TestArea::new("config-path-invalid");
+    let caller_entries_before = directory_entries(&area.caller);
 
-    for home in [
-        PathBuf::from("relative-home"),
-        PathBuf::from("/root/../outside"),
-    ] {
-        let output = area.invoke(&home, &["config", "path"]);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "invalid home {home:?} stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.stdout.is_empty());
-        assert_eq!(output.stderr, b"cli_home_invalid\n");
-    }
+    // A relative home is rejected before any observation; the caller-relative
+    // target must stay absent and the caller entries unchanged.
+    let relative_home = PathBuf::from("relative-home");
+    let relative_target = area.caller.join(&relative_home);
+    assert!(!relative_target.exists());
+    let relative = area.invoke(&relative_home, &["config", "path"]);
+    assert_eq!(
+        relative.status.code(),
+        Some(1),
+        "relative home stderr={}",
+        String::from_utf8_lossy(&relative.stderr)
+    );
+    assert!(relative.stdout.is_empty());
+    assert_eq!(relative.stderr, b"cli_home_invalid\n");
+    assert!(
+        !relative_target.exists(),
+        "relative home must not be created"
+    );
+    assert_eq!(directory_entries(&area.caller), caller_entries_before);
+
+    // A parent-directory component is rejected; neither the absent parent nor the
+    // potentially normalized sibling target may be created.
+    let absent_parent = area.root.join("absent-parent");
+    let parent_home = absent_parent.join("..").join("outside");
+    let normalized_sibling = area.root.join("outside");
+    assert!(!absent_parent.exists());
+    assert!(!normalized_sibling.exists());
+    let parent = area.invoke(&parent_home, &["config", "path"]);
+    assert_eq!(
+        parent.status.code(),
+        Some(1),
+        "parent component stderr={}",
+        String::from_utf8_lossy(&parent.stderr)
+    );
+    assert!(parent.stdout.is_empty());
+    assert_eq!(parent.stderr, b"cli_home_invalid\n");
+    assert!(!absent_parent.exists(), "absent parent must not be created");
+    assert!(
+        !normalized_sibling.exists(),
+        "normalized sibling target must not be created"
+    );
 
     // Native text bounds reject control characters, oversize and non-UTF-8 paths with
-    // the static invalid_path failure and no echoed bytes or created homes.
-    let control_home = area.root.join(format!("line{}break", '\n'));
+    // the static invalid_path failure and no echoed bytes or created homes. Every such
+    // fixture lives below one owned, never-created parent.
+    let invalid_parent = area.root.join("absent-invalid-parent");
+    assert!(!invalid_parent.exists());
+
+    let control_home = invalid_parent.join(format!("line{}break", '\n'));
     let control = area.invoke(&control_home, &["config", "path"]);
     assert_eq!(control.status.code(), Some(1));
     assert!(control.stdout.is_empty());
     assert_eq!(control.stderr, b"invalid_path\n");
     assert!(!String::from_utf8_lossy(&control.stderr).contains("line"));
+    assert!(!control_home.exists(), "control home must not be created");
+    assert!(
+        !invalid_parent.exists(),
+        "control parent must not be created"
+    );
 
-    let long_home = (0..11).fold(area.root.clone(), |path, _| path.join("x".repeat(220)));
+    let long_home = (0..11).fold(invalid_parent.clone(), |path, _| path.join("x".repeat(220)));
     assert!(long_home.join("config.yaml").as_os_str().len() > 2048);
     let long = area.invoke(&long_home, &["config", "path"]);
     assert_eq!(long.status.code(), Some(1));
     assert!(long.stdout.is_empty());
     assert_eq!(long.stderr, b"invalid_path\n");
+    // Asserting the first absent ancestor is sufficient for the oversize path.
+    assert!(
+        !invalid_parent.exists(),
+        "oversize parent must not be created"
+    );
 
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
-        let mut bytes = area.root.as_os_str().as_encoded_bytes().to_vec();
+        let mut bytes = invalid_parent.as_os_str().as_encoded_bytes().to_vec();
         bytes.extend_from_slice(b"/invalid-\xff-home");
         let invalid_utf8 = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        assert!(!invalid_utf8.exists());
+        assert!(fs::symlink_metadata(&invalid_utf8).is_err());
         let report = area.invoke(&invalid_utf8, &["config", "path"]);
         assert_eq!(report.status.code(), Some(1));
         assert!(report.stdout.is_empty());
         assert_eq!(report.stderr, b"invalid_path\n");
         assert!(!String::from_utf8_lossy(&report.stderr).contains("invalid-"));
+        assert!(
+            !invalid_utf8.exists(),
+            "invalid-UTF-8 home must not be created"
+        );
+        assert!(
+            fs::symlink_metadata(&invalid_utf8).is_err(),
+            "invalid-UTF-8 home must not exist after the run"
+        );
+        assert!(
+            !invalid_parent.exists(),
+            "invalid-UTF-8 parent must not be created"
+        );
     }
 
     assert!(!area.root.join("isolated-default-home").exists());
@@ -516,17 +610,27 @@ fn installed_config_path_rejects_invalid_home_and_path_without_creation() {
 #[test]
 fn installed_config_path_rejects_malformed_argv_without_resolving_home() {
     let area = TestArea::new("config-path-argv");
-    let home = area.home("home");
-    let before_entries = directory_entries(&home);
+    let caller_entries_before = directory_entries(&area.caller);
+    let relative_home = PathBuf::from("argv-invalid-home");
+    let relative_target = area.caller.join(&relative_home);
 
     // `config path` with a trailing argument is an argv-shape failure before any home
-    // or path resolution: exit 2 with the static usage error and no side effects.
-    let output = area.invoke(&home, &["config", "path", "extra"]);
+    // or path resolution. An explicitly INVALID relative home proves the ordering:
+    // if home resolution ran first this would yield exit1 cli_home_invalid instead of
+    // the argv failure, so the exit2/usage assertion is load-bearing.
+    let output = area.invoke(&relative_home, &["config", "path", "extra"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).starts_with("cli_arguments_invalid\nUsage:"));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("extra"));
-    assert_eq!(directory_entries(&home), before_entries);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("cli_arguments_invalid\nUsage:"));
+    assert!(!stderr.contains("extra"));
+    assert!(!stderr.contains("cli_home_invalid"));
+    assert!(!stderr.contains(relative_home.to_str().expect("relative home is ASCII")));
+    assert!(
+        !relative_target.exists(),
+        "malformed argv must not create the relative home"
+    );
+    assert_eq!(directory_entries(&area.caller), caller_entries_before);
     assert!(!area.root.join("isolated-default-home").exists());
 }
 
