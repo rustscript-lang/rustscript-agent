@@ -445,10 +445,7 @@ mod tests {
         let output = run_with_owned_signal_driver(invocation, |cancellation| {
             install_ctrl_c_watcher(
                 cancellation,
-                std::future::ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "synthetic registration failure",
-                ))),
+                std::future::ready(Err(io::Error::other("synthetic registration failure"))),
             )
         })
         .await;

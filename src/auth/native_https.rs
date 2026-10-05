@@ -1353,7 +1353,6 @@ mod tests {
                     device_url,
                     output_receiver,
                     worker_shutdown,
-                    started_at,
                 ))
             });
             Self {
@@ -1668,7 +1667,6 @@ mod tests {
         device_url: String,
         output_receiver: mpsc::Receiver<DevicePipeObservation>,
         shutdown: Arc<AtomicBool>,
-        started_at: Instant,
     ) -> Result<Vec<DeviceTlsRequest>, &'static str> {
         let listener = tokio::net::TcpListener::from_std(listener)
             .map_err(|_| "TLS fixture listener setup failed")?;
@@ -1695,13 +1693,11 @@ mod tests {
                 serve_device_tls_request(
                     tcp,
                     Arc::clone(&acceptor),
-                    stage,
-                    flow,
+                    (stage, flow),
                     &secrets[flow],
                     &device_url,
                     &output_receiver,
                     &shutdown,
-                    started_at,
                 )
                 .await?,
             );
@@ -1714,13 +1710,11 @@ mod tests {
                 let unexpected = serve_device_tls_request(
                     tcp,
                     Arc::clone(&acceptor),
-                    DeviceTlsStage::Unexpected,
-                    0,
+                    (DeviceTlsStage::Unexpected, 0),
                     &secrets[0],
                     &device_url,
                     &output_receiver,
                     &shutdown,
-                    started_at,
                 )
                 .await?;
                 records.push(unexpected);
@@ -1758,14 +1752,13 @@ mod tests {
     async fn serve_device_tls_request(
         tcp: tokio::net::TcpStream,
         acceptor: Arc<tokio_rustls::TlsAcceptor>,
-        stage: DeviceTlsStage,
-        flow: usize,
+        stage_flow: (DeviceTlsStage, usize),
         secrets: &DeviceFlowSecrets,
         expected_url: &str,
         output_receiver: &Arc<std::sync::Mutex<mpsc::Receiver<DevicePipeObservation>>>,
         shutdown: &Arc<AtomicBool>,
-        started_at: Instant,
     ) -> Result<DeviceTlsRequest, &'static str> {
+        let (stage, flow) = stage_flow;
         let tls = tokio::time::timeout(Duration::from_secs(2), acceptor.accept(tcp))
             .await
             .map_err(|_| "TLS fixture handshake timed out")?
@@ -1801,15 +1794,8 @@ mod tests {
             let expected_url = expected_url.clone();
             let response_body = response_body.clone();
             async move {
-                let result = read_device_tls_request(
-                    request,
-                    stage,
-                    flow,
-                    &expected_url,
-                    &receiver,
-                    started_at,
-                )
-                .await;
+                let result =
+                    read_device_tls_request(request, stage, flow, &expected_url, &receiver).await;
                 let successful = result.is_ok();
                 *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
                 let response = Response::builder()
@@ -1846,7 +1832,6 @@ mod tests {
         flow: usize,
         expected_url: &str,
         output_receiver: &Arc<std::sync::Mutex<mpsc::Receiver<DevicePipeObservation>>>,
-        _started_at: Instant,
     ) -> Result<DeviceTlsRequest, &'static str> {
         let received_at = Instant::now();
         let (parts, mut body) = request.into_parts();
