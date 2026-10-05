@@ -226,10 +226,15 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
 }
 
 #[cfg(feature = "config-fixture")]
-fn save_request(policy: &Value, credential_id: &str, access_slot: Value) -> Value {
+fn save_request(
+    policy: &Value,
+    credential_id: &str,
+    expected_generation: i64,
+    access_slot: Value,
+) -> Value {
     record(vec![
         ("credential_id", Value::string(credential_id)),
-        ("expected_generation", Value::Int(0)),
+        ("expected_generation", Value::Int(expected_generation)),
         ("policy_handle", policy.clone()),
         (
             "metadata",
@@ -241,7 +246,7 @@ fn save_request(policy: &Value, credential_id: &str, access_slot: Value) -> Valu
                 ("expires_at_ms", Value::Int(2_000_000_000_000)),
                 ("scopes", Value::array(vec![])),
                 ("account_id", Value::string("synthetic-login-account")),
-                ("generation", Value::Int(0)),
+                ("generation", Value::Int(expected_generation)),
                 ("status", Value::string("active")),
                 ("last_refresh_at_ms", Value::Null),
                 ("has_refresh_token", Value::Bool(false)),
@@ -299,6 +304,118 @@ fn login_guest_admits_multiple_absent_configured_ids_and_denies_orphan_query_and
     assert_eq!(vm.host_context().resource_count(), 2);
 }
 
+#[test]
+fn login_guest_preserves_existing_configured_metadata_and_generation() {
+    let references = ["fixture-codex", LOGIN_IDS[0]];
+    let home = FixtureHome::new(&references, true);
+    let config_before = fs::read(home.0.join("config.yaml")).expect("config bytes");
+    let auth_before = fs::read(home.0.join("auth.yaml")).expect("auth bytes");
+    let entries_before = home.entries();
+    assert!(!home.0.join("auth.yaml.lock").exists());
+
+    let auth = AuthHost::new_for_login(home.0.clone(), cancellation())
+        .expect("configured existing and absent references");
+    let (mut vm, policy, _) = bind(&auth);
+    let existing = invoke(
+        &mut vm,
+        "metadata_result",
+        &[policy.clone(), Value::string("fixture-codex")],
+    );
+    assert_eq!(field(&existing, "ok"), &Value::Bool(true));
+    let existing_value = field(&existing, "value");
+    assert_eq!(field(existing_value, "outcome"), &Value::string("loaded"));
+    let metadata = field(existing_value, "metadata");
+    assert_eq!(
+        field(metadata, "credential_id"),
+        &Value::string("fixture-codex")
+    );
+    assert_eq!(field(metadata, "provider"), &Value::string("openai-codex"));
+    assert_eq!(field(metadata, "kind"), &Value::string("oauth"));
+    assert_eq!(field(metadata, "source"), &Value::string("codex-device"));
+    assert_eq!(field(metadata, "token_type"), &Value::string("Bearer"));
+    assert_eq!(
+        field(metadata, "expires_at_ms"),
+        &Value::Int(1_900_000_000_000)
+    );
+    assert_eq!(field(metadata, "scopes"), &Value::array(vec![]));
+    assert_eq!(
+        field(metadata, "account_id"),
+        &Value::string("acct_synthetic")
+    );
+    assert_eq!(field(metadata, "generation"), &Value::Int(4));
+    assert_eq!(field(metadata, "status"), &Value::string("active"));
+    assert_eq!(
+        field(metadata, "last_refresh_at_ms"),
+        &Value::Int(1_899_996_400_000)
+    );
+    assert_eq!(field(metadata, "has_refresh_token"), &Value::Bool(true));
+
+    let absent = invoke(
+        &mut vm,
+        "metadata_result",
+        &[policy.clone(), Value::string(LOGIN_IDS[0])],
+    );
+    assert_eq!(field(&absent, "ok"), &Value::Bool(false));
+    assert_eq!(error_code(&absent), "credential_not_found");
+    assert_eq!(
+        fs::read(home.0.join("config.yaml")).expect("config unchanged"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(home.0.join("auth.yaml")).expect("auth unchanged"),
+        auth_before
+    );
+    assert_eq!(home.entries(), entries_before);
+
+    #[cfg(feature = "config-fixture")]
+    {
+        let access_slot = auth
+            .fixture_slot(
+                &mut vm,
+                "fixture-codex",
+                4,
+                false,
+                "LOGIN_EXISTING_ACCESS_SLOT_FIXTURE",
+            )
+            .expect("public fixture slot at existing generation four");
+        let saved = invoke(
+            &mut vm,
+            "save_result",
+            &[save_request(&policy, "fixture-codex", 4, access_slot)],
+        );
+        assert_eq!(field(&saved, "ok"), &Value::Bool(true), "{saved:?}");
+        let value = field(&saved, "value");
+        assert_eq!(field(value, "outcome"), &Value::string("committed"));
+        assert_eq!(
+            field(field(value, "metadata"), "generation"),
+            &Value::Int(5)
+        );
+        let store = rustscript_agent::auth::store::AuthStore::from_home(&home.0)
+            .expect("read persisted auth store");
+        assert_eq!(
+            store
+                .load_metadata("fixture-codex")
+                .expect("saved credential")
+                .generation,
+            5,
+        );
+        assert_eq!(
+            fs::read(home.0.join("config.yaml")).expect("config unchanged"),
+            config_before
+        );
+        assert_ne!(
+            fs::read(home.0.join("auth.yaml")).expect("auth updated"),
+            auth_before
+        );
+        let mut expected_entries = entries_before;
+        expected_entries.push("auth.yaml.lock".into());
+        expected_entries.sort();
+        assert_eq!(home.entries(), expected_entries);
+        assert!(!format!("{saved:?}").contains("LOGIN_EXISTING_ACCESS_SLOT_FIXTURE"));
+    }
+    assert_eq!(vm.host_context().resource_count(), 2);
+}
+
 #[cfg(feature = "config-fixture")]
 #[test]
 fn login_authorized_fixture_slot_saves_absent_configured_credential_from_generation_zero() {
@@ -321,7 +438,12 @@ fn login_authorized_fixture_slot_saves_absent_configured_credential_from_generat
     let rejected = invoke(
         &mut vm,
         "save_result",
-        &[save_request(&policy, "fixture-codex", orphan_slot.clone())],
+        &[save_request(
+            &policy,
+            "fixture-codex",
+            0,
+            orphan_slot.clone(),
+        )],
     );
     assert_eq!(field(&rejected, "ok"), &Value::Bool(false));
     assert_eq!(error_code(&rejected), "credential_not_admitted");
@@ -343,7 +465,7 @@ fn login_authorized_fixture_slot_saves_absent_configured_credential_from_generat
     let saved = invoke(
         &mut vm,
         "save_result",
-        &[save_request(&policy, LOGIN_IDS[0], access_slot)],
+        &[save_request(&policy, LOGIN_IDS[0], 0, access_slot)],
     );
     assert_eq!(field(&saved, "ok"), &Value::Bool(true), "{saved:?}");
     let value = field(&saved, "value");
