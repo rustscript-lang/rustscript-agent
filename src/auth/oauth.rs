@@ -2805,10 +2805,7 @@ fn sanitize_response(
     let text = std::str::from_utf8(&raw.body).map_err(|_| OAuthError::MalformedResponse {
         reason: "response is not UTF-8".to_string(),
     })?;
-    let parsed: JsonValue =
-        serde_json::from_str(text).map_err(|_| OAuthError::MalformedResponse {
-            reason: "response is not JSON".to_string(),
-        })?;
+    let parsed = parse_strict_json(text)?;
     if json_depth(&parsed) > MAX_JSON_DEPTH {
         return Err(OAuthError::MalformedResponse {
             reason: "response JSON exceeds depth".to_string(),
