@@ -582,6 +582,68 @@ fn native_save_rejection_is_redacted_and_does_not_change_store() {
 }
 
 #[test]
+fn native_secret_slot_kind_provenance_rejection_is_redacted_and_cleanup_retires_candidates() {
+    let home = TempHome::new("secret-slot-kind-provenance");
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(
+        200,
+        &format!(
+            r#"{{"access_token":"{STALE_ACCESS}","refresh_token":"{STALE_REFRESH}","token_type":"Bearer","expires_in":3600}}"#
+        ),
+    );
+    let auth = native_host(&home, transport.clone());
+    let (mut vm, home_handle, policy) = bind_and_snapshot(&auth, &production_source());
+    let (original_access, refresh_candidate) = capture_slots(&mut vm, &policy);
+    assert_eq!(transport.take_sent().len(), 1, "native refresh transport");
+    assert!(!matches!(original_access, Value::Null));
+
+    let before = fs::read(home.0.join("auth.yaml")).expect("snapshot actual auth store");
+    let input = save_input_for(SaveInputSpec {
+        credential_id: CREDENTIAL_ID,
+        expected_generation: EXPECTED_GENERATION,
+        provider: AUTHORIZED_PROVIDER,
+        source: "slot-kind-provenance-source",
+        status: "active",
+        expires_at_ms: 2_100_000_000_000,
+        has_refresh_token: false,
+        refresh_action: "clear",
+    });
+
+    let result = invoke(
+        &mut vm,
+        "save",
+        &[
+            home_handle,
+            policy.clone(),
+            input,
+            refresh_candidate,
+            Value::Null,
+        ],
+    );
+    assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
+    assert_eq!(field(&result, "code"), &Value::string("save_rejected"));
+    assert!(is_null_or_absent(&result, "outcome"));
+    assert!(is_null_or_absent(&result, "value"));
+    for secret in [STALE_ACCESS, STALE_REFRESH] {
+        assert!(!format!("{result:?}").contains(secret));
+    }
+    assert_eq!(fs::read(home.0.join("auth.yaml")).unwrap(), before);
+    assert_eq!(
+        vm.host_context().resource_count(),
+        4,
+        "same-owner candidates remain live after native provenance rejection"
+    );
+
+    let _ = invoke(&mut vm, "cleanup", &[policy]);
+    assert_eq!(
+        vm.host_context().resource_count(),
+        2,
+        "enclosing cleanup retires both candidates and retains home and policy"
+    );
+    assert_eq!(fs::read(home.0.join("auth.yaml")).unwrap(), before);
+}
+
+#[test]
 fn cancelled_native_cas_fails_closed_without_persisted_mutation() {
     let home = TempHome::new("cancelled");
     let transport = Arc::new(ScriptedHttpsTransport::new());
