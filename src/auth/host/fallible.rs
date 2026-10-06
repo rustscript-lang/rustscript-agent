@@ -339,6 +339,29 @@ fn device_instruction_failure(owner: Option<&Owner>, code: &str) -> VmResult<Cal
     ]))
 }
 
+pub(super) fn emit_authorization_instruction_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::emit_authorization_instruction_result",
+        vec![borrow("callback_handle", key("oauth.callback"))],
+        result_type(
+            "AuthorizationInstructionResultEnvelope",
+            HostTypeSchema::Bool,
+        ),
+        emit_authorization_instruction_result_call,
+    )
+}
+
+fn emit_authorization_instruction_result_call(
+    vm: &mut Vm,
+    args: &[Value],
+) -> VmResult<CallOutcome> {
+    let callback = args.first().ok_or_else(|| error("invalid_request"))?;
+    let owner = super::flow::owner_for_callback_cleanup(vm, callback)?;
+    let outcome = super::flow::emit_authorization_instruction(vm, callback, &owner)
+        .and_then(|()| result(Value::Bool(true)));
+    wrap_value(owner, outcome)
+}
+
 pub(super) fn public_json_field_result_desc() -> HostFunctionDescriptor {
     desc(
         "oauth::public_json_field_result",

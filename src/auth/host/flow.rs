@@ -16,8 +16,9 @@ use crate::auth::oauth::{
 };
 
 use super::{
-    Bound, LIMIT, Owner, OwnerResource, TrustedTransportPolicy, borrow, desc, envelope, error,
-    field, handle, issue, key, named, object, opt, policy_owner, result, string, transport_policy,
+    Bound, LIMIT, Owner, OwnerResource, PublicAuthorizationInstruction, TrustedTransportPolicy,
+    borrow, desc, envelope, error, field, handle, issue, key, named, object, opt, policy_owner,
+    result, string, transport_policy,
 };
 
 const CALLBACK_KEY: &str = "oauth.callback";
@@ -37,6 +38,7 @@ struct FlowResources {
     callback: Option<OpaqueCallbackHandle>,
     verifier: OpaqueVerifierHandle,
     code: Mutex<Option<OpaqueAuthorizationCodeHandle>>,
+    public_authorization_instruction: Option<PublicAuthorizationInstruction>,
     callback_resource: Mutex<Option<ResourceHandle>>,
     verifier_resource: Mutex<Option<ResourceHandle>>,
     code_resource: Mutex<Option<ResourceHandle>>,
@@ -289,6 +291,7 @@ pub(super) fn publish_exchange_pair(
         callback: None,
         verifier: pair.verifier_handle,
         code: Mutex::new(Some(pair.code_handle)),
+        public_authorization_instruction: None,
         callback_resource: Mutex::new(None),
         verifier_resource: Mutex::new(None),
         code_resource: Mutex::new(None),
@@ -617,6 +620,10 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         let _ = oauth.revoke_callback_flow(&begun.callback_handle);
         return Err(failure);
     }
+    let public_authorization_instruction = PublicAuthorizationInstruction {
+        authorization_url: begun.authorization_url.clone(),
+        redirect_uri: begun.redirect_uri.clone(),
+    };
     let flow = Arc::new(FlowResources {
         owner: owner.clone(),
         credential_id,
@@ -625,6 +632,7 @@ fn pkce_begin_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         callback: Some(begun.callback_handle),
         verifier: begun.verifier_handle,
         code: Mutex::new(None),
+        public_authorization_instruction: Some(public_authorization_instruction),
         callback_resource: Mutex::new(None),
         verifier_resource: Mutex::new(None),
         code_resource: Mutex::new(None),
@@ -802,6 +810,65 @@ fn close_resource<T: HostResource + HostResourceType + OwnerResource>(
     owner.check()?;
     closed?;
     result(Value::Null)
+}
+
+pub(super) fn owner_for_callback_cleanup(vm: &mut Vm, value: &Value) -> VmResult<Arc<Owner>> {
+    owner_for_cleanup::<CallbackResource>(vm, value)
+}
+
+pub(super) fn emit_authorization_instruction(
+    vm: &mut Vm,
+    callback_value: &Value,
+    owner: &Arc<Owner>,
+) -> VmResult<()> {
+    let flow = flow_for_callback(vm, callback_value)?;
+    if !Arc::ptr_eq(owner, &flow.owner) {
+        return Err(error("owner_mismatch"));
+    }
+    callback_owner_check(owner, &flow.credential_id)
+        .inspect_err(|_| rollback_resources(vm, &flow))?;
+    if owner.snapshot.generation != flow.policy_generation {
+        rollback_resources(vm, &flow);
+        return Err(error("policy_inactive"));
+    }
+    let _policy = revalidate_callback_policy(vm, &flow)?;
+    let instruction = flow
+        .public_authorization_instruction
+        .as_ref()
+        .ok_or_else(|| error("ui_instruction_invalid"))?;
+    if instruction.authorization_url.is_empty()
+        || instruction.authorization_url.len() > 32_768
+        || instruction
+            .authorization_url
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+        || instruction.redirect_uri.is_empty()
+        || instruction.redirect_uri.len() > 2_048
+        || instruction
+            .redirect_uri
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+    {
+        return Err(error("ui_instruction_invalid"));
+    }
+    let sender = owner
+        .authorization_instruction_sender
+        .as_ref()
+        .ok_or_else(|| error("ui_unavailable"))?;
+    sender.try_send(instruction.clone()).map_err(error)?;
+
+    callback_owner_check(owner, &flow.credential_id)
+        .inspect_err(|_| rollback_resources(vm, &flow))?;
+    let current_owner = vm
+        .host_context()
+        .scope_state::<Bound>()
+        .map(|bound| Arc::clone(&bound.0))
+        .ok_or_else(|| error("host_unbound"))?;
+    if !Arc::ptr_eq(owner, &current_owner) {
+        rollback_resources(vm, &flow);
+        return Err(error("owner_mismatch"));
+    }
+    Ok(())
 }
 
 fn owner_for_cleanup<T: HostResource + HostResourceType + OwnerResource>(
