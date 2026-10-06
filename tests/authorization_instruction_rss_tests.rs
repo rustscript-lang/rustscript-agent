@@ -555,11 +555,22 @@ fn elapsed_native_owner_deadline_cleans_flow_and_returns_typed_fact() {
     let home = TestHome::new();
     let (path, source) = authorization_contract_source();
     let (mut vm, catalog) = compile_contract(&path, &source);
+    // Owner-independent preparation: install the restricted auth registry/catalog and
+    // execute the RSS declaration run under the original ten-second setup budget.
+    // AuthHost::register installs only the static auth module descriptors and never
+    // creates or binds an Owner, so this compile/setup I/O does not consume the timed
+    // 750ms owner deadline; no assertion, budget or production path changes.
+    let preparation = AuthHost::new_for_login(
+        home.path(),
+        RunCancellation::with_timeout(Duration::from_secs(10)),
+    )
+    .expect("preparation AuthHost installs declarations under original setup budget");
+    register_and_run(&preparation, &mut vm, catalog.as_ref());
+
     let cancellation = RunCancellation::with_timeout(Duration::from_millis(750));
     let auth = AuthHost::new_for_login(home.path(), cancellation.clone())
         .expect("short-deadline fixture AuthHost")
         .with_oauth_host(native_oauth(&cancellation));
-    register_and_run(&auth, &mut vm, catalog.as_ref());
     let bound = auth.bind_vm(&mut vm).expect("bind short-deadline owner");
     let begun = begin(&mut vm, &bound);
     std::thread::sleep(Duration::from_millis(800));
