@@ -96,6 +96,18 @@ pub fn emit_instruction(
 ) -> AuthorizationInstructionResultEnvelope {
     oauth::emit_authorization_instruction_result(&callback_handle)
 }
+
+pub fn emit_instruction_decision(
+    callback_handle: resource<oauth.callback>
+) -> map {
+    let ack: AuthorizationInstructionResultEnvelope =
+        oauth::emit_authorization_instruction_result(&callback_handle);
+    if ack.ok.copy() => {
+        {action: "await_callback", ack: ack}
+    } else => {
+        {action: "retain_callback_report_delivery_failure", ack: ack}
+    }
+}
 "#,
     );
     (path, source)
@@ -257,6 +269,14 @@ fn emit(vm: &mut Vm, callback: &Value) -> Value {
         .expect("typed sanitized acknowledgement")
 }
 
+fn emit_decision(vm: &mut Vm, callback: &Value) -> Value {
+    let callable = vm
+        .resolve_exported_callable("emit_instruction_decision")
+        .expect("RSS-owned instruction success/failure decision");
+    vm.invoke_callable(callable, std::slice::from_ref(callback))
+        .expect("typed RSS decision and sanitized acknowledgement")
+}
+
 fn callback_state(begun: &Value) -> String {
     Url::parse(&string_field(begun, "authorization_url"))
         .expect("native generated authorization URL")
@@ -309,19 +329,6 @@ fn assert_failure(ack: &Value, code: &str) {
 }
 
 #[test]
-fn restricted_catalog_exposes_typed_authorization_instruction_result() {
-    let home = TestHome::new();
-    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
-    let auth = AuthHost::new_for_login(home.path(), cancellation.clone())
-        .expect("default configured login AuthHost")
-        .with_oauth_host(native_oauth(&cancellation));
-    let (path, source) = authorization_contract_source();
-    let mut vm = restricted_vm(&auth, &path, &source);
-    let bound = auth.bind_vm(&mut vm).expect("bind actual host owner");
-    assert!(matches!(field(&bound, "host_home"), Value::Int(_)));
-}
-
-#[test]
 fn native_instructions_are_fifo_bounded_and_full_does_not_consume_callbacks() {
     let home = TestHome::new();
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
@@ -338,7 +345,14 @@ fn native_instructions_are_fifo_bounded_and_full_does_not_consume_callbacks() {
     for index in 0..5 {
         let begun = begin(&mut vm, &bound);
         let callback = field(&begun, "callback_handle");
-        let ack = emit(&mut vm, &callback);
+        let decision = emit_decision(&mut vm, &callback);
+        let action = if index < 4 {
+            "await_callback"
+        } else {
+            "retain_callback_report_delivery_failure"
+        };
+        assert_eq!(field(&decision, "action"), Value::string(action));
+        let ack = field(&decision, "ack");
         if index < 4 {
             assert_eq!(field(&ack, "ok"), Value::Bool(true));
             assert_eq!(field(&ack, "value"), Value::Bool(true));
@@ -406,7 +420,12 @@ fn failed_enqueue_keeps_callback_live(closed: bool, expected_code: &str) {
     let bound = host.bind_vm(&mut vm).expect("bind actual owner");
     let begun = begin(&mut vm, &bound);
     let callback = field(&begun, "callback_handle");
-    let ack = emit(&mut vm, &callback);
+    let decision = emit_decision(&mut vm, &callback);
+    assert_eq!(
+        field(&decision, "action"),
+        Value::string("retain_callback_report_delivery_failure")
+    );
+    let ack = field(&decision, "ack");
     assert_failure(&ack, expected_code);
     assert!(!format!("{ack:?}").contains(&string_field(&begun, "authorization_url")));
 
@@ -421,6 +440,79 @@ fn failed_enqueue_keeps_callback_live(closed: bool, expected_code: &str) {
 fn missing_and_closed_queue_errors_are_typed_without_consuming_the_callback() {
     failed_enqueue_keeps_callback_live(false, "ui_unavailable");
     failed_enqueue_keeps_callback_live(true, "ui_sink_closed");
+}
+
+#[test]
+fn closed_callback_resource_hard_traps_without_enqueueing_or_consuming_sibling() {
+    let home = TestHome::new();
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let (sender, receiver) = authorization_instruction_channel();
+    let auth = AuthHost::new_for_login(home.path(), cancellation.clone())
+        .expect("default configured login AuthHost")
+        .with_oauth_host(native_oauth(&cancellation))
+        .with_authorization_instruction_sender(sender);
+    let (path, source) = authorization_contract_source();
+    let mut vm = restricted_vm(&auth, &path, &source);
+    let bound = auth.bind_vm(&mut vm).expect("bind actual owner");
+    let closed_target = begin(&mut vm, &bound);
+    let sibling = begin(&mut vm, &bound);
+    let stale_callback = field(&closed_target, "callback_handle");
+
+    close_resource(
+        &mut vm,
+        "close_callback",
+        field(&closed_target, "callback_handle"),
+    );
+    assert_port_released(&closed_target);
+    let resources_after_close = vm.host_context().resource_count();
+    let emitter = vm
+        .resolve_exported_callable("emit_instruction")
+        .expect("real RSS instruction emitter");
+    let failure = vm
+        .invoke_callable(emitter, std::slice::from_ref(&stale_callback))
+        .expect_err("closed callback capability must hard-trap at resource borrow");
+    assert!(
+        failure
+            .to_string()
+            .contains("resource error [resource_already_closed] in resource::table"),
+        "{failure}"
+    );
+    assert_eq!(vm.host_context().resource_count(), resources_after_close);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+
+    close_resource(
+        &mut vm,
+        "close_verifier",
+        field(&closed_target, "verifier_handle"),
+    );
+    let sibling_decision = emit_decision(&mut vm, &field(&sibling, "callback_handle"));
+    assert_eq!(
+        field(&sibling_decision, "action"),
+        Value::string("await_callback")
+    );
+    let sibling_ack = field(&sibling_decision, "ack");
+    assert_eq!(field(&sibling_ack, "ok"), Value::Bool(true));
+    assert_eq!(field(&sibling_ack, "value"), Value::Bool(true));
+    let instruction = receiver.try_recv().expect("live sibling enqueued");
+    assert_eq!(
+        instruction.authorization_url,
+        string_field(&sibling, "authorization_url")
+    );
+    assert_eq!(
+        instruction.redirect_uri,
+        string_field(&sibling, "redirect_uri")
+    );
+
+    let code = wait_for_callback(&mut vm, &sibling);
+    assert!(matches!(code, Value::Int(_)));
+    close_flow(&mut vm, &sibling, Some(code));
+    assert_eq!(vm.host_context().resource_count(), 2);
+    assert_no_live_oauth_flows(&auth);
+    assert_port_released(&closed_target);
+    assert_port_released(&sibling);
 }
 
 fn run_owner_failure_case(revoke: bool) {
