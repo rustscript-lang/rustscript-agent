@@ -1362,6 +1362,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             flow::pkce_begin_result_desc,
             flow::callback_wait_desc,
             flow::callback_wait_result_desc,
+            flow::code_generation_result_desc,
             flow::close_callback_desc,
             flow::close_verifier_desc,
             flow::close_code_desc,

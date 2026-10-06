@@ -545,6 +545,18 @@ pub(super) fn callback_wait_result_desc() -> HostFunctionDescriptor {
     )
 }
 
+pub(super) fn code_generation_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "oauth::code_generation_result",
+        vec![
+            borrow("code_handle", resource(CODE_KEY)),
+            borrow("verifier_handle", resource(VERIFIER_KEY)),
+        ],
+        super::fallible::result_type("CodeGenerationResultEnvelope", HostTypeSchema::Int),
+        code_generation_result_call,
+    )
+}
+
 fn close_desc(
     name: &'static str,
     resource_key: &'static str,
@@ -685,6 +697,88 @@ fn callback_wait_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
     let owner = owner_for_cleanup::<CallbackResource>(vm, callback_value)?;
     let outcome = callback_wait_call(vm, args);
     super::fallible::wrap_value(owner, outcome)
+}
+
+fn code_generation_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let code_value = args.first().ok_or_else(|| error("invalid_request"))?;
+    let owner = owner_for_cleanup::<CodeResource>(vm, code_value)?;
+    let outcome = code_generation_call(vm, args, &owner);
+    super::fallible::wrap_value(owner, outcome)
+}
+
+fn code_generation_call(vm: &mut Vm, args: &[Value], owner: &Arc<Owner>) -> VmResult<CallOutcome> {
+    let code_value = args.first().ok_or_else(|| error("invalid_request"))?;
+    let verifier_value = args.get(1).ok_or_else(|| error("invalid_request"))?;
+    let code_flow = {
+        let context = vm.host_context();
+        context
+            .borrow_resource_with_key::<CodeResource>(
+                handle(code_value)?,
+                &ResourceTypeKey::new(CODE_KEY).expect("static code key"),
+            )
+            .map_err(|_| error("resource_invalid"))?
+            .flow
+            .clone()
+    };
+    let verifier_flow = {
+        let context = vm.host_context();
+        context
+            .borrow_resource_with_key::<VerifierResource>(
+                handle(verifier_value)?,
+                &ResourceTypeKey::new(VERIFIER_KEY).expect("static verifier key"),
+            )
+            .map_err(|_| error("resource_invalid"))?
+            .flow
+            .clone()
+    };
+    if !Arc::ptr_eq(&code_flow, &verifier_flow) {
+        return Err(error("handle_provenance"));
+    }
+
+    let pair = match transport_pair(
+        vm,
+        code_value,
+        verifier_value,
+        owner,
+        &code_flow.credential_id,
+        code_flow.policy_generation,
+    ) {
+        Ok(pair) => pair,
+        Err(failure) => {
+            rollback_resources(vm, &code_flow);
+            return Err(failure);
+        }
+    };
+    if let Err(failure) = owner.authorize(&code_flow.credential_id) {
+        pair.rollback(vm);
+        return Err(failure);
+    }
+    if pair.owner_inactive() {
+        pair.rollback(vm);
+        return Err(error("policy_inactive"));
+    }
+    if !pair.callback_result_live() {
+        pair.rollback(vm);
+        return Err(error("handle_expired"));
+    }
+
+    let generation = match i64::try_from(pair.credential_generation()) {
+        Ok(generation) => generation,
+        Err(_) => {
+            pair.rollback(vm);
+            return Err(error("generation_overflow"));
+        }
+    };
+
+    if pair.owner_inactive() || owner.check().is_err() {
+        pair.rollback(vm);
+        return Err(error("policy_inactive"));
+    }
+    if !pair.callback_result_live() {
+        pair.rollback(vm);
+        return Err(error("handle_expired"));
+    }
+    result(Value::Int(generation))
 }
 
 fn callback_wait_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
