@@ -1,5 +1,7 @@
 //! Authentication configuration, token, and secure-store modules.
 
+#[cfg(target_os = "linux")]
+pub mod authorization_output;
 pub mod config;
 pub mod device_output;
 pub mod host;
