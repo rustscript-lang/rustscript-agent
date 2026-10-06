@@ -10,6 +10,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Barrier, mpsc::Receiver, mpsc::SyncSender, mpsc::sync_channel},
     thread,
     time::{Duration, Instant},
@@ -322,6 +323,257 @@ fn peer_close_is_sanitized_failure_without_process_signal() {
     );
     // Reaching here proves SIGPIPE did not terminate the process.
     assert_eq!(std::process::id(), std::process::id());
+}
+
+fn current_thread_mask() -> libc::sigset_t {
+    // SAFETY: pthread_sigmask accepts a null `set` to query the current thread mask.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) },
+        0
+    );
+    mask
+}
+
+fn sigpipe_is_pending() -> bool {
+    // SAFETY: sigpending writes to valid stack storage.
+    let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::sigpending(&mut pending) }, 0);
+    // SAFETY: pending is a valid signal set.
+    unsafe { libc::sigismember(&pending, libc::SIGPIPE) == 1 }
+}
+
+fn assert_thread_mask_matches(expected: &libc::sigset_t) {
+    let actual = current_thread_mask();
+    for signal in 1..=64 {
+        // SAFETY: both values are valid Linux signal sets and signal is in range.
+        let expected_member = unsafe { libc::sigismember(expected, signal) };
+        // SAFETY: both values are valid Linux signal sets and signal is in range.
+        let actual_member = unsafe { libc::sigismember(&actual, signal) };
+        assert_eq!(actual_member, expected_member, "signal mask bit {signal}");
+    }
+}
+
+fn install_default_sigpipe() -> libc::sigaction {
+    // SAFETY: sigaction structures are initialized before use and SIGPIPE is valid.
+    unsafe {
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0);
+        assert_eq!(libc::sigaction(libc::SIGPIPE, &action, &mut previous), 0);
+        previous
+    }
+}
+
+fn restore_sigpipe_state(previous_action: &libc::sigaction, previous_mask: &libc::sigset_t) {
+    // SAFETY: the saved action/mask are exact values returned by libc.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        assert_eq!(libc::sigemptyset(&mut set), 0);
+        assert_eq!(libc::sigaddset(&mut set, libc::SIGPIPE), 0);
+        if sigpipe_is_pending() {
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout),
+                libc::SIGPIPE
+            );
+        }
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_SETMASK, previous_mask, std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(
+            libc::sigaction(libc::SIGPIPE, previous_action, std::ptr::null_mut()),
+            0
+        );
+    }
+}
+
+fn run_isolated_sigpipe_child(test_name: &str, mode: &str) -> std::process::Output {
+    Command::new(std::env::current_exe().expect("native test binary path"))
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env("RUSTSCRIPT_NATIVE_SIGPIPE_CHILD", mode)
+        .output()
+        .expect("spawn isolated native SIGPIPE child")
+}
+
+#[test]
+fn native_emit_preserves_preexisting_sigpipe_under_default_disposition() {
+    let child = run_isolated_sigpipe_child("isolated_sigpipe_pending_child", "pending");
+    assert!(
+        child.status.success(),
+        "isolated pending-signal proof failed: status={:?}, stdout={}, stderr={}",
+        child.status,
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[test]
+fn native_emit_peerclose_survives_default_sigpipe_only_in_isolated_child() {
+    let child = run_isolated_sigpipe_child("isolated_sigpipe_unblocked_child", "unblocked");
+    assert!(
+        child.status.success(),
+        "isolated peer-close proof failed: status={:?}, stdout={}, stderr={}",
+        child.status,
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[test]
+fn isolated_sigpipe_pending_child() {
+    if std::env::var("RUSTSCRIPT_NATIVE_SIGPIPE_CHILD").as_deref() != Ok("pending") {
+        return;
+    }
+    let previous_action = install_default_sigpipe();
+    let previous_mask = current_thread_mask();
+    // Deliberately make SIGPIPE part of the caller's original blocked mask.
+    // SAFETY: set is a valid SIGPIPE-only set.
+    let mut sigpipe: libc::sigset_t = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::sigemptyset(&mut sigpipe) }, 0);
+    assert_eq!(unsafe { libc::sigaddset(&mut sigpipe, libc::SIGPIPE) }, 0);
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &sigpipe, std::ptr::null_mut()) },
+        0
+    );
+    let caller_mask = current_thread_mask();
+    assert!(!sigpipe_is_pending());
+
+    // Generate a genuine thread-pending SIGPIPE from a native pipe write.
+    let (trigger_reader, trigger_writer) = pipe(false);
+    drop(trigger_reader);
+    let byte = b"x";
+    // SAFETY: byte is readable and trigger_writer is a real pipe descriptor.
+    assert_eq!(
+        unsafe { libc::write(trigger_writer.as_raw_fd(), byte.as_ptr().cast(), 1) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    assert!(
+        sigpipe_is_pending(),
+        "the setup EPIPE must really queue SIGPIPE"
+    );
+
+    // A distinct healthy native pipe must not consume the caller's pending bit.
+    let (healthy_reader, healthy_writer) = pipe(false);
+    let output = NativeAuthorizationInstructionOutput::from_fd(healthy_writer)
+        .expect("healthy pipe admitted");
+    output
+        .emit(
+            &public_instruction(),
+            &context_for(Instant::now() + Duration::from_secs(2)),
+        )
+        .expect("healthy native emit");
+    assert!(sigpipe_is_pending(), "healthy emit drained caller SIGPIPE");
+    assert_thread_mask_matches(&caller_mask);
+    assert_eq!(
+        drain_nonblocking(healthy_reader.as_raw_fd()),
+        EXPECTED_RECORD
+    );
+    drop(output);
+
+    // A second actual EPIPE coalesces with, but must not drain, the old pending bit.
+    let (closed_reader, closed_writer) = pipe(false);
+    let closed_output = NativeAuthorizationInstructionOutput::from_fd(closed_writer)
+        .expect("closed-peer pipe admitted before peer close");
+    drop(closed_reader);
+    let result = closed_output.emit(
+        &public_instruction(),
+        &context_for(Instant::now() + Duration::from_secs(2)),
+    );
+    assert!(
+        matches!(result, Err(OAuthError::Transport { .. })),
+        "{result:?}"
+    );
+    assert!(
+        sigpipe_is_pending(),
+        "EPIPE emit drained the preexisting SIGPIPE"
+    );
+    assert_thread_mask_matches(&caller_mask);
+    drop(closed_output);
+
+    // With no prior pending bit, a caller-blocked mask still owns a new EPIPE.
+    let timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `sigpipe` is the valid SIGPIPE-only set prepared above.
+    assert_eq!(
+        unsafe { libc::sigtimedwait(&sigpipe, std::ptr::null_mut(), &timeout) },
+        libc::SIGPIPE
+    );
+    assert!(!sigpipe_is_pending());
+    let (blocked_reader, blocked_writer) = pipe(false);
+    let blocked_output = NativeAuthorizationInstructionOutput::from_fd(blocked_writer)
+        .expect("blocked-mask peer-close pipe admitted");
+    drop(blocked_reader);
+    let blocked_result = blocked_output.emit(
+        &public_instruction(),
+        &context_for(Instant::now() + Duration::from_secs(2)),
+    );
+    assert!(
+        matches!(blocked_result, Err(OAuthError::Transport { .. })),
+        "{blocked_result:?}"
+    );
+    assert!(
+        sigpipe_is_pending(),
+        "caller-blocked mask must retain the new EPIPE SIGPIPE"
+    );
+    assert_thread_mask_matches(&caller_mask);
+    drop(blocked_output);
+    restore_sigpipe_state(&previous_action, &previous_mask);
+}
+
+#[test]
+fn isolated_sigpipe_unblocked_child() {
+    if std::env::var("RUSTSCRIPT_NATIVE_SIGPIPE_CHILD").as_deref() != Ok("unblocked") {
+        return;
+    }
+    let previous_action = install_default_sigpipe();
+    let previous_mask = current_thread_mask();
+    let mut caller_mask = previous_mask;
+    // SAFETY: caller_mask is a valid signal set.
+    assert_eq!(
+        unsafe { libc::sigdelset(&mut caller_mask, libc::SIGPIPE) },
+        0
+    );
+    // SAFETY: caller_mask is the exact test caller mask required for this proof.
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut()) },
+        0
+    );
+    assert!(
+        !sigpipe_is_pending(),
+        "isolated child starts without pending SIGPIPE"
+    );
+
+    let (reader, writer) = pipe(false);
+    let output = NativeAuthorizationInstructionOutput::from_fd(writer)
+        .expect("peer-close pipe admitted before close");
+    drop(reader);
+    let result = output.emit(
+        &public_instruction(),
+        &context_for(Instant::now() + Duration::from_secs(2)),
+    );
+    assert!(
+        matches!(result, Err(OAuthError::Transport { .. })),
+        "{result:?}"
+    );
+    assert!(
+        !sigpipe_is_pending(),
+        "own EPIPE remained pending for unblocked caller"
+    );
+    assert_thread_mask_matches(&caller_mask);
+    drop(output);
+    restore_sigpipe_state(&previous_action, &previous_mask);
 }
 
 #[test]

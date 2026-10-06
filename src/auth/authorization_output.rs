@@ -32,11 +32,11 @@
 //!
 //! ## Peer close
 //!
-//! `SIGPIPE` is blocked with a *thread-local* mask around each write and any
-//! pending signal is drained with `sigtimedwait` before the previous mask is
-//! restored. No process-global disposition or handler is mutated, so a peer
-//! close becomes an ordinary sanitized write failure instead of terminating the
-//! process.
+//! `SIGPIPE` is blocked with a *thread-local* mask around each write. The
+//! caller's original mask and pending state are preserved; only an EPIPE from
+//! this sink's own write may be drained, and only when SIGPIPE was previously
+//! unblocked and not already pending. No process-global disposition or handler
+//! is mutated, so a peer close becomes an ordinary sanitized write failure.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -228,10 +228,10 @@ impl NativeAuthorizationInstructionOutput {
 
     fn write_record(&self, record: &[u8], context: &OAuthIoContext) -> Result<(), OAuthError> {
         let fd = self.fd.as_raw_fd();
-        let _sigpipe = SigpipeGuard::block()?;
+        let mut sigpipe = SigpipeGuard::block()?;
         match self.kind {
-            TargetKind::Pipe => write_pipe_atomic(fd, record, context),
-            TargetKind::Tty => write_tty_bounded(fd, record, context),
+            TargetKind::Pipe => write_pipe_atomic(fd, record, context, &mut sigpipe),
+            TargetKind::Tty => write_tty_bounded(fd, record, context, &mut sigpipe),
         }
     }
 }
@@ -381,12 +381,29 @@ fn pipe_buffer_size(fd: RawFd) -> Result<usize, OAuthError> {
 }
 
 /// Write a whole record to a pipe in one atomic, non-partial step.
-fn write_pipe_atomic(fd: RawFd, record: &[u8], context: &OAuthIoContext) -> Result<(), OAuthError> {
+fn write_pipe_atomic(
+    fd: RawFd,
+    record: &[u8],
+    context: &OAuthIoContext,
+    sigpipe: &mut SigpipeGuard,
+) -> Result<(), OAuthError> {
     loop {
         context.check()?;
         // SAFETY: `record` is readable for its length and the descriptor is a
         // nonblocking pipe writer.
         let written = unsafe { libc::write(fd, record.as_ptr().cast(), record.len()) };
+        let write_error = if written < 0 {
+            // Preserve errno before context or signal helpers can overwrite it.
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EPIPE) {
+                sigpipe.record_epipe();
+            }
+            Some(error)
+        } else {
+            None
+        };
+        // A successful final write is still subject to this same context.
+        context.check()?;
         if written == record.len() as isize {
             return Ok(());
         }
@@ -397,7 +414,7 @@ fn write_pipe_atomic(fd: RawFd, record: &[u8], context: &OAuthIoContext) -> Resu
             // A record within PIPE_BUF must not be split; treat this as failure.
             return Err(transport_failure());
         }
-        match std::io::Error::last_os_error().raw_os_error() {
+        match write_error.and_then(|error| error.raw_os_error()) {
             Some(libc::EINTR) => continue,
             Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => {
                 wait_writable(fd, context)?;
@@ -409,7 +426,12 @@ fn write_pipe_atomic(fd: RawFd, record: &[u8], context: &OAuthIoContext) -> Resu
 }
 
 /// Write a whole record to a tty, finishing bounded progress when possible.
-fn write_tty_bounded(fd: RawFd, record: &[u8], context: &OAuthIoContext) -> Result<(), OAuthError> {
+fn write_tty_bounded(
+    fd: RawFd,
+    record: &[u8],
+    context: &OAuthIoContext,
+    sigpipe: &mut SigpipeGuard,
+) -> Result<(), OAuthError> {
     let mut written = 0;
     while written < record.len() {
         context.check()?;
@@ -422,6 +444,18 @@ fn write_tty_bounded(fd: RawFd, record: &[u8], context: &OAuthIoContext) -> Resu
                 record.len() - written,
             )
         };
+        let write_error = if count < 0 {
+            // Preserve errno before context or signal helpers can overwrite it.
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EPIPE) {
+                sigpipe.record_epipe();
+            }
+            Some(error)
+        } else {
+            None
+        };
+        // Positive progress may already be visible; report cancellation honestly.
+        context.check()?;
         if count > 0 {
             written += count as usize;
             continue;
@@ -429,7 +463,7 @@ fn write_tty_bounded(fd: RawFd, record: &[u8], context: &OAuthIoContext) -> Resu
         if count == 0 {
             return Err(transport_failure());
         }
-        match std::io::Error::last_os_error().raw_os_error() {
+        match write_error.and_then(|error| error.raw_os_error()) {
             Some(libc::EINTR) => continue,
             Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => {
                 wait_writable(fd, context)?;
@@ -437,6 +471,7 @@ fn write_tty_bounded(fd: RawFd, record: &[u8], context: &OAuthIoContext) -> Resu
             _ => return Err(transport_failure()),
         }
     }
+    context.check()?;
     Ok(())
 }
 
@@ -472,10 +507,13 @@ fn wait_writable(fd: RawFd, context: &OAuthIoContext) -> Result<(), OAuthError> 
     }
 }
 
-/// A thread-local `SIGPIPE` block that is drained before the mask is restored.
+/// A thread-local `SIGPIPE` block that only drains this sink's unmasked EPIPE.
 struct SigpipeGuard {
     set: libc::sigset_t,
     previous: libc::sigset_t,
+    previously_blocked: bool,
+    pending_before_write: bool,
+    wrote_epipe: bool,
 }
 
 impl SigpipeGuard {
@@ -491,8 +529,30 @@ impl SigpipeGuard {
             if libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous) != 0 {
                 return Err(transport_failure());
             }
-            Ok(Self { set, previous })
+
+            let mut pending: libc::sigset_t = std::mem::zeroed();
+            if libc::sigpending(&mut pending) != 0 {
+                let _ = libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                return Err(transport_failure());
+            }
+            let pending_member = libc::sigismember(&pending, libc::SIGPIPE);
+            let blocked_member = libc::sigismember(&previous, libc::SIGPIPE);
+            if pending_member < 0 || blocked_member < 0 {
+                let _ = libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                return Err(transport_failure());
+            }
+            Ok(Self {
+                set,
+                previous,
+                previously_blocked: blocked_member == 1,
+                pending_before_write: pending_member == 1,
+                wrote_epipe: false,
+            })
         }
+    }
+
+    fn record_epipe(&mut self) {
+        self.wrote_epipe = true;
     }
 }
 
@@ -500,14 +560,12 @@ impl Drop for SigpipeGuard {
     fn drop(&mut self) {
         // SAFETY: `set`/`previous` were produced by the calls in `block`.
         unsafe {
-            let mut pending: libc::sigset_t = std::mem::zeroed();
-            if libc::sigpending(&mut pending) == 0
-                && libc::sigismember(&pending, libc::SIGPIPE) == 1
-            {
+            if self.wrote_epipe && !self.previously_blocked && !self.pending_before_write {
                 let timeout = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 0,
                 };
+                // Drain at most the one standard signal generated by our EPIPE.
                 let _ = libc::sigtimedwait(&self.set, std::ptr::null_mut(), &timeout);
             }
             let _ = libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
@@ -865,6 +923,48 @@ mod tests {
             b"Open https://auth.example.test/oauth/authorize?response_type=code&client_id=public-client&state=public-state&code_challenge=public-challenge\nRedirect: http://127.0.0.1:49152/callback\n"
         );
         assert_eq!(output.target_label(), "pipe");
+    }
+
+    /// A real pipe-readability cancellation view; no counter or injected phase.
+    struct PipeReadableCancel {
+        reader: OwnedFd,
+    }
+
+    impl OAuthCancel for PipeReadableCancel {
+        fn is_cancelled(&self) -> bool {
+            let mut available: libc::c_int = 0;
+            // SAFETY: FIONREAD reads the byte count into valid storage; reader is owned.
+            (unsafe { libc::ioctl(self.reader.as_raw_fd(), libc::FIONREAD, &mut available) } == 0)
+                && available > 0
+        }
+    }
+
+    #[test]
+    fn successful_pipe_write_observes_os_readable_additional_cancellation() {
+        let (reader, writer) = pipe();
+        let reader_fd = reader.as_raw_fd();
+        let output = NativeAuthorizationInstructionOutput::from_fd(writer)
+            .expect("admitted pipe descriptor");
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+        let base_context = native_authorization_io_context(&cancellation)
+            .expect("exact finite child-deadline context");
+        let readable = Arc::new(PipeReadableCancel { reader });
+        assert!(!readable.is_cancelled(), "the real pipe begins empty");
+        let cancel_view: Arc<dyn OAuthCancel> = readable.clone();
+        let context = base_context.with_additional_cancel(cancel_view);
+        assert!(context.check().is_ok(), "empty pipe is not cancelled");
+
+        let result = output.emit(&instruction(), &context);
+        assert!(matches!(result, Err(OAuthError::Cancelled)), "{result:?}");
+        assert!(
+            readable.is_cancelled(),
+            "the native write must make the actual OS pipe readable"
+        );
+        // Cancellation wins after visible bytes; it must not pretend they were absent.
+        assert_eq!(
+            drain(reader_fd),
+            b"Open https://auth.example.test/oauth/authorize?response_type=code&client_id=public-client&state=public-state&code_challenge=public-challenge\nRedirect: http://127.0.0.1:49152/callback\n"
+        );
     }
 
     #[test]
