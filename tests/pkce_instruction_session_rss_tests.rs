@@ -11,18 +11,23 @@
 //! descriptor; no guest-supplied URL is ever injected.
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::PermissionsExt,
+    },
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
+    task::{Context, Poll, Waker},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustscript_agent::{
@@ -32,6 +37,7 @@ use rustscript_agent::{
             AuthHost, AuthorizationInstructionSender, PublicAuthorizationInstruction,
             RunOAuthCancel, SystemOAuthClock, auth_host_catalog, authorization_instruction_channel,
         },
+        native_browser::NativeBrowserOpener,
         native_https::NativeHttpsTransport,
         oauth::{BrowserOpener, OAuthError, OAuthHost, OAuthIoContext},
     },
@@ -172,6 +178,13 @@ struct PkceSessionResult {
     begin: PkceBeginEnvelope?,
     waited: CallbackEnvelope?
 }
+struct PkceStartResult {
+    ok: bool,
+    code: string,
+    selected_mode: string,
+    fallback_used: bool,
+    value: PkceBeginEnvelope?
+}
 
 pub fn policy(home: resource<auth.host_home>) -> resource<auth.policy> {
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&home);
@@ -199,6 +212,21 @@ pub fn wait(handle: resource<oauth.callback>) -> CallbackResultEnvelope {
 pub fn close_callback(handle: resource<oauth.callback>) -> null { oauth::close_callback(handle) }
 pub fn close_verifier(handle: resource<oauth.verifier>) -> null { oauth::close_verifier(handle) }
 pub fn close_code(handle: resource<oauth.authorization_code>) -> null { oauth::close_code(handle) }
+"#;
+
+/// Test-only exports around actual production RSS functions. The production
+/// instruction-session module remains the exact prefix of this override.
+const INSTRUCTION_PROBE_EXPORTS: &str = r#"
+pub fn probe_begin_native(
+    policy_handle: resource<auth.policy>,
+    intent: BoundedPublicOAuthIntent,
+    allow_manual_fallback: bool
+) -> PkceStartResult {
+    session::begin(policy_handle, intent, allow_manual_fallback)
+}
+pub fn probe_instruction_prepared(start: PkceStartResult) -> PkceSessionResult {
+    instruction_session(start)
+}
 "#;
 
 fn runner_bundle() -> AuthEntryRunner {
@@ -247,9 +275,14 @@ fn inspect_vm() -> Vm {
         "/__rustscript_agent_auth_bundle__/rss/auth/pkce_session.rss",
         include_str!("../rss/auth/pkce_session.rss"),
     );
+    let instruction_source = format!(
+        "{}{}",
+        include_str!("../rss/auth/pkce_instruction_session.rss"),
+        INSTRUCTION_PROBE_EXPORTS
+    );
     options.set_module_override_source(
         "/__rustscript_agent_auth_bundle__/rss/auth/pkce_instruction_session.rss",
-        include_str!("../rss/auth/pkce_instruction_session.rss"),
+        instruction_source,
     );
     let compiled = compile_source_at_path_with_flavor_and_options(
         "/__rustscript_agent_auth_bundle__/rss/auth/pkce_instruction_inspect.rss",
@@ -263,7 +296,7 @@ fn inspect_vm() -> Vm {
     let registration_home = TempHome::new("registration");
     let registration_host = AuthHost::new_for_login(
         registration_home.path(),
-        RunCancellation::with_timeout(Duration::from_secs(30)),
+        RunCancellation::with_timeout(Duration::from_secs(10)),
     )
     .expect("registration host");
     registration_host
@@ -342,11 +375,19 @@ impl BrowserOpener for FailingBrowser {
 #[derive(Default)]
 struct LoopbackBrowser {
     opens: AtomicUsize,
+    redirects: Mutex<Vec<String>>,
 }
 
 impl LoopbackBrowser {
     fn opens(&self) -> usize {
         self.opens.load(Ordering::Acquire)
+    }
+
+    fn redirects(&self) -> Vec<String> {
+        self.redirects
+            .lock()
+            .expect("native redirect observer")
+            .clone()
     }
 }
 
@@ -363,6 +404,12 @@ impl BrowserOpener for LoopbackBrowser {
             .ok_or_else(|| OAuthError::Transport {
                 message: "synthetic redirect missing".into(),
             })?;
+        self.redirects
+            .lock()
+            .map_err(|_| OAuthError::Transport {
+                message: "native redirect observer unavailable".into(),
+            })?
+            .push(redirect_uri.clone());
         let state = authorization
             .query_pairs()
             .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
@@ -406,6 +453,46 @@ fn assert_fd_closed(fd: i32) {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::EBADF)
     );
+}
+
+fn assert_direct_child_reaped(pid: i32) {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(result, -1, "direct native launcher is no longer waitable");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD),
+        "NativeBrowserOpener reaped the direct launcher"
+    );
+}
+
+fn failing_native_browser(home: &TempHome) -> (NativeBrowserOpener, PathBuf, PathBuf) {
+    let executable = home.path().join("native-browser-failure");
+    let pids = home.path().join("native-browser-pids");
+    let attempted_urls = home.path().join("native-browser-urls");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$HOME/native-browser-pids\"\nprintf '%s\\n' \"$1\" >> \"$HOME/native-browser-urls\"\nexit 23\n",
+    )
+    .expect("write assigned native launcher fixture");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+        .expect("make assigned native launcher executable");
+    let browser = NativeBrowserOpener::new(
+        executable,
+        BTreeMap::from([(
+            "HOME".to_owned(),
+            home.path().to_string_lossy().into_owned(),
+        )]),
+    )
+    .expect("construct native opener with only fixture HOME");
+    (browser, pids, attempted_urls)
 }
 
 fn callback_address(redirect_uri: &str) -> SocketAddr {
@@ -673,6 +760,7 @@ fn none_mode_real_runner_enqueues_before_finish_and_closes_family() {
 fn browser_transport_failure_single_manual_fallback_succeeds_and_delivers() {
     let runner = runner_bundle();
     let home = TempHome::new("runner-fallback");
+    let (browser, launcher_pids, attempted_urls) = failing_native_browser(&home);
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
     let (sender, receiver) = authorization_instruction_channel();
@@ -682,7 +770,7 @@ fn browser_transport_failure_single_manual_fallback_succeeds_and_delivers() {
         &runner,
         &home,
         "fallback",
-        Arc::new(FailingBrowser),
+        Arc::new(browser),
         Some(reader),
         Some(sender),
         &cancellation,
@@ -697,6 +785,27 @@ fn browser_transport_failure_single_manual_fallback_succeeds_and_delivers() {
         "the delivered flow is the one manual fallback"
     );
     assert!(observed[0].authorization_url.starts_with("https://"));
+    let launched = fs::read_to_string(launcher_pids).expect("native launcher PID receipt");
+    let pids = launched
+        .lines()
+        .map(|pid| pid.parse::<i32>().expect("direct launcher PID"))
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 1, "one actual browser subprocess invocation");
+    assert_direct_child_reaped(pids[0]);
+    let attempted_urls = fs::read_to_string(attempted_urls)
+        .expect("private native launcher URL receipt")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(attempted_urls.len(), 1, "one failed browser URL attempt");
+    let failed_redirect = Url::parse(&attempted_urls[0])
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find_map(|(key, value)| (key == "redirect_uri").then(|| value.into_owned()))
+        })
+        .expect("private failed-browser redirect");
+    assert_port_released(&failed_redirect);
     assert_fd_closed(raw_fd);
     assert!(!cancellation.watcher_is_armed());
 }
@@ -870,8 +979,12 @@ fn missing_queue_stops_typed_without_wait_or_new_begin_and_sibling_survives() {
     assert_eq!(field(&failed, "code"), Value::string("ui_unavailable"));
     assert_eq!(optional_field(&failed, "begin"), Value::Null);
     assert_eq!(optional_field(&failed, "waited"), Value::Null);
-    // Only the failing family was closed; the sibling stays live.
+    // Only the failing family was closed; its native listener is released
+    // before the unrelated sibling is waited or disposed.
     assert_eq!(vm.host_context().resource_count(), 4);
+    let redirects = browser.redirects();
+    assert_eq!(redirects.len(), 2, "one actual begin per family");
+    assert_port_released(&redirects[1]);
 
     let wait_result = invoke(&mut vm, "wait", &[field(&sibling, "callback_handle")])
         .expect("sibling callback remains usable");
@@ -900,17 +1013,12 @@ fn missing_queue_stops_typed_without_wait_or_new_begin_and_sibling_survives() {
 #[test]
 fn closed_queue_stops_with_typed_fact_and_scoped_cleanup() {
     let home = TempHome::new("inspect-closed-queue");
+    let browser = Arc::new(LoopbackBrowser::default());
     let (sender, receiver) = authorization_instruction_channel();
     drop(receiver);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
     let mut vm = inspect_vm();
-    let host = inspect_host(
-        &home,
-        Arc::new(NoopBrowser),
-        None,
-        Some(sender),
-        &cancellation,
-    );
+    let host = inspect_host(&home, browser.clone(), None, Some(sender), &cancellation);
     let owner = host.bind_vm(&mut vm).expect("bind actual owner");
     let policy = invoke(&mut vm, "policy", &[field(&owner, "host_home")]).expect("policy");
     let session = invoke(
@@ -929,6 +1037,10 @@ fn closed_queue_stops_with_typed_fact_and_scoped_cleanup() {
         2,
         "scoped cleanup leaves no capability in the arena"
     );
+    let redirects = browser.redirects();
+    assert_eq!(redirects.len(), 1, "closed queue attempt has no retry");
+    assert_eq!(browser.opens(), 1, "closed queue attempt does not re-open");
+    assert_port_released(&redirects[0]);
 }
 
 #[test]
@@ -936,7 +1048,7 @@ fn full_queue_stops_with_typed_fact_and_scoped_cleanup() {
     let home = TempHome::new("inspect-full-queue");
     let browser = Arc::new(LoopbackBrowser::default());
     let (sender, receiver) = authorization_instruction_channel();
-    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
     let mut vm = inspect_vm();
     let host = inspect_host(&home, browser.clone(), None, Some(sender), &cancellation);
     let owner = host.bind_vm(&mut vm).expect("bind actual owner");
@@ -965,6 +1077,10 @@ fn full_queue_stops_with_typed_fact_and_scoped_cleanup() {
     assert_eq!(field(&full, "code"), Value::string("ui_sink_full"));
     assert_eq!(optional_field(&full, "begin"), Value::Null);
     assert_eq!(vm.host_context().resource_count(), 2);
+    let redirects = browser.redirects();
+    assert_eq!(redirects.len(), 5, "four successes and one failed begin");
+    assert_eq!(browser.opens(), 5, "full queue failure does not re-open");
+    assert_port_released(&redirects[4]);
 
     // Draining one instruction allows a fresh sibling family to succeed.
     let drained = receiver.try_recv().expect("queued sibling instruction");
@@ -1004,6 +1120,98 @@ fn owner_cancellation_propagates_sanitized_code_without_new_begin() {
     assert_eq!(optional_field(&session, "waited"), Value::Null);
     assert_eq!(vm.host_context().resource_count(), 2);
     assert_eq!(browser.opens(), 0, "cancellation must not open the browser");
+}
+
+#[test]
+fn successful_native_begin_then_owner_cancel_hardtraps_and_drains_vm() {
+    let home = TempHome::new("inspect-post-begin-cancel");
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
+    let browser = Arc::new(LoopbackBrowser::default());
+    let (sender, receiver) = authorization_instruction_channel();
+    let mut vm = inspect_vm();
+    let host = inspect_host(&home, browser.clone(), None, Some(sender), &cancellation);
+    let owner = host.bind_vm(&mut vm).expect("bind actual owner");
+    let policy = invoke(&mut vm, "policy", &[field(&owner, "host_home")]).expect("policy");
+    let baseline = vm.host_context().resource_count();
+    assert_eq!(baseline, 2, "owner baseline before native begin");
+    let started = invoke(
+        &mut vm,
+        "probe_begin_native",
+        &[policy, public_intent("browser"), Value::Bool(false)],
+    )
+    .expect("actual successful native session::begin");
+    assert_eq!(field(&started, "ok"), Value::Bool(true));
+    assert_eq!(field(&started, "code"), Value::string("ok"));
+    assert_eq!(field(&started, "selected_mode"), Value::string("browser"));
+    assert_eq!(field(&started, "fallback_used"), Value::Bool(false));
+    let begin = field(&started, "value");
+    assert!(!matches!(begin, Value::Null));
+    let redirect = string_field(&begin, "redirect_uri");
+    assert_eq!(vm.host_context().resource_count(), baseline + 2);
+    assert_eq!(browser.opens(), 1, "one actual successful browser begin");
+    assert_eq!(browser.redirects(), vec![redirect.clone()]);
+    assert!(
+        matches!(
+            TcpListener::bind(callback_address(&redirect)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse
+        ),
+        "successful begin owns a live native callback listener"
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "begin alone delivers no instruction"
+    );
+
+    cancellation.request(CancellationReason::Requested);
+    let rejected = invoke(
+        &mut vm,
+        "probe_instruction_prepared",
+        std::slice::from_ref(&started),
+    );
+    let error = rejected.expect_err("VM admission rejects the same closed capability family");
+    let error = error.to_string();
+    assert!(
+        error.contains("resource_already_closed"),
+        "pinned VM closed-capability rejection: {error}"
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "rejected helper sends no instruction"
+    );
+    assert_eq!(browser.opens(), 1, "rejection triggers no second opener");
+    assert_eq!(browser.redirects(), vec![redirect.clone()]);
+
+    // Keep the actual lazy-admission state in the proof; production reset
+    // drains every remaining VM resource under its existing one-second bound.
+    let post_rejection_arena = vm.host_context().resource_count();
+    assert!(
+        post_rejection_arena <= baseline + 2,
+        "measured post-rejection VM resource arena count: {post_rejection_arena}"
+    );
+    println!("post-rejection VM resource arena count: {post_rejection_arena}");
+
+    vm.reset_for_reuse()
+        .expect("start production VM reset and drain");
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    loop {
+        let mut context = Context::from_waker(Waker::noop());
+        match vm.poll_reset_for_reuse(&mut context) {
+            Poll::Ready(Ok(())) => break,
+            Poll::Ready(Err(error)) => panic!("production VM drain failed: {error:?}"),
+            Poll::Pending if Instant::now() >= deadline => {
+                panic!("production VM drain exceeded its one-second bound")
+            }
+            Poll::Pending => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(
+        vm.host_context().resource_count(),
+        0,
+        "VM arena after drain"
+    );
+    assert_port_released(&redirect);
 }
 
 #[test]
