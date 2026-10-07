@@ -387,6 +387,279 @@ fn error_of(result: &JsonValue) -> &JsonMap<String, JsonValue> {
     result["error"].as_object().expect("error object")
 }
 
+const PUBLIC_PROFILE_CREDENTIAL_KEYS: [&str; 8] = [
+    "api_key",
+    "authorization",
+    "token",
+    "access_token",
+    "refresh_token",
+    "headers",
+    "cookie",
+    "cookies",
+];
+
+fn spawn_public_profile_fixture(
+    body: String,
+) -> (
+    u16,
+    AgentRunner,
+    mpsc::Receiver<Vec<RecordedRequest>>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind public-profile fixture");
+    let port = listener
+        .local_addr()
+        .expect("public-profile fixture address")
+        .port();
+    let runner = harness_runner(port);
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("public-profile fixture nonblocking");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut requests = Vec::new();
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .expect("public-profile request timeout");
+                    requests.push(read_http_request(&mut stream));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write public-profile response");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("public-profile fixture accept failed: {error}"),
+            }
+        }
+        sender
+            .send(requests)
+            .expect("send public-profile fixture requests");
+    });
+    (port, runner, receiver, handle)
+}
+
+fn public_profile_request(options: JsonValue, request_model: &str) -> JsonValue {
+    let mut request: JsonValue = serde_json::from_str(&read_fixture("requests/chat_request.json"))
+        .expect("canonical request fixture should be JSON");
+    request["provider_options"] = options;
+    request["model"] = json!(request_model);
+    request["stream"] = json!(false);
+    request
+}
+
+fn assert_public_profile_rejects_credentials(provider: &str) {
+    let (port, runner, requests, fixture) =
+        spawn_public_profile_fixture(read_fixture("openai_chat/response.json"));
+    let mut failures = Vec::new();
+    for key in PUBLIC_PROFILE_CREDENTIAL_KEYS {
+        let secret = format!("synthetic-public-profile-{provider}-{key}");
+        let mut options = JsonMap::new();
+        options.insert(
+            "base_url".to_string(),
+            json!(format!("http://127.0.0.1:{port}")),
+        );
+        options.insert("model".to_string(), json!("public-profile-model"));
+        options.insert(key.to_string(), json!(secret.clone()));
+        let request = public_profile_request(JsonValue::Object(options), "public-profile-model");
+        let (result, events) =
+            run_adapter(&format!("profile:{provider}"), request, json!({}), &runner);
+        let error = error_of(&result);
+        let rendered = serde_json::to_string(&result).expect("public result JSON");
+        let rejected = error.get("code").and_then(JsonValue::as_str) == Some("config")
+            && error.get("message").and_then(JsonValue::as_str)
+                == Some("credential-bearing provider options are not public");
+        if !rejected || !events.is_empty() || rendered.contains(&secret) {
+            failures.push(format!(
+                "{provider}/{key}: rejected={rejected}, events={}, secret_echo={}",
+                events.len(),
+                rendered.contains(&secret)
+            ));
+        }
+    }
+    fixture.join().expect("public-profile fixture thread");
+    let observed = requests.recv().expect("public-profile request list");
+    assert!(
+        failures.is_empty(),
+        "credential options were not rejected as specified: {failures:?}; HTTP requests observed: {}",
+        observed.len()
+    );
+    assert!(
+        observed.is_empty(),
+        "credential options triggered {} HTTP request(s)",
+        observed.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Public profile wrappers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn public_profile_custom_rejects_credentials_before_http() {
+    assert_public_profile_rejects_credentials("custom");
+}
+
+#[test]
+fn public_profile_deepseek_rejects_credentials_before_http() {
+    assert_public_profile_rejects_credentials("deepseek");
+}
+
+#[test]
+fn public_profile_opencode_go_rejects_credentials_before_http() {
+    assert_public_profile_rejects_credentials("opencode_go");
+}
+
+#[test]
+fn public_profile_opencode_zen_rejects_credentials_before_http() {
+    assert_public_profile_rejects_credentials("opencode_zen");
+}
+
+#[test]
+fn public_profile_openrouter_rejects_credentials_before_http() {
+    assert_public_profile_rejects_credentials("openrouter");
+}
+
+#[test]
+fn public_profile_nonsecret_overrides_reach_real_wire() {
+    let (port, runner, requests, fixture) =
+        spawn_public_profile_fixture(read_fixture("openai_chat/response.json"));
+    let base_url = format!("http://127.0.0.1:{port}");
+    let expected_model = "public-profile-model-override";
+    let providers = [
+        "custom",
+        "deepseek",
+        "opencode_go",
+        "opencode_zen",
+        "openrouter",
+    ];
+    let mut failures = Vec::new();
+    for provider in providers {
+        let mut options = json!({"base_url": base_url, "model": expected_model});
+        if provider == "custom" {
+            options["adapter"] = json!("openai_chat");
+        }
+        let request = public_profile_request(options, "request-model-before-profile-override");
+        let (result, events) =
+            run_adapter(&format!("profile:{provider}"), request, json!({}), &runner);
+        if result["ok"] != json!(true) || !events.is_empty() {
+            failures.push(format!(
+                "{provider}: ok={}, events={}",
+                result["ok"],
+                events.len()
+            ));
+        }
+    }
+    fixture.join().expect("public-profile fixture thread");
+    let observed = requests.recv().expect("public-profile request list");
+    if observed.len() != providers.len() {
+        failures.push(format!("wire request count={}", observed.len()));
+    }
+    for (index, recorded) in observed.iter().enumerate() {
+        if request_line(recorded) != "POST /chat/completions HTTP/1.1" {
+            failures.push(format!("wire path[{index}] was not Chat Completions"));
+        }
+        match serde_json::from_str::<JsonValue>(&recorded.body) {
+            Ok(body) if body["model"] == json!(expected_model) => {}
+            Ok(_) => failures.push(format!(
+                "wire model[{index}] did not use the public profile override"
+            )),
+            Err(_) => failures.push(format!("wire body[{index}] was not JSON")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "public profile wire mismatches: {failures:?}"
+    );
+}
+
+#[test]
+fn public_profile_request_model_preserved_without_override() {
+    let (port, runner, requests, fixture) =
+        spawn_public_profile_fixture(read_fixture("openai_chat/response.json"));
+    let base_url = format!("http://127.0.0.1:{port}");
+    let canonical_model = "canonical-request-model";
+    let providers = [
+        "custom",
+        "deepseek",
+        "opencode_go",
+        "opencode_zen",
+        "openrouter",
+    ];
+    let mut failures = Vec::new();
+    for provider in providers {
+        for explicit_empty in [false, true] {
+            let mut options = JsonMap::new();
+            options.insert("base_url".to_string(), json!(base_url));
+            if explicit_empty {
+                options.insert("model".to_string(), json!(""));
+            }
+            let request = public_profile_request(JsonValue::Object(options), canonical_model);
+            let (result, events) =
+                run_adapter(&format!("profile:{provider}"), request, json!({}), &runner);
+            if result["ok"] != json!(true) || !events.is_empty() {
+                failures.push(format!(
+                    "{provider}/empty={explicit_empty}: ok={}, events={}",
+                    result["ok"],
+                    events.len()
+                ));
+            }
+        }
+    }
+    fixture.join().expect("public-profile fixture thread");
+    let observed = requests.recv().expect("public-profile request list");
+    if observed.len() != providers.len() * 2 {
+        failures.push(format!("wire request count={}", observed.len()));
+    }
+    for (index, recorded) in observed.iter().enumerate() {
+        if request_line(recorded) != "POST /chat/completions HTTP/1.1" {
+            failures.push(format!("wire path[{index}] was not Chat Completions"));
+        }
+        match serde_json::from_str::<JsonValue>(&recorded.body) {
+            Ok(body) if body["model"] == json!(canonical_model) => {}
+            Ok(_) => failures.push(format!(
+                "wire model[{index}] did not preserve the canonical request model"
+            )),
+            Err(_) => failures.push(format!("wire body[{index}] was not JSON")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "public profile request model mismatches: {failures:?}"
+    );
+}
+
+#[test]
+fn public_profile_custom_selects_anthropic_adapter() {
+    let (port, _runner, requests, fixture) =
+        spawn_public_profile_fixture(read_fixture("openai_chat/response.json"));
+    let options = json!({
+        "base_url": format!("http://127.0.0.1:{port}"),
+        "model": "public-profile-model",
+        "adapter": "anthropic_messages"
+    });
+    let request = public_profile_request(options, "request-model");
+    let (result, events) = run_adapter("profile:custom", request, json!({}), &_runner);
+    fixture.join().expect("public-profile fixture thread");
+    let observed = requests.recv().expect("public-profile request list");
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(error_of(&result)["code"], json!("not_implemented"));
+    assert_eq!(
+        error_of(&result)["message"],
+        json!("anthropic_messages adapter is not implemented")
+    );
+    assert!(events.is_empty());
+    assert!(observed.is_empty(), "stub adapter must not issue HTTP");
+}
+
 // ---------------------------------------------------------------------------
 // S1: OpenAI Chat Completions, buffered
 // ---------------------------------------------------------------------------

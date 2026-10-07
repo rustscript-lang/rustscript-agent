@@ -7,24 +7,18 @@
 use json;
 use super::llm::types as types;
 
-/// Merges profile metadata with provider_options overrides. Non-empty
-/// overrides win; the merged profile carries `{provider, base_url, api_key,
-/// model}` plus adapter capability metadata; the adapter appends its
-/// protocol path.
+/// Merges public profile metadata with provider_options overrides. Non-empty
+/// base/model overrides win; the result carries only `{provider, base_url,
+/// model, adapter, capabilities}`. Adapters append their protocol path.
 pub fn profile_merge(
     metadata: map,
     override_base: string,
-    override_key: string,
     override_model: string
 ) -> map {
     let mut base_url: string = types::profile_string(metadata, "base_url");
-    let mut api_key: string = types::profile_string(metadata, "api_key");
     let mut model: string = types::profile_string(metadata, "model");
     if override_base != "" {
         base_url = override_base;
-    }
-    if override_key != "" {
-        api_key = override_key;
     }
     if override_model != "" {
         model = override_model;
@@ -32,7 +26,6 @@ pub fn profile_merge(
     {
         provider: types::profile_string(metadata, "provider"),
         base_url: base_url,
-        api_key: api_key,
         model: model,
         adapter: types::profile_string(metadata, "adapter"),
         capabilities: types::request_map(metadata, "capabilities")
