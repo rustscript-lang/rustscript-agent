@@ -1,0 +1,350 @@
+// Pure public OpenAI Chat stream protocol codec (Task7 prerequisite).
+//
+// Consumes already-decoded JSON chunk maps from an upstream sanitized record
+// source and accumulates canonical text/usage/tool-call state. It does not
+// parse raw SSE framing, own dispatch, or touch transport/auth resources:
+// every value here is a public, resource-free map. The legacy buffered stream
+// entry in openai_chat.rss remains authoritative until the opaque streaming
+// migration lands, so this file deliberately has no host/resource signature.
+//
+// Compiler-contract notes inherited from openai_chat.rss:
+// - Script-function calls must appear at function top level, in expression-if
+//   branches, or inside `while` bodies — never in statement-if bodies.
+// - A map element read (`m[key]`) moves that element, so a map must not be
+//   passed or indexed again after one of its elements was moved. Presence and
+//   type probes therefore live in the small `field_is_*` helpers, where the
+//   index read is the container's last use.
+use self::types as types;
+use self::openai_chat as openai_chat;
+
+pub fn begin() -> map {
+    {
+        text: "",
+        stop_reason: "",
+        tools: [],
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        done: false,
+        failed: false,
+        error: {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Field probes (index read is the container's final use)
+// ---------------------------------------------------------------------------
+
+fn field_is_map(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "map";
+    }
+    result
+}
+
+fn field_is_array(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "array";
+    }
+    result
+}
+
+fn field_is_int(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "int";
+    }
+    result
+}
+
+/// A terminal, static malformed-payload failure. The message never echoes the
+/// offending field or input value.
+fn codec_failed(state: map, message: string) -> map {
+    let mut next: map = state;
+    next["failed"] = true;
+    next["error"] = types::error_malformed(0, message);
+    next
+}
+
+// ---------------------------------------------------------------------------
+// Chunk ingestion
+// ---------------------------------------------------------------------------
+
+/// Ingests one already-decoded chunk object. Returns the state unchanged once
+/// it is terminal (done or failed), so late chunks are ignored.
+pub fn push_chunk(state: map, chunk: map) -> map {
+    let done: bool = types::request_bool(state, "done", false);
+    let failed: bool = types::request_bool(state, "failed", false);
+    let terminal: bool = done || failed;
+    let result: map = if terminal => {
+        state
+    } else => {
+        codec_ingest(state, chunk)
+    };
+    result
+}
+
+fn codec_ingest(state: map, chunk: map) -> map {
+    let has_choices: bool = chunk.has("choices");
+    let choices_ok: bool = !has_choices || field_is_array(chunk, "choices");
+    let usage_present: bool = field_is_map(chunk, "usage");
+    let choices: array = types::request_array(chunk, "choices");
+    let result: map = if !choices_ok => {
+        codec_failed(state, "malformed OpenAI chat stream chunk: choices is not an array")
+    } else if has_choices && choices.length > 0 => {
+        codec_apply_choice(state, choices, chunk, usage_present)
+    } else if !has_choices && !usage_present => {
+        codec_failed(
+            state,
+            "malformed OpenAI chat stream chunk: missing choices and usage"
+        )
+    } else => {
+        codec_apply_usage(state, chunk, usage_present)
+    };
+    result
+}
+
+fn codec_apply_choice(state: map, choices: array, chunk: map, usage_present: bool) -> map {
+    let first: map = types::array_entry(choices, 0);
+    let delta_ok: bool = field_is_map(first, "delta");
+    let delta: map = types::request_map(first, "delta");
+    let applied: map = if delta_ok => {
+        codec_apply_delta(state, first, delta)
+    } else => {
+        codec_failed(state, "malformed OpenAI chat stream chunk: invalid choice delta")
+    };
+    codec_apply_usage(applied, chunk, usage_present)
+}
+
+fn codec_apply_delta(state: map, first: map, delta: map) -> map {
+    let content: string = types::request_string(delta, "content");
+    let text: string = types::request_string(state, "text");
+    let mut result: map = state;
+    if content != "" {
+        result["text"] = text + content;
+    }
+    let reason: string = types::request_string(first, "finish_reason");
+    if reason != "" {
+        result["stop_reason"] = reason;
+    }
+    codec_apply_tools(result, delta)
+}
+
+fn codec_apply_tools(state: map, delta: map) -> map {
+    let has_tools: bool = delta.has("tool_calls");
+    let tools_ok: bool = !has_tools || field_is_array(delta, "tool_calls");
+    let result: map = if !tools_ok => {
+        codec_failed(state, "malformed OpenAI chat stream chunk: tool_calls is not an array")
+    } else if !has_tools => {
+        state
+    } else => {
+        codec_merge_tools(state, delta)
+    };
+    result
+}
+
+fn codec_merge_tools(state: map, delta: map) -> map {
+    let deltas: array = types::request_array(delta, "tool_calls");
+    let indices_ok: bool = codec_tool_indices_valid(deltas);
+    let result: map = if indices_ok => {
+        codec_store_merged(state, deltas)
+    } else => {
+        codec_failed(state, "malformed OpenAI chat stream chunk: invalid tool call index")
+    };
+    result
+}
+
+/// Every tool-call fragment must carry a non-negative integer `index`.
+fn codec_tool_indices_valid(deltas: array) -> bool {
+    let mut valid: bool = true;
+    let mut i = 0;
+    while i < deltas.length {
+        let entry: map = types::array_entry(deltas, i);
+        let index: int = types::request_int(entry, "index", -1);
+        if index < 0 {
+            valid = false;
+        }
+        i += 1;
+    }
+    valid
+}
+
+fn codec_store_merged(state: map, deltas: array) -> map {
+    let tools: array = types::request_array(state, "tools");
+    let merged: array = openai_chat::chat_stream_merge_tool_calls(tools, deltas);
+    let mut result: map = state;
+    result["tools"] = merged;
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
+
+/// Processes valid usage fields for a chunk that carried them, regardless of
+/// whether it also carried choices. An explicit `null` usage is ignored
+/// (`field_is_map` is false).
+fn codec_apply_usage(state: map, chunk: map, usage_present: bool) -> map {
+    let failed: bool = types::request_bool(state, "failed", false);
+    let apply: bool = usage_present && !failed;
+    let result: map = if apply => {
+        codec_merge_usage(state, chunk)
+    } else => {
+        state
+    };
+    result
+}
+
+/// Updates the usage counters, retaining the previous value for an absent
+/// field. A present field that is not a non-negative int makes the chunk
+/// malformed.
+fn codec_merge_usage(state: map, chunk: map) -> map {
+    let usage: map = types::request_map(chunk, "usage");
+    let mut result: map = state;
+    let mut valid: bool = true;
+    // Prompt tokens.
+    let prompt_present: bool = usage.has("prompt_tokens");
+    let prompt_int: bool = field_is_int(usage, "prompt_tokens");
+    let prompt_value: int = types::request_int(usage, "prompt_tokens", 0);
+    if prompt_present {
+        if prompt_int {
+            if prompt_value >= 0 {
+                result["input_tokens"] = prompt_value;
+            } else {
+                valid = false;
+            }
+        } else {
+            valid = false;
+        }
+    }
+    // Completion tokens.
+    let completion_present: bool = usage.has("completion_tokens");
+    let completion_int: bool = field_is_int(usage, "completion_tokens");
+    let completion_value: int = types::request_int(usage, "completion_tokens", 0);
+    if completion_present {
+        if completion_int {
+            if completion_value >= 0 {
+                result["output_tokens"] = completion_value;
+            } else {
+                valid = false;
+            }
+        } else {
+            valid = false;
+        }
+    }
+    // Total tokens.
+    let total_present: bool = usage.has("total_tokens");
+    let total_int: bool = field_is_int(usage, "total_tokens");
+    let total_value: int = types::request_int(usage, "total_tokens", 0);
+    if total_present {
+        if total_int {
+            if total_value >= 0 {
+                result["total_tokens"] = total_value;
+            } else {
+                valid = false;
+            }
+        } else {
+            valid = false;
+        }
+    }
+    let outcome: map = if valid => {
+        result
+    } else => {
+        codec_failed(state, "malformed OpenAI chat stream chunk: invalid usage")
+    };
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Terminal operations
+// ---------------------------------------------------------------------------
+
+/// Marks the stream terminal on a caller-declared `[DONE]` record. A failed
+/// state is preserved (a terminator cannot repair a malformed stream); a
+/// duplicate DONE is harmless.
+pub fn push_done(state: map) -> map {
+    let failed: bool = types::request_bool(state, "failed", false);
+    let result: map = if failed => {
+        state
+    } else => {
+        let mut done_state: map = state;
+        done_state["done"] = true;
+        done_state
+    };
+    result
+}
+
+/// Builds the canonical call result. A failed state returns its stored static
+/// malformed error; a stream without a DONE terminator fails closed (never a
+/// partial success); a completed stream returns the canonical response.
+pub fn finish(state: map) -> map {
+    let failed: bool = types::request_bool(state, "failed", false);
+    let done: bool = types::request_bool(state, "done", false);
+    let result: map = if failed => {
+        types::fail(types::request_map(state, "error"))
+    } else if done => {
+        codec_success(state)
+    } else => {
+        types::fail(types::error_new(
+            200,
+            "api_error",
+            "stream_eof_without_done",
+            "provider stream ended without [DONE] terminator",
+            "",
+            ""
+        ))
+    };
+    result
+}
+
+fn codec_success(state: map) -> map {
+    let tools: array = types::request_array(state, "tools");
+    let identities_ok: bool = codec_tool_identities_valid(tools);
+    let result: map = if identities_ok => {
+        codec_canonical(state, tools)
+    } else => {
+        types::fail(types::error_malformed(
+            0,
+            "malformed OpenAI chat stream chunk: tool call missing id or name"
+        ))
+    };
+    result
+}
+
+/// Before the shared argument parser runs, every accumulated tool entry must
+/// carry a final id and name (fill-in fragments may legitimately omit them).
+fn codec_tool_identities_valid(tools: array) -> bool {
+    let mut valid: bool = true;
+    let mut i = 0;
+    while i < tools.length {
+        let entry: map = types::array_entry(tools, i);
+        let id: string = types::request_string(entry, "id");
+        let name: string = types::request_string(entry, "name");
+        if id == "" {
+            valid = false;
+        }
+        if name == "" {
+            valid = false;
+        }
+        i += 1;
+    }
+    valid
+}
+
+fn codec_canonical(state: map, tools: array) -> map {
+    let text: string = types::request_string(state, "text");
+    let stop_reason: string = types::request_string(state, "stop_reason");
+    let input_tokens: int = types::request_int(state, "input_tokens", 0);
+    let output_tokens: int = types::request_int(state, "output_tokens", 0);
+    let total_tokens: int = types::request_int(state, "total_tokens", 0);
+    let calls: array = openai_chat::chat_stream_parse_tool_calls(tools);
+    types::ok(types::response_new(
+        text,
+        calls,
+        types::usage_new(input_tokens, output_tokens, total_tokens),
+        "",
+        stop_reason
+    ))
+}

@@ -187,6 +187,19 @@ pub fn chat_build_public_body(request: map, model: string) -> string {
     chat_splice_tool_schemas(with_user_parts, types::request_array(request, "tools"))
 }
 
+/// Public streaming body: identical to the buffered builder except the wire
+/// request encodes `stream: true` with `stream_options.include_usage`. Shares
+/// the same marker-splice helpers and user/tool content semantics, and carries
+/// no URL, header, key, or credential argument.
+pub fn chat_build_public_stream_body(request: map, model: string) -> string {
+    let body_text: string = chat_encode_wire(request, model, true);
+    let with_user_parts: string = chat_splice_user_parts(
+        body_text,
+        types::request_array(request, "messages")
+    );
+    chat_splice_tool_schemas(with_user_parts, types::request_array(request, "tools"))
+}
+
 fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
     let messages: array<WireMessage> = chat_build_messages(
         types::request_array(request, "messages")
@@ -773,8 +786,8 @@ fn chat_send_stream(
 /// is `{index, id, name, args}`; a delta whose `index` already exists fills
 /// missing `id`/`name` and appends its `arguments` fragment to `args`.
 /// Returns a new array (the caller assigns the result back to the captured
-/// accumulator).
-fn chat_stream_merge_tool_calls(tools: array, deltas: array) -> array {
+/// accumulator). Public so the pure stream codec reuses it unchanged.
+pub fn chat_stream_merge_tool_calls(tools: array, deltas: array) -> array {
     let mut merged: array = tools;
     let mut i = 0;
     while i < deltas.length {
@@ -821,8 +834,9 @@ fn chat_stream_merge_tool_calls(tools: array, deltas: array) -> array {
 }
 
 /// Converts the accumulator entries into canonical `{id, name, arguments}`
-/// tool calls, decoding each accumulated `arguments` JSON fragment.
-fn chat_stream_parse_tool_calls(tools: array) -> array {
+/// tool calls, decoding each accumulated `arguments` JSON fragment. Public so
+/// the pure stream codec reuses it unchanged.
+pub fn chat_stream_parse_tool_calls(tools: array) -> array {
     let mut calls: array = [];
     let mut i = 0;
     while i < tools.length {
