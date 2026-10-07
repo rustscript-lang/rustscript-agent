@@ -1,0 +1,40 @@
+use auth;
+use oauth;
+
+struct OpaqueProviderIntent {
+    credential_id: string,
+    method: string,
+    path: string,
+    public_headers: array<PublicHeader>,
+    public_body: string
+}
+
+struct OpaquePolicyBinding {
+    policy: resource<auth.policy>
+}
+
+pub fn call(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
+    let metadata: AuthMetadataEnvelope = auth::load_metadata(intent.credential_id, &binding.policy);
+    let access: AccessHandleEnvelope = auth::access_handle(
+        intent.credential_id,
+        metadata.metadata.generation,
+        &binding.policy
+    );
+    let request: TransportPublicRequest = {
+        policy_handle: binding.policy,
+        credential_id: intent.credential_id,
+        method: intent.method,
+        path: intent.path,
+        public_headers: intent.public_headers,
+        public_body: intent.public_body
+    };
+    let usage: TransportCredentialUse = {
+        kind: "access",
+        access_handle: access.handle,
+        refresh_handle: null,
+        code_handle: null,
+        verifier_handle: null,
+        device_handle: null
+    };
+    oauth::transport_result(&request, &usage)
+}

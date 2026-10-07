@@ -1,0 +1,25 @@
+use auth;
+use config;
+use super::providers::opaque_bridge::{call as bridge_call};
+
+struct OpaqueProviderIntent {
+    credential_id: string,
+    method: string,
+    path: string,
+    public_headers: array<PublicHeader>,
+    public_body: string
+}
+
+struct OpaqueHostHomeBinding {
+    home: resource<auth.host_home>
+}
+
+struct OpaquePolicyBinding {
+    policy: resource<auth.policy>
+}
+
+pub fn call(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
+    let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
+    let binding: OpaquePolicyBinding = { "policy": snapshot.policy_handle, };
+    bridge_call(binding, intent)
+}
