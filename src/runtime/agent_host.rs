@@ -19,7 +19,7 @@ use super::cancellation::CancellationReason;
 use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
-use crate::auth::host::{AuthHost, auth_host_module};
+use crate::auth::host::{AuthHost, auth_host_module, validate_provider_json_resources};
 use crate::capabilities::{
     ArtifactCapability, CapabilityError, CapabilityLifecycle, CapabilityOwner, CapabilityRisk,
     ExecutionLease, FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
@@ -986,6 +986,7 @@ pub fn register_agent_host_functions(
 
 fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let request = args.first().cloned().unwrap_or(Value::Null);
+    validate_provider_json_resources(vm, &request)?;
     let state = installed_state(vm)?;
     let json = vm_value_to_json(&request);
     return_json(state.provider_call(&json))
