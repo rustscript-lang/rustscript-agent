@@ -776,6 +776,109 @@ fn worker_delivers_queue_record_to_real_pipe_and_preserves_exact_deadline() {
 }
 
 #[test]
+fn worker_finish_draining_flushes_all_records_before_join() {
+    let (read_fd, write_fd) = pipe(true);
+    let output = Arc::new(
+        NativeAuthorizationInstructionOutput::from_fd(write_fd).expect("admitted pipe descriptor"),
+    );
+    let (sender, receiver) = queue();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let cancellation = RunCancellation::with_deadline(deadline);
+    let worker =
+        NativeAuthorizationInstructionWorker::start(Arc::clone(&output), receiver, cancellation)
+            .expect("worker with finite original context");
+    let tid = wait_for_thread_id(&worker);
+    for _ in 0..2 {
+        sender
+            .try_send(public_instruction())
+            .expect("queue public authorization record");
+    }
+
+    assert!(worker.finish_draining().is_ok());
+    assert!(
+        !thread_alive(tid),
+        "drain joined the existing worker thread"
+    );
+    assert_eq!(
+        drain_nonblocking(read_fd.as_raw_fd()),
+        [EXPECTED_RECORD, EXPECTED_RECORD].concat(),
+        "finish_draining returns only after every queued record was written"
+    );
+}
+
+#[test]
+fn worker_finish_draining_reports_child_cancellation_after_idle_exit() {
+    let fds_before = open_fd_count();
+    let (read_fd, write_fd) = pipe(false);
+    let output = Arc::new(
+        NativeAuthorizationInstructionOutput::from_fd(write_fd).expect("admitted pipe descriptor"),
+    );
+    let (_sender, receiver) = queue();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let cancellation = RunCancellation::with_deadline(deadline);
+    let worker =
+        NativeAuthorizationInstructionWorker::start(output.clone(), receiver, cancellation.clone())
+            .expect("worker with exact child cancellation");
+    let tid = wait_for_thread_id(&worker);
+
+    cancellation.request(rustscript_agent::CancellationReason::Requested);
+    let wait_until = Instant::now() + Duration::from_secs(2);
+    while thread_alive(tid) {
+        assert!(Instant::now() < wait_until, "cancelled worker did not exit");
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(worker.error().is_none(), "idle exit precedes drain request");
+    let result = worker.finish_draining();
+    assert!(matches!(result, Err(OAuthError::Cancelled)), "{result:?}");
+    assert!(
+        !thread_alive(tid),
+        "drain joined the existing worker thread"
+    );
+    drop(output);
+    drop(read_fd);
+    drop(cancellation);
+    assert_eq!(open_fd_count(), fds_before, "no descriptor leaked by drain");
+}
+
+#[test]
+fn worker_finish_draining_reports_original_deadline_after_idle_exit() {
+    let fds_before = open_fd_count();
+    let (read_fd, write_fd) = pipe(false);
+    let output = Arc::new(
+        NativeAuthorizationInstructionOutput::from_fd(write_fd).expect("admitted pipe descriptor"),
+    );
+    let (_sender, receiver) = queue();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let cancellation = RunCancellation::with_deadline(deadline);
+    let worker =
+        NativeAuthorizationInstructionWorker::start(output.clone(), receiver, cancellation.clone())
+            .expect("worker with exact child deadline");
+    assert_eq!(worker.deadline(), deadline);
+    let tid = wait_for_thread_id(&worker);
+
+    let wait_until = Instant::now() + Duration::from_secs(2);
+    while thread_alive(tid) {
+        assert!(Instant::now() < wait_until, "deadline worker did not exit");
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(Instant::now() >= deadline, "the original deadline elapsed");
+    assert!(worker.error().is_none(), "idle exit precedes drain request");
+    let result = worker.finish_draining();
+    assert!(
+        matches!(result, Err(OAuthError::DeadlineExceeded)),
+        "{result:?}"
+    );
+    assert!(
+        !thread_alive(tid),
+        "drain joined the existing worker thread"
+    );
+    drop(output);
+    drop(read_fd);
+    drop(cancellation);
+    assert_eq!(open_fd_count(), fds_before, "no descriptor leaked by drain");
+}
+
+#[test]
 fn worker_requires_finite_child_deadline() {
     let (read_fd, write_fd) = pipe(false);
     let output = Arc::new(

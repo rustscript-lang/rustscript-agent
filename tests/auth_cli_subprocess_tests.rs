@@ -1,21 +1,26 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-#[cfg(unix)]
+#[cfg(any(
+    feature = "default",
+    all(target_os = "linux", feature = "config-fixture")
+))]
+use std::io::Read;
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 use std::net::TcpListener;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 use std::process::Child;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 use std::thread;
-#[cfg(unix)]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 use std::time::{Duration, Instant};
 const ACCESS_TOKEN: &str = "SYNTHETIC_ACCESS_TOKEN";
 const REFRESH_TOKEN: &str = "SYNTHETIC_REFRESH_TOKEN";
@@ -1374,7 +1379,7 @@ fn parser_help_and_literal_values_are_redacted_without_home_resolution() {
     assert!(!String::from_utf8_lossy(&literal_script.stdout).contains("Usage:"));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 #[derive(Debug)]
 enum TrustServerEvent {
     TcpAccepted,
@@ -1385,14 +1390,14 @@ enum TrustServerEvent {
     },
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 struct ObservedTcpStream {
     stream: tokio::net::TcpStream,
     inbound_bytes: Arc<AtomicUsize>,
     outbound_bytes: Arc<AtomicUsize>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 impl tokio::io::AsyncRead for ObservedTcpStream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -1410,7 +1415,7 @@ impl tokio::io::AsyncRead for ObservedTcpStream {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 impl tokio::io::AsyncWrite for ObservedTcpStream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -1442,10 +1447,11 @@ impl tokio::io::AsyncWrite for ObservedTcpStream {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn untrusted_tls_server_config() -> Arc<rustls::ServerConfig> {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("generate local self-signed certificate");
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+            .expect("generate local self-signed certificate");
     Arc::new(
         rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -1458,7 +1464,7 @@ fn untrusted_tls_server_config() -> Arc<rustls::ServerConfig> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn spawn_trust_server(
     listener: TcpListener,
     tls_config: Arc<rustls::ServerConfig>,
@@ -1517,7 +1523,7 @@ fn spawn_trust_server(
     (receiver, stop, worker)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 #[derive(Debug)]
 enum StallServerEvent {
     TcpAccepted,
@@ -1526,7 +1532,7 @@ enum StallServerEvent {
     ReadFailed,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn spawn_stalled_tls_server(
     listener: TcpListener,
     stop: Arc<AtomicBool>,
@@ -1597,7 +1603,7 @@ fn spawn_stalled_tls_server(
     (receiver, worker)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn local_listener() -> TcpListener {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback listener");
     listener
@@ -1606,7 +1612,7 @@ fn local_listener() -> TcpListener {
     listener
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn device_login_home(area: &TestArea, label: &str, port: u16) -> PathBuf {
     let home = area.root.join(label);
     fs::create_dir(&home).expect("create fresh local-login home");
@@ -1615,7 +1621,7 @@ fn device_login_home(area: &TestArea, label: &str, port: u16) -> PathBuf {
     let mut config: serde_yaml::Value =
         serde_yaml::from_slice(&fs::read(fixture).expect("read device-login fixture"))
             .expect("parse device-login fixture");
-    let authority = format!("https://localhost:{port}");
+    let authority = format!("https://127.0.0.1:{port}");
     config["providers"]["openai-codex"]["oauth"]["issuer"] =
         serde_yaml::Value::String(authority.clone());
     config["providers"]["openai-codex"]["oauth"]["token_endpoint"] =
@@ -1638,14 +1644,14 @@ fn device_login_home(area: &TestArea, label: &str, port: u16) -> PathBuf {
     home
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn copied_binary(area: &TestArea) -> PathBuf {
     let copied = area.caller.join("rustscript-agent");
     fs::copy(area.binary(), &copied).expect("stage actual Cargo executable outside checkout");
     copied
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn spawn_copied_login(area: &TestArea, binary: &Path, home: &Path) -> (Child, Vec<String>, i32) {
     use std::os::unix::process::CommandExt;
 
@@ -1673,7 +1679,7 @@ fn spawn_copied_login(area: &TestArea, binary: &Path, home: &Path) -> (Child, Ve
     (child, argv, process_group)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1687,7 +1693,7 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn finish_copied_child(
     area: &TestArea,
     mut child: Child,
@@ -1710,7 +1716,7 @@ fn finish_copied_child(
     output
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn wait_for_trust_event(
     receiver: &mpsc::Receiver<TrustServerEvent>,
     child: &mut Child,
@@ -1735,7 +1741,7 @@ fn wait_for_trust_event(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn wait_for_stall_event(
     receiver: &mpsc::Receiver<StallServerEvent>,
     child: &mut Child,
@@ -1760,7 +1766,8 @@ fn wait_for_stall_event(
     }
 }
 
-#[cfg(target_os = "linux")]
+// These native loopback TLS tests require the explicit local-provider fixture feature.
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 #[test]
 fn copied_login_reaches_untrusted_local_tls_and_keeps_home_unchanged() {
     let area = TestArea::new("login-untrusted-local-tls");
@@ -1826,7 +1833,7 @@ fn copied_login_reaches_untrusted_local_tls_and_keeps_home_unchanged() {
     assert!(!home.join("auth.yaml.lock").exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
 #[test]
 fn copied_login_sigint_after_tls_client_hello_returns_auth_cancelled_and_reaps_child() {
     let area = TestArea::new("login-tls-sigint");

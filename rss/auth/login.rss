@@ -3,6 +3,7 @@ use config;
 use json;
 use oauth;
 use self::codex_device;
+use self::pkce_login::{run as pkce_run};
 use self::types;
 
 struct AuthCommandInput {
@@ -48,6 +49,7 @@ struct ProviderSelection {
 struct MetadataSelection {
     ok: bool,
     expected_generation: int,
+    has_refresh_token: bool,
     error: string
 }
 
@@ -78,6 +80,22 @@ fn empty_provider() -> ProviderEntry {
     {name: "", protocol: "", base_url: "", auth: null, oauth: null}
 }
 
+fn empty_oauth_config() -> OAuthConfig {
+    {
+        flow: null,
+        issuer: null,
+        client_id: null,
+        device_user_code_path: null,
+        device_poll_path: null,
+        authorization_path: null,
+        token_endpoint: null,
+        redirect_uri: null,
+        refresh_skew_seconds: 0,
+        scopes: null,
+        authorization_parameters: null
+    }
+}
+
 fn provider_selection(public_config: BoundedPublicConfig, requested: string) -> ProviderSelection {
     let providers = public_config.providers.copy();
     let mut found: bool = false;
@@ -104,25 +122,25 @@ fn metadata_selection(
         if envelope.ok.copy() && envelope.error.copy() == null && envelope.outcome.copy() == "loaded" => {
             let metadata: AuthMetadata = envelope.metadata.copy();
             if metadata.credential_id.copy() != credential_id.copy() || metadata.generation.copy() < 0 => {
-                {ok: false, expected_generation: 0, error: "host_failure"}
+                {ok: false, expected_generation: 0, has_refresh_token: false, error: "host_failure"}
             } else if metadata.provider.copy() != provider.copy() => {
-                {ok: false, expected_generation: metadata.generation.copy(), error: "credential_provider_mismatch"}
+                {ok: false, expected_generation: metadata.generation.copy(), has_refresh_token: false, error: "credential_provider_mismatch"}
             } else => {
-                {ok: true, expected_generation: metadata.generation.copy(), error: ""}
+                {ok: true, expected_generation: metadata.generation.copy(), has_refresh_token: metadata.has_refresh_token.copy(), error: ""}
             }
         } else => {
-            {ok: false, expected_generation: 0, error: "host_failure"}
+            {ok: false, expected_generation: 0, has_refresh_token: false, error: "host_failure"}
         }
     } else if !loaded.ok.copy() && loaded.error.copy() != null && loaded.value.copy() == null => {
         let failure: AuthBridgeFailure = loaded.error.copy();
         let code: string = failure.code.copy();
         if code.copy() == "credential_not_found" => {
-            {ok: true, expected_generation: 0, error: ""}
+            {ok: true, expected_generation: 0, has_refresh_token: false, error: ""}
         } else => {
-            {ok: false, expected_generation: 0, error: code.copy()}
+            {ok: false, expected_generation: 0, has_refresh_token: false, error: code.copy()}
         }
     } else => {
-        {ok: false, expected_generation: 0, error: "host_failure"}
+        {ok: false, expected_generation: 0, has_refresh_token: false, error: "host_failure"}
     }
 }
 
@@ -202,14 +220,16 @@ fn workflow_result(
 
 pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
     let operation: string = command.operation.copy();
+    let requested_credential: string? = command.credential_id.copy();
+    let requested_provider_holder: string? = command.provider.copy();
+    let requested_provider: string = requested_provider_holder.unwrap_or("");
     if operation.copy() != "auth.login" => {
         failed(operation.copy(), "unsupported_operation", null, 0)
-    } else if command.credential_id.copy() != null => {
+    } else if requested_credential != null => {
         failed(operation.copy(), "invalid_command", null, 0)
-    } else if command.provider.copy() == null || command.provider.copy() == "" => {
+    } else if requested_provider == "" => {
         failed(operation.copy(), "provider_required", null, 0)
     } else => {
-        let requested_provider: string = command.provider.copy();
         let snapshot = config::load_snapshot(&home);
         let snapshot_generation: int = snapshot.policy_generation;
         if !snapshot.ok || snapshot.error != null || snapshot_generation < 0 => {
@@ -222,43 +242,92 @@ pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEnt
                 failed(operation.copy(), "provider_not_found", null, snapshot_generation.copy())
             } else => {
                 let provider: ProviderEntry = selected.provider.copy();
-                if provider.auth.copy() == null || provider.auth.copy() == "" => {
+                let credential_holder: string? = provider.auth.copy();
+                let credential_id: string = credential_holder.unwrap_or("");
+                let oauth_holder: OAuthConfig? = provider.oauth.copy();
+                let oauth_config: OAuthConfig = oauth_holder.unwrap_or(empty_oauth_config());
+                let flow_holder: string? = oauth_config.flow;
+                let flow: string = flow_holder.unwrap_or("");
+                if credential_id == "" => {
                     failed(operation.copy(), "credential_id_required", null, snapshot_generation.copy())
-                } else if provider.oauth.copy() == null => {
-                    failed(operation.copy(), "login_flow_unsupported", provider.auth.copy(), snapshot_generation.copy())
+                } else if oauth_holder == null => {
+                    failed(operation.copy(), "login_flow_unsupported", credential_id.copy(), snapshot_generation.copy())
+                } else if flow != "codex-device" && flow != "authorization_code_pkce" => {
+                    failed(operation.copy(), "login_flow_unsupported", credential_id.copy(), snapshot_generation.copy())
                 } else => {
-                    let oauth_config: OAuthConfig = provider.oauth.copy();
-                    if oauth_config.flow.copy() != "codex-device" => {
-                        failed(operation.copy(), "login_flow_unsupported", provider.auth.copy(), snapshot_generation.copy())
-                    } else => {
-                        let credential_id: string = provider.auth.copy();
-                        let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
+                    let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
                         let metadata: MetadataSelection = metadata_selection(loaded, credential_id.copy(), provider.name.copy());
                         if !metadata.ok.copy() => {
                             failed(operation.copy(), metadata.error.copy(), credential_id.copy(), metadata.expected_generation.copy())
                         } else => {
                             let expected_generation: int = metadata.expected_generation.copy();
-                            let request: CodexDeviceLoginRequest = {
-                                policy_handle: policy,
-                                provider: provider,
-                                credential_id: credential_id.copy(),
-                                expected_generation: expected_generation.copy()
-                            };
-                            let result: CodexDeviceLoginResult = codex_device::login_with_instruction_result(
-                                request,
-                                emit_device_instruction
-                            );
-                            workflow_result(
-                                result,
-                                operation.copy(),
-                                requested_provider.copy(),
-                                credential_id.copy(),
-                                expected_generation.copy()
-                            )
+                            if flow == "codex-device" => {
+                                let request: CodexDeviceLoginRequest = {
+                                    policy_handle: policy,
+                                    provider: provider,
+                                    credential_id: credential_id.copy(),
+                                    expected_generation: expected_generation.copy()
+                                };
+                                let result: CodexDeviceLoginResult = codex_device::login_with_instruction_result(
+                                    request,
+                                    emit_device_instruction
+                                );
+                                workflow_result(
+                                    result,
+                                    operation.copy(),
+                                    requested_provider.copy(),
+                                    credential_id.copy(),
+                                    expected_generation.copy()
+                                )
+                            } else => {
+                                let result = pkce_run(
+                                    home,
+                                    policy,
+                                    provider,
+                                    credential_id.copy(),
+                                    expected_generation.copy(),
+                                    metadata.has_refresh_token.copy()
+                                );
+                                if !result.ok.copy() => {
+                                    failed(operation.copy(), result.code.copy(), credential_id.copy(), expected_generation.copy())
+                                } else if result.metadata.copy() == null => {
+                                    failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+                                } else => {
+                                    let envelope: AuthMetadataEnvelope = result.metadata;
+                                    let envelope_error_present: bool = envelope.has("error");
+                                    let envelope_has_error: bool = if envelope_error_present => {
+                                        envelope.error.copy() != null
+                                    } else => {false};
+                                    if !envelope.ok.copy() || envelope_has_error ||
+                                       (envelope.outcome.copy() != "committed" && envelope.outcome.copy() != "adopted") => {
+                                        failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+                                    } else => {
+                                        let saved: AuthMetadata = envelope.metadata.copy();
+                                        if saved.credential_id.copy() != credential_id.copy() ||
+                                           saved.provider.copy() != requested_provider.copy() || saved.generation.copy() < 0 => {
+                                            failed(operation.copy(), "host_failure", credential_id.copy(), expected_generation.copy())
+                                        } else => {
+                                            entry(
+                                                true,
+                                                operation.copy(),
+                                                saved.credential_id.copy(),
+                                                saved.generation.copy(),
+                                                report_row(
+                                                    saved.provider.copy(),
+                                                    saved.credential_id.copy(),
+                                                    saved.status.copy(),
+                                                    saved.generation.copy(),
+                                                    saved.source.copy()
+                                                ),
+                                                null
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-    }
 }

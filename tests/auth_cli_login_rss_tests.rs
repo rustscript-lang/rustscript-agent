@@ -47,6 +47,26 @@ const STARTER_SOURCES: &[(&str, &str)] = &[
 
 const LOGIN_SOURCES: &[(&str, &str)] = &[
     (ENTRY_PATH, include_str!("../rss/auth/login.rss")),
+    (
+        "rss/auth/pkce_login.rss",
+        include_str!("../rss/auth/pkce_login.rss"),
+    ),
+    (
+        "rss/auth/pkce_instruction_session.rss",
+        include_str!("../rss/auth/pkce_instruction_session.rss"),
+    ),
+    (
+        "rss/auth/pkce_session.rss",
+        include_str!("../rss/auth/pkce_session.rss"),
+    ),
+    (
+        "rss/auth/token_metadata.rss",
+        include_str!("../rss/auth/token_metadata.rss"),
+    ),
+    (
+        "rss/auth/token_save.rss",
+        include_str!("../rss/auth/token_save.rss"),
+    ),
     (CODEX_PATH, include_str!("../rss/auth/codex_device.rss")),
     (TYPES_PATH, include_str!("../rss/auth/types.rss")),
 ];

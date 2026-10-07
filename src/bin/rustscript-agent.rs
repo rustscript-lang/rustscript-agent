@@ -1,20 +1,24 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::{self, Write as FmtWrite};
 use std::future::Future;
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rustscript_agent::auth::authorization_output::{
+    NativeAuthorizationInstructionOutput, NativeAuthorizationInstructionWorker,
+};
 use rustscript_agent::auth::host::{
     AuthHost, ConfigPathHost, DeviceInstructionSender, NativeDeviceInstructionOutput,
-    RunOAuthCancel, SystemOAuthClock,
+    RunOAuthCancel, SystemOAuthClock, authorization_instruction_channel,
 };
+use rustscript_agent::auth::native_browser::NativeBrowserOpener;
 use rustscript_agent::auth::native_https::NativeHttpsTransport;
-use rustscript_agent::auth::oauth::{
-    BrowserOpener, CallbackWaiter, OAuthError, OAuthHost, OAuthIoContext, RawCallbackInput,
-};
+use rustscript_agent::auth::oauth::{OAuthError, OAuthHost};
 use rustscript_agent::cli::{
     CliInvocation, CliOutput, cli_usage, execute_auth_cli, execute_config_path_cli, parse_cli_args,
     resolve_cli_paths,
@@ -37,6 +41,26 @@ const AUTH_SOURCES: &[(&str, &str)] = &[
     (
         "rss/auth/login.rss",
         include_str!("../../rss/auth/login.rss"),
+    ),
+    (
+        "rss/auth/pkce_login.rss",
+        include_str!("../../rss/auth/pkce_login.rss"),
+    ),
+    (
+        "rss/auth/pkce_instruction_session.rss",
+        include_str!("../../rss/auth/pkce_instruction_session.rss"),
+    ),
+    (
+        "rss/auth/pkce_session.rss",
+        include_str!("../../rss/auth/pkce_session.rss"),
+    ),
+    (
+        "rss/auth/token_metadata.rss",
+        include_str!("../../rss/auth/token_metadata.rss"),
+    ),
+    (
+        "rss/auth/token_save.rss",
+        include_str!("../../rss/auth/token_save.rss"),
     ),
     (
         "rss/auth/codex_device.rss",
@@ -154,26 +178,53 @@ fn execute_invocation(invocation: CliInvocation, cancellation: RunCancellation) 
     }
 }
 
-struct UnavailableCallbackWaiter;
+const APPROVED_DESKTOP_ENVIRONMENT: &[&str] = &[
+    "HOME",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CURRENT_DESKTOP",
+    "DESKTOP_SESSION",
+    "LANG",
+    "LC_ALL",
+];
 
-impl CallbackWaiter for UnavailableCallbackWaiter {
-    fn wait_one(&self, context: &OAuthIoContext) -> Result<RawCallbackInput, OAuthError> {
-        context.check()?;
-        Err(OAuthError::Transport {
-            message: "callback unavailable in this CLI".to_owned(),
-        })
+fn approved_desktop_environment() -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    let mut aggregate_bytes = 0usize;
+    for key in APPROVED_DESKTOP_ENVIRONMENT {
+        if let Ok(value) = env::var(key) {
+            let entry_bytes = key.len().saturating_add(value.len());
+            if value.len() > 4096
+                || value.chars().any(char::is_control)
+                || aggregate_bytes.saturating_add(entry_bytes) > 16_384
+            {
+                continue;
+            }
+            aggregate_bytes += entry_bytes;
+            environment.insert((*key).to_owned(), value);
+        }
     }
+    environment
 }
 
-struct UnavailableBrowserOpener;
-
-impl BrowserOpener for UnavailableBrowserOpener {
-    fn open(&self, _url: &str, context: &OAuthIoContext) -> Result<(), OAuthError> {
-        context.check()?;
-        Err(OAuthError::Transport {
-            message: "browser unavailable in this CLI".to_owned(),
-        })
+fn duplicate_manual_stdin() -> Option<OwnedFd> {
+    // SAFETY: F_DUPFD_CLOEXEC creates a separately owned, close-on-exec copy.
+    let duplicated = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return None;
     }
+    // SAFETY: fcntl returned a new descriptor owned by this process.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(duplicated) };
+    // Reject descriptors that cannot be read; NativeManualCallbackInput applies
+    // its own bounded nonblocking/terminal rules when the manual path is chosen.
+    let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_ACCMODE == libc::O_WRONLY {
+        return None;
+    }
+    Some(descriptor)
 }
 
 fn execute_auth(
@@ -189,17 +240,40 @@ fn execute_auth(
         Err(_) => return code_output("agent_compile_failed", 1),
     };
     let configured_login = input.operation == "auth.login";
-    execute_auth_cli(&runner, input, cancellation, move |child| {
+    let worker_slot = Arc::new(Mutex::new(None));
+    let factory_worker_slot = Arc::clone(&worker_slot);
+    let output = execute_auth_cli(&runner, input, cancellation, move |child| {
         if configured_login {
-            let host = AuthHost::new_for_login(paths.home, child.clone())?;
-            let oauth = Arc::new(OAuthHost::new(
+            let mut host = AuthHost::new_for_login(paths.home, child.clone())?;
+            let browser = NativeBrowserOpener::new(
+                PathBuf::from("/usr/bin/xdg-open"),
+                approved_desktop_environment(),
+            )
+            .map_err(|_| "native_browser_setup_failed".to_owned())?;
+            let oauth = OAuthHost::new_with_native_inputs(
                 Arc::new(NativeHttpsTransport::new()),
-                Arc::new(UnavailableCallbackWaiter),
-                Arc::new(UnavailableBrowserOpener),
+                Arc::new(browser),
+                duplicate_manual_stdin(),
                 Arc::new(SystemOAuthClock),
                 Arc::new(RunOAuthCancel::new(child.clone())),
-            ));
-            let host = host.with_oauth_host(oauth);
+            )
+            .map_err(|_| "native_callback_setup_failed".to_owned())?;
+            host = host.with_oauth_host(Arc::new(oauth));
+
+            let (authorization_sender, receiver) = authorization_instruction_channel();
+            if let Ok(output) = NativeAuthorizationInstructionOutput::stderr()
+                && let Ok(worker) = NativeAuthorizationInstructionWorker::start(
+                    Arc::new(output),
+                    receiver,
+                    child.clone(),
+                )
+            {
+                *factory_worker_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker);
+                host = host.with_authorization_instruction_sender(authorization_sender);
+            }
+
             Ok(match NativeDeviceInstructionOutput::stderr() {
                 Ok(output) => host.with_device_instruction_sender(
                     DeviceInstructionSender::from_sink(Arc::new(output)),
@@ -209,7 +283,21 @@ fn execute_auth(
         } else {
             AuthHost::new_for_commands(paths.home, child)
         }
-    })
+    });
+
+    let worker = worker_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(worker) = worker {
+        match worker.finish_draining() {
+            Ok(()) => {}
+            Err(OAuthError::Cancelled | OAuthError::DeadlineExceeded)
+                if matches!(output.exit_code, 124 | 130) => {}
+            Err(_) => return code_output("agent_run_failed", 1),
+        }
+    }
+    output
 }
 
 fn execute_config_path(

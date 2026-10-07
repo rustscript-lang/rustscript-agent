@@ -612,9 +612,10 @@ impl OAuthCancel for WorkerStop {
 /// orderly stop is distinct from a queued/pending output error.
 pub struct NativeAuthorizationInstructionWorker {
     stop: Arc<WorkerStop>,
+    drain_requested: Arc<AtomicBool>,
     error: Arc<Mutex<Option<OAuthError>>>,
     handle: Option<JoinHandle<()>>,
-    context: OAuthIoContext,
+    original_context: OAuthIoContext,
     /// Exact Linux thread id observed by the worker while running; `-1` before
     /// it runs, cleared by the worker on exit. Used to prove the thread was
     /// joined rather than detached.
@@ -644,11 +645,13 @@ impl NativeAuthorizationInstructionWorker {
     ) -> Result<Self, OAuthError> {
         let context = native_authorization_io_context(&cancellation)?;
         let stop = Arc::new(WorkerStop::new());
+        let drain_requested = Arc::new(AtomicBool::new(false));
         let combined = context.with_additional_cancel(Arc::clone(&stop) as Arc<dyn OAuthCancel>);
         let error = Arc::new(Mutex::new(None));
         let thread_id = Arc::new(AtomicI64::new(-1));
         let worker_error = Arc::clone(&error);
         let worker_stop = Arc::clone(&stop);
+        let worker_drain_requested = Arc::clone(&drain_requested);
         let worker_thread_id = Arc::clone(&thread_id);
         let worker_context = combined.clone();
         let handle = thread::Builder::new()
@@ -659,6 +662,7 @@ impl NativeAuthorizationInstructionWorker {
                     receiver,
                     worker_context,
                     worker_stop,
+                    worker_drain_requested,
                     worker_error,
                     worker_thread_id,
                 );
@@ -666,16 +670,17 @@ impl NativeAuthorizationInstructionWorker {
             .map_err(|_| transport_failure())?;
         Ok(Self {
             stop,
+            drain_requested,
             error,
             handle: Some(handle),
-            context: combined,
+            original_context: context,
             thread_id,
         })
     }
 
     /// The exact deadline this worker observes (from the supplied child).
     pub fn deadline(&self) -> Instant {
-        self.context.deadline()
+        self.original_context.deadline()
     }
 
     /// The first captured output error, if any.
@@ -716,6 +721,28 @@ impl NativeAuthorizationInstructionWorker {
         }
     }
 
+    /// Drain every queued record under the original child context, then join.
+    ///
+    /// Unlike `finish`, this does not cancel the worker before consuming the
+    /// queue. A write or context failure is returned and a pending record is
+    /// never reported as delivered.
+    pub fn finish_draining(mut self) -> Result<(), OAuthError> {
+        self.drain_requested.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            record_error(&self.error, transport_failure());
+        }
+        if let Err(failure) = self.original_context.remaining() {
+            record_error(&self.error, failure);
+        }
+        self.stop.stop();
+        match self.error() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn join(&mut self) {
         self.stop.stop();
         if let Some(handle) = self.handle.take()
@@ -737,6 +764,7 @@ fn run_worker(
     receiver: Receiver<PublicAuthorizationInstruction>,
     context: OAuthIoContext,
     stop: Arc<WorkerStop>,
+    drain_requested: Arc<AtomicBool>,
     error: Arc<Mutex<Option<OAuthError>>>,
     thread_id: Arc<AtomicI64>,
 ) {
@@ -755,10 +783,18 @@ fn run_worker(
                 }
             }
             Err(TryRecvError::Empty) => {
+                if drain_requested.load(Ordering::Acquire) {
+                    break;
+                }
                 // Idle: bounded slice, honoring the exact supplied context.
                 match context.remaining() {
                     Ok(remaining) => thread::sleep(remaining.min(POLL_SLICE)),
-                    Err(_) => break,
+                    Err(failure) => {
+                        if drain_requested.load(Ordering::Acquire) {
+                            record_error(&error, failure);
+                        }
+                        break;
+                    }
                 }
             }
             Err(TryRecvError::Disconnected) => break,
