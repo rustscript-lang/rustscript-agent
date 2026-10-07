@@ -1,0 +1,58 @@
+// Provider selection and host_home remain in this RSS VM.
+// dispatch avoids the opaque entry's exported run name.
+use auth;
+use self::types as types;
+use self::openai_opaque_chat::{run as opaque_chat_run};
+
+/// Public provider names that select the opaque OpenAI Chat entry. An empty
+/// provider is the canonical default and maps to the same entry.
+fn is_openai_provider(provider: string) -> bool {
+    let mut selected = false;
+    if provider == "" {
+        selected = true;
+    }
+    if provider == "openai" {
+        selected = true;
+    }
+    if provider == "openai_chat" {
+        selected = true;
+    }
+    selected
+}
+
+pub fn dispatch(context: map) -> map {
+    let request: map = types::request_map(context, "request");
+    let provider: string = types::request_string(request, "provider");
+    let result: map = if is_openai_provider(provider) == false => {
+        types::fail(types::error_request(
+            "adapter_unavailable",
+            "provider is unavailable for default opaque dispatch"
+        ))
+    } else => {
+        let credential_id: string = types::request_string(request, "credential_id");
+        if credential_id == "" => {
+            types::fail(types::error_request(
+                "missing_credential",
+                "request.credential_id is required"
+            ))
+        } else => {
+            dispatch_openai_chat(context, request, credential_id)
+        }
+    };
+    result
+}
+
+/// Builds the private local context and hands it to the opaque Chat entry. The
+/// child `AuthHost` is created natively inside that invocation; only this
+/// in-VM context carries `host_home`.
+fn dispatch_openai_chat(context: map, request: map, credential_id: string) -> map {
+    let home: resource<auth.host_home> = context["host_home"];
+    let profile: map = { provider: "openai" };
+    let child: map = {
+        request: request,
+        profile: profile,
+        credential_id: credential_id,
+        host_home: home
+    };
+    opaque_chat_run(child)
+}

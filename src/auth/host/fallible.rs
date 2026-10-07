@@ -219,6 +219,29 @@ fn load_metadata_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcom
     wrap_value(owner, outcome)
 }
 
+pub(super) fn access_handle_result_desc() -> HostFunctionDescriptor {
+    desc(
+        "auth::access_handle_result",
+        vec![
+            super::param("credential_id", HostTypeSchema::String),
+            super::param("expected_generation", HostTypeSchema::Int),
+            borrow("policy_handle", key(super::Policy::KEY)),
+        ],
+        result_type(
+            "AccessHandleResultEnvelope",
+            super::handle_envelope("AccessHandleEnvelope", super::Access::KEY),
+        ),
+        access_handle_result_call,
+    )
+}
+
+fn access_handle_result_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let policy = args.get(2).ok_or_else(|| error("invalid_request"))?;
+    let owner = policy_owner_for_cleanup(vm, policy)?;
+    let outcome = super::access_call(vm, args);
+    wrap_value(owner, outcome)
+}
+
 pub(super) fn delete_result_desc() -> HostFunctionDescriptor {
     desc(
         "auth::delete_result",

@@ -520,6 +520,102 @@ impl OAuthIoContext {
     }
 }
 
+/// Private native wrapper over an injected incremental HTTPS stream.
+///
+/// It fuses the host I/O context with the inner reader so every read is bounded
+/// by the shared cancellation/deadline budget and the cumulative response body
+/// cap, even when the injected transport misbehaves. Head and chunks stay
+/// native-only: the type is private and its `Debug` is redacted, so raw or
+/// secret bytes are never formatted.
+struct AuthenticatedAccessStream {
+    inner: Box<dyn BoundedHttpsStream>,
+    context: OAuthIoContext,
+    max_body_bytes: usize,
+    received: usize,
+    eof: bool,
+    terminal_error: Option<OAuthError>,
+}
+
+impl fmt::Debug for AuthenticatedAccessStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedAccessStream")
+            .field("received", &self.received)
+            .field("eof", &self.eof)
+            .field("terminal", &self.terminal_error.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedAccessStream {
+    /// Terminalize, cancel the inner reader, and surface the error. Once
+    /// terminal, no further bytes are produced and the same error is returned.
+    fn fail(&mut self, error: OAuthError) -> OAuthError {
+        self.terminal_error = Some(error.clone());
+        self.inner.cancel();
+        error
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.eof || self.terminal_error.is_some()
+    }
+}
+
+impl BoundedHttpsStream for AuthenticatedAccessStream {
+    fn head(&self) -> &RawHttpsResponseHead {
+        self.inner.head()
+    }
+
+    fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, OAuthError> {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        if self.eof {
+            return Ok(None);
+        }
+        if let Err(error) = self.context.check() {
+            return Err(self.fail(error));
+        }
+        let chunk = match self.inner.read_chunk() {
+            Ok(chunk) => chunk,
+            Err(error) => return Err(self.fail(error)),
+        };
+        if let Err(error) = self.context.check() {
+            return Err(self.fail(error));
+        }
+        let Some(chunk) = chunk else {
+            self.eof = true;
+            self.inner.cancel();
+            return Ok(None);
+        };
+        self.received = match self.received.checked_add(chunk.len()) {
+            Some(total) if total <= self.max_body_bytes => total,
+            _ => {
+                return Err(self.fail(OAuthError::ResponseTooLarge {
+                    max_bytes: self.max_body_bytes,
+                }));
+            }
+        };
+        Ok(Some(chunk))
+    }
+
+    fn cancel(&mut self) {
+        if !self.is_terminal() {
+            self.terminal_error = Some(OAuthError::Cancelled);
+            self.inner.cancel();
+        }
+    }
+}
+
+impl Drop for AuthenticatedAccessStream {
+    fn drop(&mut self) {
+        if !self.is_terminal() {
+            self.eof = true;
+            self.inner.cancel();
+        }
+    }
+}
+
 /// Typed primitive failure. Codes are transport/security facts, not business policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OAuthError {
@@ -1341,6 +1437,77 @@ impl OAuthHost {
         .map(|result| result.response)
     }
 
+    /// Native-only authenticated incremental read. The trusted HTTPS policy is
+    /// the sole authority; the caller cannot supply a URL. Local method/path/
+    /// header/body/provenance admission runs before the one-shot access is
+    /// consumed, and the final Bearer is injected through the same helper used
+    /// by the buffered path. Raw head/chunks never leave native scope.
+    ///
+    /// No guest/RSS caller is bound in this scope yet, so this carries the same
+    /// narrow `allow(dead_code)` as the existing scoped transport entry point.
+    #[allow(dead_code)]
+    pub(crate) fn start_access_stream_scoped(
+        &self,
+        policy: &TrustedTransportPolicy,
+        request: ProviderRequest,
+        access: crate::auth::store::OpaqueAccessHandle,
+        owner_cancel: Arc<dyn OAuthCancel>,
+    ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
+        // Reuse the exact trusted admission ladder from the buffered path, in
+        // the same order, so a caller cannot reach the transport by bypassing
+        // method/path/header/body/provenance checks.
+        let method = request.method.to_ascii_uppercase();
+        if method != "GET" && method != "POST" {
+            return Err(OAuthError::MethodDenied { method });
+        }
+        if request.public_body.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(OAuthError::RequestTooLarge {
+                max_bytes: MAX_REQUEST_BODY_BYTES,
+            });
+        }
+        let endpoint = admit_path(policy, &request.path)?;
+        let mut headers = admit_headers(policy, &request.public_headers)?;
+        let credential_id = CredentialId::new(request.credential_id.clone()).map_err(|_| {
+            OAuthError::InvalidIntent {
+                reason: "credential ID is invalid".to_string(),
+            }
+        })?;
+        // `validate_binding` does not consume the one-shot slot, so a denial
+        // here leaves the caller's access handle live for a valid retry.
+        self.validate_credential_use(
+            policy,
+            credential_id.as_str(),
+            &CredentialUse::Access(access.clone()),
+        )?;
+        reject_reserved_form_keys(&request.public_body)?;
+        let context = self.io_context_with_cancel(policy.deadline, owner_cancel);
+        context.check()?;
+        // Only now consume the one-shot access and inject the shared final
+        // Bearer. If injection fails the slot is already terminal and the
+        // request is aborted before any transport call.
+        inject_access_authorization(&mut headers, &access)?;
+        let prepared = PreparedHttpsRequest {
+            method,
+            url: format!("https://{}{}", endpoint.authority, request.path),
+            headers,
+            body: request.public_body,
+        };
+        context.check()?;
+        let mut inner = self.inner.transport.start_stream(&prepared, &context)?;
+        if let Err(error) = context.check() {
+            inner.cancel();
+            return Err(error);
+        }
+        Ok(Box::new(AuthenticatedAccessStream {
+            inner,
+            context,
+            max_body_bytes: MAX_RESPONSE_BODY_BYTES,
+            received: 0,
+            eof: false,
+            terminal_error: None,
+        }))
+    }
+
     pub fn transport_exchange_pair(
         &self,
         policy: &TrustedTransportPolicy,
@@ -1558,11 +1725,7 @@ impl OAuthHost {
         match credential_use {
             CredentialUse::None => {}
             CredentialUse::Access(handle) => {
-                let secret = handle.take_for_transport()?;
-                prepared.headers.insert(
-                    "authorization".to_string(),
-                    format!("Bearer {}", secret.as_str()),
-                );
+                inject_access_authorization(&mut prepared.headers, &handle)?;
             }
             CredentialUse::Refresh(handle) => {
                 let secret = handle.take_for_transport()?;
@@ -2613,6 +2776,22 @@ fn append_form(body: &mut String, key: &str, value: &str) {
     body.push_str(&percent_encode(key));
     body.push('=');
     body.push_str(&percent_encode(value));
+}
+
+/// Injects the one-shot access credential as the final `Authorization: Bearer`
+/// header. Both the buffered Access transport path and the native
+/// authenticated stream path call this, so the secret-to-header assembly lives
+/// in exactly one place and no other variant can copy it.
+fn inject_access_authorization(
+    headers: &mut BTreeMap<String, String>,
+    handle: &crate::auth::store::OpaqueAccessHandle,
+) -> Result<(), OAuthError> {
+    let secret = handle.take_for_transport()?;
+    headers.insert(
+        "authorization".to_string(),
+        format!("Bearer {}", secret.as_str()),
+    );
+    Ok(())
 }
 
 fn reject_reserved_form_keys(body: &str) -> Result<(), OAuthError> {
@@ -4167,5 +4346,668 @@ mod device_poll_tests {
         assert_eq!(flow.device_state.load(Ordering::Acquire), HANDLE_LIVE);
         assert!(!flow.revoked.load(Ordering::Acquire));
         drop(retry);
+    }
+}
+
+/// Real-behavior tests for the native authenticated incremental HTTPS path.
+///
+/// These drive the scoped `pub(crate)` entry point through a genuine
+/// `AuthStore`-issued opaque access handle and an injected bounded HTTPS
+/// transport that performs a real incremental start (never a `send` fallback).
+/// No operator secret, provider, or network is involved.
+#[cfg(test)]
+mod authenticated_stream_tests {
+    use super::*;
+    use crate::auth::config::CredentialConfig;
+    use crate::auth::store::{
+        AuthStore, OpaqueAccessHandle, RefreshSecretAction, SaveCredentialRequest,
+    };
+    use crate::config_file::AgentPaths;
+
+    const ACCESS_SECRET: &str = "SYNTHETIC_TASK7_ACCESS_TOKEN";
+    const POLICY_GENERATION: u64 = 7;
+    const RUN_ID: &str = "task7-native-stream-test";
+    const AUTHORITY: &str = "auth.example.test";
+
+    fn policy() -> TrustedTransportPolicy {
+        TrustedTransportPolicy {
+            generation: POLICY_GENERATION,
+            run_id: RUN_ID.to_string(),
+            deadline: Instant::now() + Duration::from_secs(120),
+            endpoints: vec![TrustedEndpoint {
+                authority: AUTHORITY.to_string(),
+                path_prefix: "/v1".to_string(),
+            }],
+            allowed_header_names: ["accept", "content-type"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
+    fn temp_home(name: &str) -> std::path::PathBuf {
+        let base = std::env::var_os("TEST_TMPDIR")
+            .expect("TEST_TMPDIR must be assigned for native stream tests");
+        let path = std::path::PathBuf::from(base).join(format!(
+            "task7-native-stream-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("temp home");
+        path
+    }
+
+    fn issue_access(name: &str) -> (AuthStore, OpaqueAccessHandle) {
+        let home = temp_home(name);
+        let paths = AgentPaths::from_home(home.join("home")).expect("paths");
+        let store = AuthStore::open(paths).expect("store");
+        let access_slot = store
+            .fixture_access_slot("primary", 0, POLICY_GENERATION, RUN_ID, ACCESS_SECRET)
+            .expect("access slot");
+        let refresh_slot = store
+            .fixture_refresh_slot("primary", 0, POLICY_GENERATION, RUN_ID, "unused-refresh")
+            .expect("refresh slot");
+        store
+            .save_if_generation(SaveCredentialRequest::new(
+                CredentialId::new("primary").expect("id"),
+                0,
+                POLICY_GENERATION,
+                RUN_ID,
+                CredentialConfig {
+                    provider: "synthetic-provider".to_string(),
+                    kind: "oauth".to_string(),
+                    source: "synthetic-test".to_string(),
+                    token_type: "Bearer".to_string(),
+                    expires_at_ms: 2_500_000_000_000,
+                    scopes: vec!["scope.synthetic".to_string()],
+                    account_id: Some("acct.synthetic".to_string()),
+                    generation: 0,
+                    status: "active".to_string(),
+                    last_refresh_at_ms: None,
+                    has_refresh_token: true,
+                },
+                access_slot,
+                RefreshSecretAction::Replace(refresh_slot),
+            ))
+            .expect("seed");
+        let handle = store
+            .issue_access_handle("primary", 1, POLICY_GENERATION, RUN_ID)
+            .expect("access handle");
+        (store, handle)
+    }
+
+    enum Injected {
+        Chunk(Vec<u8>),
+        Eof,
+        Fail,
+    }
+
+    struct InjectedState {
+        starts: usize,
+        cancels: usize,
+        drops: usize,
+        reads: usize,
+        sent: Vec<PreparedHttpsRequest>,
+        queue: VecDeque<Injected>,
+    }
+
+    impl InjectedState {
+        fn with_queue(queue: Vec<Injected>) -> Arc<Mutex<Self>> {
+            Arc::new(Mutex::new(Self {
+                starts: 0,
+                cancels: 0,
+                drops: 0,
+                reads: 0,
+                sent: Vec::new(),
+                queue: VecDeque::from(queue),
+            }))
+        }
+    }
+
+    struct InjectedTransport {
+        state: Arc<Mutex<InjectedState>>,
+        status: u16,
+        headers: BTreeMap<String, String>,
+    }
+
+    struct InjectedStream {
+        state: Arc<Mutex<InjectedState>>,
+        head: RawHttpsResponseHead,
+    }
+
+    impl BoundedHttpsStream for InjectedStream {
+        fn head(&self) -> &RawHttpsResponseHead {
+            &self.head
+        }
+
+        fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, OAuthError> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.reads += 1;
+            match state.queue.pop_front() {
+                Some(Injected::Chunk(bytes)) => Ok(Some(bytes)),
+                Some(Injected::Fail) => Err(OAuthError::Transport {
+                    message: "injected_transport_failure".to_string(),
+                }),
+                Some(Injected::Eof) | None => Ok(None),
+            }
+        }
+
+        fn cancel(&mut self) {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cancels += 1;
+        }
+    }
+
+    impl Drop for InjectedStream {
+        fn drop(&mut self) {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drops += 1;
+        }
+    }
+
+    impl BoundedHttpsTransport for InjectedTransport {
+        fn send(
+            &self,
+            _request: &PreparedHttpsRequest,
+            _context: &OAuthIoContext,
+        ) -> Result<RawHttpsResponse, OAuthError> {
+            panic!("the authenticated stream path must not fall back to send");
+        }
+
+        fn start_stream(
+            &self,
+            request: &PreparedHttpsRequest,
+            context: &OAuthIoContext,
+        ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
+            context.check()?;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.starts += 1;
+            state.sent.push(request.clone());
+            drop(state);
+            Ok(Box::new(InjectedStream {
+                state: Arc::clone(&self.state),
+                head: RawHttpsResponseHead {
+                    status: self.status,
+                    headers: self.headers.clone(),
+                },
+            }))
+        }
+    }
+
+    fn transport(queue: Vec<Injected>) -> (Arc<InjectedTransport>, Arc<Mutex<InjectedState>>) {
+        let state = InjectedState::with_queue(queue);
+        (
+            Arc::new(InjectedTransport {
+                state: Arc::clone(&state),
+                status: 200,
+                headers: BTreeMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            }),
+            state,
+        )
+    }
+
+    fn host(
+        transport: Arc<InjectedTransport>,
+        clock: Arc<ScriptedClock>,
+        cancel: Arc<ScriptedCancel>,
+    ) -> OAuthHost {
+        OAuthHost::new(
+            transport,
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            clock,
+            cancel,
+        )
+    }
+
+    fn get(path: &str) -> ProviderRequest {
+        ProviderRequest {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            public_headers: BTreeMap::new(),
+            public_body: String::new(),
+            credential_id: "primary".to_string(),
+        }
+    }
+
+    fn post(path: &str, body: &str) -> ProviderRequest {
+        ProviderRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            public_headers: BTreeMap::new(),
+            public_body: body.to_string(),
+            credential_id: "primary".to_string(),
+        }
+    }
+
+    fn expect_start_err(result: Result<Box<dyn BoundedHttpsStream>, OAuthError>) -> OAuthError {
+        match result {
+            Ok(_) => panic!("expected the authenticated stream to be denied"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn authenticated_stream_injects_trusted_bearer_and_yields_first_chunk_before_eof() {
+        let (_store, access) = issue_access("inject");
+        let (transport, state) = transport(vec![Injected::Chunk(b"first".to_vec())]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+
+        let mut stream = host
+            .start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access.clone(),
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            )
+            .expect("authenticated stream starts");
+
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.starts, 1, "exactly one incremental start");
+            assert_eq!(state.sent.len(), 1);
+            assert_eq!(
+                state.sent[0]
+                    .headers
+                    .get("authorization")
+                    .map(String::as_str),
+                Some("Bearer SYNTHETIC_TASK7_ACCESS_TOKEN"),
+                "shared helper injects the final Bearer"
+            );
+            assert_eq!(
+                state.sent[0].url, "https://auth.example.test/v1/me",
+                "authority comes from trusted policy, not the caller"
+            );
+        }
+        assert_eq!(stream.head().status, 200);
+        assert_eq!(stream.read_chunk().unwrap().as_deref(), Some(&b"first"[..]));
+        // Incremental: the inner reader was polled exactly once and EOF is not
+        // yet observed, proving the first chunk arrived before end-of-stream.
+        assert_eq!(state.lock().unwrap().reads, 1);
+
+        {
+            let mut state = state.lock().unwrap();
+            state.queue.push_back(Injected::Chunk(b"second".to_vec()));
+            state.queue.push_back(Injected::Eof);
+        }
+        assert_eq!(
+            stream.read_chunk().unwrap().as_deref(),
+            Some(&b"second"[..])
+        );
+        assert_eq!(stream.read_chunk().unwrap(), None);
+        assert!(
+            state.lock().unwrap().cancels > 0,
+            "EOF must close the inner reader before the wrapper is dropped"
+        );
+        assert_eq!(
+            stream.read_chunk().unwrap(),
+            None,
+            "no bytes after terminal"
+        );
+        drop(stream);
+
+        assert_eq!(
+            access
+                .consume()
+                .expect_err("one-shot access is consumed")
+                .code(),
+            "handle_replayed"
+        );
+    }
+
+    #[test]
+    fn local_admission_denials_do_not_consume_access_then_valid_use_consumes_once() {
+        let (_store, access) = issue_access("deny");
+        let (transport, state) =
+            transport(vec![Injected::Chunk(b"payload".to_vec()), Injected::Eof]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+        let owner = || Arc::clone(&cancel) as Arc<dyn OAuthCancel>;
+
+        let path_denied = expect_start_err(host.start_access_stream_scoped(
+            &policy(),
+            get("/nope"),
+            access.clone(),
+            owner(),
+        ));
+        assert_eq!(path_denied.code(), "path_denied");
+
+        let mut denied_header = get("/v1/me");
+        denied_header
+            .public_headers
+            .insert("cookie".to_string(), "session=1".to_string());
+        assert_eq!(
+            expect_start_err(host.start_access_stream_scoped(
+                &policy(),
+                denied_header,
+                access.clone(),
+                owner()
+            ))
+            .code(),
+            "header_denied"
+        );
+
+        let mut denied_method = get("/v1/me");
+        denied_method.method = "DELETE".to_string();
+        assert_eq!(
+            expect_start_err(host.start_access_stream_scoped(
+                &policy(),
+                denied_method,
+                access.clone(),
+                owner()
+            ))
+            .code(),
+            "method_denied"
+        );
+
+        assert_eq!(
+            expect_start_err(host.start_access_stream_scoped(
+                &policy(),
+                post("/v1/me", "code=host-owned"),
+                access.clone(),
+                owner()
+            ))
+            .code(),
+            "invalid_intent"
+        );
+
+        // No local admission failure reached the transport or consumed the slot.
+        assert_eq!(state.lock().unwrap().starts, 0);
+        access.validate().expect("access stays live after denials");
+
+        let mut stream = host
+            .start_access_stream_scoped(&policy(), get("/v1/me"), access.clone(), owner())
+            .expect("valid use after denials");
+        assert_eq!(
+            stream.read_chunk().unwrap().as_deref(),
+            Some(&b"payload"[..])
+        );
+        assert_eq!(state.lock().unwrap().starts, 1);
+
+        let replayed = expect_start_err(host.start_access_stream_scoped(
+            &policy(),
+            get("/v1/me"),
+            access.clone(),
+            owner(),
+        ));
+        assert!(
+            replayed.code() == "handle_replayed" || replayed.code() == "handle_invalid",
+            "unexpected replay code {}",
+            replayed.code()
+        );
+        assert_eq!(state.lock().unwrap().starts, 1, "no second transport start");
+    }
+
+    #[test]
+    fn interruption_during_start_closes_reader_without_publishing_stream() {
+        struct InterruptOnStart {
+            inner: Arc<InjectedTransport>,
+            clock: Arc<ScriptedClock>,
+            cancel: Arc<ScriptedCancel>,
+            expire: bool,
+        }
+
+        impl BoundedHttpsTransport for InterruptOnStart {
+            fn send(
+                &self,
+                _request: &PreparedHttpsRequest,
+                _context: &OAuthIoContext,
+            ) -> Result<RawHttpsResponse, OAuthError> {
+                panic!("streaming must not fall back to send");
+            }
+
+            fn start_stream(
+                &self,
+                request: &PreparedHttpsRequest,
+                context: &OAuthIoContext,
+            ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
+                let stream = self.inner.start_stream(request, context)?;
+                if self.expire {
+                    self.clock.expire();
+                } else {
+                    self.cancel.cancel();
+                }
+                Ok(stream)
+            }
+        }
+
+        for (expire, expected) in [(false, "cancelled"), (true, "deadline_exceeded")] {
+            let (_store, access) = issue_access(expected);
+            let (transport, state) = transport(vec![Injected::Chunk(b"unread".to_vec())]);
+            let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+            let cancel = Arc::new(ScriptedCancel::new());
+            let host = OAuthHost::new(
+                Arc::new(InterruptOnStart {
+                    inner: transport,
+                    clock: Arc::clone(&clock),
+                    cancel: Arc::clone(&cancel),
+                    expire,
+                }),
+                Arc::new(ScriptedCallback::new()),
+                Arc::new(ScriptedBrowser::new()),
+                clock,
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            );
+            let error = expect_start_err(host.start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access,
+                cancel as Arc<dyn OAuthCancel>,
+            ));
+            assert_eq!(error.code(), expected);
+            let state = state.lock().unwrap();
+            assert_eq!(state.reads, 0, "interrupted startup publishes no bytes");
+            assert!(state.cancels > 0, "interrupted startup closes the reader");
+            assert!(state.drops > 0, "interrupted reader is released");
+        }
+    }
+
+    #[test]
+    fn owner_cancellation_between_reads_stops_before_next_inner_read() {
+        let (_store, access) = issue_access("cancel");
+        let (transport, state) = transport(vec![
+            Injected::Chunk(b"one".to_vec()),
+            Injected::Chunk(b"two".to_vec()),
+        ]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+
+        let mut stream = host
+            .start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access.clone(),
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            )
+            .expect("authenticated stream starts");
+        assert_eq!(stream.read_chunk().unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(state.lock().unwrap().reads, 1);
+
+        cancel.cancel();
+        assert_eq!(stream.read_chunk().unwrap_err().code(), "cancelled");
+        assert_eq!(
+            state.lock().unwrap().reads,
+            1,
+            "cancelled stream does not poll the inner reader again"
+        );
+    }
+
+    #[test]
+    fn deadline_between_reads_stops_before_next_inner_read() {
+        let (_store, access) = issue_access("deadline");
+        let (transport, state) = transport(vec![
+            Injected::Chunk(b"one".to_vec()),
+            Injected::Chunk(b"two".to_vec()),
+        ]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+
+        let mut stream = host
+            .start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access.clone(),
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            )
+            .expect("authenticated stream starts");
+        assert_eq!(stream.read_chunk().unwrap().as_deref(), Some(&b"one"[..]));
+
+        clock.expire();
+        assert_eq!(stream.read_chunk().unwrap_err().code(), "deadline_exceeded");
+        assert_eq!(state.lock().unwrap().reads, 1);
+    }
+
+    #[test]
+    fn misbehaving_transport_is_bounded_by_cumulative_checked_cap() {
+        let (_store, access) = issue_access("bound");
+        let (transport, state) = transport(vec![
+            Injected::Chunk(vec![b'a'; 40 * 1024]),
+            Injected::Chunk(vec![b'b'; 40 * 1024]),
+        ]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+
+        let mut stream = host
+            .start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access.clone(),
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            )
+            .expect("authenticated stream starts");
+        assert_eq!(stream.read_chunk().unwrap().unwrap().len(), 40 * 1024);
+        assert_eq!(
+            stream.read_chunk().unwrap_err().code(),
+            "response_too_large"
+        );
+        assert!(
+            state.lock().unwrap().cancels >= 1,
+            "bounded stream cancels the inner reader on overflow"
+        );
+    }
+
+    #[test]
+    fn oversize_single_chunk_is_refused_even_without_eof() {
+        let (_store, access) = issue_access("single-oversize");
+        let (transport, _state) = transport(vec![Injected::Chunk(vec![b'x'; 70 * 1024])]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+
+        let mut stream = host
+            .start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access.clone(),
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            )
+            .expect("authenticated stream starts");
+        assert_eq!(
+            stream.read_chunk().unwrap_err().code(),
+            "response_too_large"
+        );
+        assert_eq!(
+            stream.read_chunk().unwrap_err().code(),
+            "response_too_large",
+            "terminal state is preserved"
+        );
+    }
+
+    #[test]
+    fn inner_failure_cancels_and_terminalizes() {
+        let (_store, access) = issue_access("inner-failure");
+        let (transport, state) = transport(vec![Injected::Fail]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+
+        let mut stream = host
+            .start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access.clone(),
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            )
+            .expect("authenticated stream starts");
+        assert_eq!(stream.read_chunk().unwrap_err().code(), "transport_error");
+        assert!(state.lock().unwrap().cancels >= 1);
+        assert_eq!(stream.read_chunk().unwrap_err().code(), "transport_error");
+    }
+
+    #[test]
+    fn dropping_live_stream_cancels_and_drops_inner_reader() {
+        let (_store, access) = issue_access("drop");
+        let (transport, state) = transport(vec![
+            Injected::Chunk(b"one".to_vec()),
+            Injected::Chunk(b"two".to_vec()),
+        ]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = host(
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+        );
+
+        let mut stream = host
+            .start_access_stream_scoped(
+                &policy(),
+                get("/v1/me"),
+                access.clone(),
+                Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
+            )
+            .expect("authenticated stream starts");
+        assert_eq!(stream.read_chunk().unwrap().as_deref(), Some(&b"one"[..]));
+        drop(stream);
+        let state = state.lock().unwrap();
+        assert!(state.cancels >= 1, "live drop cancels the inner reader");
+        assert!(state.drops >= 1, "inner reader is dropped");
     }
 }

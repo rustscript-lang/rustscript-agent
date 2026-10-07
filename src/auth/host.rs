@@ -1399,6 +1399,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             fallible::transport_capture_result_desc,
             fallible::save_if_generation_result_desc,
             fallible::load_metadata_result_desc,
+            fallible::access_handle_result_desc,
             fallible::delete_result_desc,
             fallible::now_ms_result_desc,
             fallible::wait_ms_result_desc,

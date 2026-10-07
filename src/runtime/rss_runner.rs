@@ -41,8 +41,8 @@ use super::cancellation::{CancellationReason, CancellationToken};
 use super::host_wait::wait_for_host_op_blocking_with_cancel;
 
 use super::agent_host::{
-    AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog, agent_host_module,
-    register_agent_host_functions,
+    AgentHostBridges, AgentHostState, AgentProviderHost, AuthHostFactory, agent_host_catalog,
+    agent_host_module, register_agent_host_functions,
 };
 use crate::auth::host::AuthHost;
 use crate::capabilities::sha256_hex;
@@ -868,7 +868,7 @@ impl AgentRunner {
     /// cancellation. Returns only the `Complete` value.
     pub fn run_with_context(&self, context: Value) -> std::result::Result<Value, RunError> {
         if self.host.auth_host_factory.is_none() {
-            let (mut vm, callable, _auth_binding) = self.prepare_vm(None)?;
+            let (mut vm, callable, _auth_binding) = self.prepare_vm("run", None)?;
             return self.run_invocation(&mut vm, callable, context, None, None);
         }
         if has_caller_auth_home(&context) {
@@ -890,7 +890,7 @@ impl AgentRunner {
         let _watcher_guard = EpochWatcherGuard {
             cancellation: &cancellation,
         };
-        let (mut vm, callable, auth_binding) = self.prepare_vm(Some(&cancellation))?;
+        let (mut vm, callable, auth_binding) = self.prepare_vm("run", Some(&cancellation))?;
         let context = with_native_auth_home(context, auth_binding.as_ref())?;
         self.run_invocation(&mut vm, callable, context, None, Some(&cancellation))
     }
@@ -900,6 +900,20 @@ impl AgentRunner {
     /// `deliver` pauses polling and therefore script execution.
     pub fn run_with_context_and_events(
         &self,
+        context: Value,
+        sink: &mut dyn RunEventSink,
+        cancellation: &RunCancellation,
+    ) -> std::result::Result<Value, RunError> {
+        self.run_named_with_context_and_events("run", context, sink, cancellation)
+    }
+
+    /// Runs the named exported entry with the same auth/cancellation guards as
+    /// [`Self::run_with_context_and_events`]. Used by the default provider
+    /// dispatcher, whose entry is `dispatch` so the flattened exported-callable
+    /// table can also reach the opaque entry's canonical `run`.
+    pub fn run_named_with_context_and_events(
+        &self,
+        entry: &str,
         context: Value,
         sink: &mut dyn RunEventSink,
         cancellation: &RunCancellation,
@@ -917,7 +931,7 @@ impl AgentRunner {
             }
         }
         let _watcher_guard = EpochWatcherGuard { cancellation };
-        let (mut vm, callable, auth_binding) = self.prepare_vm(Some(cancellation))?;
+        let (mut vm, callable, auth_binding) = self.prepare_vm(entry, Some(cancellation))?;
         if self.prepare_fault == RunnerPrepareFault::PanicDuringDrive {
             panic!("injected drive panic");
         }
@@ -927,6 +941,7 @@ impl AgentRunner {
 
     fn prepare_vm(
         &self,
+        entry: &str,
         cancellation: Option<&RunCancellation>,
     ) -> std::result::Result<(Vm, Value, Option<NativeAuthBinding>), RunError> {
         let mut vm = Vm::try_new(self.program.clone()).map_err(RunError::Vm)?;
@@ -938,11 +953,10 @@ impl AgentRunner {
         self.registry
             .bind_vm_cached(&mut vm)
             .map_err(RunError::Setup)?;
-        let provider: Arc<dyn AgentProviderHost> = self
-            .host
-            .provider
-            .clone()
-            .unwrap_or_else(|| Arc::new(RssAdapterProvider));
+        let provider: Arc<dyn AgentProviderHost> =
+            self.host.provider.clone().unwrap_or_else(|| {
+                default_agent_provider_host_with_auth_factory(self.host.auth_host_factory.clone())
+            });
         vm.host_context().set_module_state(AgentHostState {
             provider,
             cancellation: cancellation
@@ -1000,7 +1014,7 @@ impl AgentRunner {
         }
         self.drive_root_frame(&mut vm, cancellation)?;
         let callable = vm
-            .resolve_exported_callable("run")
+            .resolve_exported_callable(entry)
             .map_err(|_| RunError::NoEntry)?;
         let arity = match &callable {
             Value::Callable(callable) => self
@@ -1194,12 +1208,38 @@ fn compile_options() -> CompileSourceFileOptions {
     CompileSourceFileOptions::default().with_host_api_catalog(agent_host_catalog())
 }
 
-/// Default production provider: invoke the existing RSS adapter harness.
+/// Default production provider: drive the bounded RSS opaque provider
+/// dispatcher (`rss/llm/provider_dispatch.rss`) in a child VM.
+///
+/// The dispatcher owns provider selection and canonical dispatch. The native
+/// side forwards only the unchanged public request and injects a fresh
+/// `AuthHostFactory` into the child VM; the child `AuthHost` is created inside
+/// the child invocation, so `host_home` is never serialized across VMs. The
+/// child inherits the caller's finite cancellation.
 pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
-    Arc::new(RssAdapterProvider)
+    default_agent_provider_host_with_auth_factory(None)
 }
 
-struct RssAdapterProvider;
+/// Bounded real default provider with an optional native auth host factory.
+///
+/// Without a factory the dispatcher fails closed statically: it is not invoked
+/// at all and reports a canonical `auth_unavailable` envelope, never falling
+/// back to a direct HTTP path.
+pub(crate) fn default_agent_provider_host_with_auth_factory(
+    auth_host_factory: Option<AuthHostFactory>,
+) -> Arc<dyn AgentProviderHost> {
+    match auth_host_factory {
+        Some(factory) => Arc::new(RssAdapterProvider {
+            factory: Some(factory),
+        }),
+        None => Arc::new(RssAdapterProvider { factory: None }),
+    }
+}
+
+struct RssAdapterProvider {
+    /// Native auth host factory injected into the child VM. `None` fails closed.
+    factory: Option<AuthHostFactory>,
+}
 
 impl AgentProviderHost for RssAdapterProvider {
     fn call(
@@ -1207,54 +1247,44 @@ impl AgentProviderHost for RssAdapterProvider {
         request: &serde_json::Value,
         cancellation: &RunCancellation,
     ) -> serde_json::Value {
-        invoke_existing_adapter(request, cancellation)
+        invoke_default_opaque_dispatch(request, cancellation, self.factory.clone())
     }
 }
 
-fn invoke_existing_adapter(
+/// Dispatch one default provider call through a child RSS VM.
+///
+/// Provider choice and canonical dispatch are owned by the RSS dispatcher; the
+/// native side supplies the public request unchanged and a fresh native auth
+/// host factory. The child invocation inherits the caller's finite deadline.
+fn invoke_default_opaque_dispatch(
     request: &serde_json::Value,
     cancellation: &RunCancellation,
+    factory: Option<AuthHostFactory>,
 ) -> serde_json::Value {
-    let provider = request
-        .get("provider")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("openai");
-    let kind = adapter_kind(provider);
-    let mut config = AgentConfig::default();
-    if let Some(base_url) = request
-        .pointer("/provider_options/base_url")
-        .and_then(serde_json::Value::as_str)
-    {
-        match adapter_http_config(base_url) {
-            Ok(parsed) => config = parsed,
-            Err(error) => return error,
-        }
-    }
+    let Some(factory) = factory else {
+        return adapter_fail(
+            "auth_unavailable",
+            "native auth host is unavailable for default provider",
+        );
+    };
     let harness_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss");
-    let runner = match AgentRunner::from_file(harness_path, config) {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/provider_dispatch.rss");
+    let runner = match AgentRunner::from_file(harness_path, AgentConfig::default()) {
         Ok(runner) => runner,
-        Err(error) => {
-            return adapter_fail("adapter_unavailable", &error.to_string());
+        Err(_) => {
+            return adapter_fail("adapter_unavailable", "provider adapter is unavailable");
         }
     };
-    let mut forwarded = request.clone();
-    if let Some(object) = forwarded.as_object_mut() {
-        object.remove("provider");
-    }
-    let profile = serde_json::json!({
-        "provider": provider,
-        "base_url": request.pointer("/provider_options/base_url").cloned().unwrap_or(serde_json::Value::Null),
-        "api_key": request.pointer("/provider_options/api_key").cloned().unwrap_or(serde_json::Value::Null),
-        "model": request.get("model").cloned().unwrap_or(serde_json::Value::Null),
-    });
-    let context = json_to_vm_value(&serde_json::json!({
-        "kind": kind,
-        "request": forwarded,
-        "profile": profile,
-    }));
+    // Forward only the unchanged public request; the dispatcher forwards its own
+    // private local context (with the native host_home) to the opaque entry.
+    let context = json_to_vm_value(&serde_json::json!({ "request": request.clone() }));
+    let bridges = AgentHostBridges {
+        auth_host_factory: Some(factory),
+        ..AgentHostBridges::default()
+    };
+    let runner = runner.with_host(bridges);
     let child = cancellation.child();
-    match runner.run_with_context_and_events(context, &mut DiscardSink, &child) {
+    match runner.run_named_with_context_and_events("dispatch", context, &mut DiscardSink, &child) {
         Ok(value) => vm_value_to_json(&value),
         Err(RunError::Invocation(InvocationError::Cancelled(reason))) => {
             if matches!(reason, CancellationReason::Deadline) {
@@ -1266,32 +1296,8 @@ fn invoke_existing_adapter(
         Err(RunError::Invocation(InvocationError::DeadlineReached { .. })) => {
             adapter_fail("deadline_elapsed", "run deadline elapsed")
         }
-        Err(error) => adapter_fail("adapter_failed", &error.to_string()),
+        Err(_) => adapter_fail("adapter_failed", "provider adapter invocation failed"),
     }
-}
-
-fn adapter_http_config(base_url: &str) -> std::result::Result<AgentConfig, serde_json::Value> {
-    let url = url::Url::parse(base_url)
-        .map_err(|error| adapter_fail("config", &format!("invalid provider base_url: {error}")))?;
-    let Some(host) = url.host_str() else {
-        return Err(adapter_fail("config", "provider base_url has no host"));
-    };
-    let Some(port) = url.port_or_known_default() else {
-        return Err(adapter_fail(
-            "config",
-            &format!(
-                "provider base_url scheme '{}' has no known default port",
-                url.scheme()
-            ),
-        ));
-    };
-    let mut config = AgentConfig::for_hosts([host]);
-    config.http.allowed_schemes = vec![url.scheme().to_string()];
-    config.http.allowed_ports = vec![port];
-    if host == "127.0.0.1" || host == "localhost" {
-        config.http.allow_private_ips = true;
-    }
-    Ok(config)
 }
 
 struct DiscardSink;
@@ -1299,19 +1305,6 @@ struct DiscardSink;
 impl RunEventSink for DiscardSink {
     fn deliver(&mut self, _value: Value) -> std::result::Result<(), RunDeliveryError> {
         Ok(())
-    }
-}
-
-fn adapter_kind(provider: &str) -> &'static str {
-    match provider {
-        "openai_responses" | "responses" => "openai_responses",
-        "anthropic" | "anthropic_messages" => "anthropic_messages",
-        "profile:openrouter" => "profile:openrouter",
-        "profile:deepseek" => "profile:deepseek",
-        "profile:opencode_zen" => "profile:opencode_zen",
-        "profile:opencode_go" => "profile:opencode_go",
-        "profile:custom" => "profile:custom",
-        _ => "openai_chat",
     }
 }
 
