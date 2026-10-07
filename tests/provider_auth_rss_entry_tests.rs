@@ -14,7 +14,8 @@ use std::time::Duration;
 use rustscript_agent::auth::{
     host::AuthHost,
     oauth::{
-        OAuthHost, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
+        BoundedHttpsTransport, OAuthError, OAuthHost, OAuthIoContext, PreparedHttpsRequest,
+        RawHttpsResponse, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
         ScriptedHttpsTransport,
     },
 };
@@ -115,6 +116,15 @@ fn fixture_runner(
     transport: Arc<ScriptedHttpsTransport>,
     calls: Arc<AtomicUsize>,
 ) -> AgentRunner {
+    fixture_runner_with_source(home, transport, calls, source())
+}
+
+fn fixture_runner_with_source(
+    home: &FixtureHome,
+    transport: Arc<dyn BoundedHttpsTransport>,
+    calls: Arc<AtomicUsize>,
+    source: &str,
+) -> AgentRunner {
     let callback = Arc::new(ScriptedCallback::new());
     let browser = Arc::new(ScriptedBrowser::new());
     let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
@@ -136,7 +146,7 @@ fn fixture_runner(
         auth_host_factory: Some(factory),
         ..AgentHostBridges::default()
     };
-    AgentRunner::from_source(source(), AgentConfig::default())
+    AgentRunner::from_source(source, AgentConfig::default())
         .expect("compile RSS runner")
         .with_host(bridges)
         .with_cancellation(RunCancellation::with_timeout(Duration::from_secs(30)))
@@ -284,4 +294,387 @@ fn caller_cannot_replace_native_host_home() {
     assert!(error.to_string().contains("host_home"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(transport.take_sent().is_empty());
+}
+
+fn event_source() -> String {
+    source()
+        .replace("use oauth;", "use oauth;\nuse stream;")
+        .replace(
+            "    let request: TransportPublicRequest = {",
+            "    stream::emit({ event: \"auth-ready\" });\n    let request: TransportPublicRequest = {",
+        )
+}
+
+fn carrier_source() -> String {
+    source()
+        .replace("use oauth;", "use oauth;\nuse stream;")
+        .replace(
+            "    let request: TransportPublicRequest = {",
+            "    stream::emit({ policy_handle: policy, access_handle: access.handle });\n    let fresh_snapshot = config::load_snapshot(&home);\n    let fresh_policy: resource<auth.policy> = fresh_snapshot.policy_handle;\n    let fresh_access = auth::access_handle(\"fixture-codex\", 4, &fresh_policy);\n    let request: TransportPublicRequest = {",
+        )
+        .replace("        policy_handle: policy,", "        policy_handle: fresh_policy,")
+        .replace("        access_handle: access.handle,", "        access_handle: fresh_access.handle,")
+}
+
+fn foreign_source() -> String {
+    source()
+        .replace(
+            "    let request: TransportPublicRequest = {",
+            "    let foreign_policy: resource<auth.policy> = context[\"foreign_policy\"];\n    let foreign_access: resource<auth.access> = context[\"foreign_access\"];\n    let request: TransportPublicRequest = {",
+        )
+        .replace("        policy_handle: policy,", "        policy_handle: foreign_policy,")
+        .replace("        access_handle: access.handle,", "        access_handle: foreign_access,")
+}
+
+struct EventCaptureSink {
+    sender: std::sync::mpsc::SyncSender<Value>,
+}
+
+impl rustscript_agent::RunEventSink for EventCaptureSink {
+    fn deliver(
+        &mut self,
+        value: Value,
+    ) -> Result<(), rustscript_agent::runtime::rss_runner::RunDeliveryError> {
+        self.sender
+            .send(value)
+            .map_err(|_| rustscript_agent::runtime::rss_runner::RunDeliveryError::Closed)
+    }
+}
+
+#[test]
+fn auth_configured_event_sink_uses_supplied_cancellation_and_completes_native_transport() {
+    let home = FixtureHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    queue_responses(&transport, 1);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = fixture_runner_with_source(
+        &home,
+        transport.clone(),
+        Arc::clone(&calls),
+        &event_source(),
+    )
+    .with_cancellation(RunCancellation::new());
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(5));
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let mut sink = EventCaptureSink { sender };
+    let result = runner
+        .run_with_context_and_events(Value::map(vec![]), &mut sink, &cancellation)
+        .expect("auth-configured event run");
+    assert_eq!(field(&result, "snapshot_ok"), &Value::Bool(true));
+    assert_eq!(field(&result, "metadata_ok"), &Value::Bool(true));
+    assert_eq!(field(&result, "access_ok"), &Value::Bool(true));
+    assert_eq!(field(&result, "transport_ok"), &Value::Bool(true));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(receiver.try_recv(), Ok(Value::Map(_))));
+    assert_eq!(transport.take_sent().len(), 1);
+}
+
+fn carrier_values(value: &Value) -> (Value, Value) {
+    let Value::Map(fields) = value else {
+        panic!("event carrier must be a map")
+    };
+    let get = |name: &str| {
+        fields
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::String(key) if key.as_ref() == name => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing carrier field {name}"))
+    };
+    (get("policy_handle"), get("access_handle"))
+}
+
+fn foreign_context(carrier: &Value) -> Value {
+    let (policy, access) = carrier_values(carrier);
+    Value::map(vec![
+        (Value::string("foreign_policy"), policy),
+        (Value::string("foreign_access"), access),
+    ])
+}
+
+struct BlockingCarrierSink {
+    captured: std::sync::mpsc::SyncSender<Value>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl rustscript_agent::RunEventSink for BlockingCarrierSink {
+    fn deliver(
+        &mut self,
+        value: Value,
+    ) -> Result<(), rustscript_agent::runtime::rss_runner::RunDeliveryError> {
+        self.captured
+            .send(value)
+            .map_err(|_| rustscript_agent::runtime::rss_runner::RunDeliveryError::Closed)?;
+        self.release
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| rustscript_agent::runtime::rss_runner::RunDeliveryError::Closed)
+    }
+}
+
+#[test]
+fn authentic_event_carriers_are_foreign_while_owner_is_live_and_owner_survives_rejection() {
+    let home = FixtureHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    queue_responses(&transport, 2);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let producer = fixture_runner_with_source(
+        &home,
+        transport.clone(),
+        Arc::clone(&calls),
+        &carrier_source(),
+    );
+    let rejecting_target = fixture_runner_with_source(
+        &home,
+        transport.clone(),
+        Arc::clone(&calls),
+        &foreign_source(),
+    );
+    let (carrier_tx, carrier_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let cancel = RunCancellation::with_timeout(Duration::from_secs(5));
+    let producer_cancel = cancel.clone();
+    let producer_thread = thread::spawn(move || {
+        producer.run_with_context_and_events(
+            Value::map(vec![]),
+            &mut BlockingCarrierSink {
+                captured: carrier_tx,
+                release: release_rx,
+            },
+            &producer_cancel,
+        )
+    });
+    let carrier = carrier_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("authentic native event carrier");
+    let foreign = rejecting_target
+        .run_with_context(foreign_context(&carrier))
+        .expect_err("foreign-owner handles are rejected by the typed transport call");
+    assert!(foreign.to_string().contains("resource_invalid"));
+    assert!(
+        transport.take_sent().is_empty(),
+        "foreign handles must not send"
+    );
+    release_tx.send(()).expect("release producer sink");
+    let producer_result = producer_thread
+        .join()
+        .expect("producer thread")
+        .expect("live producer completes after the foreign rejection");
+    assert_eq!(field(&producer_result, "transport_ok"), &Value::Bool(true));
+    assert_eq!(transport.take_sent().len(), 1);
+}
+
+struct CaptureAndRejectSink {
+    captured: Arc<std::sync::Mutex<Option<Value>>>,
+}
+
+impl rustscript_agent::RunEventSink for CaptureAndRejectSink {
+    fn deliver(
+        &mut self,
+        value: Value,
+    ) -> Result<(), rustscript_agent::runtime::rss_runner::RunDeliveryError> {
+        *self.captured.lock().expect("carrier lock") = Some(value);
+        Err(
+            rustscript_agent::runtime::rss_runner::RunDeliveryError::Rejected {
+                code: "fixture_reject",
+                message: "native fixture rejection".to_string(),
+            },
+        )
+    }
+}
+
+struct CaptureAndPanicSink {
+    captured: Arc<std::sync::Mutex<Option<Value>>>,
+}
+
+impl rustscript_agent::RunEventSink for CaptureAndPanicSink {
+    fn deliver(
+        &mut self,
+        value: Value,
+    ) -> Result<(), rustscript_agent::runtime::rss_runner::RunDeliveryError> {
+        *self.captured.lock().expect("carrier lock") = Some(value);
+        panic!("fixture sink panic after native carrier capture");
+    }
+}
+
+#[test]
+fn authentic_carriers_fail_after_success_rejection_and_sink_unwind() {
+    let home = FixtureHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    queue_responses(&transport, 4);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let producer = fixture_runner_with_source(
+        &home,
+        transport.clone(),
+        Arc::clone(&calls),
+        &carrier_source(),
+    );
+    let target = fixture_runner_with_source(
+        &home,
+        transport.clone(),
+        Arc::clone(&calls),
+        &foreign_source(),
+    );
+
+    let (success_tx, success_rx) = std::sync::mpsc::sync_channel(1);
+    let mut success_sink = EventCaptureSink { sender: success_tx };
+    let result = producer
+        .run_with_context_and_events(
+            Value::map(vec![]),
+            &mut success_sink,
+            &RunCancellation::with_timeout(Duration::from_secs(5)),
+        )
+        .expect("producer success");
+    assert_eq!(field(&result, "transport_ok"), &Value::Bool(true));
+    let success_carrier = success_rx.recv().expect("success carrier");
+    let before = transport.take_sent().len();
+    let stale = target
+        .run_with_context(foreign_context(&success_carrier))
+        .expect_err("stale carrier handles are rejected");
+    assert!(stale.to_string().contains("resource_invalid"));
+    assert!(
+        transport.take_sent().is_empty(),
+        "stale handles must not send"
+    );
+    assert_eq!(before, 1);
+
+    let rejected_carrier = Arc::new(std::sync::Mutex::new(None));
+    let rejected = producer
+        .run_with_context_and_events(
+            Value::map(vec![]),
+            &mut CaptureAndRejectSink {
+                captured: Arc::clone(&rejected_carrier),
+            },
+            &RunCancellation::with_timeout(Duration::from_secs(5)),
+        )
+        .expect_err("fixture sink rejects event");
+    assert!(rejected.to_string().contains("fixture_reject"));
+    let rejected_carrier = rejected_carrier
+        .lock()
+        .expect("carrier lock")
+        .take()
+        .expect("rejected sink captured authentic event");
+    assert!(transport.take_sent().is_empty());
+    let rejected_reuse = target
+        .run_with_context(foreign_context(&rejected_carrier))
+        .expect_err("rejected carrier handles are rejected");
+    assert!(rejected_reuse.to_string().contains("resource_invalid"));
+    assert!(
+        transport.take_sent().is_empty(),
+        "rejected handles must not send"
+    );
+
+    let panic_carrier = Arc::new(std::sync::Mutex::new(None));
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = producer.run_with_context_and_events(
+            Value::map(vec![]),
+            &mut CaptureAndPanicSink {
+                captured: Arc::clone(&panic_carrier),
+            },
+            &RunCancellation::with_timeout(Duration::from_secs(5)),
+        );
+    }));
+    assert!(
+        unwind.is_err(),
+        "sink panic must unwind through the public call"
+    );
+    let panic_carrier = panic_carrier
+        .lock()
+        .expect("carrier lock")
+        .take()
+        .expect("panicking sink captured authentic event");
+    let panic_reuse = target
+        .run_with_context(foreign_context(&panic_carrier))
+        .expect_err("unwound carrier handles are rejected");
+    assert!(panic_reuse.to_string().contains("resource_invalid"));
+    assert!(
+        transport.take_sent().is_empty(),
+        "unwound handles must not send"
+    );
+}
+
+struct PendingCheckTransport {
+    entered: std::sync::mpsc::SyncSender<()>,
+}
+
+impl BoundedHttpsTransport for PendingCheckTransport {
+    fn send(
+        &self,
+        _request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        self.entered.send(()).map_err(|_| OAuthError::Transport {
+            message: "pending test observer closed".to_string(),
+        })?;
+        loop {
+            context.check()?;
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+fn assert_pending_run_not_successful(
+    receiver: std::sync::mpsc::Receiver<
+        Result<Value, rustscript_agent::runtime::rss_runner::RunError>,
+    >,
+) {
+    match receiver.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(result)) => assert_eq!(
+            field(&result, "transport_ok"),
+            &Value::Bool(false),
+            "pending cancellation/deadline must not return successful native transport"
+        ),
+        Ok(Err(error)) => assert!(
+            error.to_string().contains("cancel") || error.to_string().contains("deadline"),
+            "unexpected pending native failure: {error}"
+        ),
+        Err(error) => panic!("pending native run did not terminate within bound: {error}"),
+    }
+}
+
+#[test]
+fn supplied_cancellation_and_deadline_interrupt_pending_native_transport() {
+    for deadline_case in [false, true] {
+        let home = FixtureHome::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let transport: Arc<dyn BoundedHttpsTransport> = Arc::new(PendingCheckTransport {
+            entered: entered_tx,
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = fixture_runner_with_source(&home, transport, calls, source());
+        let cancellation = if deadline_case {
+            RunCancellation::with_timeout(Duration::from_millis(250))
+        } else {
+            RunCancellation::with_timeout(Duration::from_secs(5))
+        };
+        let worker_cancel = cancellation.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = runner.run_with_context_and_events(
+                Value::map(vec![]),
+                &mut NoopSink,
+                &worker_cancel,
+            );
+            let _ = result_tx.send(result);
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("native transport entered pending state");
+        if !deadline_case {
+            cancellation.request(CancellationReason::Requested);
+        }
+        assert_pending_run_not_successful(result_rx);
+        worker.join().expect("pending transport worker");
+    }
+}
+
+struct NoopSink;
+
+impl rustscript_agent::RunEventSink for NoopSink {
+    fn deliver(
+        &mut self,
+        _value: Value,
+    ) -> Result<(), rustscript_agent::runtime::rss_runner::RunDeliveryError> {
+        Ok(())
+    }
 }
