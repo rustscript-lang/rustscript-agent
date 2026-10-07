@@ -674,6 +674,28 @@ mod tests {
             host: String,
             authorization: String,
         },
+        ConnectionClosed,
+    }
+
+    fn assert_connection_closed_within(events: &mpsc::Receiver<ServerEvent>) {
+        let deadline = Instant::now() + Duration::from_millis(750);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "server did not observe connection completion within 750ms"
+            );
+            match events.recv_timeout(remaining) {
+                Ok(ServerEvent::ConnectionClosed) => return,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("server did not observe connection completion within 750ms")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("server fixture ended before connection completion")
+                }
+            }
+        }
     }
 
     fn scripted_server(
@@ -737,6 +759,7 @@ mod tests {
                 else {
                     return;
                 };
+                let close_tx = tx.clone();
                 let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                     let _ = tx.send(ServerEvent::Request {
                         path: req.uri().to_string(),
@@ -813,11 +836,14 @@ mod tests {
                         Ok::<_, Infallible>(response)
                     }
                 });
-                let _ = tokio::time::timeout(
+                let completed = tokio::time::timeout(
                     Duration::from_secs(4),
                     http1::Builder::new().serve_connection(TokioIo::new(tls), service),
                 )
                 .await;
+                if completed.is_ok() {
+                    let _ = close_tx.send(ServerEvent::ConnectionClosed);
+                }
             });
         });
         (url, roots, rx, thread)
@@ -975,14 +1001,18 @@ mod tests {
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
         body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
         let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
-        let (url, roots, _events, cancelled_server) = scripted_server(Reply::GatedStream(receiver));
+        let (url, roots, events, cancelled_server) = scripted_server(Reply::GatedStream(receiver));
         let cancelled_transport = NativeHttpsTransport::with_roots(roots);
         let (cancelled_context, cancel) = context(Duration::from_secs(3));
         let mut cancelled = cancelled_transport
             .start_stream(&request(url), &cancelled_context)
             .unwrap();
+        assert_eq!(
+            cancelled.read_chunk().unwrap().as_deref(),
+            Some(&b"first"[..])
+        );
         body_tx
-            .blocking_send(Bytes::from_static(b"second"))
+            .blocking_send(Bytes::from(vec![b'x'; 40 * 1024]))
             .unwrap();
         std::thread::sleep(Duration::from_millis(30));
 
@@ -998,6 +1028,7 @@ mod tests {
             .unwrap();
 
         cancel.0.store(true, Ordering::Release);
+        assert_connection_closed_within(&events);
         assert_eq!(cancelled.read_chunk().unwrap_err().code(), "cancelled");
         drop(body_tx);
         cancelled_server.join().unwrap();
@@ -1007,15 +1038,56 @@ mod tests {
     }
 
     #[test]
+    fn explicit_stream_cancel_closes_only_its_socket_with_a_shared_context() {
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
+        body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
+        let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
+        let (url, roots, events, cancelled_server) = scripted_server(Reply::GatedStream(receiver));
+        let cancelled_transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let mut cancelled = cancelled_transport
+            .start_stream(&request(url), &io_context)
+            .unwrap();
+        assert_eq!(
+            cancelled.read_chunk().unwrap().as_deref(),
+            Some(&b"first"[..])
+        );
+
+        let (peer_url, peer_roots, _peer_events, peer_server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: Vec::new(),
+            body: b"peer".to_vec(),
+        });
+        let peer_transport = NativeHttpsTransport::with_roots(peer_roots);
+        let mut peer = peer_transport
+            .start_stream(&request(peer_url), &io_context)
+            .unwrap();
+
+        cancelled.cancel();
+        assert_connection_closed_within(&events);
+        assert_eq!(cancelled.read_chunk().unwrap_err().code(), "cancelled");
+        assert_eq!(peer.read_chunk().unwrap().as_deref(), Some(&b"peer"[..]));
+        assert_eq!(peer.read_chunk().unwrap(), None);
+        drop(body_tx);
+        cancelled_server.join().unwrap();
+        peer_server.join().unwrap();
+    }
+
+    #[test]
     fn dropping_live_stream_closes_its_socket() {
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
         body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
         let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
-        let (url, roots, _events, server) = scripted_server(Reply::GatedStream(receiver));
+        let (url, roots, events, server) = scripted_server(Reply::GatedStream(receiver));
         let transport = NativeHttpsTransport::with_roots(roots);
         let (io_context, _) = context(Duration::from_secs(3));
-        let response = transport.start_stream(&request(url), &io_context).unwrap();
+        let mut response = transport.start_stream(&request(url), &io_context).unwrap();
+        assert_eq!(
+            response.read_chunk().unwrap().as_deref(),
+            Some(&b"first"[..])
+        );
         drop(response);
+        assert_connection_closed_within(&events);
         drop(body_tx);
         server.join().unwrap();
     }
@@ -1711,6 +1783,26 @@ mod tests {
         (
             "rss/auth/types.rss",
             include_str!("../../rss/auth/types.rss"),
+        ),
+        (
+            "rss/auth/pkce_instruction_session.rss",
+            include_str!("../../rss/auth/pkce_instruction_session.rss"),
+        ),
+        (
+            "rss/auth/pkce_login.rss",
+            include_str!("../../rss/auth/pkce_login.rss"),
+        ),
+        (
+            "rss/auth/pkce_session.rss",
+            include_str!("../../rss/auth/pkce_session.rss"),
+        ),
+        (
+            "rss/auth/token_metadata.rss",
+            include_str!("../../rss/auth/token_metadata.rss"),
+        ),
+        (
+            "rss/auth/token_save.rss",
+            include_str!("../../rss/auth/token_save.rss"),
         ),
     ];
 
