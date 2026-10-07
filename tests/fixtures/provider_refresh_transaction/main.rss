@@ -1,0 +1,65 @@
+use auth;
+use config;
+use oauth;
+use super::super::super::rss::providers::refresh as refresh_module;
+
+// Unit-local guest declarations mirror rss/providers/refresh.rss; the pinned
+// parser requires identical local bodies for cross-module calls.
+struct OpaqueHostHomeBinding {
+    home: resource<auth.host_home>
+}
+
+struct OpaqueRefreshIntent {
+    credential_id: string,
+    path: string,
+    public_body: string
+}
+
+struct ProviderRefreshResult {
+    ok: bool,
+    code: string,
+    outcome: string,
+    metadata: AuthMetadata?
+}
+
+pub fn run_refresh(binding: OpaqueHostHomeBinding, intent: OpaqueRefreshIntent) -> ProviderRefreshResult {
+    refresh_module::refresh(binding, intent)
+}
+
+pub fn snapshot(home: resource<auth.host_home>) -> ConfigSnapshotEnvelope {
+    config::load_snapshot(&home)
+}
+
+// Genuine caller topology: after the transaction, issue a real access handle
+// for the freshly stored generation and send one authenticated request.
+pub fn probe_access(credential_id: string, generation: int, policy: resource<auth.policy>) -> TransportResultEnvelope {
+    let issued: AccessHandleResultEnvelope = auth::access_handle_result(credential_id, generation, &policy);
+    let has_value: bool = issued.has("value");
+    let issued_ok: bool = issued.ok && issued.error == null && has_value;
+    if !issued_ok => {
+        {ok: false, error: null, value: null}
+    } else => {
+        let inner: AccessHandleEnvelope = issued.value;
+        let request: TransportPublicRequest = {
+            policy_handle: policy,
+            credential_id: credential_id,
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            public_headers: [{name: "accept", value: "application/json"}],
+            public_body: "{}"
+        };
+        let usage: TransportCredentialUse = {
+            kind: "access",
+            access_handle: inner.handle,
+            refresh_handle: null,
+            code_handle: null,
+            verifier_handle: null,
+            device_handle: null
+        };
+        oauth::transport_result(&request, &usage)
+    }
+}
+
+pub fn cleanup(policy: resource<auth.policy>) -> null {
+    auth::cleanup_transients(&policy)
+}

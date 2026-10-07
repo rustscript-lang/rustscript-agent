@@ -228,8 +228,8 @@ pub fn save(
             refresh_slot: refresh_slot
         };
         let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&request);
-        let saved_metadata: AuthMetadataEnvelope? = saved.value;
-        let saved_has_value: bool = saved_metadata != null;
+        let saved_has_value: bool = saved.has("value");
+        let saved_metadata: AuthMetadataEnvelope? = if saved_has_value => { saved.value.copy() } else => { null };
         let saved_envelope: AuthMetadataEnvelope =
             saved_metadata.unwrap_or(empty_metadata_envelope());
         if !saved.ok.copy() || saved.error.copy() != null => {
@@ -259,8 +259,8 @@ pub fn save(
                         credential_id.copy(),
                         &snapshot.policy_handle
                     );
-                    let loaded_metadata: AuthMetadataEnvelope? = loaded.value;
-                    let loaded_has_value: bool = loaded_metadata != null;
+                    let loaded_has_value: bool = loaded.has("value");
+                    let loaded_metadata: AuthMetadataEnvelope? = if loaded_has_value => { loaded.value.copy() } else => { null };
                     let loaded_envelope: AuthMetadataEnvelope =
                         loaded_metadata.unwrap_or(empty_metadata_envelope());
                     if !loaded.ok.copy() || loaded.error.copy() != null => {
@@ -283,8 +283,8 @@ pub fn save(
                         } else => {
                             let clock: OAuthNowResultEnvelope =
                                 oauth::now_ms_result(&snapshot.policy_handle);
-                            let clock_value: int? = clock.value;
-                            let clock_has_value: bool = clock_value != null;
+                            let clock_has_value: bool = clock.has("value");
+                            let clock_value: int? = if clock_has_value => { clock.value.copy() } else => { null };
                             let now_ms: int = clock_value.unwrap_or(-1);
                             if !clock.ok.copy() || clock.error.copy() != null => {
                                 failed(native_failure_code(clock.error.copy(), "clock_unavailable"))
