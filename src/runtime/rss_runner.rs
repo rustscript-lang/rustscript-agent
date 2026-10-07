@@ -44,6 +44,7 @@ use super::agent_host::{
     AgentHostBridges, AgentHostState, AgentProviderHost, agent_host_catalog, agent_host_module,
     register_agent_host_functions,
 };
+use crate::auth::host::AuthHost;
 use crate::capabilities::sha256_hex;
 use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::registry::ToolRegistry;
@@ -735,6 +736,56 @@ pub struct AgentRunner {
     snapshot_digest: String,
 }
 
+struct NativeAuthBinding {
+    host: AuthHost,
+    context: Value,
+}
+
+impl Drop for NativeAuthBinding {
+    fn drop(&mut self) {
+        self.host.revoke();
+    }
+}
+
+fn has_caller_auth_home(context: &Value) -> bool {
+    matches!(context, Value::Map(fields) if fields.iter().any(|(key, _)| {
+        matches!(key, Value::String(key) if key.as_ref() == "host_home")
+    }))
+}
+
+fn with_native_auth_home(
+    context: Value,
+    binding: Option<&NativeAuthBinding>,
+) -> std::result::Result<Value, RunError> {
+    let Some(binding) = binding else {
+        return Ok(context);
+    };
+    let Value::Map(auth_fields) = &binding.context else {
+        return Err(RunError::Setup(VmError::HostError(
+            "native auth binding context is invalid".to_string(),
+        )));
+    };
+    let Some(host_home) = auth_fields.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == "host_home" => Some(value.clone()),
+        _ => None,
+    }) else {
+        return Err(RunError::Setup(VmError::HostError(
+            "native auth binding omitted host_home".to_string(),
+        )));
+    };
+    let Value::Map(fields) = context else {
+        return Err(RunError::Setup(VmError::HostError(
+            "auth-enabled entry context must be a map".to_string(),
+        )));
+    };
+    let mut fields = fields
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    fields.push((Value::string("host_home"), host_home));
+    Ok(Value::map(fields))
+}
+
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
         let (program, digest) = compiled_source_program(source)?;
@@ -816,8 +867,32 @@ impl AgentRunner {
     /// Runs the exported `run(context)` entry with no event sink and no
     /// cancellation. Returns only the `Complete` value.
     pub fn run_with_context(&self, context: Value) -> std::result::Result<Value, RunError> {
-        let (mut vm, callable) = self.prepare_vm(None)?;
-        self.run_invocation(&mut vm, callable, context, None, None)
+        if self.host.auth_host_factory.is_none() {
+            let (mut vm, callable, _auth_binding) = self.prepare_vm(None)?;
+            return self.run_invocation(&mut vm, callable, context, None, None);
+        }
+        if has_caller_auth_home(&context) {
+            return Err(RunError::Setup(VmError::HostError(
+                "caller-supplied host_home is reserved".to_string(),
+            )));
+        }
+        let root = self
+            .host
+            .cancellation
+            .as_ref()
+            .filter(|cancellation| cancellation.deadline_instant().is_some())
+            .ok_or_else(|| {
+                RunError::Setup(VmError::HostError(
+                    "auth host factory requires finite cancellation".to_string(),
+                ))
+            })?;
+        let cancellation = root.child();
+        let _watcher_guard = EpochWatcherGuard {
+            cancellation: &cancellation,
+        };
+        let (mut vm, callable, auth_binding) = self.prepare_vm(Some(&cancellation))?;
+        let context = with_native_auth_home(context, auth_binding.as_ref())?;
+        self.run_invocation(&mut vm, callable, context, None, Some(&cancellation))
     }
 
     /// Runs the exported `run(context)` entry, delivering each `Event(Value)`
@@ -829,18 +904,31 @@ impl AgentRunner {
         sink: &mut dyn RunEventSink,
         cancellation: &RunCancellation,
     ) -> std::result::Result<Value, RunError> {
+        if self.host.auth_host_factory.is_some() {
+            if has_caller_auth_home(&context) {
+                return Err(RunError::Setup(VmError::HostError(
+                    "caller-supplied host_home is reserved".to_string(),
+                )));
+            }
+            if cancellation.deadline_instant().is_none() {
+                return Err(RunError::Setup(VmError::HostError(
+                    "auth host factory requires finite cancellation".to_string(),
+                )));
+            }
+        }
         let _watcher_guard = EpochWatcherGuard { cancellation };
-        let (mut vm, callable) = self.prepare_vm(Some(cancellation))?;
+        let (mut vm, callable, auth_binding) = self.prepare_vm(Some(cancellation))?;
         if self.prepare_fault == RunnerPrepareFault::PanicDuringDrive {
             panic!("injected drive panic");
         }
+        let context = with_native_auth_home(context, auth_binding.as_ref())?;
         self.run_invocation(&mut vm, callable, context, Some(sink), Some(cancellation))
     }
 
     fn prepare_vm(
         &self,
         cancellation: Option<&RunCancellation>,
-    ) -> std::result::Result<(Vm, Value), RunError> {
+    ) -> std::result::Result<(Vm, Value, Option<NativeAuthBinding>), RunError> {
         let mut vm = Vm::try_new(self.program.clone()).map_err(RunError::Vm)?;
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()))
             .map_err(RunError::Setup)?;
@@ -872,6 +960,26 @@ impl AgentRunner {
             leases: Arc::new(Mutex::new(HashMap::new())),
             control_hook: self.host.control_hook.clone(),
         });
+        let auth_binding = if let Some(factory) = &self.host.auth_host_factory {
+            let cancellation = cancellation
+                .or(self.host.cancellation.as_ref())
+                .filter(|cancellation| cancellation.deadline_instant().is_some())
+                .ok_or_else(|| {
+                    RunError::Setup(VmError::HostError(
+                        "auth host factory requires finite cancellation".to_string(),
+                    ))
+                })?;
+            let host = factory(cancellation.clone())
+                .map_err(|message| RunError::Setup(VmError::HostError(message)))?;
+            let mut binding = NativeAuthBinding {
+                host,
+                context: Value::Null,
+            };
+            binding.context = binding.host.bind_vm(&mut vm).map_err(RunError::Setup)?;
+            Some(binding)
+        } else {
+            None
+        };
         if let Some(cancellation) = cancellation {
             vm.set_epoch_check_interval(RUN_EPOCH_CHECK_INTERVAL)
                 .map_err(RunError::Setup)?;
@@ -909,7 +1017,7 @@ impl AgentRunner {
                 got: arity,
             });
         }
-        Ok((vm, callable))
+        Ok((vm, callable, auth_binding))
     }
 
     /// Halts the root frame so the exported callable can be started.
@@ -1061,11 +1169,15 @@ fn build_restricted_registry_with_builtins(
         descriptor.install_from_catalog(&mut registry, catalog.as_ref())?;
     }
     register_agent_host_functions(&mut registry, catalog.as_ref())?;
+    crate::auth::host::auth_host_module().install_from_catalog(&mut registry, catalog.as_ref())?;
     // Module installation grants every declared import by default. Reset that
     // grant before applying the explicit builtin list, so omitted HTTP imports
     // cannot remain authorized merely because the full module was installed.
     registry.set_capability_profile(CapabilityProfile::deny_all());
     for descriptor in agent_host_module().descriptors() {
+        registry.authorize_registered_builtin_import(&descriptor.schema.name);
+    }
+    for descriptor in crate::auth::host::auth_host_module().descriptors() {
         registry.authorize_registered_builtin_import(&descriptor.schema.name);
     }
     for &name in builtins {

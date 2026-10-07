@@ -318,6 +318,7 @@ impl CapabilityHostState {
     ) -> AgentHostBridges {
         AgentHostBridges {
             provider: None,
+            auth_host_factory: None,
             cancellation: Some(cancellation),
             sleeps: Default::default(),
             skip_sleep: false,
@@ -3300,6 +3301,7 @@ impl AgentService {
             )) as Arc<dyn AgentProviderHost>);
             let host = AgentHostBridges {
                 provider,
+                auth_host_factory: None,
                 cancellation: Some(cancellation.clone()),
                 sleeps: Default::default(),
                 skip_sleep: false,

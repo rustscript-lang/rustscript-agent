@@ -80,3 +80,8 @@ required-features = ["config-fixture"]
 name = "oauth_rss_entry_tests"
 path = "tests/oauth_rss_entry_tests.rs"
 required-features = ["config-fixture"]
+
+[[test]]
+name = "provider_auth_rss_entry_tests"
+path = "tests/provider_auth_rss_entry_tests.rs"
+required-features = ["config-fixture"]

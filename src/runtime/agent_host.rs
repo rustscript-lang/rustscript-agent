@@ -19,6 +19,7 @@ use super::cancellation::CancellationReason;
 use serde_json::{Value as JsonValue, json};
 
 use super::rss_runner::RunCancellation;
+use crate::auth::host::{AuthHost, auth_host_module};
 use crate::capabilities::{
     ArtifactCapability, CapabilityError, CapabilityLifecycle, CapabilityOwner, CapabilityRisk,
     ExecutionLease, FilesystemCapability, FsRead, LifecycleError, ProcessCapability, ProcessLimits,
@@ -54,9 +55,9 @@ const PARSE_JSON_OBJECT_MAX_BYTES: usize = 64 * 1024;
 /// Combined catalog: standard host surfaces plus the agent loop bridges.
 pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: std::sync::OnceLock<Arc<HostApiCatalog>> = std::sync::OnceLock::new();
-    Arc::clone(
-        CATALOG.get_or_init(|| super::host_compose::compose_with_standard(&[agent_host_module()])),
-    )
+    Arc::clone(CATALOG.get_or_init(|| {
+        super::host_compose::compose_with_standard(&[agent_host_module(), auth_host_module()])
+    }))
 }
 
 const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
@@ -417,11 +418,14 @@ pub trait AgentProviderHost: Send + Sync {
 }
 
 pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
+pub type AuthHostFactory =
+    Arc<dyn Fn(RunCancellation) -> std::result::Result<AuthHost, String> + Send + Sync>;
 
 /// Injectable host bridges for one compiled runner.
 #[derive(Clone, Default)]
 pub struct AgentHostBridges {
     pub provider: Option<Arc<dyn AgentProviderHost>>,
+    pub auth_host_factory: Option<AuthHostFactory>,
     /// Shared with the runner invocation; never an independent cancellation root.
     pub cancellation: Option<RunCancellation>,
     pub sleeps: Arc<Mutex<SleepLog>>,
