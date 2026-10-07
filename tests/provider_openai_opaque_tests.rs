@@ -400,3 +400,27 @@ fn opaque_openai_chat_native_policy_denial_is_safe_and_sends_nothing() {
         assert!(!rendered.contains(secret));
     }
 }
+
+#[test]
+fn opaque_openai_chat_preserves_unadmitted_credential_failure_without_send() {
+    let home = FixtureHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(
+                canonical_request(),
+                public_profile(),
+                "not-admitted",
+            ))
+            .expect("metadata rejection returns a canonical public failure"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("credential_not_admitted"));
+    assert_eq!(
+        result["error"]["message"],
+        json!("provider transport failed")
+    );
+    assert!(transport.take_sent().is_empty());
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
+}

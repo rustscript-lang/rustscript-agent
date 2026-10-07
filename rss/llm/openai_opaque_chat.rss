@@ -60,6 +60,7 @@ fn chat_send_buffered(request: map, profile: map, context: map, model: string) -
 }
 
 fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string) -> map {
+    let has_response: bool = envelope.has("value");
     let maybe_failure: AuthBridgeFailure? = envelope.error;
     let failure: AuthBridgeFailure = maybe_failure.unwrap_or({
         code: "transport_error",
@@ -67,7 +68,11 @@ fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string)
         deadline_exceeded: false,
         revoked: false
     });
-    let maybe_response: TransportResponseEnvelope? = envelope.value;
+    let maybe_response: TransportResponseEnvelope? = if has_response => {
+        envelope.value
+    } else => {
+        null
+    };
     let response: TransportResponseEnvelope = maybe_response.unwrap_or({
         ok: false,
         error: null,
