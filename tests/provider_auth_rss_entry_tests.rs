@@ -678,3 +678,105 @@ impl rustscript_agent::RunEventSink for NoopSink {
         Ok(())
     }
 }
+
+struct ProviderCapture {
+    calls: AtomicUsize,
+    request: std::sync::Mutex<Option<serde_json::Value>>,
+}
+
+impl ProviderCapture {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            request: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl rustscript_agent::runtime::AgentProviderHost for ProviderCapture {
+    fn call(
+        &self,
+        request: &serde_json::Value,
+        _cancellation: &RunCancellation,
+    ) -> serde_json::Value {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.request.lock().expect("provider capture") = Some(request.clone());
+        json!({"ok": true, "response": {"text": "ok", "tool_calls": []}, "error": {}})
+    }
+}
+
+fn provider_resource_source() -> &'static str {
+    r#"
+use agent;
+use auth;
+use config;
+pub fn run(context: map) -> map {
+    let home: resource<auth.host_home> = context["host_home"];
+    let snapshot = config::load_snapshot(&home);
+    let policy: resource<auth.policy> = snapshot.policy_handle;
+    let access = auth::access_handle("fixture-codex", 4, &policy);
+    let request: map = agent::provider_call({
+        envelope: {
+            items: [{
+                policy_handle: policy,
+                access_handle: access.handle
+            }]
+        }
+    });
+    { provider_ok: request.ok }
+}
+"#
+}
+
+#[test]
+fn provider_json_rejects_nested_live_auth_resources_before_callback() {
+    let home = FixtureHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capture = Arc::new(ProviderCapture::new());
+    let runner = fixture_runner_with_source(&home, transport, calls, provider_resource_source())
+        .with_provider(capture.clone());
+
+    let outcome = runner.run_with_context(Value::map(vec![]));
+    let error = match outcome {
+        Err(error) => error,
+        Ok(_) => panic!("live auth resource reached provider JSON boundary"),
+    };
+    assert!(
+        error.to_string().contains("opaque_nonserializable"),
+        "provider boundary returned an unexpected error class"
+    );
+    assert_eq!(capture.calls.load(Ordering::SeqCst), 0);
+    assert!(capture.request.lock().expect("provider capture").is_none());
+}
+
+#[test]
+fn provider_json_preserves_ordinary_public_nested_values() {
+    let home = FixtureHome::new();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capture = Arc::new(ProviderCapture::new());
+    let source = r#"
+use agent;
+pub fn run(context: map) -> map {
+    let result: map = agent::provider_call({
+        ordinary_integer: 42,
+        nested: { label: "public", values: [1, 2, 3] }
+    });
+    { provider_ok: result.ok }
+}
+"#;
+    let runner =
+        fixture_runner_with_source(&home, transport, calls, source).with_provider(capture.clone());
+
+    let outcome = runner.run_with_context(Value::map(vec![]));
+    assert!(outcome.is_ok(), "ordinary provider request failed");
+    assert_eq!(capture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        capture.request.lock().expect("provider capture").as_ref(),
+        Some(&json!({
+            "ordinary_integer": 42,
+            "nested": { "label": "public", "values": [1, 2, 3] }
+        }))
+    );
+}

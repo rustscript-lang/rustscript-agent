@@ -775,6 +775,66 @@ fn load_snapshot(
 fn error(code: &str) -> VmError {
     VmError::HostError(code.to_string())
 }
+
+const PROVIDER_JSON_MAX_DEPTH: usize = 64;
+const PROVIDER_JSON_MAX_NODES: usize = 65_536;
+
+pub(crate) fn validate_provider_json_resources(vm: &mut Vm, value: &Value) -> VmResult<()> {
+    let resource_types = auth_host_module()
+        .resources
+        .iter()
+        .map(|resource_type| resource_type())
+        .collect::<Vec<_>>();
+    let mut remaining = PROVIDER_JSON_MAX_NODES;
+    validate_provider_json_node(vm, value, 0, &mut remaining, &resource_types)
+}
+
+fn validate_provider_json_node(
+    vm: &mut Vm,
+    value: &Value,
+    depth: usize,
+    remaining: &mut usize,
+    resource_types: &[HostResourceTypeMeta],
+) -> VmResult<()> {
+    if depth > PROVIDER_JSON_MAX_DEPTH || *remaining == 0 {
+        return Err(error("serialization_bound_exceeded"));
+    }
+    *remaining -= 1;
+    match value {
+        Value::Int(raw) if *raw > 0 => {
+            let Ok(raw) = u64::try_from(*raw) else {
+                return Ok(());
+            };
+            let Ok(handle) = ResourceHandle::from_raw(raw) else {
+                return Ok(());
+            };
+            for resource_type in resource_types {
+                if vm
+                    .host_context()
+                    .execution_scope()
+                    .resources()
+                    .validate_resource_type_key(handle, &resource_type.schema.key)
+                    .is_ok()
+                {
+                    return Err(error("opaque_nonserializable"));
+                }
+            }
+        }
+        Value::Map(entries) => {
+            for (key, child) in entries.iter() {
+                validate_provider_json_node(vm, key, depth + 1, remaining, resource_types)?;
+                validate_provider_json_node(vm, child, depth + 1, remaining, resource_types)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values.iter() {
+                validate_provider_json_node(vm, child, depth + 1, remaining, resource_types)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 #[allow(dead_code)] // Fixture-only slot issuer borrows the run owner.
 fn bound(vm: &mut Vm) -> VmResult<Arc<Owner>> {
     vm.host_context()
