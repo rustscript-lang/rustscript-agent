@@ -52,6 +52,10 @@ tracing-core = "0.1"
 default = []
 config-fixture = []
 
+# Optimize the embedded compiler while retaining development checks.
+[profile.dev.package.pd-vm]
+opt-level = 1
+
 [[test]]
 name = "auth_store_tests"
 path = "tests/auth_store_tests.rs"
