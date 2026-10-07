@@ -331,6 +331,29 @@ pub struct RawHttpsResponse {
     pub body: Vec<u8>,
 }
 
+/// Native-only HTTPS response head for incremental body reads.
+pub struct RawHttpsResponseHead {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for RawHttpsResponseHead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawHttpsResponseHead")
+            .field("status", &self.status)
+            .field("headers", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Native-only incremental reader over a bounded HTTPS response body.
+pub trait BoundedHttpsStream: Send {
+    fn head(&self) -> &RawHttpsResponseHead;
+    fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, OAuthError>;
+    fn cancel(&mut self);
+}
+
 /// Injected callback payload. State comparison stays host-side.
 #[derive(Clone)]
 pub enum RawCallbackInput {
@@ -367,6 +390,17 @@ pub trait BoundedHttpsTransport: Send + Sync {
         request: &PreparedHttpsRequest,
         context: &OAuthIoContext,
     ) -> Result<RawHttpsResponse, OAuthError>;
+
+    /// Start an incremental response read when the implementation supports it.
+    fn start_stream(
+        &self,
+        _request: &PreparedHttpsRequest,
+        _context: &OAuthIoContext,
+    ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
+        Err(OAuthError::Transport {
+            message: "stream_transport_unavailable".to_string(),
+        })
+    }
 }
 
 /// Injected one-shot callback waiter.

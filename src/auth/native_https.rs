@@ -5,6 +5,8 @@
 //! the pool is limited to two threads and request admission to 32 in flight.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
@@ -19,12 +21,14 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsConnector;
 
 use crate::auth::oauth::{
-    BoundedHttpsTransport, OAuthError, OAuthIoContext, PreparedHttpsRequest, RawHttpsResponse,
+    BoundedHttpsStream, BoundedHttpsTransport, OAuthError, OAuthIoContext, PreparedHttpsRequest,
+    RawHttpsResponse, RawHttpsResponseHead,
 };
 
 const MAX_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_ACTIVE_REQUESTS: usize = 32;
+const MAX_STREAM_CHUNK_BYTES: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
 static REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -76,154 +80,442 @@ impl Default for NativeHttpsTransport {
     }
 }
 
+struct ValidatedRequest {
+    host: String,
+    port: u16,
+    name: ServerName<'static>,
+    request: Request<Full<Bytes>>,
+}
+
+enum PumpMessage {
+    Head(RawHttpsResponseHead),
+    Chunk(Vec<u8>),
+    Eof,
+    Error(OAuthError),
+}
+
+struct NativeHttpsStream {
+    head: RawHttpsResponseHead,
+    receiver: Option<mpsc::Receiver<PumpMessage>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    context: OAuthIoContext,
+    eof: bool,
+    terminal_error: Option<OAuthError>,
+}
+
+impl NativeHttpsStream {
+    fn stop(&mut self) {
+        self.receiver.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+
+    fn fail(&mut self, error: OAuthError) -> OAuthError {
+        self.terminal_error = Some(error.clone());
+        self.stop();
+        error
+    }
+}
+
+impl BoundedHttpsStream for NativeHttpsStream {
+    fn head(&self) -> &RawHttpsResponseHead {
+        &self.head
+    }
+
+    fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, OAuthError> {
+        if self.eof {
+            return Ok(None);
+        }
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        loop {
+            let remaining = match self.context.remaining() {
+                Ok(remaining) => remaining,
+                Err(error) => return Err(self.fail(error)),
+            };
+            let received = self
+                .receiver
+                .as_ref()
+                .ok_or(OAuthError::Cancelled)?
+                .recv_timeout(remaining.min(POLL_INTERVAL));
+            match received {
+                Ok(PumpMessage::Chunk(chunk)) => match self.context.check() {
+                    Ok(()) => return Ok(Some(chunk)),
+                    Err(error) => return Err(self.fail(error)),
+                },
+                Ok(PumpMessage::Eof) => {
+                    self.eof = true;
+                    self.stop();
+                    return Ok(None);
+                }
+                Ok(PumpMessage::Error(error)) => return Err(self.fail(error)),
+                Ok(PumpMessage::Head(_)) => return Err(self.fail(failed())),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let error = self.context.check().err().unwrap_or_else(failed);
+                    return Err(self.fail(error));
+                }
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        if !self.eof {
+            self.terminal_error = Some(OAuthError::Cancelled);
+            self.stop();
+        }
+    }
+}
+
+impl Drop for NativeHttpsStream {
+    fn drop(&mut self) {
+        if !self.eof {
+            self.stop();
+        }
+    }
+}
+
+fn validate_request(
+    request: &PreparedHttpsRequest,
+    context: &OAuthIoContext,
+) -> Result<ValidatedRequest, OAuthError> {
+    context.check()?;
+    if request.body.len() > context.max_request_body_bytes() {
+        return Err(OAuthError::RequestTooLarge {
+            max_bytes: context.max_request_body_bytes(),
+        });
+    }
+    let url = url::Url::parse(&request.url).map_err(|_| failed())?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(failed());
+    }
+    let host = url.host_str().ok_or_else(failed)?.to_owned();
+    let port = url.port_or_known_default().ok_or_else(failed)?;
+    let name = ServerName::try_from(host.clone()).map_err(|_| failed())?;
+    let uri: Uri = request.url.parse().map_err(|_| failed())?;
+    let authority = uri.authority().ok_or_else(failed)?.as_str().to_owned();
+    if uri.scheme_str() != Some("https") || authority.contains('@') {
+        return Err(failed());
+    }
+    let method = Method::from_bytes(request.method.as_bytes()).map_err(|_| failed())?;
+    if request.headers.len().saturating_add(1) > MAX_HEADERS {
+        return Err(failed());
+    }
+    let mut header_bytes = hyper::header::HOST
+        .as_str()
+        .len()
+        .saturating_add(authority.len())
+        .saturating_add(4);
+    for (key, value) in &request.headers {
+        if key.eq_ignore_ascii_case("host") {
+            return Err(failed());
+        }
+        header_bytes = header_bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len())
+            .saturating_add(4);
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(failed());
+        }
+    }
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"))
+        .header(hyper::header::HOST, authority);
+    for (key, value) in &request.headers {
+        builder = builder.header(key.as_str(), value.as_str());
+    }
+    let request = builder
+        .body(Full::new(Bytes::from(request.body.clone())))
+        .map_err(|_| failed())?;
+    Ok(ValidatedRequest {
+        host,
+        port,
+        name,
+        request,
+    })
+}
+
+fn start_native_stream(
+    tls: &Arc<rustls::ClientConfig>,
+    request: &PreparedHttpsRequest,
+    context: &OAuthIoContext,
+) -> Result<NativeHttpsStream, OAuthError> {
+    let validated = validate_request(request, context)?;
+    let permit = Arc::clone(REQUESTS.get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS))))
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let runtime = RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(2)
+                .enable_all()
+                .build()
+                .ok()
+        })
+        .as_ref()
+        .ok_or_else(failed)?;
+    let owned_context = context.clone();
+    let tls = Arc::clone(tls);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let task = runtime.spawn(async move {
+        let result = tokio::time::timeout_at(
+            owned_context.deadline().into(),
+            pump_response(tls.clone(), validated, &sender, &owned_context),
+        )
+        .await
+        .unwrap_or(Err(OAuthError::DeadlineExceeded));
+        if let Err(error) = result {
+            let _ = send_message(&sender, PumpMessage::Error(error), &owned_context).await;
+        }
+        drop(permit);
+    });
+
+    let mut receiver = Some(receiver);
+    let head = loop {
+        let remaining = match context.remaining() {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                receiver.take();
+                task.abort();
+                return Err(error);
+            }
+        };
+        let received = receiver
+            .as_ref()
+            .expect("receiver remains available until headers arrive")
+            .recv_timeout(remaining.min(POLL_INTERVAL));
+        match received {
+            Ok(PumpMessage::Head(head)) => break head,
+            Ok(PumpMessage::Error(error)) => {
+                receiver.take();
+                task.abort();
+                return Err(error);
+            }
+            Ok(PumpMessage::Chunk(_)) | Ok(PumpMessage::Eof) => {
+                receiver.take();
+                task.abort();
+                return Err(failed());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                receiver.take();
+                task.abort();
+                return Err(context.check().err().unwrap_or_else(failed));
+            }
+        }
+    };
+    if let Err(error) = context.check() {
+        receiver.take();
+        task.abort();
+        return Err(error);
+    }
+
+    Ok(NativeHttpsStream {
+        head,
+        receiver,
+        task: Some(task),
+        context: context.clone(),
+        eof: false,
+        terminal_error: None,
+    })
+}
+
+async fn wait_context<F: Future>(
+    future: F,
+    context: &OAuthIoContext,
+) -> Result<F::Output, OAuthError> {
+    tokio::pin!(future);
+    loop {
+        context.check()?;
+        let pause = context.remaining()?.min(POLL_INTERVAL);
+        tokio::select! {
+            result = &mut future => {
+                context.check()?;
+                return Ok(result);
+            }
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+}
+
+async fn wait_http<F, T, C>(
+    future: F,
+    context: &OAuthIoContext,
+    connection: &mut Pin<Box<C>>,
+) -> Result<T, OAuthError>
+where
+    F: Future<Output = T>,
+    C: Future<Output = Result<(), hyper::Error>>,
+{
+    tokio::pin!(future);
+    loop {
+        context.check()?;
+        let pause = context.remaining()?.min(POLL_INTERVAL);
+        tokio::select! {
+            result = &mut future => {
+                context.check()?;
+                return Ok(result);
+            }
+            _ = connection.as_mut() => return Err(failed()),
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+}
+
+async fn send_message(
+    sender: &mpsc::SyncSender<PumpMessage>,
+    message: PumpMessage,
+    context: &OAuthIoContext,
+) -> Result<(), OAuthError> {
+    let mut message = Some(message);
+    loop {
+        context.check()?;
+        match sender.try_send(message.take().expect("message is retained until queued")) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(message_value)) => {
+                message = Some(message_value);
+                let pause = context.remaining()?.min(POLL_INTERVAL);
+                tokio::time::sleep(pause).await;
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(failed()),
+        }
+    }
+}
+
+async fn pump_response(
+    tls: Arc<rustls::ClientConfig>,
+    validated: ValidatedRequest,
+    sender: &mpsc::SyncSender<PumpMessage>,
+    context: &OAuthIoContext,
+) -> Result<(), OAuthError> {
+    let addresses = wait_context(
+        tokio::net::lookup_host((validated.host.as_str(), validated.port)),
+        context,
+    )
+    .await?
+    .map_err(|_| failed())?;
+    context.check()?;
+    let mut connected = None;
+    for address in addresses {
+        context.check()?;
+        if let Ok(stream) = wait_context(tokio::net::TcpStream::connect(address), context).await? {
+            connected = Some(stream);
+            break;
+        }
+    }
+    let stream = connected.ok_or_else(failed)?;
+    context.check()?;
+    let stream = wait_context(
+        TlsConnector::from(tls).connect(validated.name, stream),
+        context,
+    )
+    .await?
+    .map_err(|_| failed())?;
+    context.check()?;
+
+    let mut builder = http1::Builder::new();
+    builder
+        .max_headers(MAX_HEADERS)
+        .max_buf_size(MAX_HEADER_BYTES);
+    let handshake = builder.handshake(TokioIo::new(stream));
+    let (mut request_sender, connection) = wait_context(handshake, context)
+        .await?
+        .map_err(|_| failed())?;
+    let mut connection = Box::pin(connection);
+    context.check()?;
+
+    let response = wait_http(
+        request_sender.send_request(validated.request),
+        context,
+        &mut connection,
+    )
+    .await?
+    .map_err(|_| failed())?;
+    let mut headers = BTreeMap::new();
+    let mut header_bytes = 0usize;
+    for (name, value) in response.headers() {
+        header_bytes = header_bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len());
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(failed());
+        }
+        headers.insert(
+            name.to_string(),
+            value.to_str().map_err(|_| failed())?.to_string(),
+        );
+    }
+    let head = RawHttpsResponseHead {
+        status: response.status().as_u16(),
+        headers,
+    };
+    send_message(sender, PumpMessage::Head(head), context).await?;
+
+    let mut incoming = response.into_body();
+    let mut body_bytes = 0usize;
+    loop {
+        let frame = wait_http(incoming.frame(), context, &mut connection).await?;
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame = frame.map_err(|_| failed())?;
+        if let Some(chunk) = frame.data_ref() {
+            let remaining = context.max_response_body_bytes().saturating_sub(body_bytes);
+            if chunk.len() > remaining {
+                return Err(OAuthError::ResponseTooLarge {
+                    max_bytes: context.max_response_body_bytes(),
+                });
+            }
+            body_bytes = body_bytes.saturating_add(chunk.len());
+            for bytes in chunk.chunks(MAX_STREAM_CHUNK_BYTES) {
+                send_message(sender, PumpMessage::Chunk(bytes.to_vec()), context).await?;
+            }
+        }
+    }
+    context.check()?;
+    send_message(sender, PumpMessage::Eof, context).await
+}
+
 impl BoundedHttpsTransport for NativeHttpsTransport {
     fn send(
         &self,
         request: &PreparedHttpsRequest,
         context: &OAuthIoContext,
     ) -> Result<RawHttpsResponse, OAuthError> {
-        context.check()?;
-        if request.body.len() > context.max_request_body_bytes() {
-            return Err(OAuthError::RequestTooLarge {
-                max_bytes: context.max_request_body_bytes(),
-            });
-        }
-        let url = url::Url::parse(&request.url).map_err(|_| failed())?;
-        if url.scheme() != "https"
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(failed());
-        }
-        let host = url.host_str().ok_or_else(failed)?.to_owned();
-        let port = url.port_or_known_default().ok_or_else(failed)?;
-        let name = ServerName::try_from(host.clone()).map_err(|_| failed())?;
-        let uri: Uri = request.url.parse().map_err(|_| failed())?;
-        let authority = uri.authority().ok_or_else(failed)?.as_str().to_owned();
-        if uri.scheme_str() != Some("https") || authority.contains('@') {
-            return Err(failed());
-        }
-        let method = Method::from_bytes(request.method.as_bytes()).map_err(|_| failed())?;
-        if request.headers.len().saturating_add(1) > MAX_HEADERS {
-            return Err(failed());
-        }
-        let mut header_bytes = hyper::header::HOST
-            .as_str()
-            .len()
-            .saturating_add(authority.len())
-            .saturating_add(4);
-        for (key, value) in &request.headers {
-            if key.eq_ignore_ascii_case("host") {
-                return Err(failed());
+        let mut stream = start_native_stream(&self.tls, request, context)?;
+        let status = stream.head().status;
+        let headers = stream.head().headers.clone();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.read_chunk()? {
+            if chunk.len() > context.max_response_body_bytes().saturating_sub(body.len()) {
+                stream.cancel();
+                return Err(OAuthError::ResponseTooLarge {
+                    max_bytes: context.max_response_body_bytes(),
+                });
             }
-            header_bytes = header_bytes
-                .saturating_add(key.len())
-                .saturating_add(value.len())
-                .saturating_add(4);
-            if header_bytes > MAX_HEADER_BYTES {
-                return Err(failed());
-            }
+            body.extend_from_slice(&chunk);
         }
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"))
-            .header(hyper::header::HOST, authority);
-        for (key, value) in &request.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let request = builder
-            .body(Full::new(Bytes::from(request.body.clone())))
-            .map_err(|_| failed())?;
-        let _permit =
-            Arc::clone(REQUESTS.get_or_init(|| Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS))))
-                .try_acquire_owned()
-                .map_err(|_| busy())?;
-        let runtime = RUNTIME
-            .get_or_init(|| {
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .max_blocking_threads(2)
-                    .enable_all()
-                    .build()
-                    .ok()
-            })
-            .as_ref()
-            .ok_or_else(failed)?;
-        let tls = Arc::clone(&self.tls);
-        let owned_context = context.clone();
-        let (tx, rx) = mpsc::sync_channel(1);
-        let task = runtime.spawn(async move {
-            let result = tokio::time::timeout_at(owned_context.deadline().into(), async {
-                let addresses = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|_| failed())?;
-                owned_context.check()?;
-                let mut connected = None;
-                for address in addresses {
-                    owned_context.check()?;
-                    if let Ok(stream) = tokio::net::TcpStream::connect(address).await {
-                        connected = Some(stream);
-                        break;
-                    }
-                }
-                let stream = connected.ok_or_else(failed)?;
-                owned_context.check()?;
-                let stream = TlsConnector::from(tls).connect(name, stream).await.map_err(|_| failed())?;
-                owned_context.check()?;
-                let (mut sender, connection) = http1::Builder::new().max_headers(MAX_HEADERS).max_buf_size(MAX_HEADER_BYTES).handshake(TokioIo::new(stream)).await.map_err(|_| failed())?;
-                owned_context.check()?;
-                tokio::pin!(connection);
-                tokio::select! {
-                    result = async {
-                        let response = sender.send_request(request).await.map_err(|_| failed())?;
-                        owned_context.check()?;
-                        let mut headers = BTreeMap::new();
-                        let mut size = 0usize;
-                        for (name, value) in response.headers() {
-                            size = size.saturating_add(name.as_str().len()).saturating_add(value.as_bytes().len());
-                            if size > MAX_HEADER_BYTES { return Err(failed()); }
-                            headers.insert(name.to_string(), value.to_str().map_err(|_| failed())?.to_string());
-                        }
-                        let status = response.status().as_u16();
-                        let mut incoming = response.into_body();
-                        let mut body = Vec::new();
-                        while let Some(frame) = incoming.frame().await {
-                            owned_context.check()?;
-                            let frame = frame.map_err(|_| failed())?;
-                            if let Some(chunk) = frame.data_ref() {
-                                if chunk.len() > owned_context.max_response_body_bytes().saturating_sub(body.len()) {
-                                    return Err(OAuthError::ResponseTooLarge { max_bytes: owned_context.max_response_body_bytes() });
-                                }
-                                body.extend_from_slice(chunk);
-                            }
-                        }
-                        owned_context.check()?;
-                        Ok(RawHttpsResponse { status, headers, body })
-                    } => result,
-                    _ = &mut connection => Err(failed()),
-                }
-            }).await.unwrap_or(Err(OAuthError::DeadlineExceeded));
-            let _ = tx.send(result);
-        });
-        loop {
-            let remaining = match context.remaining() {
-                Ok(remaining) => remaining,
-                Err(error) => {
-                    task.abort();
-                    return Err(error);
-                }
-            };
-            match rx.recv_timeout(remaining.min(POLL_INTERVAL)) {
-                Ok(result) => {
-                    context.check()?;
-                    return result;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    context.check()?;
-                    return Err(failed());
-                }
-            }
-        }
+        Ok(RawHttpsResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    fn start_stream(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
+        Ok(Box::new(start_native_stream(&self.tls, request, context)?))
     }
 }
 
@@ -371,6 +663,7 @@ mod tests {
         ChunkedOversize,
         StallHandshake(Duration),
         StallResponse(Duration),
+        GatedStream(Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Bytes>>>>),
     }
 
     enum ServerEvent {
@@ -474,6 +767,7 @@ mod tests {
                         },
                         Reply::ChunkedOversize => Reply::ChunkedOversize,
                         Reply::StallResponse(duration) => Reply::StallResponse(*duration),
+                        Reply::GatedStream(receiver) => Reply::GatedStream(Arc::clone(receiver)),
                         Reply::StallHandshake(_) => unreachable!(),
                     };
                     async move {
@@ -504,6 +798,15 @@ mod tests {
                             Reply::StallResponse(duration) => {
                                 tokio::time::sleep(duration).await;
                                 Response::new(Full::new(Bytes::from_static(b"ok")).boxed())
+                            }
+                            Reply::GatedStream(receiver) => {
+                                let receiver = receiver.lock().unwrap().take().unwrap();
+                                let chunks = stream::unfold(receiver, |mut receiver| async move {
+                                    receiver.recv().await.map(|chunk| {
+                                        (Ok::<_, Infallible>(Frame::data(chunk)), receiver)
+                                    })
+                                });
+                                Response::new(StreamBody::new(chunks).boxed())
                             }
                             Reply::StallHandshake(_) => unreachable!(),
                         };
@@ -594,6 +897,180 @@ mod tests {
             });
         });
         (url, roots, rx, thread)
+    }
+
+    #[test]
+    fn native_stream_yields_body_before_server_releases_eof() {
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
+        body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
+        let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
+        let (url, roots, _events, server_thread) = scripted_server(Reply::GatedStream(receiver));
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (context, _) = context(Duration::from_secs(3));
+
+        let mut response = transport
+            .start_stream(&request(url), &context)
+            .expect("native streaming transport should be available");
+        assert_eq!(response.head().status, 200);
+        assert_eq!(
+            response.read_chunk().unwrap().as_deref(),
+            Some(&b"first"[..])
+        );
+
+        body_tx
+            .blocking_send(Bytes::from_static(b"second"))
+            .unwrap();
+        drop(body_tx);
+        assert_eq!(
+            response.read_chunk().unwrap().as_deref(),
+            Some(&b"second"[..])
+        );
+        assert_eq!(response.read_chunk().unwrap(), None);
+        drop(response);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn native_stream_splits_large_frames_and_preserves_all_bytes() {
+        let body = (0..24_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: Vec::new(),
+            body: body.clone(),
+        });
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let mut response = transport.start_stream(&request(url), &io_context).unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = response.read_chunk().unwrap() {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= MAX_STREAM_CHUNK_BYTES);
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(collected, body);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn native_stream_enforces_cumulative_body_cap() {
+        let (url, roots, _events, server) = scripted_server(Reply::ChunkedOversize);
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let mut response = transport.start_stream(&request(url), &io_context).unwrap();
+        let error = loop {
+            match response.read_chunk() {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("oversized response unexpectedly reached clean EOF"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.code(), "response_too_large");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn caller_cancellation_during_bounded_queue_backpressure_closes_only_its_stream() {
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
+        body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
+        let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
+        let (url, roots, _events, cancelled_server) = scripted_server(Reply::GatedStream(receiver));
+        let cancelled_transport = NativeHttpsTransport::with_roots(roots);
+        let (cancelled_context, cancel) = context(Duration::from_secs(3));
+        let mut cancelled = cancelled_transport
+            .start_stream(&request(url), &cancelled_context)
+            .unwrap();
+        body_tx
+            .blocking_send(Bytes::from_static(b"second"))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let (peer_url, peer_roots, _events, peer_server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: Vec::new(),
+            body: b"peer".to_vec(),
+        });
+        let peer_transport = NativeHttpsTransport::with_roots(peer_roots);
+        let (peer_context, _) = context(Duration::from_secs(3));
+        let mut peer = peer_transport
+            .start_stream(&request(peer_url), &peer_context)
+            .unwrap();
+
+        cancel.0.store(true, Ordering::Release);
+        assert_eq!(cancelled.read_chunk().unwrap_err().code(), "cancelled");
+        drop(body_tx);
+        cancelled_server.join().unwrap();
+        assert_eq!(peer.read_chunk().unwrap().as_deref(), Some(&b"peer"[..]));
+        assert_eq!(peer.read_chunk().unwrap(), None);
+        peer_server.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_live_stream_closes_its_socket() {
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
+        body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
+        let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
+        let (url, roots, _events, server) = scripted_server(Reply::GatedStream(receiver));
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let response = transport.start_stream(&request(url), &io_context).unwrap();
+        drop(response);
+        drop(body_tx);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stream_read_uses_original_deadline_while_waiting_for_body() {
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
+        let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
+        let (url, roots, _events, server) = scripted_server(Reply::GatedStream(receiver));
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_millis(150));
+        let mut response = transport.start_stream(&request(url), &io_context).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            response.read_chunk().unwrap_err().code(),
+            "deadline_exceeded"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(response);
+        drop(body_tx);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stream_head_debug_and_transport_errors_redact_values() {
+        let secret_header = "response-header-secret";
+        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: vec![("x-private".into(), secret_header.into())],
+            body: b"ok".to_vec(),
+        });
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let response = transport.start_stream(&request(url), &io_context).unwrap();
+        let debug = format!("{:?}", response.head());
+        assert!(debug.contains("status: 200"));
+        assert!(!debug.contains(secret_header));
+        drop(response);
+        server.join().unwrap();
+
+        let secret_request = "request-secret-marker";
+        let mut rejected = request(format!(
+            "https://user:{secret_request}@localhost/private?{secret_request}"
+        ));
+        rejected
+            .headers
+            .insert("x-private".into(), secret_request.into());
+        rejected.body = secret_request.into();
+        let error = NativeHttpsTransport::new()
+            .start_stream(&rejected, &io_context)
+            .err()
+            .unwrap();
+        let debug = format!("{error:?}");
+        assert!(!debug.contains(secret_request));
+        assert!(!error.to_string().contains(secret_request));
     }
 
     #[test]
