@@ -13,28 +13,86 @@ struct OpaquePolicyBinding {
     policy: resource<auth.policy>
 }
 
+fn empty_metadata() -> AuthMetadata {
+    {
+        credential_id: "",
+        provider: "",
+        kind: "",
+        source: "",
+        token_type: "",
+        expires_at_ms: 0,
+        scopes: [],
+        account_id: null,
+        generation: 0,
+        status: "",
+        last_refresh_at_ms: null,
+        has_refresh_token: false
+    }
+}
+
+fn empty_metadata_envelope() -> AuthMetadataEnvelope {
+    {
+        ok: false,
+        error: null,
+        metadata: empty_metadata(),
+        outcome: ""
+    }
+}
+
+fn invalid_metadata_result() -> TransportResultEnvelope {
+    let failure: AuthBridgeFailure = {
+        code: "invalid_credential_metadata",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false
+    };
+    {
+        ok: false,
+        error: failure,
+        value: null
+    }
+}
+
 pub fn call(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
-    let metadata: AuthMetadataEnvelope = auth::load_metadata(intent.credential_id, &binding.policy);
-    let access: AccessHandleEnvelope = auth::access_handle(
-        intent.credential_id,
-        metadata.metadata.generation,
-        &binding.policy
-    );
-    let request: TransportPublicRequest = {
-        policy_handle: binding.policy,
-        credential_id: intent.credential_id,
-        method: intent.method,
-        path: intent.path,
-        public_headers: intent.public_headers,
-        public_body: intent.public_body
-    };
-    let usage: TransportCredentialUse = {
-        kind: "access",
-        access_handle: access.handle,
-        refresh_handle: null,
-        code_handle: null,
-        verifier_handle: null,
-        device_handle: null
-    };
-    oauth::transport_result(&request, &usage)
+    let loaded: AuthMetadataResultEnvelope =
+        auth::load_metadata_result(intent.credential_id, &binding.policy);
+    if loaded.error.copy() != null => {
+        {ok: false, error: loaded.error.copy(), value: null}
+    } else if !loaded.ok => {
+        invalid_metadata_result()
+    } else => {
+        let maybe_metadata: AuthMetadataEnvelope? = loaded.value;
+        if maybe_metadata == null => {
+            invalid_metadata_result()
+        } else => {
+            let metadata: AuthMetadataEnvelope =
+                maybe_metadata.unwrap_or(empty_metadata_envelope());
+            if !metadata.ok || metadata.error != null => {
+                invalid_metadata_result()
+            } else => {
+                let access: AccessHandleEnvelope = auth::access_handle(
+                    intent.credential_id,
+                    metadata.metadata.generation,
+                    &binding.policy
+                );
+                let request: TransportPublicRequest = {
+                    policy_handle: binding.policy,
+                    credential_id: intent.credential_id,
+                    method: intent.method,
+                    path: intent.path,
+                    public_headers: intent.public_headers,
+                    public_body: intent.public_body
+                };
+                let usage: TransportCredentialUse = {
+                    kind: "access",
+                    access_handle: access.handle,
+                    refresh_handle: null,
+                    code_handle: null,
+                    verifier_handle: null,
+                    device_handle: null
+                };
+                oauth::transport_result(&request, &usage)
+            }
+        }
+    }
 }

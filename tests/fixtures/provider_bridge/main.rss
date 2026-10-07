@@ -35,7 +35,19 @@ pub fn run(context: map) -> map {
         public_body: ""
     };
     let envelope: TransportResultEnvelope = provider_runtime::call(binding, intent);
-    let maybe_response: TransportResponseEnvelope? = envelope.value;
+    let has_response: bool = envelope.has("value");
+    let maybe_error: AuthBridgeFailure? = envelope.error;
+    let error: AuthBridgeFailure = maybe_error.unwrap_or({
+        code: "",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false
+    });
+    let maybe_response: TransportResponseEnvelope? = if has_response => {
+        envelope.value
+    } else => {
+        null
+    };
     let response: TransportResponseEnvelope = maybe_response.unwrap_or({
         ok: false,
         error: null,
@@ -53,6 +65,11 @@ pub fn run(context: map) -> map {
         retry_after_ms = maybe_retry_after_ms.unwrap_or(0);
     }
     let public_response: map = {
+        ok: envelope.ok,
+        error_code: error.code,
+        cancelled: error.cancelled,
+        deadline_exceeded: error.deadline_exceeded,
+        revoked: error.revoked,
         status: response.status,
         body: response.body_without_secret_fields,
         retry_after_ms: retry_after_ms

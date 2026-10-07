@@ -182,16 +182,17 @@ fn agent_runner_uses_metadata_selected_access_handle_and_native_buffered_transpo
         .run_with_context_and_events(Value::map(vec![]), &mut events, &cancellation)
         .expect("same-VM RSS transport");
 
+    assert_eq!(field(&result, "ok"), &Value::Bool(true));
+    assert_eq!(field(&result, "error_code"), &Value::string(""));
+    assert_eq!(field(&result, "cancelled"), &Value::Bool(false));
+    assert_eq!(field(&result, "deadline_exceeded"), &Value::Bool(false));
+    assert_eq!(field(&result, "revoked"), &Value::Bool(false));
     assert_eq!(field(&result, "status"), &Value::Int(200));
     assert_eq!(
         field(&result, "body"),
         &Value::string(r#"{"public":"accepted"}"#)
     );
     assert_eq!(field(&result, "retry_after_ms"), &Value::Int(0));
-    let Value::Map(fields) = &result else {
-        panic!("only public response fields may leave RSS")
-    };
-    assert_eq!(fields.len(), 3, "resource slots stay inside the live VM");
     let rendered = format!("{result:?}{:?}", events.0);
     for secret in [
         "SYNTHETIC_ACCESS_TOKEN",
@@ -232,8 +233,12 @@ fn native_path_denial_sends_nothing_and_returns_only_public_fallback() {
             &mut events,
             &cancellation,
         )
-        .expect("native path denial is represented by a nullable result");
-
+        .expect("native path denial returns a public native failure");
+    assert_eq!(field(&result, "ok"), &Value::Bool(false));
+    assert_eq!(field(&result, "error_code"), &Value::string("path_denied"));
+    assert_eq!(field(&result, "cancelled"), &Value::Bool(false));
+    assert_eq!(field(&result, "deadline_exceeded"), &Value::Bool(false));
+    assert_eq!(field(&result, "revoked"), &Value::Bool(false));
     assert_eq!(field(&result, "status"), &Value::Int(0));
     assert_eq!(field(&result, "body"), &Value::string(""));
     assert_eq!(field(&result, "retry_after_ms"), &Value::Int(0));
@@ -254,8 +259,16 @@ fn native_header_denial_sends_nothing_and_returns_only_public_fallback() {
             &mut events,
             &cancellation,
         )
-        .expect("native header denial is represented by a nullable result");
+        .expect("native header denial returns a public native failure");
 
+    assert_eq!(field(&result, "ok"), &Value::Bool(false));
+    assert_eq!(
+        field(&result, "error_code"),
+        &Value::string("header_denied")
+    );
+    assert_eq!(field(&result, "cancelled"), &Value::Bool(false));
+    assert_eq!(field(&result, "deadline_exceeded"), &Value::Bool(false));
+    assert_eq!(field(&result, "revoked"), &Value::Bool(false));
     assert_eq!(field(&result, "status"), &Value::Int(0));
     assert_eq!(field(&result, "body"), &Value::string(""));
     assert_eq!(field(&result, "retry_after_ms"), &Value::Int(0));
@@ -276,7 +289,15 @@ fn unknown_credential_is_denied_before_native_send() {
         &cancellation,
     );
 
-    assert!(result.is_err());
+    let result = result.expect("unknown credential returns a public native failure");
+    assert_eq!(field(&result, "ok"), &Value::Bool(false));
+    assert_eq!(
+        field(&result, "error_code"),
+        &Value::string("credential_not_admitted")
+    );
+    assert_eq!(field(&result, "cancelled"), &Value::Bool(false));
+    assert_eq!(field(&result, "deadline_exceeded"), &Value::Bool(false));
+    assert_eq!(field(&result, "revoked"), &Value::Bool(false));
     assert!(events.0.is_empty());
     assert!(transport.take_sent().is_empty());
 }
