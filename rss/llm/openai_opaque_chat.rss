@@ -1,0 +1,100 @@
+use auth;
+use self::types as types;
+use self::openai_chat as openai_chat;
+use super::agent::provider_runtime as provider_runtime;
+
+struct OpaqueProviderIntent {
+    credential_id: string,
+    method: string,
+    path: string,
+    public_headers: array<PublicHeader>,
+    public_body: string
+}
+
+struct OpaqueHostHomeBinding {
+    home: resource<auth.host_home>
+}
+
+pub fn run(context: map) -> map {
+    let request: map = types::request_map(context, "request");
+    let profile: map = types::request_map(context, "profile");
+    let model: string = types::request_string(request, "model");
+    let streaming: bool = types::request_bool(request, "stream", false);
+    let options: map = types::provider_options(request);
+    let options_are_public: bool = types::profile_options_are_public(options);
+    let result: map = if model == "" => {
+        types::fail(types::error_request("missing_model", "request.model is required"))
+    } else if streaming => {
+        types::fail(types::error_request(
+            "adapter_unavailable",
+            "opaque OpenAI Chat streaming is unavailable"
+        ))
+    } else if !options_are_public => {
+        types::fail(types::error_request(
+            "config",
+            "credential-bearing provider options are not public"
+        ))
+    } else => {
+        chat_send_buffered(request, profile, context, model)
+    };
+    result
+}
+
+fn chat_send_buffered(request: map, profile: map, context: map, model: string) -> map {
+    let provider: string = types::profile_string(profile, "provider");
+    let body: string = openai_chat::chat_build_public_body(request, model);
+    let binding: OpaqueHostHomeBinding = { "home": context["host_home"], };
+    let credential_id: string = types::request_string(context, "credential_id");
+    let intent: OpaqueProviderIntent = {
+        credential_id: credential_id,
+        method: "POST",
+        path: "/v1/chat/completions",
+        public_headers: [
+            { name: "accept", value: "application/json" },
+            { name: "content-type", value: "application/json" }
+        ],
+        public_body: body
+    };
+    let envelope: TransportResultEnvelope = provider_runtime::call(binding, intent);
+    chat_interpret_transport(envelope, provider)
+}
+
+fn chat_interpret_transport(envelope: TransportResultEnvelope, provider: string) -> map {
+    let maybe_failure: AuthBridgeFailure? = envelope.error;
+    let failure: AuthBridgeFailure = maybe_failure.unwrap_or({
+        code: "transport_error",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false
+    });
+    let maybe_response: TransportResponseEnvelope? = envelope.value;
+    let response: TransportResponseEnvelope = maybe_response.unwrap_or({
+        ok: false,
+        error: null,
+        status: 0,
+        public_headers: [],
+        body_without_secret_fields: "",
+        retry_after_ms: null,
+        access_slot: null,
+        refresh_slot: null,
+        device_handle: null
+    });
+    let result: map = if envelope.ok => {
+        chat_parse_transport_response(response, provider)
+    } else => {
+        types::fail(types::error_request(failure.code, "provider transport failed"))
+    };
+    result
+}
+
+fn chat_parse_transport_response(response: TransportResponseEnvelope, provider: string) -> map {
+    if response.status >= 200 && response.status < 300 => {
+        openai_chat::chat_parse_public_response(
+            response.body_without_secret_fields,
+            response.status,
+            provider
+        )
+    } else => {
+        openai_chat::chat_parse_public_error(response.body_without_secret_fields, response.status)
+    }
+}

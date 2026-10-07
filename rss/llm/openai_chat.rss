@@ -178,6 +178,15 @@ fn chat_encode_wire(request: map, model: string, stream: bool) -> string {
     body_text
 }
 
+pub fn chat_build_public_body(request: map, model: string) -> string {
+    let body_text: string = chat_encode_wire(request, model, false);
+    let with_user_parts: string = chat_splice_user_parts(
+        body_text,
+        types::request_array(request, "messages")
+    );
+    chat_splice_tool_schemas(with_user_parts, types::request_array(request, "tools"))
+}
+
 fn chat_build_wire(request: map, model: string, stream: bool) -> WireRequest {
     let messages: array<WireMessage> = chat_build_messages(
         types::request_array(request, "messages")
@@ -466,6 +475,11 @@ fn chat_parse_response(body_bytes: bytes, status: int, provider: string) -> map 
     chat_parse_response_body(body, status, provider)
 }
 
+pub fn chat_parse_public_response(body_text: string, status: int, provider: string) -> map {
+    let body: map = json::decode(body_text);
+    chat_parse_response_body(body, status, provider)
+}
+
 fn chat_parse_response_body(body: map, status: int, provider: string) -> map {
     let choices: array = types::request_array(body, "choices");
     if choices.length > 0 => {
@@ -578,6 +592,14 @@ fn chat_parse_tool_calls(tool_calls: array) -> array {
 
 fn chat_parse_error(body_bytes: bytes, status: int) -> map {
     let body_text: string = bytes::to_utf8(body_bytes);
+    chat_parse_error_text(body_text, status)
+}
+
+pub fn chat_parse_public_error(body_text: string, status: int) -> map {
+    chat_parse_error_text(body_text, status)
+}
+
+fn chat_parse_error_text(body_text: string, status: int) -> map {
     let payload: map = chat_error_payload(body_text);
     let mut error_type: string = "api_error";
     let mut code: string = "http_error";
