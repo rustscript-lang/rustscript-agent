@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use rustscript_agent::auth::host::auth_host_catalog;
 use rustscript_vm::{
-    compile_source_at_path_with_flavor_and_options, register_http_builtin_module_from_catalog,
     CapabilityProfile, CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Value, Vm,
-    VmStatus,
+    VmStatus, compile_source_at_path_with_flavor_and_options,
+    register_http_builtin_module_from_catalog,
 };
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
