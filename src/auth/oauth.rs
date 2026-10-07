@@ -15,6 +15,9 @@ use zeroize::Zeroizing;
 
 use crate::auth::pkce::{self, PKCE_CHALLENGE_METHOD, PkceError};
 use crate::auth::request_body::{self, SecretField};
+
+/// Native authenticated sanitized incremental SSE-record security adapter.
+pub(crate) mod sanitized_sse;
 use crate::auth::store::{AuthStoreError, OpaqueRefreshHandle, OpaqueSecretSlot, SecretSlotKind};
 use crate::auth::token::CredentialId;
 
@@ -3300,6 +3303,28 @@ fn secret_key(key: &str) -> bool {
     SECRET_JSON_KEYS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
+/// Removes every secret-shaped key at every nesting level without minting any
+/// credential slot. This is the discard-only sibling of `strip_secrets`, shared
+/// with the sanitized incremental SSE record path so there is one classifier.
+fn strip_secret_keys(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => {
+            let mut kept = JsonMap::new();
+            for (key, nested) in map {
+                if secret_key(&key) {
+                    continue;
+                }
+                kept.insert(key, strip_secret_keys(nested));
+            }
+            JsonValue::Object(kept)
+        }
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.into_iter().map(strip_secret_keys).collect())
+        }
+        other => other,
+    }
 }
 
 fn device_secret_key(key: &str) -> bool {
