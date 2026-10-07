@@ -1672,3 +1672,266 @@ fn normalize_provider_envelope(result: JsonValue) -> JsonValue {
     }
     result
 }
+
+#[cfg(all(feature = "config-fixture", test))]
+mod b1_json_guard_native_auth_reuse_tests {
+    use super::*;
+    use rustscript_vm::{
+        CallOutcome, CallReturn, CompileSourceFileOptions, HostAdapterDescriptor,
+        HostFunctionRegistry, SourceFlavor, VmStatus,
+        compile_source_at_path_with_flavor_and_options,
+    };
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture_home() -> std::path::PathBuf {
+        let root = std::path::PathBuf::from(
+            std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let home = root.join(format!(
+            "b1-json-guard-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&home).expect("private fixture home");
+        #[cfg(unix)]
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+            .expect("fixture home permissions");
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/config_auth_rss");
+        fs::copy(fixture.join("config.yaml"), home.join("config.yaml")).expect("fixture config");
+        let auth = fs::read_to_string(fixture.join("auth.yaml"))
+            .expect("fixture auth")
+            .replace("1788440000000", "1900003600000");
+        assert!(auth.contains("1900003600000"));
+        assert!(!auth.contains("1788440000000"));
+        fs::write(home.join("auth.yaml"), auth).expect("fixture auth copy");
+        #[cfg(unix)]
+        for name in ["config.yaml", "auth.yaml"] {
+            fs::set_permissions(home.join(name), fs::Permissions::from_mode(0o600))
+                .expect("fixture file permissions");
+        }
+        home
+    }
+
+    fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
+        let Value::Map(entries) = value else {
+            panic!("expected map")
+        };
+        entries
+            .iter()
+            .find_map(|(key, value)| match key {
+                Value::String(key) if key.as_ref() == name => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    }
+
+    fn invoke_adapter(
+        vm: &mut Vm,
+        adapter: HostAdapterDescriptor,
+        args: &[Value],
+    ) -> rustscript_vm::VmResult<CallOutcome> {
+        match adapter {
+            HostAdapterDescriptor::StaticStack(function)
+            | HostAdapterDescriptor::StaticStackRuntimeOwned(function) => function(vm, args),
+            HostAdapterDescriptor::StaticArgs(function)
+            | HostAdapterDescriptor::StaticNonYieldingArgs(function) => function(args),
+            _ => panic!("auth access descriptor has an unsupported adapter kind"),
+        }
+    }
+
+    #[test]
+    fn provider_json_guard_rejects_nested_resources_without_consuming_native_auth_resources() {
+        use crate::auth::host::{AuthHost, auth_host_module};
+        use crate::auth::oauth::{
+            OAuthHost, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
+            ScriptedHttpsTransport,
+        };
+        use std::time::Duration;
+
+        let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        transport.push_json(
+            200,
+            json!({
+                "access_token": "SYNTHETIC_PRIVATE_RESPONSE_FIELD",
+                "public": "accepted"
+            }),
+        );
+        let oauth = Arc::new(OAuthHost::new(
+            transport.clone(),
+            Arc::new(ScriptedCallback::new()),
+            Arc::new(ScriptedBrowser::new()),
+            Arc::new(ScriptedClock::new(1_900_000_000_000)),
+            Arc::new(ScriptedCancel::new()),
+        ));
+        let auth_host = AuthHost::new(fixture_home(), cancellation.clone())
+            .expect("auth owner")
+            .with_oauth_host(oauth);
+
+        let source = r#"
+use config;
+use auth;
+use oauth;
+
+pub fn b1_issue_policy(home: resource<auth.host_home>) -> resource<auth.policy> {
+    config::load_snapshot(&home).policy_handle
+}
+
+pub fn b1_send(
+    policy: resource<auth.policy>,
+    access: resource<auth.access>
+) -> TransportResultEnvelope {
+    let request: TransportPublicRequest = {
+        policy_handle: policy,
+        credential_id: "fixture-codex",
+        method: "GET",
+        path: "/oauth/token",
+        public_headers: [{name: "accept", value: "application/json"}],
+        public_body: ""
+    };
+    let usage: TransportCredentialUse = {
+        kind: "access",
+        access_handle: access,
+        refresh_handle: null,
+        code_handle: null,
+        verifier_handle: null,
+        device_handle: null
+    };
+    oauth::transport_result(&request, &usage)
+}
+"#;
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("rss/auth/transport_contract.rss");
+        let catalog = agent_host_catalog();
+        let compiled = compile_source_at_path_with_flavor_and_options(
+            &path,
+            source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+        )
+        .expect("compile fixture RSS");
+        let mut vm = Vm::new_shared(Arc::new(compiled.program));
+        let mut registry = HostFunctionRegistry::restricted();
+        auth_host
+            .register(&mut registry, catalog.as_ref())
+            .expect("register auth descriptors");
+        register_agent_host_functions(&mut registry, catalog.as_ref())
+            .expect("register agent descriptors");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind restricted catalog");
+
+        let provider = ScriptedProvider::new();
+        vm.host_context().set_module_state(AgentHostState {
+            provider: Arc::new(provider.clone()),
+            cancellation: cancellation.clone(),
+            sleeps: Arc::new(Mutex::new(SleepLog::default())),
+            skip_sleep: true,
+            metrics: None,
+            lifecycle: None,
+            capability_owner: None,
+            filesystem: None,
+            processes: None,
+            artifacts: None,
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            control_hook: None,
+        });
+        let context = auth_host.bind_vm(&mut vm).expect("bind genuine auth owner");
+        let home = field(&context, "host_home").clone();
+        assert!(matches!(vm.run().expect("RSS root"), VmStatus::Halted));
+
+        let issue = vm
+            .resolve_exported_callable("b1_issue_policy")
+            .expect("policy issuer");
+        let policy = vm
+            .invoke_callable(issue, &[home])
+            .expect("real policy issue");
+        let access_descriptor = auth_host_module()
+            .functions
+            .iter()
+            .map(|descriptor| descriptor())
+            .find(|descriptor| descriptor.schema.name == "auth::access_handle")
+            .expect("existing auth access descriptor");
+        let access_outcome = invoke_adapter(
+            &mut vm,
+            access_descriptor.adapter,
+            &[
+                Value::string("fixture-codex"),
+                Value::Int(4),
+                policy.clone(),
+            ],
+        )
+        .expect("existing auth access adapter");
+        let CallOutcome::Return(CallReturn::One(access_envelope)) = access_outcome else {
+            panic!("auth access adapter returned an unexpected outcome")
+        };
+        assert_eq!(field(&access_envelope, "ok"), &Value::Bool(true));
+        let access = field(&access_envelope, "handle").clone();
+        assert!(matches!(access, Value::Int(_)));
+
+        let nested_request = Value::map(vec![(
+            Value::string("messages"),
+            Value::array(vec![Value::map(vec![
+                (Value::string("policy"), policy.clone()),
+                (
+                    Value::string("parts"),
+                    Value::array(vec![Value::map(vec![(
+                        Value::string("credential"),
+                        access.clone(),
+                    )])]),
+                ),
+            ])]),
+        )]);
+        let guard_failure = provider_call_adapter(&mut vm, &[nested_request])
+            .expect_err("nested resource-bearing provider JSON rejected");
+        assert!(matches!(
+            guard_failure,
+            VmError::HostError(message) if message == "opaque_nonserializable"
+        ));
+        assert_eq!(provider.call_count(), 0);
+
+        let send = vm
+            .resolve_exported_callable("b1_send")
+            .expect("native send");
+        let envelope = vm
+            .invoke_callable(send, &[policy, access])
+            .expect("native transport result envelope");
+        assert_eq!(field(&envelope, "ok"), &Value::Bool(true));
+        let response = field(&envelope, "value");
+        assert!(
+            !matches!(response, Value::Null),
+            "canonical transport response absent"
+        );
+        assert_eq!(field(response, "status"), &Value::Int(200));
+        assert_eq!(
+            field(response, "body_without_secret_fields"),
+            &Value::string(r#"{"public":"accepted"}"#)
+        );
+        assert!(!format!("{response:?}").contains("SYNTHETIC_PRIVATE_RESPONSE_FIELD"));
+        let sent = transport.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url, "https://auth.openai.com/oauth/token");
+        assert!(
+            sent[0]
+                .headers
+                .get("authorization")
+                .is_some_and(|header| header == "Bearer SYNTHETIC_ACCESS_TOKEN")
+        );
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "native auth transport bypasses provider callback"
+        );
+
+        provider.push_ok(json!({}));
+        let control_request =
+            Value::map(vec![(Value::string("messages"), Value::array(Vec::new()))]);
+        let control = provider_call_adapter(&mut vm, &[control_request])
+            .expect("ordinary provider callback with resource-free JSON");
+        assert!(matches!(control, CallOutcome::Return(_)));
+        assert_eq!(provider.call_count(), 1);
+    }
+}
