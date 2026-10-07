@@ -418,6 +418,31 @@ fn missing_access_token_is_response_invalid_without_save() {
 }
 
 #[test]
+fn explicit_null_token_type_is_response_invalid_without_save() {
+    let home = TempHome::new("null-token-type");
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(
+        200,
+        &format!(r#"{{"access_token":"{NEW_ACCESS}","token_type":null,"expires_in":900}}"#),
+    );
+    let auth = native_host(&home, transport.clone());
+    let (mut vm, home_handle, _policy) = bind_and_snapshot(&auth);
+    let before = stored_yaml(&home);
+    let result = run_refresh(&mut vm, &home_handle, CREDENTIAL_ID);
+    assert_eq!(field(&result, "ok"), &Value::Bool(false), "{result:?}");
+    assert_eq!(
+        field(&result, "code"),
+        &Value::string("refresh_response_invalid")
+    );
+    assert_eq!(field(&result, "outcome"), &Value::string(""));
+    assert!(is_null_or_absent(&result, "metadata"));
+    assert_eq!(stored_yaml(&home), before);
+    assert_eq!(transport.take_sent().len(), 1);
+    assert_no_secrets(&format!("{result:?}"));
+    assert_eq!(vm.host_context().resource_count(), 2);
+}
+
+#[test]
 fn nonbearer_success_is_response_invalid_without_leak() {
     let home = TempHome::new("nonbearer-success");
     let transport = Arc::new(ScriptedHttpsTransport::new());

@@ -152,7 +152,7 @@ fn bearer_token_type(envelope: PublicJsonFieldResultEnvelope) -> bool {
     let mut valid: bool = false;
     if usable(envelope.copy()) {
         let selected: PublicJsonFieldEnvelope = envelope.value.copy();
-        if selected.kind.copy() == "missing" || selected.kind.copy() == "null" {
+        if selected.kind.copy() == "missing" {
             valid = true;
         } else if selected.kind.copy() == "string" && selected.string_value.copy() != null {
             if selected.string_value.copy() == "Bearer" {
