@@ -353,6 +353,7 @@ fn build_llm_request(context: map, messages: array) -> map {
         messages: messages,
         tools: tools_from_context(context),
         tool_choice: ctx_string(context, "tool_choice", ""),
+        credential_id: ctx_string(context, "credential_id", ""),
         reasoning: ctx_string(context, "reasoning", ""),
         sampling: sampling,
         max_output_tokens: ctx_int(context, "max_output_tokens", ctx_int(limits, "max_output_tokens", 0)),
