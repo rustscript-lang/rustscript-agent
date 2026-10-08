@@ -33,11 +33,24 @@ pub fn run(context: map) -> map {
             "credential-bearing provider options are not public"
         ))
     } else if streaming => {
-        chat_send_stream(request, context, model)
+        chat_send_stream(request, profile, context, model)
     } else => {
         chat_send_buffered(request, profile, context, model)
     };
     result
+}
+
+/// Optional profile path intent; defaults to the exact canonical Chat
+/// Completions path. Resource-free: the native transport trusts and
+/// validates the intent against the admitted policy.
+fn chat_path_or_default(profile: map) -> string {
+    let configured: string = types::profile_string(profile, "chat_path");
+    let path: string = if configured == "" => {
+        "/v1/chat/completions"
+    } else => {
+        configured
+    };
+    path
 }
 
 fn chat_send_buffered(request: map, profile: map, context: map, model: string) -> map {
@@ -48,7 +61,7 @@ fn chat_send_buffered(request: map, profile: map, context: map, model: string) -
     let intent: OpaqueProviderIntent = {
         credential_id: credential_id,
         method: "POST",
-        path: "/v1/chat/completions",
+        path: chat_path_or_default(profile),
         public_headers: [
             { name: "accept", value: "application/json" },
             { name: "content-type", value: "application/json" }
@@ -121,12 +134,12 @@ fn malformed_stream(status: int) -> map {
     types::fail(types::error_malformed(status, "malformed provider stream record"))
 }
 
-fn chat_send_stream(request: map, context: map, model: string) -> map {
+fn chat_send_stream(request: map, profile: map, context: map, model: string) -> map {
     let binding: OpaqueHostHomeBinding = {home: context["host_home"]};
     let intent: OpaqueProviderIntent = {
         credential_id: types::request_string(context, "credential_id"),
         method: "POST",
-        path: "/v1/chat/completions",
+        path: chat_path_or_default(profile),
         public_headers: [
             {name: "accept", value: "text/event-stream"},
             {name: "content-type", value: "application/json"}

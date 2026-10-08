@@ -1,15 +1,20 @@
 // Shared profile wiring: merges profile metadata with per-request
-// provider_options overrides and dispatches to the profile's adapter.
+// provider_options overrides, derives the public logical chat path, and
+// dispatches to the admitted native-auth OpenAI Chat entry through a private
+// context. Carries no secrets: keys, tokens, and raw HTTP never appear here;
+// the native transport owns authority, credentials, and the wire.
 //
 // Compiler-contract note: `profile_merge` reads only its `metadata` map
 // parameter; the request's provider_options are flattened to primitives by
 // the caller (see the core callable-schema limitation).
-use json;
+use auth;
 use super::llm::types as types;
+use super::llm::openai_opaque_chat as openai_opaque_chat;
 
 /// Merges public profile metadata with provider_options overrides. Non-empty
 /// base/model overrides win; the result carries only `{provider, base_url,
-/// model, adapter, capabilities}`. Adapters append their protocol path.
+/// model, adapter, capabilities, chat_path}`. `chat_path` is the public
+/// logical path intent derived from the merged base URL.
 pub fn profile_merge(
     metadata: map,
     override_base: string,
@@ -28,6 +33,181 @@ pub fn profile_merge(
         base_url: base_url,
         model: model,
         adapter: types::profile_string(metadata, "adapter"),
-        capabilities: types::request_map(metadata, "capabilities")
+        capabilities: types::request_map(metadata, "capabilities"),
+        chat_path: chat_path_for_base(base_url)
     }
+}
+
+/// Public logical chat path intent derived from a merged base URL. Only the
+/// path segments after the authority boundary are kept (slash-joined from
+/// split index 3 on, trailing empty segments ignored, internal segments
+/// preserved); `/chat/completions` is appended. An empty base resolves to
+/// the canonical default. Scheme, authority, credentials, and query/fragment
+/// never travel with this intent: native auth owns the HTTPS authority.
+pub fn chat_path_for_base(base_url: string) -> string {
+    let path: string = if base_url == "" => {
+        "/v1/chat/completions"
+    } else => {
+        chat_path_from_parts(string_split_literal(base_url, "/"))
+    };
+    path
+}
+
+fn chat_path_from_parts(parts: array) -> string {
+    let count: int = parts.length;
+    let end: int = chat_path_end(parts, count);
+    chat_path_prefix(parts, end) + "/chat/completions"
+}
+
+/// Exclusive end of the kept segments: the position after the last non-empty
+/// segment at index>=3, so trailing empty segments are ignored.
+fn chat_path_end(parts: array, count: int) -> int {
+    let mut end: int = 3;
+    let mut i: int = 3;
+    while i < count {
+        let segment: string = split_segment(parts, i);
+        if segment != "" {
+            end = i + 1;
+        }
+        i += 1;
+    }
+    end
+}
+
+/// Slash-joins the kept segments into the intent prefix.
+fn chat_path_prefix(parts: array, end: int) -> string {
+    let mut prefix: string = "";
+    let mut i: int = 3;
+    while i < end {
+        let segment: string = split_segment(parts, i);
+        prefix = prefix + "/" + segment;
+        i += 1;
+    }
+    prefix
+}
+
+/// One split segment as text, or "" when absent or non-string. Resource-free
+/// array copies only; elements are plain strings.
+fn split_segment(parts: array, index: int) -> string {
+    let mut segment: string = "";
+    if parts.has(index) {
+        if type(parts[index].copy()) == "string" {
+            let coerced: string = parts[index].copy();
+            segment = coerced;
+        }
+    }
+    segment
+}
+
+/// Credential-bearing profile metadata is never admitted to transport. Only
+/// the bounded public key shapes are inspected; values are never read.
+fn profile_metadata_is_public(profile: map) -> bool {
+    if profile.has("api_key") => {
+        false
+    } else if profile.has("authorization") => {
+        false
+    } else if profile.has("token") => {
+        false
+    } else if profile.has("access_token") => {
+        false
+    } else if profile.has("refresh_token") => {
+        false
+    } else if profile.has("headers") => {
+        false
+    } else if profile.has("cookie") => {
+        false
+    } else if profile.has("cookies") => {
+        false
+    } else => {
+        true
+    }
+}
+
+/// Shared admitted dispatch. Accepts ONE context
+/// `{request, profile, credential_id?, host_home?}`: the named credential
+/// resolves from the context first, then the request. Secret-shaped
+/// provider_options and credential-bearing profile metadata fail closed with
+/// zero transport; a missing named ID fails as `missing_credential`; a
+/// missing admitted home fails as `auth_unavailable`. Otherwise the child is
+/// reconstructed in the same guest VM with the existing
+/// `resource<auth.host_home>`, the public request/profile, and the named ID,
+/// and routed to the opaque Chat entry. Unsupported or deferred adapter
+/// selections never reach this dispatch.
+pub fn profile_dispatch(context: map) -> map {
+    let has_home: bool = context.has("host_home");
+    let request: map = types::request_map(context, "request");
+    let profile: map = types::request_map(context, "profile");
+    let options: map = types::provider_options(request);
+    let metadata_ok: bool = profile_metadata_is_public(profile);
+    let result: map = if !types::profile_options_are_public(options) => {
+        types::fail(types::error_request(
+            "config",
+            "credential-bearing provider options are not public"
+        ))
+    } else if !metadata_ok => {
+        types::fail(types::error_request(
+            "config",
+            "credential-bearing profile metadata is not public"
+        ))
+    } else => {
+        dispatch_guarded(context, request, profile, has_home)
+    };
+    result
+}
+
+fn dispatch_guarded(context: map, request: map, profile: map, has_home: bool) -> map {
+    let from_context: string = types::request_string(context, "credential_id");
+    let from_request: string = types::request_string(request, "credential_id");
+    let credential_id: string = if from_context != "" => {
+        from_context
+    } else => {
+        from_request
+    };
+    let result: map = if credential_id == "" => {
+        types::fail(types::error_request(
+            "missing_credential",
+            "request.credential_id is required"
+        ))
+    } else if !has_home => {
+        types::fail(types::error_request(
+            "auth_unavailable",
+            "authenticated transport is unavailable for this profile call"
+        ))
+    } else => {
+        dispatch_admitted(context, request, profile, credential_id)
+    };
+    result
+}
+
+fn dispatch_admitted(context: map, request: map, profile: map, credential_id: string) -> map {
+    let path: string = profile_with_path(profile);
+    let home: resource<auth.host_home> = context["host_home"];
+    let routed: map = {
+        provider: types::profile_string(profile, "provider"),
+        base_url: types::profile_string(profile, "base_url"),
+        model: types::profile_string(profile, "model"),
+        adapter: types::profile_string(profile, "adapter"),
+        capabilities: types::request_map(profile, "capabilities"),
+        chat_path: path
+    };
+    let child: map = {
+        request: request,
+        profile: routed,
+        credential_id: credential_id,
+        host_home: home
+    };
+    openai_opaque_chat::run(child)
+}
+
+/// The routed path intent: the merged `chat_path` when present, otherwise
+/// derived from the profile base URL.
+fn profile_with_path(profile: map) -> string {
+    let configured: string = types::profile_string(profile, "chat_path");
+    let base_url: string = types::profile_string(profile, "base_url");
+    let path: string = if configured != "" => {
+        configured
+    } else => {
+        chat_path_for_base(base_url)
+    };
+    path
 }

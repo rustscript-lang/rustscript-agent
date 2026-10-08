@@ -1,18 +1,25 @@
 // OpenRouter profile: OpenAI Chat Completions compatible endpoint.
+use auth;
 use self::profile as profile;
 use super::llm::types as types;
-use super::llm::openai_chat as openai_chat;
 
-pub fn call(request: map) -> map {
+/// Admitted dispatch entry: ONE context `{request, credential_id?,
+/// host_home?}`. Merges the profile defaults with public per-request
+/// overrides, then routes a fresh local context (public request/profile,
+/// named credential, existing home) through the shared admitted dispatch.
+/// Carries no keys: secret-shaped options fail before any transport, and no
+/// authority from metadata can bypass native policy.
+pub fn call(context: map) -> map {
+    let request: map = types::request_map(context, "request");
     let options: map = types::provider_options(request);
     if types::profile_options_are_public(options) => {
-        call_public(request, options)
+        call_public(context, request, options)
     } else => {
         types::fail(types::error_request("config", "credential-bearing provider options are not public"))
     }
 }
 
-fn call_public(request: map, options: map) -> map {
+fn call_public(context: map, request: map, options: map) -> map {
     let override_base: string = types::request_string(options, "base_url");
     let override_model: string = types::request_string(options, "model");
     let merged: map = profile::profile_merge(
@@ -30,5 +37,40 @@ fn call_public(request: map, options: map) -> map {
     if override_model != "" {
         adapter_request["model"] = override_model;
     }
-    openai_chat::openai_chat_call(adapter_request, merged)
+    route_public(context, adapter_request, merged)
+}
+
+fn route_public(context: map, adapter_request: map, merged: map) -> map {
+    let has_home: bool = context.has("host_home");
+    let credential_id: string = types::request_string(context, "credential_id");
+    route_by_home(has_home, context, adapter_request, merged, credential_id)
+}
+
+fn route_by_home(has_home: bool, context: map, adapter_request: map, merged: map, credential_id: string) -> map {
+    let result: map = if has_home => {
+        route_with_home(context, adapter_request, merged, credential_id)
+    } else => {
+        route_without_home(adapter_request, merged, credential_id)
+    };
+    result
+}
+
+fn route_with_home(context: map, adapter_request: map, merged: map, credential_id: string) -> map {
+    let home: resource<auth.host_home> = context["host_home"];
+    let local: map = {
+        request: adapter_request,
+        profile: merged,
+        credential_id: credential_id,
+        host_home: home
+    };
+    profile::profile_dispatch(local)
+}
+
+fn route_without_home(adapter_request: map, merged: map, credential_id: string) -> map {
+    let local: map = {
+        request: adapter_request,
+        profile: merged,
+        credential_id: credential_id
+    };
+    profile::profile_dispatch(local)
 }

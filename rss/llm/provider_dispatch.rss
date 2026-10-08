@@ -3,6 +3,12 @@
 use auth;
 use self::types as types;
 use self::openai_opaque_chat::{run as opaque_chat_run};
+use super::providers::profile as profile;
+use super::providers::openrouter as openrouter;
+use super::providers::deepseek as deepseek;
+use super::providers::opencode_zen as opencode_zen;
+use super::providers::opencode_go as opencode_go;
+use super::providers::custom as custom;
 
 /// Public provider names that select the opaque OpenAI Chat entry. An empty
 /// provider is the canonical default and maps to the same entry.
@@ -20,26 +26,43 @@ fn is_openai_provider(provider: string) -> bool {
     selected
 }
 
+/// Known profile aliases route through the same-context profile call, which
+/// merges its public defaults and dispatches through admitted native auth.
+/// Unknown providers keep the existing unavailable guard.
 pub fn dispatch(context: map) -> map {
     let request: map = types::request_map(context, "request");
     let provider: string = types::request_string(request, "provider");
-    let result: map = if is_openai_provider(provider) == false => {
+    let result: map = if is_openai_provider(provider) => {
+        dispatch_openai_request(context, request)
+    } else if provider == "openrouter" => {
+        openrouter::call(context)
+    } else if provider == "deepseek" => {
+        deepseek::call(context)
+    } else if provider == "opencode_zen" => {
+        opencode_zen::call(context)
+    } else if provider == "opencode_go" => {
+        opencode_go::call(context)
+    } else if provider == "custom" => {
+        custom::call(context)
+    } else => {
         types::fail(types::error_request(
             "adapter_unavailable",
             "provider is unavailable for default opaque dispatch"
         ))
-    } else => {
-        let credential_id: string = types::request_string(request, "credential_id");
-        if credential_id == "" => {
-            types::fail(types::error_request(
-                "missing_credential",
-                "request.credential_id is required"
-            ))
-        } else => {
-            dispatch_openai_chat(context, request, credential_id)
-        }
     };
     result
+}
+
+fn dispatch_openai_request(context: map, request: map) -> map {
+    let credential_id: string = types::request_string(request, "credential_id");
+    if credential_id == "" => {
+        types::fail(types::error_request(
+            "missing_credential",
+            "request.credential_id is required"
+        ))
+    } else => {
+        dispatch_openai_chat(context, request, credential_id)
+    }
 }
 
 /// Builds the private local context and hands it to the opaque Chat entry. The
