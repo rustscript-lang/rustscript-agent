@@ -1,6 +1,8 @@
 use auth;
 use config;
+use oauth;
 use super::providers::opaque_bridge::{call as bridge_call, start_stream as bridge_start_stream};
+use super::providers::refresh as refresh_module;
 
 struct OpaqueProviderIntent {
     credential_id: string,
@@ -18,14 +20,289 @@ struct OpaquePolicyBinding {
     policy: resource<auth.policy>
 }
 
-pub fn call(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
+struct OpaqueRefreshIntent {
+    credential_id: string,
+    path: string,
+    public_body: string
+}
+
+struct ProviderRefreshResult {
+    ok: bool,
+    code: string,
+    outcome: string,
+    metadata: AuthMetadata?
+}
+
+struct PreflightReady {
+    policy: resource<auth.policy>
+}
+
+struct PreflightResult {
+    ok: bool,
+    error: AuthBridgeFailure?,
+    value: PreflightReady?,
+    did_refresh: bool
+}
+
+struct ProviderLookup {
+    found: bool,
+    provider: ProviderEntry
+}
+
+fn max_int() -> int {
+    9223372036854775807
+}
+
+fn empty_metadata() -> AuthMetadata {
+    {
+        credential_id: "",
+        provider: "",
+        kind: "",
+        source: "",
+        token_type: "",
+        expires_at_ms: 0,
+        scopes: [],
+        account_id: null,
+        generation: 0,
+        status: "",
+        last_refresh_at_ms: null,
+        has_refresh_token: false
+    }
+}
+
+fn empty_metadata_envelope() -> AuthMetadataEnvelope {
+    {ok: false, error: null, metadata: empty_metadata(), outcome: ""}
+}
+
+fn empty_provider() -> ProviderEntry {
+    {name: "", protocol: "", base_url: "", auth: null, oauth: null}
+}
+
+fn bridge_failure(code: string) -> AuthBridgeFailure {
+    {code: code, cancelled: false, deadline_exceeded: false, revoked: false}
+}
+
+fn failure_from_code(code: string) -> AuthBridgeFailure {
+    if code.copy() == "cancelled" => {
+        {code: code, cancelled: true, deadline_exceeded: false, revoked: false}
+    } else if code.copy() == "deadline_elapsed" => {
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
+    } else if code.copy() == "deadline_exceeded" => {
+        {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
+    } else => {
+        bridge_failure(code.copy())
+    }
+}
+
+fn find_text(value: string, needle: string) -> int {
+    let mut found: int = -1;
+    let mut index: int = 0;
+    while found < 0 && index + needle.length <= value.length {
+        if value[index:(index + needle.length)] == needle {
+            found = index;
+        }
+        index = index + 1;
+    }
+    found
+}
+
+fn safe_relative_path(value: string) -> bool {
+    value.length > 0 && value.length <= 2048 && value[0:1] == "/" &&
+    find_text(value, "//") != 0 && find_text(value, "..") < 0 &&
+    find_text(value, "://") < 0 && find_text(value, "?") < 0 && find_text(value, "#") < 0
+}
+
+fn token_path(endpoint: string) -> string? {
+    let mut selected_path: string? = null;
+    if find_text(endpoint, "https://") == 0 && find_text(endpoint, "?") < 0 &&
+       find_text(endpoint, "#") < 0 {
+        let authority_and_path: string = endpoint[8:];
+        let slash: int = find_text(authority_and_path, "/");
+        if slash < 0 {
+            if authority_and_path != "" && find_text(authority_and_path, "@") < 0 {
+                selected_path = "/";
+            }
+        } else {
+            let authority: string = authority_and_path.copy()[0:slash];
+            let path: string = authority_and_path[slash:];
+            if authority != "" && find_text(authority, "@") < 0 && safe_relative_path(path) {
+                selected_path = path;
+            }
+        }
+    }
+    selected_path
+}
+
+fn lookup_provider(public_config: BoundedPublicConfig, credential_id: string) -> ProviderLookup {
+    let providers = public_config.providers.copy();
+    let mut found: bool = false;
+    let mut selected: ProviderEntry = empty_provider();
+    let mut index: int = 0;
+    while index < providers.length && !found {
+        let candidate: ProviderEntry = providers[index].copy();
+        let auth_holder: string? = candidate.auth.copy();
+        if auth_holder != null {
+            let auth_id: string = auth_holder;
+            if auth_id == credential_id {
+                found = true;
+                selected = candidate;
+            }
+        }
+        index += 1;
+    }
+    {found: found, provider: selected}
+}
+
+fn preflight_failed(error: AuthBridgeFailure?) -> PreflightResult {
+    {ok: false, error: error, value: null, did_refresh: false}
+}
+
+fn preflight_ready(binding: OpaquePolicyBinding, refreshed: bool) -> PreflightResult {
+    {ok: true, error: null, value: {policy: binding.policy}, did_refresh: refreshed}
+}
+
+fn skew_ms_guarded(skew_seconds: int) -> int {
+    let mut skew_ms: int = 0;
+    if skew_seconds < 0 {
+        skew_ms = 0;
+    } else if skew_seconds > max_int() / 1000 {
+        skew_ms = max_int();
+    } else {
+        skew_ms = skew_seconds * 1000;
+    }
+    skew_ms
+}
+
+fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> PreflightResult {
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
-    let binding: OpaquePolicyBinding = { "policy": snapshot.policy_handle, };
-    bridge_call(binding, intent)
+    let snapshot_has_error: bool = snapshot.has("error");
+    let snapshot_ok: bool = snapshot.ok;
+    let snapshot_error: string? = if snapshot_has_error => { snapshot.error } else => { null };
+    if !snapshot_ok || snapshot_error != null => {
+        let code: string = snapshot_error.unwrap_or("auth_unavailable");
+        preflight_failed(failure_from_code(code))
+    } else => {
+        let policy_binding: OpaquePolicyBinding = {policy: snapshot.policy_handle};
+        let public_config: BoundedPublicConfig = snapshot.public_config;
+        let loaded: AuthMetadataResultEnvelope =
+            auth::load_metadata_result(credential_id.copy(), &policy_binding.policy);
+        if loaded.error.copy() != null => {
+            preflight_failed(loaded.error.copy())
+        } else if !loaded.ok => {
+            preflight_failed(bridge_failure("invalid_credential_metadata"))
+        } else => {
+            let maybe_envelope: AuthMetadataEnvelope? = loaded.value.copy();
+            if maybe_envelope == null => {
+                preflight_failed(bridge_failure("invalid_credential_metadata"))
+            } else => {
+                let envelope: AuthMetadataEnvelope =
+                    maybe_envelope.unwrap_or(empty_metadata_envelope());
+                if !envelope.ok.copy() || envelope.error.copy() != null || envelope.outcome.copy() != "loaded" => {
+                    preflight_failed(bridge_failure("invalid_credential_metadata"))
+                } else => {
+                    let metadata: AuthMetadata = envelope.metadata.copy();
+                    if metadata.credential_id.copy() != credential_id.copy() || metadata.generation.copy() < 0 || metadata.provider.copy() == "" || metadata.status.copy() != "active" => {
+                        preflight_failed(bridge_failure("invalid_credential_metadata"))
+                    } else if metadata.kind.copy() != "oauth" => {
+                        preflight_ready(policy_binding, false)
+                    } else => {
+                        let selected: ProviderLookup = lookup_provider(public_config, credential_id.copy());
+                        if !selected.found.copy() => {
+                            preflight_failed(bridge_failure("credential_not_admitted"))
+                        } else => {
+                            let provider: ProviderEntry = selected.provider.copy();
+                            if provider.name.copy() != metadata.provider.copy() => {
+                                preflight_failed(bridge_failure("credential_not_admitted"))
+                            } else => {
+                                let now_field: OAuthNowResultEnvelope = oauth::now_ms_result(&policy_binding.policy);
+                                if now_field.error.copy() != null => {
+                                    preflight_failed(now_field.error.copy())
+                                } else if !now_field.ok.copy() || now_field.value.copy() == null => {
+                                    preflight_failed(bridge_failure("clock_unavailable"))
+                                } else => {
+                                    let now_ms: int = now_field.value.copy();
+                                    if now_ms < 0 || now_ms > 9000000000000000 => {
+                                        preflight_failed(bridge_failure("clock_unavailable"))
+                                    } else if provider.oauth.copy() == null => {
+                                        if metadata.expires_at_ms.copy() > now_ms => {
+                                            preflight_ready(policy_binding, false)
+                                        } else => {
+                                            preflight_failed(bridge_failure("refresh_unavailable"))
+                                        }
+                                    } else => {
+                                        let oauth_config: OAuthConfig = provider.oauth.copy();
+                                        let skew_ms: int = skew_ms_guarded(oauth_config.refresh_skew_seconds);
+                                        let endpoint_holder: string? = oauth_config.token_endpoint;
+                                        let expires_at: int = metadata.expires_at_ms.copy();
+                                        let mut needs_refresh: bool = false;
+                                        if expires_at <= now_ms {
+                                            needs_refresh = true;
+                                        } else {
+                                            let remaining: int = expires_at - now_ms;
+                                            if remaining > 0 && remaining <= skew_ms {
+                                                needs_refresh = true;
+                                            }
+                                        }
+                                        if !needs_refresh => {
+                                            preflight_ready(policy_binding, false)
+                                        } else if !metadata.has_refresh_token.copy() || endpoint_holder == null => {
+                                            preflight_failed(bridge_failure("refresh_unavailable"))
+                                        } else => {
+                                            let path_holder: string? = token_path(endpoint_holder.unwrap_or(""));
+                                            if path_holder == null => {
+                                                preflight_failed(bridge_failure("refresh_unavailable"))
+                                            } else => {
+                                                let refresh_intent: OpaqueRefreshIntent = {
+                                                    credential_id: credential_id.copy(),
+                                                    path: path_holder.unwrap_or(""),
+                                                    public_body: "grant_type=refresh_token"
+                                                };
+                                                let refreshed: ProviderRefreshResult =
+                                                    refresh_module::refresh({home: binding.home}, refresh_intent);
+                                                if !refreshed.ok.copy() => {
+                                                    preflight_failed(failure_from_code(refreshed.code.copy()))
+                                                } else if refreshed.outcome.copy() != "committed" && refreshed.outcome.copy() != "adopted" => {
+                                                    preflight_failed(bridge_failure("refresh_failed"))
+                                                } else => {
+                                                    preflight_ready(policy_binding, true)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn call(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
+    let prepared: PreflightResult = preflight(binding, intent.credential_id.copy());
+    let has_value: bool = prepared.has("value");
+    let has_error: bool = prepared.has("error");
+    let ok: bool = prepared.ok;
+    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
+    if !ok || failure != null || !has_value => {
+        {ok: false, error: failure, value: null}
+    } else => {
+        let ready: PreflightReady = prepared.value;
+        bridge_call({policy: ready.policy}, intent)
+    }
 }
 
 pub fn start_stream(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent, markers: array<string>) -> OAuthStreamStartResultEnvelope {
-    let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
-    let policy_binding: OpaquePolicyBinding = {policy: snapshot.policy_handle};
-    bridge_start_stream(policy_binding, intent, markers)
+    let prepared: PreflightResult = preflight(binding, intent.credential_id.copy());
+    let has_value: bool = prepared.has("value");
+    let has_error: bool = prepared.has("error");
+    let ok: bool = prepared.ok;
+    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
+    if !ok || failure != null || !has_value => {
+        {ok: false, error: failure, value: null}
+    } else => {
+        let ready: PreflightReady = prepared.value;
+        bridge_start_stream({policy: ready.policy}, intent, markers)
+    }
 }

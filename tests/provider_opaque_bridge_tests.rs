@@ -84,6 +84,18 @@ impl ModuleTree {
             providers.join("opaque_bridge.rss"),
         )
         .expect("copy checked-in opaque bridge helper");
+        let auth = tree.join("rss/auth");
+        fs::create_dir_all(&auth).expect("create auth module directory");
+        fs::copy(
+            repo.join("rss/providers/refresh.rss"),
+            providers.join("refresh.rss"),
+        )
+        .expect("copy checked-in refresh dependency");
+        fs::copy(
+            repo.join("rss/auth/token_save.rss"),
+            auth.join("token_save.rss"),
+        )
+        .expect("copy checked-in refresh persistence dependency");
         Self(tree)
     }
 

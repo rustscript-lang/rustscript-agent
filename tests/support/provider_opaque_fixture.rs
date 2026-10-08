@@ -78,6 +78,82 @@ impl FixtureHome {
         Self { path: home }
     }
 
+    /// Fixture-only expiry override for actual refresh decisions.
+    pub fn with_expiry(self, credential: &str, expires_at_ms: i64) -> Self {
+        let path = self.path.join("auth.yaml");
+        let mut auth: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&path).expect("auth fixture"))
+                .expect("auth fixture YAML");
+        auth["credentials"][credential]["expires_at_ms"] =
+            serde_yaml::Value::Number(expires_at_ms.into());
+        fs::write(
+            &path,
+            serde_yaml::to_string(&auth).expect("auth fixture YAML"),
+        )
+        .expect("write fixture expiry");
+        self
+    }
+
+    /// Trusted test-side persistence readback; never supplied to a guest.
+    pub fn stored_auth(&self) -> serde_yaml::Value {
+        serde_yaml::from_str(
+            &fs::read_to_string(self.path.join("auth.yaml")).expect("stored auth fixture"),
+        )
+        .expect("stored auth YAML")
+    }
+
+    fn update_auth(&self, update: impl FnOnce(&mut serde_yaml::Value)) {
+        let path = self.path.join("auth.yaml");
+        let mut document = self.stored_auth();
+        update(&mut document);
+        fs::write(path, serde_yaml::to_string(&document).expect("auth YAML"))
+            .expect("write synthetic credential fixture");
+    }
+
+    pub fn without_refresh_token(self, credential: &str) -> Self {
+        self.update_auth(|document| {
+            document["credentials"][credential]
+                .as_mapping_mut()
+                .expect("credential")
+                .remove(serde_yaml::Value::String("refresh_token".to_string()));
+        });
+        self
+    }
+
+    pub fn with_api_key(self, credential: &str) -> Self {
+        self.update_auth(|document| {
+            document["credentials"][credential]["kind"] =
+                serde_yaml::Value::String("api_key".to_string());
+        });
+        self.without_refresh_token(credential)
+    }
+
+    pub fn without_oauth_configuration(self, provider: &str) -> Self {
+        let path = self.path.join("config.yaml");
+        let mut config: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&path).expect("config fixture"))
+                .expect("config YAML");
+        config["providers"][provider]
+            .as_mapping_mut()
+            .expect("provider")
+            .remove(serde_yaml::Value::String("oauth".to_string()));
+        fs::write(path, serde_yaml::to_string(&config).expect("config YAML"))
+            .expect("write trusted fixture without OAuth configuration");
+        self
+    }
+
+    pub fn with_refresh_skew_seconds(self, provider: &str, seconds: i64) -> Self {
+        let path = self.path.join("config.yaml");
+        let mut config: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&path).expect("config fixture"))
+                .expect("config YAML");
+        config["providers"][provider]["oauth"]["refresh_skew_seconds"] =
+            serde_yaml::Value::Number(seconds.into());
+        fs::write(path, serde_yaml::to_string(&config).expect("config YAML"))
+            .expect("write trusted fixture refresh skew");
+        self
+    }
+
     pub fn auth_factory<T: BoundedHttpsTransport + 'static>(
         &self,
         transport: Arc<T>,
