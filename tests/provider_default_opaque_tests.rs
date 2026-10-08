@@ -2,6 +2,9 @@
 
 #![cfg(feature = "config-fixture")]
 
+#[path = "support/opaque_chat_stream.rs"]
+mod opaque_chat_stream;
+
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -376,36 +379,45 @@ fn default_provider_missing_credential_is_canonical_and_sends_nothing() {
 }
 
 #[test]
-fn default_provider_guards_unsupported_stream_and_private_options_without_send() {
-    let cases: [(&str, JsonValue, &str); 3] = [
+fn default_provider_guards_unsupported_provider_and_private_options_without_start() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let cases: [(&str, bool, JsonValue, &str); 3] = [
         (
             "unsupported-provider",
+            false,
             json!("anthropic"),
             "adapter_unavailable",
         ),
-        ("streaming", json!(true), "adapter_unavailable"),
         (
             "private-options",
+            false,
+            json!({"api_key": "SYNTHETIC_PRIVATE_OPTION_MARKER"}),
+            "config",
+        ),
+        (
+            "private-options-stream",
+            true,
             json!({"api_key": "SYNTHETIC_PRIVATE_OPTION_MARKER"}),
             "config",
         ),
     ];
 
-    for (label, mutation, expected_code) in cases {
+    for (label, stream, mutation, expected_code) in cases {
         let home = FixtureHome::new();
-        let transport = Arc::new(ScriptedHttpsTransport::new());
+        let transport = Arc::new(StreamTransport::new(
+            200,
+            "text/event-stream",
+            vec![b"data: [DONE]\n\n".to_vec()],
+            false,
+        ));
         let runner = outer_runner(&home, transport.clone(), finite());
         let mut request = public_request();
-        match label {
-            "unsupported-provider" => {
-                request["provider"] = mutation;
-            }
-            "streaming" => {
-                request["stream"] = mutation;
-            }
-            _ => {
-                request["provider_options"] = mutation;
-            }
+        request["stream"] = json!(stream);
+        if label == "unsupported-provider" {
+            request["provider"] = mutation;
+        } else {
+            request["provider_options"] = mutation;
         }
 
         let result = vm_value_to_json(&runner.run_with_context(context(request)).unwrap_or_else(
@@ -413,8 +425,18 @@ fn default_provider_guards_unsupported_stream_and_private_options_without_send()
         ));
         assert_eq!(result["ok"], json!(false), "{label} guard must fail closed");
         assert_eq!(result["error"]["code"], json!(expected_code), "{label}");
+        assert_eq!(
+            transport.counts.starts.load(Ordering::SeqCst),
+            0,
+            "{label} guard must not start a stream"
+        );
         assert!(
-            transport.take_sent().is_empty(),
+            transport
+                .counts
+                .sent
+                .lock()
+                .expect("recorded native request")
+                .is_empty(),
             "{label} guard must not reach the native transport"
         );
         assert!(
@@ -422,6 +444,48 @@ fn default_provider_guards_unsupported_stream_and_private_options_without_send()
                 .to_string()
                 .contains("SYNTHETIC_PRIVATE_OPTION_MARKER")
         );
+    }
+}
+
+#[test]
+fn default_provider_stream_credential_guards_start_nothing() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let cases: [(&str, &str); 2] = [
+        ("", "missing_credential"),
+        ("not-admitted", "credential_not_admitted"),
+    ];
+    for (credential, expected_code) in cases {
+        let home = FixtureHome::new();
+        let transport = Arc::new(StreamTransport::new(
+            200,
+            "text/event-stream",
+            vec![b"data: [DONE]\n\n".to_vec()],
+            false,
+        ));
+        let runner = outer_runner(&home, transport.clone(), finite());
+        let mut request = public_request();
+        request["stream"] = json!(true);
+        request["credential_id"] = json!(credential);
+        let result = vm_value_to_json(&runner.run_with_context(context(request)).unwrap_or_else(
+            |error| panic!("credential guard must return a canonical value: {error}"),
+        ));
+        assert_eq!(result["ok"], json!(false), "{expected_code}");
+        assert_eq!(result["error"]["code"], json!(expected_code));
+        assert_eq!(
+            transport.counts.starts.load(Ordering::SeqCst),
+            0,
+            "credential guard must not start a stream"
+        );
+        assert!(
+            transport
+                .counts
+                .sent
+                .lock()
+                .expect("recorded native request")
+                .is_empty()
+        );
+        assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
     }
 }
 
@@ -490,4 +554,113 @@ fn default_provider_child_inherits_caller_finite_cancellation() {
         }
     }
     worker.join().expect("cancellation worker join");
+}
+
+#[test]
+fn default_provider_dispatches_opaque_openai_stream_with_indexed_tool_fragments() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Found \"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one match.\"},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_default\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"qu\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_default\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"ery\\\":\\\"rustscript\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec()],
+        false,
+    ));
+    let runner = outer_runner(&home, transport.clone(), finite());
+    let mut request = public_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(&runner.run_with_context(context(request)).unwrap_or_else(
+        |error| {
+            panic!(
+                "default dispatch stream failed: {error}; starts={}, drops={}",
+                transport.counts.starts.load(Ordering::SeqCst),
+                transport.counts.drops.load(Ordering::SeqCst)
+            )
+        },
+    ));
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "unexpected default stream result: {result}"
+    );
+    assert_eq!(result["response"]["text"], json!("Found one match."));
+    assert_eq!(result["response"]["stop_reason"], json!("tool_calls"));
+    assert_eq!(result["response"]["usage"]["input_tokens"], json!(3));
+    assert_eq!(result["response"]["usage"]["output_tokens"], json!(4));
+    assert_eq!(result["response"]["usage"]["total_tokens"], json!(7));
+    assert_eq!(
+        result["response"]["tool_calls"][0]["id"],
+        json!("call_default")
+    );
+    assert_eq!(result["response"]["tool_calls"][0]["name"], json!("lookup"));
+    assert_eq!(
+        result["response"]["tool_calls"][0]["arguments"]["query"],
+        json!("rustscript"),
+        "indexed tool fragments must accumulate: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.eof.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.counts.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.drops.load(Ordering::SeqCst), 1);
+
+    let sent = transport.counts.sent.lock().expect("native request");
+    assert_eq!(sent.len(), 1, "exactly one admitted stream start");
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(
+        sent[0].url, "https://api.openai.com/v1/chat/completions",
+        "native trusted authority must win over the public hostile base_url"
+    );
+    assert!(
+        sent[0]
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value == "Bearer SYNTHETIC_OPENAI_ACCESS"),
+        "native authorization must match the stored synthetic credential"
+    );
+    assert_eq!(
+        sent[0].headers.get("accept").map(String::as_str),
+        Some("text/event-stream")
+    );
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("public stream body");
+    assert_eq!(wire["model"], json!("request-model"));
+    assert_eq!(wire["stream"], json!(true));
+    assert_eq!(wire["stream_options"]["include_usage"], json!(true));
+    assert_eq!(wire["temperature"], json!(0.25));
+    assert_eq!(wire["max_tokens"], json!(64));
+    assert_eq!(
+        wire["messages"][0]["content"][0]["text"],
+        json!("hello default dispatch")
+    );
+    assert_eq!(wire["tools"][0]["type"], json!("function"));
+    assert_eq!(wire["tools"][0]["function"]["name"], json!("lookup"));
+    assert_eq!(
+        wire["tools"][0]["function"]["parameters"],
+        json!({"type":"object","properties":{"query":{"type":"string"}}}),
+        "tool schema must be spliced raw into the stream body"
+    );
+    drop(sent);
+
+    let rendered = result.to_string();
+    for secret in [
+        "SYNTHETIC_OPENAI_ACCESS",
+        "SYNTHETIC_REFRESH_TOKEN",
+        "host_home",
+        "hostile-public-model",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "public canonical result leaked {secret}"
+        );
+    }
 }

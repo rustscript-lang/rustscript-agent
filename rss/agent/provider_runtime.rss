@@ -1,6 +1,6 @@
 use auth;
 use config;
-use super::providers::opaque_bridge::{call as bridge_call};
+use super::providers::opaque_bridge::{call as bridge_call, start_stream as bridge_start_stream};
 
 struct OpaqueProviderIntent {
     credential_id: string,
@@ -22,4 +22,10 @@ pub fn call(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent) -> Tra
     let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
     let binding: OpaquePolicyBinding = { "policy": snapshot.policy_handle, };
     bridge_call(binding, intent)
+}
+
+pub fn start_stream(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent, markers: array<string>) -> OAuthStreamStartResultEnvelope {
+    let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
+    let policy_binding: OpaquePolicyBinding = {policy: snapshot.policy_handle};
+    bridge_start_stream(policy_binding, intent, markers)
 }

@@ -13,6 +13,17 @@ struct OpaquePolicyBinding {
     policy: resource<auth.policy>
 }
 
+struct PreparedProviderTransport {
+    request: TransportPublicRequest,
+    usage: TransportCredentialUse
+}
+
+struct PreparedProviderTransportResult {
+    ok: bool,
+    error: AuthBridgeFailure?,
+    value: PreparedProviderTransport?
+}
+
 struct AccessHandlePresence {
     handle: resource<auth.access>?
 }
@@ -51,7 +62,7 @@ fn empty_access_envelope() -> AccessHandleEnvelope {
     }
 }
 
-fn invalid_metadata_result() -> TransportResultEnvelope {
+fn invalid_metadata_result() -> PreparedProviderTransportResult {
     let failure: AuthBridgeFailure = {
         code: "invalid_credential_metadata",
         cancelled: false,
@@ -65,7 +76,7 @@ fn invalid_metadata_result() -> TransportResultEnvelope {
     }
 }
 
-fn access_unavailable_result() -> TransportResultEnvelope {
+fn access_unavailable_result() -> PreparedProviderTransportResult {
     let failure: AuthBridgeFailure = {
         code: "access_unavailable",
         cancelled: false,
@@ -79,7 +90,7 @@ fn access_unavailable_result() -> TransportResultEnvelope {
     }
 }
 
-pub fn call(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
+fn prepare(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> PreparedProviderTransportResult {
     let loaded: AuthMetadataResultEnvelope =
         auth::load_metadata_result(intent.credential_id, &binding.policy);
     if loaded.error.copy() != null => {
@@ -139,10 +150,38 @@ pub fn call(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> Trans
                             verifier_handle: null,
                             device_handle: null
                         };
-                        oauth::transport_result(&request, &usage)
+                        {ok: true, error: null, value: {request: request, usage: usage}}
                     }
                 }
             }
         }
+    }
+}
+
+pub fn call(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
+    let prepared: PreparedProviderTransportResult = prepare(binding, intent);
+    let has_value: bool = prepared.has("value");
+    let has_error: bool = prepared.has("error");
+    let ok: bool = prepared.ok;
+    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
+    if !ok || failure != null || !has_value => {
+        {ok: false, error: failure, value: null}
+    } else => {
+        let inner: PreparedProviderTransport = prepared.value;
+        oauth::transport_result(&inner.request, &inner.usage)
+    }
+}
+
+pub fn start_stream(binding: OpaquePolicyBinding, intent: OpaqueProviderIntent, markers: array<string>) -> OAuthStreamStartResultEnvelope {
+    let prepared: PreparedProviderTransportResult = prepare(binding, intent);
+    let has_value: bool = prepared.has("value");
+    let has_error: bool = prepared.has("error");
+    let ok: bool = prepared.ok;
+    let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
+    if !ok || failure != null || !has_value => {
+        {ok: false, error: failure, value: null}
+    } else => {
+        let inner: PreparedProviderTransport = prepared.value;
+        oauth::stream_start_result(&inner.request, &inner.usage, markers)
     }
 }

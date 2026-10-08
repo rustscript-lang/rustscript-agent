@@ -1,5 +1,8 @@
 #![cfg(feature = "config-fixture")]
 
+#[path = "support/opaque_chat_stream.rs"]
+mod opaque_chat_stream;
+
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -10,8 +13,8 @@ use std::time::Duration;
 use rustscript_agent::auth::{
     host::AuthHost,
     oauth::{
-        OAuthHost, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
-        ScriptedHttpsTransport,
+        BoundedHttpsTransport, OAuthHost, ScriptedBrowser, ScriptedCallback, ScriptedCancel,
+        ScriptedClock, ScriptedHttpsTransport,
     },
 };
 use rustscript_agent::{AgentConfig, AgentHostBridges, AgentRunner, RunCancellation};
@@ -63,12 +66,27 @@ impl Drop for FixtureHome {
     }
 }
 
-fn fixture_runner(home: &FixtureHome, transport: Arc<ScriptedHttpsTransport>) -> AgentRunner {
+fn fixture_runner<T: BoundedHttpsTransport + 'static>(
+    home: &FixtureHome,
+    transport: Arc<T>,
+) -> AgentRunner {
+    fixture_runner_with_clock(
+        home,
+        transport,
+        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+    )
+}
+
+fn fixture_runner_with_clock<T: BoundedHttpsTransport + 'static>(
+    home: &FixtureHome,
+    transport: Arc<T>,
+    clock: Arc<ScriptedClock>,
+) -> AgentRunner {
     let oauth = Arc::new(OAuthHost::new(
         transport,
         Arc::new(ScriptedCallback::new()),
         Arc::new(ScriptedBrowser::new()),
-        Arc::new(ScriptedClock::new(1_900_000_000_000)),
+        clock,
         Arc::new(ScriptedCancel::new()),
     ));
     let home_path = home.0.clone();
@@ -343,16 +361,344 @@ fn opaque_openai_chat_rejects_missing_model_before_native_send() {
 }
 
 #[test]
-fn opaque_openai_chat_rejects_streaming_without_downgrade_or_send() {
+fn opaque_chat_stream_guards_reject_before_any_start() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let cases: [(&str, &str, Option<JsonValue>, &str); 3] = [
+        ("empty-credential", "", None, "credential_not_admitted"),
+        (
+            "unadmitted-credential",
+            "not-admitted",
+            None,
+            "credential_not_admitted",
+        ),
+        (
+            "private-options",
+            "synthetic-openai",
+            Some(json!({"api_key": "SYNTHETIC_PRIVATE_OPTION_MARKER"})),
+            "config",
+        ),
+    ];
+    for (label, credential, private_options, expected) in cases {
+        let home = FixtureHome::new();
+        let transport = Arc::new(StreamTransport::new(
+            200,
+            "text/event-stream",
+            vec![b"data: [DONE]\n\n".to_vec()],
+            false,
+        ));
+        let runner = fixture_runner(&home, Arc::clone(&transport));
+        let mut request = canonical_request();
+        request["stream"] = json!(true);
+        if let Some(options) = private_options {
+            request["provider_options"] = options;
+        }
+        let result = vm_value_to_json(
+            &runner
+                .run_with_context(context(request, public_profile(), credential))
+                .unwrap_or_else(|error| {
+                    panic!("{label} guard must return a canonical value: {error}")
+                }),
+        );
+        assert_eq!(result["ok"], json!(false), "{label} guard must fail closed");
+        assert_eq!(result["error"]["code"], json!(expected), "{label}");
+        assert_eq!(
+            transport.counts.starts.load(Ordering::SeqCst),
+            0,
+            "{label} must not start a stream"
+        );
+        assert!(
+            transport
+                .counts
+                .sent
+                .lock()
+                .expect("recorded native request")
+                .is_empty(),
+            "{label} must not reach the native transport"
+        );
+        let rendered = result.to_string();
+        assert!(!rendered.contains("SYNTHETIC_OPENAI_ACCESS"), "{label}");
+        assert!(
+            !rendered.contains("SYNTHETIC_PRIVATE_OPTION_MARKER"),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn opaque_chat_stream_eof_without_done_after_partial_text_fails_closed() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
     let home = FixtureHome::new();
-    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial text\"}}]}\n\n"
+                .to_vec(),
+        ],
+        true,
+    ));
+    let runner = fixture_runner(&home, Arc::clone(&transport));
     let mut request = canonical_request();
     request["stream"] = json!(true);
-    let result = run_request(&home, Arc::clone(&transport), request);
-
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("EOF without DONE must return a canonical public failure"),
+    );
     assert_eq!(result["ok"], json!(false));
-    assert_eq!(result["error"]["code"], json!("adapter_unavailable"));
-    assert!(transport.take_sent().is_empty());
+    assert_eq!(result["error"]["code"], json!("stream_eof_without_done"));
+    assert_ne!(
+        result["response"]["text"],
+        json!("partial text"),
+        "EOF without DONE must never publish partial success"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn opaque_chat_stream_semantic_invalid_object_is_static_public_failure() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![b"data: {\"id\":\"bounded-but-incomplete\"}\n\n".to_vec()],
+        false,
+    ));
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("semantic stream failure must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_payload"));
+    assert!(
+        !result.to_string().contains("bounded-but-incomplete"),
+        "the offending stream object must not be echoed: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn opaque_chat_stream_non_json_record_fails_closed_without_echo() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![b"data: not-strict-json\n\n".to_vec()],
+        false,
+    ));
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("strict non-JSON record must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_response"));
+    assert!(
+        !result.to_string().contains("not-strict-json"),
+        "raw stream data must not be echoed: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn opaque_chat_stream_injected_read_failure_detail_is_not_echoed() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(
+        StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_read_error("SYNTHETIC_PRIVATE_READ_DETAIL"),
+    );
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("injected transport read failure must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("transport_error"));
+    assert_eq!(
+        result["error"]["message"],
+        json!("provider transport failed")
+    );
+    assert!(
+        !result.to_string().contains("SYNTHETIC_PRIVATE_READ_DETAIL"),
+        "injected transport detail must not be published: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn opaque_chat_stream_http_errors_use_existing_status_classification() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let cases: [(u16, &str, bool); 2] = [
+        (401, "invalid_request_error", false),
+        (429, "rate_limit_error", true),
+    ];
+    for (status, error_type, retryable) in cases {
+        let home = FixtureHome::new();
+        let body = json!({
+            "error": {
+                "type": error_type,
+                "code": "SYNTHETIC_PRIVATE_CODE_FIELD",
+                "message": "Synthetic provider rejection",
+                "api_key": "SYNTHETIC_PRIVATE_OPTION_MARKER"
+            }
+        });
+        let transport = Arc::new(StreamTransport::new(
+            status,
+            "application/json",
+            vec![body.to_string().into_bytes()],
+            true,
+        ));
+        let runner = fixture_runner(&home, Arc::clone(&transport));
+        let mut request = canonical_request();
+        request["stream"] = json!(true);
+        let result = vm_value_to_json(
+            &runner
+                .run_with_context(context(request, public_profile(), "synthetic-openai"))
+                .unwrap_or_else(|error| {
+                    panic!("HTTP {status} must return a public failure: {error}")
+                }),
+        );
+        assert_eq!(result["ok"], json!(false), "HTTP {status}");
+        assert_eq!(result["error"]["status"], json!(status), "HTTP {status}");
+        assert_eq!(result["error"]["type"], json!(error_type), "HTTP {status}");
+        assert_eq!(
+            result["error"]["code"],
+            json!("http_error"),
+            "HTTP {status}"
+        );
+        assert_eq!(
+            result["error"]["retryable"],
+            json!(retryable),
+            "HTTP {status} retryability"
+        );
+        assert_eq!(
+            result["error"]["message"],
+            json!("Synthetic provider rejection"),
+            "HTTP {status}"
+        );
+        assert_eq!(
+            transport.counts.starts.load(Ordering::SeqCst),
+            1,
+            "HTTP {status} must start exactly once with no retry"
+        );
+        assert!(
+            transport.counts.drops.load(Ordering::SeqCst) >= 1,
+            "HTTP {status} must close the stream resource"
+        );
+        let rendered = result.to_string();
+        assert!(
+            !rendered.contains("SYNTHETIC_PRIVATE_CODE_FIELD"),
+            "HTTP {status}"
+        );
+        assert!(
+            !rendered.contains("SYNTHETIC_PRIVATE_OPTION_MARKER"),
+            "HTTP {status}"
+        );
+        assert!(
+            !rendered.contains("SYNTHETIC_OPENAI_ACCESS"),
+            "HTTP {status}"
+        );
+    }
+}
+
+#[test]
+fn opaque_chat_stream_unsupported_mime_fails_closed_without_echo() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/plain",
+        vec![b"data: {\"choices\":[]}\n\n".to_vec()],
+        true,
+    ));
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("unsupported MIME must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_response"));
+    assert!(
+        !result.to_string().contains("text/plain"),
+        "raw media type must not be published: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn opaque_chat_stream_deadline_expiry_during_live_stream_has_no_partial_success() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+    let transport = Arc::new(
+        StreamTransport::new(
+            200,
+            "text/event-stream",
+            vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial text\"}}]}\n\n"
+                    .to_vec(),
+            ],
+            false,
+        )
+        .with_read_callback({
+            let clock = Arc::clone(&clock);
+            move || clock.expire()
+        }),
+    );
+    let runner = fixture_runner_with_clock(&home, Arc::clone(&transport), clock);
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(request, public_profile(), "synthetic-openai"))
+            .expect("stream expiry must stay a canonical public value"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    let code = result["error"]["code"].clone();
+    assert!(
+        code == json!("deadline_exceeded") || code == json!("cancelled"),
+        "unexpected stream expiry code: {code}"
+    );
+    assert_ne!(
+        result["response"]["text"],
+        json!("partial text"),
+        "expiry during a live stream must never publish partial success"
+    );
+    assert_eq!(
+        transport.counts.starts.load(Ordering::SeqCst),
+        1,
+        "expiry must not trigger a second start"
+    );
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
 }
 
 #[test]
@@ -422,5 +768,104 @@ fn opaque_openai_chat_preserves_unadmitted_credential_failure_without_send() {
         json!("provider transport failed")
     );
     assert!(transport.take_sent().is_empty());
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
+}
+
+#[test]
+fn opaque_chat_stream_json_array_is_public_failure_and_closes_reader() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![b"data: [1,2]\n\n".to_vec()],
+        false,
+    ));
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(
+                request,
+                json!({"provider":"openai"}),
+                "synthetic-openai",
+            ))
+            .expect("valid JSON array must yield public failure, not VM abort"),
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_payload"));
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.eof.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.counts.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn opaque_chat_stream_finishes_before_eof_with_native_auth() {
+    use opaque_chat_stream::StreamTransport;
+    use std::sync::atomic::Ordering;
+    let home = FixtureHome::new();
+    let transport = Arc::new(StreamTransport::new(
+        200, "text/event-stream",
+        vec![concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" stream\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n"
+        ).as_bytes().to_vec()], false,
+    ));
+    let runner = fixture_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request();
+    request["stream"] = json!(true);
+    let result = vm_value_to_json(
+        &runner
+            .run_with_context(context(
+                request,
+                json!({"provider":"openai","base_url":"https://ignored.invalid"}),
+                "synthetic-openai",
+            ))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "stream call failed: {error}; starts={}, reads={}, drops={}",
+                    transport.counts.starts.load(Ordering::SeqCst),
+                    transport.counts.reads.load(Ordering::SeqCst),
+                    transport.counts.drops.load(Ordering::SeqCst)
+                )
+            }),
+    );
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "stream call must succeed; public code={}",
+        result["error"]["code"]
+    );
+    assert_eq!(result["response"]["text"], json!("Hello stream"));
+    assert_eq!(result["response"]["usage"]["total_tokens"], json!(7));
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.eof.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.counts.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.drops.load(Ordering::SeqCst), 1);
+    let sent = transport.counts.sent.lock().expect("native request");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(sent[0].url, "https://api.openai.com/v1/chat/completions");
+    assert!(
+        sent[0]
+            .headers
+            .get("authorization")
+            .is_some_and(|s| s == "Bearer SYNTHETIC_OPENAI_ACCESS"),
+        "native authorization must match stored synthetic credential"
+    );
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("public stream body");
+    assert_eq!(wire["stream"], json!(true));
+    assert_eq!(wire["stream_options"]["include_usage"], json!(true));
+    assert_eq!(
+        wire["messages"][0]["content"][0]["text"],
+        json!("hello opaque Chat")
+    );
     assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
 }
