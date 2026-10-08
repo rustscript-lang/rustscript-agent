@@ -48,6 +48,7 @@ mod flow;
 mod paths;
 mod payload;
 mod public_json;
+mod stream;
 mod timing;
 mod transients;
 
@@ -1428,6 +1429,9 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             flow::close_callback_desc,
             flow::close_verifier_desc,
             flow::close_code_desc,
+            stream::stream_start_result_desc,
+            stream::stream_read_result_desc,
+            stream::stream_close_desc,
         ],
         resources: &[
             host_home_meta,
@@ -1440,6 +1444,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
             flow::callback_meta,
             flow::verifier_meta,
             flow::code_meta,
+            stream::stream_meta,
         ],
     }
 }
