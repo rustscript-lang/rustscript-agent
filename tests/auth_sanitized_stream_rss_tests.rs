@@ -1064,3 +1064,66 @@ fn guest_stream_same_vm_rebind_is_structurally_unreachable() {
     assert_eq!(field(&read, "kind"), &Value::string("json"), "{read:?}");
     assert_eq!(locked(&state).starts, 1);
 }
+
+#[test]
+fn guest_stream_foreign_vm_rejects_handle_without_reading_or_closing_owner_stream() {
+    let (transport, state) =
+        event_stream(200, vec![Injected::Chunk(b"data: {\"a\":1}\n\n".to_vec())]);
+    let home = PrivateHome::new();
+    let (host, catalog) = native_host(
+        &home,
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+        transport,
+    );
+    let mut owner_vm = fixture_vm(&host, catalog.as_ref());
+    let policy = bind_policy(&host, &mut owner_vm);
+    let opened = invoke(
+        &mut owner_vm,
+        "stream_open_result",
+        &start_args(&policy, markers(&[])),
+    )
+    .expect("open owner stream");
+    assert_eq!(field(&opened, "ok"), &Value::Bool(true));
+    let stream = field(&opened, "stream").clone();
+    assert_eq!(locked(&state).reads, 0);
+
+    let (foreign_transport, foreign_state) = event_stream(200, vec![Injected::Eof]);
+    let foreign_home = PrivateHome::new();
+    let (foreign_host, foreign_catalog) = native_host(
+        &foreign_home,
+        RunCancellation::with_timeout(Duration::from_secs(30)),
+        foreign_transport,
+    );
+    let mut foreign_vm = fixture_vm(&foreign_host, foreign_catalog.as_ref());
+    let _foreign_policy = bind_policy(&foreign_host, &mut foreign_vm);
+    let foreign_count = foreign_vm.host_context().resource_count();
+    let failure = invoke(
+        &mut foreign_vm,
+        "stream_read_one_result",
+        std::slice::from_ref(&stream),
+    )
+    .expect_err("foreign arena cannot read an owner stream");
+    assert!(
+        failure.to_string().contains("resource_handle_wrong_table"),
+        "unexpected foreign arena failure: {failure}"
+    );
+    assert_eq!(foreign_vm.host_context().resource_count(), foreign_count);
+    assert_eq!(locked(&state).reads, 0);
+    assert_eq!(locked(&state).cancels, 0);
+    assert_eq!(locked(&state).drops, 0);
+    assert_eq!(locked(&foreign_state).starts, 0);
+    assert_eq!(locked(&foreign_state).reads, 0);
+
+    let read = invoke(
+        &mut owner_vm,
+        "stream_read_one_result",
+        std::slice::from_ref(&stream),
+    )
+    .expect("owner stream remains readable");
+    assert_eq!(field(&read, "ok"), &Value::Bool(true));
+    assert_eq!(field(&read, "json"), &Value::string("{\"a\":1}"));
+    assert_eq!(locked(&state).reads, 1);
+    invoke(&mut owner_vm, "stream_close", &[stream]).expect("owner closes stream");
+    assert!(locked(&state).cancels >= 1);
+    assert!(locked(&state).drops >= 1);
+}
