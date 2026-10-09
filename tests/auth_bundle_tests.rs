@@ -904,6 +904,26 @@ fn aliased_public_login_run_executes_in_the_closed_bundle_and_returns_auth_metad
             include_str!("../rss/auth/codex_device.rss"),
         ),
         ("rss/auth/types.rss", include_str!("../rss/auth/types.rss")),
+        (
+            "rss/auth/pkce_login.rss",
+            include_str!("../rss/auth/pkce_login.rss"),
+        ),
+        (
+            "rss/auth/pkce_instruction_session.rss",
+            include_str!("../rss/auth/pkce_instruction_session.rss"),
+        ),
+        (
+            "rss/auth/pkce_session.rss",
+            include_str!("../rss/auth/pkce_session.rss"),
+        ),
+        (
+            "rss/auth/token_metadata.rss",
+            include_str!("../rss/auth/token_metadata.rss"),
+        ),
+        (
+            "rss/auth/token_save.rss",
+            include_str!("../rss/auth/token_save.rss"),
+        ),
     ];
 
     let runner = AuthEntryRunner::from_bundle(ENTRY, SOURCES)
