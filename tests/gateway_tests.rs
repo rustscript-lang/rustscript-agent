@@ -266,12 +266,13 @@ async fn run_returns_202_and_sse_contains_terminal_events() {
         ],
         "default bundled main.rss SSE events: {text}"
     );
-    assert!(text.contains("\"error_code\":\"adapter_failed\""), "{text}");
+    assert!(
+        text.contains("\"error_code\":\"auth_unavailable\""),
+        "{text}"
+    );
     assert!(text.contains("\"error_code\":\"agent_failed\""), "{text}");
     assert!(
-        text.contains(
-            "\"error_message\":\"run host failure: invalid HTTP URL: relative URL without a base\""
-        ),
+        text.contains("\"error_message\":\"native auth host is unavailable for default provider\""),
         "{text}"
     );
     assert!(text.contains(run_id), "{text}");
