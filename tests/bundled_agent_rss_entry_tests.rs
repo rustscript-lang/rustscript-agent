@@ -1,11 +1,4 @@
-//! Behavioral tests for RSS-owned agent source selection through AgentRunner.
-//!
-//! Every case invokes the checked-in production policy
-//! `rss/agent/source_policy.rss` through `AgentRunner::from_file` and the real
-//! VM entry `run(context)`; only the business selection/error/deprecation
-//! outcome is asserted. The success map omits `error`; the failure map omits
-//! `source`/`descriptor` and never echoes hostile input (v2 optional-output
-//! contract).
+//! RSS source selection through the production AgentRunner.
 
 use rustscript_agent::{AgentConfig, AgentRunner};
 use rustscript_vm::Value as VmValue;
@@ -73,7 +66,6 @@ fn decide(context: JsonValue) -> JsonValue {
     vm_to_json(&result)
 }
 
-/// Expected failure decision: ok/deprecated_override/error only.
 fn failure(code: &str, message: &str) -> JsonValue {
     json!({
         "ok": false,
@@ -100,18 +92,9 @@ fn file_success(source: &str, path: &str, deprecated_override: bool) -> JsonValu
     })
 }
 
-// ---------------------------------------------------------------------------
-// Default source
-// ---------------------------------------------------------------------------
-
 #[test]
 fn absent_and_null_source_select_bundled_coding() {
-    let expected = json!({
-        "ok": true,
-        "source": "bundled:coding",
-        "descriptor": {"kind": "bundled", "resource": "coding"},
-        "deprecated_override": false
-    });
+    let expected = bundled_success();
 
     assert_eq!(decide(json!({})), expected);
     assert_eq!(
@@ -119,10 +102,6 @@ fn absent_and_null_source_select_bundled_coding() {
         expected
     );
 }
-
-// ---------------------------------------------------------------------------
-// Explicit source selection
-// ---------------------------------------------------------------------------
 
 #[test]
 fn explicit_bundled_source_is_selected() {
@@ -144,14 +123,13 @@ fn explicit_file_source_is_selected() {
 fn explicit_file_source_preserves_spaces_and_unicode() {
     let path = "/srv/エージェント dir/my agent.rss";
     assert_eq!(
-        decide(json!({"source": format!("file:{path}")})),
+        decide(json!({
+            "source": format!("file:{path}"),
+            "legacy_script": "/legacy/agent.rss"
+        })),
         file_success(&format!("file:{path}"), path, false)
     );
 }
-
-// ---------------------------------------------------------------------------
-// Explicit source precedence over legacy
-// ---------------------------------------------------------------------------
 
 #[test]
 fn explicit_bundled_source_beats_valid_legacy() {
@@ -169,10 +147,6 @@ fn explicit_file_source_beats_valid_legacy() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Legacy absolute raw path migration
-// ---------------------------------------------------------------------------
-
 #[test]
 fn legacy_absolute_raw_path_migrates_to_file_source() {
     let raw = "/legacy/エージェント dir/agent.rss";
@@ -189,10 +163,6 @@ fn null_source_falls_back_to_valid_legacy() {
         file_success("file:/legacy/agent.rss", "/legacy/agent.rss", true)
     );
 }
-
-// ---------------------------------------------------------------------------
-// Explicit invalid/unsupported source (authoritative; never falls back)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn explicit_non_string_source_is_invalid_without_fallback() {
@@ -256,23 +226,31 @@ fn oversized_explicit_source_is_invalid() {
         decide(json!({"source": oversized})),
         failure("invalid_agent_source", "agent source is invalid")
     );
+    for scalar in ["a", "界"] {
+        let source = format!("file:/{}", scalar.repeat(4091));
+        assert_eq!(source.chars().count(), 4097);
+        assert_eq!(
+            decide(json!({"source": source})),
+            failure("invalid_agent_source", "agent source is invalid")
+        );
+    }
 }
 
 #[test]
 fn explicit_file_source_at_scalar_limit_is_accepted() {
-    // 4096 Unicode scalars is within the inclusive scalar limit.
-    let path = format!("/{}", "a".repeat(4090));
-    let source = format!("file:{path}");
-    assert_eq!(source.chars().count(), 4096);
-    assert_eq!(
-        decide(json!({"source": source})),
-        file_success(&format!("file:{path}"), &path, false)
-    );
+    for scalar in ["a", "界"] {
+        let path = format!("/{}", scalar.repeat(4090));
+        let source = format!("file:{path}");
+        assert_eq!(source.chars().count(), 4096);
+        if scalar == "界" {
+            assert!(source.len() > 4096);
+        }
+        assert_eq!(
+            decide(json!({"source": source})),
+            file_success(&format!("file:{path}"), &path, false)
+        );
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Invalid legacy source (no explicit source)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn invalid_legacy_without_explicit_source_is_reported() {
@@ -289,10 +267,6 @@ fn invalid_legacy_without_explicit_source_is_reported() {
     assert_eq!(decide(json!({"legacy_script": "/"})), expected);
     assert_eq!(decide(json!({"legacy_script": "/legacy\n.rss"})), expected);
 }
-
-// ---------------------------------------------------------------------------
-// Failure output never echoes hostile input
-// ---------------------------------------------------------------------------
 
 #[test]
 fn failure_output_does_not_echo_hostile_input() {

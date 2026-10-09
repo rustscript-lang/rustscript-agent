@@ -1,29 +1,5 @@
-// Task9 RSS-owned agent source-selection policy.
-//
-// Public contract: `run(context)` selects the agent source from the two
-// trusted configuration inputs `source` and `legacy_script`.
-//
-//   source         absent | null | string   (explicit, authoritative)
-//   legacy_script  absent | null | string    (deprecated migration input)
-//
-// When `source` is present and non-null it is authoritative: an invalid or
-// unsupported explicit source NEVER falls back to legacy_script. When no
-// explicit source is supplied, a present non-null `legacy_script` is used.
-// When neither is supplied the default `bundled:coding` is selected.
-//
-// Success returns ok/source/descriptor/deprecated_override and omits `error`
-// (the v2 optional-output contract). Failure returns
-// ok/deprecated_override/error and omits source/descriptor. Failure output
-// never echoes the hostile input.
-//
-// The bounded length limit is 4096 Unicode scalar characters (`.length` is a
-// scalar count, not a UTF-8 byte count). NUL/CR/LF/TAB are rejected by exact
-// scalar comparison. Paths are preserved verbatim: no trim, no repair, no URL
-// decoding, no path canonicalization. Filesystem authority, UTF-8 byte limits
-// and the native gate remain outside this policy.
-//
-// This policy has no imports and no host side effects: it only reads the
-// bounded context map and returns a decision map.
+// Selection descriptors carry no filesystem authority.
+// Preserve paths verbatim; the token bound counts Unicode scalars.
 
 fn char_at(value: string, index: int) -> string {
     value[index:(index + 1)]
@@ -37,7 +13,6 @@ fn starts_with(value: string, prefix: string) -> bool {
     result
 }
 
-// True when `value` holds a present, non-null field `key`.
 fn field_present(value: map, key: string) -> bool {
     let mut present: bool = false;
     if value.has(key) {
@@ -48,7 +23,6 @@ fn field_present(value: map, key: string) -> bool {
     present
 }
 
-// True when the present field holds a string value.
 fn field_is_string(value: map, key: string) -> bool {
     let mut is_string: bool = false;
     if type(value[key]) == "string" {
@@ -70,8 +44,6 @@ fn has_control_character(value: string) -> bool {
     found
 }
 
-// Empty, overlength (>4096 Unicode scalars) or control-bearing tokens are
-// invalid for both the explicit and the legacy input.
 fn is_invalid_token(value: string) -> bool {
     let mut invalid: bool = false;
     if value.length == 0 {
@@ -145,11 +117,6 @@ fn failure_invalid_legacy() -> map {
     failure("invalid_legacy_agent_source", "legacy agent source is invalid")
 }
 
-// Exact explicit-source algorithm (never consults legacy):
-//   `bundled:coding`                 -> default bundled descriptor
-//   `file:<absolute path>` (len > 1) -> file descriptor, unchanged path
-//   `file:<relative or empty>`       -> invalid_agent_source
-//   any other well-formed string     -> unsupported_agent_source
 fn select_explicit_source(value: string) -> map {
     let mut decision: map = failure_unsupported_source();
     if value == "bundled:coding" {
@@ -167,9 +134,6 @@ fn select_explicit_source(value: string) -> map {
     decision
 }
 
-// Legacy migration: a valid absolute raw path is re-expressed as the same
-// file descriptor with a canonical `file:` source and deprecated_override
-// true; a relative or exactly-root path is invalid_legacy_agent_source.
 fn select_legacy_source(raw: string) -> map {
     let mut decision: map = failure_invalid_legacy();
     if is_absolute_path(raw) {
