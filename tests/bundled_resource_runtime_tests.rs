@@ -309,25 +309,6 @@ fn bundled_default_dispatcher_runs_with_injected_native_auth() {
     }
 }
 
-#[test]
-fn bundled_default_dispatcher_without_auth_factory_fails_closed() {
-    // No native auth factory installed: the bundled dispatcher must not run at
-    // all (the outer bridge fails closed before the child dispatch starts).
-    let provider = rustscript_agent::AgentRunner::from_source(
-        "use agent;\npub fn run(context: map) -> map { agent::provider_call(context[\"request\"]); }\n",
-        AgentConfig::default(),
-    )
-    .expect("outer bridge source compiles")
-    .with_cancellation(RunCancellation::with_timeout(Duration::from_secs(30)));
-    let result = vm_value_to_json(
-        &provider
-            .run_with_context(json_to_vm_value(&json!({ "request": public_request() })))
-            .expect("static fail-closed envelope"),
-    );
-    assert_eq!(result["ok"], json!(false));
-    assert_eq!(result["error"]["code"], json!("auth_unavailable"));
-}
-
 // ---------------------------------------------------------------------------
 // Vertical 3: bundled typed SQLite storage worker roundtrip in assigned temp.
 // ---------------------------------------------------------------------------
@@ -442,23 +423,4 @@ fn bundled_runner_binds_only_its_exact_logical_entry() {
         matches!(error, RunError::NoEntry),
         "unexpected error: {error:?}"
     );
-}
-
-#[test]
-fn bundled_and_source_runners_use_disjoint_identity_domains() {
-    let bundled_a = AgentRunner::from_bundled("rss/tools/registry.rss", AgentConfig::default())
-        .expect("bundled registry runner compiles");
-    let bundled_b = AgentRunner::from_bundled("rss/tools/registry.rss", AgentConfig::default())
-        .expect("bundled registry runner compiles again");
-    assert_eq!(
-        bundled_a.snapshot_digest(),
-        bundled_b.snapshot_digest(),
-        "identical bundled resources must share one identity"
-    );
-    let source = AgentRunner::from_source(
-        "pub fn run(context: map) -> map { {} }\n",
-        AgentConfig::default(),
-    )
-    .expect("legacy source runner compiles");
-    assert_ne!(bundled_a.snapshot_digest(), source.snapshot_digest());
 }

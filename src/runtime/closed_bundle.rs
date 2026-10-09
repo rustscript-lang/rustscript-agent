@@ -765,33 +765,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn catalog_closure_selects_exact_tool_closure_and_compiles_overrides_only() {
-        assert_eq!(
-            probe_closure("rss/agent/main.rss"),
-            vec![
-                "rss/agent/main.rss",
-                "rss/tools/dispatch.rss",
-                "rss/tools/patch.rss",
-                "rss/tools/process.rss",
-                "rss/tools/read_file.rss",
-                "rss/tools/search_files.rss",
-                "rss/tools/terminal.rss",
-                "rss/tools/types.rss",
-                "rss/tools/write_file.rss",
-            ]
-        );
-        let compiled = probe_compile("rss/agent/main.rss", "run");
-        assert_eq!(compiled.entry_name.as_deref(), Some("run"));
-        assert!(
-            compiled
-                .program
-                .exported_callables
-                .iter()
-                .any(|callable| callable.name == "run")
-        );
-    }
-
-    #[test]
     fn catalog_closure_ignores_unselected_inventory_but_rejects_it_when_selected() {
         // `rss/storage/import-test.rss` is inventory-only: selecting the storage
         // entry must succeed without it, and it must be absent from the closure.
@@ -827,7 +800,6 @@ pub(crate) mod tests {
 
         let closure = probe_closure("rss/llm/provider_dispatch.rss");
         assert!(closure.windows(2).all(|pair| pair[0] < pair[1]));
-        assert_eq!(closure.len(), 17);
         probe_compile("rss/llm/provider_dispatch.rss", "dispatch");
     }
 

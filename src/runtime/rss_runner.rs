@@ -300,18 +300,8 @@ fn bundled_catalog() -> &'static [(&'static str, &'static str)] {
     crate::bundled_rss_sources()
 }
 
-/// Host namespaces admitted for a bundled compilation: every `::`-rooted
-/// namespace the agent compile catalog publishes, plus the two parser builtin
-/// namespaces the shipped bundled sources import directly.
-///
-/// Absent-schema gap (reported, not broadened): `json` and `bytes` are parser
-/// builtin namespaces — the shipped sources `use json;` / `use bytes;` and call
-/// `json::encode`/`bytes::to_utf8` etc. — but the compile catalog publishes NO
-/// `json::`/`bytes::` `::` descriptors (the runtime authorizes them via
-/// `allow_builtin`, not via registered catalog imports). Every other builtin
-/// namespace the parser names (`io`/`jit`/`sqlite`) IS catalog-published, and
-/// `re`/`math` are imported by no bundled source. Only the two genuinely
-/// required roots are added; the remaining fixed five are not.
+/// Catalog namespace roots plus descriptor-only `json`/`bytes` builtins.
+/// Parsing admission stays separate from restricted runtime authorization.
 fn bundled_host_roots() -> BTreeSet<String> {
     let mut roots: BTreeSet<String> = ["json", "bytes"].into_iter().map(str::to_owned).collect();
     for function in agent_host_catalog().functions() {
@@ -1253,8 +1243,12 @@ impl AgentRunner {
             vm.set_fuel(fuel);
         }
         self.drive_root_frame(&mut vm, cancellation)?;
+        let resolved_entry = self
+            .bundled_origin
+            .as_ref()
+            .map_or(entry, |origin| origin.entry_name.as_str());
         let callable = vm
-            .resolve_exported_callable(entry)
+            .resolve_exported_callable(resolved_entry)
             .map_err(|_| RunError::NoEntry)?;
         let arity = match &callable {
             Value::Callable(callable) => self
