@@ -1,22 +1,4 @@
-//! Embedded compile-time RSS resource catalog: production gates.
-//!
-//! Three independent gate families:
-//!
-//! 1. Real Core VM policy execution: the catalog's `source_policy.rss` bytes
-//!    compiles with the production host catalog, runs at a guaranteed-absent
-//!    virtual root, and returns the genuine bundled/default, Unicode
-//!    legacy-precedence, and invalid-authority decisions.
-//! 2. A trusted raw compile qualification: the ACTUAL coding `agent/main.rss`
-//!    compiles entirely from embedded overrides at an absent virtual root.
-//!    This is a compile-boundary proof, NOT a provider turn or full shared
-//!    import-admission safety claim.
-//! 3. A source-free child re-exec: the current test executable re-runs the
-//!    same compile from an assigned source-free scratch cwd, proving the
-//!    catalog has no runtime source-root dependency.
-//!
-//! The library never reopens a source root, reads an environment variable, or
-//! materializes files at runtime; test-only byte binding below reads the
-//! tracked tree solely to prove the embedded bytes are the real assets.
+//! Real RSS policy execution and trusted embedded-source compile qualification.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -158,10 +140,6 @@ fn failure(code: &str, message: &str) -> Value {
     ])
 }
 
-// ---------------------------------------------------------------------------
-// Gate 1: real Core VM source-policy execution at an absent virtual root.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn source_policy_default_selects_bundled_coding() {
     let program = compile_entry("rss/agent/source_policy.rss");
@@ -206,10 +184,6 @@ fn source_policy_invalid_authority_has_no_fallback() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Inventory structure and test-only byte binding.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn catalog_keys_are_sorted_unique_rss_paths() {
     let keys: Vec<&str> = bundled_rss_sources().iter().map(|(key, _)| *key).collect();
@@ -240,10 +214,6 @@ fn catalog_keys_are_sorted_unique_rss_paths() {
     );
 }
 
-/// Test-only binding: prove the embedded `include_str!` bytes equal the
-/// tracked on-disk assets for the full catalog key set, and that the key set
-/// is exactly the tracked tree minus the three exact fixtures. The library
-/// never performs this read; it exists so catalog bytes bind to the manifest.
 #[test]
 fn catalog_bytes_bind_to_tracked_tree() {
     let rss_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss");
@@ -297,16 +267,9 @@ fn walk_rss(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>
     }
 }
 
-// ---------------------------------------------------------------------------
-// Gate 2: trusted raw compile qualification of the coding main entry.
-// ---------------------------------------------------------------------------
-
+// Trusted compile qualification, not guarded admission or a provider turn.
 #[test]
 fn coding_main_compiles_from_embedded_overrides_at_absent_root() {
-    // The entry is the real production coding agent; it and every transitive
-    // relative import resolve exclusively from embedded catalog bytes. The
-    // virtual root is a guaranteed-absent absolute path, so any attempt to
-    // reopen a repository file fails the compile.
     assert!(
         !PathBuf::from(VIRTUAL_ROOT).exists(),
         "virtual root must be absent"
@@ -321,10 +284,6 @@ fn coding_main_compiles_from_embedded_overrides_at_absent_root() {
     );
 }
 
-/// Child-only variant used by the source-free re-exec test. Ignored in the
-/// ordinary suite: it is executed explicitly with `--ignored` by
-/// `coding_main_compiles_outside_checkout_from_scratch_cwd`, so it never
-/// passes vacuously.
 #[test]
 #[ignore = "child-only: re-executed by the source-free parent gate"]
 fn source_free_child_compiles_coding_main() {
@@ -351,9 +310,6 @@ fn source_free_child_compiles_coding_main() {
 
 #[test]
 fn coding_main_compiles_outside_checkout_from_scratch_cwd() {
-    // Re-run THIS test executable as a child from an assigned source-free
-    // scratch directory. The catalog's compile-time absolute include_str!
-    // paths still resolve, proving there is no runtime source-root reopening.
     let exe = std::env::current_exe().expect("current test executable");
     let scratch = std::env::temp_dir().join(format!("task9-source-free-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("create scratch cwd");

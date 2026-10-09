@@ -1,21 +1,4 @@
-//! Task9 build script: compile-time RSS resource catalog generation.
-//!
-//! Recursively discovers every regular `.rss` under `CARGO_MANIFEST_DIR/rss`,
-//! excludes ONLY the three exact default-corpus fixture entries, sorts the
-//! original relative `rss/...` keys, and emits a `&'static [(&'static str,
-//! &'static str)]` catalog whose values are compile-time `include_str!` of
-//! each asset's absolute path. The catalog is pure immutable public source
-//! inventory: no selection/default/provider/legacy/config/credential policy.
-//!
-//! Generic packaging guards run before any code is produced: selected files
-//! must be regular files (no symlinks), all paths must be UTF-8, every asset
-//! must stay canonically confined to the rss root, and no path component may
-//! be empty, `..`, backslash-separated, or control-bearing. Bounds match the
-//! existing module snapshot: 256 files, depth 16 (components relative to the
-//! crate root), 1 MiB per file, 8 MiB checked total.
-//!
-//! STD-ONLY. No subprocess, git, network, or Cargo recursion. Code is written
-//! only into the Cargo-assigned `OUT_DIR`.
+//! Compile-time public RSS asset inventory. Admission and permissions are separate.
 
 use std::env;
 use std::fmt::Write as _;
@@ -27,7 +10,7 @@ const MAX_DEPTH: usize = 16;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The three exact default-corpus fixture entries excluded from the catalog.
+// Exclude only the existing default-corpus fixtures.
 const FIXTURE_EXCLUSIONS: &[&str] = &[
     "rss/auth/oauth_flow.rss",
     "rss/auth/store_entry.rss",
@@ -88,9 +71,7 @@ fn main() {
 }
 
 struct Asset {
-    /// Original relative key, always spelled `rss/...`.
     key: String,
-    /// Canonical absolute path used by the compile-time `include_str!`.
     absolute: String,
 }
 
@@ -168,9 +149,6 @@ fn walk(root: &Path, dir: &Path, assets: &mut Vec<Asset>, total_bytes: &mut u64)
     }
 }
 
-/// Builds the original `rss/...` key from a path confined to `root`, whose
-/// parent directory is named `rss`. Rejects any non-normal component, a
-/// backslash, or a control character.
 fn relative_key(root: &Path, path: &Path) -> String {
     let relative = path
         .strip_prefix(root.parent().unwrap_or(root))
