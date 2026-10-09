@@ -146,22 +146,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Explicit agent-source selection: the new bounded env tokens plus the
-    // original legacy script names. Raw values are passed through untouched;
-    // every priority/migration/validation decision is made by the RSS source
-    // policy inside `with_agent_selection` (never in Rust). The SQLite path
-    // stays the existing native collector.
-    let source = env_value("RUSTSCRIPT_AGENT_SOURCE", "PD_EDGE_AGENT_SOURCE")?;
-    let legacy_script = env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")?;
+    // original legacy script names. The primary/legacy collector semantics stay
+    // in `env_value`: a valid UTF8 token is preserved verbatim and a missing
+    // token omits the field. A token that is *present* but not valid UTF8 on
+    // this OS cannot become a JSON string; `source_env_value` admits it as the
+    // fixed public boolean `false` so the RSS source policy observes a present
+    // non-string value and applies its own priority/validation/fallback
+    // decision (never in Rust). The SQLite path stays the existing native
+    // collector.
+    let source = source_env_value("RUSTSCRIPT_AGENT_SOURCE", "PD_EDGE_AGENT_SOURCE");
+    let legacy_script = source_env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT");
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
     let mut selection = serde_json::Map::new();
     if let Some(source) = source {
-        selection.insert("source".to_string(), serde_json::Value::String(source));
+        selection.insert("source".to_string(), source);
     }
     if let Some(script) = legacy_script {
-        selection.insert(
-            "legacy_script".to_string(),
-            serde_json::Value::String(script),
-        );
+        selection.insert("legacy_script".to_string(), script);
     }
     // Built before the listener binds: an invalid authoritative source is a
     // static construction error and never falls back to a legacy/default
@@ -387,6 +388,23 @@ fn env_value(primary: &str, legacy: &str) -> Result<Option<String>, env::VarErro
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
+    }
+}
+
+/// Collects one selected source field (`SOURCE`/legacy `SCRIPT`) for the RSS
+/// source policy. Valid UTF8 tokens and the existing primary/legacy
+/// precedence/deprecation semantics come from the shared `env_value` collector.
+/// A token that is *present* on this OS but not valid UTF8 cannot become a JSON
+/// string, so it is admitted as the fixed public boolean `false`: the policy
+/// then observes a present non-string value and owns the invalid/static
+/// classification and the no-fallback decision. This never prints or forwards
+/// the raw OS bytes, never repairs the value into a string, and a missing token
+/// still omits the map field.
+fn source_env_value(primary: &str, legacy: &str) -> Option<serde_json::Value> {
+    match env_value(primary, legacy) {
+        Ok(Some(value)) => Some(serde_json::Value::String(value)),
+        Ok(None) | Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => Some(serde_json::Value::Bool(false)),
     }
 }
 

@@ -9,6 +9,8 @@
 //! * the actual gateway binary started over real loopback and observed for
 //!   health facts and pre-listen failure (the packaged-binary layer).
 
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -766,4 +768,127 @@ async fn binary_default_starts_and_health_reports_bundled_source() {
     );
 
     stop_child(&mut child).await;
+}
+
+// ---------------------------------------------------------------------------
+// Native OS encoding admission: a present non-UTF8 token for the two selected
+// source fields must be classified by the RSS source policy, never decoded in
+// Rust. These cases spawn the actual packaged binary with a synthetic opaque
+// OS environment value (never a credential) and assert the RSS-level outcome.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(bytes.to_vec())
+}
+
+/// A present non-UTF8 authoritative `SOURCE` must reach the RSS policy as a
+/// present non-string token, so the policy returns its canonical
+/// `invalid_agent_source` static error before the listener binds. The raw OS
+/// bytes must never be surfaced (no `NotUnicode`, no marker) and the valid
+/// legacy script must never be selected.
+#[cfg(unix)]
+#[tokio::test]
+async fn binary_non_utf8_authoritative_source_is_static_invalid_without_leak() {
+    let root = binary_root("non-utf8-source");
+    let legacy = write_marker_source("nonutf8src", "NON_UTF8_SOURCE_LEGACY_MARKER");
+    let db = root.join("state.db");
+    let stderr_path = root.join("stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let marker = "\u{FFFD}PRIVATE_SOURCE_ENCODING_SENTINEL";
+    let opaque_source = os_string_from_bytes(b"\xFFPRIVATE_SOURCE_ENCODING_SENTINEL");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+        .env("RUSTSCRIPT_AGENT_SOURCE", opaque_source)
+        .env("RUSTSCRIPT_AGENT_SCRIPT", &legacy)
+        .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
+        .env("HOME", &root)
+        .current_dir(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("gateway binary should spawn");
+
+    let listening = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(25)).await;
+    if let Some(address) = listening {
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        stop_child(&mut child).await;
+        panic!(
+            "a present non-UTF8 authoritative source must not bind/listen on {address}: {stderr}"
+        );
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("the gateway must exit")
+        .expect("child wait");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        !status.success(),
+        "a present non-UTF8 authoritative source must exit non-zero: {stderr}"
+    );
+    assert!(
+        !stderr.contains("listening on http://"),
+        "the gateway must not listen with an invalid source: {stderr}"
+    );
+    assert!(
+        !stderr.contains("NotUnicode") && !stderr.contains(marker),
+        "the RSS static error must never expose the raw OS bytes: {stderr}"
+    );
+    assert!(
+        !stderr.contains(legacy.to_string_lossy().as_ref()),
+        "the invalid authoritative source must not fall back to the legacy script: {stderr}"
+    );
+    assert!(
+        stderr.contains("invalid_agent_source") || stderr.contains("agent source is invalid"),
+        "the RSS policy's canonical invalid-source error must be returned: {stderr}"
+    );
+}
+
+/// A valid authoritative bundled selection plus a present non-UTF8 legacy
+/// script must still start: the RSS policy selects the bundled entry and never
+/// reads the unused invalid legacy token. The collector must not throw an OS
+/// decoding error before the policy can select.
+#[cfg(unix)]
+#[tokio::test]
+async fn binary_valid_source_with_non_utf8_legacy_starts_bundled() {
+    let root = binary_root("valid-src-non-utf8-legacy");
+    let stderr_path = root.join("stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let opaque_legacy = os_string_from_bytes(b"\xFFPRIVATE_LEGACY_ENCODING_SENTINEL");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+        .env("RUSTSCRIPT_AGENT_SOURCE", "bundled:coding")
+        .env("RUSTSCRIPT_AGENT_SCRIPT", opaque_legacy)
+        .env("HOME", &root)
+        .current_dir(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("gateway binary should spawn");
+
+    let address = match wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await
+    {
+        Some(address) => address,
+        None => {
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            panic!("a valid bundled source with an unused non-UTF8 legacy must start: {stderr}");
+        }
+    };
+    let health = http_get(&address, "/health/detailed").await;
+    stop_child(&mut child).await;
+    assert!(
+        health.contains("200 OK"),
+        "health must answer 200: {health}"
+    );
+    let body = health.split("\r\n\r\n").nth(1).unwrap_or("");
+    let json: Value = serde_json::from_str(body).expect("health body must be JSON");
+    assert_eq!(json["status"], "ok");
+    assert_eq!(
+        json["source"]["kind"], "bundled",
+        "the valid authoritative source must select bundled:coding: {json}"
+    );
+    assert_eq!(json["source"]["deprecated_override"], false);
 }
