@@ -13,7 +13,7 @@
 //! is drained completely, never silently truncated.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -161,11 +161,7 @@ impl StorageRunner {
             fuel: config.fuel,
         }
         .with_sqlite_root(root);
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("rss")
-            .join("storage")
-            .join("main.rss");
-        let runner = AgentRunner::from_file(source, agent_config)
+        let runner = AgentRunner::from_bundled("rss/storage/main.rss", agent_config)
             .map_err(|error| format!("compile RSS storage program: {error}"))?;
         let db_path = path
             .file_name()

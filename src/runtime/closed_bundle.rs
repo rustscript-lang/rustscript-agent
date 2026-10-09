@@ -6,7 +6,7 @@
 //! exact root export through Core's module graph. It carries no auth workflow,
 //! no registry grants, no global cache, and no serialization.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,6 +15,55 @@ use rustscript_vm::{
     SourceFlavor, UsePathSegment, analyze_source_from_string_with_options,
     compile_source_at_path_with_flavor_and_options, parse_source_with_dialect,
 };
+
+/// Whole-catalog bounds of the bundled-resource closure selector: the entire
+/// immutable embedded catalog (max 256 files, 8 MiB of source) is inspected.
+const MAX_CATALOG_FILES: usize = 256;
+const MAX_CATALOG_DEPTH: usize = 16;
+const MAX_CATALOG_FILE_BYTES: usize = 1024 * 1024;
+const MAX_CATALOG_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Catalog-derived implicit-externs prelude: one `use <namespace>;` per host
+/// namespace the compile catalog publishes. Mirrors the existing snapshot
+/// prelude but derives from the supplied catalog, so parsing tolerates the same
+/// implicit host externs the real compiler provides. Prelude declarations are
+/// dropped before module imports are inspected.
+fn catalog_prelude(catalog: &HostApiCatalog) -> String {
+    let mut namespaces = BTreeSet::new();
+    for function in catalog.functions() {
+        if let Some((namespace, _)) = function.name.split_once("::") {
+            namespaces.insert(namespace.to_string());
+        }
+    }
+    let mut prelude = String::new();
+    for namespace in namespaces {
+        prelude.push_str("use ");
+        prelude.push_str(&namespace);
+        prelude.push_str(";\n");
+    }
+    prelude
+}
+
+fn scan_imports_with_prelude(
+    source: &str,
+    dialect: &'static dyn ParserDialect,
+    prelude: &str,
+) -> Result<Vec<BundleImport>, ClosedBundleError> {
+    if prelude.is_empty() {
+        return scan_imports(source, dialect);
+    }
+    let prelude_imports = scan_imports(prelude, dialect)?;
+    let combined = format!("{prelude}{source}");
+    let mut imports = scan_imports(&combined, dialect)?;
+    imports.drain(0..prelude_imports.len());
+    Ok(imports)
+}
+
+/// The bundled-resource closure selector parses with the EXISTING snapshot
+/// RustScript dialect (reused, never a new one).
+fn bundled_rss_dialect() -> &'static dyn ParserDialect {
+    crate::runtime::module_snapshot::snapshot_parser_dialect()
+}
 
 /// Caller-supplied bounds for a closed bundle.
 #[derive(Clone, Copy, Debug)]
@@ -58,10 +107,36 @@ struct BundleImport {
 
 /// Compile a closed, bounded RSS tree from trusted embedding-owned bytes.
 /// No input path is opened or materialized on disk.
+///
+/// This is the ORIGINAL entry: it scans each module's imports with the
+/// original no-prepended-import mode. Its algorithm, bounds, host-collision
+/// and reachability checks are unchanged.
 pub(crate) fn compile_closed_bundle(
     entry_path: &str,
     sources: &[(&str, &str)],
     options: ClosedBundleOptions<'_>,
+) -> Result<CompiledClosedBundle, ClosedBundleError> {
+    compile_closed_bundle_impl(entry_path, sources, options, false)
+}
+
+/// Bundled-resource entry: the SAME shared compiler/admission body, but each
+/// module is parsed with the catalog-derived implicit-externs parse context the
+/// real compiler supplies. This never grants permissions; it only lets parsing
+/// accept the same host externs the shipped sources rely on. Only the immutable
+/// embedded bundled route (and its catalog probe) use this.
+pub(crate) fn compile_bundled_closed_bundle(
+    entry_path: &str,
+    sources: &[(&str, &str)],
+    options: ClosedBundleOptions<'_>,
+) -> Result<CompiledClosedBundle, ClosedBundleError> {
+    compile_closed_bundle_impl(entry_path, sources, options, true)
+}
+
+fn compile_closed_bundle_impl(
+    entry_path: &str,
+    sources: &[(&str, &str)],
+    options: ClosedBundleOptions<'_>,
+    catalog_parse_context: bool,
 ) -> Result<CompiledClosedBundle, ClosedBundleError> {
     if !options.virtual_root.is_absolute() {
         return Err(ClosedBundleError::ImportDenied);
@@ -98,9 +173,22 @@ pub(crate) fn compile_closed_bundle(
         .get(entry_path)
         .ok_or(ClosedBundleError::ImportDenied)?;
     reject_host_collisions(bundle.keys(), options.host_roots)?;
+    // The original entry scans modules with their own imports untouched. The
+    // bundled entry additionally parses each module under the catalog-derived
+    // implicit-externs parse context the real compiler supplies; the prelude
+    // declarations are dropped so only module imports are admitted, and the
+    // provided-tree reachability checks below are identical either way.
+    let prelude = if catalog_parse_context {
+        catalog_prelude(&options.catalog)
+    } else {
+        String::new()
+    };
     let mut imports = BTreeMap::new();
     for (path, source) in &bundle {
-        imports.insert(path.clone(), scan_imports(source, options.dialect)?);
+        imports.insert(
+            path.clone(),
+            scan_imports_with_prelude(source, options.dialect, &prelude)?,
+        );
     }
     preflight_bundle(&bundle, &imports, options.host_roots, limits.max_depth)?;
 
@@ -208,7 +296,7 @@ fn validate_bundle_path(path: &str, max_depth: usize) -> Result<(), ClosedBundle
     Ok(())
 }
 
-fn valid_module_identifier(name: &str) -> bool {
+pub(crate) fn valid_module_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -309,6 +397,82 @@ fn first_import_identifier(path: &[UsePathSegment]) -> Result<(&str, usize), Clo
             UsePathSegment::Self_ | UsePathSegment::Super => None,
         })
         .ok_or(ClosedBundleError::ImportDenied)
+}
+
+/// Select the bounded import closure for one chosen catalog key using the
+/// EXISTING admission helpers (`validate_bundle_path` / `scan_imports` /
+/// `resolve_bundle_import` and the identical host-namespace clause check). The
+/// whole immutable catalog is supplied; only the selected closure is returned,
+/// sorted by key. Unselected inventory-only modules are ignored; a selected
+/// module that cannot be parsed or resolved is rejected.
+pub(crate) fn select_catalog_closure(
+    catalog: &[(&str, &str)],
+    host_catalog: &HostApiCatalog,
+    entry_key: &str,
+    host_roots: &BTreeSet<String>,
+) -> Result<Vec<String>, ClosedBundleError> {
+    if catalog.len() > MAX_CATALOG_FILES {
+        return Err(ClosedBundleError::SourceTooLarge);
+    }
+    let mut total_bytes = 0usize;
+    let mut sources: BTreeMap<&str, &str> = BTreeMap::new();
+    for (key, source) in catalog {
+        if source.len() > MAX_CATALOG_FILE_BYTES {
+            return Err(ClosedBundleError::SourceTooLarge);
+        }
+        total_bytes = total_bytes
+            .checked_add(source.len())
+            .ok_or(ClosedBundleError::SourceTooLarge)?;
+        if total_bytes > MAX_CATALOG_TOTAL_BYTES {
+            return Err(ClosedBundleError::SourceTooLarge);
+        }
+        if sources.insert(*key, *source).is_some() {
+            return Err(ClosedBundleError::ImportDenied);
+        }
+    }
+    validate_bundle_path(entry_key, MAX_CATALOG_DEPTH)?;
+    sources
+        .get(entry_key)
+        .ok_or(ClosedBundleError::ImportDenied)?;
+
+    let prelude = catalog_prelude(host_catalog);
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(entry_key.to_owned());
+    while let Some(key) = queue.pop_front() {
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        validate_bundle_path(&key, MAX_CATALOG_DEPTH)?;
+        let source = *sources
+            .get(key.as_str())
+            .ok_or(ClosedBundleError::ImportDenied)?;
+        let module_imports = scan_imports_with_prelude(source, bundled_rss_dialect(), &prelude)?;
+        for import in &module_imports {
+            let (root, first_index) = first_import_identifier(&import.path)?;
+            if first_index == 0 && host_roots.contains(root) {
+                if import.path.len() == 1
+                    && matches!(
+                        import.clause,
+                        ImportClause::AllPublic | ImportClause::Namespace(_)
+                    )
+                {
+                    continue;
+                }
+                return Err(ClosedBundleError::ImportDenied);
+            }
+            let target = resolve_bundle_import(&key, &import.path, MAX_CATALOG_DEPTH)?;
+            if !sources.contains_key(target.as_str()) {
+                return Err(ClosedBundleError::ImportDenied);
+            }
+            if !visited.contains(&target) {
+                queue.push_back(target);
+            }
+        }
+    }
+    let mut selected: Vec<String> = visited.iter().cloned().collect();
+    selected.sort();
+    Ok(selected)
 }
 
 fn resolve_bundle_import(
@@ -541,6 +705,130 @@ pub(crate) mod tests {
                 ))
             },
         )
+    }
+
+    fn bundled_probe_host_roots() -> BTreeSet<String> {
+        let mut host_roots: BTreeSet<String> =
+            ["json", "bytes"].into_iter().map(str::to_owned).collect();
+        for function in crate::runtime::agent_host::agent_host_catalog().functions() {
+            if let Some((namespace, _)) = function.name.split_once("::") {
+                host_roots.insert(namespace.to_owned());
+            }
+        }
+        host_roots
+    }
+
+    fn probe_closure(entry: &str) -> Vec<String> {
+        select_catalog_closure(
+            crate::bundled_rss_sources(),
+            crate::runtime::agent_host::agent_host_catalog().as_ref(),
+            entry,
+            &bundled_probe_host_roots(),
+        )
+        .unwrap_or_else(|error| panic!("closure for {entry}: {error:?}"))
+    }
+
+    fn probe_compile(entry: &str, export: &str) -> CompiledClosedBundle {
+        let closure = probe_closure(entry);
+        let sources: Vec<(&str, &str)> = closure
+            .iter()
+            .map(|key| {
+                (
+                    key.as_str(),
+                    *crate::bundled_rss_sources()
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, s)| s)
+                        .expect("catalog key"),
+                )
+            })
+            .collect();
+        let host_roots = bundled_probe_host_roots();
+        compile_bundled_closed_bundle(
+            entry,
+            &sources,
+            ClosedBundleOptions {
+                limits: ClosedBundleLimits {
+                    max_files: 256,
+                    max_depth: 16,
+                    max_file_bytes: crate::runtime::rss_runner::MAX_AGENT_SOURCE_BYTES,
+                    max_total_bytes: 8 * 1024 * 1024,
+                },
+                virtual_root: Path::new("/__rustscript_agent_bundled_rss__"),
+                host_roots: &host_roots,
+                catalog: crate::runtime::agent_host::agent_host_catalog(),
+                dialect: bundled_rss_dialect(),
+                entry_export: export,
+            },
+        )
+        .unwrap_or_else(|error| panic!("compile {entry} as {export}: {error:?}"))
+    }
+
+    #[test]
+    fn catalog_closure_selects_exact_tool_closure_and_compiles_overrides_only() {
+        assert_eq!(
+            probe_closure("rss/agent/main.rss"),
+            vec![
+                "rss/agent/main.rss",
+                "rss/tools/dispatch.rss",
+                "rss/tools/patch.rss",
+                "rss/tools/process.rss",
+                "rss/tools/read_file.rss",
+                "rss/tools/search_files.rss",
+                "rss/tools/terminal.rss",
+                "rss/tools/types.rss",
+                "rss/tools/write_file.rss",
+            ]
+        );
+        let compiled = probe_compile("rss/agent/main.rss", "run");
+        assert_eq!(compiled.entry_name.as_deref(), Some("run"));
+        assert!(
+            compiled
+                .program
+                .exported_callables
+                .iter()
+                .any(|callable| callable.name == "run")
+        );
+    }
+
+    #[test]
+    fn catalog_closure_ignores_unselected_inventory_but_rejects_it_when_selected() {
+        // `rss/storage/import-test.rss` is inventory-only: selecting the storage
+        // entry must succeed without it, and it must be absent from the closure.
+        let storage = probe_closure("rss/storage/main.rss");
+        assert!(
+            !storage
+                .iter()
+                .any(|key| key == "rss/storage/import-test.rss")
+        );
+        probe_compile("rss/storage/main.rss", "run");
+
+        // Selecting the invalid import-test module in its own right is rejected.
+        let error = select_catalog_closure(
+            crate::bundled_rss_sources(),
+            crate::runtime::agent_host::agent_host_catalog().as_ref(),
+            "rss/storage/import-test.rss",
+            &bundled_probe_host_roots(),
+        )
+        .expect_err("invalid import-test module must be rejected when selected");
+        assert_eq!(error, ClosedBundleError::ImportDenied);
+    }
+
+    #[test]
+    fn catalog_closure_rejects_unknown_entry_and_is_sorted() {
+        let error = select_catalog_closure(
+            crate::bundled_rss_sources(),
+            crate::runtime::agent_host::agent_host_catalog().as_ref(),
+            "rss/does/not/exist.rss",
+            &bundled_probe_host_roots(),
+        )
+        .expect_err("unknown entry must be rejected");
+        assert_eq!(error, ClosedBundleError::ImportDenied);
+
+        let closure = probe_closure("rss/llm/provider_dispatch.rss");
+        assert!(closure.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(closure.len(), 17);
+        probe_compile("rss/llm/provider_dispatch.rss", "dispatch");
     }
 
     #[test]

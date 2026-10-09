@@ -15,7 +15,7 @@
 //! the configured epoch bound (surfacing as a typed deadline failure).
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,7 @@ use rustscript_vm::{
 };
 
 use super::cancellation::{CancellationReason, CancellationToken};
+use super::closed_bundle;
 use super::host_wait::wait_for_host_op_blocking_with_cancel;
 
 use super::agent_host::{
@@ -73,9 +74,27 @@ fn invoke_after_snapshot(path: &Path) {
     });
 }
 
+/// Private origin metadata of one bundled compiled runner. Never a resource
+/// framework or public type: it records only the chosen catalog key, the
+/// requested logical export, and the exact root callable the semantic model
+/// selected for that export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BundledOrigin {
+    resource_key: String,
+    entry_export: String,
+    entry_name: String,
+    /// Digest of the selected closure's owned bytes + chosen entry key. Program
+    /// identity domain is `bundled:<identity>:<export>`; it can never collide
+    /// with a legacy source/file digest.
+    identity: String,
+}
+
 struct CachedProgram {
     program: rustscript_vm::Program,
     weight: usize,
+    /// Optional exact-root binding fact for a bundled program. Legacy source
+    /// and file programs carry `None`; cached programs stay pure.
+    origin: Option<BundledOrigin>,
 }
 
 struct ProgramLru {
@@ -94,6 +113,13 @@ impl ProgramLru {
     }
 
     fn get(&mut self, digest: &str) -> Option<rustscript_vm::Program> {
+        self.get_bound(digest).map(|(program, _)| program)
+    }
+
+    fn get_bound(
+        &mut self,
+        digest: &str,
+    ) -> Option<(rustscript_vm::Program, Option<BundledOrigin>)> {
         if !self.entries.contains_key(digest) {
             return None;
         }
@@ -101,10 +127,22 @@ impl ProgramLru {
             self.order.remove(index);
         }
         self.order.push_back(digest.to_string());
-        self.entries.get(digest).map(|entry| entry.program.clone())
+        self.entries
+            .get(digest)
+            .map(|entry| (entry.program.clone(), entry.origin.clone()))
     }
 
     fn insert(&mut self, digest: String, program: rustscript_vm::Program, weight: usize) {
+        self.insert_bound(digest, program, weight, None);
+    }
+
+    fn insert_bound(
+        &mut self,
+        digest: String,
+        program: rustscript_vm::Program,
+        weight: usize,
+        origin: Option<BundledOrigin>,
+    ) {
         if self.entries.contains_key(&digest) {
             if let Some(index) = self.order.iter().position(|key| key == &digest) {
                 self.order.remove(index);
@@ -126,8 +164,14 @@ impl ProgramLru {
             }
         }
         self.total_weight = self.total_weight.saturating_add(weight);
-        self.entries
-            .insert(digest.clone(), CachedProgram { program, weight });
+        self.entries.insert(
+            digest.clone(),
+            CachedProgram {
+                program,
+                weight,
+                origin,
+            },
+        );
         self.order.push_back(digest);
     }
 }
@@ -244,8 +288,134 @@ fn rss_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("rss")
 }
 
-fn default_provider_dispatch_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/provider_dispatch.rss")
+/// Virtual root identity of the embedded bundled-resource compilation. No
+/// bundled source is ever opened or materialized on disk.
+const BUNDLED_VIRTUAL_ROOT: &str = "/__rustscript_agent_bundled_rss__";
+const BUNDLED_MAX_FILES: usize = 256;
+const BUNDLED_MAX_DEPTH: usize = 16;
+const BUNDLED_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// The immutable embedded catalog (original `rss/...` keys, unchanged).
+fn bundled_catalog() -> &'static [(&'static str, &'static str)] {
+    crate::bundled_rss_sources()
+}
+
+/// Host namespaces admitted for a bundled compilation: every `::`-rooted
+/// namespace the agent compile catalog publishes, plus the two parser builtin
+/// namespaces the shipped bundled sources import directly.
+///
+/// Absent-schema gap (reported, not broadened): `json` and `bytes` are parser
+/// builtin namespaces — the shipped sources `use json;` / `use bytes;` and call
+/// `json::encode`/`bytes::to_utf8` etc. — but the compile catalog publishes NO
+/// `json::`/`bytes::` `::` descriptors (the runtime authorizes them via
+/// `allow_builtin`, not via registered catalog imports). Every other builtin
+/// namespace the parser names (`io`/`jit`/`sqlite`) IS catalog-published, and
+/// `re`/`math` are imported by no bundled source. Only the two genuinely
+/// required roots are added; the remaining fixed five are not.
+fn bundled_host_roots() -> BTreeSet<String> {
+    let mut roots: BTreeSet<String> = ["json", "bytes"].into_iter().map(str::to_owned).collect();
+    for function in agent_host_catalog().functions() {
+        if let Some((namespace, _)) = function.name.split_once("::") {
+            roots.insert(namespace.to_owned());
+        }
+    }
+    roots
+}
+
+/// Compile (or reuse from the existing bounded program LRU) one bundled
+/// resource. Returns the compiled program plus its private exact-root origin.
+/// All failures are static: no resource key, source, or path is echoed.
+fn compiled_bundled_program(
+    resource_key: &str,
+    entry_export: &str,
+) -> Result<(rustscript_vm::Program, BundledOrigin)> {
+    if !closed_bundle::valid_module_identifier(entry_export) {
+        return Err(AgentError::Compile(
+            "bundled resource export is invalid".to_string(),
+        ));
+    }
+    let catalog = bundled_catalog();
+    if !catalog.iter().any(|(key, _)| *key == resource_key) {
+        return Err(AgentError::UnknownResource);
+    }
+    let host_roots = bundled_host_roots();
+    let host_catalog = agent_host_catalog();
+    let closure = closed_bundle::select_catalog_closure(
+        catalog,
+        host_catalog.as_ref(),
+        resource_key,
+        &host_roots,
+    )
+    .map_err(|_| AgentError::Compile("bundled resource is unavailable".to_string()))?;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(closure.len());
+    for key in &closure {
+        let source = catalog
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, source)| *source)
+            .ok_or_else(|| AgentError::Compile("bundled resource is unavailable".to_string()))?;
+        files.push((key.clone(), source.as_bytes().to_vec()));
+    }
+    files.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let identity = super::module_snapshot::owned_memory_snapshot_digest(&files, resource_key);
+    let cache_key = format!("bundled:{identity}:{entry_export}");
+    {
+        let mut cache = program_cache();
+        if let Some((program, Some(origin))) = cache.get_bound(&cache_key) {
+            return Ok((program, origin));
+        }
+    }
+    let sources: Vec<(&str, &str)> = closure
+        .iter()
+        .map(|key| {
+            catalog
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(candidate, source)| (*candidate, *source))
+                .ok_or_else(|| AgentError::Compile("bundled resource is unavailable".to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let compiled = closed_bundle::compile_bundled_closed_bundle(
+        resource_key,
+        &sources,
+        closed_bundle::ClosedBundleOptions {
+            limits: closed_bundle::ClosedBundleLimits {
+                max_files: BUNDLED_MAX_FILES,
+                max_depth: BUNDLED_MAX_DEPTH,
+                max_file_bytes: MAX_AGENT_SOURCE_BYTES,
+                max_total_bytes: BUNDLED_MAX_TOTAL_BYTES,
+            },
+            virtual_root: Path::new(BUNDLED_VIRTUAL_ROOT),
+            host_roots: &host_roots,
+            catalog: Arc::clone(&host_catalog),
+            dialect: super::module_snapshot::snapshot_parser_dialect(),
+            entry_export,
+        },
+    )
+    .map_err(|_| AgentError::Compile("bundled resource is unavailable".to_string()))?;
+    let entry_name = compiled
+        .entry_name
+        .ok_or_else(|| AgentError::Compile("bundled resource export is missing".to_string()))?;
+    let origin = BundledOrigin {
+        resource_key: resource_key.to_owned(),
+        entry_export: entry_export.to_owned(),
+        entry_name,
+        identity: identity.clone(),
+    };
+    let weight = files.iter().map(|(_, bytes)| bytes.len()).sum();
+    {
+        let mut cache = program_cache();
+        if let Some((program, Some(cached_origin))) = cache.get_bound(&cache_key) {
+            return Ok((program, cached_origin));
+        }
+        cache.insert_bound(
+            cache_key,
+            compiled.program.clone(),
+            weight,
+            Some(origin.clone()),
+        );
+    }
+    Ok((compiled.program, origin))
 }
 
 /// Production bundled coding-agent entry (`rss/agent/main.rss`).
@@ -263,9 +433,8 @@ pub fn bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
 }
 
 fn load_bundled_tool_registry() -> std::result::Result<ToolRegistry, String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("rss/tools/registry.rss");
-    let runner =
-        AgentRunner::from_file(&path, AgentConfig::default()).map_err(|error| error.to_string())?;
+    let runner = AgentRunner::from_bundled("rss/tools/registry.rss", AgentConfig::default())
+        .map_err(|error| error.to_string())?;
     let result = runner
         .run_with_context(json_to_vm_value(
             &json!({"kind": "descriptors", "config": {}}),
@@ -340,6 +509,9 @@ pub(crate) fn execute_rss_source(
 pub enum AgentError {
     Io(std::io::Error),
     Compile(String),
+    /// The requested embedded bundled resource is not part of the immutable
+    /// catalog. Static: the key is never echoed.
+    UnknownResource,
 }
 
 impl Display for AgentError {
@@ -347,6 +519,7 @@ impl Display for AgentError {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Compile(error) => write!(formatter, "RustScript compile error: {error}"),
+            Self::UnknownResource => formatter.write_str("bundled resource is unknown"),
         }
     }
 }
@@ -738,6 +911,10 @@ pub struct AgentRunner {
     host: AgentHostBridges,
     prepare_fault: RunnerPrepareFault,
     snapshot_digest: String,
+    /// Private origin metadata of a bundled runner: the chosen catalog key,
+    /// the requested logical export, and the exact root callable. `None` for
+    /// legacy `from_source`/`from_file` runners.
+    bundled_origin: Option<BundledOrigin>,
 }
 
 struct NativeAuthBinding {
@@ -806,6 +983,15 @@ impl AgentRunner {
         config: AgentConfig,
         snapshot_digest: String,
     ) -> Result<Self> {
+        Self::from_program_with_origin(program, config, snapshot_digest, None)
+    }
+
+    fn from_program_with_origin(
+        program: rustscript_vm::Program,
+        config: AgentConfig,
+        snapshot_digest: String,
+        bundled_origin: Option<BundledOrigin>,
+    ) -> Result<Self> {
         let registry = build_restricted_registry()
             .map_err(|error| AgentError::Compile(format!("host registry: {error}")))?;
         Ok(Self {
@@ -815,7 +1001,37 @@ impl AgentRunner {
             host: AgentHostBridges::default(),
             prepare_fault: RunnerPrepareFault::None,
             snapshot_digest,
+            bundled_origin,
         })
+    }
+
+    /// Compiles an embedded bundled resource (`run` export) into a compiled,
+    /// admitted runner. No input path is opened or materialized on disk.
+    /// Unknown resources and invalid root exports fail with static errors that
+    /// never echo the key, source, or path.
+    pub fn from_bundled(resource_key: &str, config: AgentConfig) -> Result<Self> {
+        Self::from_bundled_named(resource_key, "run", config)
+    }
+
+    /// Like [`Self::from_bundled`], selecting an explicit logical
+    /// `entry_export` from the same compiled resource.
+    pub fn from_bundled_named(
+        resource_key: &str,
+        entry_export: &str,
+        config: AgentConfig,
+    ) -> Result<Self> {
+        let (program, origin) = compiled_bundled_program(resource_key, entry_export)?;
+        let identity = origin.identity.clone();
+        Self::from_program_with_origin(program, config, identity, Some(origin))
+    }
+
+    /// The embedded catalog key this runner was compiled from, or `None` for a
+    /// legacy source/file runner. Consumed by service integration.
+    #[allow(dead_code)]
+    pub(crate) fn bundled_resource_key(&self) -> Option<&str> {
+        self.bundled_origin
+            .as_ref()
+            .map(|origin| origin.resource_key.as_str())
     }
 
     /// Digest of the snapshot or source bytes this runner compiled.
@@ -851,7 +1067,7 @@ impl AgentRunner {
                 .any(|import| import.name == "agent::provider_call")
         {
             // The builder cannot report this error; dispatch revalidates live bytes.
-            let _ = compiled_file_program(&default_provider_dispatch_path());
+            let _ = compiled_bundled_program("rss/llm/provider_dispatch.rss", "dispatch");
         }
         self.host = host;
         self
@@ -959,6 +1175,15 @@ impl AgentRunner {
         entry: &str,
         cancellation: Option<&RunCancellation>,
     ) -> std::result::Result<(Vm, Value, Option<NativeAuthBinding>), RunError> {
+        // A bundled runner binds EXACTLY its recorded logical export to the
+        // semantic root callable the compile step selected. Any other caller
+        // entry (including a sibling `run`) is rejected; there is no child
+        // entry hijack and no fallback to a different root.
+        if let Some(origin) = &self.bundled_origin
+            && entry != origin.entry_export
+        {
+            return Err(RunError::NoEntry);
+        }
         let mut vm = Vm::try_new(self.program.clone()).map_err(RunError::Vm)?;
         vm.set_async_bridge(Box::new(AgentAsyncBridge::new()))
             .map_err(RunError::Setup)?;
@@ -1245,7 +1470,7 @@ pub(crate) fn default_agent_provider_host_with_auth_factory(
 ) -> Arc<dyn AgentProviderHost> {
     if auth_host_factory.is_some() {
         // The actual child invocation revalidates current bytes before dispatch.
-        let _ = compiled_file_program(&default_provider_dispatch_path());
+        let _ = compiled_bundled_program("rss/llm/provider_dispatch.rss", "dispatch");
     }
     new_default_agent_provider_host(auth_host_factory)
 }
@@ -1289,8 +1514,11 @@ fn invoke_default_opaque_dispatch(
             "native auth host is unavailable for default provider",
         );
     };
-    let harness_path = default_provider_dispatch_path();
-    let runner = match AgentRunner::from_file(harness_path, AgentConfig::default()) {
+    let runner = match AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
+    ) {
         Ok(runner) => runner,
         Err(_) => {
             return adapter_fail("adapter_unavailable", "provider adapter is unavailable");
