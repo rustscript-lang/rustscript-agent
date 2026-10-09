@@ -86,6 +86,17 @@ pub enum CleanupOutcome {
     Failed,
 }
 
+/// Private tagged agent entry route. `File` keeps the original live-tree
+/// compile/freshness behavior (fixed install path only). `Bundled` names an
+/// embedded catalog key admitted by the RSS source policy; it is compiled
+/// from the immutable native closed bundle and never reads the checkout
+/// module tree.
+#[derive(Clone)]
+enum AgentEntry {
+    File(PathBuf),
+    Bundled(String),
+}
+
 struct CachedAgentRunner {
     source_digest: String,
     config: AgentConfig,
@@ -631,7 +642,7 @@ struct AgentServiceInner {
     store: Arc<RwLock<GatewayStore>>,
     persistence: Option<Arc<GatewayPersistence>>,
     agent_source: Option<Arc<String>>,
-    agent_entry: Mutex<Option<PathBuf>>,
+    agent_entry: Mutex<Option<AgentEntry>>,
     http_config: HttpConfig,
     tool_registry: RwLock<ToolRegistry>,
     provider_profiles: RwLock<HashMap<String, ProviderProfile>>,
@@ -826,6 +837,18 @@ impl AgentService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|cached| cached.config.clone())
+    }
+
+    /// The native snapshot digest of the currently installed runner, if any.
+    /// Read from the admitted runner itself (never recomputed), for bounded
+    /// public health facts.
+    pub(crate) fn installed_runner_snapshot_digest(&self) -> Option<String> {
+        self.inner
+            .runner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|cached| cached.runner.snapshot_digest().to_string())
     }
 
     /// Compiles or reuses the cached runner using current source + effective config.
@@ -1958,63 +1981,106 @@ impl AgentService {
             .expect("agent entry lock")
             .clone()
         {
-            let mut last_error = "module tree changed during compile".to_string();
-            for _ in 0..Self::COMPILE_DIGEST_RETRIES {
-                if let Some(hook) = self
-                    .inner
-                    .agent_compile_lookup_entered
-                    .lock()
-                    .expect("agent compile lookup observer lock")
-                    .clone()
-                {
-                    hook();
-                }
-                let live_a = crate::runtime::rss_runner::module_tree_digest(&entry)
-                    .map_err(|error| error.to_string())?;
-                {
-                    let cache = self
-                        .inner
-                        .runner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(cached) = cache.as_ref()
-                        && cached.source_digest == live_a
-                        && cached.config == expected
-                        && cached.runner.snapshot_digest() == live_a
-                    {
-                        return Ok(cached.runner.clone());
+            match entry {
+                AgentEntry::File(entry) => {
+                    let mut last_error = "module tree changed during compile".to_string();
+                    for _ in 0..Self::COMPILE_DIGEST_RETRIES {
+                        if let Some(hook) = self
+                            .inner
+                            .agent_compile_lookup_entered
+                            .lock()
+                            .expect("agent compile lookup observer lock")
+                            .clone()
+                        {
+                            hook();
+                        }
+                        let live_a = crate::runtime::rss_runner::module_tree_digest(&entry)
+                            .map_err(|error| error.to_string())?;
+                        {
+                            let cache = self
+                                .inner
+                                .runner
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(cached) = cache.as_ref()
+                                && cached.source_digest == live_a
+                                && cached.config == expected
+                                && cached.runner.snapshot_digest() == live_a
+                            {
+                                return Ok(cached.runner.clone());
+                            }
+                        }
+                        let runner = AgentRunner::from_file(&entry, expected.clone())
+                            .map_err(|error| error.to_string())?;
+                        if let Some(hook) = self
+                            .inner
+                            .agent_compile_postcheck_entered
+                            .lock()
+                            .expect("agent compile postcheck observer lock")
+                            .clone()
+                        {
+                            hook();
+                        }
+                        let compiled_b = runner.snapshot_digest().to_string();
+                        let live_c = crate::runtime::rss_runner::module_tree_digest(&entry)
+                            .map_err(|error| error.to_string())?;
+                        if live_c == compiled_b {
+                            let mut cache = self
+                                .inner
+                                .runner
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            *cache = Some(CachedAgentRunner {
+                                source_digest: compiled_b,
+                                config: expected,
+                                runner: runner.clone(),
+                            });
+                            return Ok(runner);
+                        }
+                        last_error = "module tree changed during compile".to_string();
                     }
+                    return Err(format!("RustScript compile error: {last_error}"));
                 }
-                let runner = AgentRunner::from_file(&entry, expected.clone())
-                    .map_err(|error| error.to_string())?;
-                if let Some(hook) = self
-                    .inner
-                    .agent_compile_postcheck_entered
-                    .lock()
-                    .expect("agent compile postcheck observer lock")
-                    .clone()
-                {
-                    hook();
-                }
-                let compiled_b = runner.snapshot_digest().to_string();
-                let live_c = crate::runtime::rss_runner::module_tree_digest(&entry)
-                    .map_err(|error| error.to_string())?;
-                if live_c == compiled_b {
+                AgentEntry::Bundled(key) => {
+                    // Immutable embedded resource: never a file digest or
+                    // checkout tree read. A cache hit is honored only when it
+                    // still names this exact admitted key and carries the
+                    // current effective config; otherwise the same admitted
+                    // key is recompiled through the native staged pipeline.
+                    {
+                        let cache = self
+                            .inner
+                            .runner
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(cached) = cache.as_ref()
+                            && cached.runner.bundled_resource_key() == Some(key.as_str())
+                            && cached.config == expected
+                        {
+                            return Ok(cached.runner.clone());
+                        }
+                    }
+                    let runner = AgentRunner::from_bundled(&key, expected.clone())
+                        .map_err(|error| error.to_string())?;
                     let mut cache = self
                         .inner
                         .runner
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(cached) = cache.as_ref()
+                        && cached.runner.bundled_resource_key() == Some(key.as_str())
+                        && cached.config == expected
+                    {
+                        return Ok(cached.runner.clone());
+                    }
                     *cache = Some(CachedAgentRunner {
-                        source_digest: compiled_b,
+                        source_digest: runner.snapshot_digest().to_string(),
                         config: expected,
                         runner: runner.clone(),
                     });
                     return Ok(runner);
                 }
-                last_error = "module tree changed during compile".to_string();
             }
-            return Err(format!("RustScript compile error: {last_error}"));
         }
         let source = source.ok_or_else(|| "RSS agent source is not configured".to_string())?;
         let digest = agent_source_digest(source);
@@ -2080,7 +2146,22 @@ impl AgentService {
     }
 
     pub fn install_agent_entry(&self, path: PathBuf) {
-        *self.inner.agent_entry.lock().expect("agent entry lock") = Some(path);
+        *self.inner.agent_entry.lock().expect("agent entry lock") = Some(AgentEntry::File(path));
+    }
+
+    /// Installs an immutable embedded bundled agent entry named by an
+    /// admitted native catalog key. The runner is compiled through the
+    /// native closed-bundle API with the current effective config *before*
+    /// the tagged entry is published, so a worker can never observe a
+    /// `Bundled` tag without its matching admitted runner. A `Bundled` key
+    /// is never resolved against the checkout module tree.
+    pub(crate) fn install_bundled_agent_entry(&self, key: &str) -> Result<(), String> {
+        let runner = AgentRunner::from_bundled(key, self.effective_agent_config())
+            .map_err(|_| "native bundled agent source could not be compiled".to_string())?;
+        self.install_agent_runner(runner);
+        *self.inner.agent_entry.lock().expect("agent entry lock") =
+            Some(AgentEntry::Bundled(key.to_string()));
+        Ok(())
     }
 
     /// Drops the live handle so `run_worker` must restore cancellation from

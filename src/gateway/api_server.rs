@@ -390,14 +390,26 @@ async fn health_detailed_handler(State(state): State<AgentGatewayState>) -> impl
     // scrape renders, so health and metrics can never disagree (one source
     // of truth) and neither endpoint ever touches the store.
     let snapshot = state.metrics.snapshot();
-    Json(json!({
+    let mut payload = json!({
         "status": "ok",
         "active_agents": snapshot.active_runs.max(0),
         // Runs whose terminal commit is awaiting the bounded durable retry
         // (observable instead of a silent leak).
         "terminal_pending": snapshot.runs_terminal_pending.max(0),
         "agent": state.config.agent_name,
-    }))
+    });
+    // Bounded public source facts for an RSS-selected entry: the native
+    // `kind`, the runner's native snapshot `hash`, and the policy's migration
+    // indicator. Never a raw selected path or source text. Absent for the
+    // legacy constructors that carry no RSS selection.
+    if let Some(source) = state.source_metadata() {
+        payload["source"] = json!({
+            "kind": source.kind,
+            "hash": source.hash,
+            "deprecated_override": source.deprecated_override,
+        });
+    }
+    Json(payload)
 }
 
 /// Prometheus text exposition of the bounded registry. Reads atomics only;

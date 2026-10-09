@@ -145,19 +145,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(std::io::Error::other)?;
     }
 
-    let script = env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")?;
+    // Explicit agent-source selection: the new bounded env tokens plus the
+    // original legacy script names. Raw values are passed through untouched;
+    // every priority/migration/validation decision is made by the RSS source
+    // policy inside `with_agent_selection` (never in Rust). The SQLite path
+    // stays the existing native collector.
+    let source = env_value("RUSTSCRIPT_AGENT_SOURCE", "PD_EDGE_AGENT_SOURCE")?;
+    let legacy_script = env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT")?;
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
-    let state = match (script.as_deref(), state_db.as_deref()) {
-        (Some(path), Some(db)) => AgentGatewayState::with_agent_file_and_sqlite(config, path, db)
-            .map_err(std::io::Error::other)?,
-        (Some(path), None) => {
-            AgentGatewayState::with_agent_file(config, path).map_err(std::io::Error::other)?
-        }
-        (None, Some(db)) => {
-            AgentGatewayState::with_sqlite_path(config, db).map_err(std::io::Error::other)?
-        }
-        (None, None) => AgentGatewayState::new(config).map_err(std::io::Error::other)?,
-    };
+    let mut selection = serde_json::Map::new();
+    if let Some(source) = source {
+        selection.insert("source".to_string(), serde_json::Value::String(source));
+    }
+    if let Some(script) = legacy_script {
+        selection.insert(
+            "legacy_script".to_string(),
+            serde_json::Value::String(script),
+        );
+    }
+    // Built before the listener binds: an invalid authoritative source is a
+    // static construction error and never falls back to a legacy/default
+    // source, and never reaches the socket.
+    let state = AgentGatewayState::with_agent_selection(
+        config,
+        serde_json::Value::Object(selection),
+        state_db.as_deref().map(std::path::Path::new),
+    )
+    .map_err(std::io::Error::other)?;
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!(
