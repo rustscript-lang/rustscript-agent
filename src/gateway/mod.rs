@@ -464,7 +464,13 @@ fn run_source_policy(selection: &serde_json::Value) -> Result<AgentSourceDecisio
     let value = runner
         .run_with_context(json_to_vm_value(selection))
         .map_err(|error| format!("run RSS agent source policy: {error}"))?;
-    parse_source_decision(&vm_value_to_json(&value))
+    let decision = vm_value_to_json(&value);
+    let reply = serde_json::to_vec(&decision)
+        .map_err(|_| "invalid_agent_source: policy returned an invalid decision".to_string())?;
+    if reply.len() > MAX_AGENT_SELECTION_BYTES {
+        return Err("agent source policy response exceeds the bounded size".to_string());
+    }
+    parse_source_decision(&decision)
 }
 
 /// Admits a source-policy decision. The native descriptors the policy can
@@ -475,21 +481,28 @@ fn parse_source_decision(decision: &serde_json::Value) -> Result<AgentSourceDeci
     let deprecated_override = decision
         .get("deprecated_override")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .ok_or_else(|| "invalid_agent_source: policy returned an invalid decision".to_string())?;
     match decision.get("ok").and_then(serde_json::Value::as_bool) {
         Some(true) => {}
-        _ => {
+        Some(false) => {
             let code = decision
                 .get("error")
                 .and_then(|error| error.get("code"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("invalid_agent_source");
+                .ok_or_else(|| {
+                    "invalid_agent_source: policy returned an invalid decision".to_string()
+                })?;
             let message = decision
                 .get("error")
                 .and_then(|error| error.get("message"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("agent source is invalid");
+                .ok_or_else(|| {
+                    "invalid_agent_source: policy returned an invalid decision".to_string()
+                })?;
             return Err(format!("{code}: {message}"));
+        }
+        None => {
+            return Err("invalid_agent_source: policy returned an invalid decision".to_string());
         }
     }
     let descriptor = decision

@@ -344,6 +344,53 @@ async fn empty_selection_runs_bundled_coding_with_provider_answer() {
     );
 }
 
+async fn assert_bundled_run_rebuilds_replaced_cache(key: &str, wrong_config: bool) {
+    let state =
+        AgentGatewayState::with_agent_selection(AgentGatewayConfig::default(), json!({}), None)
+            .expect("bundled selection must start");
+    let service = state.service();
+    let expected = service
+        .cached_runner_config()
+        .expect("the bundled selection installs its admitted runner");
+    let mut replacement_config = expected.clone();
+    if wrong_config {
+        replacement_config.http.allowed_hosts = vec!["cache-policy.invalid".to_string()];
+    }
+    let replacement = AgentRunner::from_bundled(key, replacement_config)
+        .expect("the replacement is an admitted native bundled runner");
+    service.install_agent_runner(replacement);
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("cache-rebuilt-bundled-answer"));
+    service.inject_provider_host(std::sync::Arc::new(provider.clone()));
+    let admitted = service.admit(admit_request()).await.expect("admission");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "run.completed")
+        .unwrap_or_else(|| panic!("the admitted coding entry must complete: {events:?}"));
+    assert!(
+        completed
+            .to_string()
+            .contains("cache-rebuilt-bundled-answer")
+    );
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(service.cached_runner_config(), Some(expected));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_cache_rebuilds_same_key_with_wrong_effective_config() {
+    assert_bundled_run_rebuilds_replaced_cache("rss/agent/main.rss", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_cache_rejects_another_admitted_resource_key() {
+    assert_bundled_run_rebuilds_replaced_cache("rss/storage/main.rss", false).await;
+}
+
 /// The explicit file selection must execute the selected source, not the
 /// default bundled entry.
 #[tokio::test]
