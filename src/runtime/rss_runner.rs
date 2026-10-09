@@ -970,7 +970,7 @@ impl AgentRunner {
             .map_err(RunError::Setup)?;
         let provider: Arc<dyn AgentProviderHost> =
             self.host.provider.clone().unwrap_or_else(|| {
-                default_agent_provider_host_with_auth_factory(self.host.auth_host_factory.clone())
+                new_default_agent_provider_host(self.host.auth_host_factory.clone())
             });
         vm.host_context().set_module_state(AgentHostState {
             provider,
@@ -1243,16 +1243,19 @@ pub(crate) fn default_agent_provider_host() -> Arc<dyn AgentProviderHost> {
 pub(crate) fn default_agent_provider_host_with_auth_factory(
     auth_host_factory: Option<AuthHostFactory>,
 ) -> Arc<dyn AgentProviderHost> {
-    match auth_host_factory {
-        Some(factory) => {
-            // The actual child invocation revalidates current bytes before dispatch.
-            let _ = compiled_file_program(&default_provider_dispatch_path());
-            Arc::new(RssAdapterProvider {
-                factory: Some(factory),
-            })
-        }
-        None => Arc::new(RssAdapterProvider { factory: None }),
+    if auth_host_factory.is_some() {
+        // The actual child invocation revalidates current bytes before dispatch.
+        let _ = compiled_file_program(&default_provider_dispatch_path());
     }
+    new_default_agent_provider_host(auth_host_factory)
+}
+
+fn new_default_agent_provider_host(
+    auth_host_factory: Option<AuthHostFactory>,
+) -> Arc<dyn AgentProviderHost> {
+    Arc::new(RssAdapterProvider {
+        factory: auth_host_factory,
+    })
 }
 
 struct RssAdapterProvider {
