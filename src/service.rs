@@ -1307,7 +1307,7 @@ impl AgentService {
                 session_id: session_id.clone(),
                 role: "assistant".to_string(),
                 content: content.clone(),
-                created_at: timestamp(),
+                created_at: event.timestamp,
                 run_id: Some(run_id.to_string()),
                 finish_reason: finish_reason.map(str::to_string),
                 name: None,
@@ -1323,7 +1323,7 @@ impl AgentService {
                 "event_id": event_id,
                 "event_type": "model.completed",
                 "payload_json": serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string()),
-                "now_ms": timestamp(),
+                "now_ms": event.timestamp,
                 "max_events": self.inner.config.max_events_per_run,
                 "message_id": message_id,
                 "role": "assistant",
@@ -1639,7 +1639,7 @@ impl AgentService {
                 "event_type": event_type,
                 "payload_json": serde_json::to_string(&event.data)
                     .unwrap_or_else(|_| "{}".to_string()),
-                "now_ms": timestamp(),
+                "now_ms": event.timestamp,
                 "max_events": max_events,
                 "seq": event.seq,
             });
