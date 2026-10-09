@@ -27,7 +27,10 @@ pub mod sqlite_storage_rows;
 pub mod tool_result;
 pub mod tool_schema;
 
+mod bundled_sources;
 mod durable_provider;
+
+pub use bundled_sources::bundled_rss_sources;
 
 pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
 #[cfg(feature = "config-fixture")]
