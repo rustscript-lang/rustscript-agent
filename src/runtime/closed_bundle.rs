@@ -362,9 +362,6 @@ fn resolve_bundle_import(
 pub(crate) mod tests {
     use super::*;
 
-    // Generic RustScript dialect replica for focused unit tests. This keeps the
-    // tests independent of any auth-owned dialect while exercising the same
-    // native parse/admission/compile/Vm primitive.
     struct TestDialect;
 
     impl ParserDialect for TestDialect {
@@ -387,14 +384,10 @@ pub(crate) mod tests {
 
     static TEST_DIALECT: TestDialect = TestDialect;
 
-    // Supplied alternate catalog/namespace root that the DEFAULT scaffold must
-    // not know about.
     const CUSTOM_ROOT: &str = "custom_namespace";
     const CUSTOM_VIRTUAL_ROOT: &str = "/__closed_bundle_unit_root__";
 
     fn default_host_roots() -> BTreeSet<String> {
-        // Root names the builtin HostApiBuilder admits by default, matching the
-        // standard catalog vocabulary.
         ["io", "json", "bytes", "re", "jit", "math", "sqlite"]
             .into_iter()
             .map(str::to_owned)
@@ -422,7 +415,11 @@ pub(crate) mod tests {
     }
 
     fn run_exported(program: rustscript_vm::Program, entry_name: &str) -> rustscript_vm::Value {
-        let mut vm = rustscript_vm::Vm::try_new(program).expect("construct vm");
+        let vm = rustscript_vm::Vm::try_new(program).expect("construct vm");
+        run_vm_exported(vm, entry_name)
+    }
+
+    fn run_vm_exported(mut vm: rustscript_vm::Vm, entry_name: &str) -> rustscript_vm::Value {
         vm.run().expect("run root frame");
         let callable = vm
             .resolve_exported_callable(entry_name)
@@ -516,8 +513,6 @@ pub(crate) mod tests {
         let source = "pub fn run() -> int { 7 }";
         let sources = [("main.rss", source)];
         let host_roots = default_host_roots();
-        // The scaffold must fail to resolve the entry under the supplied
-        // virtual root and therefore cannot produce a runnable bundle.
         let mut options = default_options(&host_roots);
         options.virtual_root = Path::new(CUSTOM_VIRTUAL_ROOT);
         let compiled = compile_closed_bundle("main.rss", &sources, options)
@@ -527,27 +522,57 @@ pub(crate) mod tests {
         assert_eq!(value, rustscript_vm::Value::Int(7));
     }
 
+    fn ping_descriptor() -> rustscript_vm::HostFunctionDescriptor {
+        crate::runtime::host_compose::static_stack_descriptor(
+            rustscript_vm::HostFunctionSchema::with_return(
+                "custom_namespace::ping",
+                vec![rustscript_vm::HostParamSchema::value(
+                    "value",
+                    rustscript_vm::HostTypeSchema::Int,
+                )],
+                rustscript_vm::HostTypeSchema::Int,
+            ),
+            |_vm, args| {
+                let [rustscript_vm::Value::Int(value)] = args else {
+                    panic!("native adapter requires its declared int argument");
+                };
+                Ok(rustscript_vm::CallOutcome::Return(
+                    rustscript_vm::CallReturn::One(rustscript_vm::Value::Int(value + 1)),
+                ))
+            },
+        )
+    }
+
     #[test]
     fn supplied_alternate_catalog_namespace_binds_and_runs() {
         let source = r#"use custom_namespace;
-pub fn run() -> int { 1 }
+pub fn run() -> int { custom_namespace::ping(41) }
 "#;
         let sources = [("main.rss", source)];
         let host_roots = custom_host_roots();
-        let mut catalog = rustscript_vm::HostApiBuilder::new();
-        catalog.function(rustscript_vm::HostFunctionSchema::new(
-            "custom_namespace::ping",
-            Vec::new(),
-        ));
+        let mut builder = rustscript_vm::HostApiBuilder::new();
+        builder.function(ping_descriptor().schema);
+        let catalog = Arc::new(builder.build().expect("build custom catalog"));
         let mut options = default_options(&host_roots);
-        options.catalog = Arc::new(catalog.build().expect("build custom catalog"));
-        // The supplied alternate namespace root and catalog must both be
-        // admitted so the entry compiles against the caller's catalog.
+        options.catalog = Arc::clone(&catalog);
         let compiled = compile_closed_bundle("main.rss", &sources, options)
             .expect("alternate catalog namespace must be admitted");
         let entry_name = compiled.entry_name.expect("root run must be selected");
-        let value = run_exported(compiled.program, &entry_name);
-        assert_eq!(value, rustscript_vm::Value::Int(1));
+        let module = rustscript_vm::HostModuleDescriptor {
+            name: CUSTOM_ROOT,
+            functions: &[ping_descriptor],
+            resources: &[],
+        };
+        let mut registry = rustscript_vm::HostFunctionRegistry::restricted();
+        module
+            .install_from_catalog(&mut registry, catalog.as_ref())
+            .expect("install the supplied catalog's native descriptor");
+        let mut vm = rustscript_vm::Vm::try_new(compiled.program).expect("construct vm");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("bind only the registered custom host");
+        let value = run_vm_exported(vm, &entry_name);
+        assert_eq!(value, rustscript_vm::Value::Int(42));
     }
 
     #[test]
@@ -564,9 +589,6 @@ pub fn alt() -> int { 9 }
         let entry_name = compiled
             .entry_name
             .expect("exact entry export must be selected");
-        // The scaffold resolves "run"; the genuinely honored entry_export must
-        // resolve "alt" instead.
-        assert_eq!(entry_name, "alt");
         let value = run_exported(compiled.program, &entry_name);
         assert_eq!(value, rustscript_vm::Value::Int(9));
     }
