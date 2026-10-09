@@ -20,7 +20,8 @@ struct ProviderRefreshResult {
     ok: bool,
     code: string,
     outcome: string,
-    metadata: AuthMetadata?
+    metadata: AuthMetadata?,
+    failure: AuthBridgeFailure?
 }
 
 // Unit-local declarations identical to rss/auth/token_save.rss; the pinned
@@ -36,7 +37,8 @@ struct TokenSaveResult {
     ok: bool,
     code: string,
     outcome: string?,
-    value: AuthMetadata?
+    value: AuthMetadata?,
+    failure: AuthBridgeFailure?
 }
 
 struct RefreshHandlePresence {
@@ -52,7 +54,28 @@ fn max_int() -> int {
 }
 
 fn failed(code: string) -> ProviderRefreshResult {
-    {ok: false, code: code, outcome: "", metadata: null}
+    {ok: false, code: code, outcome: "", metadata: null, failure: null}
+}
+
+fn failed_native(failure_value: AuthBridgeFailure?, fallback: string) -> ProviderRefreshResult {
+    if failure_value != null => {
+        let failure: AuthBridgeFailure = failure_value;
+        let code: string = failure_code(failure_value.copy(), fallback.copy());
+        {
+            ok: false,
+            code: code.copy(),
+            outcome: "",
+            metadata: null,
+            failure: {
+                code: code.copy(),
+                cancelled: failure.cancelled.copy(),
+                deadline_exceeded: failure.deadline_exceeded.copy(),
+                revoked: failure.revoked.copy()
+            }
+        }
+    } else => {
+        failed(fallback.copy())
+    }
 }
 
 fn empty_metadata() -> AuthMetadata {
@@ -214,6 +237,8 @@ fn complete(
         oauth::public_json_field_result(&policy, body.copy(), "/expires_in");
     let token_type_field: PublicJsonFieldResultEnvelope =
         oauth::public_json_field_result(&policy, body.copy(), "/token_type");
+    let expiry_failure: AuthBridgeFailure? = expiry_field.error.copy();
+    let token_type_failure: AuthBridgeFailure? = token_type_field.error.copy();
     let expires_in: int = expiry_seconds(expiry_field.copy());
     let token_type_ok: bool = bearer_token_type(token_type_field.copy());
     if !response_ok {
@@ -222,6 +247,12 @@ fn complete(
     } else if status < 200 || status >= 300 {
         close_returned_slots(response.access_slot, refresh_field);
         result = failed(non_success_code(policy, body.copy(), status));
+    } else if expiry_failure != null {
+        close_returned_slots(response.access_slot, refresh_field);
+        result = failed_native(expiry_failure.copy(), "refresh_response_invalid");
+    } else if token_type_failure != null {
+        close_returned_slots(response.access_slot, refresh_field);
+        result = failed_native(token_type_failure.copy(), "refresh_response_invalid");
     } else if !access_present {
         close_returned_slots(response.access_slot, refresh_field);
         result = failed("refresh_response_invalid");
@@ -235,7 +266,7 @@ fn complete(
         let now_ms: int = now_maybe.unwrap_or(-1);
         if !now_field.ok.copy() || now_field.error.copy() != null {
             close_returned_slots(response.access_slot, refresh_field);
-            result = failed(failure_code(now_field.error.copy(), "clock_unavailable"));
+            result = failed_native(now_field.error.copy(), "clock_unavailable");
         } else if !now_has_value || now_ms < 0 || now_ms > 9000000000000000 {
             close_returned_slots(response.access_slot, refresh_field);
             result = failed("clock_unavailable");
@@ -277,8 +308,10 @@ fn complete(
                 let saved_metadata: AuthMetadata = saved_maybe.unwrap_or(empty_metadata());
                 let has_outcome: bool = saved.has("outcome");
                 let outcome_maybe: string? = if has_outcome => { saved.outcome.copy() } else => { null };
+                let saved_has_failure: bool = saved.has("failure");
+                let saved_failure: AuthBridgeFailure? = if saved_has_failure => { saved.failure.copy() } else => { null };
                 if !saved.ok.copy() {
-                    result = failed(saved.code.copy());
+                    result = failed_native(saved_failure, saved.code.copy());
                 } else if !has_outcome {
                     result = failed("save_failed");
                 } else if !saved_has_value {
@@ -289,7 +322,8 @@ fn complete(
                         ok: true,
                         code: saved.code.copy(),
                         outcome: outcome.copy(),
-                        metadata: saved_metadata.copy()
+                        metadata: saved_metadata.copy(),
+                        failure: null
                     };
                 }
             }
@@ -314,7 +348,7 @@ fn issue_and_send(
     let issued_maybe: RefreshHandleEnvelope? = if issued_has_value => { issued.value } else => { null };
     let issued_envelope: RefreshHandleEnvelope = issued_maybe.unwrap_or(empty_refresh_envelope());
     if !issued_ok || issue_error.copy() != null {
-        result = failed(failure_code(issue_error.copy(), "refresh_unavailable"));
+        result = failed_native(issue_error.copy(), "refresh_unavailable");
     } else if !issued_has_value {
         result = failed("refresh_unavailable");
     } else if !issued_envelope.ok || issued_envelope.error != null {
@@ -352,7 +386,7 @@ fn issue_and_send(
             let response: TransportResponseEnvelope =
                 response_maybe.unwrap_or(empty_transport_response());
             if !sent_ok || send_error.copy() != null {
-                result = failed(failure_code(send_error.copy(), "refresh_failed"));
+                result = failed_native(send_error.copy(), "refresh_failed");
             } else if !response_has_value {
                 result = failed("refresh_failed");
             } else {
@@ -417,10 +451,10 @@ pub fn refresh(binding: OpaqueHostHomeBinding, intent: OpaqueRefreshIntent) -> P
         let loaded_has_value: bool = loaded.has("value");
         let loaded_maybe: AuthMetadataEnvelope? = if loaded_has_value => { loaded.value.copy() } else => { null };
         let loaded_envelope: AuthMetadataEnvelope = loaded_maybe.unwrap_or(empty_metadata_envelope());
-        if !loaded_has_value {
+        if loaded.error.copy() != null {
+            result = failed_native(loaded.error.copy(), "credential_not_admitted");
+        } else if !loaded_has_value {
             result = failed("credential_not_admitted");
-        } else if loaded.error.copy() != null {
-            result = failed(failure_code(loaded.error.copy(), "credential_not_admitted"));
         } else if !loaded.ok.copy() {
             result = failed("credential_not_admitted");
         } else if !loaded_envelope.ok.copy() {

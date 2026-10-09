@@ -19,7 +19,8 @@ struct ProviderRefreshResult {
     ok: bool,
     code: string,
     outcome: string,
-    metadata: AuthMetadata?
+    metadata: AuthMetadata?,
+    failure: AuthBridgeFailure?
 }
 
 pub fn run_refresh(binding: OpaqueHostHomeBinding, intent: OpaqueRefreshIntent) -> ProviderRefreshResult {

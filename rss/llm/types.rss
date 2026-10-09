@@ -138,10 +138,23 @@ pub fn error_new(
     if code == "interrupted_provider" {
         retryable = false;
     }
+    // Explicit quota signal is terminal and overrides 429/rate-limit
+    // retryability: the native sanitizer strips JSON `code` fields, so the
+    // public `type` is the usable distinguisher here. Canonicalize the
+    // returned code while keeping status/type/message/param/request_id.
+    let mut out_code: string = code;
+    if error_type == "insufficient_quota" {
+        retryable = false;
+        out_code = "insufficient_quota";
+    }
+    if code == "insufficient_quota" {
+        retryable = false;
+        out_code = "insufficient_quota";
+    }
     {
         status: status,
         type: error_type,
-        code: code,
+        code: out_code,
         message: message,
         param: param,
         request_id: request_id,

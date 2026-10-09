@@ -30,17 +30,44 @@ struct ProviderRefreshResult {
     ok: bool,
     code: string,
     outcome: string,
-    metadata: AuthMetadata?
+    metadata: AuthMetadata?,
+    failure: AuthBridgeFailure?
 }
 
 struct PreflightReady {
-    policy: resource<auth.policy>
+    home: resource<auth.host_home>?,
+    policy: resource<auth.policy>,
+    has_refresh_token: bool,
+    refresh_path: string?
+}
+
+struct BufferedSlotPresence {
+    slot: resource<auth.secret_slot>?
+}
+
+struct BufferedSlotBinding {
+    slot: resource<auth.secret_slot>
+}
+
+struct HostHomePresence {
+    home: resource<auth.host_home>?
+}
+
+struct PolicySlotPresence {
+    policy: resource<auth.policy>?
+}
+
+struct PolicyPresence {
+    home: resource<auth.host_home>?,
+    policy: resource<auth.policy>?,
+    error: AuthBridgeFailure?
 }
 
 struct PreflightResult {
     ok: bool,
     error: AuthBridgeFailure?,
     value: PreflightReady?,
+    credential_kind: string,
     did_refresh: bool
 }
 
@@ -89,6 +116,8 @@ fn failure_from_code(code: string) -> AuthBridgeFailure {
         {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
     } else if code.copy() == "deadline_exceeded" => {
         {code: code, cancelled: false, deadline_exceeded: true, revoked: false}
+    } else if code.copy() == "revoked" => {
+        {code: code, cancelled: false, deadline_exceeded: false, revoked: true}
     } else => {
         bridge_failure(code.copy())
     }
@@ -154,11 +183,104 @@ fn lookup_provider(public_config: BoundedPublicConfig, credential_id: string) ->
 }
 
 fn preflight_failed(error: AuthBridgeFailure?) -> PreflightResult {
-    {ok: false, error: error, value: null, did_refresh: false}
+    {ok: false, error: error, value: null, credential_kind: "", did_refresh: false}
 }
 
-fn preflight_ready(binding: OpaquePolicyBinding, refreshed: bool) -> PreflightResult {
-    {ok: true, error: null, value: {policy: binding.policy}, did_refresh: refreshed}
+fn preflight_ready(
+    home: resource<auth.host_home>?,
+    binding: OpaquePolicyBinding,
+    credential_kind: string,
+    has_refresh_token: bool,
+    refresh_path: string?,
+    refreshed: bool
+) -> PreflightResult {
+    {
+        ok: true,
+        error: null,
+        value: {
+            home: home,
+            policy: binding.policy,
+            has_refresh_token: has_refresh_token,
+            refresh_path: refresh_path
+        },
+        credential_kind: credential_kind,
+        did_refresh: refreshed
+    }
+}
+
+fn refresh_provider(
+    binding: OpaqueHostHomeBinding,
+    credential_id: string,
+    path: string
+) -> ProviderRefreshResult {
+    let refresh_intent: OpaqueRefreshIntent = {
+        credential_id: credential_id,
+        path: path,
+        public_body: "grant_type=refresh_token"
+    };
+    refresh_module::refresh(binding, refresh_intent)
+}
+
+fn reauth_required_result() -> TransportResultEnvelope {
+    {
+        ok: false,
+        error: {code: "reauth_required", cancelled: false, deadline_exceeded: false, revoked: false},
+        value: null
+    }
+}
+
+fn refresh_failure_result(code: string, failure_value: AuthBridgeFailure?) -> TransportResultEnvelope {
+    let mut canonical_code: string = code.copy();
+    if code.copy() == "reauth_required" || code.copy() == "refresh_unavailable" {
+        canonical_code = "reauth_required";
+    }
+    if failure_value != null => {
+        let failure: AuthBridgeFailure = failure_value;
+        {
+            ok: false,
+            error: {
+                code: canonical_code.copy(),
+                cancelled: failure.cancelled.copy(),
+                deadline_exceeded: failure.deadline_exceeded.copy(),
+                revoked: failure.revoked.copy()
+            },
+            value: null
+        }
+    } else if canonical_code.copy() == "reauth_required" => {
+        reauth_required_result()
+    } else => {
+        {ok: false, error: failure_from_code(code.copy()), value: null}
+    }
+}
+
+fn close_response_slots(response: TransportResponseEnvelope) -> null {
+    let has_access: bool = response.has("access_slot");
+    let has_refresh: bool = response.has("refresh_slot");
+    let access: BufferedSlotPresence = if has_access => {
+        {slot: response.access_slot}
+    } else => {
+        {slot: null}
+    };
+    let refresh: BufferedSlotPresence = if has_refresh => {
+        {slot: response.refresh_slot}
+    } else => {
+        {slot: null}
+    };
+    if access.has("slot") {
+        let slot: resource<auth.secret_slot>? = access.slot;
+        if slot != null {
+            let binding: BufferedSlotBinding = {slot: slot};
+            auth::close_slot(binding.slot);
+        }
+    }
+    if refresh.has("slot") {
+        let slot: resource<auth.secret_slot>? = refresh.slot;
+        if slot != null {
+            let binding: BufferedSlotBinding = {slot: slot};
+            auth::close_slot(binding.slot);
+        }
+    }
+    null
 }
 
 fn skew_ms_guarded(skew_seconds: int) -> int {
@@ -204,7 +326,7 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
                     if metadata.credential_id.copy() != credential_id.copy() || metadata.generation.copy() < 0 || metadata.provider.copy() == "" || metadata.status.copy() != "active" => {
                         preflight_failed(bridge_failure("invalid_credential_metadata"))
                     } else if metadata.kind.copy() != "oauth" => {
-                        preflight_ready(policy_binding, false)
+                        preflight_ready(binding.home, policy_binding, metadata.kind.copy(), false, null, false)
                     } else => {
                         let selected: ProviderLookup = lookup_provider(public_config, credential_id.copy());
                         if !selected.found.copy() => {
@@ -225,7 +347,7 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
                                         preflight_failed(bridge_failure("clock_unavailable"))
                                     } else if provider.oauth.copy() == null => {
                                         if metadata.expires_at_ms.copy() > now_ms => {
-                                            preflight_ready(policy_binding, false)
+                                            preflight_ready(binding.home, policy_binding, metadata.kind.copy(), metadata.has_refresh_token.copy(), null, false)
                                         } else => {
                                             preflight_failed(bridge_failure("refresh_unavailable"))
                                         }
@@ -244,7 +366,19 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
                                             }
                                         }
                                         if !needs_refresh => {
-                                            preflight_ready(policy_binding, false)
+                                            let refresh_path: string? = if endpoint_holder == null => {
+                                                null
+                                            } else => {
+                                                token_path(endpoint_holder.unwrap_or(""))
+                                            };
+                                            preflight_ready(
+                                                binding.home,
+                                                policy_binding,
+                                                metadata.kind.copy(),
+                                                metadata.has_refresh_token.copy(),
+                                                refresh_path,
+                                                false
+                                            )
                                         } else if !metadata.has_refresh_token.copy() || endpoint_holder == null => {
                                             preflight_failed(bridge_failure("refresh_unavailable"))
                                         } else => {
@@ -252,19 +386,31 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
                                             if path_holder == null => {
                                                 preflight_failed(bridge_failure("refresh_unavailable"))
                                             } else => {
-                                                let refresh_intent: OpaqueRefreshIntent = {
-                                                    credential_id: credential_id.copy(),
-                                                    path: path_holder.unwrap_or(""),
-                                                    public_body: "grant_type=refresh_token"
-                                                };
                                                 let refreshed: ProviderRefreshResult =
-                                                    refresh_module::refresh({home: binding.home}, refresh_intent);
+                                                    refresh_provider(
+                                                        {home: binding.home},
+                                                        credential_id.copy(),
+                                                        path_holder.unwrap_or("")
+                                                    );
                                                 if !refreshed.ok.copy() => {
-                                                    preflight_failed(failure_from_code(refreshed.code.copy()))
+                                                    let has_failure: bool = refreshed.has("failure");
+                                                    let failure: AuthBridgeFailure? = if has_failure => { refreshed.failure.copy() } else => { null };
+                                                    if failure != null => {
+                                                        preflight_failed(failure)
+                                                    } else => {
+                                                        preflight_failed(failure_from_code(refreshed.code.copy()))
+                                                    }
                                                 } else if refreshed.outcome.copy() != "committed" && refreshed.outcome.copy() != "adopted" => {
                                                     preflight_failed(bridge_failure("refresh_failed"))
                                                 } else => {
-                                                    preflight_ready(policy_binding, true)
+                                                    preflight_ready(
+                                                        null,
+                                                        policy_binding,
+                                                        metadata.kind.copy(),
+                                                        metadata.has_refresh_token.copy(),
+                                                        path_holder,
+                                                        true
+                                                    )
                                                 }
                                             }
                                         }
@@ -279,17 +425,134 @@ fn preflight(binding: OpaqueHostHomeBinding, credential_id: string) -> Preflight
     }
 }
 
+fn retain_retry_policy(binding: OpaqueHostHomeBinding) -> PolicyPresence {
+    let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&binding.home);
+    let has_error: bool = snapshot.has("error");
+    let ok: bool = snapshot.ok;
+    let error: string? = if has_error => { snapshot.error } else => { null };
+    if !ok || error != null => {
+        {home: null, policy: null, error: failure_from_code(error.unwrap_or("auth_unavailable"))}
+    } else => {
+        {home: binding.home, policy: snapshot.policy_handle, error: null}
+    }
+}
+
+fn forced_refresh_retry(
+    binding: OpaqueHostHomeBinding,
+    policy_binding: OpaquePolicyBinding,
+    path: string,
+    intent: OpaqueProviderIntent
+) -> TransportResultEnvelope {
+    let refreshed: ProviderRefreshResult =
+        refresh_provider(binding, intent.credential_id.copy(), path.copy());
+    let has_failure: bool = refreshed.has("failure");
+    let failure: AuthBridgeFailure? = if has_failure => { refreshed.failure.copy() } else => { null };
+    let outcome: string = refreshed.outcome.copy();
+    if !refreshed.ok.copy() => {
+        refresh_failure_result(refreshed.code.copy(), failure)
+    } else if outcome.copy() != "committed" && outcome.copy() != "adopted" => {
+        refresh_failure_result("save_failed", null)
+    } else => {
+        let mut retried: TransportResultEnvelope = bridge_call(policy_binding, intent.copy());
+        let retry_has_value: bool = retried.has("value");
+        // Native wrap_value guarantees ok => error is null. Leave that
+        // nullable field untouched: moving/reassigning it changes the guest
+        // map shape consumed by the codec. Restore only inspected scalars.
+        let retry_ok: bool = retried.ok;
+        retried.ok = retry_ok;
+        if !retry_ok || !retry_has_value => {
+            retried
+        } else => {
+            let mut response: TransportResponseEnvelope = retried.value;
+            let status: int = response.status;
+            response.status = status;
+            if status == 401 => {
+                close_response_slots(response);
+                reauth_required_result()
+            } else => {
+                retried.value = response;
+                retried
+            }
+        }
+    }
+}
+
 pub fn call(binding: OpaqueHostHomeBinding, intent: OpaqueProviderIntent) -> TransportResultEnvelope {
     let prepared: PreflightResult = preflight(binding, intent.credential_id.copy());
     let has_value: bool = prepared.has("value");
     let has_error: bool = prepared.has("error");
+    let credential_kind: string = prepared.credential_kind;
+    let did_refresh: bool = prepared.did_refresh;
     let ok: bool = prepared.ok;
     let failure: AuthBridgeFailure? = if has_error => { prepared.error } else => { null };
     if !ok || failure != null || !has_value => {
         {ok: false, error: failure, value: null}
     } else => {
         let ready: PreflightReady = prepared.value;
-        bridge_call({policy: ready.policy}, intent)
+        let has_home: bool = ready.has("home");
+        let has_refresh_path: bool = ready.has("refresh_path");
+        let has_refresh_token: bool = ready.has_refresh_token;
+        let home_holder: HostHomePresence = if has_home => {
+            {home: ready.home}
+        } else => {
+            {home: null}
+        };
+        let refresh_path: string? = if has_refresh_path => { ready.refresh_path } else => { null };
+        let retained: PolicyPresence = if credential_kind.copy() == "oauth" && !did_refresh &&
+            has_refresh_token && refresh_path != null && home_holder.has("home") => {
+            retain_retry_policy({home: home_holder?.home})
+        } else => {
+            {home: null, policy: null, error: null}
+        };
+        let retained_has_home: bool = retained.has("home");
+        let retained_has_policy: bool = retained.has("policy");
+        let retained_has_error: bool = retained.has("error");
+        let retained_failure: AuthBridgeFailure? = if retained_has_error => { retained.error } else => { null };
+        let retry_home: HostHomePresence = if retained_has_home => {
+            {home: retained.home}
+        } else => {
+            {home: null}
+        };
+        let retry_policy: PolicySlotPresence = if retained_has_policy => {
+            {policy: retained.policy}
+        } else => {
+            {policy: null}
+        };
+        if retained_failure != null => {
+            {ok: false, error: retained_failure, value: null}
+        } else => {
+            let first_binding: OpaquePolicyBinding = {policy: ready.policy};
+            let mut first: TransportResultEnvelope = bridge_call(first_binding, intent.copy());
+            let first_has_value: bool = first.has("value");
+            let first_ok: bool = first.ok;
+            first.ok = first_ok;
+            if !first_ok || !first_has_value => {
+                first
+            } else => {
+                let mut response: TransportResponseEnvelope = first.value;
+                let status: int = response.status;
+                response.status = status;
+                if status != 401 || credential_kind.copy() != "oauth" => {
+                    first.value = response;
+                    first
+                } else => {
+                    close_response_slots(response);
+                    if did_refresh || !has_refresh_token => {
+                        reauth_required_result()
+                    } else if refresh_path == null || !retained_has_home || !retained_has_policy => {
+                        reauth_required_result()
+                    } else => {
+                        let path: string = refresh_path.unwrap_or("");
+                        forced_refresh_retry(
+                            {home: retry_home?.home},
+                            {policy: retry_policy?.policy},
+                            path,
+                            intent.copy()
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 

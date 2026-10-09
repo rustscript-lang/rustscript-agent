@@ -13,7 +13,8 @@ struct TokenSaveResult {
     ok: bool,
     code: string,
     outcome: string?,
-    value: AuthMetadata?
+    value: AuthMetadata?,
+    failure: AuthBridgeFailure?
 }
 
 fn failed(code: string) -> TokenSaveResult {
@@ -21,7 +22,8 @@ fn failed(code: string) -> TokenSaveResult {
         ok: false,
         code: code,
         outcome: null,
-        value: null
+        value: null,
+        failure: null
     }
 }
 
@@ -30,7 +32,8 @@ fn succeeded(outcome: string, metadata: AuthMetadata) -> TokenSaveResult {
         ok: true,
         code: "ok",
         outcome: outcome,
-        value: metadata
+        value: metadata,
+        failure: null
     }
 }
 
@@ -102,6 +105,27 @@ fn native_failure_code(failure_value: AuthBridgeFailure?, fallback: string) -> s
         recognized_native_code(failure.code.copy(), fallback)
     } else => {
         fallback
+    }
+}
+
+fn failed_native(failure_value: AuthBridgeFailure?, fallback: string) -> TokenSaveResult {
+    if failure_value != null => {
+        let failure: AuthBridgeFailure = failure_value;
+        let code: string = native_failure_code(failure_value.copy(), fallback.copy());
+        {
+            ok: false,
+            code: code.copy(),
+            outcome: null,
+            value: null,
+            failure: {
+                code: code.copy(),
+                cancelled: failure.cancelled.copy(),
+                deadline_exceeded: failure.deadline_exceeded.copy(),
+                revoked: failure.revoked.copy()
+            }
+        }
+    } else => {
+        failed(fallback.copy())
     }
 }
 
@@ -233,7 +257,7 @@ pub fn save(
         let saved_envelope: AuthMetadataEnvelope =
             saved_metadata.unwrap_or(empty_metadata_envelope());
         if !saved.ok.copy() || saved.error.copy() != null => {
-            failed(native_failure_code(saved.error.copy(), "save_failed"))
+            failed_native(saved.error.copy(), "save_failed")
         } else if !saved_has_value => {
             failed("save_failed")
         } else if !saved_envelope.ok.copy() || saved_envelope.error.copy() != null => {
@@ -264,7 +288,7 @@ pub fn save(
                     let loaded_envelope: AuthMetadataEnvelope =
                         loaded_metadata.unwrap_or(empty_metadata_envelope());
                     if !loaded.ok.copy() || loaded.error.copy() != null => {
-                        failed(native_failure_code(loaded.error.copy(), "credential_unavailable"))
+                        failed_native(loaded.error.copy(), "credential_unavailable")
                     } else if !loaded_has_value => {
                         failed("credential_unavailable")
                     } else if !loaded_envelope.ok.copy() || loaded_envelope.error.copy() != null => {
@@ -287,7 +311,7 @@ pub fn save(
                             let clock_value: int? = if clock_has_value => { clock.value.copy() } else => { null };
                             let now_ms: int = clock_value.unwrap_or(-1);
                             if !clock.ok.copy() || clock.error.copy() != null => {
-                                failed(native_failure_code(clock.error.copy(), "clock_unavailable"))
+                                failed_native(clock.error.copy(), "clock_unavailable")
                             } else if !clock_has_value || now_ms < 0 => {
                                 failed("clock_unavailable")
                             } else if readback.expires_at_ms.copy() <= now_ms => {
