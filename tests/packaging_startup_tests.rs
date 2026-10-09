@@ -796,7 +796,7 @@ async fn binary_non_utf8_authoritative_source_is_static_invalid_without_leak() {
     let db = root.join("state.db");
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
-    let marker = "\u{FFFD}PRIVATE_SOURCE_ENCODING_SENTINEL";
+    let marker = "PRIVATE_SOURCE_ENCODING_SENTINEL";
     let opaque_source = os_string_from_bytes(b"\xFFPRIVATE_SOURCE_ENCODING_SENTINEL");
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
         .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
@@ -808,6 +808,7 @@ async fn binary_non_utf8_authoritative_source_is_static_invalid_without_leak() {
         .current_dir(&root)
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
+        .kill_on_drop(true)
         .spawn()
         .expect("gateway binary should spawn");
 
@@ -866,6 +867,7 @@ async fn binary_valid_source_with_non_utf8_legacy_starts_bundled() {
         .current_dir(&root)
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
+        .kill_on_drop(true)
         .spawn()
         .expect("gateway binary should spawn");
 
