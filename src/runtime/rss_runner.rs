@@ -1244,9 +1244,13 @@ pub(crate) fn default_agent_provider_host_with_auth_factory(
     auth_host_factory: Option<AuthHostFactory>,
 ) -> Arc<dyn AgentProviderHost> {
     match auth_host_factory {
-        Some(factory) => Arc::new(RssAdapterProvider {
-            factory: Some(factory),
-        }),
+        Some(factory) => {
+            // The actual child invocation revalidates current bytes before dispatch.
+            let _ = compiled_file_program(&default_provider_dispatch_path());
+            Arc::new(RssAdapterProvider {
+                factory: Some(factory),
+            })
+        }
         None => Arc::new(RssAdapterProvider { factory: None }),
     }
 }

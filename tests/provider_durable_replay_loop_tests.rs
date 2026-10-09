@@ -702,3 +702,164 @@ fn explicit_empty_top_level_credential_id_blocks_provider_option_fallback() {
     assert!(transport.take_sent().is_empty());
     drop(home);
 }
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::oneshot;
+
+use rustscript_agent::CancellationReason;
+use rustscript_agent::auth::oauth::{
+    BoundedHttpsTransport, OAuthError, OAuthIoContext, PreparedHttpsRequest, RawHttpsResponse,
+};
+
+struct PendingServiceTransport {
+    entered: Mutex<Option<oneshot::Sender<PreparedHttpsRequest>>>,
+    send_count: AtomicUsize,
+}
+
+impl BoundedHttpsTransport for PendingServiceTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        if self.send_count.fetch_add(1, Ordering::SeqCst) != 0 {
+            return Err(OAuthError::Transport {
+                message: "unexpected duplicate fixture request".to_string(),
+            });
+        }
+        self.entered
+            .lock()
+            .expect("native entry sender")
+            .take()
+            .expect("one expected native entry")
+            .send(request.clone())
+            .map_err(|_| OAuthError::Transport {
+                message: "native entry observer closed".to_string(),
+            })?;
+        loop {
+            context.check()?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn service_default_provider_native_entry_is_bounded_after_model_request() {
+    let home = fixture_home();
+    let (entered_tx, mut entered_rx) = oneshot::channel();
+    let transport = Arc::new(PendingServiceTransport {
+        entered: Mutex::new(Some(entered_tx)),
+        send_count: AtomicUsize::new(0),
+    });
+    let db_path = fixture_db_path();
+    let state = open_sqlite_service(&db_path);
+    let service = state.service();
+    service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let admitted = service.admit(admit_request()).await.expect("admission");
+    let cancellation = service
+        .handle(&admitted.run_id)
+        .expect("live run handle")
+        .cancellation()
+        .clone();
+    let mut worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move { service.run_worker(run_id, "ignored".to_string()).await }
+    });
+
+    let requested_observed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if named_event_count(&service.run_events(&admitted.run_id), "model.requested") == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    let native_entry = if requested_observed.is_ok() {
+        Some(tokio::time::timeout(Duration::from_secs(5), &mut entered_rx).await)
+    } else {
+        None
+    };
+
+    cancellation.request(CancellationReason::Requested);
+    let cancellation_join = tokio::time::timeout(Duration::from_secs(5), &mut worker).await;
+    let cancellation_joined_within_five_seconds = matches!(cancellation_join, Ok(Ok(())));
+    let worker_joined_for_cleanup = if cancellation_joined_within_five_seconds {
+        true
+    } else {
+        let cleanup_budget = cancellation
+            .remaining_deadline()
+            .unwrap_or_default()
+            .saturating_add(Duration::from_secs(5));
+        tokio::time::timeout(cleanup_budget, &mut worker)
+            .await
+            .is_ok_and(|result| result.is_ok())
+    };
+
+    let events = service.run_events(&admitted.run_id);
+    let assistants = assistant_messages(&service, &admitted.session_id);
+    assert_service_surfaces_secret_free(&service, &admitted.run_id, &admitted.session_id, &db_path);
+    let send_count = transport.send_count.load(Ordering::SeqCst);
+
+    drop(service);
+    drop(state);
+    drop(home);
+    remove_db_artifacts(&db_path);
+
+    assert!(
+        requested_observed.is_ok(),
+        "service did not publish model.requested within its 30-second fixture budget"
+    );
+    assert!(
+        cancellation_joined_within_five_seconds,
+        "requested cancellation did not join the service worker within 5 seconds"
+    );
+    assert!(
+        worker_joined_for_cleanup,
+        "service worker cleanup join failed"
+    );
+    let native_request = native_entry
+        .expect("native entry wait follows model.requested")
+        .expect("actual default provider native entry within 5 seconds")
+        .expect("native transport entry channel remains open");
+    assert_eq!(send_count, 1, "exactly one native provider send");
+    assert_eq!(native_request.method, "POST");
+    assert_eq!(native_request.url, EXPECTED_URL);
+    assert_eq!(
+        native_request
+            .headers
+            .get("authorization")
+            .map(String::as_str),
+        Some("Bearer SYNTHETIC_DURABLE_ACCESS")
+    );
+    let wire: JsonValue = serde_json::from_str(&native_request.body).expect("public request JSON");
+    assert_no_fixture_secret_text(&native_request.body, "provider request body");
+    assert_eq!(wire["model"], json!("durable-request-model"));
+    let wire_messages = wire["messages"].as_array().expect("parsed public messages");
+    assert_eq!(wire_messages.len(), 2);
+    assert_eq!(
+        wire_messages[1],
+        json!({
+            "role": "user",
+            "content": [{"type": "text", "text": EXPECTED_USER_TEXT}]
+        })
+    );
+    assert_eq!(named_event_count(&events, "model.requested"), 1);
+    assert_eq!(named_event_count(&events, "model.completed"), 0);
+    assert_eq!(named_event_count(&events, "run.cancelled"), 1);
+    assert_eq!(
+        event_names(&events)
+            .iter()
+            .filter(|name| matches!(**name, "run.completed" | "run.failed" | "run.cancelled"))
+            .count(),
+        1,
+        "requested cancellation commits exactly one terminal event"
+    );
+    assert!(
+        assistants.is_empty(),
+        "cancelled service run has no assistant completion"
+    );
+}
