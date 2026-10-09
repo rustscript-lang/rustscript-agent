@@ -54,7 +54,7 @@ config-fixture = []
 
 # Optimize the embedded compiler while retaining development checks.
 [profile.dev.package.pd-vm]
-opt-level = 1
+opt-level = 3
 
 [[test]]
 name = "auth_store_tests"
