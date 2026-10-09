@@ -244,6 +244,10 @@ fn rss_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("rss")
 }
 
+fn default_provider_dispatch_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/provider_dispatch.rss")
+}
+
 /// Production bundled coding-agent entry (`rss/agent/main.rss`).
 pub fn bundled_agent_main_path() -> PathBuf {
     rss_root().join("agent/main.rss")
@@ -838,6 +842,17 @@ impl AgentRunner {
 
     /// Replaces the full host-bridge bundle for one run.
     pub fn with_host(mut self, host: AgentHostBridges) -> Self {
+        if host.provider.is_none()
+            && host.auth_host_factory.is_some()
+            && self
+                .program
+                .imports
+                .iter()
+                .any(|import| import.name == "agent::provider_call")
+        {
+            // The builder cannot report this error; dispatch revalidates live bytes.
+            let _ = compiled_file_program(&default_provider_dispatch_path());
+        }
         self.host = host;
         self
     }
@@ -1267,8 +1282,7 @@ fn invoke_default_opaque_dispatch(
             "native auth host is unavailable for default provider",
         );
     };
-    let harness_path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/provider_dispatch.rss");
+    let harness_path = default_provider_dispatch_path();
     let runner = match AgentRunner::from_file(harness_path, AgentConfig::default()) {
         Ok(runner) => runner,
         Err(_) => {
