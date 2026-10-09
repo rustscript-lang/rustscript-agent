@@ -1,179 +1,66 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+//! Auth bundle entry: a thin adapter over the generic closed-bundle compiler.
+//!
+//! Only the auth-specific constants, catalog, dialects, host-root factory, and
+//! error mapping live here. The compile/admission algorithm is owned by
+//! `crate::runtime::closed_bundle`.
 
-use rustscript_vm::{
-    CompileSourceFileOptions, ImportClause, SharedParserOptions, SourceFlavor, UsePathSegment,
-    analyze_source_from_string_with_options, compile_source_at_path_with_flavor_and_options,
-    parse_source_with_dialect,
-};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
 
 use super::{AUTH_ENTRY_PARSER_DIALECT, AuthEntryError, AuthEntryRunner, MAX_AGENT_SOURCE_BYTES};
 use crate::auth::host::{auth_host_catalog, auth_host_module};
+use crate::runtime::closed_bundle::{
+    ClosedBundleError, ClosedBundleLimits, ClosedBundleOptions, compile_closed_bundle,
+};
 
 const MAX_BUNDLE_FILES: usize = 64;
 const MAX_BUNDLE_DEPTH: usize = 16;
 const MAX_BUNDLE_SOURCE_BYTES: usize = 4 * MAX_AGENT_SOURCE_BYTES;
 const VIRTUAL_BUNDLE_ROOT: &str = "/__rustscript_agent_auth_bundle__";
 const JSON_ROOT: &str = "json";
-
-struct BundleImport {
-    path: Vec<UsePathSegment>,
-    clause: ImportClause,
-}
+const AUTH_ENTRY_EXPORT: &str = "run";
 
 impl AuthEntryRunner {
     /// Compile a closed, bounded RSS tree from trusted embedding-owned bytes.
     /// No input path is opened or materialized on disk.
     pub fn from_bundle(entry_path: &str, sources: &[(&str, &str)]) -> Result<Self, AuthEntryError> {
-        if sources.len() > MAX_BUNDLE_FILES {
-            return Err(AuthEntryError::SourceTooLarge);
-        }
-        validate_bundle_path(entry_path)?;
-        let mut total_bytes = 0usize;
-        let mut bundle = BTreeMap::new();
-        for (path, source) in sources {
-            validate_bundle_path(path)?;
-            if source.len() > MAX_AGENT_SOURCE_BYTES {
-                return Err(AuthEntryError::SourceTooLarge);
-            }
-            total_bytes = total_bytes
-                .checked_add(source.len())
-                .ok_or(AuthEntryError::SourceTooLarge)?;
-            if total_bytes > MAX_BUNDLE_SOURCE_BYTES {
-                return Err(AuthEntryError::SourceTooLarge);
-            }
-            if bundle
-                .insert((*path).to_owned(), (*source).to_owned())
-                .is_some()
-            {
-                return Err(AuthEntryError::ImportDenied);
-            }
-        }
-        let entry = bundle.get(entry_path).ok_or(AuthEntryError::ImportDenied)?;
         let host_roots = admitted_host_roots();
-        reject_host_collisions(bundle.keys(), &host_roots)?;
-        let mut imports = BTreeMap::new();
-        for (path, source) in &bundle {
-            imports.insert(path.clone(), scan_imports(source)?);
-        }
-        preflight_bundle(&bundle, &imports, &host_roots)?;
-
         let catalog = auth_host_catalog();
-        let mut options =
-            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
-        for (path, source) in &bundle {
-            let virtual_path = virtual_path(path);
-            options.set_module_override_source(virtual_path.to_string_lossy().into_owned(), source);
-        }
-        let entry_virtual_path = virtual_path(entry_path);
-        let analysis_path = entry_virtual_path.clone();
-        let analysis_source = entry.clone();
-        let analysis_options = options.clone();
-        let (semantic_model, compiled) = std::thread::scope(|scope| {
-            let analysis = scope.spawn(move || {
-                analyze_source_from_string_with_options(
-                    analysis_path,
-                    &analysis_source,
-                    analysis_options,
-                )
-            });
-            let compiled = compile_source_at_path_with_flavor_and_options(
-                &entry_virtual_path,
-                entry,
-                SourceFlavor::RustScript,
-                options,
-            );
-            let semantic_model = analysis
-                .join()
-                .map_err(|_| AuthEntryError::CompileFailed)?
-                .map_err(|_| AuthEntryError::CompileFailed)?;
-            let compiled = compiled.map_err(|_| AuthEntryError::CompileFailed)?;
-            Ok::<_, AuthEntryError>((semantic_model, compiled))
-        })?;
-        let module_graph = semantic_model
-            .module_graph()
-            .ok_or(AuthEntryError::CompileFailed)?;
-        let root_module = module_graph
-            .module_id_for_identity(&entry_virtual_path)
-            .ok_or(AuthEntryError::CompileFailed)?;
-        let entry_name = match module_graph.symbol_for_export(root_module, "run") {
-            Some(symbol) => {
-                let mut declarations = semantic_model
-                    .ir()
-                    .functions
-                    .iter()
-                    .filter(|function| function.symbol == Some(symbol));
-                let function = declarations.next().ok_or(AuthEntryError::CompileFailed)?;
-                if declarations.next().is_some() {
-                    return Err(AuthEntryError::CompileFailed);
-                }
-                Some(function.name.clone())
-            }
-            None => None,
-        };
-        if let Some(entry_name) = entry_name.as_deref() {
-            let matching_exports = compiled
-                .program
-                .exported_callables
-                .iter()
-                .filter(|callable| callable.name.as_str() == entry_name)
-                .count();
-            if matching_exports != 1 {
-                return Err(AuthEntryError::CompileFailed);
-            }
-        }
+        let compiled = compile_closed_bundle(
+            entry_path,
+            sources,
+            ClosedBundleOptions {
+                limits: ClosedBundleLimits {
+                    max_files: MAX_BUNDLE_FILES,
+                    max_depth: MAX_BUNDLE_DEPTH,
+                    max_file_bytes: MAX_AGENT_SOURCE_BYTES,
+                    max_total_bytes: MAX_BUNDLE_SOURCE_BYTES,
+                },
+                virtual_root: Path::new(VIRTUAL_BUNDLE_ROOT),
+                host_roots: &host_roots,
+                catalog: Arc::clone(&catalog),
+                dialect: &AUTH_ENTRY_PARSER_DIALECT,
+                entry_export: AUTH_ENTRY_EXPORT,
+            },
+        )
+        .map_err(map_bundle_error)?;
         Ok(Self {
             program: compiled.program,
             catalog,
             bundle_json_encode: true,
-            entry_name,
+            entry_name: compiled.entry_name,
         })
     }
 }
 
-fn validate_bundle_path(path: &str) -> Result<(), AuthEntryError> {
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.contains('\\')
-        || path.chars().any(char::is_control)
-    {
-        return Err(AuthEntryError::ImportDenied);
+fn map_bundle_error(error: ClosedBundleError) -> AuthEntryError {
+    match error {
+        ClosedBundleError::SourceTooLarge => AuthEntryError::SourceTooLarge,
+        ClosedBundleError::SourceInvalid => AuthEntryError::SourceInvalid,
+        ClosedBundleError::ImportDenied => AuthEntryError::ImportDenied,
+        ClosedBundleError::CompileFailed => AuthEntryError::CompileFailed,
     }
-    let components: Vec<&str> = path.split('/').collect();
-    if components.len() > MAX_BUNDLE_DEPTH
-        || components
-            .iter()
-            .any(|component| component.is_empty() || *component == "." || *component == "..")
-    {
-        return Err(AuthEntryError::ImportDenied);
-    }
-    for (index, component) in components.iter().enumerate() {
-        let name = if index + 1 == components.len() {
-            component
-                .strip_suffix(".rss")
-                .ok_or(AuthEntryError::ImportDenied)?
-        } else {
-            component
-        };
-        if !valid_module_identifier(name) {
-            return Err(AuthEntryError::ImportDenied);
-        }
-    }
-    Ok(())
-}
-
-fn valid_module_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_alphabetic())
-        && chars.all(|character| character == '_' || character.is_alphanumeric())
-}
-
-fn virtual_path(path: &str) -> PathBuf {
-    Path::new(VIRTUAL_BUNDLE_ROOT).join(path)
 }
 
 fn admitted_host_roots() -> BTreeSet<String> {
@@ -185,133 +72,4 @@ fn admitted_host_roots() -> BTreeSet<String> {
     }
     roots.insert(JSON_ROOT.to_owned());
     roots
-}
-
-fn reject_host_collisions<'a>(
-    paths: impl Iterator<Item = &'a String>,
-    host_roots: &BTreeSet<String>,
-) -> Result<(), AuthEntryError> {
-    for path in paths {
-        let first = path.split('/').next().ok_or(AuthEntryError::ImportDenied)?;
-        let root = first.strip_suffix(".rss").unwrap_or(first);
-        if host_roots.contains(root) {
-            return Err(AuthEntryError::ImportDenied);
-        }
-    }
-    Ok(())
-}
-
-fn scan_imports(source: &str) -> Result<Vec<BundleImport>, AuthEntryError> {
-    let ir = parse_source_with_dialect(
-        source,
-        &AUTH_ENTRY_PARSER_DIALECT,
-        SharedParserOptions {
-            source_id: 0,
-            allow_implicit_externs: true,
-            allow_implicit_semicolons: false,
-            enforce_mutable_bindings: false,
-            import_scan_mode: true,
-        },
-    )
-    .map_err(|_| AuthEntryError::SourceInvalid)?;
-    ir.use_declarations
-        .into_iter()
-        .map(|declaration| {
-            if matches!(
-                declaration.clause,
-                ImportClause::AllPublic | ImportClause::Named(_) | ImportClause::Namespace(_)
-            ) {
-                Ok(BundleImport {
-                    path: declaration.path,
-                    clause: declaration.clause,
-                })
-            } else {
-                Err(AuthEntryError::ImportDenied)
-            }
-        })
-        .collect()
-}
-
-fn preflight_bundle(
-    bundle: &BTreeMap<String, String>,
-    imports: &BTreeMap<String, Vec<BundleImport>>,
-    host_roots: &BTreeSet<String>,
-) -> Result<(), AuthEntryError> {
-    for (importer, imports) in imports {
-        for import in imports {
-            let (root, first_index) = first_import_identifier(&import.path)?;
-            if first_index == 0 && host_roots.contains(root) {
-                if import.path.len() == 1
-                    && matches!(
-                        import.clause,
-                        ImportClause::AllPublic | ImportClause::Namespace(_)
-                    )
-                {
-                    continue;
-                }
-                return Err(AuthEntryError::ImportDenied);
-            }
-            let target = resolve_bundle_import(importer, &import.path)?;
-            if !bundle.contains_key(&target) {
-                return Err(AuthEntryError::ImportDenied);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn first_import_identifier(path: &[UsePathSegment]) -> Result<(&str, usize), AuthEntryError> {
-    path.iter()
-        .enumerate()
-        .find_map(|(index, segment)| match segment {
-            UsePathSegment::Ident(name) => Some((name.as_str(), index)),
-            UsePathSegment::Self_ | UsePathSegment::Super => None,
-        })
-        .ok_or(AuthEntryError::ImportDenied)
-}
-
-fn resolve_bundle_import(
-    importer: &str,
-    segments: &[UsePathSegment],
-) -> Result<String, AuthEntryError> {
-    if segments.is_empty() {
-        return Err(AuthEntryError::ImportDenied);
-    }
-    let mut resolved: Vec<&str> = importer
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.split('/').collect())
-        .unwrap_or_default();
-    let mut cursor = 0usize;
-    while cursor < segments.len() {
-        match &segments[cursor] {
-            UsePathSegment::Self_ => cursor += 1,
-            UsePathSegment::Super => {
-                if resolved.pop().is_none() {
-                    return Err(AuthEntryError::ImportDenied);
-                }
-                cursor += 1;
-            }
-            UsePathSegment::Ident(name) if name == "crate" => {
-                return Err(AuthEntryError::ImportDenied);
-            }
-            UsePathSegment::Ident(_) => break,
-        }
-    }
-    if cursor == segments.len() {
-        return Err(AuthEntryError::ImportDenied);
-    }
-    let mut names = Vec::with_capacity(segments.len() - cursor);
-    for segment in &segments[cursor..] {
-        let name = match segment {
-            UsePathSegment::Ident(name) if valid_module_identifier(name) => name.as_str(),
-            UsePathSegment::Self_ => "self",
-            UsePathSegment::Super => "super",
-            _ => return Err(AuthEntryError::ImportDenied),
-        };
-        names.push(name);
-    }
-    resolved.extend(names);
-    let target = format!("{}.rss", resolved.join("/"));
-    validate_bundle_path(&target)?;
-    Ok(target)
 }

@@ -3,6 +3,7 @@
 pub(crate) mod agent_host;
 pub mod auth_runner;
 pub(crate) mod cancellation;
+pub(crate) mod closed_bundle;
 pub(crate) mod delivery;
 pub(crate) mod host_compose;
 pub(crate) mod host_types;
