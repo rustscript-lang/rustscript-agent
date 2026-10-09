@@ -4688,7 +4688,16 @@ fn cross_connection_arm_body(label: &str, db_name: &str) -> CrossConnChildOutcom
 /// can never wedge Cargo.
 fn run_cross_connection_arm(label: &str, db_name: &str) -> CrossConnChildOutcome {
     let exe = std::env::current_exe().expect("current test executable");
-    let mut child = std::process::Command::new(exe)
+    struct RescueChild(Option<std::process::Child>);
+    impl Drop for RescueChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let child = std::process::Command::new(exe)
         .args([
             "--exact",
             "cross_conn_read_coherence_child_entrypoint",
@@ -4702,14 +4711,21 @@ fn run_cross_connection_arm(label: &str, db_name: &str) -> CrossConnChildOutcome
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn rescue cross-connection helper");
+    let mut child = RescueChild(Some(child));
     let deadline = std::time::Instant::now() + CROSS_CONN_MAX_WAIT;
     loop {
-        match child.try_wait().expect("poll rescue helper") {
+        match child
+            .0
+            .as_mut()
+            .expect("rescue child")
+            .try_wait()
+            .expect("poll rescue helper")
+        {
             Some(_) => break,
             None => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = child.0.as_mut().expect("rescue child").kill();
+                    let _ = child.0.as_mut().expect("rescue child").wait();
                     panic!("cross-connection helper exceeded the {CROSS_CONN_MAX_WAIT:?} bound");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4717,6 +4733,9 @@ fn run_cross_connection_arm(label: &str, db_name: &str) -> CrossConnChildOutcome
         }
     }
     let output = child
+        .0
+        .take()
+        .expect("exited rescue child")
         .wait_with_output()
         .expect("collect rescue helper output");
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -66,11 +66,7 @@ struct LoadPage {
     overload: bool
 }
 
-/// Fixed internal TEMP table names for the per-connection stage snapshot.
-/// These are script-owned names only; no main-table schema is touched. The
-/// stage reuses the ORIGINAL read ceilings (512 rows / 2 MiB) — no stage
-/// statement returns rows, so these are pure formality — and the original
-/// 5s transaction / 30s worker bounds, so no budget is raised.
+/// Original host limits also bound the snapshot capture.
 fn stage_limits() -> SqliteLimits {
     sql_limits(512, 2097152)
 }
@@ -80,19 +76,9 @@ fn stage_statement(sql: string, params: array<SqliteValue>) -> SqliteStatement {
     { sql: sql, params: params, query: false, limits: stage_limits() }
 }
 
-/// Atomically stages the six normalized tables into connection-local
-/// immutable fixed-named TEMP tables in ONE existing bounded transaction.
-///
-/// Every stage object is TEMP-qualified (`temp.load_stage_*`, and `DROP TABLE
-/// IF EXISTS temp.load_stage_*`) so a main-table object of the same name is
-/// never inspected, shadowed, or deleted. Each `CREATE TEMP TABLE ... AS
-/// SELECT` preserves the original rowid as a fixed `_load_rowid` snapshot
-/// cursor and every original column in its original order, and is bounded by
-/// `load_cap + 1` (`LIMIT ?`) so the old paging projection can still detect
-/// overflow (more rows than the cap) without silently truncating. The
-/// `DROP ... IF EXISTS temp.*` makes a repeated load on the same connection
-/// idempotent. Twelve statements stay well inside the original 128-statement
-/// transaction ceiling.
+/// Capture all tables in one transaction; indexed original rowids preserve
+/// bounded paging. TEMP-qualified cleanup leaves same-named main data intact.
+/// Each table retains cap + 1 rows so the existing loader detects overflow.
 fn storage_stage_snapshot(db_id: resource<sqlite.connection>, load_cap: int) -> bool {
     let bound: int = load_cap + 1;
     let statements: array<SqliteStatement> = [
