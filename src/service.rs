@@ -653,6 +653,9 @@ struct AgentServiceInner {
     /// Optional one-shot injected provider host for tests. Consumed atomically
     /// by the next `run_worker`; production uses RssAdapterProvider.
     provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
+    /// Native auth construction installed by the owning process. Each VM
+    /// receives the factory and creates its own invocation-scoped AuthHost.
+    auth_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
     runner: Mutex<Option<CachedAgentRunner>>,
     /// Test seam: invoked after file-agent lookup digest and before compile.
@@ -732,6 +735,7 @@ impl AgentService {
             prompt_read_entered: Mutex::new(None),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
+            auth_host_factory: Mutex::new(None),
             runner: Mutex::new(None),
             agent_compile_lookup_entered: Mutex::new(None),
             agent_compile_postcheck_entered: Mutex::new(None),
@@ -762,6 +766,25 @@ impl AgentService {
     /// A second run without another inject uses the production adapter.
     pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
         *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
+    }
+
+    /// Installs the native-owned factory used to construct a fresh AuthHost
+    /// for each RSS VM invocation.
+    pub fn set_auth_host_factory(
+        &self,
+        factory: Arc<
+            dyn Fn(
+                    crate::runtime::RunCancellation,
+                ) -> std::result::Result<crate::auth::host::AuthHost, String>
+                + Send
+                + Sync,
+        >,
+    ) {
+        *self
+            .inner
+            .auth_host_factory
+            .lock()
+            .expect("auth host factory lock") = Some(factory);
     }
 
     /// Installs or replaces a provider profile used by later admissions.
@@ -3282,13 +3305,27 @@ impl AgentService {
                         return;
                     }
                 };
-            let raw_provider = self
+            let provider_override = self
                 .inner
                 .provider_host
                 .lock()
                 .expect("provider host lock")
-                .take()
-                .unwrap_or_else(crate::runtime::rss_runner::default_agent_provider_host);
+                .take();
+            let auth_host_factory = self
+                .inner
+                .auth_host_factory
+                .lock()
+                .expect("auth host factory lock")
+                .clone();
+            let raw_provider = provider_override.unwrap_or_else(|| {
+                if let Some(factory) = auth_host_factory.clone() {
+                    crate::runtime::rss_runner::default_agent_provider_host_with_auth_factory(Some(
+                        factory,
+                    ))
+                } else {
+                    crate::runtime::rss_runner::default_agent_provider_host()
+                }
+            });
             let accounted = Arc::new(crate::durable_provider::AccountingProvider::new(
                 raw_provider,
                 Arc::clone(&self.inner.metrics),
@@ -3301,7 +3338,7 @@ impl AgentService {
             )) as Arc<dyn AgentProviderHost>);
             let host = AgentHostBridges {
                 provider,
-                auth_host_factory: None,
+                auth_host_factory,
                 cancellation: Some(cancellation.clone()),
                 sleeps: Default::default(),
                 skip_sleep: false,
