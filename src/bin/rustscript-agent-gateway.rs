@@ -173,6 +173,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_db.as_deref().map(std::path::Path::new),
     )
     .map_err(std::io::Error::other)?;
+    let state = match std::env::var_os("RUSTSCRIPT_AGENT_HOME") {
+        Some(home) => {
+            let home = std::path::PathBuf::from(home);
+            if home.as_os_str().is_empty() {
+                return Err("RUSTSCRIPT_AGENT_HOME must not be blank".into());
+            }
+            state.with_workspace_home(home)
+        }
+        None => state,
+    };
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!(

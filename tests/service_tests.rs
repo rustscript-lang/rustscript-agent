@@ -2005,6 +2005,14 @@ async fn tool_result_stores_actual_assistant_parent_and_name() {
     )
     .expect("SQLite gateway should open");
     let service = state.service();
+    let workspace = path
+        .parent()
+        .expect("private test database has a workspace directory");
+    service
+        .set_run_limits(
+            RunLimits::new(64, 128, 1024 * 1024, workspace).expect("trusted embedding limits"),
+        )
+        .expect("explicit test workspace should be trusted");
     let admitted = service
         .admit(admit_request(None))
         .await

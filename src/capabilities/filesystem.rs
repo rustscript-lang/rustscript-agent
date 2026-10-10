@@ -92,6 +92,7 @@ pub struct FilesystemCapability {
     limits: FilesystemLimits,
     root: Arc<ConfinedFsRoot>,
     frozen: Arc<FrozenDir>,
+    workspace: Option<Arc<crate::auth::host::workspace::WorkspaceGrant>>,
     cas_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     before_write: Arc<Mutex<Option<BeforeWriteHook>>>,
     after_publish: Arc<Mutex<Option<AfterPublishHook>>>,
@@ -131,6 +132,50 @@ impl FilesystemCapability {
             limits,
             root: Arc::new(root),
             frozen: Arc::new(frozen),
+            workspace: None,
+            cas_locks: Arc::new(Mutex::new(HashMap::new())),
+            before_write: Arc::new(Mutex::new(None)),
+            after_publish: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Constructs a filesystem capability by adopting a live workspace grant.
+    /// No pathname is reopened; bounded readers duplicate the retained root fd.
+    pub(crate) fn new_adopted(
+        lifecycle: CapabilityLifecycle,
+        owner: CapabilityOwner,
+        limits: FilesystemLimits,
+        workspace: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+    ) -> Result<Self, CapabilityError> {
+        if limits.max_read_bytes == 0 || limits.max_write_bytes == 0 || limits.max_list_entries == 0
+        {
+            return Err(CapabilityError::new(
+                "invalid_configuration",
+                "filesystem limits must be positive",
+            ));
+        }
+        workspace
+            .check()
+            .map_err(|_| CapabilityError::new("workspace_denied", "workspace is unavailable"))?;
+        let root = workspace
+            .held()
+            .root()
+            .adopt(ConfinedFsLimits {
+                max_read_bytes: MAX_READ_BYTES,
+                max_write_bytes: limits.max_write_bytes.min(MAX_WRITE_BYTES),
+                max_entries: MAX_ENUM_ENTRIES,
+                max_entry_name_bytes: MAX_COMPONENT_BYTES,
+                max_temp_attempts: 32,
+            })
+            .map_err(map_fs_error)?;
+        let frozen = FrozenDir::adopt(&root)?;
+        Ok(Self {
+            lifecycle,
+            owner,
+            limits,
+            root: Arc::new(root),
+            frozen: Arc::new(frozen),
+            workspace: Some(workspace),
             cas_locks: Arc::new(Mutex::new(HashMap::new())),
             before_write: Arc::new(Mutex::new(None)),
             after_publish: Arc::new(Mutex::new(None)),
@@ -386,6 +431,11 @@ impl FilesystemCapability {
     }
 
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
+        if let Some(workspace) = &self.workspace {
+            workspace.check().map_err(|_| {
+                CapabilityError::new("workspace_denied", "workspace is unavailable")
+            })?;
+        }
         self.lifecycle
             .authorize(&self.owner, token, risk)
             .map_err(CapabilityError::from)

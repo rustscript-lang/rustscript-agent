@@ -101,6 +101,11 @@ struct UpdateSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetSessionWorkspaceRequest {
+    workspace: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateRunRequest {
     input: Option<Value>,
     session_id: Option<String>,
@@ -108,6 +113,7 @@ struct CreateRunRequest {
     provider: Option<String>,
     parent_run_id: Option<String>,
     instructions: Option<String>,
+    workspace: Option<String>,
     #[serde(rename = "conversation_history")]
     conversation_history: Option<Value>,
     #[serde(flatten)]
@@ -160,6 +166,10 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
             get(get_session_handler)
                 .patch(update_session_handler)
                 .delete(delete_session_handler),
+        )
+        .route(
+            "/v1/sessions/{session_id}/workspace",
+            post(set_session_workspace_handler),
         )
         .route(
             "/api/sessions/{session_id}/messages",
@@ -458,6 +468,7 @@ async fn create_session_handler(
                 .or_else(|| state.config.provider.clone()),
             source: request.source.clone().unwrap_or_else(|| "yahu".to_string()),
             system_prompt: request.system_prompt.clone(),
+            workspace: None,
             created_at: now,
             updated_at: now,
             message_count: 0,
@@ -511,6 +522,48 @@ async fn create_session_handler(
         )
     })
     .await
+}
+
+async fn set_session_workspace_handler(
+    State(state): State<AgentGatewayState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<SetSessionWorkspaceRequest>,
+) -> Response {
+    match state
+        .service
+        .bind_session_workspace(&session_id, request.workspace)
+        .await
+    {
+        Ok(session) => json_response(
+            StatusCode::OK,
+            json!({"object":"hermes.session", "session":session, "data":session}),
+        ),
+        Err(crate::service::AdmitError::SessionNotFound) => json_error(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session does not exist",
+        ),
+        Err(crate::service::AdmitError::ActiveRun) => json_error(
+            StatusCode::CONFLICT,
+            "active_run",
+            "workspace cannot change while a run is active",
+        ),
+        Err(crate::service::AdmitError::Persistence(message)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_unavailable",
+            &message,
+        ),
+        Err(crate::service::AdmitError::Halting) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "halting",
+            "gateway is halting",
+        ),
+        Err(error) => json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_rejected",
+            &error.to_string(),
+        ),
+    }
 }
 
 async fn list_sessions_handler(
@@ -918,6 +971,7 @@ async fn create_run_handler(
             "provider": request.provider.clone(),
             "parent_run_id": request.parent_run_id.clone(),
             "instructions": request.instructions.clone(),
+            "workspace": request.workspace.clone(),
             "conversation_history": request.conversation_history.clone(),
             "extra": request.extra.clone(),
         }))
@@ -942,17 +996,20 @@ async fn create_run_handler(
     // cancellation and delivery state; rejection leaves nothing behind.
     let admitted = match state
         .service
-        .admit(crate::service::AdmitRunRequest {
-            input,
-            session_id: request.session_id.clone(),
-            model: request.model.clone(),
-            provider: request.provider.clone(),
-            parent_run_id: request.parent_run_id.clone(),
-            instructions: request.instructions.clone(),
-            platform: "api_server".to_string(),
-            idempotency_key,
-            idempotency_hash: request_hash,
-        })
+        .admit_external_with_workspace_selector(
+            crate::service::AdmitRunRequest {
+                input,
+                session_id: request.session_id.clone(),
+                model: request.model.clone(),
+                provider: request.provider.clone(),
+                parent_run_id: request.parent_run_id.clone(),
+                instructions: request.instructions.clone(),
+                platform: "api_server".to_string(),
+                idempotency_key,
+                idempotency_hash: request_hash,
+            },
+            request.workspace.clone(),
+        )
         .await
     {
         Ok(admitted) => admitted,
@@ -982,6 +1039,13 @@ async fn create_run_handler(
                 StatusCode::NOT_FOUND,
                 "session_not_found",
                 "session not found",
+            );
+        }
+        Err(AdmitError::ActiveRun) => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "active_run",
+                "session workspace cannot change while a run is active",
             );
         }
         Err(AdmitError::Persistence(message)) => {

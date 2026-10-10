@@ -88,6 +88,29 @@ impl AgentGatewayState {
         Self::with_agent_selection(config, serde_json::json!({}), None)
     }
 
+    /// Installs only workspace authority from an explicitly supplied trusted
+    /// native home. Provider RSS receives no OAuth host factory.
+    pub fn with_workspace_home(self, home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
+        self.service
+            .set_workspace_host_factory(Arc::new(move |cancellation| {
+                crate::auth::host::AuthHost::new(home.clone(), cancellation)
+            }));
+        self
+    }
+
+    /// Compatibility initializer for embeddings that intentionally install
+    /// both provider OAuth and workspace authority from one trusted home.
+    pub fn with_trusted_auth_home(self, home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
+        let factory: crate::runtime::agent_host::AuthHostFactory = Arc::new(move |cancellation| {
+            crate::auth::host::AuthHost::new(home.clone(), cancellation)
+        });
+        self.service.set_auth_host_factory(Arc::clone(&factory));
+        self.service.set_workspace_host_factory(factory);
+        self
+    }
+
     /// Selects the RSS agent source through the embedded source policy.
     ///
     /// `selection` is a bounded public map `{source?, legacy_script?}` whose

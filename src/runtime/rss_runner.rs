@@ -912,6 +912,43 @@ struct NativeAuthBinding {
     context: Value,
 }
 
+pub(crate) struct WorkspaceAdmissionOutcome {
+    pub(crate) ok: bool,
+    pub(crate) code: String,
+    pub(crate) canonical_path: Option<String>,
+    pub(crate) effective_selector: Option<String>,
+    pub(crate) selected_name: Option<String>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) authority: Option<Arc<WorkspaceAuthority>>,
+}
+
+pub(crate) struct WorkspaceAuthority {
+    binding: NativeAuthBinding,
+    grant: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+}
+
+impl WorkspaceAuthority {
+    pub(crate) fn check(&self) -> std::result::Result<(), String> {
+        self.grant.check()
+    }
+
+    pub(crate) fn canonical_path(&self) -> &str {
+        self.grant.held().canonical_path()
+    }
+
+    pub(crate) fn grant(&self) -> Arc<crate::auth::host::workspace::WorkspaceGrant> {
+        Arc::clone(&self.grant)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.grant.generation()
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.binding.host.revoke();
+    }
+}
+
 impl Drop for NativeAuthBinding {
     fn drop(&mut self) {
         self.host.revoke();
@@ -922,6 +959,30 @@ fn has_caller_auth_home(context: &Value) -> bool {
     matches!(context, Value::Map(fields) if fields.iter().any(|(key, _)| {
         matches!(key, Value::String(key) if key.as_ref() == "host_home")
     }))
+}
+
+fn workspace_field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+    let Value::Map(fields) = value else {
+        return None;
+    };
+    fields.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key.as_ref() == name => Some(value),
+        _ => None,
+    })
+}
+
+fn workspace_string(value: &Value, name: &str) -> Option<String> {
+    match workspace_field(value, name) {
+        Some(Value::String(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn workspace_generation(value: &Value) -> Option<u64> {
+    match workspace_field(value, "generation") {
+        Some(Value::Int(value)) => u64::try_from(*value).ok(),
+        _ => None,
+    }
 }
 
 fn with_native_auth_home(
@@ -1083,6 +1144,79 @@ impl AgentRunner {
     /// Number of backoff records dropped after the bounded sleep ring filled.
     pub fn recorded_sleep_dropped(&self) -> u64 {
         self.host.sleeps.lock().expect("sleep log lock").dropped()
+    }
+
+    /// Runs the bundled restricted workspace admission entry and adopts its
+    /// typed directory resource before the VM arena is dropped.
+    pub(crate) fn run_workspace_admission(
+        &self,
+        entry_name: &str,
+        context: Value,
+        cancellation: &RunCancellation,
+    ) -> std::result::Result<WorkspaceAdmissionOutcome, RunError> {
+        if has_caller_auth_home(&context) {
+            return Err(RunError::Setup(VmError::HostError(
+                "caller-supplied host_home is reserved".to_string(),
+            )));
+        }
+        if cancellation.deadline_instant().is_none() {
+            return Err(RunError::Setup(VmError::HostError(
+                "workspace admission requires finite cancellation".to_string(),
+            )));
+        }
+        let _watcher_guard = EpochWatcherGuard { cancellation };
+        let (mut vm, callable, binding) = self.prepare_vm(entry_name, Some(cancellation))?;
+        let context = with_native_auth_home(context, binding.as_ref())?;
+        let value = self.run_invocation(&mut vm, callable, context, None, Some(cancellation))?;
+        let ok = matches!(workspace_field(&value, "ok"), Some(Value::Bool(true)));
+        let code =
+            workspace_string(&value, "code").unwrap_or_else(|| "workspace_unavailable".to_string());
+        let canonical_path =
+            workspace_string(&value, "canonical_path").filter(|path| !path.is_empty());
+        let effective_selector =
+            workspace_string(&value, "effective_selector").filter(|selector| !selector.is_empty());
+        let selected_name =
+            workspace_string(&value, "selected_name").filter(|name| !name.is_empty());
+        let generation = workspace_generation(&value);
+        let grant = match workspace_field(&value, "directory") {
+            Some(directory @ Value::Int(_)) => {
+                let binding = binding.as_ref().ok_or_else(|| {
+                    RunError::Setup(VmError::HostError(
+                        "workspace resource returned without trusted host".to_string(),
+                    ))
+                })?;
+                Some(
+                    binding
+                        .host
+                        .take_workspace_directory(&mut vm, directory)
+                        .map_err(RunError::Setup)?,
+                )
+            }
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(RunError::Setup(VmError::HostError(
+                    "workspace admission returned an invalid directory resource".to_string(),
+                )));
+            }
+        };
+        let authority = match (grant, binding) {
+            (Some(grant), Some(binding)) => Some(Arc::new(WorkspaceAuthority { binding, grant })),
+            (Some(_), None) => {
+                return Err(RunError::Setup(VmError::HostError(
+                    "workspace resource returned without trusted host".to_string(),
+                )));
+            }
+            (None, _) => None,
+        };
+        Ok(WorkspaceAdmissionOutcome {
+            ok,
+            code,
+            canonical_path,
+            effective_selector,
+            selected_name,
+            generation,
+            authority,
+        })
     }
 
     /// Runs the exported `run(context)` entry with no event sink and no

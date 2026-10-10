@@ -50,6 +50,7 @@ struct AdmissionCreateInput {
     model: string,
     provider: string,
     system_prompt: string,
+    session_metadata_json: string,
     run_id: string,
     parent_run_id: string,
     input_json: string,
@@ -109,15 +110,15 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             let mut statements: array<SqliteStatement> = [];
             if input.session_new.copy() == 1 {
                 statements[statements.length] = {
-                    sql: "INSERT INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, system_prompt, model, provider, toolset_hash, metadata_json, created_at_ms, updated_at_ms) SELECT ?, ?, ?, ?, '', '', '', 1, ?, ?, ?, '', '{}', ?, ? WHERE NOT EXISTS (SELECT 1 FROM sessions existing WHERE existing.id = ?)",
-                    params: [sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.platform.copy()), sql_text(input.account_id.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())],
+                    sql: "INSERT INTO sessions (id, profile, platform, account_id, chat_id, thread_id, user_id, generation, system_prompt, model, provider, toolset_hash, metadata_json, created_at_ms, updated_at_ms) SELECT ?, ?, ?, ?, '', '', '', 1, ?, ?, ?, '', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM sessions existing WHERE existing.id = ?)",
+                    params: [sql_text(input.session_id.copy()), sql_text(input.profile.copy()), sql_text(input.platform.copy()), sql_text(input.account_id.copy()), sql_text(input.system_prompt.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             } else {
                 statements[statements.length] = {
-                    sql: "UPDATE sessions SET model = CASE WHEN ? = '' THEN model ELSE ? END, provider = CASE WHEN ? = '' THEN provider ELSE ? END, system_prompt = CASE WHEN ? = '' THEN system_prompt ELSE ? END, updated_at_ms = ? WHERE id = ?",
-                    params: [sql_text(input.model.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.provider.copy()), sql_text(input.system_prompt.copy()), sql_text(input.system_prompt.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy())],
+                    sql: "UPDATE sessions SET model = CASE WHEN ? = '' THEN model ELSE ? END, provider = CASE WHEN ? = '' THEN provider ELSE ? END, system_prompt = CASE WHEN ? = '' THEN system_prompt ELSE ? END, metadata_json = CASE WHEN ? = '{}' THEN metadata_json ELSE json_set(CASE WHEN json_valid(metadata_json) THEN CASE WHEN json_type(metadata_json) = 'object' THEN metadata_json ELSE '{}' END ELSE '{}' END, '$.workspace', json_extract(?, '$.workspace')) END, updated_at_ms = ? WHERE id = ? AND (? = '{}' OR json_extract(metadata_json, '$.workspace.selector') IS NULL OR json_extract(metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector'))",
+                    params: [sql_text(input.model.copy()), sql_text(input.model.copy()), sql_text(input.provider.copy()), sql_text(input.provider.copy()), sql_text(input.system_prompt.copy()), sql_text(input.system_prompt.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
@@ -125,14 +126,14 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
             let user_content = storage_admission_user_content(input.input_json.copy());
             let encoded_content = messages::storage_message_encode_content(user_content);
             statements[statements.length] = {
-                sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, 'user', ?, '{}', ?, '', ? FROM messages WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?)",
-                params: [sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(encoded_content), sql_text(input.message_run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.message_id.copy()), sql_text(input.session_id.copy())],
+                sql: "INSERT INTO messages (id, session_id, ordinal, role, content_json, metadata_json, run_id, finish_reason, created_at_ms) SELECT ?, ?, COALESCE(MAX(ordinal), 0) + 1, 'user', ?, '{}', ?, '', ? FROM messages WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM messages existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')))",
+                params: [sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(encoded_content), sql_text(input.message_run_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.session_id.copy()), sql_text(input.message_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };
             statements[statements.length] = {
-                sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?))",
-                params: [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy())],
+                sql: "INSERT INTO runs (id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, created_at_ms, started_at_ms, updated_at_ms) SELECT ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM runs existing WHERE existing.id = ? AND existing.session_id <> ?) AND EXISTS (SELECT 1 FROM sessions WHERE id = ?) AND (? = '' OR EXISTS (SELECT 1 FROM runs parent WHERE parent.id = ?)) AND EXISTS (SELECT 1 FROM sessions workspace_session WHERE workspace_session.id = ? AND (? = '{}' OR json_extract(workspace_session.metadata_json, '$.workspace.selector') = json_extract(?, '$.workspace.selector')))",
+                params: [sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.input_json.copy()), sql_text(input.provider.copy()), sql_text(input.model.copy()), sql_text(input.script_hash.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_int(input.now_ms.copy()), sql_text(input.run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.parent_run_id.copy()), sql_text(input.session_id.copy()), sql_text(input.session_metadata_json.copy()), sql_text(input.session_metadata_json.copy())],
                         query: false,
                         limits: sql_limits(1000, 4194304)
                         };

@@ -270,6 +270,23 @@ impl Default for OAuthSettings {
 pub struct WorkspaceSettings {
     pub allowed_roots: Vec<PathBuf>,
     pub default: Option<PathBuf>,
+    /// Explicitly named workspaces. The key is a bounded public selector
+    /// token; RSS interprets `name:<key>` and native validates the path like
+    /// any other trusted root path.
+    pub named: BTreeMap<String, PathBuf>,
+}
+
+/// Bounds of one named-workspace selector key.
+pub const MAX_NAMED_WORKSPACES: usize = 64;
+pub const MAX_WORKSPACE_NAME_BYTES: usize = 64;
+
+/// True when `name` is a valid named-workspace selector key.
+pub fn valid_workspace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_WORKSPACE_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -474,6 +491,39 @@ impl ConfigFile {
                 source,
                 &format!("workspaces.allowed_roots[{index}]"),
             )?;
+        }
+        if self.workspaces.named.len() > MAX_NAMED_WORKSPACES {
+            return Err(invalid_value(
+                source,
+                "workspaces.named",
+                "must contain at most 64 named workspaces",
+            ));
+        }
+        for (name, path) in &self.workspaces.named {
+            if !valid_workspace_name(name) {
+                return Err(invalid_value(
+                    source,
+                    "workspaces.named",
+                    "a named-workspace key must be 1..64 characters of [A-Za-z0-9_-]",
+                ));
+            }
+            validate_absolute_workspace(
+                path,
+                source,
+                &format!("workspaces.named.{name}"),
+            )?;
+            if !self
+                .workspaces
+                .allowed_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+            {
+                return Err(invalid_value(
+                    source,
+                    &format!("workspaces.named.{name}"),
+                    "must be below one of workspaces.allowed_roots",
+                ));
+            }
         }
         if let Some(default) = self.workspaces.default.as_ref() {
             validate_absolute_workspace(default, source, "workspaces.default")?;
@@ -950,7 +1000,7 @@ fn validate_config_shape(source: &Path, value: &Value) -> Result<(), ConfigFileE
             source,
             "workspaces",
             workspaces,
-            &["allowed_roots", "default"],
+            &["allowed_roots", "default", "named"],
         )?;
     }
     if let Some(approvals) = root.get(Value::String("approvals".to_string())) {

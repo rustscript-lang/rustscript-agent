@@ -1043,6 +1043,87 @@ impl ConfinedFsRoot {
         self.limits
     }
 
+    /// Revalidates the retained root binding against the live filesystem.
+    ///
+    /// A retained root whose path entry was replaced (rename, symlink swap)
+    /// reports `false`, so an adopted capability fails closed instead of
+    /// silently redirecting to another tree.
+    pub fn revalidate_binding(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.ensure_bound("fs::root").is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    /// Adopts an already-retained root: clones the descriptor binding and the
+    /// operation limits without reopening the path.
+    pub fn adopt(&self, limits: ConfinedFsLimits) -> Result<Self, ConfinedFsError> {
+        let limits = limits.validate()?;
+        #[cfg(unix)]
+        {
+            let duplicate = self
+                .fd
+                .try_clone()
+                .map_err(|error| ConfinedFsError::os("fs::root", &error))?;
+            Ok(Self {
+                fd: duplicate,
+                root_identity: self.root_identity,
+                binding: self
+                    .binding
+                    .duplicate()
+                    .map_err(|error| ConfinedFsError::os("fs::root", &error))?,
+                limits,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = limits;
+            Err(unsupported_error("fs::root"))
+        }
+    }
+
+    /// Duplicates only the already-retained descriptor for descriptor-based
+    /// readers. The binding is revalidated before the duplicate is issued.
+    #[cfg(unix)]
+    pub(crate) fn duplicate_descriptor(&self) -> Result<std::os::fd::OwnedFd, ConfinedFsError> {
+        self.ensure_bound("fs::root")?;
+        self.fd
+            .try_clone()
+            .map_err(|error| ConfinedFsError::os("fs::root", &error))
+    }
+
+    /// Opens a child directory relative to this retained root and makes that
+    /// descriptor the root of a new capability. Every component is opened
+    /// without following symlinks, and the child binding extends this root's
+    /// original anchor/identity chain.
+    pub fn subroot(&self, path: &str, limits: ConfinedFsLimits) -> Result<Self, ConfinedFsError> {
+        let path = validate_directory_path(path, "fs::subroot")?;
+        let limits = limits.validate()?;
+        #[cfg(unix)]
+        {
+            self.ensure_bound("fs::subroot")?;
+            let opened = unix::open_subroot(self.fd.as_raw_fd(), &self.binding, &path.components)
+                .map_err(|error| ConfinedFsError::os("fs::subroot", &error))?;
+            let child = Self {
+                fd: opened.fd,
+                root_identity: opened.root_identity,
+                binding: opened.binding,
+                limits,
+            };
+            child.ensure_bound("fs::subroot")?;
+            Ok(child)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, limits);
+            Err(unsupported_error("fs::subroot"))
+        }
+    }
+
     #[cfg(unix)]
     fn ensure_bound(&self, operation: &'static str) -> Result<(), ConfinedFsError> {
         unix::verify_root_binding(&self.binding, self.root_identity).map_err(|error| {
@@ -1592,6 +1673,18 @@ mod unix {
         identities: Vec<FileIdentity>,
     }
 
+    impl RootBinding {
+        /// Clones the retained anchor descriptor and the recorded component
+        /// identities, so an adopted capability walks the same binding.
+        pub(super) fn duplicate(&self) -> io::Result<RootBinding> {
+            Ok(RootBinding {
+                anchor: self.anchor.try_clone()?,
+                components: self.components.clone(),
+                identities: self.identities.clone(),
+            })
+        }
+    }
+
     pub(super) struct OpenedRoot {
         pub(super) fd: OwnedFd,
         pub(super) root_identity: FileIdentity,
@@ -1642,6 +1735,34 @@ mod unix {
         }
         let root_identity = file_identity(current.as_raw_fd())
             .map_err(|error| ConfinedFsError::os("fs::root", &error))?;
+        Ok(OpenedRoot {
+            fd: current,
+            root_identity,
+            binding: RootBinding {
+                anchor,
+                components,
+                identities,
+            },
+        })
+    }
+
+    pub(super) fn open_subroot(
+        parent_fd: RawFd,
+        binding: &RootBinding,
+        child_components: &[&str],
+    ) -> Result<OpenedRoot, io::Error> {
+        let mut current = duplicate_fd(parent_fd)?;
+        let mut components = binding.components.clone();
+        let mut identities = binding.identities.clone();
+        for component in child_components {
+            let bytes = component.as_bytes();
+            let next = open_directory_component(current.as_raw_fd(), bytes)?;
+            identities.push(file_identity(next.as_raw_fd())?);
+            components.push(bytes.to_vec());
+            current = next;
+        }
+        let root_identity = file_identity(current.as_raw_fd())?;
+        let anchor = binding.anchor.try_clone()?;
         Ok(OpenedRoot {
             fd: current,
             root_identity,

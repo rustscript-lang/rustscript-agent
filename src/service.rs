@@ -65,7 +65,7 @@ use crate::events;
 use crate::events::{DurableEventCommitter, EventCommitError};
 use crate::gateway::store::{
     GatewayEvent, GatewayPersistence, GatewayStore, IdempotencyRecord, RunRecord, SessionMessage,
-    SessionRecord, SessionView,
+    SessionRecord, SessionView, WorkspaceBinding,
 };
 use crate::metrics::{AdmitRejectReason, Metrics, TerminalRetryOutcome, TerminalStatus};
 use crate::prompt::{CodingPromptBudgets, DateSource, SystemDateSource, build_coding_prompt};
@@ -216,6 +216,8 @@ pub struct RunHandle {
     /// Run-scoped capability host shared by RSS `tools::dispatch` and cleanup.
     capability_host: Mutex<CapabilityHostPhase>,
     capability_host_cv: Condvar,
+    workspace_authority: Option<Arc<crate::runtime::rss_runner::WorkspaceAuthority>>,
+    legacy_workspace_root: Option<PathBuf>,
     /// Frozen coding system prompt captured at admission.
     coding_system_prompt: Arc<str>,
     /// Exclusive worker occupancy. Concurrent `run_worker` tasks cannot both
@@ -231,8 +233,8 @@ struct CapabilityHostState {
     uncooperative: Option<Arc<AtomicBool>>,
     lifecycle: Arc<CapabilityLifecycle>,
     capability_owner: CapabilityOwner,
-    filesystem: Arc<FilesystemCapability>,
-    processes: Arc<ProcessCapability>,
+    filesystem: Option<Arc<FilesystemCapability>>,
+    processes: Option<Arc<ProcessCapability>>,
     artifacts: Arc<ArtifactCapability>,
 }
 
@@ -248,7 +250,7 @@ enum CapabilityHostPhase {
 
 #[derive(Clone)]
 struct ClosedCapabilityHost {
-    processes: Arc<ProcessCapability>,
+    processes: Option<Arc<ProcessCapability>>,
 }
 
 /// Restores a retriable `Empty` phase if initialization panics or returns
@@ -295,7 +297,11 @@ impl CapabilityHostState {
 
     fn shutdown_with_grace(&self, grace: Duration) -> CleanupOutcome {
         if self.cleaned.swap(true, Ordering::SeqCst) {
-            return if self.processes.table_len() == 0 {
+            return if self
+                .processes
+                .as_ref()
+                .is_none_or(|processes| processes.table_len() == 0)
+            {
                 CleanupOutcome::Clean
             } else {
                 CleanupOutcome::Timeout
@@ -313,9 +319,15 @@ impl CapabilityHostState {
                 return CleanupOutcome::Timeout;
             }
         }
-        self.processes.shutdown_all();
+        if let Some(processes) = &self.processes {
+            processes.shutdown_all();
+        }
         let _ = self.lifecycle.recover_open_tokens();
-        if self.processes.table_len() > 0 {
+        if self
+            .processes
+            .as_ref()
+            .is_some_and(|processes| processes.table_len() > 0)
+        {
             CleanupOutcome::Timeout
         } else {
             CleanupOutcome::Clean
@@ -336,8 +348,8 @@ impl CapabilityHostState {
             metrics,
             lifecycle: Some(Arc::clone(&self.lifecycle)),
             capability_owner: Some(self.capability_owner.clone()),
-            filesystem: Some(Arc::clone(&self.filesystem)),
-            processes: Some(Arc::clone(&self.processes)),
+            filesystem: self.filesystem.clone(),
+            processes: self.processes.clone(),
             artifacts: Some(Arc::clone(&self.artifacts)),
             control_hook: None,
         }
@@ -388,10 +400,9 @@ impl RunHandle {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &*phase {
-                CapabilityHostPhase::Ready(state) => (
-                    Some(Arc::clone(&state.lifecycle)),
-                    Some(Arc::clone(&state.processes)),
-                ),
+                CapabilityHostPhase::Ready(state) => {
+                    (Some(Arc::clone(&state.lifecycle)), state.processes.clone())
+                }
                 _ => (None, None),
             }
         };
@@ -412,12 +423,15 @@ impl RunHandle {
 
     fn release_capability_host(&self) -> CleanupOutcome {
         self.tool_cancel.cancel();
+        if let Some(authority) = &self.workspace_authority {
+            authority.revoke();
+        }
         let state = {
             let mut phase = self.capability_host.lock().expect("capability host lock");
             match std::mem::replace(&mut *phase, CapabilityHostPhase::Closed(None)) {
                 CapabilityHostPhase::Ready(state) => {
                     *phase = CapabilityHostPhase::Closed(Some(ClosedCapabilityHost {
-                        processes: Arc::clone(&state.processes),
+                        processes: state.processes.clone(),
                     }));
                     self.capability_host_cv.notify_all();
                     Some(state)
@@ -583,6 +597,7 @@ pub enum AdmitError {
     IdempotencyConflict,
     ParentNotFound,
     SessionNotFound,
+    ActiveRun,
     Persistence(String),
     Invalid(String),
     /// The gateway is halting (SIGINT path): admission is closed before
@@ -600,6 +615,7 @@ impl std::fmt::Display for AdmitError {
             }
             Self::ParentNotFound => formatter.write_str("parent run not found"),
             Self::SessionNotFound => formatter.write_str("session not found"),
+            Self::ActiveRun => formatter.write_str("workspace cannot change while a run is active"),
             Self::Persistence(message) => formatter.write_str(message),
             Self::Invalid(message) => formatter.write_str(message),
             Self::Halting => formatter.write_str("gateway is halting; new runs are not admitted"),
@@ -667,6 +683,12 @@ struct AgentServiceInner {
     /// Native auth construction installed by the owning process. Each VM
     /// receives the factory and creates its own invocation-scoped AuthHost.
     auth_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
+    /// Workspace admission uses a separate trusted-home factory so opting
+    /// into filesystem policy never opts provider RSS into OAuth authority.
+    workspace_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
+    /// Explicit embedding-supplied legacy root; default RunLimits never
+    /// become ambient authority for production HTTP or Telegram requests.
+    trusted_legacy_workspace_root: RwLock<Option<PathBuf>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
     runner: Mutex<Option<CachedAgentRunner>>,
     /// Test seam: invoked after file-agent lookup digest and before compile.
@@ -747,6 +769,8 @@ impl AgentService {
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
             auth_host_factory: Mutex::new(None),
+            workspace_host_factory: Mutex::new(None),
+            trusted_legacy_workspace_root: RwLock::new(None),
             runner: Mutex::new(None),
             agent_compile_lookup_entered: Mutex::new(None),
             agent_compile_postcheck_entered: Mutex::new(None),
@@ -796,6 +820,103 @@ impl AgentService {
             .auth_host_factory
             .lock()
             .expect("auth host factory lock") = Some(factory);
+    }
+
+    /// Installs only the trusted-home factory used by workspace admission.
+    /// It does not install an OAuth/provider factory for ordinary agent runs.
+    pub fn set_workspace_host_factory(&self, factory: crate::runtime::agent_host::AuthHostFactory) {
+        *self
+            .inner
+            .workspace_host_factory
+            .lock()
+            .expect("workspace host factory lock") = Some(factory);
+    }
+
+    fn resolve_workspace_admission(
+        &self,
+        selector: Option<&str>,
+        existing: Option<&WorkspaceBinding>,
+        cancellation: &RunCancellation,
+        allow_switch: bool,
+    ) -> Result<
+        (
+            Option<WorkspaceBinding>,
+            Option<Arc<crate::runtime::rss_runner::WorkspaceAuthority>>,
+        ),
+        AdmitError,
+    > {
+        let factory = self
+            .inner
+            .workspace_host_factory
+            .lock()
+            .expect("auth host factory lock")
+            .clone();
+        if selector.is_none() && existing.is_none() && factory.is_none() {
+            return Ok((None, None));
+        }
+        let context = json!({
+            "selector": selector.unwrap_or(""),
+            "selector_present": selector.is_some(),
+            "session_selector": existing.map_or("", |binding| binding.selector.as_str()),
+            "session_canonical_path": existing.map_or("", |binding| binding.canonical_path.as_str()),
+        });
+        let entry = if allow_switch { "bind" } else { "open" };
+        let runner = AgentRunner::from_bundled_named(
+            "rss/agent/workspace.rss",
+            entry,
+            AgentConfig {
+                http: self.inner.http_config.clone(),
+                sqlite: self.inner.config.sqlite.clone(),
+                fuel: self.inner.config.fuel,
+            },
+        )
+        .map_err(|_| AdmitError::Invalid("workspace admission is unavailable".to_string()))?;
+        let bridges = AgentHostBridges {
+            auth_host_factory: factory,
+            cancellation: Some(cancellation.clone()),
+            ..AgentHostBridges::default()
+        };
+        let outcome = match runner
+            .with_host(bridges)
+            .with_cancellation(cancellation.clone())
+            .run_workspace_admission(
+                entry,
+                crate::domain::json_to_vm_value(&context),
+                cancellation,
+            ) {
+            Ok(outcome) => outcome,
+            Err(_) if selector.is_none() && existing.is_none() => return Ok((None, None)),
+            Err(_) => {
+                return Err(AdmitError::Invalid(
+                    "workspace admission was rejected".to_string(),
+                ));
+            }
+        };
+        if !outcome.ok {
+            if selector.is_none() && existing.is_none() && outcome.code == "workspace_unavailable" {
+                return Ok((None, None));
+            }
+            return Err(AdmitError::Invalid(outcome.code));
+        }
+        let authority = outcome.authority.ok_or_else(|| {
+            AdmitError::Invalid("workspace authority was not retained".to_string())
+        })?;
+        let canonical_path = outcome.canonical_path.ok_or_else(|| {
+            AdmitError::Invalid("workspace admission omitted its path".to_string())
+        })?;
+        let generation = outcome.generation.ok_or_else(|| {
+            AdmitError::Invalid("workspace admission omitted its generation".to_string())
+        })?;
+        let effective_selector = outcome.effective_selector.ok_or_else(|| {
+            AdmitError::Invalid("workspace admission omitted its effective selector".to_string())
+        })?;
+        let binding = WorkspaceBinding {
+            selector: effective_selector,
+            canonical_path,
+            selected_name: outcome.selected_name,
+            generation,
+        };
+        Ok((Some(binding), Some(authority)))
     }
 
     /// Installs or replaces a provider profile used by later admissions.
@@ -949,6 +1070,7 @@ impl AgentService {
     /// Replaces the validated limits used by future admissions.
     pub fn set_run_limits(&self, limits: RunLimits) -> Result<(), RunLimitsError> {
         let limits = limits.normalized()?;
+        *self.inner.trusted_legacy_workspace_root.write() = Some(limits.workspace_root.clone());
         *self.inner.run_limits.write() = limits;
         Ok(())
     }
@@ -1763,12 +1885,20 @@ impl AgentService {
                 actual: registry.identity().to_string(),
             });
         }
-        let workspace = context
-            .limits
-            .get("workspace_root")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| invalid_context_metadata(run_id, "workspace_root is missing"))?;
-        let workspace = PathBuf::from(workspace);
+        let workspace_authority = handle.workspace_authority.as_ref();
+        let (workspace, workspace_grant) = if let Some(authority) = workspace_authority {
+            authority.check().map_err(|_| {
+                invalid_context_metadata(run_id, "trusted workspace authority is revoked")
+            })?;
+            (
+                Some(PathBuf::from(authority.canonical_path())),
+                Some(authority.grant()),
+            )
+        } else if let Some(root) = handle.legacy_workspace_root.as_ref() {
+            (Some(root.clone()), None)
+        } else {
+            (None, None)
+        };
         let max_tool_calls = context
             .limits
             .get("max_tool_calls")
@@ -1781,7 +1911,10 @@ impl AgentService {
             .ok_or_else(|| invalid_context_metadata(run_id, "max_tool_output_bytes is missing"))?
             as usize;
         let output_cap = max_tool_output_bytes.clamp(1, MAX_TOOL_OUTPUT_BYTES);
-        let mut file_config = FileToolConfig::for_workspace(&workspace);
+        // Limits are independent of path authority. With no admitted workspace,
+        // keep only the bounded configuration values; do not open a path.
+        let limits_root = workspace.clone().unwrap_or_default();
+        let mut file_config = FileToolConfig::for_workspace(limits_root.clone());
         file_config.apply_admitted_output_cap(output_cap);
         let filesystem_limits = FilesystemLimits {
             max_read_bytes: file_config.max_read_bytes,
@@ -1793,7 +1926,7 @@ impl AgentService {
             max_total_bytes: file_config.artifact_store.max_total_bytes,
             max_objects: file_config.artifact_store.max_objects.max(1),
         };
-        let mut process_config = ProcessToolConfig::for_workspace(&workspace);
+        let mut process_config = ProcessToolConfig::for_workspace(limits_root.clone());
         process_config.apply_admitted_output_cap(output_cap);
         let process_limits = ProcessLimits {
             timeout_ms: u64::try_from(process_config.max_timeout.as_millis()).unwrap_or(u64::MAX),
@@ -1834,7 +1967,10 @@ impl AgentService {
         let lifecycle = CapabilityLifecycle::builder()
             .owner(capability_owner.clone())
             .registry_identity(expected.to_string())
-            .workspace(workspace.clone())
+            // CapabilityLifecycle currently requires a path-shaped token claim.
+            // The empty value is an absent marker only: filesystem/process
+            // capabilities are omitted below when no trusted root exists.
+            .workspace(limits_root)
             .limits(LifecycleLimits {
                 max_tool_calls,
                 max_output_bytes: output_cap,
@@ -1850,21 +1986,45 @@ impl AgentService {
             .cancellation(Arc::new(HandleCancelFlag {
                 cancel: handle.cancel.clone(),
             }) as Arc<dyn CancellationFlag>)
-            .generation(1)
+            .generation(workspace_authority.map_or(1, |authority| authority.generation()))
             .build()
             .map_err(|error| invalid_context_metadata(run_id, error.code()))?;
-        let filesystem = Arc::new(
-            FilesystemCapability::new(
-                lifecycle.clone(),
-                capability_owner.clone(),
-                filesystem_limits,
-            )
-            .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
-        );
-        let processes = Arc::new(
-            ProcessCapability::new(lifecycle.clone(), capability_owner.clone(), process_limits)
+        let filesystem = match (workspace.as_ref(), workspace_grant.as_ref()) {
+            (Some(_), Some(grant)) => Some(Arc::new(
+                FilesystemCapability::new_adopted(
+                    lifecycle.clone(),
+                    capability_owner.clone(),
+                    filesystem_limits,
+                    Arc::clone(grant),
+                )
                 .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
-        );
+            )),
+            (Some(_), None) => Some(Arc::new(
+                FilesystemCapability::new(
+                    lifecycle.clone(),
+                    capability_owner.clone(),
+                    filesystem_limits,
+                )
+                .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+            )),
+            (None, _) => None,
+        };
+        let processes = match (workspace.as_ref(), workspace_grant.as_ref()) {
+            (Some(_), Some(grant)) => Some(Arc::new(
+                ProcessCapability::new_adopted(
+                    lifecycle.clone(),
+                    capability_owner.clone(),
+                    process_limits,
+                    Arc::clone(grant),
+                )
+                .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+            )),
+            (Some(_), None) => Some(Arc::new(
+                ProcessCapability::new(lifecycle.clone(), capability_owner.clone(), process_limits)
+                    .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
+            )),
+            (None, _) => None,
+        };
         let artifacts = Arc::new(
             ArtifactCapability::new(lifecycle.clone(), capability_owner.clone(), artifact_limits)
                 .map_err(|error| invalid_context_metadata(run_id, error.code()))?,
@@ -1913,8 +2073,14 @@ impl AgentService {
             return 0;
         };
         match &*phase {
-            CapabilityHostPhase::Ready(state) => state.processes.table_len(),
-            CapabilityHostPhase::Closed(Some(closed)) => closed.processes.table_len(),
+            CapabilityHostPhase::Ready(state) => state
+                .processes
+                .as_ref()
+                .map_or(0, |processes| processes.table_len()),
+            CapabilityHostPhase::Closed(Some(closed)) => closed
+                .processes
+                .as_ref()
+                .map_or(0, |processes| processes.table_len()),
             CapabilityHostPhase::Empty
             | CapabilityHostPhase::Initializing
             | CapabilityHostPhase::Closed(None) => 0,
@@ -1930,8 +2096,14 @@ impl AgentService {
             return Vec::new();
         };
         match &*phase {
-            CapabilityHostPhase::Ready(state) => state.processes.live_pids(),
-            CapabilityHostPhase::Closed(Some(closed)) => closed.processes.live_pids(),
+            CapabilityHostPhase::Ready(state) => state
+                .processes
+                .as_ref()
+                .map_or_else(Vec::new, |processes| processes.live_pids()),
+            CapabilityHostPhase::Closed(Some(closed)) => closed
+                .processes
+                .as_ref()
+                .map_or_else(Vec::new, |processes| processes.live_pids()),
             CapabilityHostPhase::Empty
             | CapabilityHostPhase::Initializing
             | CapabilityHostPhase::Closed(None) => Vec::new(),
@@ -2219,6 +2391,8 @@ impl AgentService {
             started_at: Instant::now(),
             capability_host: Mutex::new(CapabilityHostPhase::Empty),
             capability_host_cv: Condvar::new(),
+            workspace_authority: None,
+            legacy_workspace_root: None,
             coding_system_prompt: Arc::from(prompt),
             occupancy: AtomicBool::new(false),
         });
@@ -2442,6 +2616,98 @@ impl AgentService {
         self.inner.persistence.clone()
     }
 
+    /// Resolves and durably changes a session workspace through the shared RSS
+    /// selection entry and the atomic storage session command.
+    pub(crate) async fn bind_session_workspace(
+        &self,
+        session_id: &str,
+        selector: String,
+    ) -> Result<SessionView, AdmitError> {
+        if self.inner.halting.load(Ordering::Acquire) {
+            return Err(AdmitError::Halting);
+        }
+        let service = self.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            service.bind_session_workspace_blocking(&session_id, &selector)
+        })
+        .await
+        .map_err(|error| {
+            AdmitError::Persistence(format!("workspace binding worker failed: {error}"))
+        })?
+    }
+
+    fn bind_session_workspace_blocking(
+        &self,
+        session_id: &str,
+        selector: &str,
+    ) -> Result<SessionView, AdmitError> {
+        let _admission_serial = self.inner.commit_gate.lock();
+        if self.inner.halting.load(Ordering::Acquire) {
+            return Err(AdmitError::Halting);
+        }
+        let existing = {
+            let store = self.inner.store.read();
+            let Some(session) = store.sessions.get(session_id) else {
+                return Err(AdmitError::SessionNotFound);
+            };
+            if store.runs.values().any(|run| {
+                run.session_id == session_id
+                    && matches!(
+                        run.status.as_str(),
+                        "queued" | "running" | "started" | "stopping"
+                    )
+            }) {
+                return Err(AdmitError::ActiveRun);
+            }
+            session.view.workspace.clone()
+        };
+        let cancellation = RunCancellation::with_timeout(self.inner.config.run_timeout);
+        let (binding, authority) = self.resolve_workspace_admission(
+            Some(selector),
+            existing.as_ref(),
+            &cancellation,
+            true,
+        )?;
+        let binding = binding.ok_or_else(|| {
+            AdmitError::Invalid("workspace selection was not admitted".to_string())
+        })?;
+        let authority = authority.ok_or_else(|| {
+            AdmitError::Invalid("workspace authority was not retained".to_string())
+        })?;
+        authority.check().map_err(|_| {
+            AdmitError::Invalid(
+                "workspace authority was revoked before session binding".to_string(),
+            )
+        })?;
+        let workspace_value = serde_json::to_value(&binding)
+            .map_err(|error| AdmitError::Invalid(error.to_string()))?;
+        let durable = match self.inner.persistence.as_ref() {
+            Some(persistence) => persistence
+                .session_workspace_bind(session_id, &workspace_value)
+                .map(|_| ())
+                .map_err(|error| match error.code.as_str() {
+                    "active_run" => AdmitError::ActiveRun,
+                    "session_not_found" => AdmitError::SessionNotFound,
+                    _ => {
+                        AdmitError::Persistence(format!("session workspace update failed: {error}"))
+                    }
+                }),
+            None => Ok(()),
+        };
+        authority.revoke();
+        durable?;
+
+        let mut store = self.inner.store.write();
+        let session = store
+            .sessions
+            .get_mut(session_id)
+            .ok_or(AdmitError::SessionNotFound)?;
+        session.view.workspace = Some(binding);
+        session.view.updated_at = timestamp();
+        Ok(session.view.clone())
+    }
+
     /// Atomically admits one run: capacity permit, idempotency, parent check,
     /// session resolution/creation, run ID, cancellation/delivery state, and
     /// one transactional durable admission command. The whole critical
@@ -2456,6 +2722,37 @@ impl AgentService {
     /// after the durable commit succeeded, so a failed admission leaves
     /// nothing behind — in memory or on disk.
     pub async fn admit(&self, request: AdmitRunRequest) -> Result<AdmittedRun, AdmitError> {
+        self.admit_with_workspace_options(request, None, true).await
+    }
+
+    /// Admits a run with an optional raw workspace selector. RSS interprets the
+    /// token against the trusted native policy before the durable transaction.
+    pub async fn admit_with_workspace_selector(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        self.admit_with_workspace_options(request, workspace_selector, true)
+            .await
+    }
+
+    /// Admits an external HTTP/Telegram request. These transport callers may
+    /// use only a trusted workspace binding, never an embedding's legacy root.
+    pub async fn admit_external_with_workspace_selector(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+    ) -> Result<AdmittedRun, AdmitError> {
+        self.admit_with_workspace_options(request, workspace_selector, false)
+            .await
+    }
+
+    async fn admit_with_workspace_options(
+        &self,
+        request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+        allow_legacy_workspace_root: bool,
+    ) -> Result<AdmittedRun, AdmitError> {
         // The halting gate is checked before any capacity permit or storage
         // work: once shutdown begins (SIGINT path), new admissions answer
         // the typed Halting rejection and never consume capacity.
@@ -2506,21 +2803,31 @@ impl AgentService {
                 AdmitError::RunLimitReached
             })?;
         let service = self.clone();
-        tokio::task::spawn_blocking(move || service.admit_blocking(request, capacity_permit))
-            .await
-            .map_err(|error| {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::Persistence);
-                AdmitError::Persistence(format!("admission worker failed: {error}"))
-            })?
+        tokio::task::spawn_blocking(move || {
+            service.admit_blocking(
+                request,
+                workspace_selector,
+                allow_legacy_workspace_root,
+                capacity_permit,
+            )
+        })
+        .await
+        .map_err(|error| {
+            self.inner
+                .metrics
+                .admission_rejected(AdmitRejectReason::Persistence);
+            AdmitError::Persistence(format!("admission worker failed: {error}"))
+        })?
     }
 
     fn admit_blocking(
         &self,
         request: AdmitRunRequest,
+        workspace_selector: Option<String>,
+        allow_legacy_workspace_root: bool,
         capacity_permit: OwnedSemaphorePermit,
     ) -> Result<AdmittedRun, AdmitError> {
+        let _admission_serial = self.inner.commit_gate.lock();
         let run_id = Uuid::new_v4().to_string();
         let now = timestamp();
         let message_id = Uuid::new_v4().to_string();
@@ -2538,19 +2845,20 @@ impl AgentService {
         run_limits
             .validate()
             .map_err(|error| AdmitError::Invalid(format!("invalid run limits: {error}")))?;
-        if let Some(replayed) = self.replay_existing_admission(
-            request.idempotency_key.as_deref(),
-            request.idempotency_hash.as_deref(),
-        )? {
-            return Ok(replayed);
-        }
-
+        let cancellation = RunCancellation::with_timeout(self.inner.config.run_timeout);
         let generation = self.inner.store_generation.load(Ordering::Acquire);
         let store = self.inner.store.read();
 
         // Session resolution: reuse an existing session or prepare a new one
         // (applied in memory only after the durable commit).
-        let session_id = match request.session_id.clone() {
+        let replay_session_id = request
+            .idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotency.get(key))
+            .and_then(|record| store.runs.get(&record.run_id))
+            .map(|run| run.session_id.clone());
+        let has_idempotency_replay = replay_session_id.is_some();
+        let session_id = match request.session_id.clone().or(replay_session_id) {
             Some(session_id) => {
                 if !store.sessions.contains_key(&session_id) {
                     self.inner
@@ -2563,6 +2871,10 @@ impl AgentService {
             None => Uuid::new_v4().to_string(),
         };
         let session_new = !store.sessions.contains_key(&session_id);
+        let existing_workspace_binding = store
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.view.workspace.clone());
         let (effective_model, effective_provider, effective_system_prompt) = if session_new {
             (
                 request
@@ -2613,7 +2925,7 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::Invalid);
             return Err(AdmitError::Invalid(message));
         }
-        let new_session_view = if session_new {
+        let mut new_session_view = if session_new {
             let view = SessionView {
                 id: session_id.clone(),
                 object: "hermes.session".to_string(),
@@ -2622,6 +2934,7 @@ impl AgentService {
                 provider: effective_provider.clone(),
                 source: request.platform.clone(),
                 system_prompt: effective_system_prompt.clone(),
+                workspace: None,
                 created_at: now,
                 updated_at: now,
                 message_count: 0,
@@ -2642,7 +2955,7 @@ impl AgentService {
         let provider_profile = self
             .resolve_provider_profile(effective_provider.as_deref())
             .map_err(|error| AdmitError::Invalid(format!("invalid provider profile: {error}")))?;
-        let snapshot = RunAdmissionSnapshot {
+        let mut snapshot = RunAdmissionSnapshot {
             registry,
             provider_profile,
             limits: run_limits,
@@ -2680,13 +2993,50 @@ impl AgentService {
             provider: effective_provider.clone(),
             system_prompt: effective_system_prompt.clone(),
         };
+        drop(store);
+        let (workspace_binding, workspace_authority) = self.resolve_workspace_admission(
+            workspace_selector.as_deref(),
+            existing_workspace_binding.as_ref(),
+            &cancellation,
+            has_idempotency_replay,
+        )?;
+        let legacy_workspace_root = if workspace_binding.is_none() && allow_legacy_workspace_root {
+            self.inner.trusted_legacy_workspace_root.read().clone()
+        } else {
+            None
+        };
+        let effective_request_hash = request.idempotency_hash.as_deref().map(|hash| {
+            workspace_scoped_request_hash(
+                hash,
+                workspace_binding.as_ref(),
+                legacy_workspace_root.as_deref(),
+            )
+        });
+        if let Some(replayed) = self.replay_existing_admission(
+            request.idempotency_key.as_deref(),
+            effective_request_hash.as_deref(),
+        )? {
+            return Ok(replayed);
+        }
+        if let Some(binding) = &workspace_binding {
+            snapshot.limits.workspace_root = PathBuf::from(&binding.canonical_path);
+        } else if let Some(root) = &legacy_workspace_root {
+            snapshot.limits.workspace_root = root.clone();
+        }
+        if let Some(view) = new_session_view.as_mut() {
+            view.workspace = workspace_binding.clone();
+        }
+        let session_metadata_json = match &workspace_binding {
+            Some(binding) => serde_json::to_string(&json!({"workspace": binding}))
+                .map_err(|error| AdmitError::Invalid(error.to_string()))?,
+            None => "{}".to_string(),
+        };
         let date = self.inner.date_source.read().current_date();
         let platform = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
         let workspace_root = snapshot.limits.workspace_root.clone();
         let tool_descriptors = snapshot.registry.descriptors().to_vec();
         let run_limits = snapshot.limits.clone();
-        drop(store);
 
         let prompt_read_observer = self
             .inner
@@ -2757,6 +3107,7 @@ impl AgentService {
             "model": effective_model.clone(),
             "provider": effective_provider.clone().unwrap_or_default(),
             "system_prompt": effective_system_prompt.clone().unwrap_or_default(),
+            "session_metadata_json": session_metadata_json,
             "run_id": run_id,
             "parent_run_id": request.parent_run_id.clone().unwrap_or_default(),
             "input_json": persisted_input,
@@ -2765,7 +3116,7 @@ impl AgentService {
             "script_hash": snapshot.registry.identity(),
             "idempotency_scope": ADMISSION_IDEMPOTENCY_SCOPE,
             "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
-            "request_hash": request.idempotency_hash.clone().unwrap_or_default(),
+            "request_hash": effective_request_hash.clone().unwrap_or_default(),
             "event_id": event_id,
             "now_ms": now,
             "expires_at_ms": 0,
@@ -2800,7 +3151,7 @@ impl AgentService {
             &store,
             generation,
             request.idempotency_key.as_deref(),
-            request.idempotency_hash.as_deref(),
+            effective_request_hash.as_deref(),
             &run_id,
         )? {
             return Ok(replayed);
@@ -2842,6 +3193,9 @@ impl AgentService {
         if request.instructions.is_some() {
             session.view.system_prompt = request.instructions.clone();
         }
+        if let Some(binding) = workspace_binding.clone() {
+            session.view.workspace = Some(binding);
+        }
         session.messages.push(context_message);
         session.view.message_count = session.messages.len();
         session.view.updated_at = now;
@@ -2867,7 +3221,7 @@ impl AgentService {
         store.runs.insert(run_id.clone(), run);
         if let (Some(key), Some(hash)) = (
             request.idempotency_key.as_deref(),
-            request.idempotency_hash.as_deref(),
+            effective_request_hash.as_deref(),
         ) {
             store.idempotency.insert(
                 key.to_string(),
@@ -2878,10 +3232,9 @@ impl AgentService {
             );
         }
 
-        let cancel = RunCancellation::with_timeout(self.inner.config.run_timeout);
         let handle = Arc::new(RunHandle {
-            tool_cancel: cancel.token(),
-            cancel,
+            tool_cancel: cancellation.token(),
+            cancel: cancellation,
             terminal_at: Mutex::new(None),
             permit: Mutex::new(Some(capacity_permit)),
             terminal: AtomicBool::new(false),
@@ -2894,6 +3247,8 @@ impl AgentService {
             started_at: Instant::now(),
             capability_host: Mutex::new(CapabilityHostPhase::Empty),
             capability_host_cv: Condvar::new(),
+            workspace_authority,
+            legacy_workspace_root,
             coding_system_prompt: Arc::from(coding_system_prompt),
             occupancy: AtomicBool::new(false),
         });
@@ -3372,8 +3727,8 @@ impl AgentService {
                     Ok(Some(state)) => (
                         Some(Arc::clone(&state.lifecycle)),
                         Some(state.capability_owner.clone()),
-                        Some(Arc::clone(&state.filesystem)),
-                        Some(Arc::clone(&state.processes)),
+                        state.filesystem.clone(),
+                        state.processes.clone(),
                         Some(Arc::clone(&state.artifacts)),
                     ),
                     Ok(None) => (None, None, None, None, None),
@@ -4256,6 +4611,32 @@ impl AgentService {
             .expect("run context was verified before execution");
         context.to_vm_value()
     }
+}
+
+fn workspace_scoped_request_hash(
+    request_hash: &str,
+    binding: Option<&WorkspaceBinding>,
+    legacy_root: Option<&std::path::Path>,
+) -> String {
+    let workspace = binding.map(|binding| {
+        json!({
+            "selector": binding.selector,
+            "canonical_path": binding.canonical_path,
+            "selected_name": binding.selected_name,
+        })
+    });
+    let material = serde_json::to_vec(&json!({
+        "request_hash": request_hash,
+        "workspace": workspace,
+        "legacy_root": legacy_root.map(|path| path.to_string_lossy().into_owned()),
+    }))
+    .unwrap_or_default();
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in material {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv64:{hash:016x}")
 }
 
 /// Validates the service-owned idempotency-key grammar before any admission

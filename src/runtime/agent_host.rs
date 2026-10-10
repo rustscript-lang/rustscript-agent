@@ -541,6 +541,12 @@ impl AgentHostState {
     }
 
     fn missing_capability(name: &str) -> JsonValue {
+        if matches!(name, "filesystem" | "process") {
+            return capability_error_envelope(&CapabilityError::new(
+                "workspace_unavailable",
+                "workspace authority is unavailable",
+            ));
+        }
         capability_error_envelope(&CapabilityError::new(
             "invalid_metadata",
             format!("{name} capability is not installed"),

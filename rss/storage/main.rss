@@ -317,6 +317,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_raw_ok(request_id, op, sessions::storage_session_list(db_id, input.profile, input.platform, command.max_rows, command.max_bytes));
     } else if command.op == "session.touch" {
         result = storage_raw_ok(request_id, op, sessions::storage_session_touch(db_id, command.payload_json, command.max_rows, command.max_bytes));
+    } else if command.op == "session.workspace_bind" {
+        result = storage_unwrap(request_id, op, sessions::storage_session_workspace_bind(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.append" {
         result = storage_unwrap(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.get" {

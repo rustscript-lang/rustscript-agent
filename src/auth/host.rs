@@ -51,6 +51,7 @@ mod public_json;
 mod stream;
 mod timing;
 mod transients;
+pub mod workspace;
 
 pub use authorization_io::{
     AuthorizationInstructionSender, PublicAuthorizationInstruction,
@@ -153,6 +154,7 @@ struct Owner {
     deadline: Instant,
     cancellation: RunCancellation,
     revoked: AtomicBool,
+    workspace_epoch: Arc<AtomicU64>,
     policy: Mutex<Option<ResourceHandle>>,
     snapshot: Arc<Snapshot>,
     store: AuthStore,
@@ -172,6 +174,13 @@ impl Owner {
         }
         Ok(())
     }
+    pub(super) fn workspace_check(&self) -> Result<(), &'static str> {
+        self.check().map_err(|_| "workspace_unauthorized")?;
+        if self.workspace_epoch.load(Ordering::Acquire) != self.snapshot.generation {
+            return Err("workspace_generation_stale");
+        }
+        Ok(())
+    }
     fn authorize(&self, id: &str) -> VmResult<()> {
         self.check()?;
         if !self.snapshot.allowed.contains(id) {
@@ -185,6 +194,13 @@ impl Owner {
     }
 }
 struct Bound(Arc<Owner>);
+
+/// Production workspace admission host functions and typed values.
+pub use self::workspace::{
+    HeldDirectory, WorkspaceSelection, directory_meta as workspace_directory_meta,
+    open_descriptor as workspace_open_descriptor,
+    open_result_descriptor as workspace_open_result_descriptor,
+};
 
 /// Trusted home and immutable admission snapshots. Reload affects future binds only.
 enum AdmissionMode {
@@ -200,6 +216,7 @@ pub struct AuthHost {
     cancellation: RunCancellation,
     admission: AdmissionMode,
     published: Mutex<Arc<Snapshot>>,
+    workspace_epoch: Arc<AtomicU64>,
     next_generation: AtomicU64,
     owners: Mutex<Vec<std::sync::Weak<Owner>>>,
     oauth: Option<Arc<OAuthHost>>,
@@ -271,6 +288,7 @@ impl AuthHost {
             cancellation,
             admission,
             published: Mutex::new(snapshot),
+            workspace_epoch: Arc::new(AtomicU64::new(1)),
             next_generation: AtomicU64::new(2),
             owners: Mutex::new(Vec::new()),
             oauth: None,
@@ -317,7 +335,14 @@ impl AuthHost {
             generation,
             &self.admission,
         )?);
-        *self.published.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
+        let mut published = self.published.lock().unwrap_or_else(|p| p.into_inner());
+        // Reload construction can finish out of order. Never let an older
+        // snapshot make a previously revoked workspace generation live again.
+        if generation <= published.generation {
+            return Ok(published.generation);
+        }
+        self.workspace_epoch.store(generation, Ordering::Release);
+        *published = snapshot;
         Ok(generation)
     }
 
@@ -367,6 +392,7 @@ impl AuthHost {
             deadline,
             cancellation: self.cancellation.clone(),
             revoked: AtomicBool::new(false),
+            workspace_epoch: Arc::clone(&self.workspace_epoch),
             policy: Mutex::new(None),
             snapshot,
             store: self.store.clone(),
@@ -407,6 +433,29 @@ impl AuthHost {
             "host_home",
             Value::Int(home.handle().raw() as i64),
         )]))
+    }
+
+    /// Adopts a workspace directory resource returned by the restricted RSS
+    /// admission entry while its VM arena is still live.
+    pub(crate) fn take_workspace_directory(
+        &self,
+        vm: &mut Vm,
+        value: &Value,
+    ) -> VmResult<Arc<workspace::WorkspaceGrant>> {
+        let (owner, held) = workspace::borrow_held(vm, value)?;
+        let owned = self
+            .owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|weak| {
+                weak.upgrade()
+                    .is_some_and(|candidate| Arc::ptr_eq(&candidate, &owner))
+            });
+        if !owned {
+            return Err(error("owner_mismatch"));
+        }
+        Ok(workspace::WorkspaceGrant::from_parts(owner, held))
     }
 
     /// Derive a host-only OAuth transport view from a live, host-issued policy.
@@ -1098,6 +1147,14 @@ fn config_type() -> HostTypeSchema {
                     vec![
                         ("allowed_roots", array(s.clone())),
                         ("default", opt(s.clone())),
+                        (
+                            "named",
+                            array(named(
+                                "WorkspaceNamed",
+                                vec![("name", s.clone()), ("path", s.clone())],
+                            )),
+                        ),
+                        ("generation", i.clone()),
                     ],
                 ),
             ),
@@ -1406,6 +1463,8 @@ pub fn auth_host_module() -> HostModuleDescriptor {
         functions: &[
             config_desc,
             paths::resolved_path_result_desc,
+            workspace::open_result_descriptor,
+            workspace::close_descriptor,
             transport_desc,
             transport_payload_desc,
             transport_capture_desc,
@@ -1450,6 +1509,7 @@ pub fn auth_host_module() -> HostModuleDescriptor {
         resources: &[
             host_home_meta,
             paths::home_meta,
+            workspace::directory_meta,
             policy_meta,
             access_meta,
             refresh_meta,
@@ -1488,6 +1548,33 @@ fn config_call(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         serde_json::to_value(&owner.snapshot.config).map_err(|_| error("config_invalid"))?;
     if let Json::Object(ref mut fields) = public {
         fields.insert("providers".into(), Json::Array(owner.snapshot.config.providers.iter().map(|(name,provider)| json!({"name":name,"protocol":provider.protocol,"base_url":provider.base_url,"auth":provider.auth,"oauth":provider.oauth})).collect()));
+        // Typed public workspace view: display-only. Roots remain frozen
+        // host-side in `Owner.snapshot.config.workspaces.allowed_roots`; the
+        // RSS interpreter of default/named/session policy reads only this view.
+        let workspaces = &owner.snapshot.config.workspaces;
+        fields.insert(
+            "workspaces".into(),
+            json!({
+                "allowed_roots": workspaces
+                    .allowed_roots
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                "default": workspaces
+                    .default
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                "named": workspaces
+                    .named
+                    .iter()
+                    .map(|(name, path)| json!({
+                        "name": name,
+                        "path": path.to_string_lossy(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "generation": owner.snapshot.generation,
+            }),
+        );
     }
     result(object(vec![
         ("ok", Value::Bool(true)),

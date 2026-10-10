@@ -391,6 +391,28 @@ impl GatewayPersistence {
         self.command_data("session.touch", payload)
     }
 
+    /// Atomically binds trusted workspace display metadata to an idle session
+    /// through the RSS session command, preserving unrelated metadata keys.
+    pub fn session_workspace_bind(
+        &self,
+        session_id: &str,
+        workspace: &Value,
+    ) -> Result<Value, StorageError> {
+        let workspace_json = serde_json::to_string(workspace).map_err(|error| StorageError {
+            code: "invalid_payload".to_string(),
+            message: format!("workspace binding serialization failed: {error}"),
+        })?;
+        self.command_data(
+            "session.workspace_bind",
+            &json!({
+                "session_id": session_id,
+                "workspace_json": workspace_json,
+                "now_ms": crate::domain::timestamp() as i64,
+            }),
+        )?;
+        self.session_get(session_id)
+    }
+
     /// Cascades one session (messages, runs, events, links, approvals,
     /// compactions, delivery cursors, idempotency) in one transaction.
     pub fn session_delete(&self, session_id: &str) -> Result<Value, StorageError> {
@@ -759,6 +781,14 @@ pub(crate) struct JobView {
     pub(crate) last_run_at: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct WorkspaceBinding {
+    pub(crate) selector: String,
+    pub(crate) canonical_path: String,
+    pub(crate) selected_name: Option<String>,
+    pub(crate) generation: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SessionView {
     pub(crate) id: String,
@@ -768,6 +798,8 @@ pub(crate) struct SessionView {
     pub(crate) provider: Option<String>,
     pub(crate) source: String,
     pub(crate) system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace: Option<WorkspaceBinding>,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
     pub(crate) message_count: usize,
@@ -874,6 +906,15 @@ impl GatewayStore {
         let mut sessions = BTreeMap::new();
         for row in session_rows {
             let id = string_cell(&row, 0, "session id")?;
+            let metadata = json_optional_cell(&row, 13, "session metadata")?.unwrap_or(Value::Null);
+            let workspace = metadata
+                .get("workspace")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| "invalid workspace binding metadata".to_string())
+                })
+                .transpose()?;
             let view = SessionView {
                 id: id.clone(),
                 object: "hermes.session".to_string(),
@@ -882,6 +923,7 @@ impl GatewayStore {
                 provider: optional_string(&row, 11),
                 source: string_cell(&row, 2, "session platform")?,
                 system_prompt: optional_string(&row, 9),
+                workspace,
                 created_at: int_cell(&row, 15, "session created_at")? as u64,
                 updated_at: int_cell(&row, 16, "session updated_at")? as u64,
                 message_count: 0,
