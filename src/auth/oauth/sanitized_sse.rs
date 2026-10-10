@@ -16,8 +16,9 @@ use serde_json::Value as JsonValue;
 use crate::auth::store::OpaqueAccessHandle;
 
 use super::{
-    BoundedHttpsStream, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext, ProviderRequest,
-    TrustedTransportPolicy, parse_strict_json, retry_after_ms, strip_secret_keys,
+    BoundedHttpsStream, MAX_JSON_DEPTH, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext,
+    ProviderRequest, TrustedTransportPolicy, parse_strict_json_with_depth, retry_after_ms,
+    strip_secret_keys,
 };
 
 const MAX_PUBLIC_MARKERS: usize = 16;
@@ -456,8 +457,10 @@ impl SanitizedAccessSseStream {
     /// Strict bounded JSON with every secret-shaped key removed at every level.
     /// Primitive JSON and non-JSON are static malformed with no raw fallback.
     fn sanitize_json(text: &str) -> Result<SanitizedSseRecord, OAuthError> {
-        let parsed =
-            parse_strict_json(text).map_err(|_| static_malformed("sse data is not strict json"))?;
+        // The custom parser counts primitive leaves as one seed level beyond
+        // container nesting; allow that leaf for the existing container cap.
+        let parsed = parse_strict_json_with_depth(text, MAX_JSON_DEPTH + 1)
+            .map_err(|_| static_malformed("sse data is not strict json"))?;
         let cleaned = strip_secret_keys(parsed);
         if !matches!(cleaned, JsonValue::Object(_) | JsonValue::Array(_)) {
             return Err(static_malformed("sse data is not a json object or array"));
@@ -1236,6 +1239,52 @@ mod sanitized_sse_tests {
         assert_eq!(parsed["delta"], "OK");
         assert_eq!(locked(&state).reads, 1);
         expect_end(stream.read_record());
+    }
+
+    #[test]
+    fn sanitized_sse_depth_eight_record_keeps_general_limit_and_redacts() {
+        let mut json = r#"{"access_token":"SYNTHETIC_SECRET"}"#.to_string();
+        for _ in 0..7 {
+            json = format!("{{\"nested\":{json}}}");
+        }
+        assert!(super::super::parse_strict_json(&json).is_err());
+
+        let (_store, access) = issue_access("depth-eight");
+        let body = format!("data: {json}\n\n").into_bytes();
+        let (transport, state) =
+            make_transport(200, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+
+        let sanitized = json_text(expect_record(stream.read_record()));
+        assert!(!sanitized.contains("SYNTHETIC_SECRET"));
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&sanitized).expect("sanitized JSON parses");
+        for _ in 0..7 {
+            parsed = parsed["nested"].clone();
+        }
+        assert!(parsed.get("access_token").is_none());
+        assert_eq!(locked(&state).reads, 1);
+        expect_end(stream.read_record());
+
+        let mut too_deep = r#"{"value":"leaf"}"#.to_string();
+        for _ in 0..8 {
+            too_deep = format!("{{\"nested\":{too_deep}}}");
+        }
+        let body = format!("data: {too_deep}\n\n").into_bytes();
+        let (transport, _state) =
+            make_transport(200, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let (_depth_store, depth_access) = issue_access("depth-nine");
+        let mut stream = start_stream(&host, depth_access, &cancel, vec!["DONE".to_string()]);
+        assert_eq!(
+            expect_error(stream.read_record()).code(),
+            "malformed_response"
+        );
     }
 
     #[test]

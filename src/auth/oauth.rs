@@ -2939,6 +2939,7 @@ fn percent_decode(value: &str) -> String {
 
 struct StrictJsonSeed {
     depth: usize,
+    max_depth: usize,
 }
 
 impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
@@ -2948,17 +2949,21 @@ impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
     where
         D: serde::Deserializer<'de>,
     {
-        if self.depth > MAX_JSON_DEPTH {
+        if self.depth > self.max_depth {
             return Err(<D::Error as serde::de::Error>::custom(
                 "response JSON exceeds depth",
             ));
         }
-        deserializer.deserialize_any(StrictJsonVisitor { depth: self.depth })
+        deserializer.deserialize_any(StrictJsonVisitor {
+            depth: self.depth,
+            max_depth: self.max_depth,
+        })
     }
 }
 
 struct StrictJsonVisitor {
     depth: usize,
+    max_depth: usize,
 }
 
 impl<'de> Visitor<'de> for StrictJsonVisitor {
@@ -3026,6 +3031,7 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
         let mut values = Vec::new();
         while let Some(value) = sequence.next_element_seed(StrictJsonSeed {
             depth: self.depth + 1,
+            max_depth: self.max_depth,
         })? {
             values.push(value);
         }
@@ -3046,6 +3052,7 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
             }
             let value = object.next_value_seed(StrictJsonSeed {
                 depth: self.depth + 1,
+                max_depth: self.max_depth,
             })?;
             values.insert(key, value);
         }
@@ -3054,12 +3061,19 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
 }
 
 fn parse_strict_json(text: &str) -> Result<JsonValue, OAuthError> {
+    parse_strict_json_with_depth(text, MAX_JSON_DEPTH)
+}
+
+fn parse_strict_json_with_depth(text: &str, max_depth: usize) -> Result<JsonValue, OAuthError> {
     let mut deserializer = serde_json::Deserializer::from_str(text);
-    let parsed = StrictJsonSeed { depth: 1 }
-        .deserialize(&mut deserializer)
-        .map_err(|error| OAuthError::MalformedResponse {
-            reason: error.to_string(),
-        })?;
+    let parsed = StrictJsonSeed {
+        depth: 1,
+        max_depth,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| OAuthError::MalformedResponse {
+        reason: error.to_string(),
+    })?;
     deserializer
         .end()
         .map_err(|error| OAuthError::MalformedResponse {
