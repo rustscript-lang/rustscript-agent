@@ -185,9 +185,16 @@ impl OAuthHost {
             return Err(static_malformed("sse response status is invalid"));
         }
         let media = canonical_media_type(&reader.head().headers);
+        let has_content_type = reader
+            .head()
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"));
         let mode = match media {
             Some("text/event-stream") => SseMode::EventStream,
             Some("application/json") => SseMode::BufferedJson,
+            None if (200..300).contains(&status) && !has_content_type => SseMode::EventStream,
+            None if status >= 400 && !has_content_type => SseMode::BufferedJson,
             _ => SseMode::Unsupported,
         };
         let head = SanitizedSseHead {
@@ -536,6 +543,7 @@ mod sanitized_sse_tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            transport_identity: None,
         }
     }
 
@@ -1203,6 +1211,52 @@ mod sanitized_sse_tests {
         let cancel = Arc::new(ScriptedCancel::new());
         let host = make_host(transport, &clock, &cancel);
         let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+        expect_end(stream.read_record());
+    }
+
+    #[test]
+    fn sanitized_sse_missing_mime_success_parses_strict_event_stream() {
+        let (_store, access) = issue_access("missing-mime-success");
+        let body = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"OK\"}\n\n";
+        let (transport, state) = make_transport(
+            200,
+            Vec::new(),
+            vec![Injected::Chunk(body.to_vec()), Injected::Eof],
+        );
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+
+        assert_eq!(stream.head().status, 200);
+        assert_eq!(stream.head().content_type, "");
+        let text = json_text(expect_record(stream.read_record()));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json parses");
+        assert_eq!(parsed["type"], "response.output_text.delta");
+        assert_eq!(parsed["delta"], "OK");
+        assert_eq!(locked(&state).reads, 1);
+        expect_end(stream.read_record());
+    }
+
+    #[test]
+    fn sanitized_sse_missing_mime_error_reads_bounded_json_body() {
+        let (_store, access) = issue_access("missing-mime-error");
+        let body = br#"{"error":{"type":"invalid_request_error","message":"safe error","access_token":"SYNTHETIC_SECRET"}}"#.to_vec();
+        let (transport, state) =
+            make_transport(400, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+
+        assert_eq!(stream.head().status, 400);
+        assert_eq!(stream.head().content_type, "");
+        let text = json_text(expect_record(stream.read_record()));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json parses");
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+        assert!(parsed["error"].get("access_token").is_none());
+        assert!(!text.contains("SYNTHETIC_SECRET"));
+        assert_eq!(locked(&state).reads, 2);
         expect_end(stream.read_record());
     }
 

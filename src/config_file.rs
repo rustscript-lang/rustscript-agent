@@ -215,6 +215,8 @@ impl Default for ModelSettings {
 pub struct ProviderSettings {
     pub protocol: String,
     pub base_url: String,
+    /// Optional administrator-owned native transport identity intent.
+    pub transport_identity: Option<String>,
     /// A named credential reference. The token itself cannot be represented
     /// by this field because it is a string ID validated against auth.yaml.
     pub auth: Option<String>,
@@ -450,6 +452,17 @@ impl ConfigFile {
             )?;
             if let Some(auth) = provider.auth.as_deref() {
                 validate_visible(auth, source, &format!("providers.{provider_name}.auth"))?;
+            }
+            if provider
+                .transport_identity
+                .as_deref()
+                .is_some_and(|identity| identity != "codex_access_claim")
+            {
+                return Err(invalid_value(
+                    source,
+                    &format!("providers.{provider_name}.transport_identity"),
+                    "must be absent or codex_access_claim",
+                ));
             }
             if let Some(oauth) = provider.oauth.as_ref() {
                 validate_oauth(source, provider_name, oauth)?;
@@ -902,7 +915,13 @@ fn validate_config_shape(source: &Path, value: &Value) -> Result<(), ConfigFileE
                 source,
                 &path,
                 provider,
-                &["protocol", "base_url", "auth", "oauth"],
+                &[
+                    "protocol",
+                    "base_url",
+                    "auth",
+                    "oauth",
+                    "transport_identity",
+                ],
             )?;
             if let Some(oauth) = as_mapping_optional(provider, "oauth")? {
                 validate_known_keys(

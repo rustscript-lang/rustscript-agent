@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::auth::config::CredentialConfig;
 use crate::auth::oauth::{
     CredentialUse, NativeTransportIntents, OAuthHost, OpaqueExchangePair, ProviderRequest,
-    SanitizedProviderResponse, TrustedEndpoint, TrustedTransportPolicy,
+    SanitizedProviderResponse, TrustedEndpoint, TrustedTransportIdentity, TrustedTransportPolicy,
 };
 use crate::auth::store::{
     AuthMetadata, AuthStore, AuthStoreError, OpaqueAccessHandle, OpaqueRefreshHandle,
@@ -542,11 +542,24 @@ impl AuthHost {
 
 fn transport_policy(owner: &Arc<Owner>, credential_id: &str) -> VmResult<TrustedTransportPolicy> {
     let mut endpoints = Vec::new();
+    let mut transport_identity = None;
     for provider in owner.snapshot.config.providers.values() {
         if provider.auth.as_deref() != Some(credential_id) {
             continue;
         }
         let base = trusted_url_endpoint(&provider.base_url)?;
+        if provider.transport_identity.as_deref() == Some("codex_access_claim") {
+            let candidate = TrustedTransportIdentity::CodexAccessClaim {
+                endpoint: base.clone(),
+            };
+            if transport_identity
+                .as_ref()
+                .is_some_and(|current| current != &candidate)
+            {
+                return Err(error("transport_identity_conflict"));
+            }
+            transport_identity = Some(candidate);
+        }
         let base_authority = base.authority.clone();
         push_endpoint(&mut endpoints, base);
         if let Some(oauth) = &provider.oauth {
@@ -608,6 +621,7 @@ fn transport_policy(owner: &Arc<Owner>, credential_id: &str) -> VmResult<Trusted
         deadline: owner.deadline,
         endpoints,
         allowed_header_names: BTreeSet::from(["accept".into(), "content-type".into()]),
+        transport_identity,
     })
 }
 

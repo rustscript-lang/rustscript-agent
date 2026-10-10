@@ -1265,6 +1265,7 @@ fn trusted_policy(view: AdmittedTransportView) -> TrustedTransportPolicy {
             })
             .collect(),
         allowed_header_names: view.allowed_header_names,
+        transport_identity: None,
     }
 }
 
