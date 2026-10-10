@@ -377,6 +377,19 @@ fn public_config_value(config: &ConfigFile) -> Value {
         })
         .unwrap_or_default();
     public["providers"] = serde_json::Value::Array(providers);
+    // Match the production display-only WorkspaceConfig projection. These
+    // fixture paths do not grant authority and no workspace host is invoked.
+    let workspaces = &config.workspaces;
+    public["workspaces"] = serde_json::json!({
+        "allowed_roots": workspaces.allowed_roots.iter()
+            .map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "default": workspaces.default.as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        "named": workspaces.named.iter()
+            .map(|(name, path)| serde_json::json!({"name": name, "path": path.to_string_lossy()}))
+            .collect::<Vec<_>>(),
+        "generation": 1,
+    });
     json_to_vm(&public)
 }
 

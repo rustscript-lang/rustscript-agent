@@ -126,6 +126,11 @@ has no effect on a packaged gateway. It is listed here so the drift guard's
 canonical section accounts for every `RUSTSCRIPT_AGENT_*` token in `src/`; it is
 never renamed or skipped to satisfy that guard.
 
+`RUSTSCRIPT_AGENT_TEST_TMPDIR` is also an **internal test input, not a production
+setting**. The workspace Telegram unit fixture requires this input to select
+isolated test scratch storage. It is confined to `#[cfg(test)]` code and does
+not configure a packaged gateway.
+
 ## CLI arguments (runner binary)
 
 `rustscript-agent` is the single-run runner: it compiles one script and
