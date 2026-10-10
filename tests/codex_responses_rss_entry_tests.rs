@@ -395,3 +395,52 @@ fn responses_adapter_without_native_home_fails_closed_legacy() {
     );
     assert!(transport.take_sent().is_empty());
 }
+
+#[test]
+fn admitted_responses_accumulates_refusal_deltas_through_done_exact_text() {
+    let home = codex_home();
+    let expected = "I cannot help with that request.";
+    let transcript = format!(
+        "event: response.refusal.delta\ndata: {}\n\nevent: response.refusal.delta\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"type": "response.refusal.delta", "delta": "I cannot "}),
+        json!({"type": "response.refusal.delta", "delta": "help with that request."})
+    );
+    let chunks: Vec<Vec<u8>> = sse_events(&transcript)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    let transport = Arc::new(StreamTransport::new(200, "text/event-stream", chunks, true));
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let result = run_harness(
+        &runner,
+        "openai_responses",
+        canonical_request(true),
+        codex_profile(),
+        CREDENTIAL,
+    );
+
+    assert_eq!(result["ok"], json!(true), "{result}");
+    assert_eq!(result["response"]["text"], json!(expected), "{result}");
+    assert_eq!(result["response"]["tool_calls"], json!([]), "{result}");
+    assert_eq!(
+        transport
+            .counts
+            .starts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one native stream start"
+    );
+    assert_eq!(
+        transport.counts.sent.lock().expect("sent requests").len(),
+        1,
+        "one Responses request"
+    );
+    assert_eq!(
+        transport
+            .counts
+            .drops
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "native stream resource released"
+    );
+}

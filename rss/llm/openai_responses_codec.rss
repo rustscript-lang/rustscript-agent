@@ -94,6 +94,8 @@ fn codec_ingest(state: map, chunk: map) -> map {
     let kind: string = types::request_string(chunk, "type");
     let result: map = if kind == "response.output_text.delta" => {
         codec_text_delta(state, chunk)
+    } else if kind == "response.refusal.delta" => {
+        codec_text_delta(state, chunk)
     } else if kind == "response.reasoning_summary_text.delta" => {
         codec_reasoning_delta(state, chunk)
     } else if kind == "response.function_call_arguments.delta" => {
@@ -390,7 +392,7 @@ fn responses_output_text(output: array) -> string {
         let item: map = types::array_entry(output, i);
         let item_type: string = types::request_string(item, "type");
         if item_type == "message" {
-            text = text + responses_content_text(types::request_array(item, "content"));
+            text = text + responses_content_text(types::request_array(item, "content"), true);
         }
         i += 1;
     }
@@ -404,15 +406,15 @@ fn responses_output_reasoning(output: array) -> string {
         let item: map = types::array_entry(output, i);
         let item_type: string = types::request_string(item, "type");
         if item_type == "reasoning" {
-            text = text + responses_content_text(types::request_array(item, "summary"));
+            text = text + responses_content_text(types::request_array(item, "summary"), false);
         }
         i += 1;
     }
     text
 }
 
-/// Joins the text of `output_text`/`text`/`summary_text` content parts.
-fn responses_content_text(parts: array) -> string {
+/// Joins standard text parts; refusal strings are included for visible output only.
+fn responses_content_text(parts: array, include_refusal: bool) -> string {
     let mut joined: string = "";
     let mut i = 0;
     while i < parts.length {
@@ -426,6 +428,9 @@ fn responses_content_text(parts: array) -> string {
         }
         if part_type == "summary_text" {
             joined = joined + types::request_string(part, "text");
+        }
+        if include_refusal && part_type == "refusal" {
+            joined = joined + types::request_string(part, "refusal");
         }
         i += 1;
     }
@@ -688,7 +693,7 @@ fn responses_collect_instructions(messages: array) -> string {
         let message: map = types::array_entry(messages, i);
         let role: string = types::message_role(message);
         if role == "system" || role == "developer" {
-            let text: string = responses_content_text(types::message_content(message));
+            let text: string = responses_content_text(types::message_content(message), false);
             if text != "" {
                 if out != "" {
                     out = out + "\n";

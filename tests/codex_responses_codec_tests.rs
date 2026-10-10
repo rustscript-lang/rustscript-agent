@@ -446,3 +446,79 @@ fn buffered_error_body_maps_public_error() {
     assert_eq!(result["error"]["type"], json!("invalid_request_error"));
     assert_eq!(result["error"]["code"], json!("bad"));
 }
+
+#[test]
+fn completed_refusal_content_becomes_exact_visible_text() {
+    let mut vm = codec_vm();
+    let expected = "I cannot help with that request.";
+    let chunks = json!([
+        {"type": "response.refusal.delta", "delta": "draft refusal"},
+        {"type": "response.completed", "response": {
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "refusal", "refusal": expected}]}],
+            "usage": {"input_tokens": 2, "output_tokens": 6, "total_tokens": 8}
+        }}
+    ]);
+
+    let result = collect(&mut vm, &chunks, true);
+    assert_eq!(
+        result["response"]["text"],
+        json!(expected),
+        "result: {result}"
+    );
+    assert_eq!(result["ok"], json!(true), "result: {result}");
+    assert_eq!(result["response"]["stop_reason"], json!("stop"));
+    assert_eq!(result["response"]["tool_calls"], json!([]));
+}
+
+#[test]
+fn accumulated_refusal_deltas_without_final_body_use_exact_visible_text() {
+    let mut vm = codec_vm();
+    let chunks = json!([
+        {"type": "response.refusal.delta", "delta": "I cannot "},
+        {"type": "response.refusal.delta", "delta": "help with that request."}
+    ]);
+
+    let result = collect(&mut vm, &chunks, true);
+    assert_eq!(result["ok"], json!(true), "result: {result}");
+    assert_eq!(
+        result["response"]["text"],
+        json!("I cannot help with that request."),
+        "result: {result}"
+    );
+    assert_eq!(result["response"]["stop_reason"], json!(""));
+    assert_eq!(result["response"]["tool_calls"], json!([]));
+}
+
+#[test]
+fn empty_refusal_content_and_delta_remain_fail_closed() {
+    // Direct regression coverage: empty refusal values do not create visible text.
+    let mut vm = codec_vm();
+    let completed = json!([{
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "refusal", "refusal": ""}]}
+            ]
+        }
+    }]);
+    let completed_result = collect(&mut vm, &completed, true);
+    assert_eq!(completed_result["ok"], json!(false));
+    assert_eq!(
+        completed_result["error"]["code"],
+        json!("empty_responses_output")
+    );
+
+    let delta_result = collect(
+        &mut vm,
+        &json!([{"type": "response.refusal.delta", "delta": ""}]),
+        true,
+    );
+    assert_eq!(delta_result["ok"], json!(false));
+    assert_eq!(
+        delta_result["error"]["code"],
+        json!("empty_responses_output")
+    );
+}

@@ -23,6 +23,7 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -318,6 +319,15 @@ fn public_header_override_cannot_replace_native_account_header() {
 struct QueuedSseTransport {
     responses: Mutex<VecDeque<Vec<Vec<u8>>>>,
     sent: Mutex<Vec<PreparedHttpsRequest>>,
+    counts: Arc<QueuedSseCounts>,
+}
+
+#[derive(Default)]
+struct QueuedSseCounts {
+    starts: AtomicUsize,
+    buffered_calls: AtomicUsize,
+    cancels: AtomicUsize,
+    drops: AtomicUsize,
 }
 
 impl QueuedSseTransport {
@@ -334,6 +344,7 @@ impl QueuedSseTransport {
         Self {
             responses: Mutex::new(responses),
             sent: Mutex::new(Vec::new()),
+            counts: Arc::new(QueuedSseCounts::default()),
         }
     }
 
@@ -348,6 +359,7 @@ impl BoundedHttpsTransport for QueuedSseTransport {
         _request: &PreparedHttpsRequest,
         _context: &OAuthIoContext,
     ) -> Result<RawHttpsResponse, OAuthError> {
+        self.counts.buffered_calls.fetch_add(1, Ordering::SeqCst);
         Err(OAuthError::Transport {
             message: "unexpected buffered request".to_string(),
         })
@@ -359,6 +371,7 @@ impl BoundedHttpsTransport for QueuedSseTransport {
         context: &OAuthIoContext,
     ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
         context.check()?;
+        self.counts.starts.fetch_add(1, Ordering::SeqCst);
         self.sent
             .lock()
             .expect("sent requests")
@@ -372,6 +385,7 @@ impl BoundedHttpsTransport for QueuedSseTransport {
                 message: "no queued SSE fixture".to_string(),
             })?;
         Ok(Box::new(QueuedSseReader {
+            counts: Arc::clone(&self.counts),
             head: RawHttpsResponseHead {
                 status: 200,
                 headers: std::collections::BTreeMap::from([(
@@ -386,6 +400,7 @@ impl BoundedHttpsTransport for QueuedSseTransport {
 }
 
 struct QueuedSseReader {
+    counts: Arc<QueuedSseCounts>,
     head: RawHttpsResponseHead,
     chunks: VecDeque<Vec<u8>>,
     cancelled: bool,
@@ -405,7 +420,14 @@ impl BoundedHttpsStream for QueuedSseReader {
 
     fn cancel(&mut self) {
         self.cancelled = true;
+        self.counts.cancels.fetch_add(1, Ordering::SeqCst);
         self.chunks.clear();
+    }
+}
+
+impl Drop for QueuedSseReader {
+    fn drop(&mut self) {
+        self.counts.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -645,4 +667,325 @@ async fn bundled_main_codex_responses_tool_continuation_is_durable_and_access_on
         let _ = fs::remove_file(path);
     }
     let _ = fs::remove_dir_all(&workspace_root);
+}
+
+struct MainRegressionArtifacts {
+    root: PathBuf,
+}
+
+impl MainRegressionArtifacts {
+    fn new() -> Self {
+        let parent = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+        );
+        let root = parent.join(format!("codex-main-r1q1-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).expect("private Main regression artifacts");
+        Self { root }
+    }
+}
+
+impl Drop for MainRegressionArtifacts {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+struct MainRegressionResult {
+    events: Vec<JsonValue>,
+    messages: Vec<JsonValue>,
+    session_id: String,
+    run_id: String,
+    model_calls: u64,
+    sent_count: usize,
+    only_responses_post: bool,
+    stream_starts: usize,
+    buffered_calls: usize,
+    stream_cancels: usize,
+    stream_drops: usize,
+    auth_unchanged: bool,
+    workspace_unchanged: bool,
+    sqlite_created: bool,
+    private_home_removed: bool,
+    artifacts_removed: bool,
+}
+
+fn main_event_count(events: &[JsonValue], name: &str) -> usize {
+    events.iter().filter(|event| event["event"] == name).count()
+}
+
+fn main_has_failure_code(events: &[JsonValue], code: &str) -> bool {
+    events.iter().any(|event| {
+        event["event"] == "model.failed"
+            && event
+                .pointer("/data/error_code")
+                .and_then(JsonValue::as_str)
+                == Some(code)
+    })
+}
+
+fn assert_main_single_text(result: &MainRegressionResult, expected_text: &str) {
+    let assistants: Vec<_> = result
+        .messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 1, "one persisted assistant message");
+    let assistant = assistants[0];
+    assert_eq!(assistant["session_id"], result.session_id);
+    assert_eq!(assistant["run_id"], result.run_id);
+    assert_eq!(
+        assistant["content"],
+        json!([{"type": "text", "text": expected_text}]),
+        "exactly one canonical visible text block"
+    );
+    assert_eq!(assistant["finish_reason"], "stop");
+}
+
+fn assert_main_one_response_and_cleanup(result: &MainRegressionResult) {
+    assert_eq!(main_event_count(&result.events, "model.requested"), 1);
+    assert_eq!(result.model_calls, 1, "one model call");
+    assert_eq!(result.sent_count, 1, "one native Responses request");
+    assert!(
+        result.only_responses_post,
+        "only the Responses POST was sent"
+    );
+    assert_eq!(result.stream_starts, 1, "one bounded SSE stream");
+    assert_eq!(
+        result.buffered_calls, 0,
+        "no extra auth or buffered request"
+    );
+    assert_eq!(result.stream_cancels, 1, "native stream explicitly closed");
+    assert_eq!(result.stream_drops, 1, "native stream reader released");
+    assert_eq!(main_event_count(&result.events, "tool.started"), 0);
+    assert_eq!(main_event_count(&result.events, "tool.completed"), 0);
+    assert!(
+        result.auth_unchanged,
+        "synthetic access-only fixture unchanged"
+    );
+    assert!(result.workspace_unchanged, "fixture workspace unchanged");
+    assert!(result.sqlite_created, "production SQLite fixture created");
+    assert!(result.private_home_removed, "private fixture home removed");
+    assert!(
+        result.artifacts_removed,
+        "SQLite/workspace artifacts removed"
+    );
+}
+
+async fn run_bundled_main_with_sse(transcript: String) -> MainRegressionResult {
+    use rustscript_agent::config::RunLimits;
+
+    let artifacts = MainRegressionArtifacts::new();
+    let artifacts_root = artifacts.root.clone();
+    let workspace = artifacts_root.join("workspace");
+    fs::create_dir(&workspace).expect("fixture workspace");
+    let readme = workspace.join("README.md");
+    fs::write(&readme, "fixture-read-value\n").expect("fixture README");
+    let database = artifacts_root.join("agent.sqlite");
+
+    let home = PrivateAuthHome::new(&access_token_with_account_claim());
+    let home_path = home.0.clone();
+    let auth_path = home_path.join("auth.yaml");
+    let auth_before = fs::read(&auth_path).expect("private auth fixture bytes");
+    let transport = Arc::new(QueuedSseTransport::new([transcript]));
+    let oauth = Arc::new(OAuthHost::new(
+        transport.clone(),
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis() as u64,
+        )),
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let factory: Arc<dyn Fn(RunCancellation) -> Result<AuthHost, String> + Send + Sync> = {
+        let home_path = home_path.clone();
+        Arc::new(move |cancellation| {
+            AuthHost::new(home_path.clone(), cancellation)
+                .map(|host| host.with_oauth_host(Arc::clone(&oauth)))
+        })
+    };
+
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        AgentGatewayConfig {
+            provider: Some(PROVIDER.to_string()),
+            model: "gpt-6.1-sol".to_string(),
+            run_timeout: Duration::from_secs(45),
+            ..AgentGatewayConfig::default()
+        },
+        rustscript_agent::bundled_agent_main_path(),
+        &database,
+    )
+    .expect("bundled Main with production SQLite driver");
+    let service = state.service().clone();
+    service
+        .set_run_limits(
+            RunLimits::new(8, 8, 64 * 1024, &workspace).expect("bounded fixture run limits"),
+        )
+        .expect("install fixture run limits");
+    service.upsert_provider_profile(
+        ProviderProfile::new(
+            PROVIDER,
+            json!({
+                "profile": PROVIDER,
+                "protocol": "codex-responses",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "credential_id": CREDENTIAL_ID
+            }),
+        )
+        .expect("public Codex Responses profile"),
+    );
+    service.set_auth_host_factory(factory);
+
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "Reply with the fixed fixture response. Do not invoke tools."}),
+            model: Some("gpt-6.1-sol".to_string()),
+            provider: Some(PROVIDER.to_string()),
+            platform: "codex_responses_r1_q1_fixture".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("fixture Main admission");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    let messages = service.session_messages(&admitted.session_id);
+    let model_calls = service.metrics().snapshot().model_calls;
+    let sent = transport.take_sent();
+    let sent_count = sent.len();
+    let only_responses_post = sent_count == 1
+        && sent.iter().all(|request| {
+            request.method == "POST"
+                && request.url == "https://chatgpt.com/backend-api/codex/responses"
+        });
+    let stream_starts = transport.counts.starts.load(Ordering::SeqCst);
+    let buffered_calls = transport.counts.buffered_calls.load(Ordering::SeqCst);
+    let stream_cancels = transport.counts.cancels.load(Ordering::SeqCst);
+    let stream_drops = transport.counts.drops.load(Ordering::SeqCst);
+    let auth_unchanged = fs::read(&auth_path).expect("auth fixture after run") == auth_before;
+    let workspace_unchanged = fs::read_dir(&workspace).expect("workspace listing").count() == 1
+        && fs::read(&readme)
+            .map(|bytes| bytes == b"fixture-read-value\n")
+            .unwrap_or(false);
+    let sqlite_created = database.exists();
+    let session_id = admitted.session_id.clone();
+    let run_id = admitted.run_id.clone();
+
+    drop(service);
+    drop(state);
+    drop(home);
+    let private_home_removed = !home_path.exists();
+    drop(artifacts);
+    let artifacts_removed = !artifacts_root.exists();
+
+    MainRegressionResult {
+        events,
+        messages,
+        session_id,
+        run_id,
+        model_calls,
+        sent_count,
+        only_responses_post,
+        stream_starts,
+        buffered_calls,
+        stream_cancels,
+        stream_drops,
+        auth_unchanged,
+        workspace_unchanged,
+        sqlite_created,
+        private_home_removed,
+        artifacts_removed,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_main_completed_body_wins_over_different_nonempty_delta() {
+    let final_text = "The completed body is authoritative.";
+    let delta = format!(
+        "event: response.output_text.delta\ndata: {}\n\n",
+        json!({"type": "response.output_text.delta", "output_index": 0, "delta": "draft text must not persist"})
+    );
+    let completed = response_completed_sse(json!({
+        "id": "resp_r1q1_precedence",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-6.1-sol",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": final_text}]}],
+        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    }));
+    let result = run_bundled_main_with_sse(delta + &completed).await;
+
+    assert_main_one_response_and_cleanup(&result);
+    assert_eq!(main_event_count(&result.events, "model.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.failed"), 0);
+    assert_main_single_text(&result, final_text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_main_completed_refusal_persists_one_canonical_visible_text_block() {
+    let refusal_text = "I cannot help with that request.";
+    let delta = format!(
+        "event: response.refusal.delta\ndata: {}\n\n",
+        json!({"type": "response.refusal.delta", "delta": "draft refusal must not persist"})
+    );
+    let completed = response_completed_sse(json!({
+        "id": "resp_r1q1_refusal",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-6.1-sol",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": refusal_text}]}],
+        "usage": {"input_tokens": 1, "output_tokens": 5, "total_tokens": 6}
+    }));
+    let result = run_bundled_main_with_sse(delta + &completed).await;
+
+    assert_main_one_response_and_cleanup(&result);
+    assert_eq!(main_event_count(&result.events, "model.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.failed"), 0);
+    assert_main_single_text(&result, refusal_text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_main_nonempty_delta_then_empty_completed_body_fails_without_empty_assistant() {
+    let delta = format!(
+        "event: response.output_text.delta\ndata: {}\n\n",
+        json!({"type": "response.output_text.delta", "output_index": 0, "delta": "discarded partial text"})
+    );
+    let completed = response_completed_sse(json!({
+        "id": "resp_r1q1_empty_final",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-6.1-sol",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": ""}]}],
+        "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1}
+    }));
+    let result = run_bundled_main_with_sse(delta + &completed).await;
+
+    assert_main_one_response_and_cleanup(&result);
+    assert_eq!(main_event_count(&result.events, "model.completed"), 0);
+    assert_eq!(main_event_count(&result.events, "model.failed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.completed"), 0);
+    assert_eq!(main_event_count(&result.events, "run.failed"), 1);
+    assert!(main_has_failure_code(
+        &result.events,
+        "empty_responses_output"
+    ));
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .count(),
+        0,
+        "empty authoritative completion must persist no assistant message"
+    );
 }
