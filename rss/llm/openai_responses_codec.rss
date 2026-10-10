@@ -290,13 +290,13 @@ fn responses_canonical_from_body(body: map) -> map {
     let reasoning: string = responses_output_reasoning(output);
     let calls: array = responses_output_calls(output);
     let stop: string = responses_stop_reason(body, calls);
-    types::ok(types::response_new(
+    responses_canonical_result(
         text,
         calls,
         types::usage_new(input_tokens, output_tokens, total_tokens),
         reasoning,
         stop
-    ))
+    )
 }
 
 /// Canonical response for a stream that terminated without a complete response
@@ -306,13 +306,29 @@ fn codec_canonical_accumulated(state: map) -> map {
     let reasoning: string = types::request_string(state, "reasoning");
     let tools: array = types::request_array(state, "tools");
     let calls: array = responses_accumulated_calls(tools);
-    types::ok(types::response_new(
-        text,
-        calls,
-        types::usage_new(0, 0, 0),
-        reasoning,
-        ""
-    ))
+    responses_canonical_result(text, calls, types::usage_new(0, 0, 0), reasoning, "")
+}
+
+fn responses_canonical_result(
+    text: string,
+    calls: array,
+    usage: map,
+    reasoning: string,
+    stop: string
+) -> map {
+    let result: map = if text == "" && calls.length == 0 => {
+        types::fail(types::error_new(
+            0,
+            "api_error",
+            "empty_responses_output",
+            "provider response completed without text or tool calls",
+            "",
+            ""
+        ))
+    } else => {
+        types::ok(types::response_new(text, calls, usage, reasoning, stop))
+    };
+    result
 }
 
 // ---------------------------------------------------------------------------

@@ -277,6 +277,30 @@ fn completed_event_yields_canonical_text_and_usage() {
 }
 
 #[test]
+fn completed_empty_assistant_output_fails_closed() {
+    let mut vm = codec_vm();
+    let chunks = json!([{
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": ""}]
+            }]
+        }
+    }]);
+    let result = collect(&mut vm, &chunks, true);
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "empty completion must fail closed"
+    );
+    assert_eq!(result["error"]["code"], json!("empty_responses_output"));
+    assert_eq!(result["response"], json!({}));
+}
+
+#[test]
 fn accumulated_deltas_without_response_object_use_zero_usage() {
     let mut vm = codec_vm();
     let chunks = json!([
