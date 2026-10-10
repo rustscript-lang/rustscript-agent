@@ -477,9 +477,10 @@ async fn trusted_named_workspace_binds_session_replays_once_and_rejects_switch()
     fs::create_dir_all(&first_workspace).expect("first workspace");
     fs::create_dir_all(&second_workspace).expect("second workspace");
     let config = format!(
-        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n    alternate: '{}'\n",
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n    alias: '{}'\n    alternate: '{}'\n",
         first_workspace.display(),
         second_workspace.display(),
+        first_workspace.display(),
         first_workspace.display(),
         first_workspace.display(),
         second_workspace.display(),
@@ -495,7 +496,8 @@ async fn trusted_named_workspace_binds_session_replays_once_and_rejects_switch()
             .expect("config mode");
     }
 
-    let state = AgentGatewayState::new(AgentGatewayConfig::default())
+    let database = root.join("gateway.sqlite3");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
         .expect("gateway config")
         .with_workspace_home(PathBuf::from(&home));
     let service = state.service();
@@ -553,6 +555,39 @@ async fn trusted_named_workspace_binds_session_replays_once_and_rejects_switch()
         "same payload hash must conflict across effective workspace roots: {cross_workspace_replay:?}"
     );
     assert_eq!(service.session_messages(&first.session_id).len(), 1);
+
+    let alias_conflict = service
+        .admit_with_workspace_selector(
+            request(
+                "idem-alias",
+                "fnv64:0000000000000004",
+                "use same canonical path through another selector",
+                Some(first.session_id.clone()),
+            ),
+            Some("name:alias".to_string()),
+        )
+        .await;
+    assert!(
+        matches!(&alias_conflict, Err(AdmitError::Invalid(message)) if message == "workspace_conflict"),
+        "a different selector for the same canonical root must conflict: {alias_conflict:?}"
+    );
+    assert_eq!(service.session_messages(&first.session_id).len(), 1);
+    let stored_session = state
+        .persistence()
+        .expect("production persistence")
+        .session_get(&first.session_id)
+        .expect("read bound session after selector conflict");
+    let stored_metadata: serde_json::Value = serde_json::from_str(
+        stored_session["rows"][0][13]
+            .as_str()
+            .expect("session metadata JSON"),
+    )
+    .expect("session metadata object");
+    assert_eq!(stored_metadata["workspace"]["selector"], "name:project");
+    assert_eq!(
+        stored_metadata["workspace"]["canonical_path"],
+        first_workspace.display().to_string()
+    );
 
     let defaulted = service
         .admit_with_workspace_selector(
@@ -630,9 +665,10 @@ async fn http_session_workspace_route_binds_an_idle_session() {
     fs::create_dir_all(&first).expect("first workspace");
     fs::create_dir_all(&second).expect("second workspace");
     let config = format!(
-        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n    alternate: '{}'\n",
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n    alias: '{}'\n    alternate: '{}'\n",
         first.display(),
         second.display(),
+        first.display(),
         first.display(),
         first.display(),
         second.display()
@@ -737,6 +773,70 @@ async fn http_session_workspace_route_binds_an_idle_session() {
     );
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("workspace-bind JSON");
     assert_eq!(body["session"]["workspace"]["selector"], "name:project");
+
+    let alias_conflict = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("first run through a changed selector"),
+                platform: "http".to_string(),
+                session_id: Some(session_id.to_string()),
+                idempotency_key: Some("orphan-idempotency-key".to_string()),
+                idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:alias".to_string()),
+        )
+        .await;
+    assert!(
+        matches!(&alias_conflict, Err(AdmitError::Invalid(message)) if message == "workspace_conflict"),
+        "same-canonical selector changes must be rejected before durable admission: {alias_conflict:?}"
+    );
+    assert!(service.session_messages(session_id).is_empty());
+
+    let provider = ScriptedProvider::new();
+    provider.push_ok(scripted_tool_response(json!([
+        {
+            "id": "bound-http-write",
+            "name": "write_file",
+            "arguments": {"path": "bound-http-write.txt", "content": "HTTP_BOUND_WORKSPACE_WRITE"}
+        },
+        {
+            "id": "bound-http-process",
+            "name": "terminal",
+            "arguments": {"argv": ["/bin/touch", "bound-http-process.txt"], "timeout_ms": 3000}
+        }
+    ])));
+    provider.push_ok(scripted_text_response(
+        "bound session native effects completed",
+    ));
+    service.inject_provider_host(Arc::new(provider.clone()));
+    let ordinary_http_run = post_http_run(
+        &app,
+        json!({
+            "session_id": session_id,
+            "input": "Write the file and create a process-side workspace marker."
+        }),
+    )
+    .await;
+    let ordinary_run_id = ordinary_http_run["run_id"]
+        .as_str()
+        .expect("ordinary same-session HTTP run id");
+    let ordinary_events = wait_for_terminal(&service, ordinary_run_id).await;
+    assert!(
+        ordinary_events
+            .iter()
+            .any(|event| event["event"] == "run.completed")
+    );
+    assert!(ordinary_events.iter().any(|event| {
+        event["event"] == "run.started" && event["data"]["session_id"] == session_id
+    }));
+    assert_eq!(
+        fs::read_to_string(first.join("bound-http-write.txt")).expect("bound HTTP file effect"),
+        "HTTP_BOUND_WORKSPACE_WRITE"
+    );
+    assert!(first.join("bound-http-process.txt").is_file());
+    assert_eq!(provider.call_count(), 2);
+
     let active_created = app
         .clone()
         .oneshot(
@@ -924,6 +1024,257 @@ async fn http_session_workspace_route_binds_an_idle_session() {
     drop(service_after_policy_change);
     drop(changed_state);
     fs::remove_dir_all(root).expect("remove private test fixture");
+}
+
+#[tokio::test]
+async fn workspace_idempotency_replay_is_pure_cached_and_durable() {
+    use rustscript_agent::service::{AdmitError, AdmitRunRequest};
+
+    let root = private_test_root("workspace-pure-replay");
+    let home = root.join("auth-home");
+    let workspace = root.join("project");
+    let replacement_default = root.join("replacement-default");
+    let database = root.join("gateway.sqlite3");
+    fs::create_dir_all(&home).expect("private auth home");
+    fs::create_dir_all(&workspace).expect("workspace root");
+    fs::create_dir_all(&replacement_default).expect("replacement default workspace");
+    let config = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n    alias: '{}'\n",
+        workspace.display(),
+        replacement_default.display(),
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    rustscript_agent::config_file::ConfigFile::from_str(&config)
+        .expect("synthetic workspace policy");
+    fs::write(home.join("config.yaml"), config).expect("workspace policy file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("home mode");
+        fs::set_permissions(home.join("config.yaml"), fs::Permissions::from_mode(0o600))
+            .expect("config mode");
+    }
+
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
+        .expect("durable gateway state")
+        .with_workspace_home(home.clone());
+    let service = state.service();
+
+    let original = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-pure-replay".to_string()),
+                idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:project".to_string()),
+        )
+        .await
+        .expect("original workspace admission");
+    let original_messages = service.session_messages(&original.session_id);
+    let original_events = service.run_events(&original.run_id);
+    assert_eq!(original_messages.len(), 1);
+    assert_eq!(original_events.len(), 1);
+
+    let default_original = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original default logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-default-replay".to_string()),
+                idempotency_hash: Some("fnv64:0000000000000010".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            None,
+        )
+        .await
+        .expect("original default-workspace admission");
+    let default_messages = service.session_messages(&default_original.session_id);
+    let default_events = service.run_events(&default_original.run_id);
+    let default_cached = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original default logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-default-replay".to_string()),
+                idempotency_hash: Some("fnv64:0000000000000010".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            None,
+        )
+        .await
+        .expect("matching cached default replay");
+    assert!(default_cached.replayed);
+    assert_eq!(default_cached.run_id, default_original.run_id);
+    assert_eq!(
+        service.session_messages(&default_original.session_id),
+        default_messages
+    );
+    assert_eq!(service.run_events(&default_original.run_id), default_events);
+
+    fs::remove_dir_all(&workspace).expect("make the original root unavailable");
+    let changed_default_config = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n    alias: '{}'\n",
+        workspace.display(),
+        replacement_default.display(),
+        replacement_default.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    rustscript_agent::config_file::ConfigFile::from_str(&changed_default_config)
+        .expect("changed synthetic workspace policy");
+    fs::write(home.join("config.yaml"), changed_default_config)
+        .expect("change the current default workspace");
+
+    let cached = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-pure-replay".to_string()),
+                idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:project".to_string()),
+        )
+        .await
+        .expect("matching cached replay must not reopen the removed root");
+    assert!(cached.replayed);
+    assert_eq!(cached.run_id, original.run_id);
+    assert_eq!(
+        service.session_messages(&original.session_id),
+        original_messages
+    );
+    assert_eq!(service.run_events(&original.run_id), original_events);
+
+    drop(service);
+    drop(state);
+    let reopened = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
+        .expect("reopen durable gateway state")
+        .with_workspace_home(home.clone());
+    let reopened_service = reopened.service();
+    let durable_messages_before = reopened_service.session_messages(&original.session_id);
+    let durable_events_before = reopened_service.run_events(&original.run_id);
+    assert_eq!(durable_messages_before.len(), original_messages.len());
+    assert_eq!(durable_messages_before[0]["id"], original_messages[0]["id"]);
+    let durable = reopened_service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-pure-replay".to_string()),
+                idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:project".to_string()),
+        )
+        .await
+        .expect("matching durable replay must not reopen the removed root");
+    assert!(durable.replayed);
+    assert_eq!(durable.run_id, original.run_id);
+    assert_eq!(
+        reopened_service.session_messages(&original.session_id),
+        durable_messages_before
+    );
+    assert_eq!(
+        reopened_service.run_events(&original.run_id),
+        durable_events_before
+    );
+
+    let default_durable_messages_before =
+        reopened_service.session_messages(&default_original.session_id);
+    let default_durable_events_before = reopened_service.run_events(&default_original.run_id);
+    let default_durable = reopened_service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original default logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-default-replay".to_string()),
+                idempotency_hash: Some("fnv64:0000000000000010".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            None,
+        )
+        .await
+        .expect("missing selector retains the original default meaning after restart");
+    assert!(default_durable.replayed);
+    assert_eq!(default_durable.run_id, default_original.run_id);
+    assert_eq!(
+        reopened_service.session_messages(&default_original.session_id),
+        default_durable_messages_before
+    );
+    assert_eq!(
+        reopened_service.run_events(&default_original.run_id),
+        default_durable_events_before
+    );
+
+    let changed_selector_same_hash = reopened_service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-pure-replay".to_string()),
+                idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:alias".to_string()),
+        )
+        .await;
+    assert!(
+        matches!(
+            changed_selector_same_hash,
+            Err(AdmitError::IdempotencyConflict)
+        ),
+        "the original hash with a changed selector must conflict before opening the removed root: {changed_selector_same_hash:?}"
+    );
+
+    let changed_selector = reopened_service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("original logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-pure-replay".to_string()),
+                idempotency_hash: Some("fnv64:fedcba9876543210".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:alias".to_string()),
+        )
+        .await;
+    assert!(
+        matches!(changed_selector, Err(AdmitError::IdempotencyConflict)),
+        "changed raw selector must conflict before trying the removed root: {changed_selector:?}"
+    );
+    let changed_payload = reopened_service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("changed logical request"),
+                platform: "http".to_string(),
+                idempotency_key: Some("workspace-pure-replay".to_string()),
+                idempotency_hash: Some("fnv64:fedcba9876543210".to_string()),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:project".to_string()),
+        )
+        .await;
+    assert!(
+        matches!(changed_payload, Err(AdmitError::IdempotencyConflict)),
+        "changed logical payload must conflict before trying the removed root: {changed_payload:?}"
+    );
+    assert_eq!(
+        reopened_service.session_messages(&original.session_id),
+        durable_messages_before
+    );
+    assert_eq!(
+        reopened_service.run_events(&original.run_id),
+        durable_events_before
+    );
+    drop(reopened_service);
+    drop(reopened);
+    fs::remove_dir_all(root).expect("remove private replay fixture");
 }
 
 #[test]

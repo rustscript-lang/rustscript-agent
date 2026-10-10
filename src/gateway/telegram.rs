@@ -2728,8 +2728,6 @@ mod tests {
             Some(555),
         ));
         handle_update(&mut runtime, &api, &update).await;
-        mock_server.abort();
-        let _ = mock_server.await;
         assert_eq!(
             *reply_texts.lock().expect("reply capture lock"),
             ["Workspace updated."]
@@ -2751,6 +2749,97 @@ mod tests {
             metadata["workspace"]["canonical_path"],
             workspace.display().to_string()
         );
+
+        let service = state.service();
+        let provider = crate::ScriptedProvider::new();
+        provider.push_ok(json!({
+            "text": "",
+            "tool_calls": [
+                {
+                    "id": "telegram-workspace-write",
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "telegram-bound-write.txt",
+                        "content": "TELEGRAM_BOUND_WORKSPACE_WRITE"
+                    }
+                },
+                {
+                    "id": "telegram-workspace-process",
+                    "name": "terminal",
+                    "arguments": {
+                        "argv": ["/bin/touch", "telegram-bound-process.txt"],
+                        "timeout_ms": 3000
+                    }
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": "",
+            "stop_reason": "tool_calls"
+        }));
+        provider.push_ok(json!({
+            "text": "Telegram bound workspace effects completed",
+            "tool_calls": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": "",
+            "stop_reason": "stop"
+        }));
+        service.inject_provider_host(Arc::new(provider.clone()));
+        let ordinary_update = TgUpdate {
+            update_id: 12,
+            message: Some(make_message(
+                555,
+                "private",
+                102,
+                None,
+                Some("Create the file and process marker in this workspace."),
+                Some(555),
+            )),
+        };
+        handle_update(&mut runtime, &api, &ordinary_update).await;
+
+        let session_id = session_id_for("fixture_bot", 555, None);
+        let run_id = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let messages = service.session_messages(&session_id);
+                if let Some(run_id) = messages
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ordinary Telegram message should be admitted in the bound session");
+        let events = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let events = service.run_events(&run_id);
+                if events.iter().any(|event| {
+                    event.get("event").and_then(serde_json::Value::as_str) == Some("run.completed")
+                }) {
+                    break events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ordinary Telegram run should complete");
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(serde_json::Value::as_str) == Some("run.started")
+                && event.get("data").and_then(|data| data.get("session_id"))
+                    == Some(&serde_json::Value::String(session_id.clone()))
+        }));
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("telegram-bound-write.txt"))
+                .expect("Telegram workspace file effect"),
+            "TELEGRAM_BOUND_WORKSPACE_WRITE"
+        );
+        assert!(workspace.join("telegram-bound-process.txt").is_file());
+        mock_server.abort();
+        let _ = mock_server.await;
         drop(runtime);
         drop(state);
         std::fs::remove_dir_all(root).expect("remove private Telegram fixture");

@@ -735,6 +735,7 @@ pub struct GatewayStore {
 pub(crate) struct IdempotencyRecord {
     pub(crate) request_hash: String,
     pub(crate) run_id: String,
+    pub(crate) workspace_identity_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1081,9 +1082,17 @@ impl GatewayStore {
             let key = string_cell(&row, 1, "idempotency key")?;
             let state = string_cell(&row, 5, "idempotency state")?;
             if state == "completed" {
+                let response = json_cell(&row, 6, "idempotency response")?;
                 let record = IdempotencyRecord {
                     request_hash: string_cell(&row, 2, "idempotency request hash")?,
                     run_id: string_cell(&row, 4, "idempotency resource id")?,
+                    workspace_identity_json: response
+                        .get("workspace_identity")
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|error| {
+                            format!("idempotency workspace identity is invalid: {error}")
+                        })?,
                 };
                 if idempotency.insert(key.clone(), record).is_some() {
                     return Err(format!("duplicate idempotency row: {key}"));

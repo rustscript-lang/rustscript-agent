@@ -1219,6 +1219,30 @@ impl AgentRunner {
         })
     }
 
+    /// Runs RSS-only idempotency equality without binding a workspace host.
+    pub(crate) fn workspace_replay_identity_matches(
+        context: Value,
+        config: AgentConfig,
+        cancellation: &RunCancellation,
+    ) -> std::result::Result<bool, String> {
+        let runner =
+            Self::from_bundled_named("rss/agent/workspace.rss", "replay_identity_matches", config)
+                .map_err(|error| error.to_string())?;
+        let mut sink = DiscardSink;
+        let value = runner
+            .run_named_with_context_and_events(
+                "replay_identity_matches",
+                context,
+                &mut sink,
+                cancellation,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(matches!(
+            workspace_field(&value, "matches"),
+            Some(Value::Bool(true))
+        ))
+    }
+
     /// Runs the exported `run(context)` entry with no event sink and no
     /// cancellation. Returns only the `Complete` value.
     pub fn run_with_context(&self, context: Value) -> std::result::Result<Value, RunError> {

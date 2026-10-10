@@ -103,6 +103,13 @@ struct CachedAgentRunner {
     runner: AgentRunner,
 }
 
+#[derive(Clone, Copy)]
+struct AdmissionReplayIdentity<'a> {
+    key: Option<&'a str>,
+    request_hash: Option<&'a str>,
+    request_selector: Option<&'a str>,
+}
+
 fn agent_source_digest(source: &str) -> String {
     crate::capabilities::sha256_hex(source.as_bytes())
 }
@@ -2994,30 +3001,34 @@ impl AgentService {
             system_prompt: effective_system_prompt.clone(),
         };
         drop(store);
+
+        let replay_identity = AdmissionReplayIdentity {
+            key: request.idempotency_key.as_deref(),
+            request_hash: request.idempotency_hash.as_deref(),
+            request_selector: workspace_selector.as_deref(),
+        };
+        if let Some(replayed) = self.replay_existing_admission(replay_identity, &cancellation)? {
+            return Ok(replayed);
+        }
+
         let (workspace_binding, workspace_authority) = self.resolve_workspace_admission(
             workspace_selector.as_deref(),
             existing_workspace_binding.as_ref(),
             &cancellation,
             has_idempotency_replay,
         )?;
+
         let legacy_workspace_root = if workspace_binding.is_none() && allow_legacy_workspace_root {
             self.inner.trusted_legacy_workspace_root.read().clone()
         } else {
             None
         };
-        let effective_request_hash = request.idempotency_hash.as_deref().map(|hash| {
-            workspace_scoped_request_hash(
-                hash,
-                workspace_binding.as_ref(),
-                legacy_workspace_root.as_deref(),
-            )
-        });
-        if let Some(replayed) = self.replay_existing_admission(
-            request.idempotency_key.as_deref(),
-            effective_request_hash.as_deref(),
-        )? {
-            return Ok(replayed);
-        }
+        let effective_request_hash = request.idempotency_hash.clone();
+        let workspace_identity_json = workspace_identity_json(
+            workspace_binding.as_ref(),
+            legacy_workspace_root.as_deref(),
+            workspace_selector.as_deref(),
+        )?;
         if let Some(binding) = &workspace_binding {
             snapshot.limits.workspace_root = PathBuf::from(&binding.canonical_path);
         } else if let Some(root) = &legacy_workspace_root {
@@ -3082,7 +3093,13 @@ impl AgentService {
             profile: ADMISSION_SESSION_PROFILE.len(),
             system_prompt: effective_system_prompt.as_deref().unwrap_or("").len(),
             message_id: message_id.len(),
-            request_hash: request.idempotency_hash.as_deref().unwrap_or("").len(),
+            // The existing lens also budgets identity bytes stored in the durable response.
+            request_hash: request
+                .idempotency_hash
+                .as_deref()
+                .unwrap_or("")
+                .len()
+                .saturating_add(workspace_identity_json.as_deref().map_or(0, str::len)),
             has_idempotency: !idempotency_key.is_empty(),
         })
         .map_err(|error| {
@@ -3117,6 +3134,7 @@ impl AgentService {
             "idempotency_scope": ADMISSION_IDEMPOTENCY_SCOPE,
             "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
             "request_hash": effective_request_hash.clone().unwrap_or_default(),
+            "workspace_identity_json": workspace_identity_json.clone().unwrap_or_default(),
             "event_id": event_id,
             "now_ms": now,
             "expires_at_ms": 0,
@@ -3137,6 +3155,7 @@ impl AgentService {
             None => Ok(JsonValue::Null),
         };
         let data = durable?;
+
         // The transactional admission may have replayed an existing key (a
         // restart race the in-memory fast path cannot see).
         if data.get("replayed") == Some(&JsonValue::Bool(true)) {
@@ -3150,9 +3169,9 @@ impl AgentService {
         if let Some(replayed) = self.recheck_admission_after_commit(
             &store,
             generation,
-            request.idempotency_key.as_deref(),
-            effective_request_hash.as_deref(),
+            replay_identity,
             &run_id,
+            &cancellation,
         )? {
             return Ok(replayed);
         }
@@ -3228,6 +3247,7 @@ impl AgentService {
                 IdempotencyRecord {
                     request_hash: hash.to_string(),
                     run_id: run_id.clone(),
+                    workspace_identity_json: workspace_identity_json.clone(),
                 },
             );
         }
@@ -3270,26 +3290,29 @@ impl AgentService {
 
     fn replay_existing_admission(
         &self,
-        key: Option<&str>,
-        hash: Option<&str>,
+        replay: AdmissionReplayIdentity<'_>,
+        cancellation: &RunCancellation,
     ) -> Result<Option<AdmittedRun>, AdmitError> {
-        let (Some(key), Some(hash)) = (key, hash) else {
+        let (Some(key), Some(hash)) = (replay.key, replay.request_hash) else {
             return Ok(None);
         };
-        let peeked = {
+        let (existing, run_info) = {
             let store = self.inner.store.read();
-            store.idempotency.get(key).cloned().map(|existing| {
-                let run = store.runs.get(&existing.run_id);
-                (
-                    existing,
-                    run.map(|run| (run.session_id.clone(), run.status.clone())),
-                )
-            })
+            let Some(existing) = store.idempotency.get(key).cloned() else {
+                return Ok(None);
+            };
+            let run_info = store
+                .runs
+                .get(&existing.run_id)
+                .map(|run| (run.session_id.clone(), run.status.clone()));
+            (existing, run_info)
         };
-        let Some((existing, run_info)) = peeked else {
-            return Ok(None);
-        };
-        if existing.request_hash != hash {
+        if !self.workspace_replay_identity_matches(
+            &existing,
+            hash,
+            replay.request_selector,
+            cancellation,
+        )? {
             self.inner
                 .metrics
                 .admission_rejected(AdmitRejectReason::IdempotencyConflict);
@@ -3299,7 +3322,12 @@ impl AgentService {
         let Some(current) = store.idempotency.get(key) else {
             return Ok(None);
         };
-        if current.request_hash != hash {
+        if !self.workspace_replay_identity_matches(
+            current,
+            hash,
+            replay.request_selector,
+            cancellation,
+        )? {
             self.inner
                 .metrics
                 .admission_rejected(AdmitRejectReason::IdempotencyConflict);
@@ -3317,6 +3345,45 @@ impl AgentService {
             status,
             replayed: true,
         }))
+    }
+
+    fn workspace_replay_identity_matches(
+        &self,
+        stored: &IdempotencyRecord,
+        request_hash: &str,
+        request_selector: Option<&str>,
+        cancellation: &RunCancellation,
+    ) -> Result<bool, AdmitError> {
+        let stored_workspace_identity = stored
+            .workspace_identity_json
+            .as_deref()
+            .map(serde_json::from_str::<JsonValue>)
+            .transpose()
+            .map_err(|error| {
+                AdmitError::Persistence(format!(
+                    "stored workspace replay identity is invalid: {error}"
+                ))
+            })?;
+        let matches = AgentRunner::workspace_replay_identity_matches(
+            crate::domain::json_to_vm_value(&json!({
+                "stored_request_hash": stored.request_hash,
+                "request_hash": request_hash,
+                "stored_workspace_identity_present": stored_workspace_identity.is_some(),
+                "stored_workspace_identity": stored_workspace_identity.unwrap_or(JsonValue::Null),
+                "incoming_workspace_selector_present": request_selector.is_some(),
+                "incoming_workspace_selector": request_selector.unwrap_or_default(),
+            })),
+            AgentConfig {
+                http: self.inner.http_config.clone(),
+                sqlite: self.inner.config.sqlite.clone(),
+                fuel: self.inner.config.fuel,
+            },
+            cancellation,
+        );
+
+        matches.map_err(|error| {
+            AdmitError::Invalid(format!("workspace replay comparison failed: {error}"))
+        })
     }
 
     fn finish_durable_replay(&self, data: &JsonValue) -> Result<AdmittedRun, AdmitError> {
@@ -3356,9 +3423,9 @@ impl AgentService {
         &self,
         store: &GatewayStore,
         generation: u64,
-        key: Option<&str>,
-        hash: Option<&str>,
+        replay: AdmissionReplayIdentity<'_>,
         run_id: &str,
+        cancellation: &RunCancellation,
     ) -> Result<Option<AdmittedRun>, AdmitError> {
         let current_generation = self.inner.store_generation.load(Ordering::Acquire);
         if current_generation != generation {
@@ -3376,10 +3443,15 @@ impl AgentService {
                 replayed: true,
             }));
         }
-        if let (Some(key), Some(hash)) = (key, hash)
+        if let (Some(key), Some(hash)) = (replay.key, replay.request_hash)
             && let Some(existing) = store.idempotency.get(key)
         {
-            if existing.request_hash != hash {
+            if !self.workspace_replay_identity_matches(
+                existing,
+                hash,
+                replay.request_selector,
+                cancellation,
+            )? {
                 self.inner
                     .metrics
                     .admission_rejected(AdmitRejectReason::IdempotencyConflict);
@@ -4613,30 +4685,42 @@ impl AgentService {
     }
 }
 
-fn workspace_scoped_request_hash(
-    request_hash: &str,
+fn workspace_identity_json(
     binding: Option<&WorkspaceBinding>,
     legacy_root: Option<&std::path::Path>,
-) -> String {
-    let workspace = binding.map(|binding| {
-        json!({
-            "selector": binding.selector,
-            "canonical_path": binding.canonical_path,
-            "selected_name": binding.selected_name,
-        })
-    });
-    let material = serde_json::to_vec(&json!({
-        "request_hash": request_hash,
-        "workspace": workspace,
-        "legacy_root": legacy_root.map(|path| path.to_string_lossy().into_owned()),
-    }))
-    .unwrap_or_default();
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in material {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    request_selector: Option<&str>,
+) -> Result<Option<String>, AdmitError> {
+    if binding.is_none() && legacy_root.is_none() && request_selector.is_none() {
+        return Ok(None);
     }
-    format!("fnv64:{hash:016x}")
+
+    let mut identity = binding
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| {
+            AdmitError::Invalid(format!("workspace identity serialization failed: {error}"))
+        })?
+        .unwrap_or_else(|| json!({}));
+    let object = identity.as_object_mut().ok_or_else(|| {
+        AdmitError::Invalid("workspace identity serialization returned a non-object".to_string())
+    })?;
+    object.insert(
+        "request_selector_present".to_string(),
+        JsonValue::Bool(request_selector.is_some()),
+    );
+    object.insert(
+        "request_selector".to_string(),
+        JsonValue::String(request_selector.unwrap_or_default().to_string()),
+    );
+    if let Some(root) = legacy_root {
+        object.insert(
+            "legacy_root".to_string(),
+            JsonValue::String(root.to_string_lossy().into_owned()),
+        );
+    }
+    serde_json::to_string(&identity).map(Some).map_err(|error| {
+        AdmitError::Invalid(format!("workspace identity serialization failed: {error}"))
+    })
 }
 
 /// Validates the service-owned idempotency-key grammar before any admission

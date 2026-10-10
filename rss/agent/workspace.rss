@@ -260,7 +260,10 @@ fn open_with_policy(context: map, allow_switch: bool) -> map {
                     let mut rejected: map = failure("workspace_denied", "the selected workspace is not available");
                     rejected["selected_name"] = map_string(resolved, "name", "");
                     outcome = rejected;
-                } else if allow_switch == false && session_canonical_path.length > 0 && opened_canonical_path != session_canonical_path {
+                } else if allow_switch == false && session_canonical_path.length > 0 && (
+                    opened_canonical_path != session_canonical_path ||
+                    map_string(resolved, "effective_selector", "") != session_selector
+                ) {
                     outcome = failure("workspace_conflict", "the session is bound to a different workspace");
                 } else {
                     outcome = {
@@ -278,6 +281,35 @@ fn open_with_policy(context: map, allow_switch: bool) -> map {
         }
     }
     outcome
+}
+
+/// Compares original logical request selectors and frozen workspace identity
+/// without opening a workspace or creating native authority.
+pub fn replay_identity_matches(context: map) -> map {
+    let mut matches: bool = false;
+    if context.has("stored_request_hash") && type(context["stored_request_hash"]) == "string" && context.has("request_hash") && type(context["request_hash"]) == "string" && context.has("stored_workspace_identity_present") && type(context["stored_workspace_identity_present"]) == "bool" && context.has("stored_workspace_identity") && context.has("incoming_workspace_selector_present") && type(context["incoming_workspace_selector_present"]) == "bool" && context.has("incoming_workspace_selector") && type(context["incoming_workspace_selector"]) == "string" {
+        let stored_request_hash: string = context["stored_request_hash"];
+        let request_hash: string = context["request_hash"];
+        let stored_identity_present: bool = context["stored_workspace_identity_present"];
+        let incoming_selector_present: bool = context["incoming_workspace_selector_present"];
+        let incoming_selector: string = context["incoming_workspace_selector"];
+        let mut identity_matches: bool = false;
+        if stored_identity_present == false && incoming_selector_present == false {
+            identity_matches = true;
+        } else if stored_identity_present && type(context["stored_workspace_identity"]) == "map" {
+            let stored_identity: map = context["stored_workspace_identity"].copy();
+            if stored_identity.has("request_selector_present") && type(stored_identity["request_selector_present"].copy()) == "bool" && stored_identity.has("request_selector") && type(stored_identity["request_selector"].copy()) == "string" {
+                let stored_selector_present: bool = stored_identity["request_selector_present"].copy();
+                let stored_selector: string = stored_identity["request_selector"].copy();
+                let binding_identity_valid: bool = stored_identity.has("selector") && type(stored_identity["selector"].copy()) == "string" && stored_identity.has("canonical_path") && type(stored_identity["canonical_path"].copy()) == "string" && stored_identity.has("generation") && type(stored_identity["generation"].copy()) == "int";
+                let legacy_identity_valid: bool = stored_identity.has("legacy_root") && type(stored_identity["legacy_root"].copy()) == "string";
+                let selector_matches: bool = stored_selector_present == incoming_selector_present && stored_selector == incoming_selector;
+                identity_matches = selector_matches && (binding_identity_valid || legacy_identity_valid);
+            }
+        }
+        matches = stored_request_hash == request_hash && identity_matches;
+    }
+    {matches: matches}
 }
 
 /// Opens the effective workspace for a new run; a stored session binding
