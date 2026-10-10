@@ -39,7 +39,10 @@ RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db \
 cargo run --release --bin rustscript-agent-gateway
 ```
 
-Full environment-variable reference: [docs/configuration.md](docs/configuration.md).
+When `RUSTSCRIPT_AGENT_SOURCE` is set it is the authoritative agent source
+(`bundled:coding`, or `file:` plus an absolute path); omit it to run the
+bundled coding entry. The deprecated `RUSTSCRIPT_AGENT_SCRIPT` is read only as
+a fallback. Full environment-variable reference: [docs/configuration.md](docs/configuration.md).
 Deployment, systemd/container examples, shutdown and backup: [docs/deployment.md](docs/deployment.md).
 
 ## Status
