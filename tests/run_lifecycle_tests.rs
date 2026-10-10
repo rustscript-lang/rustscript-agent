@@ -142,6 +142,59 @@ fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> Agen
     state
 }
 
+struct LifecycleWorkspaceFixture {
+    root: PathBuf,
+    home: PathBuf,
+    workspace: PathBuf,
+}
+
+fn lifecycle_workspace_fixture(label: &str) -> LifecycleWorkspaceFixture {
+    let root = unique_temp_dir(label);
+    let home = root.join("workspace-home");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&home).expect("private workspace home");
+    fs::create_dir_all(&workspace).expect("private lifecycle workspace");
+    let config = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    lifecycle: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    rustscript_agent::config_file::ConfigFile::from_str(&config)
+        .expect("synthetic lifecycle workspace config");
+    fs::write(home.join("config.yaml"), config).expect("synthetic workspace policy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &home, &workspace] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("private lifecycle fixture directory mode");
+        }
+        fs::set_permissions(home.join("config.yaml"), fs::Permissions::from_mode(0o600))
+            .expect("private workspace config mode");
+    }
+    LifecycleWorkspaceFixture {
+        root,
+        home,
+        workspace,
+    }
+}
+
+fn loop_service_with_workspace(
+    config: AgentGatewayConfig,
+    provider: &ScriptedProvider,
+    workspace: &LifecycleWorkspaceFixture,
+) -> AgentGatewayState {
+    let state =
+        AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
+            .expect("bundled agent loop should compile")
+            .with_workspace_home(workspace.home.clone());
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    state
+}
+
 fn test_temp_root() -> PathBuf {
     let root = std::env::var_os("TEST_TMPDIR")
         .map(PathBuf::from)
@@ -462,10 +515,11 @@ async fn stop_terminates_child_process_without_residue() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response("", background_sleep_call()));
     provider.push_hang();
-    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let workspace = lifecycle_workspace_fixture("stop-child");
+    let state = loop_service_with_workspace(AgentGatewayConfig::default(), &provider, &workspace);
     let service = state.service();
     let admitted = service
-        .admit(admit_request())
+        .admit_external_with_workspace_selector(admit_request(), Some("name:lifecycle".to_string()))
         .await
         .expect("admission should succeed");
     let worker = tokio::spawn({
@@ -501,6 +555,9 @@ async fn stop_terminates_child_process_without_residue() {
         assert!(!pid_alive(pid), "PID {pid} should be dead after cleanup");
     }
     assert!(service.capability_host_closed(&admitted.run_id));
+    drop(service);
+    drop(state);
+    fs::remove_dir_all(workspace.root).expect("remove private stop workspace fixture");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -673,6 +730,12 @@ async fn persisted_restart_fails_typed_when_wall_deadline_expired() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_accounts_success_multi_turn_and_prometheus_matches_snapshot() {
+    let workspace = lifecycle_workspace_fixture("metrics-success");
+    fs::write(
+        workspace.workspace.join("README.md"),
+        "lifecycle metrics fixture\n",
+    )
+    .expect("readable lifecycle README fixture");
     let provider = ScriptedProvider::new();
     let call = ToolCall {
         id: "call-read".to_string(),
@@ -684,10 +747,10 @@ async fn worker_accounts_success_multi_turn_and_prometheus_matches_snapshot() {
         json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
     ));
     provider.push_ok(text_response("done"));
-    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let state = loop_service_with_workspace(AgentGatewayConfig::default(), &provider, &workspace);
     let service = state.service();
     let admitted = service
-        .admit(admit_request())
+        .admit_external_with_workspace_selector(admit_request(), Some("name:lifecycle".to_string()))
         .await
         .expect("admit should succeed");
 
@@ -707,6 +770,9 @@ async fn worker_accounts_success_multi_turn_and_prometheus_matches_snapshot() {
     assert_frozen_prompt_exactly_once(&service, &admitted.run_id, &provider);
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     assert!(service.capability_host_closed(&admitted.run_id));
+    drop(service);
+    drop(state);
+    fs::remove_dir_all(workspace.root).expect("remove private metrics workspace fixture");
 }
 
 #[tokio::test(flavor = "multi_thread")]
