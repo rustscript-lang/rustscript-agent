@@ -443,7 +443,7 @@ async fn bundled_main_codex_responses_tool_continuation_is_durable_and_access_on
             "id": "msg_final",
             "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": "I read fixture-read-value."}]
+            "content": [{"type": "output_text", "text": "OK"}]
         }],
         "usage": {"input_tokens": 17, "output_tokens": 6, "total_tokens": 23}
     }));
@@ -502,7 +502,7 @@ async fn bundled_main_codex_responses_tool_continuation_is_durable_and_access_on
 
     let admitted = service
         .admit(AdmitRunRequest {
-            input: json!({"message": "Read README.md and report its contents."}),
+            input: json!({"message": "Read README.md, then reply with exactly OK."}),
             model: Some("gpt-6.1-sol".to_string()),
             provider: Some(PROVIDER.to_string()),
             platform: "codex_access_main_fixture".to_string(),
@@ -550,17 +550,25 @@ async fn bundled_main_codex_responses_tool_continuation_is_durable_and_access_on
         .collect();
     assert_eq!(assistants.len(), 2, "tool-call parent and final answer");
     assert!(
+        assistants[1]["content"] == json!([{"type": "text", "text": "OK"}]),
+        "final answer must persist as one canonical OK text block"
+    );
+    assert_eq!(
+        assistants[1]["session_id"].as_str(),
+        Some(admitted.session_id.as_str())
+    );
+    assert_eq!(
+        assistants[1]["run_id"].as_str(),
+        Some(admitted.run_id.as_str())
+    );
+    assert_eq!(assistants[1]["finish_reason"], "stop");
+    assert!(
         messages.iter().any(|message| {
             message["role"] == "user"
                 && message["tool_call_id"] == "call_xy"
                 && message.to_string().contains("fixture-read-value")
         }),
         "durable tool_result must preserve call ID and read output"
-    );
-    assert!(
-        assistants[1]
-            .to_string()
-            .contains("I read fixture-read-value.")
     );
 
     let sent = transport.take_sent();

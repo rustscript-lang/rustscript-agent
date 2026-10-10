@@ -41,6 +41,121 @@ fn has_exact_assistant_ok_for_run(messages: &[Value], session_id: &str, run_id: 
         && assistant_messages[0]["finish_reason"] == "stop"
 }
 
+fn safe_value_type(value: Option<&Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn safe_finish_category(value: Option<&Value>) -> &'static str {
+    match value.and_then(Value::as_str) {
+        Some("stop") => "stop",
+        Some("tool_calls") => "tool_calls",
+        Some("length") => "length",
+        Some("") => "empty",
+        Some(_) => "other",
+        None if value.is_none() => "missing",
+        None => "other",
+    }
+}
+
+fn safe_block_category(value: &Value) -> &'static str {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => "text",
+        Some("tool_call") => "tool_call",
+        Some(_) => "other",
+        None => "missing",
+    }
+}
+
+fn safe_persisted_shape_diagnostic(messages: &[Value], session_id: &str, run_id: &str) -> String {
+    let assistant_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .collect();
+    let session_matches = assistant_messages
+        .iter()
+        .filter(|message| message.get("session_id").and_then(Value::as_str) == Some(session_id))
+        .count();
+    let run_matches = assistant_messages
+        .iter()
+        .filter(|message| message.get("run_id").and_then(Value::as_str) == Some(run_id))
+        .count();
+    let joint_matches = assistant_messages
+        .iter()
+        .filter(|message| {
+            message.get("session_id").and_then(Value::as_str) == Some(session_id)
+                && message.get("run_id").and_then(Value::as_str) == Some(run_id)
+        })
+        .count();
+    let mut summary = format!(
+        "total_messages={} assistant_total={} assistant_session_matches={} assistant_run_matches={} assistant_session_run_matches={}",
+        messages.len(),
+        assistant_messages.len(),
+        session_matches,
+        run_matches,
+        joint_matches
+    );
+    for (index, message) in assistant_messages.iter().enumerate() {
+        let session = message.get("session_id");
+        let run = message.get("run_id");
+        let content = message.get("content");
+        let blocks = content.and_then(Value::as_array);
+        let block_types = blocks
+            .into_iter()
+            .flatten()
+            .map(|block| safe_block_category(block))
+            .collect::<Vec<_>>()
+            .join(",");
+        let text_lengths = blocks
+            .into_iter()
+            .flatten()
+            .map(|block| {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| text.chars().count().to_string())
+                    .unwrap_or_else(|| "missing".to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let text_exact_ok = blocks
+            .into_iter()
+            .flatten()
+            .map(|block| block.get("text").and_then(Value::as_str) == Some("OK"))
+            .map(|matches| matches.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let exact_array_equality = content == Some(&json!([{"type": "text", "text": "OK"}]));
+        let finish = message.get("finish_reason");
+        summary.push_str(&format!(
+            " assistant[{index}]:session_present={} session_type={} session_match={} run_present={} run_type={} run_match={} content_type={} content_array={} canonical_block_count={} block_types=[{}] text_lengths=[{}] text_exact_ok=[{}] exact_array_equality={} finish_type={} finish_category={}",
+            session.is_some(),
+            safe_value_type(session),
+            session.and_then(Value::as_str) == Some(session_id),
+            run.is_some(),
+            safe_value_type(run),
+            run.and_then(Value::as_str) == Some(run_id),
+            safe_value_type(content),
+            blocks.is_some(),
+            blocks.map_or_else(|| "not_array".to_string(), |items| items.len().to_string()),
+            block_types,
+            text_lengths,
+            text_exact_ok,
+            exact_array_equality,
+            safe_value_type(finish),
+            safe_finish_category(finish)
+        ));
+    }
+    summary
+}
+
 #[test]
 fn exact_persisted_assistant_ok_requires_one_canonical_text_block() {
     let valid = json!({
@@ -649,6 +764,10 @@ async fn one_cached_access_token_runs_bundled_main_once_without_tools_or_auth_si
     let messages = service.session_messages(&admitted.session_id);
     let assistant_ok =
         has_exact_assistant_ok_for_run(&messages, &admitted.session_id, &admitted.run_id);
+    eprintln!(
+        "SAFE_PERSISTED_SHAPE {}",
+        safe_persisted_shape_diagnostic(&messages, &admitted.session_id, &admitted.run_id)
+    );
     let workspace_empty = fs::read_dir(&workspace)
         .expect("private workspace listing")
         .next()
