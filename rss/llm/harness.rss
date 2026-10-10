@@ -4,10 +4,12 @@
 // (direct or profiled) routes through the shared admitted native-auth
 // dispatch; it contains no protocol parsing and no agent-loop policy.
 use json;
+use auth;
 use self::types as types;
 use self::openai_responses as openai_responses;
 use self::anthropic_messages as anthropic_messages;
 use super::providers::profile as profile;
+use super::providers::opaque_responses as opaque_responses;
 use super::providers::openrouter as openrouter;
 use super::providers::deepseek as deepseek;
 use super::providers::opencode_zen as opencode_zen;
@@ -34,7 +36,7 @@ pub fn run_harness(context: map) -> map {
     } else if kind == "profile:custom" => {
         custom::call(context)
     } else if kind == "openai_responses" => {
-        run_responses(context)
+        run_responses_entry(context)
     } else if kind == "anthropic_messages" => {
         run_anthropic(context)
     } else => {
@@ -42,10 +44,22 @@ pub fn run_harness(context: map) -> map {
     }
 }
 
-fn run_responses(context: map) -> map {
+fn run_responses_entry(context: map) -> map {
     let request: map = types::request_map(context, "request");
     let profile: map = types::request_map(context, "profile");
-    openai_responses::openai_responses_call(request, profile)
+    if context.has("host_home") => {
+        let credential_id: string = types::request_string(context, "credential_id");
+        let home: resource<auth.host_home> = context["host_home"];
+        let child: map = {
+            request: request,
+            profile: profile,
+            credential_id: credential_id,
+            host_home: home
+        };
+        opaque_responses::run_responses(child)
+    } else => {
+        openai_responses::openai_responses_call(request, profile)
+    }
 }
 
 fn run_anthropic(context: map) -> map {

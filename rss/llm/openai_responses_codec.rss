@@ -1,0 +1,1057 @@
+// Pure public OpenAI Responses protocol codec (Task8 access-only scope).
+//
+// Consumes already-decoded JSON event maps from an upstream sanitized record
+// source and accumulates canonical text/usage/tool-call state for the
+// `response.*` event family. It also parses a buffered Responses body into the
+// canonical LlmResponse. It does not parse raw SSE framing, own dispatch, or
+// touch transport/auth resources: every value here is a public, resource-free
+// map.
+//
+// Compiler-contract notes inherited from openai_chat.rss / openai_stream_codec.rss:
+// - Script-function calls must appear at function top level, in expression-if
+//   branches, or inside `while` bodies — never in statement-if bodies.
+// - A map element read (`m[key]`) moves that element, so a map must not be
+//   passed or indexed again after one of its elements was moved. Presence and
+//   type probes therefore live in the small `field_is_*` helpers, where the
+//   index read is the container's last use.
+use json;
+use self::types as types;
+
+pub fn begin() -> map {
+    {
+        text: "",
+        reasoning: "",
+        stop_reason: "",
+        tools: [],
+        sealed_items: [],
+        sealed_invalid: false,
+        sealed_conflict: false,
+        final: null,
+        completed_event: false,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        done: false,
+        failed: false,
+        error: {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Field probes (index read is the container's final use)
+// ---------------------------------------------------------------------------
+
+fn field_is_map(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "map";
+    }
+    result
+}
+
+fn field_is_array(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "array";
+    }
+    result
+}
+
+fn field_is_int(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "int";
+    }
+    result
+}
+
+fn field_is_string(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "string";
+    }
+    result
+}
+
+/// A terminal, static malformed-payload failure. The message never echoes the
+/// offending field or input value.
+fn codec_failed(state: map, message: string) -> map {
+    let mut next: map = state;
+    next["failed"] = true;
+    next["error"] = types::error_malformed(0, message);
+    next
+}
+
+/// A terminal upstream failure event. The message is static.
+fn codec_terminal_error(state: map, code: string, message: string) -> map {
+    let mut next: map = state;
+    next["failed"] = true;
+    next["error"] = types::error_new(0, "api_error", code, message, "", "");
+    next
+}
+
+// ---------------------------------------------------------------------------
+// Chunk ingestion
+// ---------------------------------------------------------------------------
+
+/// Ingests one already-decoded Responses event object. Returns the state
+/// unchanged once it is terminal (completed/failed), so late events are
+/// ignored. Unknown event types are ignored (forward compatible): only a
+/// terminal response event or EOF ends the stream.
+pub fn push_chunk(state: map, chunk: map) -> map {
+    let done: bool = types::request_bool(state, "done", false);
+    let failed: bool = types::request_bool(state, "failed", false);
+    let terminal: bool = done || failed;
+    let result: map = if terminal => {
+        state
+    } else => {
+        codec_ingest(state, chunk)
+    };
+    result
+}
+
+fn codec_ingest(state: map, chunk: map) -> map {
+    let kind: string = types::request_string(chunk, "type");
+    let result: map = if kind == "response.output_text.delta" => {
+        codec_text_delta(state, chunk)
+    } else if kind == "response.refusal.delta" => {
+        codec_text_delta(state, chunk)
+    } else if kind == "response.reasoning_summary_text.delta" => {
+        codec_reasoning_delta(state, chunk)
+    } else if kind == "response.function_call_arguments.delta" => {
+        codec_args_delta(state, chunk)
+    } else if kind == "response.output_item.done" => {
+        codec_item_done(state, chunk)
+    } else if kind == "response.completed" => {
+        codec_completed(state, chunk)
+    } else if kind == "response.incomplete" => {
+        codec_terminal_error(state, "responses_incomplete", "provider response was incomplete")
+    } else if kind == "response.failed" => {
+        codec_terminal_error(state, "responses_failed", "provider response failed")
+    } else if kind == "error" => {
+        codec_terminal_error(state, "responses_error", "provider stream returned an error")
+    } else => {
+        state
+    };
+    result
+}
+
+fn codec_text_delta(state: map, chunk: map) -> map {
+    let delta: string = types::request_string(chunk, "delta");
+    let text: string = types::request_string(state, "text");
+    let mut result: map = state;
+    if delta != "" {
+        result["text"] = text + delta;
+    }
+    result
+}
+
+fn codec_reasoning_delta(state: map, chunk: map) -> map {
+    let delta: string = types::request_string(chunk, "delta");
+    let reasoning: string = types::request_string(state, "reasoning");
+    let mut result: map = state;
+    if delta != "" {
+        result["reasoning"] = reasoning + delta;
+    }
+    result
+}
+
+fn codec_args_delta(state: map, chunk: map) -> map {
+    let index: int = types::request_int(chunk, "output_index", -1);
+    let delta: string = types::request_string(chunk, "delta");
+    let result: map = if index < 0 => {
+        codec_failed(state, "malformed Responses stream: missing output index")
+    } else => {
+        codec_merge_args(state, index, delta)
+    };
+    result
+}
+
+/// Merges one function-call argument fragment into the accumulator. Entries
+/// are `{index, id, name, args}` keyed by `index`; a new fragment appends to
+/// the existing entry's `args` (or starts one).
+fn codec_merge_args(state: map, index: int, fragment: string) -> map {
+    let tools: array = types::request_array(state, "tools");
+    let mut merged: array = [];
+    let mut found = false;
+    let mut i = 0;
+    while i < tools.length {
+        let entry: map = types::array_entry(tools, i);
+        let current: int = types::request_int(entry, "index", -1);
+        if current == index {
+            let mut updated: map = entry;
+            updated["args"] = types::request_string(entry, "args") + fragment;
+            merged[merged.length] = updated;
+            found = true;
+        } else {
+            merged[merged.length] = entry;
+        }
+        i += 1;
+    }
+    if !found {
+        merged[merged.length] = { index: index, id: "", name: "", args: fragment };
+    }
+    let mut result: map = state;
+    result["tools"] = merged;
+    result
+}
+
+fn codec_item_done(state: map, chunk: map) -> map {
+    let item_present: bool = field_is_map(chunk, "item");
+    let result: map = if item_present => {
+        let item: map = types::request_map(chunk, "item");
+        let item_type: string = types::request_string(item, "type");
+        let sealed: map = codec_record_sealed_item(state, chunk.copy(), item.copy());
+        let stored: map = if item_type == "function_call" => {
+            codec_store_call(sealed, chunk, item)
+        } else => {
+            sealed
+        };
+        stored
+    } else => {
+        codec_mark_sealed_invalid(state)
+    };
+    result
+}
+
+fn codec_mark_sealed_invalid(state: map) -> map {
+    let mut result: map = state;
+    result["sealed_invalid"] = true;
+    result
+}
+
+fn codec_record_sealed_item(state: map, chunk: map, item: map) -> map {
+    let index_valid: bool = field_is_int(chunk, "output_index");
+    let index: int = types::request_int(chunk, "output_index", -1);
+    let item_valid: bool = codec_sealed_item_valid(item.copy());
+    let result: map = if !index_valid || index < 0 || !item_valid => {
+        codec_mark_sealed_invalid(state)
+    } else => {
+        let items: array = types::request_array(state, "sealed_items");
+        let mut merged: array = [];
+        let mut found = false;
+        let mut inserted = false;
+        let mut i = 0;
+        while i < items.length {
+            let entry: map = types::array_entry(items, i);
+            let current: int = types::request_int(entry, "index", -1);
+            if current == index {
+                merged[merged.length] = entry;
+                found = true;
+            } else {
+                if !inserted && current > index {
+                    merged[merged.length] = { index: index, item: item.copy() };
+                    inserted = true;
+                }
+                merged[merged.length] = entry;
+            }
+            i += 1;
+        }
+        let updated: map = if found => {
+            let mut conflict_state: map = state;
+            conflict_state["sealed_conflict"] = true;
+            conflict_state
+        } else => {
+            if !inserted {
+                merged[merged.length] = { index: index, item: item.copy() };
+            }
+            let mut next: map = state;
+            next["sealed_items"] = merged;
+            next
+        };
+        updated
+    };
+    result
+}
+
+fn codec_sealed_item_valid(item: map) -> bool {
+    let item_type: string = types::request_string(item, "type");
+    let status: string = types::request_string(item, "status");
+    let valid: bool = if item_type == "message" => {
+        status == "completed"
+            && types::request_string(item, "role") == "assistant"
+            && field_is_array(item, "content")
+            && codec_valid_message_content(types::request_array(item, "content"))
+    } else if item_type == "function_call" => {
+        status == "completed"
+            && (types::request_string(item, "call_id") != ""
+                || types::request_string(item, "id") != "")
+            && types::request_string(item, "name") != ""
+            && field_is_string(item, "arguments")
+    } else if item_type == "reasoning" => {
+        (!item.has("status") || status == "completed")
+            && field_is_array(item, "summary")
+            && codec_valid_reasoning_summary(types::request_array(item, "summary"))
+    } else => {
+        false
+    };
+    valid
+}
+
+fn codec_valid_message_content(parts: array) -> bool {
+    let mut valid = true;
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        let part_type: string = types::request_string(part, "type");
+        let part_valid: bool = if part_type == "output_text"
+            || part_type == "text"
+            || part_type == "summary_text" => {
+            field_is_string(part, "text")
+        } else if part_type == "refusal" => {
+            field_is_string(part, "refusal")
+        } else => {
+            false
+        };
+        if !part_valid {
+            valid = false;
+        }
+        i += 1;
+    }
+    valid
+}
+
+fn codec_valid_reasoning_summary(parts: array) -> bool {
+    let mut valid = true;
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        let part_type: string = types::request_string(part, "type");
+        let part_valid: bool = if part_type == "summary_text" || part_type == "text" => {
+            field_is_string(part, "text")
+        } else => {
+            false
+        };
+        if !part_valid {
+            valid = false;
+        }
+        i += 1;
+    }
+    valid
+}
+
+/// Records one completed function-call item authoritatively (overwrites any
+/// accumulated argument fragments for the same output index).
+fn codec_store_call(state: map, chunk: map, item: map) -> map {
+    let index: int = types::request_int(chunk, "output_index", -1);
+    let mut id: string = types::request_string(item, "call_id");
+    if id == "" {
+        id = types::request_string(item, "id");
+    }
+    let name: string = types::request_string(item, "name");
+    let args: string = types::request_string(item, "arguments");
+    let tools: array = types::request_array(state, "tools");
+    let mut merged: array = [];
+    let mut found = false;
+    let mut i = 0;
+    while i < tools.length {
+        let entry: map = types::array_entry(tools, i);
+        let current: int = types::request_int(entry, "index", -1);
+        if current == index {
+            merged[merged.length] = { index: index, id: id, name: name, args: args };
+            found = true;
+        } else {
+            merged[merged.length] = entry;
+        }
+        i += 1;
+    }
+    if !found {
+        merged[merged.length] = { index: index, id: id, name: name, args: args };
+    }
+    let mut result: map = state;
+    result["tools"] = merged;
+    result
+}
+
+fn codec_completed(state: map, chunk: map) -> map {
+    let has_response: bool = field_is_map(chunk, "response");
+    let mut result: map = state;
+    result["completed_event"] = true;
+    if has_response {
+        result["final"] = types::request_map(chunk, "response");
+    }
+    result["done"] = true;
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Terminal operations
+// ---------------------------------------------------------------------------
+
+/// Marks the stream terminal on a caller-declared `[DONE]` record. A failed
+/// state is preserved (a terminator cannot repair a malformed stream).
+pub fn push_done(state: map) -> map {
+    let failed: bool = types::request_bool(state, "failed", false);
+    let result: map = if failed => {
+        state
+    } else => {
+        let mut done_state: map = state;
+        done_state["done"] = true;
+        done_state
+    };
+    result
+}
+
+/// Builds the canonical call result. A failed state returns its stored error;
+/// a stream without a terminal response/`[DONE]` fails closed (never a partial
+/// success); a completed stream returns the canonical response.
+pub fn finish(state: map) -> map {
+    let failed: bool = types::request_bool(state, "failed", false);
+    let done: bool = types::request_bool(state, "done", false);
+    let result: map = if failed => {
+        types::fail(types::request_map(state, "error"))
+    } else if done => {
+        codec_success(state)
+    } else => {
+        types::fail(types::error_new(
+            200,
+            "api_error",
+            "stream_eof_without_response_completed",
+            "provider stream ended without a terminal response event",
+            "",
+            ""
+        ))
+    };
+    result
+}
+
+fn codec_success(state: map) -> map {
+    let final_present: bool = field_is_map(state, "final");
+    let result: map = if final_present => {
+        let body: map = types::request_map(state, "final");
+        let status: string = types::request_string(body, "status");
+        let output_is_array: bool = field_is_array(body, "output");
+        let output: array = types::request_array(body, "output");
+        let compact_completed: bool = status == "completed"
+            && output_is_array
+            && output.length == 0;
+        let terminal_status: bool = status == "failed" || status == "incomplete";
+        let canonical: map = if terminal_status => {
+            responses_parse_body(body)
+        } else if compact_completed => {
+            codec_compact_completed_body(state, body)
+        } else => {
+            responses_canonical_from_body(body)
+        };
+        canonical
+    } else => {
+        let completed_event: bool = types::request_bool(state, "completed_event", false);
+        let conflict: bool = types::request_bool(state, "sealed_conflict", false);
+        let accumulated: map = if completed_event => {
+            responses_canonical_result("", [], types::usage_new(0, 0, 0), "", "")
+        } else if conflict => {
+            types::fail(types::error_malformed(
+                0,
+                "malformed Responses stream: conflicting completed output indices"
+            ))
+        } else => {
+            codec_canonical_accumulated(state)
+        };
+        accumulated
+    };
+    result
+}
+
+fn codec_compact_completed_body(state: map, body: map) -> map {
+    let invalid: bool = types::request_bool(state, "sealed_invalid", false);
+    let conflict: bool = types::request_bool(state, "sealed_conflict", false);
+    let items: array = types::request_array(state, "sealed_items");
+    let can_reconstruct: bool = !invalid && !conflict && items.length > 0;
+    let result: map = if can_reconstruct => {
+        let output: array = codec_sealed_output_items(items);
+        let mut reconstructed: map = body;
+        reconstructed["output"] = output;
+        responses_canonical_from_body(reconstructed)
+    } else => {
+        responses_canonical_from_body(body)
+    };
+    result
+}
+
+fn codec_sealed_output_items(items: array) -> array {
+    let mut output: array = [];
+    let mut i = 0;
+    while i < items.length {
+        let entry: map = types::array_entry(items, i);
+        output[output.length] = types::request_map(entry, "item");
+        i += 1;
+    }
+    output
+}
+
+/// Canonical response built from a complete Responses `response` object.
+fn responses_canonical_from_body(body: map) -> map {
+    let output: array = types::request_array(body, "output");
+    let usage: map = types::request_map(body, "usage");
+    let input_tokens: int = types::request_int(usage, "input_tokens", 0);
+    let output_tokens: int = types::request_int(usage, "output_tokens", 0);
+    let total_tokens: int = types::request_int(usage, "total_tokens", 0);
+    let text: string = responses_output_text(output);
+    let reasoning: string = responses_output_reasoning(output);
+    let calls: array = responses_output_calls(output);
+    let stop: string = responses_stop_reason(body, calls);
+    responses_canonical_result(
+        text,
+        calls,
+        types::usage_new(input_tokens, output_tokens, total_tokens),
+        reasoning,
+        stop
+    )
+}
+
+/// Canonical response for a stream that terminated without a complete response
+/// object, using the accumulated deltas (usage stays zero).
+fn codec_canonical_accumulated(state: map) -> map {
+    let text: string = types::request_string(state, "text");
+    let reasoning: string = types::request_string(state, "reasoning");
+    let tools: array = types::request_array(state, "tools");
+    let calls: array = responses_accumulated_calls(tools);
+    responses_canonical_result(text, calls, types::usage_new(0, 0, 0), reasoning, "")
+}
+
+fn responses_canonical_result(
+    text: string,
+    calls: array,
+    usage: map,
+    reasoning: string,
+    stop: string
+) -> map {
+    let result: map = if text == "" && calls.length == 0 => {
+        types::fail(types::error_new(
+            0,
+            "api_error",
+            "empty_responses_output",
+            "provider response completed without text or tool calls",
+            "",
+            ""
+        ))
+    } else => {
+        types::ok(types::response_new(text, calls, usage, reasoning, stop))
+    };
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Buffered body parsing
+// ---------------------------------------------------------------------------
+
+/// Parses one already-decoded buffered Responses body into the canonical call
+/// result. A body whose `status` is terminal-failure or that carries a
+/// non-null `error` object fails with a static code.
+pub fn responses_parse_body(body: map) -> map {
+    let status: string = types::request_string(body, "status");
+    let error_present: bool = field_is_map(body, "error");
+    let result: map = if error_present => {
+        types::fail(types::error_new(
+            0,
+            "api_error",
+            "responses_error",
+            "provider response carried an error",
+            "",
+            ""
+        ))
+    } else if status == "failed" => {
+        types::fail(types::error_new(
+            0,
+            "api_error",
+            "responses_failed",
+            "provider response failed",
+            "",
+            ""
+        ))
+    } else if status == "incomplete" => {
+        types::fail(types::error_new(
+            0,
+            "api_error",
+            "responses_incomplete",
+            "provider response was incomplete",
+            "",
+            ""
+        ))
+    } else => {
+        responses_canonical_from_body(body)
+    };
+    result
+}
+
+pub fn responses_parse_public_response(body_text: string) -> map {
+    let body: map = json::decode(body_text);
+    responses_parse_body(body)
+}
+
+// ---------------------------------------------------------------------------
+// Output-item mapping
+// ---------------------------------------------------------------------------
+
+fn responses_output_text(output: array) -> string {
+    let mut text: string = "";
+    let mut i = 0;
+    while i < output.length {
+        let item: map = types::array_entry(output, i);
+        let item_type: string = types::request_string(item, "type");
+        if item_type == "message" {
+            text = text + responses_content_text(types::request_array(item, "content"), true);
+        }
+        i += 1;
+    }
+    text
+}
+
+fn responses_output_reasoning(output: array) -> string {
+    let mut text: string = "";
+    let mut i = 0;
+    while i < output.length {
+        let item: map = types::array_entry(output, i);
+        let item_type: string = types::request_string(item, "type");
+        if item_type == "reasoning" {
+            text = text + responses_content_text(types::request_array(item, "summary"), false);
+        }
+        i += 1;
+    }
+    text
+}
+
+/// Joins standard text parts; refusal strings are included for visible output only.
+fn responses_content_text(parts: array, include_refusal: bool) -> string {
+    let mut joined: string = "";
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        let part_type: string = types::request_string(part, "type");
+        if part_type == "output_text" {
+            joined = joined + types::request_string(part, "text");
+        }
+        if part_type == "text" {
+            joined = joined + types::request_string(part, "text");
+        }
+        if part_type == "summary_text" {
+            joined = joined + types::request_string(part, "text");
+        }
+        if include_refusal && part_type == "refusal" {
+            joined = joined + types::request_string(part, "refusal");
+        }
+        i += 1;
+    }
+    joined
+}
+
+fn responses_output_calls(output: array) -> array {
+    let mut calls: array = [];
+    let mut i = 0;
+    while i < output.length {
+        let item: map = types::array_entry(output, i);
+        let item_type: string = types::request_string(item, "type");
+        if item_type == "function_call" {
+            let mut id: string = types::request_string(item, "call_id");
+            if id == "" {
+                id = types::request_string(item, "id");
+            }
+            let name: string = types::request_string(item, "name");
+            let args_text: string = types::request_string(item, "arguments");
+            let mut args: map = {};
+            if args_text != "" {
+                let decoded: map = json::decode(args_text);
+                args = decoded;
+            }
+            calls[calls.length] = types::tool_call_new(id, name, args);
+        }
+        i += 1;
+    }
+    calls
+}
+
+fn responses_accumulated_calls(tools: array) -> array {
+    let mut calls: array = [];
+    let mut i = 0;
+    while i < tools.length {
+        let entry: map = types::array_entry(tools, i);
+        let id: string = types::request_string(entry, "id");
+        let name: string = types::request_string(entry, "name");
+        if id != "" && name != "" {
+            let args_text: string = types::request_string(entry, "args");
+            let mut args: map = {};
+            if args_text != "" {
+                let decoded: map = json::decode(args_text);
+                args = decoded;
+            }
+            calls[calls.length] = types::tool_call_new(id, name, args);
+        }
+        i += 1;
+    }
+    calls
+}
+
+/// The canonical stop reason: tool use wins, otherwise the terminal status.
+fn responses_stop_reason(body: map, calls: array) -> string {
+    let status: string = types::request_string(body, "status");
+    let result: string = if calls.length > 0 => {
+        "tool_calls"
+    } else if status == "completed" => {
+        "stop"
+    } else => {
+        status
+    };
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Public error parsing
+// ---------------------------------------------------------------------------
+
+/// Extracts a canonical public error from a non-2xx Responses body. A body
+/// that is not JSON fails the invocation; a structurally valid body without a
+/// recognisable error object yields the default `http_error` shape. The
+/// upstream message is never echoed beyond the provider's own `message` field.
+pub fn responses_parse_public_error(body_text: string, status: int) -> map {
+    let payload: map = json::decode(body_text);
+    let has_error: bool = field_is_map(payload, "error");
+    let result: map = if has_error => {
+        responses_error_from_object(types::request_map(payload, "error"), status)
+    } else => {
+        responses_default_error(status)
+    };
+    result
+}
+
+fn responses_error_from_object(error: map, status: int) -> map {
+    let mut error_type: string = "api_error";
+    let mut code: string = "http_error";
+    let mut message: string = "provider request failed";
+    let payload_type: string = types::request_string(error, "type");
+    let payload_code: string = types::request_string(error, "code");
+    let payload_message: string = types::request_string(error, "message");
+    if payload_type != "" {
+        error_type = payload_type;
+    }
+    if payload_code != "" {
+        code = payload_code;
+    } else if payload_type == "invalid_request_error" {
+        // Native secret-key sanitization intentionally removes generic `code`
+        // keys. Preserve a stable public classification from the surviving
+        // provider error type rather than exposing or reconstructing a secret.
+        code = payload_type;
+    } else if payload_type == "rate_limit_error" {
+        code = payload_type;
+    } else if payload_type == "overloaded_error" {
+        code = payload_type;
+    } else if payload_type == "server_error" {
+        code = payload_type;
+    } else if payload_type == "timeout_error" {
+        code = payload_type;
+    }
+    if payload_message != "" {
+        message = payload_message;
+    }
+    types::fail(types::error_new(status, error_type, code, message, "", ""))
+}
+
+fn responses_default_error(status: int) -> map {
+    types::fail(types::error_new(
+        status,
+        "api_error",
+        "http_error",
+        "provider request failed",
+        "",
+        ""
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Wire request building
+// ---------------------------------------------------------------------------
+//
+// The Responses wire request is assembled as an exact JSON string with no null
+// fields (the Codex backend is strict). Structural pieces are produced by
+// `json::encode` on scalar values and on structs whose fields are all
+// required, so no user/secret string is ever concatenated raw.
+
+struct ResponsesWireInputText {
+    type: string,
+    text: string
+}
+
+struct ResponsesWireMessage {
+    type: string,
+    role: string,
+    content: array<ResponsesWireInputText>
+}
+
+struct ResponsesWireFunctionCallItem {
+    type: string,
+    call_id: string,
+    name: string,
+    arguments: string
+}
+
+struct ResponsesWireFunctionCallOutputItem {
+    type: string,
+    call_id: string,
+    output: string
+}
+
+struct ResponsesWireTool {
+    type: string,
+    name: string,
+    description: string,
+    parameters: string
+}
+
+/// Public buffered Responses body for the canonical request. `store:false` and
+/// the derived `instructions` (system/developer text) are always present.
+pub fn responses_build_public_body(request: map, model: string, stream: bool) -> string {
+    let messages: array = types::request_array(request, "messages");
+    let instructions: string = responses_collect_instructions(messages);
+    let input_json: string = responses_build_input(messages);
+    let head: string = "{\"model\":" + json::encode(model) +
+        ",\"instructions\":" + json::encode(instructions) +
+        ",\"input\":" + input_json;
+    let body: string = responses_finish_body(request, head, stream);
+    responses_splice_tool_schemas(body, types::request_array(request, "tools"))
+}
+
+/// Replaces each tool schema marker (with its surrounding quotes) with the raw
+/// schema JSON. Main supplies validated descriptor maps; direct codec callers
+/// may still supply the legacy `schema_json` string form.
+fn responses_splice_tool_schemas(body: string, tools: array) -> string {
+    let mut result: string = body;
+    let mut i = 0;
+    while i < tools.length {
+        let tool: map = types::array_entry(tools, i);
+        if tool.has("schema") {
+            let schema: map = types::request_map(tool, "schema");
+            let schema_json: string = json::encode(schema);
+            result = string_replace_literal(
+                result,
+                "\"" + tool_schema_marker(i) + "\"",
+                schema_json
+            );
+        } else if tool.has("schema_json") {
+            let schema_json: string = types::tool_schema_json(tool);
+            result = string_replace_literal(
+                result,
+                "\"" + tool_schema_marker(i) + "\"",
+                schema_json
+            );
+        }
+        i += 1;
+    }
+    result
+}
+
+fn responses_finish_body(request: map, head: string, stream: bool) -> string {
+    let tools_json: string = responses_build_tools(types::request_array(request, "tools"));
+    let mut body: string = head;
+    if tools_json != "" {
+        body = body + ",\"tools\":" + tools_json;
+        let tool_choice: string = types::request_string(request, "tool_choice");
+        if tool_choice != "" {
+            body = body + ",\"tool_choice\":" + json::encode(tool_choice);
+        }
+    }
+    body = responses_append_sampling(request, body);
+    body + ",\"stream\":" + json::encode(stream) + ",\"store\":false}"
+}
+
+/// Marker for one tool's raw schema. The typed wire wrapper stores a string in
+/// `parameters`; `responses_splice_tool_schemas` replaces that placeholder with
+/// the JSON encoded from the validated descriptor map (or legacy raw string).
+fn tool_schema_marker(index: int) -> string {
+    let encoded: string = json::encode(index);
+    "__RSS_RESPONSES_SCHEMA_" + encoded + "__"
+}
+
+fn responses_append_sampling(request: map, body: string) -> string {
+    let mut out: string = body;
+    let sampling: map = types::request_map(request, "sampling");
+    let temperature_raw: map = types::sampling_float(sampling, "temperature");
+    let top_p_raw: map = types::sampling_float(sampling, "top_p");
+    let temperature_present: bool = temperature_raw["present"];
+    let temperature_value: float = temperature_raw["value"];
+    let top_p_present: bool = top_p_raw["present"];
+    let top_p_value: float = top_p_raw["value"];
+    if temperature_present {
+        out = out + ",\"temperature\":" + json::encode(temperature_value);
+    }
+    if top_p_present {
+        out = out + ",\"top_p\":" + json::encode(top_p_value);
+    }
+    let max_output: int = types::request_int(request, "max_output_tokens", 0);
+    if max_output > 0 {
+        out = out + ",\"max_output_tokens\":" + json::encode(max_output);
+    }
+    out
+}
+
+/// Folds every system/developer message's text into the single `instructions`
+/// string (newline-joined).
+fn responses_collect_instructions(messages: array) -> string {
+    let mut out: string = "";
+    let mut i = 0;
+    while i < messages.length {
+        let message: map = types::array_entry(messages, i);
+        let role: string = types::message_role(message);
+        if role == "system" || role == "developer" {
+            let text: string = responses_content_text(types::message_content(message), false);
+            if text != "" {
+                if out != "" {
+                    out = out + "\n";
+                }
+                out = out + text;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn responses_build_input(messages: array) -> string {
+    let mut parts: array = [];
+    let mut i = 0;
+    while i < messages.length {
+        let message: map = types::array_entry(messages, i);
+        if message.has("role") {
+            parts = responses_append_message(parts, message);
+        }
+        i += 1;
+    }
+    "[" + join_json(parts) + "]"
+}
+
+fn responses_append_message(parts: array, message: map) -> array {
+    let role: string = types::message_role(message);
+    if role == "user" => {
+        responses_append_user(parts, message)
+    } else if role == "assistant" => {
+        responses_append_assistant(parts, message)
+    } else => {
+        parts
+    }
+}
+
+/// One user message contributes one `message` input item (when it has text)
+/// plus one `function_call_output` item per `tool_result` part.
+fn responses_append_user(parts: array, message: map) -> array {
+    let mut result: array = parts;
+    let content: array = types::message_content(message);
+    let mut i = 0;
+    while i < content.length {
+        let part: map = types::array_entry(content, i);
+        if part.has("type") {
+            if types::part_type(part) == "tool_result" {
+                let call_id: string = types::request_string(part, "tool_call_id");
+                let output: string = types::request_string(part, "content");
+                let item: ResponsesWireFunctionCallOutputItem = {
+                    type: "function_call_output",
+                    call_id: call_id,
+                    output: output
+                };
+                result[result.length] = json::encode(item);
+            }
+        }
+        i += 1;
+    }
+    let text_parts: array<ResponsesWireInputText> = responses_text_parts(content, "input_text");
+    if text_parts.length > 0 {
+        let item: ResponsesWireMessage = { type: "message", role: "user", content: text_parts };
+        result[result.length] = json::encode(item);
+    }
+    result
+}
+
+/// One assistant message contributes its text as an `output_text` message item
+/// plus one `function_call` item per `tool_call` part.
+fn responses_append_assistant(parts: array, message: map) -> array {
+    let mut result: array = parts;
+    let content: array = types::message_content(message);
+    let text_parts: array<ResponsesWireInputText> = responses_text_parts(content, "output_text");
+    if text_parts.length > 0 {
+        let item: ResponsesWireMessage = { type: "message", role: "assistant", content: text_parts };
+        result[result.length] = json::encode(item);
+    }
+    let mut i = 0;
+    while i < content.length {
+        let part: map = types::array_entry(content, i);
+        if part.has("type") {
+            if types::part_type(part) == "tool_call" {
+                let call_id: string = types::request_string(part, "tool_call_id");
+                let name: string = types::request_string(part, "name");
+                let arguments: string = types::request_string(part, "arguments_json");
+                let item: ResponsesWireFunctionCallItem = {
+                    type: "function_call",
+                    call_id: call_id,
+                    name: name,
+                    arguments: arguments
+                };
+                result[result.length] = json::encode(item);
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Collects text parts into Responses content parts of the given wire type
+/// (`input_text` for user, `output_text` for assistant).
+fn responses_text_parts(content: array, wire_type: string) -> array<ResponsesWireInputText> {
+    let mut parts: array<ResponsesWireInputText> = [];
+    let mut i = 0;
+    while i < content.length {
+        let part: map = types::array_entry(content, i);
+        if part.has("type") {
+            if types::part_type(part) == "text" {
+                let text: string = types::request_string(part, "text");
+                parts[parts.length] = { type: wire_type, text: text };
+            }
+        }
+        i += 1;
+    }
+    parts
+}
+
+fn responses_build_tools(tools: array) -> string {
+    let mut wire: array<ResponsesWireTool> = [];
+    let mut i = 0;
+    while i < tools.length {
+        let tool: map = types::array_entry(tools, i);
+        if tool.has("name") {
+            wire[wire.length] = {
+                type: "function",
+                name: types::tool_name(tool),
+                description: types::tool_description(tool),
+                parameters: tool_schema_marker(i)
+            };
+        }
+        i += 1;
+    }
+    let mut encoded: string = "";
+    if wire.length > 0 {
+        encoded = json::encode(wire);
+    }
+    encoded
+}
+
+/// Comma-joins an array of already-encoded JSON strings.
+fn join_json(parts: array) -> string {
+    let mut out: string = "";
+    let mut i = 0;
+    while i < parts.length {
+        let piece: string = string_entry(parts, i);
+        if i > 0 {
+            out = out + ",";
+        }
+        out = out + piece;
+        i += 1;
+    }
+    out
+}
+
+fn string_entry(items: array, index: int) -> string {
+    let mut value: string = "";
+    if items.has(index) {
+        if type(items[index].copy()) == "string" {
+            let coerced: string = items[index].copy();
+            value = coerced;
+        }
+    }
+    value
+}

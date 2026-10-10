@@ -25,11 +25,13 @@ use crate::auth::oauth::{
     RawHttpsResponse, RawHttpsResponseHead,
 };
 
-const MAX_HEADERS: usize = 32;
+const MAX_REQUEST_HEADERS: usize = 32;
+const MAX_RESPONSE_HEADERS: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_ACTIVE_REQUESTS: usize = 32;
 const MAX_STREAM_CHUNK_BYTES: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
 static REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -151,7 +153,9 @@ impl BoundedHttpsStream for NativeHttpsStream {
                     return Ok(None);
                 }
                 Ok(PumpMessage::Error(error)) => return Err(self.fail(error)),
-                Ok(PumpMessage::Head(_)) => return Err(self.fail(failed())),
+                Ok(PumpMessage::Head(_)) => {
+                    return Err(self.fail(failed()));
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     let error = self.context.check().err().unwrap_or_else(failed);
@@ -204,7 +208,7 @@ fn validate_request(
         return Err(failed());
     }
     let method = Method::from_bytes(request.method.as_bytes()).map_err(|_| failed())?;
-    if request.headers.len().saturating_add(1) > MAX_HEADERS {
+    if request.headers.len().saturating_add(1) > MAX_REQUEST_HEADERS {
         return Err(failed());
     }
     let mut header_bytes = hyper::header::HOST
@@ -364,7 +368,18 @@ where
                 context.check()?;
                 return Ok(result);
             }
-            _ = connection.as_mut() => return Err(failed()),
+            _ = connection.as_mut() => {
+                context.check()?;
+                let final_poll = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(future.as_mut().poll(cx))
+                })
+                .await;
+                context.check()?;
+                match final_poll {
+                    std::task::Poll::Ready(ready) => return Ok(ready),
+                    std::task::Poll::Pending => return Err(failed()),
+                }
+            }
             _ = tokio::time::sleep(pause) => {}
         }
     }
@@ -385,7 +400,9 @@ async fn send_message(
                 let pause = context.remaining()?.min(POLL_INTERVAL);
                 tokio::time::sleep(pause).await;
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => return Err(failed()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(failed());
+            }
         }
     }
 }
@@ -423,7 +440,7 @@ async fn pump_response(
 
     let mut builder = http1::Builder::new();
     builder
-        .max_headers(MAX_HEADERS)
+        .max_headers(MAX_RESPONSE_HEADERS)
         .max_buf_size(MAX_HEADER_BYTES);
     let handshake = builder.handshake(TokioIo::new(stream));
     let (mut request_sender, connection) = wait_context(handshake, context)
@@ -527,7 +544,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{Arc, Barrier, RwLock, mpsc};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
@@ -542,6 +559,20 @@ mod tests {
 
     use super::*;
     use crate::auth::oauth::{OAuthCancel, OAuthClock};
+
+    static NATIVE_REQUEST_TEST_ADMISSION: RwLock<()> = RwLock::new(());
+
+    fn read_native_request_admission() -> std::sync::RwLockReadGuard<'static, ()> {
+        NATIVE_REQUEST_TEST_ADMISSION
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_native_request_admission() -> std::sync::RwLockWriteGuard<'static, ()> {
+        NATIVE_REQUEST_TEST_ADMISSION
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     struct WallClock;
     impl OAuthClock for WallClock {
@@ -577,6 +608,15 @@ mod tests {
             body: "payload".into(),
         }
     }
+
+    fn generated_response_headers_for_wire_count(wire_count: usize) -> Vec<(String, String)> {
+        // scripted_server adds Content-Length and Date to the response head.
+        assert!(wire_count >= 2);
+        (0..wire_count - 2)
+            .map(|index| (format!("x-test-{index}"), "value".to_owned()))
+            .collect()
+    }
+
     type ObservedRequest = (String, String, String);
     type BasicTlsServer = (
         String,
@@ -927,6 +967,7 @@ mod tests {
 
     #[test]
     fn native_stream_yields_body_before_server_releases_eof() {
+        let _admission = read_native_request_admission();
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
         body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
         let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
@@ -958,6 +999,7 @@ mod tests {
 
     #[test]
     fn native_stream_splits_large_frames_and_preserves_all_bytes() {
+        let _admission = read_native_request_admission();
         let body = (0..24_000)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
@@ -980,7 +1022,46 @@ mod tests {
     }
 
     #[test]
+    fn pending_http_response_fails_immediately_after_connection_completion() {
+        let (io_context, _) = context(Duration::from_secs(3));
+        let mut connection = Box::pin(std::future::ready(Ok(())));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                wait_http(std::future::pending::<()>(), &io_context, &mut connection),
+            )
+            .await
+        });
+        let error = result
+            .expect("a pending response must not outwait the completed connection")
+            .expect_err("a response that remains pending must preserve transport failure");
+        assert_eq!(error.code(), "transport_error");
+    }
+
+    #[test]
+    fn native_http_response_is_available_when_peer_closes_cleanly_after_reply() {
+        let _admission = read_native_request_admission();
+        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
+            status: 401,
+            headers: vec![("connection".into(), "close".into())],
+            body: b"unauthorized".to_vec(),
+        });
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let response = transport.send(&request(url), &io_context).unwrap();
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body, b"unauthorized");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn native_stream_enforces_cumulative_body_cap() {
+        let _admission = read_native_request_admission();
         let (url, roots, _events, server) = scripted_server(Reply::ChunkedOversize);
         let transport = NativeHttpsTransport::with_roots(roots);
         let (io_context, _) = context(Duration::from_secs(3));
@@ -998,6 +1079,7 @@ mod tests {
 
     #[test]
     fn caller_cancellation_during_bounded_queue_backpressure_closes_only_its_stream() {
+        let _admission = read_native_request_admission();
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
         body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
         let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
@@ -1039,6 +1121,7 @@ mod tests {
 
     #[test]
     fn explicit_stream_cancel_closes_only_its_socket_with_a_shared_context() {
+        let _admission = read_native_request_admission();
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
         body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
         let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
@@ -1075,6 +1158,7 @@ mod tests {
 
     #[test]
     fn dropping_live_stream_closes_its_socket() {
+        let _admission = read_native_request_admission();
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
         body_tx.blocking_send(Bytes::from_static(b"first")).unwrap();
         let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
@@ -1094,6 +1178,7 @@ mod tests {
 
     #[test]
     fn stream_read_uses_original_deadline_while_waiting_for_body() {
+        let _admission = read_native_request_admission();
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
         let receiver = Arc::new(std::sync::Mutex::new(Some(body_rx)));
         let (url, roots, _events, server) = scripted_server(Reply::GatedStream(receiver));
@@ -1113,6 +1198,7 @@ mod tests {
 
     #[test]
     fn stream_head_debug_and_transport_errors_redact_values() {
+        let _admission = read_native_request_admission();
         let secret_header = "response-header-secret";
         let (url, roots, _events, server) = scripted_server(Reply::Fixed {
             status: 200,
@@ -1285,6 +1371,7 @@ mod tests {
 
     #[test]
     fn loopback_tls_preserves_path_query_authority_and_injected_headers() {
+        let _admission = read_native_request_admission();
         let (url, roots, events, server) = scripted_server(Reply::Fixed {
             status: 200,
             headers: Vec::new(),
@@ -1331,6 +1418,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_response_headers_without_disclosing_values() {
+        let _admission = read_native_request_admission();
         let secret_marker = "header-secret-marker";
         let value = format!("{}{}", "a".repeat(MAX_HEADER_BYTES), secret_marker);
         let (url, roots, _events, server) = scripted_server(Reply::Fixed {
@@ -1347,6 +1435,7 @@ mod tests {
     }
     #[test]
     fn rejects_untrusted_loopback_certificate_and_redacts_url() {
+        let _admission = read_native_request_admission();
         let marker = "query-secret-marker";
         let (url, _roots, events, server) = scripted_server(Reply::Fixed {
             status: 200,
@@ -1373,6 +1462,7 @@ mod tests {
 
     #[test]
     fn rejects_loopback_certificate_hostname_mismatch() {
+        let _admission = read_native_request_admission();
         let (url, roots, events, server) = scripted_server(Reply::Fixed {
             status: 200,
             headers: Vec::new(),
@@ -1397,6 +1487,7 @@ mod tests {
 
     #[test]
     fn returns_redirect_without_connecting_to_location() {
+        let _admission = read_native_request_admission();
         let destination = TcpListener::bind("127.0.0.1:0").unwrap();
         destination.set_nonblocking(true).unwrap();
         let redirect_url = format!("http://{}/redirect", destination.local_addr().unwrap());
@@ -1439,6 +1530,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_chunked_body_without_content_length() {
+        let _admission = read_native_request_admission();
         let (url, roots, _events, server) = scripted_server(Reply::ChunkedOversize);
         let transport = NativeHttpsTransport::with_roots(roots);
         let (io_context, _) = context(Duration::from_secs(3));
@@ -1448,10 +1540,51 @@ mod tests {
     }
 
     #[test]
+    fn accepts_exactly_sixty_four_wire_response_headers() {
+        let _admission = read_native_request_admission();
+        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: generated_response_headers_for_wire_count(64),
+            body: b"ok".to_vec(),
+        });
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let response = transport
+            .send(&request(url), &io_context)
+            .expect("a response with exactly 64 wire fields is within the bound");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        assert_eq!(response.headers.len(), 64, "actual response fields");
+        assert!(response.headers.contains_key("content-length"));
+        assert!(response.headers.contains_key("date"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn accepts_complete_response_with_thirty_three_wire_headers() {
+        let _admission = read_native_request_admission();
+        let (url, roots, _events, server) = scripted_server(Reply::Fixed {
+            status: 200,
+            headers: generated_response_headers_for_wire_count(33),
+            body: b"ok".to_vec(),
+        });
+        let transport = NativeHttpsTransport::with_roots(roots);
+        let (io_context, _) = context(Duration::from_secs(3));
+        let response = transport
+            .send(&request(url), &io_context)
+            .expect("a valid 33-field response head fits the approved bound");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        assert_eq!(response.headers.len(), 33, "actual response fields");
+        assert!(response.headers.contains_key("content-length"));
+        assert!(response.headers.contains_key("date"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn rejects_excessive_response_header_count() {
-        let headers = (0..=MAX_HEADERS)
-            .map(|index| (format!("x-test-{index}"), "value".to_owned()))
-            .collect();
+        let _admission = read_native_request_admission();
+        let headers = generated_response_headers_for_wire_count(MAX_RESPONSE_HEADERS + 1);
         let (url, roots, _events, server) = scripted_server(Reply::Fixed {
             status: 200,
             headers,
@@ -1505,6 +1638,7 @@ mod tests {
 
     #[test]
     fn stalled_tls_handshake_obeys_absolute_deadline() {
+        let _admission = read_native_request_admission();
         let (url, roots, events, server) =
             scripted_server(Reply::StallHandshake(Duration::from_millis(600)));
         let transport = NativeHttpsTransport::with_roots(roots);
@@ -1523,6 +1657,7 @@ mod tests {
 
     #[test]
     fn stalled_response_obeys_absolute_deadline() {
+        let _admission = read_native_request_admission();
         let (url, roots, events, server) =
             scripted_server(Reply::StallResponse(Duration::from_millis(600)));
         let transport = NativeHttpsTransport::with_roots(roots);
@@ -1545,6 +1680,7 @@ mod tests {
 
     #[test]
     fn cancellation_after_tcp_accept_aborts_in_flight_tls() {
+        let _admission = read_native_request_admission();
         let (url, roots, events, server) =
             scripted_server(Reply::StallHandshake(Duration::from_millis(600)));
         let transport = NativeHttpsTransport::with_roots(roots);
@@ -1562,6 +1698,7 @@ mod tests {
 
     #[test]
     fn synchronous_send_works_inside_an_entered_tokio_runtime() {
+        let _admission = read_native_request_admission();
         let (url, roots, observed, server) = server();
         let expected_authority = url
             .split_once("//")
@@ -1625,7 +1762,7 @@ mod tests {
         let (io_context, _) = context(Duration::from_secs(1));
         let mut over_headered = request(format!("https://{address}/headers"));
         over_headered.headers.clear();
-        for index in 0..MAX_HEADERS {
+        for index in 0..MAX_REQUEST_HEADERS {
             over_headered
                 .headers
                 .insert(format!("x-test-{index}"), "value".into());
@@ -1682,6 +1819,7 @@ mod tests {
 
     #[test]
     fn caps_concurrent_tls_requests_and_releases_admission_on_cancel() {
+        let _admission = write_native_request_admission();
         const ACTIVE: usize = 32;
         let stall = Duration::from_secs(1);
         let (url, roots, received, server) = stalled_server(stall);
@@ -2768,6 +2906,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_commands_tls_pipe_completion_and_native_store_relogin_generations() {
+        let _admission = read_native_request_admission();
         let runner = commands_runner();
         let secrets = vec![
             DeviceFlowSecrets::generated(),
@@ -2889,6 +3028,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dev_full_stops_real_commands_tls_login_after_device_start_without_store_mutation() {
+        let _admission = read_native_request_admission();
         let runner = commands_runner();
         let secret = DeviceFlowSecrets::generated();
         let mut server = DeviceTlsSequence::start(vec![secret.clone()], false);

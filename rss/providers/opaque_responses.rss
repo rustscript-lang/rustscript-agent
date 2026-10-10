@@ -1,0 +1,241 @@
+// OpenAI Responses opaque provider entry (Task8 access-only scope).
+//
+// Mirrors `rss/llm/openai_opaque_chat.rss` for the Responses wire protocol. It
+// builds the public Responses body, drives the native opaque transport through
+// the shared `provider_runtime::call` / `start_stream` bridge, and consumes the
+// already-sanitized response/stream records with the pure Responses codec. It
+// carries no credential, authority, or header of its own: the native transport
+// owns the wire.
+use auth;
+use oauth;
+use json;
+use super::llm::types as types;
+use super::llm::openai_responses as responses;
+use super::agent::provider_runtime as provider_runtime;
+
+struct ResponsesOpaqueProviderIntent {
+    credential_id: string,
+    method: string,
+    path: string,
+    public_headers: array<PublicHeader>,
+    public_body: string
+}
+
+struct ResponsesOpaqueHostHomeBinding {
+    home: resource<auth.host_home>
+}
+
+struct ResponsesStreamValuePresence {
+    value: OAuthStreamEnvelope?
+}
+
+struct ResponsesRecordValuePresence {
+    value: OAuthStreamRecord?
+}
+
+/// Canonical Codex Responses public path for a merged profile.
+fn responses_path_or_default(profile: map) -> string {
+    let configured: string = types::profile_string(profile, "responses_path");
+    let path: string = if configured == "" => {
+        "/backend-api/codex/responses"
+    } else => {
+        configured
+    };
+    path
+}
+
+pub fn run_responses(context: map) -> map {
+    run_responses_mode(context, false)
+}
+
+/// Main-agent entry: the Codex backend requires streaming for this admitted path.
+pub fn run_responses_stream(context: map) -> map {
+    run_responses_mode(context, true)
+}
+
+fn run_responses_mode(context: map, force_stream: bool) -> map {
+    let request: map = types::request_map(context, "request");
+    let profile: map = types::request_map(context, "profile");
+    let request_model: string = types::request_string(request, "model");
+    let profile_model: string = types::profile_string(profile, "model");
+    let model: string = if request_model != "" => {
+        request_model
+    } else => {
+        profile_model
+    };
+    let streaming: bool = force_stream || types::request_bool(request, "stream", false);
+    let options: map = types::provider_options(request);
+    let options_are_public: bool = types::profile_options_are_public(options);
+    let credential_id: string = types::request_string(context, "credential_id");
+    let result: map = if credential_id == "" => {
+        types::fail(types::error_request("missing_credential", "request.credential_id is required"))
+    } else if model == "" => {
+        types::fail(types::error_request("missing_model", "request.model is required"))
+    } else if !options_are_public => {
+        types::fail(types::error_request(
+            "config",
+            "credential-bearing provider options are not public"
+        ))
+    } else if streaming => {
+        responses_send_stream(request, profile, context, model)
+    } else => {
+        responses_send_buffered(request, profile, context, model)
+    };
+    result
+}
+
+fn stream_transport_failure(failure: AuthBridgeFailure?) -> map {
+    let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
+    types::fail(types::error_request(detail.code, "provider transport failed"))
+}
+
+fn malformed_stream(status: int) -> map {
+    types::fail(types::error_malformed(status, "malformed provider stream record"))
+}
+
+fn responses_send_buffered(request: map, profile: map, context: map, model: string) -> map {
+    let binding: ResponsesOpaqueHostHomeBinding = { home: context["host_home"], };
+    let credential_id: string = types::request_string(context, "credential_id");
+    let intent: ResponsesOpaqueProviderIntent = {
+        credential_id: credential_id,
+        method: "POST",
+        path: responses_path_or_default(profile),
+        public_headers: [
+            { name: "accept", value: "application/json" },
+            { name: "content-type", value: "application/json" }
+        ],
+        public_body: responses::responses_public_body(request, model)
+    };
+    let envelope: TransportResultEnvelope = provider_runtime::call(binding, intent);
+    responses_interpret_transport(envelope)
+}
+
+fn responses_interpret_transport(envelope: TransportResultEnvelope) -> map {
+    let has_response: bool = envelope.has("value");
+    let maybe_failure: AuthBridgeFailure? = envelope.error;
+    let failure: AuthBridgeFailure = maybe_failure.unwrap_or({
+        code: "transport_error",
+        cancelled: false,
+        deadline_exceeded: false,
+        revoked: false
+    });
+    let maybe_response: TransportResponseEnvelope? = if has_response => {
+        envelope.value
+    } else => {
+        null
+    };
+    let response: TransportResponseEnvelope = maybe_response.unwrap_or({
+        ok: false,
+        error: null,
+        status: 0,
+        public_headers: [],
+        body_without_secret_fields: "",
+        retry_after_ms: null,
+        access_slot: null,
+        refresh_slot: null,
+        device_handle: null
+    });
+    let result: map = if envelope.ok => {
+        responses_parse_transport_response(response)
+    } else => {
+        types::fail(types::error_request(failure.code, "provider transport failed"))
+    };
+    result
+}
+
+fn responses_parse_transport_response(response: TransportResponseEnvelope) -> map {
+    if response.status >= 200 && response.status < 300 => {
+        responses::parse_buffered_body(response.body_without_secret_fields)
+    } else => {
+        responses::parse_error_body(response.body_without_secret_fields, response.status)
+    }
+}
+
+fn responses_send_stream(request: map, profile: map, context: map, model: string) -> map {
+    let binding: ResponsesOpaqueHostHomeBinding = {home: context["host_home"]};
+    let intent: ResponsesOpaqueProviderIntent = {
+        credential_id: types::request_string(context, "credential_id"),
+        method: "POST",
+        path: responses_path_or_default(profile),
+        public_headers: [
+            {name: "accept", value: "text/event-stream"},
+            {name: "content-type", value: "application/json"}
+        ],
+        public_body: responses::responses_public_stream_body(request, model)
+    };
+    let started: OAuthStreamStartResultEnvelope = provider_runtime::start_stream(binding, intent, ["[DONE]"]);
+    let has_value: bool = started.has("value");
+    let ok: bool = started.ok;
+    let failure: AuthBridgeFailure? = started.error;
+    if !ok || failure != null || !has_value => {
+        stream_transport_failure(failure)
+    } else => {
+        let holder: ResponsesStreamValuePresence = {value: started.value};
+        let envelope: OAuthStreamEnvelope = holder.value;
+        let stream: resource<oauth.stream> = envelope.stream;
+        let head: OAuthStreamHead = envelope.head;
+        let status: int = head.status;
+        let mut state: map = responses::responses_begin();
+        let mut result: map = {};
+        let mut finished: bool = false;
+        while !finished {
+            let read: OAuthStreamReadResultEnvelope = oauth::stream_read_result(&stream);
+            let read_has_value: bool = read.has("value");
+            let read_ok: bool = read.ok;
+            let read_failure: AuthBridgeFailure? = read.error;
+            if !read_ok || read_failure != null || !read_has_value {
+                result = stream_transport_failure(read_failure);
+                finished = true;
+            } else {
+                let record_holder: ResponsesRecordValuePresence = {value: read.value};
+                let record: OAuthStreamRecord = record_holder.value;
+                let kind: string = record.kind;
+                if kind == "json" {
+                    let body: string = record.json;
+                    // Native records are strict canonical JSON objects or arrays.
+                    if body.copy()[0:1] != "{" {
+                        result = malformed_stream(status);
+                        finished = true;
+                    } else if status < 200 || status >= 300 {
+                        result = responses::parse_error_body(body, status);
+                        finished = true;
+                    } else {
+                        let chunk: map = json::decode(body);
+                        state = responses::responses_push_chunk(state, chunk);
+                        if responses_stream_terminal(state) {
+                            result = responses::responses_finish(state);
+                            finished = true;
+                        }
+                    }
+                } else if status < 200 || status >= 300 {
+                    result = malformed_stream(status);
+                    finished = true;
+                } else if kind == "literal" {
+                    let index: int? = record.literal_index;
+                    if index.unwrap_or(-1) == 0 {
+                        state = responses::responses_push_done(state);
+                        result = responses::responses_finish(state);
+                    } else {
+                        result = malformed_stream(status);
+                    }
+                    finished = true;
+                } else if kind == "eof" {
+                    result = responses::responses_finish(state);
+                    finished = true;
+                } else {
+                    result = malformed_stream(status);
+                    finished = true;
+                }
+            }
+        }
+        oauth::stream_close(stream);
+        result
+    }
+}
+
+/// The stream is terminal once the codec recorded a completed or failed event.
+fn responses_stream_terminal(state: map) -> bool {
+    let done: bool = types::request_bool(state, "done", false);
+    let failed: bool = types::request_bool(state, "failed", false);
+    done || failed
+}

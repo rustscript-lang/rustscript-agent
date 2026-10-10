@@ -9,6 +9,7 @@ use super::providers::deepseek as deepseek;
 use super::providers::opencode_zen as opencode_zen;
 use super::providers::opencode_go as opencode_go;
 use super::providers::custom as custom;
+use super::providers::opaque_responses as opaque_responses;
 
 /// Public provider names that select the opaque OpenAI Chat entry. An empty
 /// provider is the canonical default and maps to the same entry.
@@ -32,7 +33,11 @@ fn is_openai_provider(provider: string) -> bool {
 pub fn dispatch(context: map) -> map {
     let request: map = types::request_map(context, "request");
     let provider: string = types::request_string(request, "provider");
-    let result: map = if is_openai_provider(provider) => {
+    let options: map = types::provider_options(request);
+    let protocol: string = types::profile_string(options, "protocol");
+    let result: map = if provider == "openai-codex" && protocol == "codex-responses" => {
+        dispatch_codex_responses(context, request, options)
+    } else if is_openai_provider(provider) => {
         dispatch_openai_request(context, request)
     } else if provider == "openrouter" => {
         openrouter::call(context)
@@ -51,6 +56,18 @@ pub fn dispatch(context: map) -> map {
         ))
     };
     result
+}
+
+fn dispatch_codex_responses(context: map, request: map, profile: map) -> map {
+    let credential_id: string = types::request_string(request, "credential_id");
+    let home: resource<auth.host_home> = context["host_home"];
+    let child: map = {
+        request: request,
+        profile: profile,
+        credential_id: credential_id,
+        host_home: home
+    };
+    opaque_responses::run_responses_stream(child)
 }
 
 fn dispatch_openai_request(context: map, request: map) -> map {

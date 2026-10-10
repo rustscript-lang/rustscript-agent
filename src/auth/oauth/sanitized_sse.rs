@@ -16,8 +16,9 @@ use serde_json::Value as JsonValue;
 use crate::auth::store::OpaqueAccessHandle;
 
 use super::{
-    BoundedHttpsStream, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext, ProviderRequest,
-    TrustedTransportPolicy, parse_strict_json, retry_after_ms, strip_secret_keys,
+    BoundedHttpsStream, MAX_JSON_DEPTH, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext,
+    ProviderRequest, TrustedTransportPolicy, parse_strict_json_with_limits, retry_after_ms,
+    strip_secret_keys,
 };
 
 const MAX_PUBLIC_MARKERS: usize = 16;
@@ -185,9 +186,16 @@ impl OAuthHost {
             return Err(static_malformed("sse response status is invalid"));
         }
         let media = canonical_media_type(&reader.head().headers);
+        let has_content_type = reader
+            .head()
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"));
         let mode = match media {
             Some("text/event-stream") => SseMode::EventStream,
             Some("application/json") => SseMode::BufferedJson,
+            None if (200..300).contains(&status) && !has_content_type => SseMode::EventStream,
+            None if status >= 400 && !has_content_type => SseMode::BufferedJson,
             _ => SseMode::Unsupported,
         };
         let head = SanitizedSseHead {
@@ -449,8 +457,10 @@ impl SanitizedAccessSseStream {
     /// Strict bounded JSON with every secret-shaped key removed at every level.
     /// Primitive JSON and non-JSON are static malformed with no raw fallback.
     fn sanitize_json(text: &str) -> Result<SanitizedSseRecord, OAuthError> {
-        let parsed =
-            parse_strict_json(text).map_err(|_| static_malformed("sse data is not strict json"))?;
+        // The custom parser counts primitive leaves as one seed level beyond
+        // container nesting; allow that leaf for the existing container cap.
+        let parsed = parse_strict_json_with_limits(text, MAX_JSON_DEPTH + 1, Some(MAX_JSON_DEPTH))
+            .map_err(|_| static_malformed("sse data is not strict json"))?;
         let cleaned = strip_secret_keys(parsed);
         if !matches!(cleaned, JsonValue::Object(_) | JsonValue::Array(_)) {
             return Err(static_malformed("sse data is not a json object or array"));
@@ -536,6 +546,7 @@ mod sanitized_sse_tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            transport_identity: None,
         }
     }
 
@@ -1203,6 +1214,140 @@ mod sanitized_sse_tests {
         let cancel = Arc::new(ScriptedCancel::new());
         let host = make_host(transport, &clock, &cancel);
         let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+        expect_end(stream.read_record());
+    }
+
+    #[test]
+    fn sanitized_sse_missing_mime_success_parses_strict_event_stream() {
+        let (_store, access) = issue_access("missing-mime-success");
+        let body = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"OK\"}\n\n";
+        let (transport, state) = make_transport(
+            200,
+            Vec::new(),
+            vec![Injected::Chunk(body.to_vec()), Injected::Eof],
+        );
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+
+        assert_eq!(stream.head().status, 200);
+        assert_eq!(stream.head().content_type, "");
+        let text = json_text(expect_record(stream.read_record()));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json parses");
+        assert_eq!(parsed["type"], "response.output_text.delta");
+        assert_eq!(parsed["delta"], "OK");
+        assert_eq!(locked(&state).reads, 1);
+        expect_end(stream.read_record());
+    }
+
+    #[test]
+    fn sanitized_sse_depth_eight_record_keeps_general_limit_and_redacts() {
+        let mut json = r#"{"access_token":"SYNTHETIC_SECRET"}"#.to_string();
+        for _ in 0..7 {
+            json = format!("{{\"nested\":{json}}}");
+        }
+        assert!(super::super::parse_strict_json(&json).is_err());
+
+        let (_store, access) = issue_access("depth-eight");
+        let body = format!("data: {json}\n\n").into_bytes();
+        let (transport, state) =
+            make_transport(200, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+
+        let sanitized = json_text(expect_record(stream.read_record()));
+        assert!(!sanitized.contains("SYNTHETIC_SECRET"));
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&sanitized).expect("sanitized JSON parses");
+        for _ in 0..7 {
+            parsed = parsed["nested"].clone();
+        }
+        assert!(parsed.get("access_token").is_none());
+        assert_eq!(locked(&state).reads, 1);
+        expect_end(stream.read_record());
+
+        let mut empty_ninth_object = "{}".to_string();
+        let mut empty_ninth_array = "[]".to_string();
+        let mut mixed_ninth_container = "[]".to_string();
+        for depth in 1..9 {
+            empty_ninth_object = format!("{{\"nested\":{empty_ninth_object}}}");
+            empty_ninth_array = format!("[{empty_ninth_array}]");
+            mixed_ninth_container = if depth % 2 == 0 {
+                format!("{{\"nested\":{mixed_ninth_container}}}")
+            } else {
+                format!("[{mixed_ninth_container}]")
+            };
+        }
+        for candidate in [
+            &empty_ninth_object,
+            &empty_ninth_array,
+            &mixed_ninth_container,
+        ] {
+            assert!(
+                super::super::parse_strict_json(candidate).is_err(),
+                "general OAuth strict seed depth remains eight"
+            );
+        }
+        for (label, json) in [
+            ("empty-ninth-object", empty_ninth_object),
+            ("empty-ninth-array", empty_ninth_array),
+            ("mixed-ninth-container", mixed_ninth_container),
+        ] {
+            let (_store, access) = issue_access(label);
+            let body = format!("data: {json}\n\n").into_bytes();
+            let (transport, _state) =
+                make_transport(200, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+            let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+            let cancel = Arc::new(ScriptedCancel::new());
+            let host = make_host(transport, &clock, &cancel);
+            let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+            assert_eq!(
+                expect_error(stream.read_record()).code(),
+                "malformed_response",
+                "{label} must be rejected at nine containers"
+            );
+        }
+
+        let mut too_deep = r#"{"value":"leaf"}"#.to_string();
+        for _ in 0..8 {
+            too_deep = format!("{{\"nested\":{too_deep}}}");
+        }
+        let body = format!("data: {too_deep}\n\n").into_bytes();
+        let (transport, _state) =
+            make_transport(200, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let (_depth_store, depth_access) = issue_access("depth-nine");
+        let mut stream = start_stream(&host, depth_access, &cancel, vec!["DONE".to_string()]);
+        assert_eq!(
+            expect_error(stream.read_record()).code(),
+            "malformed_response"
+        );
+    }
+
+    #[test]
+    fn sanitized_sse_missing_mime_error_reads_bounded_json_body() {
+        let (_store, access) = issue_access("missing-mime-error");
+        let body = br#"{"error":{"type":"invalid_request_error","message":"safe error","access_token":"SYNTHETIC_SECRET"}}"#.to_vec();
+        let (transport, state) =
+            make_transport(400, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+
+        assert_eq!(stream.head().status, 400);
+        assert_eq!(stream.head().content_type, "");
+        let text = json_text(expect_record(stream.read_record()));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json parses");
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+        assert!(parsed["error"].get("access_token").is_none());
+        assert!(!text.contains("SYNTHETIC_SECRET"));
+        assert_eq!(locked(&state).reads, 2);
         expect_end(stream.read_record());
     }
 

@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 use crate::auth::pkce::{self, PKCE_CHALLENGE_METHOD, PkceError};
 use crate::auth::request_body::{self, SecretField};
 
+mod codex_metadata;
 /// Native authenticated sanitized incremental SSE-record security adapter.
 pub(crate) mod sanitized_sse;
 use crate::auth::store::{AuthStoreError, OpaqueRefreshHandle, OpaqueSecretSlot, SecretSlotKind};
@@ -95,6 +96,12 @@ pub struct TrustedEndpoint {
     pub path_prefix: String,
 }
 
+/// Closed administrator-authorized identity source for native transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrustedTransportIdentity {
+    CodexAccessClaim { endpoint: TrustedEndpoint },
+}
+
 /// Host-resolved transport policy. RSS cannot construct or widen it.
 #[derive(Clone, Debug)]
 pub struct TrustedTransportPolicy {
@@ -103,6 +110,7 @@ pub struct TrustedTransportPolicy {
     pub deadline: Instant,
     pub endpoints: Vec<TrustedEndpoint>,
     pub allowed_header_names: BTreeSet<String>,
+    pub transport_identity: Option<TrustedTransportIdentity>,
 }
 
 /// Public provider request. It has no credential field.
@@ -642,6 +650,9 @@ pub enum OAuthError {
     Cancelled,
     DeadlineExceeded,
     InvalidIntent { reason: String },
+    CodexMetadataUnavailable,
+    CodexMetadataInvalid,
+    CodexMetadataConflict,
     Transport { message: String },
 }
 
@@ -668,6 +679,9 @@ impl OAuthError {
             Self::Cancelled => "cancelled",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::InvalidIntent { .. } => "invalid_intent",
+            Self::CodexMetadataUnavailable => "codex_metadata_unavailable",
+            Self::CodexMetadataInvalid => "codex_metadata_invalid",
+            Self::CodexMetadataConflict => "codex_metadata_conflict",
             Self::Transport { .. } => "transport_error",
         }
     }
@@ -704,6 +718,15 @@ impl fmt::Display for OAuthError {
             Self::Cancelled => formatter.write_str("oauth primitive was cancelled"),
             Self::DeadlineExceeded => formatter.write_str("oauth primitive deadline exceeded"),
             Self::InvalidIntent { reason } => write!(formatter, "invalid oauth intent: {reason}"),
+            Self::CodexMetadataUnavailable => {
+                formatter.write_str("required Codex credential metadata is unavailable")
+            }
+            Self::CodexMetadataInvalid => {
+                formatter.write_str("Codex credential metadata is invalid")
+            }
+            Self::CodexMetadataConflict => {
+                formatter.write_str("Codex credential metadata conflicts")
+            }
             Self::Transport { message } => write!(formatter, "transport error: {message}"),
         }
     }
@@ -1488,7 +1511,7 @@ impl OAuthHost {
         // Only now consume the one-shot access and inject the shared final
         // Bearer. If injection fails the slot is already terminal and the
         // request is aborted before any transport call.
-        inject_access_authorization(&mut headers, &access)?;
+        inject_access_authorization(&mut headers, &access, policy, endpoint, &request.path)?;
         let prepared = PreparedHttpsRequest {
             method,
             url: format!("https://{}{}", endpoint.authority, request.path),
@@ -1728,7 +1751,13 @@ impl OAuthHost {
         match credential_use {
             CredentialUse::None => {}
             CredentialUse::Access(handle) => {
-                inject_access_authorization(&mut prepared.headers, &handle)?;
+                inject_access_authorization(
+                    &mut prepared.headers,
+                    &handle,
+                    policy,
+                    endpoint,
+                    &request.path,
+                )?;
             }
             CredentialUse::Refresh(handle) => {
                 let secret = handle.take_for_transport()?;
@@ -2721,6 +2750,14 @@ fn admit_headers(
     let mut admitted = BTreeMap::new();
     for (name, value) in headers {
         let lowered = name.to_ascii_lowercase();
+        if policy.transport_identity.is_some()
+            && matches!(
+                lowered.as_str(),
+                "chatgpt-account-id" | "originator" | "user-agent"
+            )
+        {
+            return Err(OAuthError::CodexMetadataConflict);
+        }
         if matches!(
             lowered.as_str(),
             "authorization" | "cookie" | "host" | "cookie2" | "proxy-authorization"
@@ -2788,8 +2825,31 @@ fn append_form(body: &mut String, key: &str, value: &str) {
 fn inject_access_authorization(
     headers: &mut BTreeMap<String, String>,
     handle: &crate::auth::store::OpaqueAccessHandle,
+    policy: &TrustedTransportPolicy,
+    endpoint: &TrustedEndpoint,
+    path: &str,
 ) -> Result<(), OAuthError> {
     let secret = handle.take_for_transport()?;
+    if let Some(TrustedTransportIdentity::CodexAccessClaim {
+        endpoint: identity_endpoint,
+    }) = &policy.transport_identity
+        && identity_endpoint.authority == endpoint.authority
+        && path_matches(&identity_endpoint.path_prefix, path)
+    {
+        if ["chatgpt-account-id", "originator", "user-agent"]
+            .iter()
+            .any(|name| headers.contains_key(*name))
+        {
+            return Err(OAuthError::CodexMetadataConflict);
+        }
+        let account_id = codex_metadata::account_id_from_access_token(secret.as_str())?;
+        headers.insert("chatgpt-account-id".to_string(), account_id);
+        headers.insert("originator".to_string(), "codex_cli_rs".to_string());
+        headers.insert(
+            "user-agent".to_string(),
+            "rustscript-agent-access-e2e/0.1".to_string(),
+        );
+    }
     headers.insert(
         "authorization".to_string(),
         format!("Bearer {}", secret.as_str()),
@@ -2879,6 +2939,8 @@ fn percent_decode(value: &str) -> String {
 
 struct StrictJsonSeed {
     depth: usize,
+    max_depth: usize,
+    max_container_depth: Option<usize>,
 }
 
 impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
@@ -2888,17 +2950,23 @@ impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
     where
         D: serde::Deserializer<'de>,
     {
-        if self.depth > MAX_JSON_DEPTH {
+        if self.depth > self.max_depth {
             return Err(<D::Error as serde::de::Error>::custom(
                 "response JSON exceeds depth",
             ));
         }
-        deserializer.deserialize_any(StrictJsonVisitor { depth: self.depth })
+        deserializer.deserialize_any(StrictJsonVisitor {
+            depth: self.depth,
+            max_depth: self.max_depth,
+            max_container_depth: self.max_container_depth,
+        })
     }
 }
 
 struct StrictJsonVisitor {
     depth: usize,
+    max_depth: usize,
+    max_container_depth: Option<usize>,
 }
 
 impl<'de> Visitor<'de> for StrictJsonVisitor {
@@ -2963,9 +3031,19 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     where
         A: SeqAccess<'de>,
     {
+        if self
+            .max_container_depth
+            .is_some_and(|max_depth| self.depth > max_depth)
+        {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "response JSON exceeds container depth",
+            ));
+        }
         let mut values = Vec::new();
         while let Some(value) = sequence.next_element_seed(StrictJsonSeed {
             depth: self.depth + 1,
+            max_depth: self.max_depth,
+            max_container_depth: self.max_container_depth,
         })? {
             values.push(value);
         }
@@ -2976,6 +3054,14 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     where
         A: MapAccess<'de>,
     {
+        if self
+            .max_container_depth
+            .is_some_and(|max_depth| self.depth > max_depth)
+        {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "response JSON exceeds container depth",
+            ));
+        }
         let mut values = JsonMap::new();
         let mut seen = HashSet::new();
         while let Some(key) = object.next_key::<String>()? {
@@ -2986,6 +3072,8 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
             }
             let value = object.next_value_seed(StrictJsonSeed {
                 depth: self.depth + 1,
+                max_depth: self.max_depth,
+                max_container_depth: self.max_container_depth,
             })?;
             values.insert(key, value);
         }
@@ -2994,12 +3082,28 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
 }
 
 fn parse_strict_json(text: &str) -> Result<JsonValue, OAuthError> {
+    parse_strict_json_with_depth(text, MAX_JSON_DEPTH)
+}
+
+fn parse_strict_json_with_depth(text: &str, max_depth: usize) -> Result<JsonValue, OAuthError> {
+    parse_strict_json_with_limits(text, max_depth, None)
+}
+
+fn parse_strict_json_with_limits(
+    text: &str,
+    max_depth: usize,
+    max_container_depth: Option<usize>,
+) -> Result<JsonValue, OAuthError> {
     let mut deserializer = serde_json::Deserializer::from_str(text);
-    let parsed = StrictJsonSeed { depth: 1 }
-        .deserialize(&mut deserializer)
-        .map_err(|error| OAuthError::MalformedResponse {
-            reason: error.to_string(),
-        })?;
+    let parsed = StrictJsonSeed {
+        depth: 1,
+        max_depth,
+        max_container_depth,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| OAuthError::MalformedResponse {
+        reason: error.to_string(),
+    })?;
     deserializer
         .end()
         .map_err(|error| OAuthError::MalformedResponse {
@@ -3600,6 +3704,7 @@ mod exchange_pair_binding_tests {
                 path_prefix: "/oauth".to_string(),
             }],
             allowed_header_names: BTreeSet::new(),
+            transport_identity: None,
         }
     }
 
@@ -3837,6 +3942,7 @@ mod native_selected_cleanup_tests {
                 path_prefix: "/oauth".to_string(),
             }],
             allowed_header_names: BTreeSet::new(),
+            transport_identity: None,
         }
     }
 
@@ -4407,6 +4513,7 @@ mod authenticated_stream_tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            transport_identity: None,
         }
     }
 
