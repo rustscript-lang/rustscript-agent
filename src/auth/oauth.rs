@@ -2940,6 +2940,7 @@ fn percent_decode(value: &str) -> String {
 struct StrictJsonSeed {
     depth: usize,
     max_depth: usize,
+    max_container_depth: Option<usize>,
 }
 
 impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
@@ -2957,6 +2958,7 @@ impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
         deserializer.deserialize_any(StrictJsonVisitor {
             depth: self.depth,
             max_depth: self.max_depth,
+            max_container_depth: self.max_container_depth,
         })
     }
 }
@@ -2964,6 +2966,7 @@ impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
 struct StrictJsonVisitor {
     depth: usize,
     max_depth: usize,
+    max_container_depth: Option<usize>,
 }
 
 impl<'de> Visitor<'de> for StrictJsonVisitor {
@@ -3028,10 +3031,19 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     where
         A: SeqAccess<'de>,
     {
+        if self
+            .max_container_depth
+            .is_some_and(|max_depth| self.depth > max_depth)
+        {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "response JSON exceeds container depth",
+            ));
+        }
         let mut values = Vec::new();
         while let Some(value) = sequence.next_element_seed(StrictJsonSeed {
             depth: self.depth + 1,
             max_depth: self.max_depth,
+            max_container_depth: self.max_container_depth,
         })? {
             values.push(value);
         }
@@ -3042,6 +3054,14 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     where
         A: MapAccess<'de>,
     {
+        if self
+            .max_container_depth
+            .is_some_and(|max_depth| self.depth > max_depth)
+        {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "response JSON exceeds container depth",
+            ));
+        }
         let mut values = JsonMap::new();
         let mut seen = HashSet::new();
         while let Some(key) = object.next_key::<String>()? {
@@ -3053,6 +3073,7 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
             let value = object.next_value_seed(StrictJsonSeed {
                 depth: self.depth + 1,
                 max_depth: self.max_depth,
+                max_container_depth: self.max_container_depth,
             })?;
             values.insert(key, value);
         }
@@ -3065,10 +3086,19 @@ fn parse_strict_json(text: &str) -> Result<JsonValue, OAuthError> {
 }
 
 fn parse_strict_json_with_depth(text: &str, max_depth: usize) -> Result<JsonValue, OAuthError> {
+    parse_strict_json_with_limits(text, max_depth, None)
+}
+
+fn parse_strict_json_with_limits(
+    text: &str,
+    max_depth: usize,
+    max_container_depth: Option<usize>,
+) -> Result<JsonValue, OAuthError> {
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let parsed = StrictJsonSeed {
         depth: 1,
         max_depth,
+        max_container_depth,
     }
     .deserialize(&mut deserializer)
     .map_err(|error| OAuthError::MalformedResponse {

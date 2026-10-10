@@ -17,7 +17,7 @@ use crate::auth::store::OpaqueAccessHandle;
 
 use super::{
     BoundedHttpsStream, MAX_JSON_DEPTH, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext,
-    ProviderRequest, TrustedTransportPolicy, parse_strict_json_with_depth, retry_after_ms,
+    ProviderRequest, TrustedTransportPolicy, parse_strict_json_with_limits, retry_after_ms,
     strip_secret_keys,
 };
 
@@ -459,7 +459,7 @@ impl SanitizedAccessSseStream {
     fn sanitize_json(text: &str) -> Result<SanitizedSseRecord, OAuthError> {
         // The custom parser counts primitive leaves as one seed level beyond
         // container nesting; allow that leaf for the existing container cap.
-        let parsed = parse_strict_json_with_depth(text, MAX_JSON_DEPTH + 1)
+        let parsed = parse_strict_json_with_limits(text, MAX_JSON_DEPTH + 1, Some(MAX_JSON_DEPTH))
             .map_err(|_| static_malformed("sse data is not strict json"))?;
         let cleaned = strip_secret_keys(parsed);
         if !matches!(cleaned, JsonValue::Object(_) | JsonValue::Array(_)) {
@@ -1268,6 +1268,48 @@ mod sanitized_sse_tests {
         assert!(parsed.get("access_token").is_none());
         assert_eq!(locked(&state).reads, 1);
         expect_end(stream.read_record());
+
+        let mut empty_ninth_object = "{}".to_string();
+        let mut empty_ninth_array = "[]".to_string();
+        let mut mixed_ninth_container = "[]".to_string();
+        for depth in 1..9 {
+            empty_ninth_object = format!("{{\"nested\":{empty_ninth_object}}}");
+            empty_ninth_array = format!("[{empty_ninth_array}]");
+            mixed_ninth_container = if depth % 2 == 0 {
+                format!("{{\"nested\":{mixed_ninth_container}}}")
+            } else {
+                format!("[{mixed_ninth_container}]")
+            };
+        }
+        for candidate in [
+            &empty_ninth_object,
+            &empty_ninth_array,
+            &mixed_ninth_container,
+        ] {
+            assert!(
+                super::super::parse_strict_json(candidate).is_err(),
+                "general OAuth strict seed depth remains eight"
+            );
+        }
+        for (label, json) in [
+            ("empty-ninth-object", empty_ninth_object),
+            ("empty-ninth-array", empty_ninth_array),
+            ("mixed-ninth-container", mixed_ninth_container),
+        ] {
+            let (_store, access) = issue_access(label);
+            let body = format!("data: {json}\n\n").into_bytes();
+            let (transport, _state) =
+                make_transport(200, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
+            let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+            let cancel = Arc::new(ScriptedCancel::new());
+            let host = make_host(transport, &clock, &cancel);
+            let mut stream = start_stream(&host, access, &cancel, vec!["DONE".to_string()]);
+            assert_eq!(
+                expect_error(stream.read_record()).code(),
+                "malformed_response",
+                "{label} must be rejected at nine containers"
+            );
+        }
 
         let mut too_deep = r#"{"value":"leaf"}"#.to_string();
         for _ in 0..8 {

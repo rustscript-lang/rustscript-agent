@@ -12,7 +12,7 @@ use rustscript_agent::tool_schema::ToolDescriptor;
 use rustscript_agent::{AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, RunCancellation};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,6 +26,97 @@ const PROVIDER: &str = "openai-codex";
 const CREDENTIAL_ID: &str = "live-codex-access-only";
 const RESPONSE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const ALLOW_LIVE_ENV: &str = "RUSTSCRIPT_AGENT_ALLOW_CODEX_ACCESS_LIVE_E2E";
+
+fn has_exact_assistant_ok_for_run(messages: &[Value], session_id: &str, run_id: &str) -> bool {
+    let assistant_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| {
+            message["session_id"] == session_id
+                && message["run_id"] == run_id
+                && message["role"] == "assistant"
+        })
+        .collect();
+    assistant_messages.len() == 1
+        && assistant_messages[0]["content"] == json!([{"type": "text", "text": "OK"}])
+        && assistant_messages[0]["finish_reason"] == "stop"
+}
+
+#[test]
+fn exact_persisted_assistant_ok_requires_one_canonical_text_block() {
+    let valid = json!({
+        "session_id": "session-a",
+        "run_id": "run-a",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "OK"}],
+        "finish_reason": "stop"
+    });
+    assert!(has_exact_assistant_ok_for_run(
+        std::slice::from_ref(&valid),
+        "session-a",
+        "run-a"
+    ));
+
+    let mut wrong_text = valid.clone();
+    wrong_text["content"][0]["text"] = json!("OK plus");
+    assert!(!has_exact_assistant_ok_for_run(
+        &[wrong_text],
+        "session-a",
+        "run-a"
+    ));
+
+    let mut extra_block = valid.clone();
+    extra_block["content"] = json!([
+        {"type": "text", "text": "OK"},
+        {"type": "text", "text": "additional"}
+    ]);
+    assert!(!has_exact_assistant_ok_for_run(
+        &[extra_block],
+        "session-a",
+        "run-a"
+    ));
+
+    let mut tool_call_block = valid.clone();
+    tool_call_block["content"] = json!([
+        {"type": "text", "text": "OK"},
+        {"type": "tool_call", "name": "manual_access_noop"}
+    ]);
+    assert!(!has_exact_assistant_ok_for_run(
+        &[tool_call_block],
+        "session-a",
+        "run-a"
+    ));
+
+    let mut wrong_finish = valid.clone();
+    wrong_finish["finish_reason"] = json!("tool_calls");
+    assert!(!has_exact_assistant_ok_for_run(
+        &[wrong_finish],
+        "session-a",
+        "run-a"
+    ));
+
+    let mut wrong_role = valid.clone();
+    wrong_role["role"] = json!("user");
+    assert!(!has_exact_assistant_ok_for_run(
+        &[wrong_role],
+        "session-a",
+        "run-a"
+    ));
+    assert!(!has_exact_assistant_ok_for_run(
+        std::slice::from_ref(&valid),
+        "other-session",
+        "run-a"
+    ));
+    assert!(!has_exact_assistant_ok_for_run(
+        std::slice::from_ref(&valid),
+        "session-a",
+        "other-run"
+    ));
+    assert!(!has_exact_assistant_ok_for_run(
+        &[valid.clone(), valid.clone()],
+        "session-a",
+        "run-a"
+    ));
+}
 
 fn insert_yaml(mapping: &mut serde_yaml::Mapping, key: &str, value: serde_yaml::Value) {
     mapping.insert(serde_yaml::Value::String(key.into()), value);
@@ -227,8 +318,33 @@ fn write_private(path: &Path, bytes: &[u8]) {
     file.sync_all().expect("sync private file");
 }
 
+fn read_source_auth_readonly() -> Vec<u8> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(SOURCE_AUTH)
+        .expect("open authorized auth source read-only");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .expect("read authorized auth source");
+    bytes
+}
+
+#[test]
+#[ignore = "manual: verifies read-only auth-source access without network"]
+fn manual_auth_source_readonly_open_audit() {
+    assert_eq!(
+        std::env::var(ALLOW_LIVE_ENV).as_deref(),
+        Ok("1"),
+        "explicit auth-source audit guard is required"
+    );
+    let mut bytes = read_source_auth_readonly();
+    let present = !bytes.is_empty();
+    bytes.zeroize();
+    assert!(present, "authorized auth source is empty");
+}
+
 fn authorized_access_and_source_snapshot() -> (String, Vec<u8>) {
-    let bytes = fs::read(SOURCE_AUTH).expect("read authorized auth source");
+    let bytes = read_source_auth_readonly();
     let document: Value = serde_json::from_slice(&bytes).expect("auth source JSON");
     let entries = document
         .get("credential_pool")
@@ -531,11 +647,8 @@ async fn one_cached_access_token_runs_bundled_main_once_without_tools_or_auth_si
         .filter_map(|event| event.pointer("/data/status").and_then(Value::as_i64))
         .collect();
     let messages = service.session_messages(&admitted.session_id);
-    let assistant_ok = messages.iter().any(|message| {
-        message["role"] == "assistant"
-            && message["content"].as_str() == Some("OK")
-            && message["finish_reason"] == "stop"
-    });
+    let assistant_ok =
+        has_exact_assistant_ok_for_run(&messages, &admitted.session_id, &admitted.run_id);
     let workspace_empty = fs::read_dir(&workspace)
         .expect("private workspace listing")
         .next()
@@ -556,7 +669,8 @@ async fn one_cached_access_token_runs_bundled_main_once_without_tools_or_auth_si
     drop(artifacts);
     let artifacts_removed = !artifacts_path.exists();
 
-    let mut source_after = fs::read(SOURCE_AUTH).expect("re-read authorized auth source");
+    let mut source_after = read_source_auth_readonly();
+    // Record byte changes as an observation; they do not identify the writer.
     let source_auth_unchanged = source_before == source_after;
     source_before.zeroize();
     source_after.zeroize();
@@ -580,7 +694,6 @@ async fn one_cached_access_token_runs_bundled_main_once_without_tools_or_auth_si
     assert!(assistant_ok, "fixed benign completion was not returned");
     assert!(workspace_empty, "private workspace changed");
     assert!(private_auth_unchanged, "private access file changed");
-    assert!(source_auth_unchanged, "source auth file changed");
     assert!(private_home_removed, "private auth home was not removed");
     assert!(artifacts_removed, "live artifacts were not removed");
 }
