@@ -507,11 +507,7 @@ impl ConfigFile {
                     "a named-workspace key must be 1..64 characters of [A-Za-z0-9_-]",
                 ));
             }
-            validate_absolute_workspace(
-                path,
-                source,
-                &format!("workspaces.named.{name}"),
-            )?;
+            validate_absolute_workspace(path, source, &format!("workspaces.named.{name}"))?;
             if !self
                 .workspaces
                 .allowed_roots
