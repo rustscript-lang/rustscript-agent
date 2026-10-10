@@ -23,7 +23,11 @@ pub fn begin() -> map {
         reasoning: "",
         stop_reason: "",
         tools: [],
+        sealed_items: [],
+        sealed_invalid: false,
+        sealed_conflict: false,
         final: null,
+        completed_event: false,
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
@@ -49,6 +53,22 @@ fn field_is_array(container: map, key: string) -> bool {
     let mut result: bool = false;
     if container.has(key) {
         result = type(container[key]) == "array";
+    }
+    result
+}
+
+fn field_is_int(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "int";
+    }
+    result
+}
+
+fn field_is_string(container: map, key: string) -> bool {
+    let mut result: bool = false;
+    if container.has(key) {
+        result = type(container[key]) == "string";
     }
     result
 }
@@ -177,14 +197,137 @@ fn codec_merge_args(state: map, index: int, fragment: string) -> map {
 }
 
 fn codec_item_done(state: map, chunk: map) -> map {
-    let item: map = types::request_map(chunk, "item");
-    let item_type: string = types::request_string(item, "type");
-    let result: map = if item_type == "function_call" => {
-        codec_store_call(state, chunk, item)
+    let item_present: bool = field_is_map(chunk, "item");
+    let result: map = if item_present => {
+        let item: map = types::request_map(chunk, "item");
+        let item_type: string = types::request_string(item, "type");
+        let sealed: map = codec_record_sealed_item(state, chunk.copy(), item.copy());
+        let stored: map = if item_type == "function_call" => {
+            codec_store_call(sealed, chunk, item)
+        } else => {
+            sealed
+        };
+        stored
     } else => {
-        state
+        codec_mark_sealed_invalid(state)
     };
     result
+}
+
+fn codec_mark_sealed_invalid(state: map) -> map {
+    let mut result: map = state;
+    result["sealed_invalid"] = true;
+    result
+}
+
+fn codec_record_sealed_item(state: map, chunk: map, item: map) -> map {
+    let index_valid: bool = field_is_int(chunk, "output_index");
+    let index: int = types::request_int(chunk, "output_index", -1);
+    let item_valid: bool = codec_sealed_item_valid(item.copy());
+    let result: map = if !index_valid || index < 0 || !item_valid => {
+        codec_mark_sealed_invalid(state)
+    } else => {
+        let items: array = types::request_array(state, "sealed_items");
+        let mut merged: array = [];
+        let mut found = false;
+        let mut inserted = false;
+        let mut i = 0;
+        while i < items.length {
+            let entry: map = types::array_entry(items, i);
+            let current: int = types::request_int(entry, "index", -1);
+            if current == index {
+                merged[merged.length] = entry;
+                found = true;
+            } else {
+                if !inserted && current > index {
+                    merged[merged.length] = { index: index, item: item.copy() };
+                    inserted = true;
+                }
+                merged[merged.length] = entry;
+            }
+            i += 1;
+        }
+        let updated: map = if found => {
+            let mut conflict_state: map = state;
+            conflict_state["sealed_conflict"] = true;
+            conflict_state
+        } else => {
+            if !inserted {
+                merged[merged.length] = { index: index, item: item.copy() };
+            }
+            let mut next: map = state;
+            next["sealed_items"] = merged;
+            next
+        };
+        updated
+    };
+    result
+}
+
+fn codec_sealed_item_valid(item: map) -> bool {
+    let item_type: string = types::request_string(item, "type");
+    let status: string = types::request_string(item, "status");
+    let valid: bool = if item_type == "message" => {
+        status == "completed"
+            && types::request_string(item, "role") == "assistant"
+            && field_is_array(item, "content")
+            && codec_valid_message_content(types::request_array(item, "content"))
+    } else if item_type == "function_call" => {
+        status == "completed"
+            && (types::request_string(item, "call_id") != ""
+                || types::request_string(item, "id") != "")
+            && types::request_string(item, "name") != ""
+            && field_is_string(item, "arguments")
+    } else if item_type == "reasoning" => {
+        (!item.has("status") || status == "completed")
+            && field_is_array(item, "summary")
+            && codec_valid_reasoning_summary(types::request_array(item, "summary"))
+    } else => {
+        false
+    };
+    valid
+}
+
+fn codec_valid_message_content(parts: array) -> bool {
+    let mut valid = true;
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        let part_type: string = types::request_string(part, "type");
+        let part_valid: bool = if part_type == "output_text"
+            || part_type == "text"
+            || part_type == "summary_text" => {
+            field_is_string(part, "text")
+        } else if part_type == "refusal" => {
+            field_is_string(part, "refusal")
+        } else => {
+            false
+        };
+        if !part_valid {
+            valid = false;
+        }
+        i += 1;
+    }
+    valid
+}
+
+fn codec_valid_reasoning_summary(parts: array) -> bool {
+    let mut valid = true;
+    let mut i = 0;
+    while i < parts.length {
+        let part: map = types::array_entry(parts, i);
+        let part_type: string = types::request_string(part, "type");
+        let part_valid: bool = if part_type == "summary_text" || part_type == "text" => {
+            field_is_string(part, "text")
+        } else => {
+            false
+        };
+        if !part_valid {
+            valid = false;
+        }
+        i += 1;
+    }
+    valid
 }
 
 /// Records one completed function-call item authoritatively (overwrites any
@@ -223,6 +366,7 @@ fn codec_store_call(state: map, chunk: map, item: map) -> map {
 fn codec_completed(state: map, chunk: map) -> map {
     let has_response: bool = field_is_map(chunk, "response");
     let mut result: map = state;
+    result["completed_event"] = true;
     if has_response {
         result["final"] = types::request_map(chunk, "response");
     }
@@ -274,11 +418,65 @@ pub fn finish(state: map) -> map {
 fn codec_success(state: map) -> map {
     let final_present: bool = field_is_map(state, "final");
     let result: map = if final_present => {
-        responses_canonical_from_body(types::request_map(state, "final"))
+        let body: map = types::request_map(state, "final");
+        let status: string = types::request_string(body, "status");
+        let output_is_array: bool = field_is_array(body, "output");
+        let output: array = types::request_array(body, "output");
+        let compact_completed: bool = status == "completed"
+            && output_is_array
+            && output.length == 0;
+        let terminal_status: bool = status == "failed" || status == "incomplete";
+        let canonical: map = if terminal_status => {
+            responses_parse_body(body)
+        } else if compact_completed => {
+            codec_compact_completed_body(state, body)
+        } else => {
+            responses_canonical_from_body(body)
+        };
+        canonical
     } else => {
-        codec_canonical_accumulated(state)
+        let completed_event: bool = types::request_bool(state, "completed_event", false);
+        let conflict: bool = types::request_bool(state, "sealed_conflict", false);
+        let accumulated: map = if completed_event => {
+            responses_canonical_result("", [], types::usage_new(0, 0, 0), "", "")
+        } else if conflict => {
+            types::fail(types::error_malformed(
+                0,
+                "malformed Responses stream: conflicting completed output indices"
+            ))
+        } else => {
+            codec_canonical_accumulated(state)
+        };
+        accumulated
     };
     result
+}
+
+fn codec_compact_completed_body(state: map, body: map) -> map {
+    let invalid: bool = types::request_bool(state, "sealed_invalid", false);
+    let conflict: bool = types::request_bool(state, "sealed_conflict", false);
+    let items: array = types::request_array(state, "sealed_items");
+    let can_reconstruct: bool = !invalid && !conflict && items.length > 0;
+    let result: map = if can_reconstruct => {
+        let output: array = codec_sealed_output_items(items);
+        let mut reconstructed: map = body;
+        reconstructed["output"] = output;
+        responses_canonical_from_body(reconstructed)
+    } else => {
+        responses_canonical_from_body(body)
+    };
+    result
+}
+
+fn codec_sealed_output_items(items: array) -> array {
+    let mut output: array = [];
+    let mut i = 0;
+    while i < items.length {
+        let entry: map = types::array_entry(items, i);
+        output[output.length] = types::request_map(entry, "item");
+        i += 1;
+    }
+    output
 }
 
 /// Canonical response built from a complete Responses `response` object.

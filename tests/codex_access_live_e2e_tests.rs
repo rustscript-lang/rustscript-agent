@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
@@ -556,8 +556,8 @@ fn decode_base64url(input: &str) -> Option<Vec<u8>> {
 struct RequestCounts {
     allowed: AtomicUsize,
     blocked: AtomicUsize,
-    request_shape: Mutex<RequestShape>,
-    response_shape: Arc<Mutex<ResponseShape>>,
+    fixed_prompt_validated: AtomicUsize,
+    request_guard_validated: AtomicUsize,
 }
 
 struct OneResponsePostTransport {
@@ -581,15 +581,17 @@ impl OneResponsePostTransport {
             });
         }
         let wire = serde_json::from_str::<Value>(&request.body).ok();
-        *self
-            .counts
-            .request_shape
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            RequestShape::observe(wire.as_ref());
         let model_ok = wire
             .as_ref()
             .is_some_and(|wire| wire["model"] == "gpt-6.1-sol");
+        let fixed_input_ok = wire
+            .as_ref()
+            .is_some_and(|wire| fixed_prompt_is_one_canonical_user_text(wire.get("input")));
+        if fixed_input_ok {
+            self.counts
+                .fixed_prompt_validated
+                .fetch_add(1, Ordering::SeqCst);
+        }
         let stream_ok = wire.as_ref().is_some_and(|wire| wire["stream"] == true);
         let store_ok = wire.as_ref().is_some_and(|wire| wire["store"] == false);
         let instructions_ok = wire.as_ref().is_some_and(|wire| {
@@ -609,11 +611,14 @@ impl OneResponsePostTransport {
             .and_then(|parameters| parameters.get("additionalProperties"))
             == Some(&Value::Bool(false));
         let tool_type_ok = tool.is_some_and(|tool| tool["type"] == "function");
-        let valid_body = model_ok
+        let tool_name_ok = tool.is_some_and(|tool| tool["name"] == "manual_access_noop");
+        let valid_body = fixed_input_ok
+            && model_ok
             && stream_ok
             && store_ok
             && instructions_ok
             && tool_type_ok
+            && tool_name_ok
             && parameters_object
             && required_empty
             && additional_properties_closed;
@@ -622,6 +627,9 @@ impl OneResponsePostTransport {
                 reason: "manual access E2E request body failed local validation".into(),
             });
         }
+        self.counts
+            .request_guard_validated
+            .fetch_add(1, Ordering::SeqCst);
         if self
             .counts
             .allowed
@@ -653,16 +661,7 @@ impl BoundedHttpsTransport for OneResponsePostTransport {
         context: &OAuthIoContext,
     ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
         self.admit(request)?;
-        let inner = self.inner.start_stream(request, context)?;
-        self.counts
-            .response_shape
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status = Some(inner.head().status);
-        Ok(Box::new(ObservedBoundedStream {
-            inner,
-            observation: Arc::clone(&self.counts.response_shape),
-        }))
+        self.inner.start_stream(request, context)
     }
 }
 
@@ -670,780 +669,52 @@ fn event_count(events: &[Value], name: &str) -> usize {
     events.iter().filter(|event| event["event"] == name).count()
 }
 
-// Test-only observation: bounded safe counters; stream head, chunks, and cancel delegate unchanged.
-const OBSERVED_SSE_RECORD_LIMIT_BYTES: usize = 64 * 1024;
 const EXPECTED_LIVE_PROMPT: &str = "Reply with exactly OK. Do not invoke any tools.";
 
-#[derive(Default)]
-struct RequestShape {
-    seen: bool,
-    json_valid: bool,
-    input_type: &'static str,
-    input_count: usize,
-    user_message_count: usize,
-    input_text_count: usize,
-    fixed_prompt_match: bool,
-    instructions_type: &'static str,
-    instructions_nonempty: bool,
-    model_match: bool,
-    stream_true: bool,
-    store_false: bool,
-    tools_type: &'static str,
-    tools_count: usize,
-    max_output_tokens_numeric: bool,
-    max_output_tokens: Option<i64>,
-    reasoning_type: &'static str,
-    reasoning_effort: &'static str,
-}
-
-impl RequestShape {
-    fn observe(wire: Option<&Value>) -> Self {
-        let mut shape = Self {
-            seen: true,
-            ..Self::default()
-        };
-        let Some(wire) = wire else {
-            return shape;
-        };
-        shape.json_valid = true;
-        let input = wire.get("input");
-        shape.input_type = safe_value_type(input);
-        if let Some(items) = input.and_then(Value::as_array) {
-            shape.input_count = items.len();
-            for item in items {
-                if item.get("role").and_then(Value::as_str) != Some("user") {
-                    continue;
-                }
-                shape.user_message_count = shape.user_message_count.saturating_add(1);
-                if let Some(parts) = item.get("content").and_then(Value::as_array) {
-                    for part in parts {
-                        if part.get("type").and_then(Value::as_str) == Some("input_text") {
-                            shape.input_text_count = shape.input_text_count.saturating_add(1);
-                            shape.fixed_prompt_match |= part.get("text").and_then(Value::as_str)
-                                == Some(EXPECTED_LIVE_PROMPT);
-                        }
-                    }
-                }
-            }
-        }
-        shape.instructions_type = safe_value_type(wire.get("instructions"));
-        shape.instructions_nonempty = wire
-            .get("instructions")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty());
-        shape.model_match = wire.get("model").and_then(Value::as_str) == Some("gpt-6.1-sol");
-        shape.stream_true = wire.get("stream") == Some(&Value::Bool(true));
-        shape.store_false = wire.get("store") == Some(&Value::Bool(false));
-        let tools = wire.get("tools");
-        shape.tools_type = safe_value_type(tools);
-        shape.tools_count = tools.and_then(Value::as_array).map_or(0, Vec::len);
-        let max_output = wire.get("max_output_tokens");
-        shape.max_output_tokens_numeric = max_output.is_some_and(Value::is_number);
-        shape.max_output_tokens = max_output.and_then(Value::as_i64);
-        let reasoning = wire.get("reasoning");
-        shape.reasoning_type = safe_value_type(reasoning);
-        shape.reasoning_effort = match reasoning {
-            None => "missing",
-            Some(Value::Null) => "null",
-            Some(Value::Object(_)) => match reasoning
-                .and_then(|value| value.get("effort"))
-                .and_then(Value::as_str)
-            {
-                Some("none") => "none",
-                Some("minimal") => "minimal",
-                Some("low") => "low",
-                Some("medium") => "medium",
-                Some("high") => "high",
-                Some("xhigh") => "xhigh",
-                Some(_) => "other",
-                None => "missing",
-            },
-            Some(value) => safe_value_type(Some(value)),
-        };
-        shape
+fn fixed_prompt_is_one_canonical_user_text(input: Option<&Value>) -> bool {
+    let Some(messages) = input.and_then(Value::as_array) else {
+        return false;
+    };
+    if messages.len() != 1 {
+        return false;
     }
-
-    fn safe_summary(&self) -> String {
-        format!(
-            "seen={} json_valid={} input_type={} input_count={} user_message_count={} input_text_count={} fixed_prompt_match={} instructions_type={} instructions_nonempty={} model_match={} stream_true={} store_false={} tools_type={} tools_count={} max_output_tokens_numeric={} max_output_tokens={:?} reasoning_type={} reasoning_effort={}",
-            self.seen,
-            self.json_valid,
-            self.input_type,
-            self.input_count,
-            self.user_message_count,
-            self.input_text_count,
-            self.fixed_prompt_match,
-            self.instructions_type,
-            self.instructions_nonempty,
-            self.model_match,
-            self.stream_true,
-            self.store_false,
-            self.tools_type,
-            self.tools_count,
-            self.max_output_tokens_numeric,
-            self.max_output_tokens,
-            self.reasoning_type,
-            self.reasoning_effort
-        )
+    let message = &messages[0];
+    if message.get("type").and_then(Value::as_str) != Some("message")
+        || message.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return false;
     }
-}
-
-#[derive(Default)]
-struct TextShape {
-    count: usize,
-    nonempty: usize,
-    chars: usize,
-}
-
-impl TextShape {
-    fn observe(&mut self, text: &str) {
-        self.count = self.count.saturating_add(1);
-        if !text.is_empty() {
-            self.nonempty = self.nonempty.saturating_add(1);
-        }
-        self.chars = self.chars.saturating_add(text.chars().count());
-    }
-}
-
-#[derive(Default)]
-struct ItemShape {
-    message: usize,
-    reasoning: usize,
-    function_call: usize,
-    other: usize,
-}
-
-impl ItemShape {
-    fn observe(&mut self, item: &Value) {
-        let count = match item.get("type").and_then(Value::as_str) {
-            Some("message") => &mut self.message,
-            Some("reasoning") => &mut self.reasoning,
-            Some("function_call") => &mut self.function_call,
-            _ => &mut self.other,
-        };
-        *count = count.saturating_add(1);
-    }
-}
-
-struct ResponseShape {
-    status: Option<u16>,
-    parse_coverage: bool,
-    parse_errors: usize,
-    read_error: bool,
-    eof_observed: bool,
-    partial_at_eof: bool,
-    output_text_delta: usize,
-    refusal_delta: usize,
-    output_item_done: usize,
-    response_completed: usize,
-    response_incomplete: usize,
-    response_failed: usize,
-    done_marker: usize,
-    other_events: usize,
-    delta_text: TextShape,
-    completed_status_completed: usize,
-    completed_status_incomplete: usize,
-    completed_status_failed: usize,
-    completed_status_missing: usize,
-    completed_status_other: usize,
-    completed_response_missing: usize,
-    completed_response_null: usize,
-    completed_response_other_type: usize,
-    completed_output_missing: usize,
-    completed_output_null: usize,
-    completed_output_other_type: usize,
-    completed_output_arrays: usize,
-    completed_output_items: usize,
-    output_items: ItemShape,
-    done_items: ItemShape,
-    content_missing: usize,
-    content_null: usize,
-    content_other_type: usize,
-    content_arrays: usize,
-    content_parts_output_text: usize,
-    content_parts_refusal: usize,
-    content_parts_other: usize,
-    output_text: TextShape,
-    refusal_text: TextShape,
-    reasoning_summary_arrays: usize,
-    reasoning_summary_other_type: usize,
-    reasoning_summary_items: usize,
-    reasoning_summary_text: TextShape,
-    usage_output_tokens_numeric: usize,
-    usage_output_tokens: Option<i64>,
-    usage_reasoning_tokens_numeric: usize,
-    usage_reasoning_tokens: Option<i64>,
-    line: Vec<u8>,
-    data: Vec<u8>,
-    has_data: bool,
-    after_cr: bool,
-    first_line: bool,
-    dropping_record: bool,
-    discard_line_has_bytes: bool,
-}
-
-impl Default for ResponseShape {
-    fn default() -> Self {
-        Self {
-            status: None,
-            parse_coverage: true,
-            parse_errors: 0,
-            read_error: false,
-            eof_observed: false,
-            partial_at_eof: false,
-            output_text_delta: 0,
-            refusal_delta: 0,
-            output_item_done: 0,
-            response_completed: 0,
-            response_incomplete: 0,
-            response_failed: 0,
-            done_marker: 0,
-            other_events: 0,
-            delta_text: TextShape::default(),
-            completed_status_completed: 0,
-            completed_status_incomplete: 0,
-            completed_status_failed: 0,
-            completed_status_missing: 0,
-            completed_status_other: 0,
-            completed_response_missing: 0,
-            completed_response_null: 0,
-            completed_response_other_type: 0,
-            completed_output_missing: 0,
-            completed_output_null: 0,
-            completed_output_other_type: 0,
-            completed_output_arrays: 0,
-            completed_output_items: 0,
-            output_items: ItemShape::default(),
-            done_items: ItemShape::default(),
-            content_missing: 0,
-            content_null: 0,
-            content_other_type: 0,
-            content_arrays: 0,
-            content_parts_output_text: 0,
-            content_parts_refusal: 0,
-            content_parts_other: 0,
-            output_text: TextShape::default(),
-            refusal_text: TextShape::default(),
-            reasoning_summary_arrays: 0,
-            reasoning_summary_other_type: 0,
-            reasoning_summary_items: 0,
-            reasoning_summary_text: TextShape::default(),
-            usage_output_tokens_numeric: 0,
-            usage_output_tokens: None,
-            usage_reasoning_tokens_numeric: 0,
-            usage_reasoning_tokens: None,
-            line: Vec::new(),
-            data: Vec::new(),
-            has_data: false,
-            after_cr: false,
-            first_line: true,
-            dropping_record: false,
-            discard_line_has_bytes: false,
-        }
-    }
-}
-
-impl ResponseShape {
-    fn feed(&mut self, chunk: &[u8]) {
-        for byte in chunk.iter().copied() {
-            if self.dropping_record {
-                self.consume_discarded_byte(byte);
-            } else if byte == b'\r' {
-                self.finish_line();
-                self.after_cr = true;
-            } else if byte == b'\n' {
-                if self.after_cr {
-                    self.after_cr = false;
-                } else {
-                    self.finish_line();
-                }
-            } else {
-                self.after_cr = false;
-                if self.line.len() >= OBSERVED_SSE_RECORD_LIMIT_BYTES {
-                    self.parse_coverage = false;
-                    self.dropping_record = true;
-                    self.discard_line_has_bytes = true;
-                    self.clear_pending();
-                } else {
-                    self.line.push(byte);
-                }
-            }
-        }
-    }
-
-    fn consume_discarded_byte(&mut self, byte: u8) {
-        if byte == b'\r' {
-            self.finish_discarded_line();
-            self.after_cr = true;
-        } else if byte == b'\n' {
-            if self.after_cr {
-                self.after_cr = false;
-            } else {
-                self.finish_discarded_line();
-            }
-        } else {
-            self.after_cr = false;
-            self.discard_line_has_bytes = true;
-        }
-    }
-
-    fn finish_discarded_line(&mut self) {
-        if self.discard_line_has_bytes {
-            self.discard_line_has_bytes = false;
-        } else {
-            self.dropping_record = false;
-            self.has_data = false;
-            self.data.zeroize();
-            self.data.clear();
-            self.first_line = false;
-        }
-    }
-
-    fn finish_line(&mut self) {
-        let mut line = std::mem::take(&mut self.line);
-        if self.first_line {
-            self.first_line = false;
-            if line.starts_with(&[0xef, 0xbb, 0xbf]) {
-                line.drain(..3);
-            }
-        }
-        if line.is_empty() {
-            self.dispatch_data();
-            line.zeroize();
-            return;
-        }
-        if line.starts_with(b"data:") {
-            let mut payload = &line[5..];
-            if payload.first() == Some(&b' ') {
-                payload = &payload[1..];
-            }
-            let separator = usize::from(self.has_data);
-            if self
-                .data
-                .len()
-                .saturating_add(separator)
-                .saturating_add(payload.len())
-                > OBSERVED_SSE_RECORD_LIMIT_BYTES
-            {
-                self.parse_coverage = false;
-                self.dropping_record = true;
-                self.discard_line_has_bytes = false;
-                self.has_data = false;
-                self.data.zeroize();
-                self.data.clear();
-            } else {
-                if self.has_data {
-                    self.data.push(b'\n');
-                }
-                self.data.extend_from_slice(payload);
-                self.has_data = true;
-            }
-        }
-        line.zeroize();
-    }
-
-    fn dispatch_data(&mut self) {
-        if !self.has_data {
-            return;
-        }
-        let mut data = std::mem::take(&mut self.data);
-        self.has_data = false;
-        if data.as_slice() == b"[DONE]" {
-            self.done_marker = self.done_marker.saturating_add(1);
-        } else if let Ok(event) = serde_json::from_slice::<Value>(&data) {
-            self.observe_event(&event);
-        } else {
-            self.parse_errors = self.parse_errors.saturating_add(1);
-            self.parse_coverage = false;
-        }
-        data.zeroize();
-    }
-
-    fn observe_event(&mut self, event: &Value) {
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.output_text.delta") => {
-                self.output_text_delta = self.output_text_delta.saturating_add(1);
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    self.delta_text.observe(delta);
-                }
-            }
-            Some("response.refusal.delta") => {
-                self.refusal_delta = self.refusal_delta.saturating_add(1);
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    self.delta_text.observe(delta);
-                }
-            }
-            Some("response.output_item.done") => {
-                self.output_item_done = self.output_item_done.saturating_add(1);
-                if let Some(item) = event.get("item") {
-                    self.done_items.observe(item);
-                }
-            }
-            Some("response.completed") => {
-                self.response_completed = self.response_completed.saturating_add(1);
-                match event.get("response") {
-                    None => {
-                        self.completed_response_missing =
-                            self.completed_response_missing.saturating_add(1)
-                    }
-                    Some(Value::Null) => {
-                        self.completed_response_null =
-                            self.completed_response_null.saturating_add(1)
-                    }
-                    Some(Value::Object(_)) => {
-                        self.observe_completed_response(event.get("response").unwrap())
-                    }
-                    Some(_) => {
-                        self.completed_response_other_type =
-                            self.completed_response_other_type.saturating_add(1)
-                    }
-                }
-            }
-            Some("response.incomplete") => {
-                self.response_incomplete = self.response_incomplete.saturating_add(1)
-            }
-            Some("response.failed") => {
-                self.response_failed = self.response_failed.saturating_add(1)
-            }
-            _ => self.other_events = self.other_events.saturating_add(1),
-        }
-    }
-
-    fn observe_completed_response(&mut self, response: &Value) {
-        match response.get("status").and_then(Value::as_str) {
-            Some("completed") => {
-                self.completed_status_completed = self.completed_status_completed.saturating_add(1)
-            }
-            Some("incomplete") => {
-                self.completed_status_incomplete =
-                    self.completed_status_incomplete.saturating_add(1)
-            }
-            Some("failed") => {
-                self.completed_status_failed = self.completed_status_failed.saturating_add(1)
-            }
-            None if response.get("status").is_none() => {
-                self.completed_status_missing = self.completed_status_missing.saturating_add(1)
-            }
-            _ => self.completed_status_other = self.completed_status_other.saturating_add(1),
-        }
-        match response.get("output") {
-            None => self.completed_output_missing = self.completed_output_missing.saturating_add(1),
-            Some(Value::Null) => {
-                self.completed_output_null = self.completed_output_null.saturating_add(1)
-            }
-            Some(Value::Array(output)) => {
-                self.completed_output_arrays = self.completed_output_arrays.saturating_add(1);
-                self.completed_output_items =
-                    self.completed_output_items.saturating_add(output.len());
-                for item in output {
-                    self.output_items.observe(item);
-                    self.observe_output_item(item);
-                }
-            }
-            Some(_) => {
-                self.completed_output_other_type =
-                    self.completed_output_other_type.saturating_add(1)
-            }
-        }
-        if let Some(usage) = response.get("usage") {
-            if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_i64) {
-                self.usage_output_tokens_numeric =
-                    self.usage_output_tokens_numeric.saturating_add(1);
-                self.usage_output_tokens = Some(tokens);
-            }
-            let reasoning_tokens = usage.get("reasoning_tokens").or_else(|| {
-                usage
-                    .get("output_tokens_details")
-                    .and_then(|v| v.get("reasoning_tokens"))
-            });
-            if let Some(tokens) = reasoning_tokens.and_then(Value::as_i64) {
-                self.usage_reasoning_tokens_numeric =
-                    self.usage_reasoning_tokens_numeric.saturating_add(1);
-                self.usage_reasoning_tokens = Some(tokens);
-            }
-        }
-    }
-
-    fn observe_output_item(&mut self, item: &Value) {
-        match item.get("type").and_then(Value::as_str) {
-            Some("message") => self.observe_content(item.get("content")),
-            Some("reasoning") => self.observe_reasoning_summary(item.get("summary")),
-            _ => {}
-        }
-    }
-
-    fn observe_content(&mut self, content: Option<&Value>) {
-        let Some(content) = content else {
-            self.content_missing = self.content_missing.saturating_add(1);
-            return;
-        };
-        match content {
-            Value::Null => self.content_null = self.content_null.saturating_add(1),
-            Value::Array(parts) => {
-                self.content_arrays = self.content_arrays.saturating_add(1);
-                for part in parts {
-                    match part.get("type").and_then(Value::as_str) {
-                        Some("output_text") => {
-                            self.content_parts_output_text =
-                                self.content_parts_output_text.saturating_add(1);
-                            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                self.output_text.observe(text);
-                            }
-                        }
-                        Some("refusal") => {
-                            self.content_parts_refusal =
-                                self.content_parts_refusal.saturating_add(1);
-                            if let Some(text) = part
-                                .get("refusal")
-                                .or_else(|| part.get("text"))
-                                .and_then(Value::as_str)
-                            {
-                                self.refusal_text.observe(text);
-                            }
-                        }
-                        _ => self.content_parts_other = self.content_parts_other.saturating_add(1),
-                    }
-                }
-            }
-            _ => self.content_other_type = self.content_other_type.saturating_add(1),
-        }
-    }
-
-    fn observe_reasoning_summary(&mut self, summary: Option<&Value>) {
-        let Some(summary) = summary else {
-            self.reasoning_summary_other_type = self.reasoning_summary_other_type.saturating_add(1);
-            return;
-        };
-        if let Some(parts) = summary.as_array() {
-            self.reasoning_summary_arrays = self.reasoning_summary_arrays.saturating_add(1);
-            self.reasoning_summary_items = self.reasoning_summary_items.saturating_add(parts.len());
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    self.reasoning_summary_text.observe(text);
-                }
-            }
-        } else {
-            self.reasoning_summary_other_type = self.reasoning_summary_other_type.saturating_add(1);
-        }
-    }
-
-    fn observe_eof(&mut self) {
-        self.eof_observed = true;
-        self.partial_at_eof = !self.line.is_empty() || self.has_data || self.dropping_record;
-        if self.partial_at_eof {
-            self.parse_coverage = false;
-        }
-        self.clear_pending();
-    }
-
-    fn clear_pending(&mut self) {
-        self.line.zeroize();
-        self.line.clear();
-        self.data.zeroize();
-        self.data.clear();
-        self.has_data = false;
-    }
-
-    fn safe_summary(&self) -> String {
-        format!(
-            "status={:?} parse_coverage={} parse_errors={} read_error={} eof_observed={} partial_at_eof={} event_output_text_delta={} event_refusal_delta={} event_output_item_done={} event_response_completed={} event_response_incomplete={} event_response_failed={} event_done={} event_other={} delta_count={} delta_nonempty={} delta_chars={} completed_status_completed={} completed_status_incomplete={} completed_status_failed={} completed_status_missing={} completed_status_other={} completed_response_missing={} completed_response_null={} completed_response_other_type={} completed_output_missing={} completed_output_null={} completed_output_other_type={} completed_output_arrays={} completed_output_items={} item_message={} item_reasoning={} item_function_call={} item_other={} done_item_message={} done_item_reasoning={} done_item_function_call={} done_item_other={} content_missing={} content_null={} content_other_type={} content_arrays={} content_output_text={} content_refusal={} content_other={} output_text_count={} output_text_nonempty={} output_text_chars={} refusal_text_count={} refusal_text_nonempty={} refusal_text_chars={} reasoning_summary_arrays={} reasoning_summary_other_type={} reasoning_summary_items={} reasoning_summary_text_count={} reasoning_summary_text_nonempty={} reasoning_summary_text_chars={} usage_output_tokens_numeric={} usage_output_tokens={:?} usage_reasoning_tokens_numeric={} usage_reasoning_tokens={:?}",
-            self.status,
-            self.parse_coverage,
-            self.parse_errors,
-            self.read_error,
-            self.eof_observed,
-            self.partial_at_eof,
-            self.output_text_delta,
-            self.refusal_delta,
-            self.output_item_done,
-            self.response_completed,
-            self.response_incomplete,
-            self.response_failed,
-            self.done_marker,
-            self.other_events,
-            self.delta_text.count,
-            self.delta_text.nonempty,
-            self.delta_text.chars,
-            self.completed_status_completed,
-            self.completed_status_incomplete,
-            self.completed_status_failed,
-            self.completed_status_missing,
-            self.completed_status_other,
-            self.completed_response_missing,
-            self.completed_response_null,
-            self.completed_response_other_type,
-            self.completed_output_missing,
-            self.completed_output_null,
-            self.completed_output_other_type,
-            self.completed_output_arrays,
-            self.completed_output_items,
-            self.output_items.message,
-            self.output_items.reasoning,
-            self.output_items.function_call,
-            self.output_items.other,
-            self.done_items.message,
-            self.done_items.reasoning,
-            self.done_items.function_call,
-            self.done_items.other,
-            self.content_missing,
-            self.content_null,
-            self.content_other_type,
-            self.content_arrays,
-            self.content_parts_output_text,
-            self.content_parts_refusal,
-            self.content_parts_other,
-            self.output_text.count,
-            self.output_text.nonempty,
-            self.output_text.chars,
-            self.refusal_text.count,
-            self.refusal_text.nonempty,
-            self.refusal_text.chars,
-            self.reasoning_summary_arrays,
-            self.reasoning_summary_other_type,
-            self.reasoning_summary_items,
-            self.reasoning_summary_text.count,
-            self.reasoning_summary_text.nonempty,
-            self.reasoning_summary_text.chars,
-            self.usage_output_tokens_numeric,
-            self.usage_output_tokens,
-            self.usage_reasoning_tokens_numeric,
-            self.usage_reasoning_tokens
-        )
-    }
-}
-
-impl Drop for ResponseShape {
-    fn drop(&mut self) {
-        self.clear_pending();
-    }
-}
-
-struct ObservedBoundedStream {
-    inner: Box<dyn BoundedHttpsStream>,
-    observation: Arc<Mutex<ResponseShape>>,
-}
-
-impl BoundedHttpsStream for ObservedBoundedStream {
-    fn head(&self) -> &rustscript_agent::auth::oauth::RawHttpsResponseHead {
-        self.inner.head()
-    }
-
-    fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, OAuthError> {
-        match self.inner.read_chunk() {
-            Ok(Some(chunk)) => {
-                self.observation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .feed(&chunk);
-                Ok(Some(chunk))
-            }
-            Ok(None) => {
-                self.observation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .observe_eof();
-                Ok(None)
-            }
-            Err(error) => {
-                self.observation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .read_error = true;
-                Err(error)
-            }
-        }
-    }
-
-    fn cancel(&mut self) {
-        self.inner.cancel();
-    }
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return false;
+    };
+    content.len() == 1
+        && content[0].get("type").and_then(Value::as_str) == Some("input_text")
+        && content[0].get("text").and_then(Value::as_str) == Some(EXPECTED_LIVE_PROMPT)
 }
 
 #[test]
-fn bounded_split_sse_observer_counts_structure_without_retaining_text() {
-    let events = [
-        json!({"type":"response.output_text.delta","delta":"synthetic-visible-delta"}),
-        json!({"type":"response.refusal.delta","delta":"synthetic-refusal-delta"}),
-        json!({"type":"response.output_item.done","item":{"type":"function_call"}}),
-        json!({
-            "type":"response.completed",
-            "response":{
-                "status":"completed",
-                "output":[
-                    {"type":"message","content":[
-                        {"type":"output_text","text":"synthetic-completed-text"},
-                        {"type":"refusal","refusal":"synthetic-completed-refusal"},
-                        {"type":"other-part","text":"not-counted"}
-                    ]},
-                    {"type":"reasoning","summary":[{"type":"summary_text","text":"synthetic-summary"}]},
-                    {"type":"function_call"}
-                ],
-                "usage":{"output_tokens":42,"output_tokens_details":{"reasoning_tokens":7}}
-            }
-        }),
-        json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
-        json!({"type":"response.completed","response":{"output":null}}),
-        json!({"type":"response.completed","response":{"status":"other-status"}}),
-        json!({"type":"response.incomplete"}),
-        json!({"type":"response.failed"}),
-    ];
-    let mut stream = Vec::new();
-    for event in events {
-        stream.extend_from_slice(b"data: ");
-        stream.extend_from_slice(&serde_json::to_vec(&event).expect("synthetic SSE event"));
-        stream.extend_from_slice(b"\r\n\r\n");
-    }
-    stream.extend_from_slice(b"data: [DONE]\n\n");
+fn live_wire_guard_accepts_only_one_plain_fixed_prompt() {
+    let plain = json!([{
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": EXPECTED_LIVE_PROMPT}]
+    }]);
+    assert!(fixed_prompt_is_one_canonical_user_text(Some(&plain)));
 
-    let mut observation = ResponseShape::default();
-    for chunk in stream.chunks(11) {
-        observation.feed(chunk);
-    }
+    let wrapped = json!([{
+        "type": "message",
+        "role": "user",
+        "content": {"message": EXPECTED_LIVE_PROMPT}
+    }]);
+    assert!(!fixed_prompt_is_one_canonical_user_text(Some(&wrapped)));
 
-    assert!(observation.parse_coverage);
-    assert_eq!(observation.output_text_delta, 1);
-    assert_eq!(observation.refusal_delta, 1);
-    assert_eq!(observation.output_item_done, 1);
-    assert_eq!(observation.response_completed, 4);
-    assert_eq!(observation.response_incomplete, 1);
-    assert_eq!(observation.response_failed, 1);
-    assert_eq!(observation.done_marker, 1);
-    assert_eq!(observation.delta_text.count, 2);
-    assert_eq!(observation.delta_text.nonempty, 2);
-    assert_eq!(
-        observation.delta_text.chars,
-        "synthetic-visible-delta synthetic-refusal-delta"
-            .replace(' ', "")
-            .chars()
-            .count()
-    );
-    assert_eq!(observation.completed_status_completed, 2);
-    assert_eq!(observation.completed_status_missing, 1);
-    assert_eq!(observation.completed_status_other, 1);
-    assert_eq!(observation.completed_output_arrays, 2);
-    assert_eq!(observation.completed_output_items, 3);
-    assert_eq!(observation.completed_output_null, 1);
-    assert_eq!(observation.completed_output_missing, 1);
-    assert_eq!(observation.output_items.message, 1);
-    assert_eq!(observation.output_items.reasoning, 1);
-    assert_eq!(observation.output_items.function_call, 1);
-    assert_eq!(observation.content_parts_output_text, 1);
-    assert_eq!(observation.content_parts_refusal, 1);
-    assert_eq!(observation.content_parts_other, 1);
-    assert_eq!(observation.output_text.count, 1);
-    assert_eq!(observation.output_text.nonempty, 1);
-    assert_eq!(observation.refusal_text.count, 1);
-    assert_eq!(observation.refusal_text.nonempty, 1);
-    assert_eq!(observation.reasoning_summary_arrays, 1);
-    assert_eq!(observation.reasoning_summary_items, 1);
-    assert_eq!(observation.reasoning_summary_text.count, 1);
-    assert_eq!(observation.usage_output_tokens, Some(42));
-    assert_eq!(observation.usage_reasoning_tokens, Some(7));
-    let report = observation.safe_summary();
-    assert!(!report.contains("synthetic"));
-    assert!(observation.line.is_empty());
-    assert!(observation.data.is_empty());
-    stream.zeroize();
+    let wrong = json!([{
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "a different prompt"}]
+    }]);
+    assert!(!fixed_prompt_is_one_canonical_user_text(Some(&wrong)));
+    assert!(!fixed_prompt_is_one_canonical_user_text(None));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1562,6 +833,8 @@ async fn one_cached_access_token_runs_bundled_main_once_without_tools_or_auth_si
     let model_calls = service.metrics().snapshot().model_calls;
     let allowed = counts.allowed.load(Ordering::SeqCst);
     let blocked = counts.blocked.load(Ordering::SeqCst);
+    let fixed_prompt_validated = counts.fixed_prompt_validated.load(Ordering::SeqCst);
+    let request_guard_validated = counts.request_guard_validated.load(Ordering::SeqCst);
 
     let error_codes: Vec<String> = events
         .iter()
@@ -1606,23 +879,12 @@ async fn one_cached_access_token_runs_bundled_main_once_without_tools_or_auth_si
     source_after.zeroize();
 
     eprintln!(
-        "SAFE_LIVE_SUMMARY requested={requested} completed={completed} run_completed={run_completed} tool_started={tool_started} tool_completed={tool_completed} run_failed={run_failed} model_calls={model_calls} allowed_response_posts={allowed} blocked_nonresponse_attempts={blocked} error_codes={error_codes:?} error_statuses={error_statuses:?} workspace_empty={workspace_empty} private_auth_unchanged={private_auth_unchanged} source_auth_unchanged={source_auth_unchanged} private_home_removed={private_home_removed} artifacts_removed={artifacts_removed}"
+        "SAFE_LIVE_SUMMARY requested={requested} completed={completed} run_completed={run_completed} tool_started={tool_started} tool_completed={tool_completed} run_failed={run_failed} model_calls={model_calls} allowed_response_posts={allowed} blocked_nonresponse_attempts={blocked} fixed_prompt_validated={fixed_prompt_validated} request_guard_validated={request_guard_validated} error_codes={error_codes:?} error_statuses={error_statuses:?} workspace_empty={workspace_empty} private_auth_unchanged={private_auth_unchanged} source_auth_unchanged={source_auth_unchanged} private_home_removed={private_home_removed} artifacts_removed={artifacts_removed}"
     );
     eprintln!(
-        "SAFE_WIRE_SHAPE {}",
-        counts
-            .request_shape
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .safe_summary()
-    );
-    eprintln!(
-        "SAFE_RAW_RESPONSE_SHAPE {}",
-        counts
-            .response_shape
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .safe_summary()
+        "SAFE_REQUEST_GUARD fixed_prompt_exact={} full_request_validated_before_send={}",
+        fixed_prompt_validated == 1,
+        request_guard_validated == 1
     );
 
     assert_eq!(requested, 1, "one authorized logical request");
@@ -1636,6 +898,14 @@ async fn one_cached_access_token_runs_bundled_main_once_without_tools_or_auth_si
     assert_eq!(
         blocked, 0,
         "zero token/refresh/login/other endpoint attempts"
+    );
+    assert_eq!(
+        fixed_prompt_validated, 1,
+        "exact plain prompt passed wire guard"
+    );
+    assert_eq!(
+        request_guard_validated, 1,
+        "all request fields passed before send"
     );
     assert!(assistant_ok, "fixed benign completion was not returned");
     assert!(workspace_empty, "private workspace changed");

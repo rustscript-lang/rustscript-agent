@@ -277,6 +277,269 @@ fn completed_event_yields_canonical_text_and_usage() {
 }
 
 #[test]
+fn compact_completed_output_uses_same_stream_sealed_message() {
+    let mut vm = codec_vm();
+    let chunks = json!([
+        {"type": "response.output_text.delta", "output_index": 0, "delta": "draft"},
+        {"type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "message", "id": "msg_compact", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "OK"}]
+        }},
+        {"type": "response.completed", "response": {
+            "status": "completed", "output": [],
+            "usage": {"input_tokens": 2, "output_tokens": 5, "total_tokens": 7}
+        }}
+    ]);
+
+    let result = collect(&mut vm, &chunks, true);
+    assert_eq!(result["ok"], json!(true), "result: {result}");
+    assert_eq!(result["response"]["text"], json!("OK"), "result: {result}");
+    assert_eq!(result["response"]["usage"]["input_tokens"], json!(2));
+    assert_eq!(result["response"]["usage"]["output_tokens"], json!(5));
+    assert_eq!(result["response"]["usage"]["total_tokens"], json!(7));
+}
+
+#[test]
+fn sealed_items_do_not_cross_response_streams() {
+    let mut vm = codec_vm();
+    let completed = json!([
+        {"type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "OK"}]
+        }},
+        {"type": "response.completed", "response": {"status": "completed", "output": []}}
+    ]);
+    let first = collect(&mut vm, &completed, true);
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(first["response"]["text"], json!("OK"));
+
+    let second = collect(
+        &mut vm,
+        &json!([{"type": "response.completed", "response": {"status": "completed", "output": []}}]),
+        true,
+    );
+    assert_eq!(second["ok"], json!(false));
+    assert_eq!(second["error"]["code"], json!("empty_responses_output"));
+    assert_eq!(second["response"], json!({}));
+}
+
+#[test]
+fn compact_completed_items_follow_validated_output_index_order() {
+    let mut vm = codec_vm();
+    let chunks = json!([
+        {"type": "response.output_item.done", "output_index": 4, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "B"}]
+        }},
+        {"type": "response.output_item.done", "output_index": 2, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "A"}]
+        }},
+        {"type": "response.completed", "response": {
+            "status": "completed", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+        }}
+    ]);
+
+    let result = collect(&mut vm, &chunks, true);
+    assert_eq!(result["ok"], json!(true), "result: {result}");
+    assert_eq!(result["response"]["text"], json!("AB"), "result: {result}");
+}
+
+#[test]
+fn compact_completed_refusal_item_becomes_exact_visible_text() {
+    let mut vm = codec_vm();
+    let refusal = "I cannot help with that request.";
+    let chunks = json!([
+        {"type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "refusal", "refusal": refusal}]
+        }},
+        {"type": "response.completed", "response": {
+            "status": "completed", "output": [],
+            "usage": {"input_tokens": 2, "output_tokens": 6, "total_tokens": 8}
+        }}
+    ]);
+
+    let result = collect(&mut vm, &chunks, true);
+    assert_eq!(result["ok"], json!(true), "result: {result}");
+    assert_eq!(
+        result["response"]["text"],
+        json!(refusal),
+        "result: {result}"
+    );
+}
+
+#[test]
+fn compact_output_rejects_delta_only_and_unsealed_items() {
+    let mut vm = codec_vm();
+    let cases = [
+        json!([
+            {"type": "response.output_text.delta", "output_index": 0, "delta": "partial"},
+            {"type": "response.completed", "response": {"status": "completed", "output": []}}
+        ]),
+        json!([
+            {"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "status": "in_progress", "role": "assistant",
+                "content": [{"type": "output_text", "text": "partial"}]
+            }},
+            {"type": "response.completed", "response": {"status": "completed", "output": []}}
+        ]),
+        json!([
+            {"type": "response.output_item.done", "item": {
+                "type": "message", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "unindexed"}]
+            }},
+            {"type": "response.completed", "response": {"status": "completed", "output": []}}
+        ]),
+        json!([
+            {"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text"}]
+            }},
+            {"type": "response.completed", "response": {"status": "completed", "output": []}}
+        ]),
+        json!([
+            {"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "sealed"}]
+            }},
+            {"type": "response.completed", "response": {"status": "completed", "output": null}}
+        ]),
+        json!([
+            {"type": "response.output_text.delta", "output_index": 0, "delta": "partial"},
+            {"type": "response.completed"}
+        ]),
+        json!([
+            {"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "sealed"}]
+            }},
+            {"type": "response.completed", "response": {"status": "completed"}}
+        ]),
+        json!([
+            {"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "sealed"}]
+            }},
+            {"type": "response.completed", "response": {"output": []}}
+        ]),
+    ];
+
+    for chunks in cases {
+        let result = collect(&mut vm, &chunks, true);
+        assert_eq!(
+            result["ok"],
+            json!(false),
+            "invalid compact completion: {result}"
+        );
+        assert_eq!(result["error"]["code"], json!("empty_responses_output"));
+        assert_eq!(result["response"], json!({}));
+    }
+}
+
+#[test]
+fn compact_output_rejects_conflicting_indices_and_terminal_failures() {
+    let mut vm = codec_vm();
+    let conflicting = json!([
+        {"type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "first"}]
+        }},
+        {"type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "second"}]
+        }},
+        {"type": "response.completed", "response": {"status": "completed", "output": []}}
+    ]);
+    let conflict_result = collect(&mut vm, &conflicting, true);
+    assert_eq!(conflict_result["ok"], json!(false));
+    assert_eq!(
+        conflict_result["error"]["code"],
+        json!("empty_responses_output")
+    );
+
+    for event_type in ["response.incomplete", "response.failed"] {
+        let failed = json!([
+            {"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "sealed"}]
+            }},
+            {"type": event_type}
+        ]);
+        let result = collect(&mut vm, &failed, true);
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["response"], json!({}));
+        let expected = if event_type == "response.incomplete" {
+            "responses_incomplete"
+        } else {
+            "responses_failed"
+        };
+        assert_eq!(result["error"]["code"], json!(expected));
+    }
+
+    let no_terminal = json!([{
+        "type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "sealed"}]
+        }
+    }]);
+    let eof_result = collect(&mut vm, &no_terminal, false);
+    assert_eq!(eof_result["ok"], json!(false));
+    assert_eq!(
+        eof_result["error"]["code"],
+        json!("stream_eof_without_response_completed")
+    );
+    assert_eq!(eof_result["response"], json!({}));
+}
+
+#[test]
+fn nonempty_explicit_empty_final_stays_authoritative_over_sealed_item() {
+    let mut vm = codec_vm();
+    let chunks = json!([
+        {"type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "must not replace final"}]
+        }},
+        {"type": "response.completed", "response": {
+            "status": "completed",
+            "output": [{"type": "message", "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": ""}]}]
+        }}
+    ]);
+    let result = collect(&mut vm, &chunks, true);
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("empty_responses_output"));
+    assert_eq!(result["response"], json!({}));
+}
+
+#[test]
+fn completed_event_body_failed_status_never_emits_nonempty_output() {
+    let mut vm = codec_vm();
+    for (status, expected_code) in [
+        ("incomplete", "responses_incomplete"),
+        ("failed", "responses_failed"),
+    ] {
+        let chunks = json!([{
+            "type": "response.completed",
+            "response": {
+                "status": status,
+                "output": [{"type": "message", "status": "completed", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "must not persist"}]}]
+            }
+        }]);
+        let result = collect(&mut vm, &chunks, true);
+        assert_eq!(
+            result["ok"],
+            json!(false),
+            "terminal status {status}: {result}"
+        );
+        assert_eq!(result["error"]["code"], json!(expected_code));
+        assert_eq!(result["response"], json!({}));
+    }
+}
+
+#[test]
 fn completed_empty_assistant_output_fails_closed() {
     let mut vm = codec_vm();
     let chunks = json!([{

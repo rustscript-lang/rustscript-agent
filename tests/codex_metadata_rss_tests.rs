@@ -438,6 +438,17 @@ fn response_completed_sse(response: JsonValue) -> String {
     )
 }
 
+fn response_output_item_done_sse(output_index: i64, item: JsonValue) -> String {
+    format!(
+        "event: response.output_item.done\ndata: {}\n\n",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item
+        })
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bundled_main_codex_responses_tool_continuation_is_durable_and_access_only() {
     use rustscript_agent::config::RunLimits;
@@ -901,6 +912,65 @@ async fn run_bundled_main_with_sse(transcript: String) -> MainRegressionResult {
         private_home_removed,
         artifacts_removed,
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_main_compact_completed_message_persists_exact_ok_in_sqlite() {
+    let done = response_output_item_done_sse(
+        0,
+        json!({
+            "type": "message",
+            "id": "msg_compact_ok",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "OK"}]
+        }),
+    );
+    let completed = response_completed_sse(json!({
+        "id": "resp_compact_ok",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-6.1-sol",
+        "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 5, "total_tokens": 6}
+    }));
+    let result = run_bundled_main_with_sse(done + &completed).await;
+
+    assert_main_one_response_and_cleanup(&result);
+    assert_eq!(main_event_count(&result.events, "model.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.failed"), 0);
+    assert_main_single_text(&result, "OK");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_main_compact_completed_refusal_persists_one_canonical_text_block() {
+    let refusal_text = "I cannot help with that request.";
+    let done = response_output_item_done_sse(
+        0,
+        json!({
+            "type": "message",
+            "id": "msg_compact_refusal",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "refusal", "refusal": refusal_text}]
+        }),
+    );
+    let completed = response_completed_sse(json!({
+        "id": "resp_compact_refusal",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-6.1-sol",
+        "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 5, "total_tokens": 6}
+    }));
+    let result = run_bundled_main_with_sse(done + &completed).await;
+
+    assert_main_one_response_and_cleanup(&result);
+    assert_eq!(main_event_count(&result.events, "model.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.completed"), 1);
+    assert_eq!(main_event_count(&result.events, "run.failed"), 0);
+    assert_main_single_text(&result, refusal_text);
 }
 
 #[tokio::test(flavor = "multi_thread")]
