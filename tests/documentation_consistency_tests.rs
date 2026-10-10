@@ -124,6 +124,44 @@ fn deployment_documents_exactly_the_manifest_binary_set() {
     }
 }
 
+fn gateway_startup_example<'a>(document: &'a str, path: &str) -> &'a str {
+    document
+        .split("```bash")
+        .skip(1)
+        .filter_map(|fenced| fenced.split_once("```").map(|(example, _)| example))
+        .find(|example| {
+            example
+                .lines()
+                .any(|line| line.trim() == "cargo run --release --bin rustscript-agent-gateway")
+        })
+        .unwrap_or_else(|| panic!("{path} must include its gateway startup bash example"))
+}
+
+#[test]
+fn gateway_startup_examples_use_admitted_bundled_coding_source() {
+    for (path, document) in [
+        ("README.md", read_relative("README.md")),
+        (
+            "docs/configuration.md",
+            read_relative("docs/configuration.md"),
+        ),
+    ] {
+        let example = gateway_startup_example(&document, path);
+        assert!(
+            example.lines().any(|line| {
+                line.trim_end_matches('\\').trim() == "RUSTSCRIPT_AGENT_SOURCE=bundled:coding"
+            }),
+            "{path} gateway startup example must select the admitted bundled coding source"
+        );
+        assert!(
+            !example
+                .lines()
+                .any(|line| line.trim_start().starts_with("RUSTSCRIPT_AGENT_SCRIPT=")),
+            "{path} gateway startup example must not use the rejected relative legacy script"
+        );
+    }
+}
+
 #[test]
 fn configuration_documents_authoritative_source_selection_semantics() {
     // Derive the exact contract tokens from the owning RSS policy so the docs

@@ -31,7 +31,7 @@ The current scope is intentionally synchronous at the Rust API boundary: a pendi
 The gateway is part of this independent repository. It uses the RustScript `pd-vm` crate for RSS execution and does not depend on the `pd-edge` gateway runtime.
 
 ```bash
-RUSTSCRIPT_AGENT_SCRIPT=examples/http_get.rss \
+RUSTSCRIPT_AGENT_SOURCE=bundled:coding \
 RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com \
 RUSTSCRIPT_AGENT_ALLOW_PORTS=443 \
 RUSTSCRIPT_AGENT_BEARER_TOKEN='<secret>' \

@@ -107,14 +107,14 @@ do not rely on them.
 | `RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS` | `PD_EDGE_AGENT_TELEGRAM_ALLOWED_USERS` | comma-separated list of `i64` | empty (deny all) | Allowed sender user ids. Empty list denies all users; a non-integer entry fails startup. |
 | `RUSTSCRIPT_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | `PD_EDGE_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | integer seconds | `30` | `getUpdates` long-poll timeout. A non-integer value fails startup. |
 
-Example (all variables with their deprecated aliases):
+Gateway startup example (authoritative source):
 
 ```bash
 RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090 \
 RUSTSCRIPT_AGENT_BEARER_TOKEN=[REDACTED] \
 RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com \
 RUSTSCRIPT_AGENT_ALLOW_PORTS=443 \
-RUSTSCRIPT_AGENT_SCRIPT=examples/http_get.rss \
+RUSTSCRIPT_AGENT_SOURCE=bundled:coding \
 RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db \
 cargo run --release --bin rustscript-agent-gateway
 ```
