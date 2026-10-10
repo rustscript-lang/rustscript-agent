@@ -8,7 +8,7 @@ treated as available.
 ## 1. Delivery constraint: the core dependency is not released
 
 `rustscript-agent` depends on the RustScript VM through a **pinned Git
-dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e", ... }` in `Cargo.toml`.
+dependency**: `rustscript-vm = { package = "pd-vm", git = "https://github.com/rustscript-lang/rustscript.git", rev = "d9387f98df78dd88d2d1c04eebac4415f844efaf", ... }` in `Cargo.toml`.
 Consequences, stated plainly:
 
 - A build fetches the exact pinned core revision from the canonical HTTPS
@@ -18,7 +18,7 @@ Consequences, stated plainly:
 - `cargo build/test --locked` resolves the core source from `Cargo.lock`,
   which records the canonical git source for both `pd-vm` and
   `pd-host-function`:
-  `git+https://github.com/rustscript-lang/rustscript.git?rev=fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e#fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e`.
+  `git+https://github.com/rustscript-lang/rustscript.git?rev=d9387f98df78dd88d2d1c04eebac4415f844efaf#d9387f98df78dd88d2d1c04eebac4415f844efaf`.
   A build therefore needs network access to github.com (or a pre-warmed
   Cargo git cache); it never reads the state of a local core checkout.
 - **There is no crates.io release of this crate, and none can be made until
@@ -46,7 +46,7 @@ before deploying:
 ```bash
 # The lockfile records the exact git source for pd-vm and pd-host-function:
 grep -A3 'name = "pd-vm"' Cargo.lock
-#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=fd4b570…#fd4b570…"
+#   source = "git+https://github.com/rustscript-lang/rustscript.git?rev=d9387f9…#d9387f9…"
 # The resolved dependency graph shows the same source:
 cargo tree --locked -p rustscript-vm
 ```
@@ -65,7 +65,9 @@ export RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090
 export RUSTSCRIPT_AGENT_BEARER_TOKEN='<secret>'      # see section 9
 export RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com
 export RUSTSCRIPT_AGENT_ALLOW_PORTS=443
-export RUSTSCRIPT_AGENT_SCRIPT=/etc/rustscript-agent/agent.rss
+# Authoritative RSS agent source (or the deprecated RUSTSCRIPT_AGENT_SCRIPT).
+# Omit both to run the bundled coding entry:
+export RUSTSCRIPT_AGENT_SOURCE=file:/etc/rustscript-agent/agent.rss
 export RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db
 # Optional (A7): bounded rate limiting and the client-disconnect policy.
 export RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED=1
@@ -80,6 +82,11 @@ Startup failure modes (all exit non-zero before serving):
 - unparsable `RUSTSCRIPT_AGENT_GATEWAY_ADDR`;
 - missing or blank `RUSTSCRIPT_AGENT_BEARER_TOKEN` (unless
   `RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS=1`);
+- an `RUSTSCRIPT_AGENT_SOURCE` token the RSS source policy rejects: a present
+  non-string, a `file:` path that is not absolute, or any unsupported token is
+  a static `invalid_agent_source` / `unsupported_agent_source` failure with no
+  bundled or legacy fallback — decided by the policy, before the listener
+  binds;
 - `RUSTSCRIPT_AGENT_ALLOW_PORTS` with an empty entry or no valid ports;
 - `RUSTSCRIPT_AGENT_RATE_LIMIT_*` values outside their validated bounds
   (bursts above 1 000 000, a window above 86 400 000 ms, or a non-`0`/`1`
@@ -95,7 +102,11 @@ Startup failure modes (all exit non-zero before serving):
 - an unwritable or invalid `RUSTSCRIPT_AGENT_STATE_DB` path.
 
 The legacy `PD_EDGE_AGENT_*` aliases still work but print a deprecation
-warning; they are scheduled for removal before v1.
+warning; they are scheduled for removal before v1. The deprecated
+`RUSTSCRIPT_AGENT_SCRIPT` variable is read only when `RUSTSCRIPT_AGENT_SOURCE`
+is unset; a bare absolute path there migrates to a `file:` source and raises the
+`deprecated_override` indicator on `/health/detailed` (see
+`docs/configuration.md`).
 
 ## 4. SQLite state
 
@@ -287,7 +298,7 @@ RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090
 RUSTSCRIPT_AGENT_BEARER_TOKEN=[REDACTED]
 RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com
 RUSTSCRIPT_AGENT_ALLOW_PORTS=443
-RUSTSCRIPT_AGENT_SCRIPT=/var/lib/rustscript-agent/agent.rss
+RUSTSCRIPT_AGENT_SOURCE=file:/var/lib/rustscript-agent/agent.rss
 RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db
 ```
 

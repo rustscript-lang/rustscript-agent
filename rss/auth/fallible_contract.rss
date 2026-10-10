@@ -1,0 +1,112 @@
+use auth;
+use config;
+use oauth;
+
+pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
+    config::load_snapshot(&home).policy_handle
+}
+
+pub fn transport_result(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse
+) -> TransportResultEnvelope {
+    oauth::transport_result(&request, &credential_use)
+}
+
+pub fn legacy_transport(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse
+) -> TransportResponseEnvelope {
+    oauth::transport(&request, &credential_use)
+}
+
+pub fn issue_access(policy: resource<auth.policy>) -> resource<auth.access> {
+    auth::access_handle("fixture-codex", 4, &policy).handle
+}
+
+pub fn issue_refresh(policy: resource<auth.policy>) -> resource<auth.refresh> {
+    auth::refresh_handle("fixture-codex", 4, &policy).handle
+}
+
+pub fn begin_manual(policy: resource<auth.policy>) -> PkceBeginEnvelope {
+    let intent = {
+        credential_id: "fixture-codex",
+        path: "/codex/device",
+        flow: "authorization_code_pkce",
+        callback_mode: "manual",
+        scopes: ["scope.synthetic"],
+        public_query: [
+            {name: "client_id", value: "public-client-id"},
+            {name: "response_type", value: "code"}
+        ]
+    };
+    oauth::pkce_begin(&policy, intent)
+}
+
+pub fn close_access(access: resource<auth.access>) -> null {
+    auth::close_access(access)
+}
+
+pub fn now_result(policy: resource<auth.policy>) -> OAuthNowResultEnvelope {
+    oauth::now_ms_result(&policy)
+}
+
+pub fn wait_result(policy: resource<auth.policy>, millis: int) -> OAuthWaitResultEnvelope {
+    oauth::wait_ms_result(&policy, millis)
+}
+
+pub fn public_json_field_result(
+    policy: resource<auth.policy>,
+    json_text: string,
+    pointer: string
+) -> PublicJsonFieldResultEnvelope {
+    oauth::public_json_field_result(&policy, json_text, pointer)
+}
+
+pub fn cleanup(policy: resource<auth.policy>) -> null {
+    auth::cleanup_transients(&policy)
+}
+
+pub fn start_device_result(policy: resource<auth.policy>) -> TransportResultEnvelope {
+    let request = {
+        policy_handle: policy,
+        credential_id: "fixture-codex",
+        method: "POST",
+        path: "/api/accounts/deviceauth/usercode",
+        public_headers: [{name: "content-type", value: "application/json"}],
+        public_body: "{\"client_id\":\"public-client-id\"}"
+    };
+    let usage = {kind: "none"};
+    oauth::transport_result(&request, &usage)
+}
+
+pub fn capture_result(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse,
+    payload: TransportPayloadIntent,
+    capture: TransportCaptureIntent
+) -> TransportCaptureResultEnvelope {
+    oauth::transport_capture_result(&request, &credential_use, payload, capture)
+}
+
+pub fn exchange_selected_result(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse,
+    payload: TransportPayloadIntent
+) -> TransportResultEnvelope {
+    oauth::transport_payload_result(&request, &credential_use, payload)
+}
+
+pub fn save_result(request: SaveCredentialRequest) -> AuthSaveResultEnvelope {
+    auth::save_if_generation_result(&request)
+}
+
+pub fn transport_result_then_cleanup(
+    request: TransportPublicRequest,
+    credential_use: TransportCredentialUse,
+    policy: resource<auth.policy>
+) -> map {
+    let transport = oauth::transport_result(&request, &credential_use);
+    auth::cleanup_transients(&policy);
+    {transport: transport, cleanup_completed: true}
+}

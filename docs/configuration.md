@@ -27,21 +27,26 @@ through validated native configuration (`AgentConfig`/`HttpConfig`/
 `SqlitePolicy`), and the storage program receives its per-command limits
 through the typed command envelope.
 
-Persistent `config.yaml` / `auth.yaml` are loaded by a Stage A fixture host
-as `config::load_snapshot(host_home)`. Production `agent_host_catalog` /
-`AgentRunner` do not register that bridge. The fixture host binds `HostHome`
-before RSS runs; RSS cannot supply or override the filesystem path. The
-generic loader keeps bounded YAML, HTTPS-or-loopback URL syntax, secret-key
-rejection, and credential-ID reference integrity. Provider-name authority
-mapping, provider defaults, OAuth field interpretation, and local-agent
-special cases are RSS policy: an unknown provider name is not rejected merely
-because it is unknown, and explicit custom HTTPS providers remain
-configurable. The snapshot exposed to RSS is `BoundedPublicConfig`, opaque
-credential IDs, a sanitized policy summary, and a host-native
-`OpaquePolicyHandle` that is not a map or string token. Raw tokens never
-cross into RSS, events, logs, or durable output. Typed config/auth errors
-carry a path-qualified `path` field (filesystem or YAML field path), never
-the full Display prose.
+Persistent `config.yaml` / `auth.yaml` reach RSS through a host-native
+`config::load_snapshot(host_home)` bridge. **Both** the production auth host
+module (`auth_host_module`, registered on `agent_host_catalog` and exercised by
+the provider path) and the Stage A fixture host register that bridge. The
+fixture host additionally exposes `config::check_policy` and binds `HostHome`
+before RSS runs, so it is the surface used by `tests/config_auth_rss_tests.rs`;
+in both cases RSS cannot supply or override the filesystem path. The generic
+loader keeps bounded YAML, HTTPS-or-loopback URL syntax, secret-key rejection,
+and credential-ID reference integrity. Provider-name authority mapping,
+provider defaults, OAuth field interpretation, and local-agent special cases
+are RSS policy: an unknown provider name is not rejected merely because it is
+unknown, and explicit custom HTTPS providers remain configurable. The snapshot
+exposed to RSS is `BoundedPublicConfig`, opaque credential IDs, a sanitized
+policy summary, and a host-native `OpaquePolicyHandle` that is not a map or
+string token. Raw tokens never cross into RSS, events, logs, or durable output.
+Typed config/auth errors carry a path-qualified `path` field (filesystem or
+YAML field path), never the full Display prose.
+
+A loader sample of both documents (an empty-credential config/auth pair decoded
+by the bounded loaders) ships under [docs/examples/](examples/).
 
 ## Environment variables (gateway binary)
 
@@ -82,7 +87,8 @@ do not rely on them.
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
 | `RUSTSCRIPT_AGENT_ALLOW_PORTS` | `PD_EDGE_AGENT_ALLOW_PORTS` | comma-separated list of `u16` | empty (deny all) | When set it must contain at least one valid port and no empty entries; otherwise startup fails. Empty list denies all ports — with the default configuration no request can be made, so production deployments must list the ports scripts may reach (for example `443`). |
 | `RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS` | `PD_EDGE_AGENT_ALLOW_PRIVATE_IPS` | flag | unset (`false`) | Only the exact value `1` allows destinations on private/loopback IP ranges. |
-| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path | bundled `rss/agent/main.rss` | Path to the RSS agent **entry file**. The gateway compiles that file and its module tree (`with_agent_file`); it is not a source string. When unset, production `AgentGatewayState::new` / `with_sqlite_path` install the bundled `main.rss`. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
+| `RUSTSCRIPT_AGENT_SOURCE` | `PD_EDGE_AGENT_SOURCE` | string token | unset (bundled coding default) | **Authoritative** RSS agent-source selection, read by `rustscript-agent-gateway`. The bundled RSS policy `rss/agent/source_policy.rss` owns every decision: `bundled:coding` selects the immutable bundled coding entry, and a `file:` prefix with an **absolute** path selects that entry file (a relative `file:` path is rejected). A present-but-invalid or unsupported token is a static startup failure (`invalid_agent_source` / `unsupported_agent_source`) with no bundled or legacy fallback, and it fails before the listener binds. Values are never trimmed, normalized, or reparsed in Rust — non-UTF-8 bytes are admitted to the policy as a present non-string so the policy classifies them. |
+| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path (legacy) | unset | **Deprecated** legacy entry-file path, read only when `RUSTSCRIPT_AGENT_SOURCE` is unset. A bare absolute path migrates to a `file:` source and raises the migration indicator (published as `deprecated_override` on `/health/detailed`); it is not a source string. When neither variable is set, the RSS policy selects the bundled coding entry. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
 | `RUSTSCRIPT_AGENT_STATE_DB` | `PD_EDGE_AGENT_STATE_DB` | filesystem path | unset (in-memory) | SQLite state file (sessions, messages, runs, events, jobs, approvals, compactions). Without it the gateway runs in-memory only and state is lost on restart. See `docs/deployment.md`. |
 | Rate limiting (A7) |
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED` | `PD_EDGE_AGENT_RATE_LIMIT_ENABLED` | flag | `0` (disabled) | Only the exact values `0`/`1` are accepted; anything else fails startup. When enabled, every API request consumes one per-peer-IP token and verified requests additionally consume one per-account token. |
@@ -101,17 +107,29 @@ do not rely on them.
 | `RUSTSCRIPT_AGENT_TELEGRAM_ALLOWED_USERS` | `PD_EDGE_AGENT_TELEGRAM_ALLOWED_USERS` | comma-separated list of `i64` | empty (deny all) | Allowed sender user ids. Empty list denies all users; a non-integer entry fails startup. |
 | `RUSTSCRIPT_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | `PD_EDGE_AGENT_TELEGRAM_POLL_TIMEOUT_SECS` | integer seconds | `30` | `getUpdates` long-poll timeout. A non-integer value fails startup. |
 
-Example (all variables with their deprecated aliases):
+Gateway startup example (authoritative source):
 
 ```bash
 RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090 \
 RUSTSCRIPT_AGENT_BEARER_TOKEN=[REDACTED] \
 RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com \
 RUSTSCRIPT_AGENT_ALLOW_PORTS=443 \
-RUSTSCRIPT_AGENT_SCRIPT=examples/http_get.rss \
+RUSTSCRIPT_AGENT_SOURCE=bundled:coding \
 RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db \
 cargo run --release --bin rustscript-agent-gateway
 ```
+
+`RUSTSCRIPT_AGENT_TEST_TMP` is an **internal test input, not a production
+setting**: it is read only by `#[cfg(test)]` code and test fixtures in this
+repository to select a writable scratch directory, no binary reads it, and it
+has no effect on a packaged gateway. It is listed here so the drift guard's
+canonical section accounts for every `RUSTSCRIPT_AGENT_*` token in `src/`; it is
+never renamed or skipped to satisfy that guard.
+
+`RUSTSCRIPT_AGENT_TEST_TMPDIR` is also an **internal test input, not a production
+setting**. The workspace Telegram unit fixture requires this input to select
+isolated test scratch storage. It is confined to `#[cfg(test)]` code and does
+not configure a packaged gateway.
 
 ## CLI arguments (runner binary)
 

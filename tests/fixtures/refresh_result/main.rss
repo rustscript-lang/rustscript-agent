@@ -1,0 +1,153 @@
+use auth;
+use config;
+use oauth;
+
+struct RefreshIssueSendResult {
+    ok: bool,
+    code: string,
+    first_status: int,
+    first_body: string,
+    replay_ok: bool,
+    replay_code: string
+}
+
+struct RefreshValuePresence {
+    value: RefreshHandleEnvelope?
+}
+
+fn failed_refresh_issue_send_result(code: string) -> RefreshIssueSendResult {
+    {
+        ok: false,
+        code: code,
+        first_status: 0,
+        first_body: "",
+        replay_ok: false,
+        replay_code: ""
+    }
+}
+
+fn empty_transport_response() -> TransportResponseEnvelope {
+    {
+        ok: false,
+        error: null,
+        status: 0,
+        public_headers: [],
+        body_without_secret_fields: "",
+        retry_after_ms: null,
+        access_slot: null,
+        refresh_slot: null,
+        device_handle: null
+    }
+}
+
+fn failure_code(failure_value: AuthBridgeFailure?) -> string {
+    if failure_value != null => {
+        let failure: AuthBridgeFailure = failure_value;
+        failure.code.copy()
+    } else => {
+        ""
+    }
+}
+
+pub fn snapshot(home: resource<auth.host_home>) -> resource<auth.policy> {
+    config::load_snapshot(&home).policy_handle
+}
+
+pub fn issue_result(
+    credential_id: string,
+    generation: int,
+    policy: resource<auth.policy>
+) -> RefreshHandleResultEnvelope {
+    auth::refresh_handle_result(credential_id, generation, &policy)
+}
+
+// One genuine RSS callable: issue a fresh typed refresh result through the new
+// wrapper, keep one typed request/usage alive, and send twice by borrow. The
+// compiler-managed guest request/usage stay live across both native sends.
+pub fn issue_and_send_result(
+    credential_id: string,
+    generation: int,
+    policy: resource<auth.policy>
+) -> RefreshIssueSendResult {
+    let issued: RefreshHandleResultEnvelope =
+        auth::refresh_handle_result(credential_id, generation, &policy);
+    let issued_ok: bool = issued.ok;
+    let issued_failed: bool = issued.error != null;
+    let issued_holder: RefreshValuePresence = {value: issued.value};
+    let has_value: bool = issued_holder.has("value");
+    if !issued_ok || issued_failed || !has_value => {
+        failed_refresh_issue_send_result("issue_failed")
+    } else => {
+        let inner: RefreshHandleEnvelope = issued_holder.value;
+        let handle: resource<auth.refresh> = inner.handle;
+        let request: TransportPublicRequest = {
+            policy_handle: policy,
+            credential_id: credential_id.copy(),
+            method: "POST",
+            path: "/oauth/token",
+            public_headers: [
+                {name: "content-type", value: "application/x-www-form-urlencoded"},
+                {name: "accept", value: "application/json"}
+            ],
+            public_body: "grant_type=refresh_token"
+        };
+        let usage: TransportCredentialUse = {
+            kind: "refresh",
+            access_handle: null,
+            refresh_handle: handle,
+            code_handle: null,
+            verifier_handle: null,
+            device_handle: null
+        };
+        let first: TransportResultEnvelope = oauth::transport_result(&request, &usage);
+        let first_ok: bool = first.ok;
+        let first_code: string = failure_code(first.error);
+        let first_failed: bool = first_code != "";
+        let first_value_opt: TransportResponseEnvelope? = first.value;
+        let first_response: TransportResponseEnvelope = first_value_opt.unwrap_or(empty_transport_response());
+        let first_status: int = first_response.status;
+        let first_body: string = first_response.body_without_secret_fields;
+        let second: TransportResultEnvelope = oauth::transport_result(&request, &usage);
+        let replay_ok: bool = second.ok;
+        let replay_code: string = failure_code(second.error);
+        {
+            ok: first_ok && !first_failed,
+            code: first_code,
+            first_status: first_status,
+            first_body: first_body,
+            replay_ok: replay_ok,
+            replay_code: replay_code
+        }
+    }
+}
+
+pub fn send_refresh(
+    credential_id: string,
+    refresh: resource<auth.refresh>,
+    policy: resource<auth.policy>
+) -> TransportResultEnvelope {
+    let request: TransportPublicRequest = {
+        policy_handle: policy,
+        credential_id: credential_id,
+        method: "POST",
+        path: "/oauth/token",
+        public_headers: [
+            {name: "content-type", value: "application/x-www-form-urlencoded"},
+            {name: "accept", value: "application/json"}
+        ],
+        public_body: "grant_type=refresh_token"
+    };
+    let usage: TransportCredentialUse = {
+        kind: "refresh",
+        access_handle: null,
+        refresh_handle: refresh,
+        code_handle: null,
+        verifier_handle: null,
+        device_handle: null
+    };
+    oauth::transport_result(&request, &usage)
+}
+
+pub fn close_refresh(refresh: resource<auth.refresh>) -> null {
+    auth::close_refresh(refresh)
+}

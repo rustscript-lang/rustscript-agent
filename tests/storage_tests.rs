@@ -2316,6 +2316,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "run-rejected",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hello\"}",
@@ -2325,6 +2326,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "event-rejected",
             "now_ms": 2,
             "expires_at_ms": 0,
@@ -2348,6 +2350,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "model": "test-model",
             "provider": "test-provider",
             "system_prompt": "be helpful",
+            "session_metadata_json": "{}",
             "run_id": "run-1",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hello\"}",
@@ -2357,6 +2360,7 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "request-1",
             "request_hash": "hash-1",
+            "workspace_identity_json": "",
             "event_id": "event-started-1",
             "now_ms": 3,
             "expires_at_ms": 0,
@@ -2463,6 +2467,7 @@ fn run_terminal_commits_atomically_and_returns_assigned_sequences() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "run-1",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hi\"}",
@@ -2472,6 +2477,7 @@ fn run_terminal_commits_atomically_and_returns_assigned_sequences() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "event-started-1",
             "now_ms": 2,
             "expires_at_ms": 0,
@@ -2637,6 +2643,7 @@ fn load_all_paginates_beyond_single_page_and_byte_limits() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "run-1",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hi\"}",
@@ -2646,6 +2653,7 @@ fn load_all_paginates_beyond_single_page_and_byte_limits() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "event-started-1",
             "now_ms": now_ms,
             "expires_at_ms": 0,
@@ -2794,6 +2802,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "parent-1",
             "parent_run_id": "",
             "input_json": "{\"text\":\"hi\"}",
@@ -2803,6 +2812,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "key-1",
             "request_hash": "hash-1",
+            "workspace_identity_json": "",
             "event_id": "event-1",
             "now_ms": 4,
             "expires_at_ms": 0,
@@ -2823,6 +2833,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "model": "m",
             "provider": "p",
             "system_prompt": "",
+            "session_metadata_json": "{}",
             "run_id": "child-1",
             "parent_run_id": "parent-1",
             "input_json": "{\"text\":\"child\"}",
@@ -2832,6 +2843,7 @@ fn session_delete_cascades_and_jobs_round_trip() {
             "idempotency_scope": "api:chat",
             "idempotency_key": "",
             "request_hash": "",
+            "workspace_identity_json": "",
             "event_id": "event-2",
             "now_ms": 5,
             "expires_at_ms": 0,
@@ -4348,5 +4360,546 @@ fn lossless_canonical_tool_payload_roundtrips_and_read_aliases() {
     assert_eq!(content[0]["artifact"], json!({"id": "art-1"}));
     assert!(content[0].get("artifacts").is_none());
     assert_eq!(content[0]["truncated"], json!(true));
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+// ---------------------------------------------------------------------------
+// Task9: real storage read-coherence under a controlled cross-connection
+// admission.
+//
+// rss/storage/load.rss stages the six normalized tables into connection-local
+// TEMP snapshots inside ONE bounded transaction before any page projection, so
+// a writer that commits on ANOTHER connection mid-load can never tear the
+// dump. This regression drives the SHIPPED loader through the genuine
+// AgentRunner against a genuine native SQLite database, holds it with a
+// deterministic `stream::emit` barrier (delivered through a real RunEventSink)
+// strictly after the sessions page is collected, commits a genuine
+// `admission.create` on a SECOND independent runner (its own connection) while
+// it is held, then asserts one coherent point-in-time capture plus a later
+// fresh load that includes every admitted record. No sleeps, no random loops;
+// the worker can never dead-wait because every barrier exchange is bounded by
+// an absolute deadline and the whole arm runs in a rescue helper process.
+// ---------------------------------------------------------------------------
+
+const LOAD_SESSION_EMIT: &str = "load.sessions_collected";
+const CROSS_CONN_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const CROSS_CONN_CHILD_ENV: &str = "RUSTSCRIPT_AGENT_TASK9_CROSS_CONN_CHILD";
+
+fn storage_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the Unix epoch")
+        .as_millis() as i64
+}
+
+/// The one fixture-only instrumentation delta applied to a PRIVATE temporary
+/// copy of the shipped loader: `use stream;` plus one deterministic emit
+/// immediately after the sessions page is fully collected. It never edits the
+/// delivered rss/storage/load.rss. Missing anchors panic so a shape drift can
+/// never silently skip the barrier.
+fn load_snapshot_instrumented_source() -> String {
+    const USE_ANCHOR: &str = "use sqlite;\n";
+    const ROWID_ANCHOR: &str = "    );\n    let runs: LoadPage = load_page(";
+    let source = fs::read_to_string(storage_root().join("load.rss"))
+        .expect("the shipped load.rss should be readable");
+    assert!(
+        source.contains(USE_ANCHOR) && source.contains(ROWID_ANCHOR),
+        "the shipped loader must contain the instrumentation anchors"
+    );
+    let with_use = source.replacen(USE_ANCHOR, "use sqlite;\nuse stream;\n", 1);
+    assert_eq!(
+        with_use.matches("use stream;\n").count(),
+        1,
+        "exactly one `use stream;` must be injected"
+    );
+    let with_emit = with_use.replacen(
+        ROWID_ANCHOR,
+        "    );\n    stream::emit({ op: \"load.sessions_collected\" });\n    let runs: LoadPage = load_page(",
+        1,
+    );
+    assert_eq!(
+        with_emit.matches(LOAD_SESSION_EMIT).count(),
+        1,
+        "exactly one emit must be injected"
+    );
+    with_emit
+}
+
+/// Builds a module-tree runner from the real storage modules, optionally
+/// overriding only the loader bytes, under the assigned temporary root.
+fn load_snapshot_runner(root: &std::path::Path, load_source: Option<&str>) -> AgentRunner {
+    for file in STORAGE_FILES {
+        fs::copy(storage_root().join(file), root.join(file))
+            .unwrap_or_else(|error| panic!("copy storage module {file}: {error}"));
+    }
+    if let Some(source) = load_source {
+        fs::write(root.join("load.rss"), source).expect("instrumented loader should be written");
+    }
+    AgentRunner::from_file(
+        root.join("main.rss"),
+        AgentConfig::default().with_sqlite_root(root),
+    )
+    .expect("the real storage program should compile")
+}
+
+fn load_all_payload() -> JsonValue {
+    json!({"max_rows": 512, "max_bytes": 2 * 1024 * 1024, "load_cap": 1_000_000})
+}
+
+#[derive(Clone, Debug)]
+struct AdmittedIds {
+    session_id: String,
+    run_id: String,
+    message_id: String,
+}
+
+/// Commits a brand-new session+run+message+event with a genuine
+/// `admission.create` on a SECOND independent runner (its own sqlite
+/// connection) and confirms it with an independent read-back.
+fn admit_cross_connection(root: &std::path::Path, db_name: &str) -> (AdmittedIds, bool) {
+    let nonce = std::process::id() as u64 * 1_000_000 + storage_now_ms() as u64;
+    let ids = AdmittedIds {
+        session_id: format!("admitted-session-{nonce}"),
+        run_id: format!("admitted-run-{nonce}"),
+        message_id: format!("admitted-message-{nonce}"),
+    };
+    let runner = load_snapshot_runner(root, None);
+    let admitted = run_storage(
+        &runner,
+        db_name,
+        "cross-conn-admission",
+        "admission.create",
+        json!({
+            "session_id": ids.session_id,
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "test",
+            "account_id": ids.session_id,
+            "model": "m",
+            "provider": "p",
+            "system_prompt": "",
+            "session_metadata_json": "{}",
+            "run_id": ids.run_id,
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"admitted\"}",
+            "message_id": ids.message_id,
+            "message_run_id": ids.run_id,
+            "script_hash": "s",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "",
+            "request_hash": "",
+            "workspace_identity_json": "",
+            "event_id": format!("admitted-event-{nonce}"),
+            "now_ms": 900_000,
+            "expires_at_ms": 0,
+        }),
+        900_000,
+    );
+    let committed = admitted["ok"] == json!(true) && {
+        let has_rows = |op: &str, payload: JsonValue, request_id: &str| -> bool {
+            let value = run_storage(&runner, db_name, request_id, op, payload, 50);
+            result_data(&value)
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false)
+        };
+        has_rows(
+            "session.get",
+            json!({"session_id": ids.session_id}),
+            "readback-session",
+        ) && has_rows("run.get", json!({"run_id": ids.run_id}), "readback-run")
+            && has_rows(
+                "message.get",
+                json!({"message_id": ids.message_id}),
+                "readback-message",
+            )
+    };
+    (ids, committed)
+}
+
+fn emit_op(value: &Value) -> Option<String> {
+    let Value::Map(entries) = value else {
+        return None;
+    };
+    entries.iter().find_map(|(key, value)| match (key, value) {
+        (Value::String(key), Value::String(text)) if key.as_ref() == "op" => Some(text.to_string()),
+        _ => None,
+    })
+}
+
+/// (has_session, has_run, has_message, has_event) for the admitted ids in one
+/// `load.all` dump. A coherent point-in-time view has all four equal.
+fn dump_admitted_flags(dump: &JsonValue, ids: &AdmittedIds) -> (bool, bool, bool, bool) {
+    let data = result_data(dump);
+    let id_at = |key: &str, index: usize, needle: &str| -> bool {
+        data.get(key)
+            .and_then(JsonValue::as_array)
+            .map(|rows| {
+                rows.iter().any(|row| {
+                    row.as_array()
+                        .and_then(|cells| cells.get(index))
+                        .and_then(JsonValue::as_str)
+                        == Some(needle)
+                })
+            })
+            .unwrap_or(false)
+    };
+    (
+        id_at("sessions", 0, &ids.session_id),
+        id_at("runs", 0, &ids.run_id),
+        id_at("messages", 2, &ids.session_id),
+        id_at("events", 1, &ids.run_id),
+    )
+}
+
+fn flags_are_coherent(flags: (bool, bool, bool, bool)) -> bool {
+    let (session, run, message, event) = flags;
+    session == run && run == message && run == event
+}
+
+struct CrossConnChildOutcome {
+    emitted: bool,
+    writer_committed: bool,
+    first: (bool, bool, bool, bool),
+    second: (bool, bool, bool, bool),
+}
+
+/// The rescue-child body. The driver/observer barrier exchange is fully
+/// deadline-bounded (mpsc `recv_timeout`), so it can never dead-wait even if
+/// the loader or a connection misbehaves.
+fn cross_connection_arm_body(label: &str, db_name: &str) -> CrossConnChildOutcome {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    let root = temporary_root(label);
+    let (ready_tx, ready_rx) = mpsc::channel::<AdmittedIds>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let rejected: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    struct CrossConnSink {
+        root: PathBuf,
+        db_name: String,
+        ready_tx: mpsc::Sender<AdmittedIds>,
+        release_rx: mpsc::Receiver<()>,
+        rejected: Arc<Mutex<Option<String>>>,
+        emitted: bool,
+    }
+    impl rustscript_agent::RunEventSink for CrossConnSink {
+        fn deliver(
+            &mut self,
+            value: Value,
+        ) -> std::result::Result<(), rustscript_agent::RunDeliveryError> {
+            if emit_op(&value).as_deref() != Some(LOAD_SESSION_EMIT) {
+                return Ok(());
+            }
+            self.emitted = true;
+            let (ids, committed) = admit_cross_connection(&self.root, &self.db_name);
+            let _ = self.ready_tx.send(ids);
+            if !committed {
+                let message = "cross-connection admission did not commit".to_string();
+                *self.rejected.lock().expect("rejected lock") = Some(message.clone());
+                return Err(rustscript_agent::RunDeliveryError::Rejected {
+                    code: "cross_conn_admission_failed",
+                    message,
+                });
+            }
+            match self.release_rx.recv_timeout(CROSS_CONN_MAX_WAIT) {
+                Ok(()) => Ok(()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Err(rustscript_agent::RunDeliveryError::Rejected {
+                        code: "cross_conn_release_timeout",
+                        message: "cross-connection release timed out".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    let driver = {
+        let root = root.clone();
+        let db_name = db_name.to_string();
+        let rejected = Arc::clone(&rejected);
+        std::thread::spawn(move || -> Option<(bool, JsonValue)> {
+            let runner = load_snapshot_runner(&root, Some(&load_snapshot_instrumented_source()));
+            let mut sink = CrossConnSink {
+                root: root.clone(),
+                db_name: db_name.clone(),
+                ready_tx,
+                release_rx,
+                rejected,
+                emitted: false,
+            };
+            let cancellation = rustscript_agent::RunCancellation::new();
+            let first_value = runner
+                .run_with_context_and_events(
+                    storage_command(
+                        &db_name,
+                        "cross-conn-held-load",
+                        "load.all",
+                        load_all_payload(),
+                        1,
+                    ),
+                    &mut sink,
+                    &cancellation,
+                )
+                .ok()?;
+            Some((sink.emitted, vm_value_to_json(&first_value)))
+        })
+    };
+
+    let deadline = std::time::Instant::now() + CROSS_CONN_MAX_WAIT;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let ids = match ready_rx.recv_timeout(remaining) {
+        Ok(ids) => ids,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = release_tx.send(());
+            let _ = driver.join();
+            panic!("cross-connection admission did not arrive before the deadline");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = driver.join();
+            panic!(
+                "the held loader ended before admitting: {:?}",
+                rejected.lock().expect("rejected lock")
+            );
+        }
+    };
+    let _ = release_tx.send(());
+    let held = driver
+        .join()
+        .unwrap_or_else(|_| panic!("cross-connection driver thread panicked"));
+    let Some((emitted, first_dump)) = held else {
+        panic!(
+            "the held loader did not complete: {:?}",
+            rejected.lock().expect("rejected lock")
+        );
+    };
+
+    let fresh = load_snapshot_runner(&root, None);
+    let second_dump = run_storage(
+        &fresh,
+        db_name,
+        "cross-conn-fresh-load",
+        "load.all",
+        load_all_payload(),
+        2,
+    );
+    let first = dump_admitted_flags(&first_dump, &ids);
+    let second = dump_admitted_flags(&second_dump, &ids);
+    fs::remove_dir_all(&root).expect("temporary storage root should be removed");
+    CrossConnChildOutcome {
+        emitted,
+        writer_committed: true,
+        first,
+        second,
+    }
+}
+
+/// Runs the arm in a rescue helper process under the exact child test name
+/// (`--ignored`), so even a dead-wait is bounded by a kill-and-wait guard and
+/// can never wedge Cargo.
+fn run_cross_connection_arm(label: &str, db_name: &str) -> CrossConnChildOutcome {
+    let exe = std::env::current_exe().expect("current test executable");
+    struct RescueChild(Option<std::process::Child>);
+    impl Drop for RescueChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "cross_conn_read_coherence_child_entrypoint",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CROSS_CONN_CHILD_ENV, "1")
+        .env("TASK9_CROSS_CONN_LABEL", label)
+        .env("TASK9_CROSS_CONN_DB", db_name)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rescue cross-connection helper");
+    let mut child = RescueChild(Some(child));
+    let deadline = std::time::Instant::now() + CROSS_CONN_MAX_WAIT;
+    loop {
+        match child
+            .0
+            .as_mut()
+            .expect("rescue child")
+            .try_wait()
+            .expect("poll rescue helper")
+        {
+            Some(_) => break,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.0.as_mut().expect("rescue child").kill();
+                    let _ = child.0.as_mut().expect("rescue child").wait();
+                    panic!("cross-connection helper exceeded the {CROSS_CONN_MAX_WAIT:?} bound");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    let output = child
+        .0
+        .take()
+        .expect("exited rescue child")
+        .wait_with_output()
+        .expect("collect rescue helper output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "cross-connection helper failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("TASK9_ARM "))
+        .unwrap_or_else(|| {
+            panic!("helper emitted no TASK9_ARM line:\nstdout: {stdout}\nstderr: {stderr}")
+        });
+    let flags = |name: &str| -> (bool, bool, bool, bool) {
+        let value = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} in {line}"));
+        let parts: Vec<bool> = value.split(',').map(|flag| flag == "1").collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "flag tuple for {name} must have four entries"
+        );
+        (parts[0], parts[1], parts[2], parts[3])
+    };
+    CrossConnChildOutcome {
+        emitted: line.contains("emitted=1"),
+        writer_committed: line.contains("writer_committed=1"),
+        first: flags("first"),
+        second: flags("second"),
+    }
+}
+
+/// A genuine `load.all` regression: a controlled cross-connection admission
+/// committed while the loader is deterministically held after sessions are
+/// collected must never tear the dump. The shipped loader captures one
+/// coherent point-in-time view, and a later fresh load includes every admitted
+/// row.
+#[test]
+fn load_all_snapshot_is_read_coherent_under_cross_connection_admission() {
+    let arm = run_cross_connection_arm("read-snapshot-coherent", "coherent.db");
+    eprintln!(
+        "CROSS_CONN emitted={} writer_committed={} first={:?} second={:?}",
+        arm.emitted, arm.writer_committed, arm.first, arm.second
+    );
+    assert!(arm.emitted, "the deterministic barrier emit must fire");
+    assert!(
+        arm.writer_committed,
+        "the cross-connection admission must commit (independent read-back)"
+    );
+    assert!(
+        flags_are_coherent(arm.first),
+        "the shipped loader must capture one coherent point-in-time view, got {:?}",
+        arm.first
+    );
+    assert!(
+        arm.second.0 && arm.second.1 && arm.second.2 && arm.second.3,
+        "the later fresh load must include every admitted record, got {:?}",
+        arm.second
+    );
+}
+
+/// The instrumented loader runs ONLY in the rescue child process (never
+/// front-line): it runs the coherence body and prints the machine-readable
+/// `TASK9_ARM` line.
+#[test]
+#[ignore]
+fn cross_conn_read_coherence_child_entrypoint() {
+    if std::env::var(CROSS_CONN_CHILD_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    let label = std::env::var("TASK9_CROSS_CONN_LABEL").expect("child label env");
+    let db_name = std::env::var("TASK9_CROSS_CONN_DB").expect("child db env");
+    let outcome = cross_connection_arm_body(&label, &db_name);
+    let flags = |value: (bool, bool, bool, bool)| -> String {
+        let (session, run, message, event) = value;
+        format!(
+            "{},{},{},{}",
+            u8::from(session),
+            u8::from(run),
+            u8::from(message),
+            u8::from(event)
+        )
+    };
+    println!(
+        "TASK9_ARM emitted={} writer_committed={} first={} second={}",
+        u8::from(outcome.emitted),
+        u8::from(outcome.writer_committed),
+        flags(outcome.first),
+        flags(outcome.second)
+    );
+}
+
+/// A genuine `load.all` regression: the six per-connection stage objects are
+/// TEMP-qualified, so a MAIN table that shares a stage name (here the real
+/// idempotency_records column shape) is never inspected, shadowed, or
+/// deleted. A main-table sentinel row survives two loads that still return the
+/// real data.
+#[test]
+fn load_all_snapshot_stage_leaves_a_colliding_main_table_intact() {
+    let root = temporary_root("stage-collision");
+    let db_name = "stage-collision.db";
+    let runner = storage_runner(&root);
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    let seeder = raw_sql_runner(
+        &root,
+        "seed-collision",
+        &[
+            "CREATE TABLE load_stage_idempotency (scope TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT NOT NULL DEFAULT '{}', created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL DEFAULT 0, completed_at_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scope, key))",
+            "INSERT INTO load_stage_idempotency (scope, key, request_hash, resource_type, resource_id, state, response_json, created_at_ms, expires_at_ms, completed_at_ms) VALUES ('sentinel', 'preserve-me', 'h', 'run', 'r', 'completed', '{}', 1, 0, 0)",
+        ],
+    );
+    run_raw_sql(&seeder, db_name);
+    for request_id in ["collision-load-1", "collision-load-2"] {
+        let loaded = run_storage(
+            &runner,
+            db_name,
+            request_id,
+            "load.all",
+            load_all_payload(),
+            2,
+        );
+        assert_eq!(loaded["ok"], json!(true), "{loaded}");
+    }
+    let inspector = query_sql_runner(
+        &root,
+        "inspect-collision",
+        &[],
+        "SELECT key FROM load_stage_idempotency ORDER BY key",
+    );
+    let inspected = inspector
+        .run_with_context(Value::map(vec![(
+            Value::string("db_name"),
+            Value::string(db_name),
+        )]))
+        .expect("collision inspection should run");
+    let Value::Map(inspected) = inspected else {
+        panic!("inspection should return a map");
+    };
+    let rows = vm_value_to_json(&Value::Map(inspected))["rows"]
+        .as_array()
+        .expect("inspection rows")
+        .clone();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the colliding main table must still hold exactly its sentinel row: {rows:?}"
+    );
+    assert_eq!(rows[0][0], json!("preserve-me"));
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }

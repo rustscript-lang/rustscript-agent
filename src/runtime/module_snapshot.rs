@@ -237,6 +237,28 @@ pub fn module_tree_digest(entry: &Path) -> Result<String> {
     Ok(capture_module_snapshot(entry)?.digest)
 }
 
+/// The existing snapshot RustScript dialect, exposed crate-internally so the
+/// bundled-resource closure selector parses with the identical dialect.
+pub(crate) fn snapshot_parser_dialect() -> &'static dyn ParserDialect {
+    &SNAPSHOT_PARSER_DIALECT
+}
+
+/// The existing normal snapshot digest over owned in-memory bytes: sorted
+/// length-prefixed `(rel, bytes)` files followed by the length-prefixed entry
+/// relpath. No filesystem access, no new algorithm.
+pub(crate) fn owned_memory_snapshot_digest(files: &[(String, Vec<u8>)], entry_rel: &str) -> String {
+    let mut material = Vec::new();
+    for (rel, bytes) in files {
+        material.extend_from_slice(&(rel.len() as u64).to_le_bytes());
+        material.extend_from_slice(rel.as_bytes());
+        material.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        material.extend_from_slice(bytes);
+    }
+    material.extend_from_slice(&(entry_rel.len() as u64).to_le_bytes());
+    material.extend_from_slice(entry_rel.as_bytes());
+    sha256_hex(&material)
+}
+
 pub fn capture_module_snapshot(entry: &Path) -> Result<ModuleSnapshot> {
     let root = module_tree_root(entry)?;
     let entry_rel = relative_posix(&root, entry)?;
@@ -260,19 +282,11 @@ pub fn capture_module_snapshot(entry: &Path) -> Result<ModuleSnapshot> {
         return Err(tree_error(ERR_MODULE_TREE_WALK));
     }
     assert_imports_stay_in_root(&root, &files)?;
-    let mut material = Vec::new();
-    for (rel, bytes) in &files {
-        material.extend_from_slice(&(rel.len() as u64).to_le_bytes());
-        material.extend_from_slice(rel.as_bytes());
-        material.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        material.extend_from_slice(bytes);
-    }
-    material.extend_from_slice(&(entry_rel.len() as u64).to_le_bytes());
-    material.extend_from_slice(entry_rel.as_bytes());
+    let digest = owned_memory_snapshot_digest(&files, &entry_rel);
     Ok(ModuleSnapshot {
         files,
         entry_rel,
-        digest: sha256_hex(&material),
+        digest,
     })
 }
 

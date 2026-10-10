@@ -31,7 +31,7 @@ The current scope is intentionally synchronous at the Rust API boundary: a pendi
 The gateway is part of this independent repository. It uses the RustScript `pd-vm` crate for RSS execution and does not depend on the `pd-edge` gateway runtime.
 
 ```bash
-RUSTSCRIPT_AGENT_SCRIPT=examples/http_get.rss \
+RUSTSCRIPT_AGENT_SOURCE=bundled:coding \
 RUSTSCRIPT_AGENT_ALLOW_HOSTS=api.example.com \
 RUSTSCRIPT_AGENT_ALLOW_PORTS=443 \
 RUSTSCRIPT_AGENT_BEARER_TOKEN='<secret>' \
@@ -39,7 +39,10 @@ RUSTSCRIPT_AGENT_STATE_DB=/var/lib/rustscript-agent/state.db \
 cargo run --release --bin rustscript-agent-gateway
 ```
 
-Full environment-variable reference: [docs/configuration.md](docs/configuration.md).
+When `RUSTSCRIPT_AGENT_SOURCE` is set it is the authoritative agent source
+(`bundled:coding`, or `file:` plus an absolute path); omit it to run the
+bundled coding entry. The deprecated `RUSTSCRIPT_AGENT_SCRIPT` is read only as
+a fallback. Full environment-variable reference: [docs/configuration.md](docs/configuration.md).
 Deployment, systemd/container examples, shutdown and backup: [docs/deployment.md](docs/deployment.md).
 
 ## Status

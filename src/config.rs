@@ -1250,6 +1250,22 @@ fn canonicalize_provider_option(key: &str, value: &Value) -> Result<Value, Provi
             }
             Ok(Value::String(text.to_string()))
         }
+        "credential_id" => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| ProviderProfileError::InvalidOptionValue(key.to_string()))?;
+            if text.is_empty()
+                || text
+                    .chars()
+                    .any(|character| character.is_whitespace() || character.is_control())
+            {
+                return Err(ProviderProfileError::InvalidOptionValue(key.to_string()));
+            }
+            if text.len() > MAX_PROVIDER_OPTION_STRING_BYTES {
+                return Err(ProviderProfileError::OptionStringTooLong);
+            }
+            Ok(Value::String(text.to_string()))
+        }
         "base_url" => {
             let text = value
                 .as_str()

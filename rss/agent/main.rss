@@ -347,17 +347,23 @@ fn tools_from_context(context: map) -> array {
 fn build_llm_request(context: map, messages: array) -> map {
     let limits: map = ctx_map(context, "limits");
     let sampling: map = ctx_map(context, "sampling");
+    let provider_options: map = ctx_map(context, "provider_options");
+    let mut credential_id: string = ctx_string(context, "credential_id", "");
+    if !context.has("credential_id") {
+        credential_id = ctx_string(provider_options, "credential_id", "");
+    }
     {
         provider: ctx_string(context, "provider", "openai"),
         model: ctx_string(context, "model", ""),
         messages: messages,
         tools: tools_from_context(context),
         tool_choice: ctx_string(context, "tool_choice", ""),
+        credential_id: credential_id,
         reasoning: ctx_string(context, "reasoning", ""),
         sampling: sampling,
         max_output_tokens: ctx_int(context, "max_output_tokens", ctx_int(limits, "max_output_tokens", 0)),
         stream: false,
-        provider_options: ctx_map(context, "provider_options")
+        provider_options: provider_options
     }
 }
 

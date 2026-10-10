@@ -1,0 +1,147 @@
+use config;
+use auth;
+use oauth;
+
+pub fn run(home: resource<auth.host_home>) -> map {
+    let snapshot = config::load_snapshot(&home);
+    let request = {
+        policy_handle: snapshot.policy_handle,
+        credential_id: "fixture-codex",
+        method: "GET",
+        path: "/oauth/token",
+        public_headers: [{name: "accept", value: "application/json"}],
+        public_body: ""
+    };
+    let usage = {kind: "none"};
+    let response = oauth::transport(&request, &usage);
+    {
+        ok: response.ok,
+        status: response.status,
+        public_headers: response.public_headers,
+        retry_after_ms: response.retry_after_ms,
+        body_without_secret_fields: response.body_without_secret_fields,
+        access_slot: response.access_slot,
+        refresh_slot: response.refresh_slot
+    }
+}
+
+pub fn probe(home: resource<auth.host_home>, id: string, path: string, method: string, header_name: string, kind: string, supplied: bool) -> map {
+    let snapshot = config::load_snapshot(&home);
+    if supplied => {
+        let access = auth::access_handle("fixture-codex", 4, &snapshot.policy_handle);
+        let request = {
+            policy_handle: snapshot.policy_handle,
+            credential_id: id,
+            method: method,
+            path: path,
+            public_headers: [{name: header_name, value: "application/json"}],
+            public_body: ""
+        };
+        let usage = {kind: kind, access_handle: access.handle};
+        let response = oauth::transport(&request, &usage);
+        {ok: response.ok, status: response.status}
+    } else => {
+        let request = {
+            policy_handle: snapshot.policy_handle,
+            credential_id: id,
+            method: method,
+            path: path,
+            public_headers: [{name: header_name, value: "application/json"}],
+            public_body: ""
+        };
+        let usage = {kind: kind};
+        let response = oauth::transport(&request, &usage);
+        {ok: response.ok, status: response.status}
+    }
+}
+
+pub fn snapshot_only(home: resource<auth.host_home>) -> resource<auth.policy> {
+    config::load_snapshot(&home).policy_handle
+}
+
+pub fn probe_refresh(home: resource<auth.host_home>) -> map {
+    let snapshot = config::load_snapshot(&home);
+    let refresh = auth::refresh_handle("fixture-codex", 4, &snapshot.policy_handle);
+    let request = {
+        policy_handle: snapshot.policy_handle,
+        credential_id: "fixture-codex",
+        method: "GET",
+        path: "/oauth/token",
+        public_headers: [],
+        public_body: ""
+    };
+    let usage = {kind: "none", refresh_handle: refresh.handle};
+    let response = oauth::transport(&request, &usage);
+    {ok: response.ok}
+}
+
+pub fn probe_policy(policy: resource<auth.policy>) -> map {
+    let request = {
+        policy_handle: policy,
+        credential_id: "fixture-codex",
+        method: "GET",
+        path: "/oauth/token",
+        public_headers: [],
+        public_body: ""
+    };
+    let usage = {kind: "none"};
+    let response = oauth::transport(&request, &usage);
+    {ok: response.ok}
+}
+
+pub fn access_transport(home: resource<auth.host_home>) -> map {
+    let policy = config::load_snapshot(&home).policy_handle;
+    let access = auth::access_handle("fixture-codex", 4, &policy).handle;
+    let request = {
+        policy_handle: policy, credential_id: "fixture-codex", method: "GET",
+        path: "/oauth/token", public_headers: [], public_body: ""
+    };
+    let usage = {kind: "access", access_handle: access};
+    let response = oauth::transport(&request, &usage);
+    {status: response.status, body: response.body_without_secret_fields, access_slot: response.access_slot}
+}
+
+pub fn issue_access(policy: resource<auth.policy>) -> resource<auth.access> {
+    auth::access_handle("fixture-codex", 4, &policy).handle
+}
+
+pub fn issue_refresh(policy: resource<auth.policy>) -> resource<auth.refresh> {
+    auth::refresh_handle("fixture-codex", 4, &policy).handle
+}
+
+pub fn send_access(policy: resource<auth.policy>, access: resource<auth.access>, id: string, path: string, kind: string, body: string) -> map {
+    let request = {policy_handle: policy, credential_id: id, method: "GET", path: path, public_headers: [], public_body: body};
+    let usage = {kind: kind, access_handle: access};
+    let response = oauth::transport(&request, &usage);
+    {status: response.status, access_slot: response.access_slot, refresh_slot: response.refresh_slot}
+}
+
+pub fn send_refresh(policy: resource<auth.policy>, refresh: resource<auth.refresh>, id: string, path: string, kind: string, body: string) -> map {
+    let request = {policy_handle: policy, credential_id: id, method: "POST", path: path, public_headers: [], public_body: body};
+    let usage = {kind: kind, refresh_handle: refresh};
+    let response = oauth::transport(&request, &usage);
+    {status: response.status, access_slot: response.access_slot, refresh_slot: response.refresh_slot}
+}
+
+pub fn send_both(policy: resource<auth.policy>, access: resource<auth.access>, refresh: resource<auth.refresh>) -> map {
+    let request = {policy_handle: policy, credential_id: "fixture-codex", method: "POST", path: "/oauth/token", public_headers: [], public_body: ""};
+    let usage = {kind: "access", access_handle: access, refresh_handle: refresh};
+    let response = oauth::transport(&request, &usage);
+    {status: response.status}
+}
+
+pub fn issue_wrong_generation(policy: resource<auth.policy>) -> resource<auth.access> {
+    auth::access_handle("fixture-codex", 3, &policy).handle
+}
+
+pub fn save_transport_slot(policy: resource<auth.policy>, access: resource<auth.secret_slot>, expected: int) -> int {
+    let saved = auth::save_if_generation({
+        credential_id: "fixture-codex", expected_generation: expected, policy_handle: policy,
+        metadata: {provider: "openai-codex", kind: "oauth", source: "test", token_type: "Bearer",
+            expires_at_ms: 1900000000000, scopes: [], account_id: "synthetic",
+            generation: expected, status: "active", last_refresh_at_ms: 1790000000000,
+            has_refresh_token: true},
+        access_slot: access, refresh_action: "preserve"
+    });
+    saved.metadata.generation
+}

@@ -705,6 +705,20 @@ fn push_bounded<T>(window: &mut VecDeque<T>, value: T, capacity: usize) {
 /// Only the four canonical commands are recognized; anything else (including
 /// unknown `/x` tokens) is plain conversation text.
 pub(crate) fn parse_command(text: &str) -> (Option<String>, String) {
+    let workspace_text = text.trim_start();
+    if let Some(rest) = workspace_text.strip_prefix('/') {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let token = parts.next().unwrap_or_default();
+        let name = token
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name == "workspace" {
+            let args = parts.next().unwrap_or_default();
+            return (Some(name), args.to_string());
+        }
+    }
     let trimmed = text.trim();
     if let Some(rest) = trimmed.strip_prefix('/') {
         let mut parts = rest.splitn(2, char::is_whitespace);
@@ -1352,6 +1366,17 @@ async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: 
             )
             .await
         }
+        Some("workspace") => {
+            cmd_workspace(
+                runtime,
+                api,
+                &envelope,
+                chat_id,
+                message.message_thread_id,
+                &session_id,
+            )
+            .await
+        }
         Some("stop") => {
             cmd_stop(
                 runtime,
@@ -1585,6 +1610,7 @@ async fn cmd_new(
                     provider: None,
                     source: "telegram".to_string(),
                     system_prompt: None,
+                    workspace: None,
                     created_at: now,
                     updated_at: now,
                     message_count: 0,
@@ -1628,6 +1654,83 @@ async fn wait_for_run_terminal(state: &AgentGatewayState, run_id: &str, bound: D
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn cmd_workspace(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    envelope: &InboundEnvelope,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_id: &str,
+) {
+    if let Err(error) = ensure_session(
+        &runtime.state,
+        session_id,
+        &envelope.account_id,
+        &envelope.chat_id,
+        envelope.thread_id.as_deref(),
+        &envelope.user_id,
+    )
+    .await
+    {
+        tracing::warn!("telegram workspace session creation failed: {error}");
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "Storage is unavailable; try again shortly.",
+        )
+        .await;
+        return;
+    }
+    match runtime
+        .state
+        .service()
+        .bind_session_workspace(session_id, envelope.content.clone())
+        .await
+    {
+        Ok(_) => {
+            let _ = reply(api, chat_id, thread_id, "Workspace updated.").await;
+        }
+        Err(AdmitError::ActiveRun) => {
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "A run is active; workspace was not changed.",
+            )
+            .await;
+        }
+        Err(AdmitError::SessionNotFound) => {
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "No conversation is available in this chat.",
+            )
+            .await;
+        }
+        Err(AdmitError::Persistence(message)) => {
+            tracing::warn!("telegram workspace persistence failed: {message}");
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                "Storage is unavailable; try again shortly.",
+            )
+            .await;
+        }
+        Err(error) => {
+            let _ = reply(
+                api,
+                chat_id,
+                thread_id,
+                &format!("Workspace selection rejected: {error}."),
+            )
+            .await;
+        }
     }
 }
 
@@ -1770,6 +1873,7 @@ async fn ensure_session(
                     provider: None,
                     source: "telegram".to_string(),
                     system_prompt: None,
+                    workspace: None,
                     created_at: now,
                     updated_at: now,
                     message_count: 0,
@@ -1844,14 +1948,17 @@ async fn admit_text(
     let admitted = runtime
         .state
         .service()
-        .admit(AdmitRunRequest {
-            input: json!(envelope.content),
-            session_id: Some(session_id.to_string()),
-            platform: "telegram".to_string(),
-            idempotency_key: Some(idempotency_key),
-            idempotency_hash: Some(idempotency_hash),
-            ..AdmitRunRequest::default()
-        })
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!(envelope.content),
+                session_id: Some(session_id.to_string()),
+                platform: "telegram".to_string(),
+                idempotency_key: Some(idempotency_key),
+                idempotency_hash: Some(idempotency_hash),
+                ..AdmitRunRequest::default()
+            },
+            None,
+        )
         .await;
     match admitted {
         Ok(admitted_run) => {
@@ -2514,7 +2621,228 @@ mod tests {
             parse_command("/unknown x"),
             (None, "/unknown x".to_string())
         );
+        assert_eq!(
+            parse_command("/workspace name:project"),
+            (Some("workspace".to_string()), "name:project".to_string())
+        );
+        assert_eq!(
+            parse_command("/workspace"),
+            (Some("workspace".to_string()), String::new())
+        );
         assert_eq!(parse_command("hello"), (None, "hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn telegram_workspace_command_binds_via_rss_and_persists_in_sqlite() {
+        use crate::AgentGatewayConfig;
+        use std::path::PathBuf;
+
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+                .expect("RUSTSCRIPT_AGENT_TEST_TMPDIR must be assigned"),
+        );
+        let root = temp.join(format!("telegram-workspace-{}", uuid::Uuid::new_v4()));
+        let home = root.join("workspace-home");
+        let workspace = root.join("allowed-workspace");
+        let database = root.join("gateway.sqlite3");
+        std::fs::create_dir_all(&home).expect("private workspace home");
+        std::fs::create_dir_all(&workspace).expect("configured workspace");
+        let config_text = format!(
+            "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    project: '{}'\n",
+            workspace.display(),
+            workspace.display(),
+            workspace.display()
+        );
+        crate::config_file::ConfigFile::from_str(&config_text).expect("workspace fixture config");
+        std::fs::write(home.join("config.yaml"), config_text).expect("write native config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+                .expect("home mode");
+            std::fs::set_permissions(
+                home.join("config.yaml"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .expect("config mode");
+        }
+
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
+            .expect("production SQLite state")
+            .with_workspace_home(home);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback Telegram API fixture");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("loopback address")
+        );
+        let reply_texts = Arc::new(Mutex::new(Vec::new()));
+        let captured_replies = Arc::clone(&reply_texts);
+        let mock_api = axum::Router::new().route(
+            "/{token}/{method}",
+            axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let captured_replies = Arc::clone(&captured_replies);
+                async move {
+                    captured_replies
+                        .lock()
+                        .expect("reply capture lock")
+                        .push(payload["text"].as_str().unwrap_or_default().to_string());
+                    axum::Json(json!({"ok": true, "result": {"message_id": 1}}))
+                }
+            }),
+        );
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("loopback Telegram API server");
+        });
+        let mut config = TelegramConfig {
+            bot_token: "synthetic-fixture-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![555],
+            allowed_users: vec![555],
+            ..TelegramConfig::default()
+        };
+        config.max_429_retries = 0;
+        config.max_5xx_retries = 0;
+        let api = TelegramApi::new(&config);
+        let mut runtime = AdapterRuntime {
+            state: state.clone(),
+            account: "fixture_bot".to_string(),
+            allowlist: Allowlist::from_config(&config),
+            dedup: DedupWindows::new(config.dedup_capacity),
+            active_runs: Arc::new(Mutex::new(HashMap::new())),
+            epochs: Arc::new(Mutex::new(EpochState::default())),
+            advance_failures: Arc::new(AtomicU64::new(0)),
+            config,
+        };
+        let (update, _) = make_update(make_message(
+            555,
+            "private",
+            101,
+            None,
+            Some("/workspace name:project"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &update).await;
+        assert_eq!(
+            *reply_texts.lock().expect("reply capture lock"),
+            ["Workspace updated."]
+        );
+
+        let session_id = session_id_for("fixture_bot", 555, None);
+        let persisted = state
+            .persistence()
+            .expect("Telegram production persistence")
+            .session_get(&session_id)
+            .expect("read Telegram session");
+        let metadata_raw = persisted["rows"][0][13]
+            .as_str()
+            .expect("Telegram workspace metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_str(metadata_raw).expect("Telegram metadata JSON");
+        assert_eq!(metadata["workspace"]["selector"], "name:project");
+        assert_eq!(
+            metadata["workspace"]["canonical_path"],
+            workspace.display().to_string()
+        );
+
+        let service = state.service();
+        let provider = crate::ScriptedProvider::new();
+        provider.push_ok(json!({
+            "text": "",
+            "tool_calls": [
+                {
+                    "id": "telegram-workspace-write",
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "telegram-bound-write.txt",
+                        "content": "TELEGRAM_BOUND_WORKSPACE_WRITE"
+                    }
+                },
+                {
+                    "id": "telegram-workspace-process",
+                    "name": "terminal",
+                    "arguments": {
+                        "argv": ["/bin/touch", "telegram-bound-process.txt"],
+                        "timeout_ms": 3000
+                    }
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": "",
+            "stop_reason": "tool_calls"
+        }));
+        provider.push_ok(json!({
+            "text": "Telegram bound workspace effects completed",
+            "tool_calls": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": "",
+            "stop_reason": "stop"
+        }));
+        service.inject_provider_host(Arc::new(provider.clone()));
+        let ordinary_update = TgUpdate {
+            update_id: 12,
+            message: Some(make_message(
+                555,
+                "private",
+                102,
+                None,
+                Some("Create the file and process marker in this workspace."),
+                Some(555),
+            )),
+        };
+        handle_update(&mut runtime, &api, &ordinary_update).await;
+
+        let session_id = session_id_for("fixture_bot", 555, None);
+        let run_id = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let messages = service.session_messages(&session_id);
+                if let Some(run_id) = messages
+                    .last()
+                    .and_then(|message| message.get("run_id"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    break run_id.to_string();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ordinary Telegram message should be admitted in the bound session");
+        let events = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let events = service.run_events(&run_id);
+                if events.iter().any(|event| {
+                    event.get("event").and_then(serde_json::Value::as_str) == Some("run.completed")
+                }) {
+                    break events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ordinary Telegram run should complete");
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(serde_json::Value::as_str) == Some("run.started")
+                && event.get("data").and_then(|data| data.get("session_id"))
+                    == Some(&serde_json::Value::String(session_id.clone()))
+        }));
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("telegram-bound-write.txt"))
+                .expect("Telegram workspace file effect"),
+            "TELEGRAM_BOUND_WORKSPACE_WRITE"
+        );
+        assert!(workspace.join("telegram-bound-process.txt").is_file());
+        mock_server.abort();
+        let _ = mock_server.await;
+        drop(runtime);
+        drop(state);
+        std::fs::remove_dir_all(root).expect("remove private Telegram fixture");
     }
 
     #[test]

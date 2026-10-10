@@ -1,0 +1,24 @@
+# Example version-one runtime configuration.
+#
+# This is a documentation sample decoded by the bounded `ConfigFile` loader
+# (`src/config_file.rs`) and by the real RSS source-selection entry
+# (`rss/config/selection.rss`). It is the same document the library/bootstrap
+# config path consumes; the packaged gateway binary is configured through
+# environment variables instead (see ../configuration.md), so this file is a
+# loader sample rather than a gateway setting.
+#
+# The companion auth.yaml is intentionally empty: the provider below carries
+# no `auth:` credential reference, so the loader's reference-integrity check
+# has nothing to resolve and the sample stays credential-free. Actual provider
+# transport needs a credential injected through the native auth host; this
+# sample only shows the admitted, source-supported configuration shape.
+version: 1
+agent:
+  source: bundled:coding
+model:
+  provider: openai
+  model: gpt-4o
+providers:
+  openai:
+    protocol: openai-chat-completions
+    base_url: https://api.openai.com

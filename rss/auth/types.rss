@@ -1,0 +1,22 @@
+use auth;
+use oauth;
+
+struct CodexDeviceLoginRequest {
+    policy_handle: resource<auth.policy>,
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int
+}
+
+struct CodexDeviceInstruction {
+    verification_url: string,
+    user_code: string,
+    expires_in_seconds: int
+}
+
+struct CodexDeviceLoginResult {
+    ok: bool,
+    code: string,
+    message: string,
+    metadata: AuthMetadataEnvelope?
+}

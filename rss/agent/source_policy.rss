@@ -1,0 +1,173 @@
+// Selection descriptors carry no filesystem authority.
+// Preserve paths verbatim; the token bound counts Unicode scalars.
+
+fn char_at(value: string, index: int) -> string {
+    value[index:(index + 1)]
+}
+
+fn starts_with(value: string, prefix: string) -> bool {
+    let mut result: bool = false;
+    if prefix.length <= value.length {
+        result = value[0:prefix.length] == prefix;
+    }
+    result
+}
+
+fn field_present(value: map, key: string) -> bool {
+    let mut present: bool = false;
+    if value.has(key) {
+        if type(value[key]) != "null" {
+            present = true;
+        }
+    }
+    present
+}
+
+fn field_is_string(value: map, key: string) -> bool {
+    let mut is_string: bool = false;
+    if type(value[key]) == "string" {
+        is_string = true;
+    }
+    is_string
+}
+
+fn has_control_character(value: string) -> bool {
+    let mut found: bool = false;
+    let mut index: int = 0;
+    while found == false && index < value.length {
+        let ch: string = char_at(value, index);
+        if ch == "\0" || ch == "\n" || ch == "\r" || ch == "\t" {
+            found = true;
+        }
+        index = index + 1;
+    }
+    found
+}
+
+fn is_invalid_token(value: string) -> bool {
+    let mut invalid: bool = false;
+    if value.length == 0 {
+        invalid = true;
+    } else {
+        if value.length > 4096 {
+            invalid = true;
+        } else {
+            if has_control_character(value) {
+                invalid = true;
+            }
+        }
+    }
+    invalid
+}
+
+fn is_absolute_path(value: string) -> bool {
+    let mut absolute: bool = false;
+    if starts_with(value, "/") {
+        if value.length > 1 {
+            absolute = true;
+        }
+    }
+    absolute
+}
+
+fn bundled_success() -> map {
+    {
+        ok: true,
+        source: "bundled:coding",
+        descriptor: {
+            kind: "bundled",
+            resource: "coding"
+        },
+        deprecated_override: false
+    }
+}
+
+fn file_success(canonical: string, path: string, deprecated_override: bool) -> map {
+    {
+        ok: true,
+        source: canonical,
+        descriptor: {
+            kind: "file",
+            path: path
+        },
+        deprecated_override: deprecated_override
+    }
+}
+
+fn failure(code: string, message: string) -> map {
+    {
+        ok: false,
+        deprecated_override: false,
+        error: {
+            code: code,
+            message: message
+        }
+    }
+}
+
+fn failure_invalid_source() -> map {
+    failure("invalid_agent_source", "agent source is invalid")
+}
+
+fn failure_unsupported_source() -> map {
+    failure("unsupported_agent_source", "agent source is unsupported")
+}
+
+fn failure_invalid_legacy() -> map {
+    failure("invalid_legacy_agent_source", "legacy agent source is invalid")
+}
+
+fn select_explicit_source(value: string) -> map {
+    let mut decision: map = failure_unsupported_source();
+    if value == "bundled:coding" {
+        decision = bundled_success();
+    } else {
+        if starts_with(value, "file:") {
+            let path: string = value[5:value.length];
+            if is_absolute_path(path) {
+                decision = file_success("file:" + path, path, false);
+            } else {
+                decision = failure_invalid_source();
+            }
+        }
+    }
+    decision
+}
+
+fn select_legacy_source(raw: string) -> map {
+    let mut decision: map = failure_invalid_legacy();
+    if is_absolute_path(raw) {
+        decision = file_success("file:" + raw, raw, true);
+    }
+    decision
+}
+
+pub fn run(context: map) -> map {
+    let mut decision: map = bundled_success();
+    if field_present(context, "source") {
+        if field_is_string(context, "source") == false {
+            decision = failure_invalid_source();
+        } else {
+            let value: string = context["source"];
+            if is_invalid_token(value) {
+                decision = failure_invalid_source();
+            } else {
+                decision = select_explicit_source(value);
+            }
+        }
+    } else {
+        if field_present(context, "legacy_script") {
+            if field_is_string(context, "legacy_script") == false {
+                decision = failure_invalid_legacy();
+            } else {
+                let raw: string = context["legacy_script"];
+                if is_invalid_token(raw) {
+                    decision = failure_invalid_legacy();
+                } else {
+                    decision = select_legacy_source(raw);
+                }
+            }
+        }
+    }
+    decision
+}

@@ -1,405 +1,500 @@
-//! Provider protocol adapter tests.
+//! Provider protocol adapter tests through native auth.
 //!
 //! Each test compiles the production RSS adapter modules (through the generic
-//! `rss/llm/harness.rss` entry) and drives them over a real local HTTP/SSE
-//! fixture. Fixture servers record the exact wire request (method, path,
-//! headers, body) and replay real provider transcripts from
-//! `tests/fixtures/providers/`.
-//!
-//! # Core consume (pd-vm compiler revision fd4b570d08d7cc90cc29e3b05df59c9e9bf3b88e)
-//!
-//! The four A3 core blockers are fixed in the pinned core revision (B1:
-//! callable-schema identity across module merging; B2: tail expression-if
-//! branch-local typing; B3: shared mutable closure captures; B4: runtime
-//! string-key map encoding — see
-//! `plans/2026-08-14_a3-rustscript-core-unblock.md`). The committed B1–B4
-//! regression set in `tests/fixtures/core-repros/` runs by default through
-//! `tests/core_repro_driver.rs` (positive assertions plus the preserved
-//! by-value-capture rejection control).
-//!
-//! The residual slot-aliasing defect reported at d8cf291 (plan §11a) is
-//! fixed by `fd4b570` (`fix(compiler): keep parameters live for the whole
-//! body`): the liveness allocator seeds parameter slots into the body
-//! live-out and re-marks them after every statement, so a local defined
-//! after body entry can no longer be colored onto a parameter slot.
-//! The OpenAI Chat suites below run by default and pass against the
-//! pinned revision, including the streaming path (buffered, stream
-//! aggregation, cancellation, and the EOF-without-`[DONE]` fail-closed
-//! guard from the A3 review P2). The committed `param_aliasing_*` repro
-//! pair in `tests/fixtures/core-repros/` (driven by
-//! `tests/core_repro_driver.rs`) guards the fix independently of the wire
-//! fixtures.
-//!
-//! The streaming adapter is implemented and correct (`openai_chat_stream`
-//! in `rss/llm/openai_chat.rss`, with `http::client::sse` exposed in the
-//! restricted registry). The `openai_responses` and `anthropic_messages`
-//! adapters remain typed `not_implemented` stubs (no production adapter is
-//! claimed); their transcript-reference suites stay `#[ignore]`d until
-//! that agent work exists. Four buffered suites are green and remain so:
-//! the structured provider-error mapping
-//! (`openai_chat_provider_error_is_structured`), the P1 standard-wire
-//! guard (`openai_chat_wire_format_is_standard`), and the two marker-splice
-//! preservation guards
-//! (`openai_chat_wire_preserves_marker_like_user_text`,
-//! `openai_chat_wire_preserves_marker_like_tool_schema`).
+//! `rss/llm/harness.rss` entry, or the `rss/llm/provider_dispatch.rss` entry
+//! for default-alias coverage) and drives them with an `AuthHostFactory` plus
+//! an injected counted `BoundedHttpsTransport`. No live network, no raw
+//! localhost TCP fixtures, no secret material in requests, profiles, or
+//! options: the trusted fixture home owns the HTTPS authority, the native
+//! transport owns credentials and the wire, and the recorded native request
+//! (method, URL, headers, body) proves the public contract. Real provider
+//! transcripts still come from `tests/fixtures/providers/`.
 
-use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
+#[path = "support/opaque_chat_stream.rs"]
+mod opaque_chat_stream;
+
+#[path = "support/provider_opaque_fixture.rs"]
+mod provider_opaque_fixture;
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use rustscript_agent::CancellationReason;
-use rustscript_agent::capabilities::{
-    AllowAllApproval, ArtifactCapability, ArtifactLimits, CapabilityLifecycle, CapabilityOwner,
-    DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits, LifecycleClock,
-    LifecycleError, LifecycleLimits, NeverCancelled, ProcessCapability, ProcessLimits, SystemClock,
-    TokenIssuer, UuidIssuer,
-};
+use rustscript_agent::auth::oauth::{BoundedHttpsTransport, ScriptedHttpsTransport};
 use rustscript_agent::{
-    AgentConfig, AgentHostBridges, AgentRunner, RunCancellation, RunDeliveryError, RunError,
-    RunEventSink, ScriptedProvider, bundled_tool_registry,
+    AgentConfig, AgentHostBridges, AgentRunner, CancellationReason, RunCancellation,
+    RunDeliveryError, RunEventSink,
 };
 use rustscript_vm::Value;
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use serde_json::{Value as JsonValue, json};
+
+use provider_opaque_fixture::{
+    FixtureHome, canonical_request, harness_context, harness_runner,
+    harness_runner_with_cancellation, harness_runner_with_clock, read_provider_fixture, sse_events,
+    vm_value_to_json,
+};
 
 // ---------------------------------------------------------------------------
-// Fixture infrastructure
+// Shared helpers
 // ---------------------------------------------------------------------------
 
-/// One recorded client request: raw head + body and the decoded body text.
-#[derive(Debug)]
-struct RecordedRequest {
-    raw: String,
-    body: String,
+fn response_of(result: &JsonValue) -> &serde_json::Map<String, JsonValue> {
+    result["response"].as_object().expect("response object")
 }
 
-fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/providers")
+fn error_of(result: &JsonValue) -> &serde_json::Map<String, JsonValue> {
+    result["error"].as_object().expect("error object")
 }
 
-fn read_fixture(relative: &str) -> String {
-    fs::read_to_string(fixture_root().join(relative))
-        .unwrap_or_else(|error| panic!("fixture {relative} should be readable: {error}"))
-}
-
-/// Reads one HTTP/1.1 request (head plus content-length body) from the socket.
-fn read_http_request(stream: &mut std::net::TcpStream) -> RecordedRequest {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    let mut content_length = None;
-    loop {
-        let read = stream.read(&mut buffer).expect("read fixture request");
-        if read == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        let text = String::from_utf8_lossy(&request);
-        if content_length.is_none() {
-            for line in text.lines() {
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = value.trim().parse::<usize>().ok();
-                }
-            }
-        }
-        if let Some(length) = content_length {
-            let head_end = text.find("\r\n\r\n").map(|index| index + 4).unwrap_or(0);
-            if request.len() >= head_end + length {
-                break;
-            }
-        }
-        if text.contains("\r\n\r\n") && content_length == Some(0) {
-            break;
-        }
-    }
-    let text = String::from_utf8_lossy(&request).into_owned();
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default();
-    RecordedRequest { raw: text, body }
-}
-
-/// Accepts one connection with a bounded wait so tests cannot hang when the
-/// adapter under test never opens a connection.
-fn accept_bounded(listener: &TcpListener) -> Option<std::net::TcpStream> {
-    listener.set_nonblocking(true).expect("fixture nonblocking");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream
-                    .set_nonblocking(false)
-                    .expect("fixture blocking mode");
-                return Some(stream);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("fixture accept failed: {error}"),
-        }
-    }
-}
-
-/// Spawns a one-shot JSON fixture that records the request and replies with a
-/// fixed status and body.
-fn spawn_json_fixture(
-    status: u16,
-    body: String,
-) -> (u16, mpsc::Receiver<RecordedRequest>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
-    let port = listener.local_addr().expect("fixture address").port();
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let Some(mut stream) = accept_bounded(&listener) else {
-            return;
-        };
-        let request = read_http_request(&mut stream);
-        sender.send(request).expect("record fixture request");
-        let reason = if status == 200 { "OK" } else { "Error" };
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Provider-Fixture: 1\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write fixture response");
-    });
-    (port, receiver, handle)
-}
-
-/// Spawns an SSE fixture. Each event string is one full SSE dispatch (for
-/// example `"data: {...}\n\n"`). When `hold_open` is true the connection is
-/// kept open after the events until the client closes it.
-fn spawn_sse_fixture(
-    events: Vec<String>,
-    hold_open: bool,
-) -> (u16, mpsc::Receiver<RecordedRequest>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture");
-    let port = listener.local_addr().expect("fixture address").port();
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let Some(mut stream) = accept_bounded(&listener) else {
-            return;
-        };
-        let request = read_http_request(&mut stream);
-        sender.send(request).expect("record fixture request");
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
-            )
-            .expect("write fixture head");
-        for event in &events {
-            let chunk = format!("{:x}\r\n{}\r\n", event.len(), event);
-            stream
-                .write_all(chunk.as_bytes())
-                .expect("write fixture event");
-            stream.flush().expect("flush fixture event");
-        }
-        if hold_open {
-            // Wait for the client to close (cancellation drops the stream);
-            // a read timeout bounds the wait so the fixture never hangs.
-            stream
-                .set_read_timeout(Some(Duration::from_secs(30)))
-                .expect("fixture read timeout");
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer);
-        } else {
-            stream.write_all(b"0\r\n\r\n").expect("write fixture end");
-        }
-    });
-    (port, receiver, handle)
-}
-
-/// Splits a `.sse` transcript file into one event per dispatch (blank-line
-/// separated).
-fn sse_events(transcript: &str) -> Vec<String> {
-    transcript
-        .split("\n\n")
-        .map(str::trim_end)
-        .filter(|event| !event.is_empty())
-        .map(|event| format!("{event}\n\n"))
-        .collect()
-}
-
-fn http_config(port: u16) -> AgentConfig {
-    let mut config = AgentConfig::for_hosts(["127.0.0.1"]);
-    config.http.allowed_schemes = vec!["http".to_string()];
-    config.http.allowed_ports = vec![port];
-    config.http.allow_private_ips = true;
-    config
-}
-
-fn harness_runner(port: u16) -> AgentRunner {
-    AgentRunner::from_file(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/harness.rss"),
-        http_config(port),
+/// Runs the production harness entry and renders the canonical result. The
+/// entry is addressed by name: the harness tree also contains the opaque
+/// Chat entry's canonical `run`, and the runner resolves bare entry names
+/// through the flattened exported-callable table (first match wins), so the
+/// harness entry is deliberately not named `run`.
+fn run_harness(
+    runner: &AgentRunner,
+    kind: &str,
+    request: JsonValue,
+    profile: JsonValue,
+    credential_id: &str,
+) -> JsonValue {
+    let context = harness_context(kind, request, profile, credential_id);
+    let mut sink = DiscardSink;
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    vm_value_to_json(
+        &runner
+            .run_named_with_context_and_events("run_harness", context, &mut sink, &cancellation)
+            .unwrap_or_else(|error| panic!("harness {kind} run failed: {error:?}")),
     )
-    .expect("production adapter harness should compile")
 }
 
-/// Collects every delivered event value in order.
-#[derive(Clone, Default)]
-struct RecordingSink {
-    values: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+/// Public profile request: the named credential travels inside the request,
+/// the top-level context reference stays empty (fallback path).
+fn profile_request(options: JsonValue, model: &str, credential: &str, stream: bool) -> JsonValue {
+    let mut request = canonical_request(stream);
+    request["provider_options"] = options;
+    request["model"] = json!(model);
+    request["credential_id"] = json!(credential);
+    request
 }
 
-impl RunEventSink for RecordingSink {
-    fn deliver(&mut self, value: Value) -> Result<(), RunDeliveryError> {
-        self.values
-            .lock()
-            .expect("recording sink lock should not be poisoned")
-            .push(value);
+/// One synthetic provider endpoint: trusted base, expected logical path
+/// intent, named credential, and stored access marker.
+struct ProfileEndpoint {
+    provider: &'static str,
+    kind: &'static str,
+    base: &'static str,
+    origin: &'static str,
+    intent: &'static str,
+    credential: &'static str,
+    access: &'static str,
+}
+
+const PROFILES: [ProfileEndpoint; 5] = [
+    ProfileEndpoint {
+        provider: "custom",
+        origin: "https://fixture-custom.example.test",
+        kind: "profile:custom",
+        base: "https://fixture-custom.example.test/custom/v1",
+        intent: "/custom/v1/chat/completions",
+        credential: "synthetic-custom",
+        access: "SYNTHETIC_CUSTOM_ACCESS",
+    },
+    ProfileEndpoint {
+        provider: "deepseek",
+        origin: "https://fixture-deepseek.example.test",
+        kind: "profile:deepseek",
+        base: "https://fixture-deepseek.example.test",
+        intent: "/chat/completions",
+        credential: "synthetic-deepseek",
+        access: "SYNTHETIC_DEEPSEEK_ACCESS",
+    },
+    ProfileEndpoint {
+        provider: "opencode_go",
+        origin: "https://fixture-go.example.test",
+        kind: "profile:opencode_go",
+        base: "https://fixture-go.example.test/go/v1",
+        intent: "/go/v1/chat/completions",
+        credential: "synthetic-go",
+        access: "SYNTHETIC_GO_ACCESS",
+    },
+    ProfileEndpoint {
+        provider: "opencode_zen",
+        origin: "https://fixture-zen.example.test",
+        kind: "profile:opencode_zen",
+        base: "https://fixture-zen.example.test/zen/v1",
+        intent: "/zen/v1/chat/completions",
+        credential: "synthetic-zen",
+        access: "SYNTHETIC_ZEN_ACCESS",
+    },
+    ProfileEndpoint {
+        provider: "openrouter",
+        origin: "https://fixture-openrouter.example.test",
+        kind: "profile:openrouter",
+        base: "https://fixture-openrouter.example.test/api/v1",
+        intent: "/api/v1/chat/completions",
+        credential: "synthetic-openrouter",
+        access: "SYNTHETIC_OPENROUTER_ACCESS",
+    },
+];
+
+fn profile_home(endpoint: &ProfileEndpoint) -> FixtureHome {
+    FixtureHome::for_profile(
+        endpoint.provider,
+        endpoint.provider,
+        endpoint.base,
+        endpoint.credential,
+        endpoint.access,
+    )
+}
+
+fn openai_home() -> FixtureHome {
+    FixtureHome::for_profile(
+        "openai",
+        "openai",
+        "https://fixture.example.test/v1",
+        "synthetic-openai",
+        "SYNTHETIC_OPENAI_ACCESS",
+    )
+}
+
+fn openai_profile() -> JsonValue {
+    json!({
+        "provider": "openai",
+        "base_url": "https://fixture.example.test/v1",
+        "model": "fixture-model",
+    })
+}
+
+const PUBLIC_PROFILE_CREDENTIAL_KEYS: [&str; 8] = [
+    "api_key",
+    "authorization",
+    "token",
+    "access_token",
+    "refresh_token",
+    "headers",
+    "cookie",
+    "cookies",
+];
+
+struct DiscardSink;
+
+impl RunEventSink for DiscardSink {
+    fn deliver(&mut self, _value: Value) -> Result<(), RunDeliveryError> {
         Ok(())
     }
 }
 
+/// Production default-dispatch runner: the `dispatch` entry with native auth.
+fn dispatch_runner<T: BoundedHttpsTransport + 'static>(
+    home: &FixtureHome,
+    transport: Arc<T>,
+) -> AgentRunner {
+    let bridges = AgentHostBridges {
+        auth_host_factory: Some(home.auth_factory(transport)),
+        ..AgentHostBridges::default()
+    };
+    AgentRunner::from_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/llm/provider_dispatch.rss"),
+        AgentConfig::default(),
+    )
+    .expect("production provider dispatch should compile")
+    .with_host(bridges)
+    .with_cancellation(RunCancellation::with_timeout(Duration::from_secs(30)))
+}
+
+fn run_dispatch(runner: &AgentRunner, request: JsonValue) -> JsonValue {
+    let context = Value::map(vec![(
+        Value::string("request"),
+        provider_opaque_fixture::json_to_vm_value(&request),
+    )]);
+    let mut sink = DiscardSink;
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    vm_value_to_json(
+        &runner
+            .run_named_with_context_and_events("dispatch", context, &mut sink, &cancellation)
+            .unwrap_or_else(|error| panic!("dispatch run failed: {error:?}")),
+    )
+}
+
 // ---------------------------------------------------------------------------
-// Canonical request construction
+// Public profile wrappers
 // ---------------------------------------------------------------------------
 
-/// Loads the canonical request fixture and applies test overrides.
-fn canonical_request(port: u16, stream: bool) -> JsonValue {
-    let mut request: JsonValue = serde_json::from_str(&read_fixture("requests/chat_request.json"))
-        .expect("canonical request fixture should be JSON");
-    request["provider_options"] = json!({
-        "base_url": format!("http://127.0.0.1:{port}"),
-        "api_key": "test-key",
-    });
-    request["stream"] = json!(stream);
-    request
+fn assert_profile_rejects_credentials(endpoint: &ProfileEndpoint) {
+    let home = profile_home(endpoint);
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let mut failures = Vec::new();
+    for key in PUBLIC_PROFILE_CREDENTIAL_KEYS {
+        let secret = format!("synthetic-{}-{key}", endpoint.provider);
+        let options = json!({
+            "base_url": endpoint.base,
+            "model": "public-profile-model",
+            key: secret,
+        });
+        let request = profile_request(options, "public-profile-model", endpoint.credential, false);
+        let result = run_harness(&runner, endpoint.kind, request, json!({}), "");
+        let error = error_of(&result);
+        let rendered = result.to_string();
+        let rejected = error.get("code").and_then(JsonValue::as_str) == Some("config")
+            && error.get("message").and_then(JsonValue::as_str)
+                == Some("credential-bearing provider options are not public");
+        if !rejected || rendered.contains(&secret) {
+            failures.push(format!("{key}: rejected={rejected}"));
+        }
+        if !transport.take_sent().is_empty() {
+            failures.push(format!("{key}: native transport was reached"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "credential options were not rejected as specified: {failures:?}"
+    );
 }
 
-fn profile(provider: &str, port: u16) -> JsonValue {
-    json!({
-        "provider": provider,
-        "base_url": format!("http://127.0.0.1:{port}"),
-        "api_key": "test-key",
-        "model": "",
-        "capabilities": {"stream": true, "tools": true, "usage": true, "reasoning": false},
-    })
+#[test]
+fn public_profile_custom_rejects_credentials_before_send() {
+    assert_profile_rejects_credentials(&PROFILES[0]);
 }
 
-/// Runs the adapter harness entry with the given kind and request, collecting
-/// emitted events.
-fn run_adapter(
-    kind: &str,
-    request: JsonValue,
-    profile: JsonValue,
-    runner: &AgentRunner,
-) -> (JsonValue, Vec<JsonValue>) {
-    let context = Value::map(vec![
-        (Value::string("kind"), Value::string(kind)),
-        (Value::string("request"), json_to_vm_value(&request)),
-        (Value::string("profile"), json_to_vm_value(&profile)),
-    ]);
-    let mut sink = RecordingSink::default();
-    let result = runner
-        .run_with_context_and_events(context, &mut sink, &RunCancellation::new())
-        .unwrap_or_else(|error| panic!("adapter {kind} run failed: {error:?}"));
-    let events = sink
-        .values
-        .lock()
-        .expect("sink lock")
-        .iter()
-        .map(vm_value_to_json)
-        .collect();
-    (vm_value_to_json(&result), events)
+#[test]
+fn public_profile_deepseek_rejects_credentials_before_send() {
+    assert_profile_rejects_credentials(&PROFILES[1]);
 }
 
-fn json_to_vm_value(value: &JsonValue) -> Value {
-    match value {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(value) => Value::Bool(*value),
-        JsonValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Value::Int(value)
-            } else {
-                Value::Float(value.as_f64().expect("finite json number"))
+#[test]
+fn public_profile_opencode_go_rejects_credentials_before_send() {
+    assert_profile_rejects_credentials(&PROFILES[2]);
+}
+
+#[test]
+fn public_profile_opencode_zen_rejects_credentials_before_send() {
+    assert_profile_rejects_credentials(&PROFILES[3]);
+}
+
+#[test]
+fn public_profile_openrouter_rejects_credentials_before_send() {
+    assert_profile_rejects_credentials(&PROFILES[4]);
+}
+
+#[test]
+fn public_profile_nonsecret_overrides_reach_real_wire() {
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/response.json"))
+        .expect("chat response fixture should be JSON");
+    let expected_model = "public-profile-model-override";
+    let mut failures = Vec::new();
+    for endpoint in PROFILES {
+        let home = profile_home(&endpoint);
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        transport.push_json(200, body.clone());
+        let runner = harness_runner(&home, Arc::clone(&transport));
+        let mut options = json!({"base_url": endpoint.base, "model": expected_model});
+        if endpoint.provider == "custom" {
+            options["adapter"] = json!("openai_chat");
+        }
+        let request = profile_request(
+            options,
+            "request-model-before-profile-override",
+            endpoint.credential,
+            false,
+        );
+        let result = run_harness(&runner, endpoint.kind, request, json!({}), "");
+        if result["ok"] != json!(true) {
+            failures.push(format!("{}: expected ok, got {result}", endpoint.provider));
+            continue;
+        }
+        let sent = transport.take_sent();
+        if sent.len() != 1 {
+            failures.push(format!(
+                "{}: native sends={}",
+                endpoint.provider,
+                sent.len()
+            ));
+            continue;
+        }
+        let expected_url = format!("{}{}", endpoint.origin, endpoint.intent);
+        if sent[0].url != expected_url {
+            failures.push(format!(
+                "{}: trusted url={} intent={}",
+                endpoint.provider, sent[0].url, endpoint.intent
+            ));
+        }
+        if sent[0].headers.get("authorization").map(String::as_str)
+            != Some(format!("Bearer {}", endpoint.access).as_str())
+        {
+            failures.push(format!(
+                "{}: native authorization mismatch",
+                endpoint.provider
+            ));
+        }
+        match serde_json::from_str::<JsonValue>(&sent[0].body) {
+            Ok(wire) if wire["model"] == json!(expected_model) => {}
+            _ => failures.push(format!(
+                "{}: wire model did not use the public profile override",
+                endpoint.provider
+            )),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "public profile wire mismatches: {failures:?}"
+    );
+}
+
+#[test]
+fn public_profile_request_model_preserved_without_override() {
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/response.json"))
+        .expect("chat response fixture should be JSON");
+    let canonical_model = "canonical-request-model";
+    let mut failures = Vec::new();
+    for endpoint in PROFILES {
+        for explicit_empty in [false, true] {
+            let home = profile_home(&endpoint);
+            let transport = Arc::new(ScriptedHttpsTransport::new());
+            transport.push_json(200, body.clone());
+            let runner = harness_runner(&home, Arc::clone(&transport));
+            let mut options = json!({"base_url": endpoint.base});
+            if endpoint.provider == "custom" {
+                options["adapter"] = json!("openai_chat");
+            }
+            if explicit_empty {
+                options["model"] = json!("");
+            }
+            let request = profile_request(options, canonical_model, endpoint.credential, false);
+            let result = run_harness(&runner, endpoint.kind, request, json!({}), "");
+            if result["ok"] != json!(true) {
+                failures.push(format!(
+                    "{}/empty={explicit_empty}: expected ok, got {result}",
+                    endpoint.provider
+                ));
+                continue;
+            }
+            let sent = transport.take_sent();
+            match sent.first() {
+                Some(prepared)
+                    if serde_json::from_str::<JsonValue>(&prepared.body)
+                        .map(|wire| wire["model"] == json!(canonical_model))
+                        .unwrap_or(false) => {}
+                _ => failures.push(format!(
+                    "{}/empty={explicit_empty}: wire model did not preserve the request model",
+                    endpoint.provider
+                )),
             }
         }
-        JsonValue::String(value) => Value::string(value),
-        JsonValue::Array(values) => Value::Array(std::sync::Arc::new(
-            values.iter().map(json_to_vm_value).collect::<Vec<_>>(),
-        )),
-        JsonValue::Object(entries) => Value::map(
-            entries
-                .iter()
-                .map(|(key, value)| (Value::string(key), json_to_vm_value(value)))
-                .collect(),
-        ),
+    }
+    assert!(
+        failures.is_empty(),
+        "public profile request model mismatches: {failures:?}"
+    );
+}
+
+#[test]
+fn public_profile_custom_selects_deferred_adapters_without_send() {
+    for adapter in ["anthropic_messages", "openai_responses"] {
+        let home = profile_home(&PROFILES[0]);
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        let runner = harness_runner(&home, Arc::clone(&transport));
+        let options = json!({
+            "base_url": PROFILES[0].base,
+            "model": "public-profile-model",
+            "adapter": adapter,
+        });
+        let request = profile_request(options, "request-model", PROFILES[0].credential, false);
+        let result = run_harness(&runner, "profile:custom", request, json!({}), "");
+        assert_eq!(result["ok"], json!(false), "{adapter}");
+        assert_eq!(
+            error_of(&result)["code"],
+            json!("not_implemented"),
+            "{adapter}"
+        );
+        assert!(
+            transport.take_sent().is_empty(),
+            "{adapter}: stub adapter must not send"
+        );
     }
 }
 
-/// Converts one VM value into JSON (test-side mirror of the gateway renderer).
-fn vm_value_to_json(value: &Value) -> JsonValue {
-    match value {
-        Value::Null => JsonValue::Null,
-        Value::Int(value) => json!(value),
-        Value::Float(value) => serde_json::Number::from_f64(*value)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
-        Value::Bool(value) => json!(value),
-        Value::String(value) => JsonValue::String(value.to_string()),
-        Value::Bytes(value) => JsonValue::String(String::from_utf8_lossy(value).into_owned()),
-        Value::Array(values) => JsonValue::Array(values.iter().map(vm_value_to_json).collect()),
-        Value::Map(entries) => JsonValue::Object(
-            entries
-                .iter()
-                .map(|(key, value)| (vm_map_key_to_string(key), vm_value_to_json(value)))
-                .collect(),
-        ),
-        Value::Callable(_) => JsonValue::String("<callable>".to_string()),
-    }
+#[test]
+fn public_profile_hostile_base_never_overrides_native_authority() {
+    // A hostile profile base whose path intent escapes the admitted prefix
+    // fails closed with zero sends.
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let profile = json!({
+        "provider": "openai",
+        "base_url": "https://hostile.example.test/evil",
+        "model": "fixture-model",
+    });
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        profile,
+        "synthetic-openai",
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(error_of(&result)["code"], json!("path_denied"));
+    assert!(transport.take_sent().is_empty());
+
+    // A hostile authority on an admitted path shape still sends only to the
+    // trusted fixture authority: the public base contributes path intent,
+    // never transport authority.
+    let home = profile_home(&PROFILES[1]);
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/response.json"))
+        .expect("chat response fixture should be JSON");
+    transport.push_json(200, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let options = json!({
+        "base_url": "https://hostile.example.test/evil",
+        "model": "public-profile-model",
+    });
+    let request = profile_request(options, "request-model", PROFILES[1].credential, false);
+    let result = run_harness(&runner, "profile:deepseek", request, json!({}), "");
+    assert_eq!(result["ok"], json!(true), "{result}");
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].url, "https://fixture-deepseek.example.test/evil/chat/completions",
+        "hostile authority must never override the trusted native authority"
+    );
 }
 
-fn vm_map_key_to_string(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.to_string(),
-        other => vm_value_to_json(other).to_string(),
-    }
-}
-
-fn request_line(recorded: &RecordedRequest) -> &str {
-    recorded.raw.lines().next().expect("request line")
-}
-
-fn header(recorded: &RecordedRequest, name: &str) -> Option<String> {
-    recorded.raw.lines().find_map(|line| {
-        let (head, value) = line.split_once(':')?;
-        head.eq_ignore_ascii_case(name)
-            .then(|| value.trim().to_string())
-    })
-}
-
-fn response_of(result: &JsonValue) -> &JsonMap<String, JsonValue> {
-    result["response"].as_object().expect("response object")
-}
-
-fn error_of(result: &JsonValue) -> &JsonMap<String, JsonValue> {
-    result["error"].as_object().expect("error object")
+#[test]
+fn public_profile_missing_credential_fails_closed_without_send() {
+    let home = profile_home(&PROFILES[4]);
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request(false);
+    request["provider_options"] = json!({"base_url": PROFILES[4].base});
+    let result = run_harness(&runner, "profile:openrouter", request, json!({}), "");
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(error_of(&result)["code"], json!("missing_credential"));
+    assert!(transport.take_sent().is_empty());
 }
 
 // ---------------------------------------------------------------------------
-// S1: OpenAI Chat Completions, buffered
+// S1: OpenAI Chat Completions, buffered (native auth)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn openai_chat_non_stream_text_usage_and_reasoning() {
-    let body = read_fixture("openai_chat/response.json");
-    let (port, requests, fixture) = spawn_json_fixture(200, body);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/response.json"))
+        .expect("chat response fixture should be JSON");
+    transport.push_json(200, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, events) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(true), "{result}");
     let response = response_of(&result);
@@ -416,22 +511,23 @@ fn openai_chat_non_stream_text_usage_and_reasoning() {
     assert_eq!(response["usage"]["output_tokens"], json!(15));
     assert_eq!(response["usage"]["total_tokens"], json!(27));
     assert_eq!(response["tool_calls"], json!([]));
-    assert!(
-        events.is_empty(),
-        "buffered calls emit no events: {events:?}"
-    );
 
-    let recorded = requests.recv().expect("recorded request");
-    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1, "exactly one native buffered request");
+    assert_eq!(sent[0].method, "POST");
     assert_eq!(
-        header(&recorded, "authorization").as_deref(),
-        Some("Bearer test-key")
+        sent[0].url, "https://fixture.example.test/v1/chat/completions",
+        "native trusted authority owns the request URL"
     );
     assert_eq!(
-        header(&recorded, "content-type").as_deref(),
+        sent[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer SYNTHETIC_OPENAI_ACCESS")
+    );
+    assert_eq!(
+        sent[0].headers.get("content-type").map(String::as_str),
         Some("application/json")
     );
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
     assert_eq!(wire["model"], json!("test-model"));
     assert_eq!(wire["stream"], json!(false));
     assert_eq!(wire["max_tokens"], json!(128));
@@ -454,19 +550,27 @@ fn openai_chat_non_stream_text_usage_and_reasoning() {
         wire["tools"][0]["function"]["parameters"]["required"][0],
         json!("path")
     );
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
 }
 
 #[test]
 fn openai_chat_unknown_finish_reason_is_preserved_as_text_response() {
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
     let mut body: JsonValue =
-        serde_json::from_str(&read_fixture("openai_chat/response.json")).expect("fixture json");
+        serde_json::from_str(&read_provider_fixture("openai_chat/response.json"))
+            .expect("fixture json");
     body["choices"][0]["finish_reason"] = json!("mystery_stop");
-    let (port, _requests, fixture) = spawn_json_fixture(200, body.to_string());
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    transport.push_json(200, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(true), "{result}");
     let response = response_of(&result);
@@ -480,13 +584,22 @@ fn openai_chat_unknown_finish_reason_is_preserved_as_text_response() {
 
 #[test]
 fn openai_chat_non_stream_tool_calls() {
-    let body = read_fixture("openai_chat/response_tools.json");
-    let (port, requests, fixture) = spawn_json_fixture(200, body);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body = read_provider_fixture("openai_chat/response_tools.json");
+    transport.push_json(
+        200,
+        serde_json::from_str(&body).expect("tool response fixture should be JSON"),
+    );
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(true), "{result}");
     let response = response_of(&result);
@@ -502,26 +615,33 @@ fn openai_chat_non_stream_tool_calls() {
     assert_eq!(calls[1]["id"], json!("call_cd34"));
     assert_eq!(calls[1]["name"], json!("search_files"));
     assert_eq!(calls[1]["arguments"]["pattern"], json!("provider"));
-
-    let recorded = requests.recv().expect("recorded request");
-    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
+    assert_eq!(transport.take_sent().len(), 1);
 }
 
 #[test]
 fn openai_chat_provider_error_is_structured() {
-    let body = read_fixture("openai_chat/error.json");
-    let (port, _requests, fixture) = spawn_json_fixture(400, body);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/error.json"))
+        .expect("error fixture should be JSON");
+    transport.push_json(400, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(false), "{result}");
     let error = error_of(&result);
     assert_eq!(error["status"], json!(400));
     assert_eq!(error["type"], json!("invalid_request_error"));
-    assert_eq!(error["code"], json!("model_not_found"));
+    // Native sanitization removes the provider `code` field before RSS sees
+    // the body; the stable public code is the transport HTTP mapping.
+    assert_eq!(error["code"], json!("http_error"));
     assert_eq!(error["param"], json!("model"));
     assert!(
         error["message"]
@@ -529,35 +649,103 @@ fn openai_chat_provider_error_is_structured() {
             .expect("message")
             .contains("does not exist")
     );
+    assert_eq!(transport.take_sent().len(), 1);
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
 }
 
-/// P1 wire-format guard: the recorded request must carry the standard OpenAI
-/// chat-completions wire shape (user `content` as a parts array, tool/assistant
-/// content as plain strings, no custom `content_parts` field, tool schemas
-/// spliced in place, `tool_choice` not an empty string). The fixture replies
-/// 400 so the run follows the already-green error path; the wire is built and
-/// recorded before the response is parsed, which keeps this assertion
-/// independent of the core-blocked response-parse path.
+#[test]
+fn openai_chat_unauthorized_and_rate_limited_are_structured() {
+    // 401 denies without retry; 429 admits retry. Both stay canonical with
+    // the provider `code` field sanitized away and no secret echo.
+    let cases: [(u16, &str, bool); 2] = [
+        (401, "invalid_request_error", false),
+        (429, "rate_limit_error", true),
+    ];
+    for (status, error_type, retryable) in cases {
+        let home = openai_home();
+        let transport = Arc::new(ScriptedHttpsTransport::new());
+        transport.push_json(
+            status,
+            json!({"error": {
+                "type": error_type,
+                "code": "SYNTHETIC_PRIVATE_CODE_FIELD",
+                "message": "Synthetic provider rejection",
+                "param": "model",
+            }}),
+        );
+        let runner = harness_runner(&home, Arc::clone(&transport));
+        let result = run_harness(
+            &runner,
+            "openai_chat",
+            canonical_request(false),
+            openai_profile(),
+            "synthetic-openai",
+        );
+        assert_eq!(result["ok"], json!(false), "HTTP {status}");
+        let error = error_of(&result);
+        assert_eq!(error["status"], json!(status), "HTTP {status}");
+        assert_eq!(error["type"], json!(error_type), "HTTP {status}");
+        assert_eq!(error["code"], json!("http_error"), "HTTP {status}");
+        assert_eq!(error["retryable"], json!(retryable), "HTTP {status}");
+        assert_eq!(
+            error["message"],
+            json!("Synthetic provider rejection"),
+            "HTTP {status}"
+        );
+        assert_eq!(transport.take_sent().len(), 1, "HTTP {status}");
+        let rendered = result.to_string();
+        assert!(
+            !rendered.contains("SYNTHETIC_PRIVATE_CODE_FIELD"),
+            "HTTP {status}"
+        );
+        assert!(
+            !rendered.contains("SYNTHETIC_OPENAI_ACCESS"),
+            "HTTP {status}"
+        );
+    }
+}
+
+/// P1 wire-format guard: the recorded native request must carry the standard
+/// OpenAI chat-completions wire shape (user `content` as a parts array,
+/// tool/assistant content as plain strings, no custom `content_parts` field,
+/// tool schemas spliced in place, `tool_choice` omitted when empty). The
+/// fixture replies 400 so the run follows the structured error path; the wire
+/// is built and recorded before the response is parsed.
 #[test]
 fn openai_chat_wire_format_is_standard() {
-    let body = read_fixture("openai_chat/error.json");
-    let (port, requests, fixture) = spawn_json_fixture(400, body);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/error.json"))
+        .expect("error fixture should be JSON");
+    transport.push_json(400, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(false), "{result}");
 
-    let recorded = requests.recv().expect("recorded request");
-    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].url,
+        "https://fixture.example.test/v1/chat/completions"
+    );
+    assert_eq!(
+        sent[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer SYNTHETIC_OPENAI_ACCESS")
+    );
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
 
     assert!(
-        !recorded.body.contains("content_parts"),
+        !sent[0].body.contains("content_parts"),
         "wire must not contain the custom content_parts field: {}",
-        recorded.body
+        sent[0].body
     );
     assert_eq!(wire["messages"][0]["role"], json!("user"));
     assert_eq!(wire["messages"][0]["content"][0]["type"], json!("text"));
@@ -580,11 +768,9 @@ fn openai_chat_wire_format_is_standard() {
     );
     // Empty `tool_choice` is OMITTED from the wire body entirely (the struct
     // encoder drops null optional fields; OpenAI treats an absent tool_choice
-    // as the default `auto`). The old `wire["tool_choice"] == null` assertion
-    // passed vacuously because serde_json indexes a missing key as Null —
-    // asserting absence on the parsed map plus a literal body check keeps that
-    // masking from hiding a regression that would emit `"tool_choice":null` or
-    // an empty string instead.
+    // as the default `auto`). Assert absence on the parsed map plus a literal
+    // body check so a regression emitting `"tool_choice":null` or an empty
+    // string cannot hide.
     assert!(
         !wire
             .as_object()
@@ -593,82 +779,66 @@ fn openai_chat_wire_format_is_standard() {
         "empty tool_choice must be omitted from the wire body: {wire}"
     );
     assert!(
-        !recorded.body.contains("tool_choice"),
+        !sent[0].body.contains("tool_choice"),
         "wire body must not mention tool_choice at all: {}",
-        recorded.body
+        sent[0].body
     );
 }
 
 /// Loop follow-up messages must convert through the real OpenAI Chat request
 /// builder: assistant `function.arguments` is the canonical JSON string, and
 /// tool results keep wire role/tool_call_id/content instead of being dropped.
+/// The captured follow-up messages are replayed directly through the migrated
+/// harness; the agent provider loop itself is out of scope here.
 #[test]
 fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
     let first_arguments = json!({"path": "文档.txt"});
     let second_arguments = json!({"path": "a\"b.md"});
-    let provider = ScriptedProvider::new();
-    provider.push_ok(json!({
-        "text": "Let me read.",
-        "tool_calls": [
-            {"id": "call-1", "name": "read_file", "arguments": first_arguments},
-            {"id": "call-2", "name": "read_file", "arguments": second_arguments}
-        ],
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "reasoning": "",
-        "stop_reason": "tool_calls"
-    }));
-    provider.push_ok(json!({
-        "text": "done",
-        "tool_calls": [],
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "reasoning": "",
-        "stop_reason": "stop"
-    }));
-    let loop_runner = AgentRunner::from_file(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
-        AgentConfig::default(),
-    )
-    .expect("production loop policy should compile");
-    let (mut dispatcher, _root) = loop_dispatcher(8);
-    dispatcher.provider = Some(Arc::new(provider.clone()));
-    dispatcher.skip_sleep = true;
-    let loop_runner = loop_runner.with_host(dispatcher);
-    let decision = vm_value_to_json(
-        &loop_runner
-            .run_with_context(json_to_vm_value(&loop_context()))
-            .expect("loop should run"),
-    );
-    assert_eq!(decision["kind"], json!("run.completed"));
-    assert_eq!(provider.call_count(), 2);
-
-    let mut follow = provider.requests()[1].clone();
-    assert_eq!(
-        follow["messages"][2]["content"][0]["content"],
-        json!("ran read_file"),
-        "canonical tool_result content before adapter conversion: {}",
-        follow["messages"][2]
-    );
-    let body = read_fixture("openai_chat/error.json");
-    let (port, requests, fixture) = spawn_json_fixture(400, body);
-    follow["provider_options"] = json!({
-        "base_url": format!("http://127.0.0.1:{port}"),
-        "api_key": "test-key",
-    });
-    let runner = harness_runner(port);
-    let (result, _) = run_adapter("openai_chat", follow, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
-    assert!(result["ok"] == json!(false), "{result}");
-
-    let recorded = requests.recv().expect("recorded request");
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
-    let messages = wire["messages"].as_array().expect("wire messages");
-    assert_eq!(messages[0]["role"], json!("user"));
-    assert_eq!(messages[1]["role"], json!("assistant"));
-    assert_eq!(messages[1]["content"], json!("Let me read."));
     let first_arguments_json =
         serde_json::to_string(&first_arguments).expect("first arguments json");
     let second_arguments_json =
         serde_json::to_string(&second_arguments).expect("second arguments json");
+    let mut request = canonical_request(false);
+    request["messages"] = json!([
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Let me read."},
+            {"type": "tool_call", "tool_call_id": "call-1", "name": "read_file",
+             "arguments_json": first_arguments_json},
+            {"type": "tool_call", "tool_call_id": "call-2", "name": "read_file",
+             "arguments_json": second_arguments_json},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_call_id": "call-1", "content": "ran read_file",
+             "is_error": false},
+            {"type": "tool_result", "tool_call_id": "call-2", "content": "ran read_file",
+             "is_error": false},
+        ]},
+    ]);
+
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/error.json"))
+        .expect("error fixture should be JSON");
+    transport.push_json(400, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
+
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        request,
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert!(result["ok"] == json!(false), "{result}");
+
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
+    let messages = wire["messages"].as_array().expect("wire messages");
+    assert_eq!(messages[0]["role"], json!("user"));
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    assert_eq!(messages[1]["content"], json!("Let me read."));
     assert_eq!(
         messages[1]["tool_calls"][0]["function"]["arguments"],
         json!(first_arguments_json)
@@ -695,215 +865,20 @@ fn openai_chat_converts_loop_follow_up_messages_to_standard_wire() {
     );
 }
 
-fn loop_temp_root() -> PathBuf {
-    let root = std::env::var_os("TEST_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!(
-                "rustscript-agent-provider-loop-{}",
-                std::process::id()
-            ))
-        });
-    fs::create_dir_all(&root).expect("loop temp root should exist");
-    assert_temp_path_is_lease_safe(&root);
-    root
-}
-
-fn unique_loop_workspace(label: &str, sequence: u64) -> PathBuf {
-    loop_temp_root().join(format!("{}-{}-{}", label, std::process::id(), sequence))
-}
-
-fn assert_temp_path_is_lease_safe(path: &std::path::Path) {
-    if let Some(test_tmpdir) = std::env::var_os("TEST_TMPDIR") {
-        let root = PathBuf::from(test_tmpdir);
-        assert!(
-            path.starts_with(&root),
-            "loop temp paths must stay under TEST_TMPDIR ({}); got {}",
-            root.display(),
-            path.display()
-        );
-        return;
-    }
-    let rendered = path.to_string_lossy();
-    assert!(
-        path.starts_with(std::env::temp_dir()),
-        "loop temp paths must use std::env::temp_dir when TEST_TMPDIR is unset: {rendered}"
-    );
-    let worktrees = format!("/{}s/", "worktree");
-    let lease_tmp = format!("/mnt/{}/workspace/rustscript-agent/tmp/", "TEMP");
-    let prod_tmp = format!("/tmp/{}-agent-", "prod");
-    assert!(
-        !rendered.contains(&worktrees)
-            && !rendered.contains(&lease_tmp)
-            && !rendered.contains(&prod_tmp),
-        "loop temp paths must not write into a hardcoded sibling lease path: {rendered}"
-    );
-}
-
-thread_local! {
-    static LOOP_WORKSPACE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-struct LoopDurable;
-
-impl DurableToolLifecycle for LoopDurable {
-    fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
-        Ok(())
-    }
-    fn prepare_parent(
-        &self,
-        _run_id: &str,
-        _call_id: &str,
-        _tool_name: &str,
-    ) -> Result<(), LifecycleError> {
-        Ok(())
-    }
-    fn replay_result(
-        &self,
-        _run_id: &str,
-        _call_id: &str,
-        _tool_name: &str,
-    ) -> Result<Option<JsonValue>, LifecycleError> {
-        Ok(None)
-    }
-    fn commit_started(&self, _record: &DurableStarted) -> Result<(), LifecycleError> {
-        Ok(())
-    }
-    fn commit_result(
-        &self,
-        call_id: &str,
-        result: &JsonValue,
-    ) -> Result<JsonValue, LifecycleError> {
-        Ok(json!({"ok": true, "kind": "committed", "call_id": call_id, "result": result}))
-    }
-    fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
-        Ok(())
-    }
-}
-
-fn loop_owner() -> CapabilityOwner {
-    CapabilityOwner::new("profile-loop", "session-loop", "run-loop").expect("owner")
-}
-
-fn loop_dispatcher(max_tool_calls: u64) -> (AgentHostBridges, PathBuf) {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = unique_loop_workspace("adapter-loop", NEXT.fetch_add(1, Ordering::Relaxed));
-    fs::create_dir_all(&root).expect("loop dispatcher workspace");
-    fs::write(root.join("文档.txt"), "ran read_file").expect("seed");
-    fs::write(root.join(r#"a"b.md"#), "ran read_file").expect("seed");
-    LOOP_WORKSPACE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
-    let identity = bundled_tool_registry()
-        .expect("RSS registry")
-        .identity()
-        .to_string();
-    let clock = Arc::new(SystemClock);
-    let deadline_ms = clock.now_ms() + 30_000;
-    let lifecycle = Arc::new(
-        CapabilityLifecycle::builder()
-            .owner(loop_owner())
-            .registry_identity(identity)
-            .workspace(&root)
-            .limits(LifecycleLimits {
-                max_tool_calls: max_tool_calls.max(1),
-                max_output_bytes: 64 * 1024,
-                max_summary_bytes: 256,
-            })
-            .deadline_ms(deadline_ms)
-            .clock(clock)
-            .tokens(Arc::new(UuidIssuer) as Arc<dyn TokenIssuer>)
-            .durable(Arc::new(LoopDurable))
-            .approval(Arc::new(AllowAllApproval))
-            .cancellation(Arc::new(NeverCancelled))
-            .build()
-            .expect("loop lifecycle"),
-    );
-    let host = AgentHostBridges {
-        lifecycle: Some(Arc::clone(&lifecycle)),
-        capability_owner: Some(loop_owner()),
-        filesystem: Some(Arc::new(
-            FilesystemCapability::new(
-                lifecycle.as_ref().clone(),
-                loop_owner(),
-                FilesystemLimits::default(),
-            )
-            .expect("fs"),
-        )),
-        processes: Some(Arc::new(
-            ProcessCapability::new(
-                lifecycle.as_ref().clone(),
-                loop_owner(),
-                ProcessLimits::default(),
-            )
-            .expect("proc"),
-        )),
-        artifacts: Some(Arc::new(
-            ArtifactCapability::new(
-                lifecycle.as_ref().clone(),
-                loop_owner(),
-                ArtifactLimits {
-                    max_object_bytes: 8 * 1024 * 1024,
-                    max_total_bytes: 64 * 1024 * 1024,
-                    max_objects: 64,
-                },
-            )
-            .expect("artifacts"),
-        )),
-        ..AgentHostBridges::default()
-    };
-    (host, root)
-}
-
-fn loop_context() -> JsonValue {
-    json!({
-        "run_id": "run-loop",
-        "session_id": "session-loop",
-        "model": "test-model",
-        "provider": "openai",
-        "messages": [{
-            "role": "user",
-            "content": [{"type": "text", "text": "hello"}]
-        }],
-        "tools": bundled_tool_registry()
-            .expect("RSS registry")
-            .snapshot()
-            .schemas(),
-        "provider_options": {},
-        "limits": {
-            "max_turns": 4,
-            "max_tool_calls": 8,
-            "workspace_root": LOOP_WORKSPACE.with(|slot| {
-                slot.borrow().as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
-            })
-        },
-        "metadata": {
-            "registry_identity": bundled_tool_registry().ok().map(|r| r.identity().to_string()).unwrap_or_default()
-        },
-        "config": {
-            "base_retry_delay_ms": 100,
-            "max_retry_delay_ms": 400,
-            "max_retries": 2,
-            "parallel": false,
-            "task": false
-        }
-    })
-}
-
 /// Marker-splice collision guard (P3, user text): the wire splices user
 /// content parts and tool schemas through literal markers
 /// (`__RSS_USER_PARTS_<i>__`, `__RSS_TOOL_SCHEMA_<i>__`), and
-/// `string_replace_literal` replaces every occurrence. A collision requires
-/// user text to be EXACTLY the full quoted marker string — marker-like
-/// fragments in ordinary or adversarial text (prefixes, embedded occurrences,
-/// suffixed forms) must pass through byte-identical. A collision-free
-/// structured build is blocked by the core (json::encode accepts only
-/// struct-shaped values, so the splice mechanism is forced; see the plan's
-/// P3 marker note).
+/// `string_replace_literal` replaces every occurrence. Marker-like fragments
+/// in ordinary or adversarial text must pass through byte-identical.
 #[test]
 fn openai_chat_wire_preserves_marker_like_user_text() {
-    let body = read_fixture("openai_chat/error.json");
-    let (port, requests, fixture) = spawn_json_fixture(400, body);
-    let runner = harness_runner(port);
-    let mut request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/error.json"))
+        .expect("error fixture should be JSON");
+    transport.push_json(400, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request(false);
     request["messages"] = json!([
         {
             "role": "user",
@@ -930,12 +905,18 @@ fn openai_chat_wire_preserves_marker_like_user_text() {
         }
     ]);
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        request,
+        openai_profile(),
+        "synthetic-openai",
+    );
     assert!(result["ok"] == json!(false), "{result}");
 
-    let recorded = requests.recv().expect("recorded request");
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
     let messages = wire["messages"].as_array().expect("messages array");
     let texts = messages
         .iter()
@@ -961,15 +942,17 @@ fn openai_chat_wire_preserves_marker_like_user_text() {
 }
 
 /// Marker-splice collision guard (P3, tool schemas): a tool schema whose JSON
-/// text embeds the marker strings inside longer values (the only shapes
-/// ordinary or adversarial schemas can carry without being exactly the
-/// quoted marker) must be spliced in byte-identical across multi-tool passes.
+/// text embeds the marker strings inside longer values must be spliced in
+/// byte-identical across multi-tool passes.
 #[test]
 fn openai_chat_wire_preserves_marker_like_tool_schema() {
-    let body = read_fixture("openai_chat/error.json");
-    let (port, requests, fixture) = spawn_json_fixture(400, body);
-    let runner = harness_runner(port);
-    let mut request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/error.json"))
+        .expect("error fixture should be JSON");
+    transport.push_json(400, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let mut request = canonical_request(false);
     request["tools"] = json!([
         {
             "name": "read_file",
@@ -983,12 +966,18 @@ fn openai_chat_wire_preserves_marker_like_tool_schema() {
         }
     ]);
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        request,
+        openai_profile(),
+        "synthetic-openai",
+    );
     assert!(result["ok"] == json!(false), "{result}");
 
-    let recorded = requests.recv().expect("recorded request");
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1);
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
     let tools = wire["tools"].as_array().expect("tools array");
     assert_eq!(
         tools[0]["function"]["parameters"],
@@ -1012,13 +1001,21 @@ fn openai_chat_wire_preserves_marker_like_tool_schema() {
 
 #[test]
 fn openai_chat_malformed_payload_is_typed() {
-    let body = read_fixture("openai_chat/malformed.json");
-    let (port, _requests, fixture) = spawn_json_fixture(200, body);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue =
+        serde_json::from_str(&read_provider_fixture("openai_chat/malformed.json"))
+            .expect("malformed fixture should be JSON");
+    transport.push_json(200, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(false), "{result}");
     let error = error_of(&result);
@@ -1034,55 +1031,62 @@ fn openai_chat_malformed_payload_is_typed() {
 }
 
 #[test]
-fn openai_chat_invalid_json_fails_as_typed_invocation_error() {
-    let (port, _requests, fixture) = spawn_json_fixture(200, "{not json".to_string());
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+fn openai_chat_invalid_json_fails_as_typed_malformed_response() {
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_raw(200, "{not json");
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let context = Value::map(vec![
-        (Value::string("kind"), Value::string("openai_chat")),
-        (Value::string("request"), json_to_vm_value(&request)),
-        (
-            Value::string("profile"),
-            json_to_vm_value(&profile("openai", port)),
-        ),
-    ]);
-    let error = runner
-        .run_with_context(context)
-        .expect_err("invalid JSON must fail the invocation, not fabricate a response");
-    fixture.join().expect("fixture thread");
-
-    assert!(
-        matches!(
-            error,
-            RunError::Invocation(rustscript_vm::InvocationError::Host { .. })
-        ),
-        "expected a typed host failure, got {error:?}"
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
     );
-    assert!(error.to_string().contains("json_decode failed"), "{error}");
+
+    assert!(result["ok"] == json!(false), "{result}");
+    let error = error_of(&result);
+    assert_eq!(error["code"], json!("malformed_response"));
+    assert!(
+        !result.to_string().contains("not json"),
+        "raw invalid JSON must not be echoed: {result}"
+    );
+    assert_eq!(transport.take_sent().len(), 1);
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
 }
 
 // ---------------------------------------------------------------------------
-// S2: OpenAI Chat Completions, streaming (http::client::sse)
+// S2: OpenAI Chat Completions, streaming (native auth)
 // ---------------------------------------------------------------------------
-//
-// The streaming adapter (`openai_chat_stream`) is implemented against core
-// revision fd4b570 (B1 callable schemas + B3 shared BorrowMut capture
-// cells + the §11a parameter-liveness fix): the SSE callback aggregates
-// text/usage/tool-call deltas into captured accumulator locals read after
-// the stream completes, and `http::client::sse` is exposed in the
-// restricted registry. The suites below run by default and pass at the
-// pinned revision.
+
+use opaque_chat_stream::StreamTransport;
+
+fn stream_request() -> JsonValue {
+    canonical_request(true)
+}
 
 #[test]
 fn openai_chat_stream_text_and_usage() {
-    let events = sse_events(&read_fixture("openai_chat/stream.sse"));
-    let (port, requests, fixture) = spawn_sse_fixture(events, false);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, true);
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        sse_events(&read_provider_fixture("openai_chat/stream.sse"))
+            .into_iter()
+            .map(|event| event.into_bytes())
+            .collect(),
+        false,
+    ));
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(true), "{result}");
     let response = response_of(&result);
@@ -1093,26 +1097,51 @@ fn openai_chat_stream_text_and_usage() {
     assert_eq!(response["usage"]["total_tokens"], json!(27));
     assert_eq!(response["tool_calls"], json!([]));
 
-    let recorded = requests.recv().expect("recorded request");
-    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
+    let sent = transport.counts.sent.lock().expect("native request");
+    assert_eq!(sent.len(), 1, "exactly one admitted stream start");
+    assert_eq!(sent[0].method, "POST");
     assert_eq!(
-        header(&recorded, "authorization").as_deref(),
-        Some("Bearer test-key")
+        sent[0].url,
+        "https://fixture.example.test/v1/chat/completions"
     );
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    assert!(
+        sent[0]
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value == "Bearer SYNTHETIC_OPENAI_ACCESS"),
+        "native authorization must match the stored synthetic credential"
+    );
+    assert_eq!(
+        sent[0].headers.get("accept").map(String::as_str),
+        Some("text/event-stream")
+    );
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("public stream body");
     assert_eq!(wire["stream"], json!(true));
     assert_eq!(wire["stream_options"]["include_usage"], json!(true));
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
 }
 
 #[test]
 fn openai_chat_stream_tool_call_chunk_aggregation() {
-    let events = sse_events(&read_fixture("openai_chat/stream_tools.sse"));
-    let (port, requests, fixture) = spawn_sse_fixture(events, false);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, true);
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        sse_events(&read_provider_fixture("openai_chat/stream_tools.sse"))
+            .into_iter()
+            .map(|event| event.into_bytes())
+            .collect(),
+        false,
+    ));
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(result["ok"] == json!(true), "{result}");
     let response = response_of(&result);
@@ -1128,76 +1157,191 @@ fn openai_chat_stream_tool_call_chunk_aggregation() {
     assert_eq!(calls[1]["arguments"], json!({"pattern": "provider"}));
     assert_eq!(response["usage"]["total_tokens"], json!(30));
 
-    let recorded = requests.recv().expect("recorded request");
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let sent = transport.counts.sent.lock().expect("native request");
+    assert_eq!(sent.len(), 1);
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
     assert_eq!(wire["stream"], json!(true));
 }
 
 #[test]
-fn openai_chat_stream_cancellation_is_typed() {
-    // The held-open fixture must not terminate the stream itself: drop the
-    // terminal `data: [DONE]` event so only cancellation can end the run.
-    let mut events = sse_events(&read_fixture("openai_chat/stream.sse"));
-    assert_eq!(
-        events.pop().as_deref(),
-        Some("data: [DONE]\n\n"),
-        "the stream transcript must end with the [DONE] event"
-    );
-    let (port, _requests, fixture) = spawn_sse_fixture(events, true);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, true);
-    let context = Value::map(vec![
-        (Value::string("kind"), Value::string("openai_chat")),
-        (Value::string("request"), json_to_vm_value(&request)),
+fn openai_chat_stream_guards_start_nothing() {
+    use std::sync::atomic::Ordering;
+    let cases: [(&str, &str, Option<JsonValue>, &str); 3] = [
+        ("empty-credential", "", None, "missing_credential"),
         (
-            Value::string("profile"),
-            json_to_vm_value(&profile("openai", port)),
+            "unadmitted-credential",
+            "not-admitted",
+            None,
+            "credential_not_admitted",
         ),
-    ]);
+        (
+            "private-options",
+            "synthetic-openai",
+            Some(json!({"api_key": "SYNTHETIC_PRIVATE_OPTION_MARKER"})),
+            "config",
+        ),
+    ];
+    for (label, credential, private_options, expected) in cases {
+        let home = openai_home();
+        let transport = Arc::new(StreamTransport::new(
+            200,
+            "text/event-stream",
+            vec![b"data: [DONE]\n\n".to_vec()],
+            false,
+        ));
+        let runner = harness_runner(&home, Arc::clone(&transport));
+        let mut request = stream_request();
+        if let Some(options) = private_options {
+            request["provider_options"] = options;
+        }
+        let result = run_harness(
+            &runner,
+            "openai_chat",
+            request,
+            openai_profile(),
+            credential,
+        );
+        assert_eq!(result["ok"], json!(false), "{label} guard must fail closed");
+        assert_eq!(result["error"]["code"], json!(expected), "{label}");
+        assert_eq!(
+            transport.counts.starts.load(Ordering::SeqCst),
+            0,
+            "{label} must not start a stream"
+        );
+        assert!(
+            transport
+                .counts
+                .sent
+                .lock()
+                .expect("recorded native request")
+                .is_empty(),
+            "{label} must not reach the native transport"
+        );
+        let rendered = result.to_string();
+        assert!(!rendered.contains("SYNTHETIC_OPENAI_ACCESS"), "{label}");
+        assert!(
+            !rendered.contains("SYNTHETIC_PRIVATE_OPTION_MARKER"),
+            "{label}"
+        );
+    }
+}
 
-    let cancellation = RunCancellation::new();
-    let trigger = cancellation.clone();
-    let canceller = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        trigger.request(rustscript_agent::CancellationReason::Requested);
-    });
-    let mut sink = RecordingSink::default();
+#[test]
+fn openai_chat_stream_precancelled_deadline_starts_nothing() {
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        sse_events(&read_provider_fixture("openai_chat/stream.sse"))
+            .into_iter()
+            .map(|event| event.into_bytes())
+            .collect(),
+        false,
+    ));
+    let cancellation = RunCancellation::with_timeout(Duration::from_secs(30));
+    cancellation.request(CancellationReason::Requested);
+    let runner = harness_runner_with_cancellation(&home, Arc::clone(&transport), cancellation);
     let error = runner
-        .run_with_context_and_events(context, &mut sink, &cancellation)
-        .expect_err("cancelling a held-open stream must terminate the run");
-    canceller.join().expect("canceller thread");
-    fixture.join().expect("fixture thread");
-
+        .run_with_context(provider_opaque_fixture::harness_context(
+            "openai_chat",
+            stream_request(),
+            openai_profile(),
+            "synthetic-openai",
+        ))
+        .expect_err("a pre-cancelled deadline must terminate the run");
     assert!(
-        matches!(
-            error,
-            RunError::Invocation(rustscript_vm::InvocationError::Cancelled { .. })
-        ),
-        "expected a typed cancellation, got {error:?}"
+        format!("{error:?}").contains("policy_inactive"),
+        "a pre-cancelled policy must refuse setup with a typed error, got {error:?}"
+    );
+    assert_eq!(
+        transport.counts.starts.load(Ordering::SeqCst),
+        0,
+        "pre-cancelled runs must not start a stream"
+    );
+    assert!(
+        transport
+            .counts
+            .sent
+            .lock()
+            .expect("recorded native request")
+            .is_empty()
     );
 }
 
+#[test]
+fn openai_chat_stream_deadline_expiry_has_no_partial_success() {
+    use rustscript_agent::auth::oauth::ScriptedClock;
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+    let transport = Arc::new(
+        StreamTransport::new(
+            200,
+            "text/event-stream",
+            vec![
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial text\"}}]}\n\n"
+                    .to_vec(),
+            ],
+            false,
+        )
+        .with_read_callback({
+            let clock = Arc::clone(&clock);
+            move || clock.expire()
+        }),
+    );
+    let runner = harness_runner_with_clock(&home, Arc::clone(&transport), clock);
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert_eq!(result["ok"], json!(false));
+    let code = result["error"]["code"].clone();
+    assert!(
+        code == json!("deadline_exceeded") || code == json!("cancelled"),
+        "unexpected stream expiry code: {code}"
+    );
+    assert_ne!(
+        result["response"]["text"],
+        json!("partial text"),
+        "expiry during a live stream must never publish partial success"
+    );
+    assert_eq!(
+        transport.counts.starts.load(Ordering::SeqCst),
+        1,
+        "expiry must not trigger a second start"
+    );
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
 /// A3 review P2 guard: the adapter must fail CLOSED when the server EOFs the
-/// SSE body without the terminal `data: [DONE]` event. The transport reports
-/// `outcome: "eof"` (the callback sees the `kind: "end"` item and returns
-/// continue), and the adapter must not surface the accumulated partial text
-/// as `ok`. The failure is the canonical typed provider error (stable
-/// type/code/message), distinct from cancellation (which stays a typed
-/// `Cancelled` invocation error) and from a legal `[DONE]` stream (which
-/// stops the callback and reports `outcome: "stopped"`).
+/// SSE body without the terminal `data: [DONE]` event. The failure is the
+/// canonical typed provider error, distinct from cancellation and from a
+/// legal `[DONE]` stream.
 #[test]
 fn openai_chat_stream_eof_without_done_fails_closed() {
-    // One valid text delta, then immediate EOF: no `data: [DONE]`, no usage
-    // event. `hold_open` false lets the fixture close the chunked body.
-    let events = vec![
-        "data: {\"id\":\"chatcmpl-eof1\",\"object\":\"chat.completion.chunk\",\"created\":1755000009,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial \"},\"finish_reason\":null}]}\n\n".to_string(),
-    ];
-    let (port, requests, fixture) = spawn_sse_fixture(events, false);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, true);
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![
+            b"data: {\"id\":\"chatcmpl-eof1\",\"object\":\"chat.completion.chunk\",\"created\":1755000009,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial \"},\"finish_reason\":null}]}\n\n".to_vec(),
+        ],
+        true,
+    ));
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter("openai_chat", request, profile("openai", port), &runner);
-    fixture.join().expect("fixture thread");
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
 
     assert!(
         result["ok"] == json!(false),
@@ -1215,10 +1359,226 @@ fn openai_chat_stream_eof_without_done_fails_closed() {
         "{error:?}"
     );
 
-    let recorded = requests.recv().expect("recorded request");
-    assert_eq!(request_line(&recorded), "POST /chat/completions HTTP/1.1");
-    let wire: JsonValue = serde_json::from_str(&recorded.body).expect("wire body is JSON");
+    let sent = transport.counts.sent.lock().expect("native request");
+    assert_eq!(sent.len(), 1);
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("wire body is JSON");
     assert_eq!(wire["stream"], json!(true));
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn openai_chat_stream_semantic_invalid_object_is_static_public_failure() {
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![b"data: {\"id\":\"bounded-but-incomplete\"}\n\n".to_vec()],
+        false,
+    ));
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_payload"));
+    assert!(
+        !result.to_string().contains("bounded-but-incomplete"),
+        "the offending stream object must not be echoed: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn openai_chat_stream_non_json_record_fails_closed_without_echo() {
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![b"data: not-strict-json\n\n".to_vec()],
+        false,
+    ));
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_response"));
+    assert!(
+        !result.to_string().contains("not-strict-json"),
+        "raw stream data must not be echoed: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn openai_chat_stream_json_array_is_public_failure_and_closes_reader() {
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/event-stream",
+        vec![b"data: [1,2]\n\n".to_vec()],
+        false,
+    ));
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_payload"));
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.eof.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.counts.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.counts.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn openai_chat_stream_injected_read_failure_detail_is_not_echoed() {
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let transport = Arc::new(
+        StreamTransport::new(200, "text/event-stream", Vec::new(), false)
+            .with_read_error("SYNTHETIC_PRIVATE_READ_DETAIL"),
+    );
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("transport_error"));
+    assert_eq!(
+        result["error"]["message"],
+        json!("provider transport failed")
+    );
+    assert!(
+        !result.to_string().contains("SYNTHETIC_PRIVATE_READ_DETAIL"),
+        "injected transport detail must not be published: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn openai_chat_stream_http_errors_use_existing_status_classification() {
+    use std::sync::atomic::Ordering;
+    let cases: [(u16, &str, bool); 2] = [
+        (401, "invalid_request_error", false),
+        (429, "rate_limit_error", true),
+    ];
+    for (status, error_type, retryable) in cases {
+        let home = openai_home();
+        let body = json!({
+            "error": {
+                "type": error_type,
+                "code": "SYNTHETIC_PRIVATE_CODE_FIELD",
+                "message": "Synthetic provider rejection",
+                "api_key": "SYNTHETIC_PRIVATE_OPTION_MARKER"
+            }
+        });
+        let transport = Arc::new(StreamTransport::new(
+            status,
+            "application/json",
+            vec![body.to_string().into_bytes()],
+            true,
+        ));
+        let runner = harness_runner(&home, Arc::clone(&transport));
+        let result = run_harness(
+            &runner,
+            "openai_chat",
+            stream_request(),
+            openai_profile(),
+            "synthetic-openai",
+        );
+        assert_eq!(result["ok"], json!(false), "HTTP {status}");
+        assert_eq!(result["error"]["status"], json!(status), "HTTP {status}");
+        assert_eq!(result["error"]["type"], json!(error_type), "HTTP {status}");
+        assert_eq!(
+            result["error"]["code"],
+            json!("http_error"),
+            "HTTP {status}"
+        );
+        assert_eq!(
+            result["error"]["retryable"],
+            json!(retryable),
+            "HTTP {status} retryability"
+        );
+        assert_eq!(
+            result["error"]["message"],
+            json!("Synthetic provider rejection"),
+            "HTTP {status}"
+        );
+        assert_eq!(
+            transport.counts.starts.load(Ordering::SeqCst),
+            1,
+            "HTTP {status} must start exactly once with no retry"
+        );
+        assert!(
+            transport.counts.drops.load(Ordering::SeqCst) >= 1,
+            "HTTP {status} must close the stream resource"
+        );
+        let rendered = result.to_string();
+        assert!(
+            !rendered.contains("SYNTHETIC_PRIVATE_CODE_FIELD"),
+            "HTTP {status}"
+        );
+        assert!(
+            !rendered.contains("SYNTHETIC_PRIVATE_OPTION_MARKER"),
+            "HTTP {status}"
+        );
+        assert!(
+            !rendered.contains("SYNTHETIC_OPENAI_ACCESS"),
+            "HTTP {status}"
+        );
+    }
+}
+
+#[test]
+fn openai_chat_stream_unsupported_mime_fails_closed_without_echo() {
+    use std::sync::atomic::Ordering;
+    let home = openai_home();
+    let transport = Arc::new(StreamTransport::new(
+        200,
+        "text/plain",
+        vec![b"data: {\"choices\":[]}\n\n".to_vec()],
+        true,
+    ));
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        stream_request(),
+        openai_profile(),
+        "synthetic-openai",
+    );
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("malformed_response"));
+    assert!(
+        !result.to_string().contains("text/plain"),
+        "raw media type must not be published: {result}"
+    );
+    assert_eq!(transport.counts.starts.load(Ordering::SeqCst), 1);
+    assert!(transport.counts.drops.load(Ordering::SeqCst) >= 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,35 +1589,38 @@ fn openai_chat_stream_eof_without_done_fails_closed() {
 // streaming transcripts under `tests/fixtures/providers/openai_responses/`
 // document the wire contract; these tests stay ignored until the adapter is
 // implemented. The streaming transcript mirrors the real Responses API
-// transport: every
-// payload event carries an `event:` line whose value matches the `type`
-// field of its `data:` JSON payload, and the stream ends with a bare
-// `data: [DONE]`.
+// transport: every payload event carries an `event:` line whose value matches
+// the `type` field of its `data:` JSON payload, and the stream ends with a
+// bare `data: [DONE]`.
 
 #[ignore = "openai_responses adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn openai_responses_buffered_transcript_is_referenced() {
-    let body = read_fixture("openai_responses/response.json");
-    let (port, _requests, fixture) = spawn_json_fixture(200, body);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue =
+        serde_json::from_str(&read_provider_fixture("openai_responses/response.json"))
+            .expect("fixture json");
+    transport.push_json(200, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter(
-        "openai_responses",
-        request,
-        profile("openai", port),
+    let result = run_harness(
         &runner,
+        "openai_responses",
+        canonical_request(false),
+        openai_profile(),
+        "synthetic-openai",
     );
-    fixture.join().expect("fixture thread");
 
     assert!(result["ok"] == json!(false), "{result}");
     assert_eq!(result["error"]["code"], json!("not_implemented"));
+    assert!(transport.take_sent().is_empty());
 }
 
 #[ignore = "openai_responses adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced() {
-    let events = sse_events(&read_fixture("openai_responses/stream.sse"));
+    let events = sse_events(&read_provider_fixture("openai_responses/stream.sse"));
 
     // Real Responses API transport shape: each payload event is an
     // `event: <type>` / `data: {json}` pair with the event name matching the
@@ -1290,20 +1653,21 @@ fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced()
         "stream must end with a bare data: [DONE] terminator, got: {done}"
     );
 
-    let (port, _requests, fixture) = spawn_sse_fixture(events, false);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, true);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter(
-        "openai_responses",
-        request,
-        profile("openai", port),
+    let result = run_harness(
         &runner,
+        "openai_responses",
+        canonical_request(true),
+        openai_profile(),
+        "synthetic-openai",
     );
-    fixture.join().expect("fixture thread");
 
     assert!(result["ok"] == json!(false), "{result}");
     assert_eq!(result["error"]["code"], json!("not_implemented"));
+    assert!(transport.take_sent().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,206 +1682,184 @@ fn openai_responses_stream_transcript_matches_real_transport_and_is_referenced()
 #[ignore = "anthropic_messages adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn anthropic_messages_buffered_transcript_is_referenced() {
-    let body = read_fixture("anthropic/response.json");
-    let (port, _requests, fixture) = spawn_json_fixture(200, body);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, false);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = harness_runner(&home, Arc::clone(&transport));
 
-    let (result, _) = run_adapter(
-        "anthropic_messages",
-        request,
-        profile("anthropic", port),
+    let result = run_harness(
         &runner,
+        "anthropic_messages",
+        canonical_request(false),
+        json!({"provider": "anthropic"}),
+        "synthetic-openai",
     );
-    fixture.join().expect("fixture thread");
 
     assert!(result["ok"] == json!(false), "{result}");
     assert_eq!(result["error"]["code"], json!("not_implemented"));
+    assert!(transport.take_sent().is_empty());
 }
 
 #[ignore = "anthropic_messages adapter is a not_implemented stub (see module doc)"]
 #[test]
 fn anthropic_messages_stream_transcript_is_referenced() {
-    let events = sse_events(&read_fixture("anthropic/stream.sse"));
-    let (port, _requests, fixture) = spawn_sse_fixture(events, false);
-    let runner = harness_runner(port);
-    let request = canonical_request(port, true);
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let _events = sse_events(&read_provider_fixture("anthropic/stream.sse"));
 
-    let (result, _) = run_adapter(
-        "anthropic_messages",
-        request,
-        profile("anthropic", port),
+    let result = run_harness(
         &runner,
+        "anthropic_messages",
+        canonical_request(true),
+        json!({"provider": "anthropic"}),
+        "synthetic-openai",
     );
-    fixture.join().expect("fixture thread");
 
     assert!(result["ok"] == json!(false), "{result}");
     assert_eq!(result["error"]["code"], json!("not_implemented"));
+    assert!(transport.take_sent().is_empty());
 }
 
-fn production_loop_runner() -> AgentRunner {
-    AgentRunner::from_file(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rss/agent/main.rss"),
-        AgentConfig::default(),
-    )
-    .expect("production loop policy should compile")
+// ---------------------------------------------------------------------------
+// Default dispatch aliases through native auth
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_dispatch_openrouter_alias_uses_native_auth() {
+    let endpoint = &PROFILES[4];
+    let home = profile_home(endpoint);
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/response.json"))
+        .expect("chat response fixture should be JSON");
+    transport.push_json(200, body);
+    let runner = dispatch_runner(&home, Arc::clone(&transport));
+
+    let mut request = canonical_request(false);
+    request["provider"] = json!("openrouter");
+    request["model"] = json!("request-model");
+    request["credential_id"] = json!(endpoint.credential);
+    let result = run_dispatch(&runner, request);
+
+    assert_eq!(result["ok"], json!(true), "{result}");
+    assert_eq!(
+        result["response"]["text"],
+        json!("The RustScript agent framework keeps provider policy in RSS.")
+    );
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1, "exactly one native buffered request");
+    assert_eq!(
+        sent[0].url,
+        format!("{}{}", endpoint.origin, endpoint.intent),
+        "native trusted authority owns the request URL"
+    );
+    assert_eq!(
+        sent[0].headers.get("authorization").map(String::as_str),
+        Some(format!("Bearer {}", endpoint.access).as_str())
+    );
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("public wire JSON");
+    assert_eq!(wire["model"], json!("request-model"));
+    assert!(!result.to_string().contains(endpoint.access));
 }
 
-fn production_loop_context(base_url: &str) -> JsonValue {
-    let mut context = loop_context();
-    context["provider_options"] = json!({
-        "base_url": base_url,
-        "api_key": "test-key",
+#[test]
+fn default_dispatch_unknown_provider_stays_unavailable_without_send() {
+    let home = openai_home();
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let runner = dispatch_runner(&home, Arc::clone(&transport));
+
+    let mut request = canonical_request(false);
+    request["provider"] = json!("anthropic");
+    request["credential_id"] = json!("synthetic-openai");
+    let result = run_dispatch(&runner, request);
+
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["error"]["code"], json!("adapter_unavailable"));
+    assert!(transport.take_sent().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// C0: harness openai_chat migrates to native auth (RED before migration)
+// ---------------------------------------------------------------------------
+//
+// The production harness must route `openai_chat` through the shared admitted
+// profile dispatch into the opaque native-auth Chat entry. The legacy raw
+// ambient-HTTP transport is denied by the default agent config, so this
+// positive test fails until the migration lands, then proves the canonical
+// text/usage contract through actual injected native auth.
+
+#[test]
+fn harness_openai_chat_migrates_to_native_auth_with_canonical_text_usage() {
+    let home = FixtureHome::for_profile(
+        "harness-red",
+        "openai",
+        "https://fixture.example.test/v1",
+        "synthetic-openai",
+        "SYNTHETIC_OPENAI_ACCESS",
+    );
+    let transport = Arc::new(ScriptedHttpsTransport::new());
+    let body: JsonValue = serde_json::from_str(&read_provider_fixture("openai_chat/response.json"))
+        .expect("chat response fixture should be JSON");
+    transport.push_json(200, body);
+    let runner = harness_runner(&home, Arc::clone(&transport));
+    let profile = json!({
+        "provider": "openai",
+        "base_url": "https://fixture.example.test/v1",
+        "model": "fixture-model",
     });
-    context
-}
+    let result = run_harness(
+        &runner,
+        "openai_chat",
+        canonical_request(false),
+        profile,
+        "synthetic-openai",
+    );
 
-fn spawn_slow_http_fixture() -> (
-    u16,
-    Arc<AtomicBool>,
-    Arc<AtomicBool>,
-    thread::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind slow fixture");
-    let port = listener.local_addr().expect("slow fixture address").port();
-    let accepted = Arc::new(AtomicBool::new(false));
-    let finished = Arc::new(AtomicBool::new(false));
-    let accepted_flag = Arc::clone(&accepted);
-    let finished_flag = Arc::clone(&finished);
-    let handle = thread::spawn(move || {
-        let Some(mut stream) = accept_bounded(&listener) else {
-            finished_flag.store(true, Ordering::SeqCst);
-            return;
-        };
-        accepted_flag.store(true, Ordering::SeqCst);
-        let _ = read_http_request(&mut stream);
-        stream
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("slow fixture read timeout");
-        let mut buffer = [0_u8; 256];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => break,
-            }
-        }
-        finished_flag.store(true, Ordering::SeqCst);
-    });
-    (port, accepted, finished, handle)
-}
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "migrated harness must admit the native request: {result}"
+    );
+    assert_eq!(
+        result["response"]["text"],
+        json!("The RustScript agent framework keeps provider policy in RSS.")
+    );
+    assert_eq!(
+        result["response"]["reasoning"],
+        json!("User asked about the framework; summarize the ownership boundary.")
+    );
+    assert_eq!(result["response"]["stop_reason"], json!("stop"));
+    assert_eq!(result["response"]["usage"]["input_tokens"], json!(12));
+    assert_eq!(result["response"]["usage"]["output_tokens"], json!(15));
+    assert_eq!(result["response"]["usage"]["total_tokens"], json!(27));
+    assert_eq!(result["response"]["tool_calls"], json!([]));
 
-#[test]
-fn production_adapter_allows_https_default_port_without_explicit_port() {
-    let runner = production_loop_runner();
-    let decision = vm_value_to_json(
-        &runner
-            .run_with_context(json_to_vm_value(&production_loop_context(
-                "https://127.0.0.1/v1",
-            )))
-            .expect("https default-port loop should return a decision"),
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1, "exactly one native buffered request");
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(
+        sent[0].url, "https://fixture.example.test/v1/chat/completions",
+        "native trusted authority owns the request URL"
     );
-    let message = decision["error"]["message"]
-        .as_str()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    assert!(
-        !message.contains("port 443 is not allowed"),
-        "ordinary https URLs must use port_or_known_default(443): {decision}"
+    assert_eq!(
+        sent[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer SYNTHETIC_OPENAI_ACCESS")
     );
-    assert!(
-        !message.contains("has no known default port"),
-        "https has a known default port: {decision}"
+    assert_eq!(
+        sent[0].headers.get("accept").map(String::as_str),
+        Some("application/json")
     );
-}
-
-#[test]
-fn production_adapter_rejects_unknown_defaultless_scheme() {
-    let runner = production_loop_runner();
-    let decision = vm_value_to_json(
-        &runner
-            .run_with_context(json_to_vm_value(&production_loop_context(
-                "foo://127.0.0.1/v1",
-            )))
-            .expect("unknown-scheme loop should return a decision"),
+    assert_eq!(
+        sent[0].headers.get("content-type").map(String::as_str),
+        Some("application/json")
     );
-    assert_eq!(decision["kind"], json!("run.failed"));
-    assert_eq!(decision["error"]["code"], json!("config"));
-    assert_eq!(decision["error"]["retryable"], json!(false));
-}
-
-#[test]
-fn production_adapter_allows_explicit_nondefault_http_port() {
-    let body = read_fixture("openai_chat/response.json");
-    let runner = production_loop_runner();
-    let (port, _requests, fixture) = spawn_json_fixture(200, body);
-    let decision = vm_value_to_json(
-        &runner
-            .run_with_context(json_to_vm_value(&production_loop_context(&format!(
-                "http://127.0.0.1:{port}"
-            ))))
-            .expect("explicit nondefault port should reach the adapter"),
-    );
-    fixture.join().expect("fixture thread");
-    assert_eq!(decision["kind"], json!("run.completed"), "{decision}");
-}
-
-#[test]
-fn nested_adapter_http_is_interrupted_by_parent_cancel() {
-    let runner = production_loop_runner();
-    let (port, accepted, finished, fixture) = spawn_slow_http_fixture();
-    let cancellation = RunCancellation::new();
-    let worker_cancel = cancellation.clone();
-    let context = json_to_vm_value(&production_loop_context(&format!(
-        "http://127.0.0.1:{port}"
-    )));
-    let worker = thread::spawn(move || {
-        let mut sink = RecordingSink::default();
-        runner.run_with_context_and_events(context, &mut sink, &worker_cancel)
-    });
-    let wait_start = Instant::now();
-    while !accepted.load(Ordering::SeqCst) {
-        assert!(
-            wait_start.elapsed() < Duration::from_secs(8),
-            "nested adapter never opened the HTTP connection"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
-    let start = Instant::now();
-    cancellation.request(CancellationReason::Requested);
-    let result = worker.join().expect("nested adapter worker");
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "parent cancel must interrupt nested HTTP promptly, took {elapsed:?}"
-    );
-    match result {
-        Ok(value) => {
-            let decision = vm_value_to_json(&value);
-            assert_eq!(decision["kind"], json!("run.failed"), "{decision}");
-            assert_eq!(decision["error"]["code"], json!("cancelled"), "{decision}");
-        }
-        Err(error) => {
-            let text = format!("{error:?}");
-            assert!(
-                text.contains("Cancelled") || text.contains("Deadline"),
-                "parent stop must return typed cancelled/deadline, got {error:?}"
-            );
-        }
-    }
-    let join_start = Instant::now();
-    fixture
-        .join()
-        .expect("slow fixture must join after client drop");
-    assert!(
-        join_start.elapsed() < Duration::from_secs(2),
-        "HTTP fixture worker must not remain after cancel"
-    );
-    assert!(
-        finished.load(Ordering::SeqCst),
-        "slow HTTP worker must finish with no residue"
-    );
+    let wire: JsonValue = serde_json::from_str(&sent[0].body).expect("public OpenAI wire JSON");
+    assert_eq!(wire["model"], json!("test-model"));
+    assert_eq!(wire["stream"], json!(false));
+    assert_eq!(wire["max_tokens"], json!(128));
+    assert_eq!(wire["temperature"], json!(0.7));
+    assert_eq!(wire["messages"][0]["role"], json!("user"));
+    assert_eq!(wire["messages"][0]["content"][0]["text"], json!("hello"));
+    assert_eq!(wire["messages"][1]["role"], json!("tool"));
+    assert_eq!(wire["messages"][2]["role"], json!("assistant"));
+    assert!(!result.to_string().contains("SYNTHETIC_OPENAI_ACCESS"));
 }

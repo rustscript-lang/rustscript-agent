@@ -45,11 +45,16 @@ zeroize = "1"
 ring = "0.17"
 
 [dev-dependencies]
+rcgen = "0.14.10"
 tracing-core = "0.1"
 
 [features]
 default = []
 config-fixture = []
+
+# Optimize the embedded compiler while retaining development checks.
+[profile.dev.package.pd-vm]
+opt-level = 3
 
 [[test]]
 name = "auth_store_tests"
@@ -74,4 +79,9 @@ required-features = ["config-fixture"]
 [[test]]
 name = "oauth_rss_entry_tests"
 path = "tests/oauth_rss_entry_tests.rs"
+required-features = ["config-fixture"]
+
+[[test]]
+name = "provider_auth_rss_entry_tests"
+path = "tests/provider_auth_rss_entry_tests.rs"
 required-features = ["config-fixture"]

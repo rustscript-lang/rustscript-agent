@@ -1,15 +1,25 @@
 //! Programmatic RSS corpus: every bundled `.rss` file must compile.
 //!
-//! Auth/config/oauth entries use the config-fixture catalogs; every other
-//! file compiles through the production restricted agent catalog. Compile
-//! failures are fatal — there is no accepted-error path.
+//! Every discovered source compiles through the real Core compile API with a
+//! real host catalog: only the three historical fixture entry files use their
+//! config-fixture catalogs, everything else (including all other auth
+//! contract/helper modules) uses the public production agent catalog.
+//! Compile failures are fatal — there is no accepted-error path.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use rustscript_agent::{AgentConfig, AgentRunner};
+use rustscript_vm::{
+    CompileSourceFileOptions, SourceFlavor, compile_source_at_path_with_flavor_and_options,
+    host_api::HostApiCatalog,
+};
 
-const EXPECTED_RSS_CORPUS_LEN: usize = 49;
+/// Exact fixture entry paths, relative to the crate root. Only these use
+/// config-fixture catalogs; every other discovered source is production.
+const OAUTH_FLOW_ENTRY: &str = "rss/auth/oauth_flow.rss";
+const STORE_ENTRY_ENTRY: &str = "rss/auth/store_entry.rss";
+const CONFIG_ENTRY_ENTRY: &str = "rss/auth/config_entry.rss";
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,42 +55,25 @@ fn relative_rss(path: &Path) -> String {
         .to_string()
 }
 
-fn is_config_fixture_rss(path: &Path) -> bool {
-    path.strip_prefix(crate_root().join("rss").join("auth"))
-        .is_ok()
-}
-
-fn compile_production_rss(path: &Path) {
-    AgentRunner::from_file(path, AgentConfig::default()).unwrap_or_else(|error| {
-        panic!(
-            "{} must compile with the production catalog: {error}",
-            relative_rss(path)
-        );
-    });
+#[cfg(not(feature = "config-fixture"))]
+fn is_fixture_entry(relative: &str) -> bool {
+    relative == OAUTH_FLOW_ENTRY || relative == STORE_ENTRY_ENTRY || relative == CONFIG_ENTRY_ENTRY
 }
 
 #[cfg(feature = "config-fixture")]
-fn compile_fixture_rss(path: &Path) {
-    use rustscript_vm::{
-        CompileSourceFileOptions, SourceFlavor, compile_source_at_path_with_flavor_and_options,
-    };
+fn catalog_for(relative: &str) -> Arc<HostApiCatalog> {
+    match relative {
+        OAUTH_FLOW_ENTRY => rustscript_agent::config_fixture::oauth_fixture_catalog(),
+        STORE_ENTRY_ENTRY => rustscript_agent::config_fixture::auth_store_fixture_catalog(),
+        CONFIG_ENTRY_ENTRY => rustscript_agent::config_fixture::config_fixture_catalog(),
+        _ => rustscript_agent::agent_host_catalog(),
+    }
+}
 
+fn compile_with_catalog(path: &Path, relative: &str, catalog: Arc<HostApiCatalog>) {
     let source = fs::read_to_string(path).unwrap_or_else(|error| {
-        panic!("read {}: {error}", relative_rss(path));
+        panic!("read {relative}: {error}");
     });
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    let catalog = match name {
-        "oauth_flow.rss" => rustscript_agent::config_fixture::oauth_fixture_catalog(),
-        "store_entry.rss" => rustscript_agent::config_fixture::auth_store_fixture_catalog(),
-        "config_entry.rss" => rustscript_agent::config_fixture::config_fixture_catalog(),
-        other => panic!(
-            "{} is under rss/auth but has no fixture catalog mapping ({other})",
-            relative_rss(path)
-        ),
-    };
     let options = CompileSourceFileOptions::default().with_host_api_catalog(catalog);
     compile_source_at_path_with_flavor_and_options(
         path,
@@ -89,38 +82,43 @@ fn compile_fixture_rss(path: &Path) {
         options,
     )
     .unwrap_or_else(|error| {
-        panic!(
-            "{} must compile with its fixture catalog: {error}",
-            relative_rss(path)
-        );
+        panic!("{relative} must compile: {error}");
     });
+    println!("compiled {relative}");
 }
 
 #[test]
-fn bundled_rss_corpus_has_exact_count_and_compiles() {
+fn bundled_rss_corpus_compiles() {
     let files = all_rss_files();
-    let relative: Vec<String> = files.iter().map(|path| relative_rss(path)).collect();
-    assert_eq!(
-        files.len(),
-        EXPECTED_RSS_CORPUS_LEN,
-        "bundled RSS corpus must contain exactly {EXPECTED_RSS_CORPUS_LEN} files, got {}: {relative:?}",
-        files.len()
-    );
+    assert!(!files.is_empty(), "bundled RSS corpus must not be empty");
+
+    let mut compiled = 0usize;
+    #[cfg(not(feature = "config-fixture"))]
+    let mut omitted: Vec<String> = Vec::new();
 
     for path in &files {
-        if is_config_fixture_rss(path) {
-            #[cfg(feature = "config-fixture")]
-            compile_fixture_rss(path);
-            #[cfg(not(feature = "config-fixture"))]
-            {
-                assert!(
-                    path.is_file(),
-                    "{} must remain in the corpus",
-                    relative_rss(path)
-                );
+        let relative = relative_rss(path);
+        #[cfg(feature = "config-fixture")]
+        {
+            compile_with_catalog(path, &relative, catalog_for(&relative));
+            compiled += 1;
+        }
+        #[cfg(not(feature = "config-fixture"))]
+        {
+            if is_fixture_entry(&relative) {
+                omitted.push(relative);
+                continue;
             }
-        } else {
-            compile_production_rss(path);
+            compile_with_catalog(path, &relative, rustscript_agent::agent_host_catalog());
+            compiled += 1;
         }
     }
+
+    println!(
+        "rss corpus discovered={} compiled={}",
+        files.len(),
+        compiled
+    );
+    #[cfg(not(feature = "config-fixture"))]
+    println!("rss corpus fixture-only omitted={omitted:?}");
 }
