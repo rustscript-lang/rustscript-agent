@@ -10,6 +10,7 @@ use std::{
 
 use rustscript_agent::{
     AgentGatewayConfig, AgentGatewayState, ConfigFile, TelegramConfig, build_agent_gateway_app,
+    config_file::{CompactionSettings, ConfigFileError},
     gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
 };
 
@@ -49,6 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bearer_token,
         telegram: telegram.clone(),
         ..AgentGatewayConfig::default()
+    };
+    let (config_present, config_source, compaction_settings) = match ConfigFile::load_from_home() {
+        Ok(config) => (true, Some(config.agent.source), config.compaction),
+        Err(ConfigFileError::MissingFile { .. }) => (false, None, CompactionSettings::default()),
+        Err(_) => {
+            return Err(std::io::Error::other("agent config.yaml could not be loaded").into());
+        }
     };
     if let Some(hosts) = env_value("RUSTSCRIPT_AGENT_ALLOW_HOSTS", "PD_EDGE_AGENT_ALLOW_HOSTS")? {
         config.http.allowed_hosts = split_list(&hosts);
@@ -145,19 +153,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(std::io::Error::other)?;
     }
 
-    // Explicit agent-source selection: the new bounded env tokens plus the
-    // original legacy script names. The primary/legacy collector semantics stay
-    // in `env_value`: a valid UTF8 token is preserved verbatim and a missing
-    // token omits the field. A token that is *present* but not valid UTF8 on
-    // this OS cannot become a JSON string; `source_env_value` admits it as the
-    // fixed public boolean `false` so the RSS source policy observes a present
-    // non-string value and applies its own priority/validation/fallback
-    // decision (never in Rust). The SQLite path stays the existing native
-    // collector.
+    // Collect config and legacy source facts mechanically. RSS owns their
+    // priority; the config and compaction values come from one bounded snapshot.
     let source = source_env_value("RUSTSCRIPT_AGENT_SOURCE", "PD_EDGE_AGENT_SOURCE");
     let legacy_script = source_env_value("RUSTSCRIPT_AGENT_SCRIPT", "PD_EDGE_AGENT_SCRIPT");
     let state_db = env_value("RUSTSCRIPT_AGENT_STATE_DB", "PD_EDGE_AGENT_STATE_DB")?;
     let mut selection = serde_json::Map::new();
+    selection.insert(
+        "config_present".to_string(),
+        serde_json::Value::Bool(config_present),
+    );
+    if let Some(config_source) = config_source {
+        selection.insert("config_source".to_string(), source_fact(config_source));
+    }
     if let Some(source) = source {
         selection.insert("source".to_string(), source);
     }
@@ -171,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         serde_json::Value::Object(selection),
         state_db.as_deref().map(std::path::Path::new),
-        ConfigFile::load_compaction_settings_from_home().map_err(std::io::Error::other)?,
+        compaction_settings,
     )
     .map_err(std::io::Error::other)?;
     let state = match std::env::var_os("RUSTSCRIPT_AGENT_HOME") {
@@ -402,20 +410,30 @@ fn env_value(primary: &str, legacy: &str) -> Result<Option<String>, env::VarErro
     }
 }
 
-/// Collects one selected source field (`SOURCE`/legacy `SCRIPT`) for the RSS
-/// source policy. Valid UTF8 tokens and the existing primary/legacy
-/// precedence/deprecation semantics come from the shared `env_value` collector.
-/// A token that is *present* on this OS but not valid UTF8 cannot become a JSON
-/// string, so it is admitted as the fixed public boolean `false`: the policy
-/// then observes a present non-string value and owns the invalid/static
-/// classification and the no-fallback decision. This never prints or forwards
-/// the raw OS bytes, never repairs the value into a string, and a missing token
-/// still omits the map field.
+/// Collects one legacy source fact for RSS without applying source priority.
+/// Oversized and non-UTF8 facts use the same present-invalid sentinel; values
+/// are never truncated, repaired, or rendered into errors.
 fn source_env_value(primary: &str, legacy: &str) -> Option<serde_json::Value> {
     match env_value(primary, legacy) {
-        Ok(Some(value)) => Some(serde_json::Value::String(value)),
+        Ok(Some(value)) => Some(source_fact(value)),
         Ok(None) | Err(env::VarError::NotPresent) => None,
         Err(env::VarError::NotUnicode(_)) => Some(serde_json::Value::Bool(false)),
+    }
+}
+
+/// Preserves in-policy source facts exactly and uses the existing sentinel for
+/// values beyond the RSS or serialized-selection bound, never truncating them.
+fn source_fact(value: String) -> serde_json::Value {
+    const MAX_SOURCE_SCALARS: usize = 4096;
+    const MAX_SERIALIZED_FACT_BYTES: usize = 20 * 1024;
+    if value.len() > MAX_SOURCE_SCALARS * 4 || value.chars().count() > MAX_SOURCE_SCALARS {
+        return serde_json::Value::Bool(false);
+    }
+    match serde_json::to_string(&value) {
+        Ok(encoded) if encoded.len() <= MAX_SERIALIZED_FACT_BYTES => {
+            serde_json::Value::String(value)
+        }
+        Ok(_) | Err(_) => serde_json::Value::Bool(false),
     }
 }
 

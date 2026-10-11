@@ -142,7 +142,7 @@ fn select_legacy_source(raw: string) -> map {
     decision
 }
 
-pub fn run(context: map) -> map {
+fn select_legacy_facts(context: map) -> map {
     let mut decision: map = bundled_success();
     if field_present(context, "source") {
         if field_is_string(context, "source") == false {
@@ -167,6 +167,47 @@ pub fn run(context: map) -> map {
                     decision = select_legacy_source(raw);
                 }
             }
+        }
+    }
+    decision
+}
+
+fn select_config_source(context: map) -> map {
+    let mut decision: map = failure_invalid_source();
+    if field_present(context, "config_source") {
+        if field_is_string(context, "config_source") {
+            let value: string = context["config_source"];
+            if is_invalid_token(value) {
+                decision = failure_invalid_source();
+            } else {
+                decision = select_explicit_source(value);
+            }
+        }
+    }
+    decision
+}
+
+pub fn run(context: map) -> map {
+    let mut decision: map = bundled_success();
+    if context.has("config_present") {
+        if type(context["config_present"]) != "bool" {
+            decision = failure_invalid_source();
+        } else {
+            if context["config_present"] {
+                decision = select_config_source(context);
+            } else {
+                if context.has("config_source") {
+                    decision = failure_invalid_source();
+                } else {
+                    decision = select_legacy_facts(context);
+                }
+            }
+        }
+    } else {
+        if context.has("config_source") {
+            decision = failure_invalid_source();
+        } else {
+            decision = select_legacy_facts(context);
         }
     }
     decision
