@@ -348,6 +348,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, runs::storage_run_terminal(db_id, command.payload_json));
     } else if command.op == "admission.create" {
         result = storage_unwrap(request_id, op, admission::storage_admission_create(db_id, command.payload_json));
+    } else if command.op == "admission.replay" {
+        result = storage_unwrap(request_id, op, admission::storage_admission_replay(db_id, command.payload_json));
     } else if command.op == "session.delete" {
         let delete_results: array = sessions::storage_session_delete(db_id, command.payload_json);
         if storage_nth_rows_affected(delete_results, 1) == 0 {

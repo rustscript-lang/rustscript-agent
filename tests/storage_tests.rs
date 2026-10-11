@@ -2443,6 +2443,233 @@ fn admission_create_is_atomic_and_writes_the_full_normalized_set() {
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
 
+#[test]
+fn admission_replay_probe_is_read_only_and_fails_closed() {
+    let root = temporary_root("admission-replay");
+    let runner = storage_runner(&root);
+    let db_name = "admission-replay.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    let admitted = run_storage(
+        &runner,
+        db_name,
+        "admission-create-1",
+        "admission.create",
+        json!({
+            "session_id": "session-replay",
+            "session_new": 1,
+            "profile": "gateway",
+            "platform": "api_server",
+            "account_id": "session-replay",
+            "model": "test-model",
+            "provider": "test-provider",
+            "system_prompt": "",
+            "session_metadata_json": "{}",
+            "run_id": "run-replay",
+            "parent_run_id": "",
+            "input_json": "{\"text\":\"original\"}",
+            "message_id": "message-replay",
+            "message_run_id": "run-replay",
+            "script_hash": "script-hash",
+            "idempotency_scope": "api:chat",
+            "idempotency_key": "replay-key",
+            "request_hash": "hash-replay",
+            "workspace_identity_json": "",
+            "event_id": "event-replay",
+            "now_ms": 2,
+            "expires_at_ms": 0,
+        }),
+        2,
+    );
+    assert_eq!(admitted["ok"], json!(true));
+
+    let session_before = result_data(&run_storage(
+        &runner,
+        db_name,
+        "session-before",
+        "session.get",
+        json!({"session_id":"session-replay"}),
+        3,
+    ));
+    let run_before = result_data(&run_storage(
+        &runner,
+        db_name,
+        "run-before",
+        "run.get",
+        json!({"run_id":"run-replay"}),
+        3,
+    ));
+    let events_before = result_data(&run_storage(
+        &runner,
+        db_name,
+        "events-before",
+        "event.replay",
+        json!({
+            "run_id":"run-replay",
+            "after_seq":0,
+            "max_events":128,
+            "max_bytes":65_536,
+        }),
+        3,
+    ));
+
+    let absent = run_storage(
+        &runner,
+        db_name,
+        "admission-replay-absent",
+        "admission.replay",
+        json!({
+            "idempotency_scope":"api:chat",
+            "idempotency_key":"absent-key",
+            "request_hash":"hash-absent",
+            "request_selector_present":false,
+            "request_selector":"",
+        }),
+        4,
+    );
+    assert_eq!(absent["ok"], json!(true));
+    assert_eq!(result_data(&absent)["replayed"], json!(false));
+    assert_eq!(result_data(&absent)["run"]["rows"], json!([]));
+
+    let matched = run_storage(
+        &runner,
+        db_name,
+        "admission-replay-match",
+        "admission.replay",
+        json!({
+            "idempotency_scope":"api:chat",
+            "idempotency_key":"replay-key",
+            "request_hash":"hash-replay",
+            "request_selector_present":false,
+            "request_selector":"",
+        }),
+        5,
+    );
+    assert_eq!(matched["ok"], json!(true));
+    assert_eq!(result_data(&matched)["replayed"], json!(true));
+    assert_eq!(
+        result_data(&matched)["run"]["rows"][0][0],
+        json!("run-replay")
+    );
+    assert_eq!(
+        result_data(&matched)["run"]["rows"][0][1],
+        json!("session-replay")
+    );
+    assert_eq!(result_data(&matched)["run"]["rows"][0][3], json!("running"));
+
+    let hash_conflict = run_storage(
+        &runner,
+        db_name,
+        "admission-replay-hash-conflict",
+        "admission.replay",
+        json!({
+            "idempotency_scope":"api:chat",
+            "idempotency_key":"replay-key",
+            "request_hash":"different-hash",
+            "request_selector_present":false,
+            "request_selector":"",
+        }),
+        6,
+    );
+    assert_eq!(hash_conflict["ok"], json!(false));
+    assert_eq!(hash_conflict["code"], json!("idempotency_key_conflict"));
+
+    let selector_conflict = run_storage(
+        &runner,
+        db_name,
+        "admission-replay-selector-conflict",
+        "admission.replay",
+        json!({
+            "idempotency_scope":"api:chat",
+            "idempotency_key":"replay-key",
+            "request_hash":"hash-replay",
+            "request_selector_present":true,
+            "request_selector":"not-configured",
+        }),
+        7,
+    );
+    assert_eq!(selector_conflict["ok"], json!(false));
+    assert_eq!(selector_conflict["code"], json!("idempotency_key_conflict"));
+
+    let missing_run_record = run_storage(
+        &runner,
+        db_name,
+        "idempotency-begin-missing-run",
+        "idempotency.begin",
+        json!({
+            "scope":"api:chat",
+            "key":"missing-run-key",
+            "request_hash":"hash-missing-run",
+            "resource_type":"run",
+            "resource_id":"run-does-not-exist",
+            "claim_token":"missing-run-claim",
+            "now_ms":8,
+            "expires_at_ms":1000,
+        }),
+        8,
+    );
+    assert_eq!(first_query_row(&missing_run_record)["acquired"], json!(1));
+    let missing_run = run_storage(
+        &runner,
+        db_name,
+        "admission-replay-missing-run",
+        "admission.replay",
+        json!({
+            "idempotency_scope":"api:chat",
+            "idempotency_key":"missing-run-key",
+            "request_hash":"hash-missing-run",
+            "request_selector_present":false,
+            "request_selector":"",
+        }),
+        9,
+    );
+    assert_eq!(missing_run["ok"], json!(false));
+    assert_eq!(missing_run["code"], json!("admission_replay_corrupt"));
+
+    assert_eq!(
+        result_data(&run_storage(
+            &runner,
+            db_name,
+            "session-after",
+            "session.get",
+            json!({"session_id":"session-replay"}),
+            10,
+        )),
+        session_before,
+        "read-only probes preserve the durable session and its binding"
+    );
+    assert_eq!(
+        result_data(&run_storage(
+            &runner,
+            db_name,
+            "run-after",
+            "run.get",
+            json!({"run_id":"run-replay"}),
+            10,
+        )),
+        run_before,
+        "read-only probes preserve the durable run row"
+    );
+    assert_eq!(
+        result_data(&run_storage(
+            &runner,
+            db_name,
+            "events-after",
+            "event.replay",
+            json!({
+                "run_id":"run-replay",
+                "after_seq":0,
+                "max_events":128,
+                "max_bytes":65_536,
+            }),
+            10,
+        )),
+        events_before,
+        "read-only probes preserve durable events"
+    );
+
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
 /// P1-3 (RSS layer): run.terminal commits the status change, the terminal
 /// events, the retention update, and the optional assistant message in one
 /// transaction; sequences are allocated as max+1 and returned for

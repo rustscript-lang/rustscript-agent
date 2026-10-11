@@ -3919,7 +3919,8 @@ impl AgentService {
         let (existing, run_info) = {
             let store = self.inner.store.read();
             let Some(existing) = store.idempotency.get(key).cloned() else {
-                return Ok(None);
+                drop(store);
+                return self.replay_durable_admission(key, hash, replay.request_selector);
             };
             let run_info = store
                 .runs
@@ -3965,6 +3966,49 @@ impl AgentService {
             status,
             replayed: true,
         }))
+    }
+
+    fn replay_durable_admission(
+        &self,
+        key: &str,
+        request_hash: &str,
+        request_selector: Option<&str>,
+    ) -> Result<Option<AdmittedRun>, AdmitError> {
+        let Some(persistence) = self.inner.persistence.as_ref() else {
+            return Ok(None);
+        };
+        let data = persistence
+            .admission_replay(
+                ADMISSION_IDEMPOTENCY_SCOPE,
+                key,
+                request_hash,
+                request_selector,
+            )
+            .map_err(|error| {
+                if error.code == "idempotency_key_conflict" {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                    AdmitError::IdempotencyConflict
+                } else {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::Persistence);
+                    AdmitError::Persistence(format!("durable admission replay failed: {error}"))
+                }
+            })?;
+        match data.get("replayed") {
+            Some(JsonValue::Bool(true)) => self.finish_durable_replay(&data).map(Some),
+            Some(JsonValue::Bool(false)) => Ok(None),
+            _ => {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Persistence);
+                Err(AdmitError::Persistence(
+                    "durable admission replay omitted its replay status".to_string(),
+                ))
+            }
+        }
     }
 
     fn workspace_replay_identity_matches(
@@ -6957,6 +7001,22 @@ mod f3_session_maintenance_tests {
     use std::sync::{Arc, Mutex, mpsc};
     use tower::ServiceExt;
 
+    struct MaintenanceBarrierRelease(Option<mpsc::Sender<()>>);
+
+    impl MaintenanceBarrierRelease {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for MaintenanceBarrierRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     fn private_root() -> PathBuf {
         let root = PathBuf::from(
             std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
@@ -7277,6 +7337,285 @@ mod f3_session_maintenance_tests {
             "ordinary admission should resume after unwind releases the lease"
         );
 
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(root).expect("private maintenance fixture cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_only_replay_precedes_session_maintenance_rejection() {
+        const SESSION_ID: &str = "maintenance-durable-only-session";
+        const OTHER_SESSION_ID: &str = "maintenance-durable-only-other";
+        const REPLAY_KEY: &str = "f3-durable-only-replay-key";
+        const CACHED_KEY: &str = "f3-maintenance-cached-replay-key";
+
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let config = AgentGatewayConfig {
+            max_concurrent_runs: 4,
+            ..AgentGatewayConfig::default()
+        };
+        let setup = AgentGatewayState::with_sqlite_path(config.clone(), &db_path)
+            .expect("open private production SQLite fixture");
+        let persistence = setup.persistence().expect("private persistence");
+        seed_session(&persistence, SESSION_ID, 10);
+        seed_session(&persistence, OTHER_SESSION_ID, 100);
+        drop(persistence);
+        drop(setup);
+
+        let state = AgentGatewayState::with_sqlite_path(config, &db_path)
+            .expect("reload private production SQLite fixture");
+        let service = state.service();
+        let persistence = state.persistence().expect("private persistence");
+        let replay_request = AdmitRunRequest {
+            input: json!({"prompt":"durable-only maintenance replay"}),
+            session_id: Some(SESSION_ID.to_string()),
+            platform: "f3-durable-only-replay".to_string(),
+            idempotency_key: Some(REPLAY_KEY.to_string()),
+            idempotency_hash: Some("fnv64:fedcba9876543210".to_string()),
+            ..AdmitRunRequest::default()
+        };
+        let original = service
+            .admit(replay_request.clone())
+            .await
+            .expect("create durable replay fixture through service admission");
+        service
+            .finish_failed(
+                &original.run_id,
+                json!({"error":"durable replay fixture completed"}),
+            )
+            .await;
+        let cached_request = AdmitRunRequest {
+            input: json!({"prompt":"cached replay remains available"}),
+            session_id: Some(SESSION_ID.to_string()),
+            platform: "f3-cached-replay".to_string(),
+            idempotency_key: Some(CACHED_KEY.to_string()),
+            idempotency_hash: Some("fnv64:0011223344556677".to_string()),
+            ..AdmitRunRequest::default()
+        };
+        let cached_original = service
+            .admit(cached_request.clone())
+            .await
+            .expect("create independent cached replay fixture");
+        service
+            .finish_failed(
+                &cached_original.run_id,
+                json!({"error":"cached replay fixture completed"}),
+            )
+            .await;
+
+        let durable_identity = persistence
+            .admission_replay(
+                super::ADMISSION_IDEMPOTENCY_SCOPE,
+                REPLAY_KEY,
+                replay_request
+                    .idempotency_hash
+                    .as_deref()
+                    .expect("fixture hash"),
+                None,
+            )
+            .expect("read persisted idempotency record before cache eviction");
+        assert_eq!(durable_identity["replayed"], Value::Bool(true));
+        let durable_identity_run =
+            crate::sqlite_storage_rows::sqlite_storage_first_row(&durable_identity["run"])
+                .expect("durable replay exposes the stored run row");
+        assert_eq!(durable_identity_run[0], original.run_id);
+        let durable_original = persistence
+            .run_get(&original.run_id)
+            .expect("read durable original run before cache eviction");
+        let durable_run_columns = durable_original["columns"]
+            .as_array()
+            .expect("durable run columns");
+        let idempotency_key_column = durable_run_columns
+            .iter()
+            .position(|column| column == "idempotency_key")
+            .expect("durable run carries its idempotency key");
+        let status_column = durable_run_columns
+            .iter()
+            .position(|column| column == "status")
+            .expect("durable run carries its current status");
+        let durable_run_status = durable_original["rows"][0][status_column]
+            .as_str()
+            .expect("durable run status")
+            .to_string();
+        assert_eq!(
+            durable_original["rows"][0][idempotency_key_column], REPLAY_KEY,
+            "the admission transaction durably committed the keyed run"
+        );
+        let durable_session_before = persistence
+            .session_get(SESSION_ID)
+            .expect("read durable session before maintenance");
+        let durable_events_before = persistence
+            .event_replay(&json!({
+                "run_id": original.run_id,
+                "after_seq": 0,
+                "max_events": 256,
+                "max_bytes": 65536,
+            }))
+            .expect("read durable admission events before maintenance");
+        service
+            .inner
+            .store
+            .write()
+            .idempotency
+            .remove(REPLAY_KEY)
+            .expect("remove only the target in-memory idempotency entry");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *service
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock") = Some(Arc::new(move || {
+            entered_tx
+                .send(())
+                .expect("publish explicit maintenance phase");
+            release_rx
+                .lock()
+                .expect("maintenance phase barrier lock")
+                .recv()
+                .expect("release explicit maintenance phase");
+        }));
+        let explicit = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit(SESSION_ID)
+        });
+        let mut release = MaintenanceBarrierRelease(Some(release_tx));
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("maintenance observer task")
+            .expect("explicit maintenance reached post-publication phase");
+
+        let memory_before = {
+            let store = service.inner.store.read();
+            let session = &store.sessions[SESSION_ID];
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == SESSION_ID)
+                    .count(),
+                session.messages.len(),
+                session.view.updated_at,
+                store.idempotency.get(CACHED_KEY).map(|record| {
+                    (
+                        record.request_hash.clone(),
+                        record.run_id.clone(),
+                        record.workspace_identity_json.clone(),
+                    )
+                }),
+            )
+        };
+        let fresh_unmatched = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"fresh key remains blocked"}),
+                session_id: Some(SESSION_ID.to_string()),
+                platform: "f3-fresh-unmatched".to_string(),
+                idempotency_key: Some("f3-fresh-unmatched-key".to_string()),
+                idempotency_hash: Some("fnv64:abcdef0123456789".to_string()),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let matching_retry = service.admit(replay_request.clone()).await;
+        let hash_conflict = service
+            .admit(AdmitRunRequest {
+                idempotency_hash: Some("fnv64:0000000000000000".to_string()),
+                ..replay_request.clone()
+            })
+            .await;
+        let selector_conflict = service
+            .admit_with_workspace_selector(
+                replay_request.clone(),
+                Some("f3-selector-that-is-not-configured".to_string()),
+            )
+            .await;
+        let cached_replay = service.admit(cached_request).await;
+        let independent_session = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"independent session has spare capacity"}),
+                session_id: Some(OTHER_SESSION_ID.to_string()),
+                platform: "f3-independent-session".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let memory_after = {
+            let store = service.inner.store.read();
+            let session = &store.sessions[SESSION_ID];
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == SESSION_ID)
+                    .count(),
+                session.messages.len(),
+                session.view.updated_at,
+                store.idempotency.get(CACHED_KEY).map(|record| {
+                    (
+                        record.request_hash.clone(),
+                        record.run_id.clone(),
+                        record.workspace_identity_json.clone(),
+                    )
+                }),
+            )
+        };
+        let durable_session_after = persistence
+            .session_get(SESSION_ID)
+            .expect("read durable session during maintenance");
+        let durable_run_after = persistence
+            .run_get(&original.run_id)
+            .expect("read durable original run during maintenance");
+        let durable_events_after = persistence
+            .event_replay(&json!({
+                "run_id": original.run_id,
+                "after_seq": 0,
+                "max_events": 256,
+                "max_bytes": 65536,
+            }))
+            .expect("read durable admission events during maintenance");
+
+        release.release();
+        let compacted = explicit
+            .await
+            .expect("explicit service task should finish")
+            .expect("real RSS/SQLite explicit compaction should complete");
+
+        let replayed =
+            matching_retry.expect("durable-only matching retry must precede maintenance rejection");
+        assert_eq!(replayed.run_id, original.run_id);
+        assert_eq!(replayed.session_id, SESSION_ID);
+        assert_eq!(replayed.status, durable_run_status);
+        assert!(replayed.replayed);
+        assert!(matches!(
+            hash_conflict,
+            Err(AdmitError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            selector_conflict,
+            Err(AdmitError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            fresh_unmatched,
+            Err(AdmitError::SessionMaintenanceBusy(_))
+        ));
+        let cached_replay = cached_replay.expect("cached replay remains available");
+        assert_eq!(cached_replay.run_id, cached_original.run_id);
+        assert!(cached_replay.replayed);
+        let independent = independent_session.expect("spare capacity admits another session");
+        assert_eq!(independent.session_id, OTHER_SESSION_ID);
+        assert_eq!(memory_before, memory_after);
+        assert_eq!(durable_session_before, durable_session_after);
+        assert_eq!(durable_original, durable_run_after);
+        assert_eq!(durable_events_before, durable_events_after);
+        assert_eq!(compacted["status"], Value::String("committed".to_string()));
+
+        service
+            .finish_failed(
+                &independent.run_id,
+                json!({"error":"release independent fixture capacity"}),
+            )
+            .await;
         drop(service);
         drop(state);
         fs::remove_dir_all(root).expect("private maintenance fixture cleanup");

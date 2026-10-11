@@ -41,6 +41,14 @@ fn sqlite_query_map(result: SqliteQueryResult) -> map {
 use self::existence as existence;
 use self::messages as messages;
 
+struct AdmissionReplayInput {
+    idempotency_scope: string,
+    idempotency_key: string,
+    request_hash: string,
+    request_selector_present: bool,
+    request_selector: string
+}
+
 struct AdmissionCreateInput {
     session_id: string,
     session_new: int,
@@ -244,6 +252,58 @@ pub fn storage_admission_create(db_id: resource<sqlite.connection>, payload_json
                     idempotency: idempotency_result
                 }
             };
+        }
+    }
+    result
+}
+
+pub fn storage_admission_replay(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: AdmissionReplayInput = json::decode::<AdmissionReplayInput>(payload_json);
+    let mut selector_present: int = 0;
+    if input.request_selector_present.copy() == true {
+        selector_present = 1;
+    }
+    let existing = sqlite::query(&db_id, "SELECT request_hash, resource_id, CASE WHEN json_type(response_json, '$.workspace_identity') IS NULL THEN CASE WHEN ? = 0 THEN 1 ELSE 0 END WHEN json_type(response_json, '$.workspace_identity') = 'object' AND json_extract(response_json, '$.workspace_identity.request_selector_present') IS ? AND json_extract(response_json, '$.workspace_identity.request_selector') IS ? THEN 1 ELSE 0 END AS workspace_identity_match FROM idempotency_records WHERE scope = ? AND key = ? LIMIT 1", [sql_int(selector_present.copy()), sql_int(selector_present.copy()), sql_text(input.request_selector.copy()), sql_text(input.idempotency_scope.copy()), sql_text(input.idempotency_key.copy())], sql_limits(1, 8192));
+    let rows = existing.rows;
+    let empty_run: map = { columns: [], rows: [], truncated: false };
+    let mut result = {
+        ok: true,
+        code: "ok",
+        message: "",
+        result: { replayed: false, conflict: false, run: empty_run.copy() }
+    };
+    if rows.length > 0 {
+        let row: SqliteRow = rows[0].copy();
+        let cells: array<SqliteValue> = row.cells.copy();
+        let existing_hash: string = cells[0].text_value;
+        let existing_run_id: string = cells[1].text_value;
+        let workspace_identity_matches: bool = cells[2].int_value == 1;
+        if existing_hash != input.request_hash.copy() || workspace_identity_matches == false {
+            result = {
+                ok: false,
+                code: "idempotency_key_conflict",
+                message: "idempotency key was used with a different request",
+                result: { replayed: false, conflict: true, run: empty_run.copy() }
+            };
+        } else {
+            let run_result = sqlite::query(&db_id, "SELECT id, session_id, parent_run_id, status, input_json, provider, model, script_hash, idempotency_scope, idempotency_key, turn_count, input_tokens, output_tokens, error_code, error_message, recovery_reason, created_at_ms, started_at_ms, finished_at_ms, updated_at_ms FROM runs WHERE id = ? LIMIT 1", [sql_text(existing_run_id.copy())], sql_limits(1, 65536));
+            let run_result_copy: map = sqlite_query_map(run_result);
+            let run_rows = run_result.rows;
+            if run_rows.length == 0 {
+                result = {
+                    ok: false,
+                    code: "admission_replay_corrupt",
+                    message: "durable idempotency record references a missing run",
+                    result: { replayed: false, conflict: false, run: run_result_copy }
+                };
+            } else {
+                result = {
+                    ok: true,
+                    code: "ok",
+                    message: "",
+                    result: { replayed: true, conflict: false, run: run_result_copy }
+                };
+            }
         }
     }
     result

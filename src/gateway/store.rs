@@ -383,6 +383,26 @@ impl GatewayPersistence {
         self.command_data("admission.create", payload)
     }
 
+    /// Reads one durable admission identity without mutating repository state.
+    pub fn admission_replay(
+        &self,
+        scope: &str,
+        key: &str,
+        request_hash: &str,
+        request_selector: Option<&str>,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "admission.replay",
+            &json!({
+                "idempotency_scope": scope,
+                "idempotency_key": key,
+                "request_hash": request_hash,
+                "request_selector_present": request_selector.is_some(),
+                "request_selector": request_selector.unwrap_or_default(),
+            }),
+        )
+    }
+
     pub fn session_create(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("session.create", payload)
     }
