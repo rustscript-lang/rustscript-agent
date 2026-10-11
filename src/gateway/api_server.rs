@@ -1066,6 +1066,14 @@ async fn create_run_handler(
                 "session not found",
             );
         }
+        Err(AdmitError::SessionMaintenanceBusy(error)) => {
+            return json_error(
+                StatusCode::from_u16(error.http_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                &error.code,
+                &error.message,
+            );
+        }
         Err(AdmitError::ActiveRun) => {
             return json_error(
                 StatusCode::CONFLICT,

@@ -111,6 +111,29 @@ struct AdmissionReplayIdentity<'a> {
     request_selector: Option<&'a str>,
 }
 
+struct SessionMaintenanceLease {
+    session_id: String,
+    sessions: Arc<ParkingMutex<HashSet<String>>>,
+}
+
+impl SessionMaintenanceLease {
+    fn acquire(sessions: Arc<ParkingMutex<HashSet<String>>>, session_id: &str) -> Option<Self> {
+        if !sessions.lock().insert(session_id.to_string()) {
+            return None;
+        }
+        Some(Self {
+            session_id: session_id.to_string(),
+            sessions,
+        })
+    }
+}
+
+impl Drop for SessionMaintenanceLease {
+    fn drop(&mut self) {
+        self.sessions.lock().remove(&self.session_id);
+    }
+}
+
 fn agent_source_digest(source: &str) -> String {
     crate::capabilities::sha256_hex(source.as_bytes())
 }
@@ -666,12 +689,42 @@ impl std::fmt::Display for CompactionError {
 impl std::error::Error for CompactionError {}
 
 #[derive(Debug)]
+enum CompactionFailure {
+    Host(String),
+    Rss { code: String, detail: String },
+}
+
+impl CompactionFailure {
+    fn host(detail: impl Into<String>) -> Self {
+        Self::Host(detail.into())
+    }
+
+    fn rss(code: String, detail: String) -> Self {
+        Self::Rss { code, detail }
+    }
+
+    fn mapper_code(&self) -> &str {
+        match self {
+            Self::Host(_) => "internal",
+            Self::Rss { code, .. } => code,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Host(detail) | Self::Rss { detail, .. } => detail,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum AdmitError {
     RunLimitReached,
     IdempotencyConflict,
     ParentNotFound,
     SessionNotFound,
     ActiveRun,
+    SessionMaintenanceBusy(CompactionError),
     Persistence(String),
     Invalid(String),
     /// The gateway is halting (SIGINT path): admission is closed before
@@ -690,6 +743,7 @@ impl std::fmt::Display for AdmitError {
             Self::ParentNotFound => formatter.write_str("parent run not found"),
             Self::SessionNotFound => formatter.write_str("session not found"),
             Self::ActiveRun => formatter.write_str("workspace cannot change while a run is active"),
+            Self::SessionMaintenanceBusy(error) => formatter.write_str(&error.message),
             Self::Persistence(message) => formatter.write_str(message),
             Self::Invalid(message) => formatter.write_str(message),
             Self::Halting => formatter.write_str("gateway is halting; new runs are not admitted"),
@@ -742,6 +796,7 @@ struct AgentServiceInner {
     context_registries: Mutex<HashMap<String, ToolRegistrySnapshot>>,
     context_cache_capacity: usize,
     capacity: Arc<Semaphore>,
+    session_maintenance: Arc<ParkingMutex<HashSet<String>>>,
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
@@ -758,6 +813,8 @@ struct AgentServiceInner {
     /// Fault injection for compaction boundary redaction tests.
     compaction_policy_failure: Mutex<Option<String>>,
     compaction_worker_panic: Mutex<Option<String>>,
+    #[cfg(test)]
+    compaction_maintenance_published: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Native auth construction installed by the owning process. Each VM
     /// receives the factory and creates its own invocation-scoped AuthHost.
     auth_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
@@ -837,6 +894,7 @@ impl AgentService {
             context_registries: Mutex::new(HashMap::new()),
             context_cache_capacity,
             capacity,
+            session_maintenance: Arc::new(ParkingMutex::new(HashSet::new())),
             runs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
@@ -850,6 +908,8 @@ impl AgentService {
             provider_host: Mutex::new(None),
             compaction_policy_failure: Mutex::new(None),
             compaction_worker_panic: Mutex::new(None),
+            #[cfg(test)]
+            compaction_maintenance_published: Mutex::new(None),
             auth_host_factory: Mutex::new(None),
             workspace_host_factory: Mutex::new(None),
             trusted_legacy_workspace_root: RwLock::new(None),
@@ -1312,7 +1372,7 @@ impl AgentService {
                 json!({ "ok": true, "storage_available": true, "messages": messages })
             }
             Err(error) => {
-                let mut result = compaction_error("context_refresh_failed", &error);
+                let mut result = compaction_error("context_refresh_failed", error.detail());
                 result["storage_available"] = json!(true);
                 result
             }
@@ -1370,6 +1430,13 @@ impl AgentService {
                         .admission_rejected(AdmitRejectReason::RunLimitReached);
                     CompactionError::from_rss("capacity", error.to_string())
                 })?;
+        let _maintenance_lease = SessionMaintenanceLease::acquire(
+            Arc::clone(&self.inner.session_maintenance),
+            session_id,
+        )
+        .ok_or_else(|| {
+            CompactionError::from_rss("busy", "session maintenance is already active")
+        })?;
         let (generation, _, _) = load_durable_compaction_snapshot(persistence, session_id)
             .map_err(|error| CompactionError::from_rss("internal", error))?;
         let run_id = Uuid::new_v4().to_string();
@@ -1401,6 +1468,16 @@ impl AgentService {
             },
         );
         drop(_admission_serial);
+        #[cfg(test)]
+        if let Some(observer) = self
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock")
+            .take()
+        {
+            observer();
+        }
         if let Err(error) = self.transition_compaction_run(&run_id, "queued", "running") {
             self.inner.store.write().runs.remove(&run_id);
             return Err(CompactionError::from_rss("internal", error));
@@ -1420,7 +1497,10 @@ impl AgentService {
             {
                 run.status = "failed".to_string();
             }
-            return Err(CompactionError::from_rss("internal", error));
+            return Err(CompactionError::from_rss(
+                error.mapper_code(),
+                error.detail().to_string(),
+            ));
         }
         if let Err(error) = self.complete_compaction_lifecycle_run(&run_id) {
             if self
@@ -1451,16 +1531,18 @@ impl AgentService {
         model: &str,
         force: bool,
         cancellation: &RunCancellation,
-    ) -> Result<JsonValue, String> {
-        let persistence = self
-            .inner
-            .persistence
-            .as_ref()
-            .ok_or_else(|| "durable storage is unavailable for compaction".to_string())?;
+    ) -> Result<JsonValue, CompactionFailure> {
+        let persistence = self.inner.persistence.as_ref().ok_or_else(|| {
+            CompactionFailure::host("durable storage is unavailable for compaction")
+        })?;
         let (generation, history, previous_summary) =
-            load_durable_compaction_snapshot(persistence, session_id)?;
+            load_durable_compaction_snapshot(persistence, session_id)
+                .map_err(CompactionFailure::host)?;
         if cancellation.requested().is_some() || cancellation.deadline_passed() {
-            return Err("run was cancelled before RSS compaction policy".to_string());
+            return Err(CompactionFailure::rss(
+                "cancelled".to_string(),
+                "run was cancelled before RSS compaction policy".to_string(),
+            ));
         }
         if let Some(detail) = self
             .inner
@@ -1469,12 +1551,15 @@ impl AgentService {
             .expect("compaction policy failure lock")
             .take()
         {
-            return Err(format!("RSS compaction policy failed: {detail}"));
+            return Err(CompactionFailure::host(format!(
+                "RSS compaction policy failed: {detail}"
+            )));
         }
         let settings = self.inner.compaction_settings.clone();
         let decision_runner =
-            AgentRunner::from_bundled("rss/agent/compact.rss", AgentConfig::default())
-                .map_err(|error| format!("compile RSS compaction policy: {error}"))?;
+            AgentRunner::from_bundled("rss/agent/compact.rss", AgentConfig::default()).map_err(
+                |error| CompactionFailure::host(format!("compile RSS compaction policy: {error}")),
+            )?;
         let policy_input = json!({
             "session_id": session_id,
             "run_id": run_id,
@@ -1493,7 +1578,9 @@ impl AgentService {
         });
         let decision_value = decision_runner
             .run_with_context(json_to_vm_value(&policy_input))
-            .map_err(|error| format!("RSS compaction policy failed: {error}"))?;
+            .map_err(|error| {
+                CompactionFailure::host(format!("RSS compaction policy failed: {error}"))
+            })?;
         let decision = vm_value_to_json(&decision_value);
         let kind = decision
             .get("kind")
@@ -1506,38 +1593,55 @@ impl AgentService {
                 .unwrap_or_else(|| json!([]))),
             "compact.plan" => {
                 if cancellation.requested().is_some() || cancellation.deadline_passed() {
-                    return Err("run was cancelled before compaction transaction".to_string());
+                    return Err(CompactionFailure::rss(
+                        "cancelled".to_string(),
+                        "run was cancelled before compaction transaction".to_string(),
+                    ));
                 }
-                self.transition_compaction_run(run_id, "running", "compacting")?;
+                self.transition_compaction_run(run_id, "running", "compacting")
+                    .map_err(CompactionFailure::host)?;
                 let execution =
                     execute_rss_compaction(persistence, &decision_runner, &decision, cancellation);
                 let restore = self.transition_compaction_run(run_id, "compacting", "running");
-                execution?;
-                restore?;
+                execution.map_err(CompactionFailure::host)?;
+                restore.map_err(CompactionFailure::host)?;
                 let expected_generation = decision
                     .get("generation")
                     .and_then(JsonValue::as_i64)
                     .ok_or_else(|| {
-                        "RSS compaction plan omitted its target generation".to_string()
+                        CompactionFailure::host("RSS compaction plan omitted its target generation")
                     })?;
                 let (actual_generation, _, _) =
-                    load_durable_compaction_snapshot(persistence, session_id)?;
+                    load_durable_compaction_snapshot(persistence, session_id)
+                        .map_err(CompactionFailure::host)?;
                 if actual_generation != expected_generation {
-                    return Err(format!(
+                    return Err(CompactionFailure::host(format!(
                         "committed compaction generation mismatch: expected {expected_generation}, found {actual_generation}"
-                    ));
+                    )));
                 }
                 Ok(decision
                     .get("context_messages")
                     .cloned()
                     .unwrap_or_else(|| json!([])))
             }
-            "compact.error" => Err(decision
-                .get("message")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("RSS compaction policy rejected the request")
-                .to_string()),
-            _ => Err("RSS compaction policy returned an invalid decision".to_string()),
+            "compact.error" => {
+                let code = decision
+                    .get("code")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        CompactionFailure::host("RSS compaction error omitted its code")
+                    })?;
+                let detail = decision
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        CompactionFailure::host("RSS compaction error omitted its message")
+                    })?;
+                Err(CompactionFailure::rss(code.to_string(), detail.to_string()))
+            }
+            _ => Err(CompactionFailure::host(
+                "RSS compaction policy returned an invalid decision",
+            )),
         }
     }
 
@@ -3519,6 +3623,12 @@ impl AgentService {
         };
         if let Some(replayed) = self.replay_existing_admission(replay_identity, &cancellation)? {
             return Ok(replayed);
+        }
+
+        if self.inner.session_maintenance.lock().contains(&session_id) {
+            return Err(AdmitError::SessionMaintenanceBusy(
+                CompactionError::from_rss("busy", "session maintenance is in progress"),
+            ));
         }
 
         let (workspace_binding, workspace_authority) = self.resolve_workspace_admission(
@@ -6832,4 +6942,343 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod f3_session_maintenance_tests {
+    use super::{AdmitError, AdmitRunRequest};
+    use crate::config::AgentGatewayConfig;
+    use crate::gateway::AgentGatewayState;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, mpsc};
+    use tower::ServiceExt;
+
+    fn private_root() -> PathBuf {
+        let root = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+                .expect("assigned lifecycle-test directory"),
+        )
+        .join(format!("f3-maintenance-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("private maintenance fixture directory");
+        root
+    }
+
+    fn seed_session(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        session_id: &str,
+        now_ms: i64,
+    ) {
+        persistence
+            .session_create(&json!({
+                "id": session_id,
+                "profile": "default",
+                "platform": "f3-maintenance-test",
+                "account_id": session_id,
+                "chat_id": session_id,
+                "thread_id": "",
+                "user_id": "",
+                "generation": 1,
+                "system_prompt": "",
+                "model": "test-model",
+                "provider": "test-provider",
+                "toolset_hash": "test-tools",
+                "metadata_json": "{}",
+                "title": "",
+                "end_reason": "",
+                "now_ms": now_ms,
+            }))
+            .expect("create private persisted session");
+        for ordinal in 1..=40_i64 {
+            let message_id = format!("{session_id}-history-{ordinal}");
+            persistence
+                .message_append(&json!({
+                    "id": message_id,
+                    "session_id": session_id,
+                    "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                    "content_json": json!([{"type":"text", "text":format!("{session_id} fact {ordinal}")}]).to_string(),
+                    "name": "",
+                    "tool_call_id": "",
+                    "parent_message_id": "",
+                    "token_estimate": 1,
+                    "metadata_json": "{}",
+                    "run_id": "",
+                    "finish_reason": "",
+                    "now_ms": now_ms + ordinal,
+                }))
+                .expect("append private production history");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_maintenance_blocks_only_new_same_session_admission_until_release() {
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let config = AgentGatewayConfig {
+            max_concurrent_runs: 4,
+            ..AgentGatewayConfig::default()
+        };
+        let setup = AgentGatewayState::with_sqlite_path(config.clone(), &db_path)
+            .expect("open private production SQLite fixture");
+        let persistence = setup.persistence().expect("private persistence");
+        seed_session(&persistence, "maintenance-session-1", 10);
+        seed_session(&persistence, "maintenance-session-2", 100);
+        drop(persistence);
+        drop(setup);
+
+        let state = AgentGatewayState::with_sqlite_path(config, &db_path)
+            .expect("reload private production SQLite fixture");
+        let service = state.service();
+        let persistence = state.persistence().expect("private persistence");
+        let replay_request = AdmitRunRequest {
+            input: json!({"prompt":"durable maintenance replay"}),
+            session_id: Some("maintenance-session-1".to_string()),
+            platform: "f3-maintenance-replay".to_string(),
+            idempotency_key: Some("f3-maintenance-replay-key".to_string()),
+            idempotency_hash: Some("fnv64:0123456789abcdef".to_string()),
+            ..AdmitRunRequest::default()
+        };
+        let original = service
+            .admit(replay_request.clone())
+            .await
+            .expect("create durable replay fixture through service admission");
+        service
+            .finish_failed(&original.run_id, json!({"error":"fixture completed"}))
+            .await;
+        let app = crate::gateway::build_agent_gateway_app(state.clone());
+        let http_request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "input":"HTTP admission during explicit maintenance",
+                    "session_id":"maintenance-session-1"
+                })
+                .to_string(),
+            ))
+            .expect("HTTP admission request");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *service
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock") = Some(Arc::new(move || {
+            entered_tx
+                .send(())
+                .expect("publish explicit maintenance phase");
+            release_rx
+                .lock()
+                .expect("maintenance phase barrier lock")
+                .recv()
+                .expect("release explicit maintenance phase");
+        }));
+        let explicit = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit("maintenance-session-1")
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("maintenance observer task")
+            .expect("explicit maintenance reached post-publication phase");
+
+        let before_memory = {
+            let store = service.inner.store.read();
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == "maintenance-session-1")
+                    .count(),
+                store.sessions["maintenance-session-1"].messages.len(),
+            )
+        };
+        let durable_before = persistence
+            .session_get("maintenance-session-1")
+            .expect("read durable history before admission attempts");
+        let before = (
+            before_memory.0,
+            before_memory.1,
+            durable_before["rows"][0][14].clone(),
+        );
+        let same_session = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"must not race maintenance"}),
+                session_id: Some("maintenance-session-1".to_string()),
+                platform: "f3-maintenance-new".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let http_response = app.oneshot(http_request).await;
+        let replay = service.admit(replay_request).await;
+        let other_session = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"independent session remains available"}),
+                session_id: Some("maintenance-session-2".to_string()),
+                platform: "f3-maintenance-independent".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+        let after_memory = {
+            let store = service.inner.store.read();
+            (
+                store
+                    .runs
+                    .values()
+                    .filter(|run| run.session_id == "maintenance-session-1")
+                    .count(),
+                store.sessions["maintenance-session-1"].messages.len(),
+            )
+        };
+        let durable_after = persistence
+            .session_get("maintenance-session-1")
+            .expect("read durable history after admission attempts");
+        let after = (
+            after_memory.0,
+            after_memory.1,
+            durable_after["rows"][0][14].clone(),
+        );
+        release_tx
+            .send(())
+            .expect("release explicit maintenance barrier");
+        let compacted = explicit
+            .await
+            .expect("explicit service task should finish")
+            .expect("real RSS/SQLite explicit compaction should complete");
+        let fresh = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"same session after release"}),
+                session_id: Some("maintenance-session-1".to_string()),
+                platform: "f3-maintenance-after-release".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await;
+
+        let busy = match same_session {
+            Err(AdmitError::SessionMaintenanceBusy(error)) => error,
+            result => panic!("new same-session admission must be excluded, got {result:?}"),
+        };
+        let http_response = http_response.expect("HTTP admission handler should respond");
+        let http_status = http_response.status();
+        let http_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(http_response.into_body(), usize::MAX)
+                .await
+                .expect("HTTP admission body"),
+        )
+        .expect("HTTP admission JSON");
+        assert_eq!(http_status, StatusCode::CONFLICT);
+        assert_eq!(http_body["error"]["code"], "session_busy");
+        assert_eq!(busy.code, "session_busy");
+        assert_eq!(busy.http_status, 409);
+        assert_eq!(
+            before, after,
+            "rejection must leave session runs/history unchanged"
+        );
+        assert!(
+            replay
+                .expect("cached/durable replay should retain priority")
+                .replayed
+        );
+        let independent_run_id = other_session
+            .expect("spare global capacity should admit an independent session")
+            .run_id;
+        assert!(!independent_run_id.is_empty());
+        assert_eq!(compacted["status"], Value::String("committed".to_string()));
+        assert!(
+            fresh.is_ok(),
+            "same-session admission should resume after release"
+        );
+
+        let fresh_run_id = fresh
+            .as_ref()
+            .expect("fresh same-session admission")
+            .run_id
+            .clone();
+        service
+            .finish_failed(&fresh_run_id, json!({"error":"release fixture capacity"}))
+            .await;
+        service
+            .finish_failed(
+                &independent_run_id,
+                json!({"error":"release independent fixture capacity"}),
+            )
+            .await;
+        service.inject_compaction_policy_failure("F3_POLICY_SENTINEL");
+        let failed_compaction = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit("maintenance-session-2")
+        })
+        .await
+        .expect("error cleanup task should finish");
+        assert!(failed_compaction.is_err(), "injected RSS path should fail");
+        assert!(
+            !service
+                .inner
+                .session_maintenance
+                .lock()
+                .contains("maintenance-session-2"),
+            "error return must RAII-release its session lease"
+        );
+
+        let error_recovery = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"after error cleanup"}),
+                session_id: Some("maintenance-session-2".to_string()),
+                platform: "f3-maintenance-error-recovery".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("same-session admission should resume after compaction error");
+        service
+            .finish_failed(
+                &error_recovery.run_id,
+                json!({"error":"release error-recovery fixture capacity"}),
+            )
+            .await;
+
+        *service
+            .inner
+            .compaction_maintenance_published
+            .lock()
+            .expect("compaction maintenance observer lock") = Some(Arc::new(|| {
+            panic!("synthetic unwind after maintenance publication")
+        }));
+        let unwind = tokio::task::spawn_blocking({
+            let service = Arc::clone(&service);
+            move || service.compact_session_explicit("maintenance-session-2")
+        })
+        .await
+        .expect_err("phase observer should unwind the explicit operation");
+        assert!(unwind.is_panic());
+        assert!(
+            !service
+                .inner
+                .session_maintenance
+                .lock()
+                .contains("maintenance-session-2"),
+            "unwind must RAII-release its session lease"
+        );
+        assert!(
+            service
+                .admit(AdmitRunRequest {
+                    input: json!({"prompt":"after unwind cleanup"}),
+                    session_id: Some("maintenance-session-2".to_string()),
+                    platform: "f3-maintenance-unwind-recovery".to_string(),
+                    ..AdmitRunRequest::default()
+                })
+                .await
+                .is_ok(),
+            "ordinary admission should resume after unwind releases the lease"
+        );
+
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(root).expect("private maintenance fixture cleanup");
+    }
 }

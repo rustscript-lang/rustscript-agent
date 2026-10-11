@@ -2027,6 +2027,10 @@ async fn admit_text(
             )
             .await;
         }
+        Err(AdmitError::SessionMaintenanceBusy(error)) => {
+            let message = format!("{}: {}", error.code, error.message);
+            let _ = reply(api, chat_id, thread_id, &message).await;
+        }
         Err(error) => {
             let _ = reply(
                 api,
@@ -2924,6 +2928,152 @@ connection.close()"#;
         mock_server.abort();
         let _ = mock_server.await;
         std::fs::remove_dir_all(root).expect("private Telegram compaction fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn telegram_compact_empty_summary_uses_rss_invalid_compaction_result() {
+        use crate::AgentGatewayConfig;
+        use std::path::PathBuf;
+
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+                .expect("RUSTSCRIPT_AGENT_TEST_TMPDIR must be assigned"),
+        );
+        let root = temp.join(format!("telegram-empty-summary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("private Telegram compaction fixture root");
+        let database = root.join("gateway.sqlite3");
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
+            .expect("production private SQLite state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("synthetic loopback Telegram API fixture");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("loopback address")
+        );
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&replies);
+        let mock_api = axum::Router::new().route(
+            "/{token}/{method}",
+            axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured
+                        .lock()
+                        .expect("reply capture lock")
+                        .push(payload["text"].as_str().unwrap_or_default().to_string());
+                    axum::Json(json!({"ok":true, "result":{"message_id":1}}))
+                }
+            }),
+        );
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("loopback Telegram API server");
+        });
+        let mut config = TelegramConfig {
+            bot_token: "synthetic-empty-summary-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![555],
+            allowed_users: vec![555],
+            ..TelegramConfig::default()
+        };
+        config.max_429_retries = 0;
+        config.max_5xx_retries = 0;
+        let api = TelegramApi::new(&config);
+        let mut runtime = AdapterRuntime {
+            state: state.clone(),
+            config: config.clone(),
+            account: "fixture_bot".to_string(),
+            allowlist: Allowlist::from_config(&config),
+            dedup: DedupWindows::new(config.dedup_capacity),
+            active_runs: Arc::new(Mutex::new(HashMap::new())),
+            epochs: Arc::new(Mutex::new(EpochState::default())),
+            advance_failures: Arc::new(AtomicU64::new(0)),
+        };
+        let (new_update, _) = make_update(make_message(
+            555,
+            "private",
+            401,
+            None,
+            Some("/new"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &new_update).await;
+        let session_id = session_id_for("fixture_bot", 555, None);
+        let persistence = state.persistence().expect("production storage handle");
+        for ordinal in 1..=40_i64 {
+            let content = if ordinal <= 8 {
+                json!([{"type":"image", "url":"F4_PRIVATE_TELEGRAM_PREFIX_SENTINEL"}])
+            } else {
+                json!([{"type":"text", "text":format!("F4_PRIVATE_TELEGRAM_TAIL_SENTINEL {ordinal}")}])
+            };
+            persistence
+                .message_append(&json!({
+                    "id": format!("telegram-empty-summary-message-{ordinal}"),
+                    "session_id": session_id,
+                    "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                    "content_json": content.to_string(),
+                    "name": "",
+                    "tool_call_id": "",
+                    "parent_message_id": "",
+                    "token_estimate": 1,
+                    "metadata_json": "{}",
+                    "run_id": "",
+                    "finish_reason": "",
+                    "now_ms": ordinal + 100,
+                }))
+                .expect("append non-text prefix and text tail through RSS storage");
+        }
+        let before = persistence
+            .session_get(&session_id)
+            .expect("read Telegram session before compaction");
+        let provider = crate::ScriptedProvider::new();
+        state
+            .service()
+            .inject_provider_host(Arc::new(provider.clone()));
+        let (compact_update, _) = make_update(make_message(
+            555,
+            "private",
+            402,
+            None,
+            Some("/compact"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &compact_update).await;
+        let after = persistence
+            .session_get(&session_id)
+            .expect("read Telegram session after compaction");
+        let captured_replies = replies.lock().expect("reply capture lock");
+        assert_eq!(captured_replies.len(), 2);
+        assert_eq!(
+            captured_replies[1],
+            "Compaction failed [invalid_compaction]: The compaction request is invalid."
+        );
+        assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_PREFIX_SENTINEL"));
+        assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_TAIL_SENTINEL"));
+        assert_eq!(
+            before["rows"][0][7], after["rows"][0][7],
+            "generation changed"
+        );
+        assert_eq!(
+            before["rows"][0][14], after["rows"][0][14],
+            "history changed"
+        );
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "explicit compaction must not call a model"
+        );
+        drop(captured_replies);
+        drop(persistence);
+        drop(runtime);
+        drop(state);
+        mock_server.abort();
+        let _ = mock_server.await;
+        std::fs::remove_dir_all(root).expect("private Telegram empty-summary fixture cleanup");
     }
 
     #[tokio::test]

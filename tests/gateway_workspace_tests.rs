@@ -216,6 +216,103 @@ async fn explicit_http_compaction_uses_rss_and_is_generation_idempotent() {
 }
 
 #[tokio::test]
+async fn explicit_http_empty_summary_error_is_invalid_compaction() {
+    let root = private_test_root("http-empty-summary");
+    fs::create_dir_all(&root).expect("private test root");
+    let db_path = root.join("gateway.db");
+    let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+        .expect("gateway should open private SQLite fixture");
+    let app = build_agent_gateway_app(state.clone());
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"id":"http-empty-summary-session", "model":"test-model", "provider":"test-provider"}).to_string(),
+                ))
+                .expect("create-session request"),
+        )
+        .await
+        .expect("create-session response");
+    assert!(create.status().is_success());
+    let persistence = state.persistence().expect("durable repository");
+    for ordinal in 1..=40_i64 {
+        let content = if ordinal <= 8 {
+            json!([{"type":"image", "url":"F4_PRIVATE_PREFIX_SENTINEL"}])
+        } else {
+            json!([{"type":"text", "text":format!("F4_PRIVATE_TAIL_SENTINEL {ordinal}")}])
+        };
+        persistence
+            .message_append(&json!({
+                "id": format!("http-empty-summary-message-{ordinal}"),
+                "session_id": "http-empty-summary-session",
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content_json": content.to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 100,
+            }))
+            .expect("append non-text prefix and text tail through RSS storage");
+    }
+    let before = persistence
+        .session_get("http-empty-summary-session")
+        .expect("read fixture session before compaction");
+    let provider = ScriptedProvider::new();
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions/http-empty-summary-session/compact")
+                .body(Body::empty())
+                .expect("empty-summary compaction request"),
+        )
+        .await
+        .expect("empty-summary compaction response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("empty-summary response body");
+    let body: Value = serde_json::from_slice(&bytes).expect("empty-summary response JSON");
+    let after = persistence
+        .session_get("http-empty-summary-session")
+        .expect("read fixture session after compaction");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_compaction", "{body}");
+    assert!(!body.to_string().contains("F4_PRIVATE_PREFIX_SENTINEL"));
+    assert!(!body.to_string().contains("F4_PRIVATE_TAIL_SENTINEL"));
+    assert_eq!(
+        before["rows"][0][7], after["rows"][0][7],
+        "generation changed"
+    );
+    assert_eq!(
+        before["rows"][0][14], after["rows"][0][14],
+        "history changed"
+    );
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "explicit compaction must not call a model"
+    );
+
+    drop(persistence);
+    drop(state);
+    fs::remove_dir_all(root).expect("private HTTP empty-summary fixture cleanup");
+}
+
+#[tokio::test]
 async fn explicit_http_compaction_redacts_private_storage_error_details() {
     let root = private_test_root("http-compaction-error-redaction");
     fs::create_dir_all(&root).expect("private test root");

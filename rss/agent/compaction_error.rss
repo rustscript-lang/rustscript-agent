@@ -30,7 +30,7 @@ pub fn run(context: map) -> map {
         status = 409;
         code = "compaction_cancelled";
         message = "Compaction was cancelled.";
-    } else if kind == "invalid" {
+    } else if kind == "invalid" || kind == "empty_summary" {
         status = 400;
         code = "invalid_compaction";
         message = "The compaction request is invalid.";
