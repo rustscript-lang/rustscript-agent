@@ -421,19 +421,14 @@ fn source_env_value(primary: &str, legacy: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// Preserves in-policy source facts exactly and uses the existing sentinel for
-/// values beyond the RSS or serialized-selection bound, never truncating them.
+/// Preserves RSS-bounded source facts exactly and uses the existing sentinel
+/// for values beyond the scalar bound, never truncating them.
 fn source_fact(value: String) -> serde_json::Value {
     const MAX_SOURCE_SCALARS: usize = 4096;
-    const MAX_SERIALIZED_FACT_BYTES: usize = 20 * 1024;
     if value.len() > MAX_SOURCE_SCALARS * 4 || value.chars().count() > MAX_SOURCE_SCALARS {
-        return serde_json::Value::Bool(false);
-    }
-    match serde_json::to_string(&value) {
-        Ok(encoded) if encoded.len() <= MAX_SERIALIZED_FACT_BYTES => {
-            serde_json::Value::String(value)
-        }
-        Ok(_) | Err(_) => serde_json::Value::Bool(false),
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::Value::String(value)
     }
 }
 

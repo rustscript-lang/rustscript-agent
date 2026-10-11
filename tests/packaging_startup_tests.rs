@@ -11,6 +11,8 @@
 
 #[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -618,6 +620,73 @@ fn write_config_file(root: &Path, source: Option<&str>) {
         .expect("config.yaml should be written");
 }
 
+#[cfg(target_os = "linux")]
+fn write_large_escaped_source_fixture() -> (PathBuf, String) {
+    let mut directory = binary_root("src001-control-path-fixture");
+    for _ in 0..14 {
+        directory.push("\u{1}".repeat(244));
+    }
+    let path = directory.join("agent.rss");
+    let source = format!("file:{}", path.to_str().expect("fixture path is UTF-8"));
+
+    assert!(path.is_absolute());
+    assert!(path.as_os_str().as_bytes().len() < 4096);
+    assert!(
+        path.components()
+            .all(|component| component.as_os_str().as_bytes().len() <= 250)
+    );
+    assert!(source.chars().count() <= 4096);
+    assert_eq!(
+        path.as_os_str()
+            .as_bytes()
+            .iter()
+            .filter(|byte| **byte == 1)
+            .count(),
+        14 * 244
+    );
+    assert!(
+        serde_json::to_string(&source)
+            .expect("source fact must serialize")
+            .len()
+            > 20 * 1024
+    );
+    for selection in [
+        json!({ "config_present": false, "source": source }),
+        json!({ "config_present": true, "config_source": source }),
+    ] {
+        assert!(
+            serde_json::to_string(&selection)
+                .expect("source selection must serialize")
+                .len()
+                <= 64 * 1024
+        );
+    }
+
+    std::fs::create_dir_all(&directory).expect("control-path fixture directories should exist");
+    let body = format!(
+        "pub fn run(context: map) -> string {{ {:?}; }}\n",
+        "CONTROL_PATH_SOURCE_MARKER"
+    );
+    std::fs::write(&path, body).expect("control-path RSS entry should be written");
+    assert!(
+        std::fs::metadata(&path)
+            .expect("control-path RSS entry metadata should exist")
+            .is_file()
+    );
+
+    (path, source)
+}
+
+#[cfg(target_os = "linux")]
+fn write_config_file_with_control_path(root: &Path, source: &str) {
+    let config_home = root.join(".rustscript-agent");
+    std::fs::create_dir_all(&config_home).expect("config home should be created");
+    let yaml_source = source.replace('\u{1}', "\\u0001");
+    let document = format!("version: 1\nagent:\n  source: \"{yaml_source}\"\n");
+    std::fs::write(config_home.join("config.yaml"), document)
+        .expect("config.yaml should be written");
+}
+
 /// One raw HTTP GET over a plain TCP stream (no HTTP client dependency).
 async fn http_get(host_port: &str, path: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -820,6 +889,81 @@ async fn binary_config_file_source_beats_invalid_environment_source() {
     assert_eq!(json["source"]["kind"], "file");
     assert_eq!(json["source"]["deprecated_override"], false);
     assert!(!health.contains(configured.to_string_lossy().as_ref()));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn binary_accepts_rss_bounded_control_path_with_large_escaped_fact() {
+    let (source_path, source) = write_large_escaped_source_fixture();
+    let source_path = source_path.to_str().expect("fixture path is UTF-8");
+
+    for configured_source in [false, true] {
+        let root = binary_root(if configured_source {
+            "src001-configured-control-path"
+        } else {
+            "src001-environment-control-path"
+        });
+        if configured_source {
+            write_config_file_with_control_path(&root, &source);
+        }
+
+        let stderr_path = root.join("stderr.log");
+        let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+        let mut command =
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"));
+        command
+            .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+            .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+            .env("RUSTSCRIPT_AGENT_STATE_DB", root.join("state.db"))
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
+            .kill_on_drop(true)
+            .env_remove("RUSTSCRIPT_AGENT_SOURCE")
+            .env_remove("RUSTSCRIPT_AGENT_SCRIPT")
+            .env_remove("PD_EDGE_AGENT_SOURCE")
+            .env_remove("PD_EDGE_AGENT_SCRIPT");
+        if !configured_source {
+            command.env("RUSTSCRIPT_AGENT_SOURCE", &source);
+        }
+        let mut child = command.spawn().expect("gateway binary should spawn");
+
+        let address = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(30)).await;
+        let Some(address) = address else {
+            let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+                .await
+                .expect("gateway child must exit after source rejection")
+                .expect("child wait");
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            assert!(!stderr.contains(source_path));
+            assert!(!stderr.contains("listening on http://"));
+            assert!(!status.success());
+            assert!(
+                stderr.contains("invalid_agent_source")
+                    || stderr.contains("agent source is invalid"),
+                "child must reach the source-policy rejection path: {stderr}"
+            );
+            panic!("RSS-admitted source must start; gateway child rejected it: {stderr}");
+        };
+
+        let health = http_get(&address, "/health/detailed").await;
+        stop_child(&mut child).await;
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        assert!(health.contains("200 OK"));
+        let body = health.split("\r\n\r\n").nth(1).unwrap_or("");
+        let json: Value = serde_json::from_str(body).expect("health body must be JSON");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["source"]["kind"], "file");
+        let hash = json["source"]["hash"]
+            .as_str()
+            .expect("file source hash must be a string");
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(json["source"]["deprecated_override"], false);
+        assert!(!health.contains(source_path));
+        assert!(!stderr.contains(source_path));
+    }
 }
 
 #[tokio::test]
