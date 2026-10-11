@@ -358,6 +358,25 @@ impl ConfigFile {
         Self::load(paths.config_path())
     }
 
+    /// Loads the existing validated compaction settings, defaulting only when
+    /// the config file is absent. Parse, validation, and I/O errors remain
+    /// startup errors rather than silently selecting defaults.
+    pub fn load_compaction_settings(
+        path: impl AsRef<Path>,
+    ) -> Result<CompactionSettings, ConfigFileError> {
+        match Self::load(path) {
+            Ok(config) => Ok(config.compaction),
+            Err(ConfigFileError::MissingFile { .. }) => Ok(CompactionSettings::default()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Production gateway producer for the existing home `config.yaml`.
+    pub fn load_compaction_settings_from_home() -> Result<CompactionSettings, ConfigFileError> {
+        let paths = AgentPaths::resolve()?;
+        Self::load_compaction_settings(paths.config_path())
+    }
+
     pub fn load_pair(paths: &AgentPaths) -> Result<LoadedConfig, ConfigFileError> {
         let config = Self::load(paths.config_path())?;
         let auth = AuthConfig::load(paths.auth_path()).map_err(ConfigFileError::Auth)?;

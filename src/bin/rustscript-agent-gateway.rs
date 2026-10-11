@@ -9,7 +9,7 @@ use std::{
 };
 
 use rustscript_agent::{
-    AgentGatewayConfig, AgentGatewayState, TelegramConfig, build_agent_gateway_app,
+    AgentGatewayConfig, AgentGatewayState, ConfigFile, TelegramConfig, build_agent_gateway_app,
     gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
 };
 
@@ -167,10 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Built before the listener binds: an invalid authoritative source is a
     // static construction error and never falls back to a legacy/default
     // source, and never reaches the socket.
-    let state = AgentGatewayState::with_agent_selection(
+    let state = AgentGatewayState::with_agent_selection_and_compaction(
         config,
         serde_json::Value::Object(selection),
         state_db.as_deref().map(std::path::Path::new),
+        ConfigFile::load_compaction_settings_from_home().map_err(std::io::Error::other)?,
     )
     .map_err(std::io::Error::other)?;
     let state = match std::env::var_os("RUSTSCRIPT_AGENT_HOME") {

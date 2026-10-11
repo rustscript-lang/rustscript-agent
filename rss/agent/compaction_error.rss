@@ -1,0 +1,45 @@
+// Public compaction error policy. Callers pass only a stable category; raw
+// storage, VM, and worker diagnostics stay outside the public response.
+
+fn context_kind(context: map) -> string {
+    let mut kind: string = "internal";
+    if context.has("kind") && type(context["kind"]) == "string" {
+        kind = context["kind"];
+    }
+    kind
+}
+
+pub fn run(context: map) -> map {
+    let kind = context_kind(context);
+    let mut status: int = 500;
+    let mut code: string = "compaction_failed";
+    let mut message: string = "Compaction could not be completed.";
+    if kind == "not_found" {
+        status = 404;
+        code = "session_not_found";
+        message = "Session not found.";
+    } else if kind == "busy" {
+        status = 409;
+        code = "session_busy";
+        message = "The session has an active run.";
+    } else if kind == "capacity" {
+        status = 429;
+        code = "run_capacity_reached";
+        message = "Run capacity is currently full.";
+    } else if kind == "cancelled" {
+        status = 409;
+        code = "compaction_cancelled";
+        message = "Compaction was cancelled.";
+    } else if kind == "invalid" {
+        status = 400;
+        code = "invalid_compaction";
+        message = "The compaction request is invalid.";
+    }
+    {
+        "http_status": status,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    }
+}

@@ -783,6 +783,12 @@ async fn session_messages_handler(
     )
 }
 
+fn compaction_error_response(error: crate::service::CompactionError) -> Response {
+    let status =
+        StatusCode::from_u16(error.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    json_error(status, &error.code, &error.message)
+}
+
 async fn compact_session_handler(
     State(state): State<AgentGatewayState>,
     Path(session_id): Path<String>,
@@ -790,22 +796,11 @@ async fn compact_session_handler(
     let service = state.service();
     match tokio::task::spawn_blocking(move || service.compact_session_explicit(&session_id)).await {
         Ok(Ok(result)) => json_response(StatusCode::OK, result),
-        Ok(Err(error)) if error == "session not found" => {
-            json_error(StatusCode::NOT_FOUND, "session_not_found", &error)
-        }
-        Ok(Err(error)) if error == "session has an active run" => {
-            json_error(StatusCode::CONFLICT, "session_busy", &error)
-        }
-        Ok(Err(error)) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "compaction_failed",
-            &error,
-        ),
-        Err(error) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "compaction_task_failed",
-            &error.to_string(),
-        ),
+        Ok(Err(error)) => compaction_error_response(error),
+        Err(error) => compaction_error_response(crate::service::CompactionError::from_rss(
+            "internal",
+            error.to_string(),
+        )),
     }
 }
 

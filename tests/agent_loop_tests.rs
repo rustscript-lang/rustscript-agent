@@ -19,6 +19,7 @@ use rustscript_agent::capabilities::{
     LifecycleClock, LifecycleError, LifecycleLimits, NeverCancelled, ProcessCapability,
     ProcessLimits, SystemClock, TokenIssuer, UuidIssuer,
 };
+use rustscript_agent::config_file::CompactionSettings;
 use rustscript_agent::{
     AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentHostBridges,
     AgentProviderHost, AgentRunner, ControlCheckHook, RunCancellation, RunContext, RunError,
@@ -196,6 +197,102 @@ fn decide(runner: &AgentRunner, context: JsonValue) -> JsonValue {
         panic!("policy entry should return a decision map");
     };
     vm_value_to_json(&Value::Map(result))
+}
+
+#[test]
+fn rss_compaction_policy_builds_stable_identifier_from_lifecycle_and_range_primitives() {
+    let messages = (1..=4)
+        .map(|ordinal| {
+            json!({
+                "ordinal": ordinal,
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content": [{"type":"text", "text":format!("id source fact {ordinal}")}],
+                "tool_call_id": "",
+                "compacted": false
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut context = json!({
+        "session_id": "id-session",
+        "run_id": "id-run",
+        "generation": 6,
+        "messages": messages,
+        "config": {
+            "enabled": true,
+            "force": true,
+            "max_context_messages": 2,
+            "retained_tail": 1,
+            "now_ms": 1234,
+            "model": "test-model",
+            "token_estimate": 0
+        }
+    });
+    let runner = compact_runner();
+    let plan = decide(&runner, context.clone());
+    assert_eq!(plan["kind"], json!("compact.plan"));
+    let expected_id = "id-session:id-run:compact:g7:s1-e3";
+    assert_eq!(plan["commands"][0]["payload"]["id"], json!(expected_id));
+    assert_eq!(plan["commands"][2]["payload"]["id"], json!(expected_id));
+
+    context["compaction_id"] = json!("legacy-callable-compaction-id");
+    let legacy_plan = decide(&runner, context);
+    assert_eq!(
+        legacy_plan["commands"][0]["payload"]["id"],
+        json!("legacy-callable-compaction-id")
+    );
+    assert_eq!(
+        legacy_plan["commands"][2]["payload"]["id"],
+        json!("legacy-callable-compaction-id")
+    );
+}
+
+#[test]
+fn rss_compaction_error_contract_preserves_safe_typed_categories() {
+    let cases = [
+        ("not_found", 404, "session_not_found"),
+        ("busy", 409, "session_busy"),
+        ("capacity", 429, "run_capacity_reached"),
+        ("cancelled", 409, "compaction_cancelled"),
+        ("invalid", 400, "invalid_compaction"),
+        ("internal", 500, "compaction_failed"),
+    ];
+    for (category, status, code) in cases {
+        let error = rustscript_agent::service::CompactionError::from_rss(
+            category,
+            "F4_PRIVATE_DIAGNOSTIC_SENTINEL",
+        );
+        assert_eq!(error.http_status, status, "{category}");
+        assert_eq!(error.code, code, "{category}");
+        assert!(!error.message.contains("F4_PRIVATE_DIAGNOSTIC_SENTINEL"));
+    }
+}
+
+#[test]
+fn rss_refuses_to_compact_stale_only_summary_when_prefix_has_no_fresh_text() {
+    let decision = decide(
+        &compact_runner(),
+        json!({
+            "session_id":"stale-summary-session",
+            "run_id":"stale-summary-run",
+            "generation":3,
+            "messages":[
+                {"ordinal":1,"role":"user","content":[],"compacted":false},
+                {"ordinal":2,"role":"assistant","content":[{"type":"text","text":"retained tail"}],"compacted":false}
+            ],
+            "config":{
+                "enabled":true,
+                "force":true,
+                "max_context_messages":2,
+                "retained_tail":1,
+                "previous_summary":"previously committed fact",
+                "now_ms":1000,
+                "model":"test-model",
+                "token_estimate":0
+            }
+        }),
+    );
+    assert_eq!(decision["kind"], json!("compact.error"));
+    assert_eq!(decision["code"], json!("empty_summary"));
 }
 
 fn read_fixture(name: &str) -> JsonValue {
@@ -3498,6 +3595,49 @@ async fn registry_mismatch_is_observed_as_durable_failure_before_rss_source() {
 }
 
 #[tokio::test]
+async fn in_memory_production_worker_completes_without_compaction_storage() {
+    let state = AgentGatewayState::with_agent_file(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+    )
+    .expect("production in-memory service should initialize");
+    let service = state.service();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("memory answer"));
+    service.inject_provider_host(Arc::new(provider.clone()));
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"prompt": "memory-only question"}),
+            platform: "compaction-memory-regression".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("in-memory admission should succeed");
+
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let events = service.run_events(&admitted.run_id);
+    assert!(
+        events.iter().any(|event| event["event"] == "run.completed"),
+        "in-memory run should complete through the provider: {events:?}"
+    );
+    assert_eq!(provider.call_count(), 1, "one provider call is expected");
+    assert!(
+        provider.requests()[0]
+            .to_string()
+            .contains("memory-only question")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.to_string().contains("memory answer"))
+    );
+}
+
+#[tokio::test]
 async fn production_agent_loop_compacts_durable_history_before_provider_request() {
     let root = temporary_root("production-compaction-loop");
     let db_path = root.join("gateway.db");
@@ -3658,6 +3798,316 @@ async fn production_agent_loop_compacts_durable_history_before_provider_request(
     fs::remove_dir_all(root).expect("private production-compaction fixture should be removed");
 }
 
+fn seed_runtime_compaction_history(storage: &AgentRunner, db_name: &str, count: i64) {
+    seed_runtime_compaction_history_for_session(storage, db_name, "session-1", count);
+}
+
+fn seed_runtime_compaction_history_for_session(
+    storage: &AgentRunner,
+    db_name: &str,
+    session_id: &str,
+    count: i64,
+) {
+    run_storage(storage, db_name, "migrate", "migrate", json!({}), 1);
+    let mut payload = session_payload(session_id, 2);
+    payload["chat_id"] = json!(session_id);
+    run_storage(
+        storage,
+        db_name,
+        &format!("session-create-{session_id}"),
+        "session.create",
+        payload,
+        2,
+    );
+    for ordinal in 1..=count {
+        let message_id = format!("{session_id}-runtime-config-history-{ordinal}");
+        run_storage(
+            storage,
+            db_name,
+            &message_id,
+            "message.append",
+            json!({
+                "id": message_id,
+                "session_id": session_id,
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content_json": json!([{"type":"text", "text":format!("runtime config fact {ordinal}")}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 2,
+            }),
+            ordinal + 2,
+        );
+    }
+}
+
+#[tokio::test]
+async fn runtime_compaction_disabled_setting_reaches_forced_service_policy() {
+    let root = temporary_root("runtime-compaction-disabled");
+    let db_path = root.join("gateway.db");
+    let config_path = root.join("config.yaml");
+    fs::write(
+        &config_path,
+        "version: 1\ncompaction:\n  enabled: false\n  max_context_messages: 4\n  retained_tail: 2\n",
+    )
+    .expect("synthetic runtime config should be written");
+    let runtime_config = rustscript_agent::ConfigFile::load(&config_path)
+        .expect("synthetic runtime config should validate");
+    assert!(!runtime_config.compaction.enabled);
+    assert_eq!(runtime_config.compaction.max_context_messages, 4);
+    assert_eq!(runtime_config.compaction.retained_tail, 2);
+    let absent_settings =
+        rustscript_agent::ConfigFile::load_compaction_settings(root.join("missing-config.yaml"))
+            .expect("an absent config should use the existing defaults");
+    assert!(absent_settings.enabled);
+    assert_eq!(absent_settings.max_context_messages, 120);
+    assert_eq!(absent_settings.retained_tail, 32);
+    let storage = storage_runner(&root);
+    seed_runtime_compaction_history(&storage, "gateway.db", 40);
+
+    let config = AgentGatewayConfig::default();
+    let state = AgentGatewayState::with_agent_selection_and_compaction(
+        config,
+        json!({}),
+        Some(&db_path),
+        rustscript_agent::ConfigFile::load_compaction_settings(&config_path)
+            .expect("validated runtime settings should pass through"),
+    )
+    .expect("service should open the private config fixture");
+    let result = state
+        .service()
+        .compact_session_explicit("session-1")
+        .expect("explicit compaction should return a typed decision");
+    assert_eq!(result["status"], json!("skipped"));
+    assert_eq!(result["generation"], json!(1));
+    drop(state);
+    drop(storage);
+    fs::remove_dir_all(root).expect("private runtime config fixture should be removed");
+}
+
+#[tokio::test]
+async fn runtime_compaction_threshold_and_tail_reach_provider_refresh() {
+    let root = temporary_root("runtime-compaction-threshold");
+    let db_path = root.join("gateway.db");
+    let config_path = root.join("config.yaml");
+    fs::write(
+        &config_path,
+        "version: 1\ncompaction:\n  enabled: true\n  max_context_messages: 4\n  retained_tail: 2\n",
+    )
+    .expect("synthetic runtime config should be written");
+    let runtime_config = rustscript_agent::ConfigFile::load(&config_path)
+        .expect("synthetic runtime config should validate");
+    assert_eq!(runtime_config.compaction.max_context_messages, 4);
+    assert_eq!(runtime_config.compaction.retained_tail, 2);
+    let storage = storage_runner(&root);
+    seed_runtime_compaction_history(&storage, "gateway.db", 6);
+
+    let config = AgentGatewayConfig::default();
+    let state = AgentGatewayState::with_agent_selection_and_compaction(
+        config,
+        json!({}),
+        Some(&db_path),
+        rustscript_agent::ConfigFile::load_compaction_settings(&config_path)
+            .expect("validated runtime settings should pass through"),
+    )
+    .expect("service should open the private config fixture");
+    let service = state.service();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("threshold answer"));
+    service.inject_provider_host(Arc::new(provider.clone()));
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"prompt": "threshold question"}),
+            session_id: Some("session-1".to_string()),
+            platform: "runtime-compaction-config".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("session admission should succeed");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    assert_eq!(provider.call_count(), 1);
+    let request = &provider.requests()[0];
+    let messages = request["messages"].as_array().expect("provider messages");
+    assert!(
+        messages.len() <= 4,
+        "configured tail should bound context: {messages:?}"
+    );
+    let text = request.to_string();
+    assert!(text.contains("runtime config fact 6"));
+    assert!(text.contains("threshold question"));
+    assert!(messages.iter().all(|message| {
+        message["content"].as_array().is_none_or(|parts| {
+            !parts
+                .iter()
+                .any(|part| part["text"] == json!("runtime config fact 1"))
+        })
+    }));
+    let session = run_storage(
+        &storage,
+        "gateway.db",
+        "session-after-runtime-config",
+        "session.get",
+        json!({"session_id":"session-1"}),
+        1000,
+    );
+    assert_eq!(first_query_row(&session)["generation"], json!(2));
+    drop(service);
+    drop(state);
+    drop(storage);
+    fs::remove_dir_all(root).expect("private runtime config fixture should be removed");
+}
+
+struct ChannelBarrierProvider {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<JsonValue>>,
+}
+
+impl AgentProviderHost for ChannelBarrierProvider {
+    fn call(&self, _request: &JsonValue, _cancellation: &RunCancellation) -> JsonValue {
+        self.entered.send(()).expect("provider entry observer");
+        self.release
+            .lock()
+            .recv()
+            .expect("provider barrier response")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_compaction_respects_capacity_held_by_ordinary_run() {
+    let root = temporary_root("explicit-capacity-held-by-run");
+    let db_path = root.join("gateway.db");
+    let storage = storage_runner(&root);
+    seed_runtime_compaction_history(&storage, "gateway.db", 4);
+    let config = AgentGatewayConfig {
+        max_concurrent_runs: 1,
+        ..AgentGatewayConfig::default()
+    };
+    let state = AgentGatewayState::with_agent_selection(config, json!({}), Some(&db_path))
+        .expect("private SQLite gateway should initialize");
+    let service = state.service();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    service.inject_provider_host(Arc::new(ChannelBarrierProvider {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"prompt": "ordinary run holds capacity"}),
+            session_id: Some("session-1".to_string()),
+            platform: "explicit-capacity-regression".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("ordinary run should be admitted");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move { service.run_worker(run_id, "ignored".to_string()).await }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv())
+        .await
+        .expect("provider entry observer task")
+        .expect("ordinary provider should reach the barrier");
+
+    let explicit_result = tokio::task::spawn_blocking({
+        let service = service.clone();
+        move || service.compact_session_explicit("session-1")
+    })
+    .await
+    .expect("explicit compaction task");
+    release_tx
+        .send(json!({"ok":true,"response":text_response("barrier answer"),"error":{}}))
+        .expect("ordinary provider should be released");
+    worker.await.expect("ordinary worker should finish");
+    let busy = explicit_result.expect_err("explicit operation must reject a same-session run");
+    assert_eq!(busy.code, "session_busy");
+    assert_eq!(busy.http_status, 409);
+    assert!(
+        service
+            .run_events(&admitted.run_id)
+            .iter()
+            .any(|event| { event["event"] == json!("run.completed") })
+    );
+    drop(service);
+    drop(state);
+    drop(storage);
+    fs::remove_dir_all(root).expect("private capacity fixture should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_compaction_respects_global_capacity_held_by_other_session_run() {
+    let root = temporary_root("explicit-global-capacity-held-by-run");
+    let db_path = root.join("gateway.db");
+    let storage = storage_runner(&root);
+    seed_runtime_compaction_history(&storage, "gateway.db", 4);
+    seed_runtime_compaction_history_for_session(&storage, "gateway.db", "session-2", 4);
+    let config = AgentGatewayConfig {
+        max_concurrent_runs: 1,
+        ..AgentGatewayConfig::default()
+    };
+    let state = AgentGatewayState::with_agent_selection(config, json!({}), Some(&db_path))
+        .expect("private SQLite gateway should initialize");
+    let service = state.service();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    service.inject_provider_host(Arc::new(ChannelBarrierProvider {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"prompt": "ordinary run holds global capacity"}),
+            session_id: Some("session-1".to_string()),
+            platform: "explicit-global-capacity-regression".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("ordinary run should be admitted");
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move { service.run_worker(run_id, "ignored".to_string()).await }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv())
+        .await
+        .expect("provider entry observer task")
+        .expect("ordinary provider should reach the barrier");
+
+    let explicit_result = tokio::task::spawn_blocking({
+        let service = service.clone();
+        move || service.compact_session_explicit("session-2")
+    })
+    .await
+    .expect("explicit compaction task");
+    release_tx
+        .send(json!({"ok":true,"response":text_response("barrier answer"),"error":{}}))
+        .expect("ordinary provider should be released");
+    worker.await.expect("ordinary worker should finish");
+    let capacity =
+        explicit_result.expect_err("explicit operation must not overbook global capacity");
+    assert_eq!(capacity.code, "run_capacity_reached");
+    assert_eq!(capacity.http_status, 429);
+    assert!(
+        service
+            .run_events(&admitted.run_id)
+            .iter()
+            .any(|event| { event["event"] == json!("run.completed") })
+    );
+    drop(service);
+    drop(state);
+    drop(storage);
+    fs::remove_dir_all(root).expect("private capacity fixture should be removed");
+}
+
 #[tokio::test]
 async fn explicit_service_compaction_forces_once_and_survives_reopen_without_provider_calls() {
     let root = temporary_root("explicit-compaction-service");
@@ -3789,6 +4239,23 @@ async fn explicit_service_compaction_forces_once_and_survives_reopen_without_pro
         1000,
     );
     let reopened_latest_row = first_query_row(&latest);
+    let persisted_compaction_id = reopened_latest_row["id"]
+        .as_str()
+        .expect("persisted compaction identifier");
+    let persisted_generation = reopened_latest_row["generation"]
+        .as_i64()
+        .expect("persisted compaction generation");
+    let source_start = reopened_latest_row["source_start_ordinal"]
+        .as_i64()
+        .expect("persisted compaction start ordinal");
+    let source_end = reopened_latest_row["source_end_ordinal"]
+        .as_i64()
+        .expect("persisted compaction end ordinal");
+    let expected_compaction_id = format!(
+        "session-1:{}:compact:g{persisted_generation}:s{source_start}-e{source_end}",
+        third["run_id"].as_str().expect("third maintenance run id")
+    );
+    assert_eq!(persisted_compaction_id, expected_compaction_id);
     let reopened_summary_json = reopened_latest_row["summary_json"]
         .as_str()
         .expect("reopened summary JSON");
@@ -3804,5 +4271,204 @@ async fn explicit_service_compaction_forces_once_and_survives_reopen_without_pro
     );
     drop(reopened_storage);
     drop(reopened);
-    fs::remove_dir_all(root).expect("private explicit compaction fixture should be removed");
+}
+#[tokio::test]
+async fn explicit_compaction_preserves_bounded_multigeneration_fresh_facts() {
+    let root = temporary_root("bounded-multigeneration-summary");
+    let db_path = root.join("gateway.db");
+    let storage = storage_runner(&root);
+    run_storage(&storage, "gateway.db", "migrate", "migrate", json!({}), 1);
+    run_storage(
+        &storage,
+        "gateway.db",
+        "summary-session-create",
+        "session.create",
+        session_payload("summary-session", 2),
+        2,
+    );
+    let append_message = |ordinal: i64, text: String| {
+        run_storage(
+            &storage,
+            "gateway.db",
+            &format!("summary-message-{ordinal}"),
+            "message.append",
+            json!({
+                "id": format!("summary-message-{ordinal}"),
+                "session_id": "summary-session",
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content_json": json!([{"type":"text", "text":text}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 2,
+            }),
+            ordinal + 2,
+        )
+    };
+    for ordinal in 1..=48_i64 {
+        let text = if ordinal == 47 {
+            format!(
+                "g3-prefix-fresh-anchor-東京 {}",
+                "uncompacted prior tail ".repeat(36)
+            )
+        } else if ordinal == 48 {
+            format!("g3-escape-heavy-anchor-{}", r#"\""#.repeat(380))
+        } else {
+            format!(
+                "historical-anchor-{ordinal} {}",
+                "legacy summary fact ".repeat(36)
+            )
+        };
+        append_message(ordinal, text);
+    }
+
+    let settings = CompactionSettings {
+        enabled: true,
+        max_context_messages: 120,
+        retained_tail: 2,
+    };
+    let state = AgentGatewayState::with_agent_selection_and_compaction(
+        AgentGatewayConfig::default(),
+        json!({}),
+        Some(&db_path),
+        settings,
+    )
+    .expect("private summary fixture should use trusted settings");
+    let service = state.service();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("next provider answer"));
+    service.inject_provider_host(Arc::new(provider.clone()));
+
+    let generation_two = service
+        .compact_session_explicit("summary-session")
+        .expect("generation two compaction should commit");
+    assert_eq!(generation_two["status"], json!("committed"));
+    assert_eq!(generation_two["generation"], json!(2));
+    let generation_two_row = first_query_row(&run_storage(
+        &storage,
+        "gateway.db",
+        "summary-generation-two",
+        "compaction.latest",
+        json!({"session_id":"summary-session"}),
+        1000,
+    ));
+    let generation_two_json = generation_two_row["summary_json"]
+        .as_str()
+        .expect("generation two summary JSON");
+    assert!(generation_two_json.len() <= 4096);
+    assert!(generation_two_json.len() >= 2500);
+
+    for (ordinal, text) in [
+        (
+            49,
+            format!("g3-escape-middle-anchor-{}", r#"\""#.repeat(380)),
+        ),
+        (50, format!("g3-escape-late-anchor-{}", r#"\""#.repeat(380))),
+        (51, "g3-near-tail-prefix-anchor-葉".to_string()),
+        (52, "g3-retained-tail-before".to_string()),
+        (53, "g3-retained-tail-last".to_string()),
+    ] {
+        append_message(ordinal, text);
+    }
+    let generation_three = service
+        .compact_session_explicit("summary-session")
+        .expect("generation three compaction should commit");
+    assert_eq!(generation_three["status"], json!("committed"));
+    assert_eq!(generation_three["generation"], json!(3));
+    let generation_three_row = first_query_row(&run_storage(
+        &storage,
+        "gateway.db",
+        "summary-generation-three",
+        "compaction.latest",
+        json!({"session_id":"summary-session"}),
+        1000,
+    ));
+    let generation_three_json = generation_three_row["summary_json"]
+        .as_str()
+        .expect("generation three summary JSON");
+    assert!(generation_three_json.len() <= 4096);
+    assert!(
+        generation_three_json.len() < 3200,
+        "escape-heavy input should exercise reduced allocation"
+    );
+    let generation_three_summary: JsonValue =
+        serde_json::from_str(generation_three_json).expect("generation three summary JSON");
+    let generation_three_text = generation_three_summary["text"]
+        .as_str()
+        .expect("generation three summary text");
+    assert!(generation_three_text.contains("historical-anchor"));
+    assert!(generation_three_text.contains("g3-prefix-fresh-anchor-東京"));
+    assert!(generation_three_text.contains("g3-near-tail-prefix-anchor-葉"));
+    assert_eq!(generation_three_summary["truncated"], json!(true));
+    assert!(generation_three_text.contains("Summary truncated"));
+
+    for (ordinal, text) in [
+        (54, "g4-prefix-fresh-anchor-日本".to_string()),
+        (55, format!("g4-multibyte-anchor-{}", "東京🧭".repeat(160))),
+        (56, "g4-near-tail-prefix-anchor-風".to_string()),
+        (57, "g4-retained-tail-before".to_string()),
+        (58, "g4-retained-tail-last".to_string()),
+    ] {
+        append_message(ordinal, text);
+    }
+    let generation_four = service
+        .compact_session_explicit("summary-session")
+        .expect("generation four compaction should commit");
+    assert_eq!(generation_four["status"], json!("committed"));
+    assert_eq!(generation_four["generation"], json!(4));
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "compaction must not make provider calls"
+    );
+    let generation_four_row = first_query_row(&run_storage(
+        &storage,
+        "gateway.db",
+        "summary-generation-four",
+        "compaction.latest",
+        json!({"session_id":"summary-session"}),
+        1000,
+    ));
+    let generation_four_json = generation_four_row["summary_json"]
+        .as_str()
+        .expect("generation four summary JSON");
+    assert!(generation_four_json.len() <= 4096);
+    let generation_four_summary: JsonValue =
+        serde_json::from_str(generation_four_json).expect("generation four summary JSON");
+    let generation_four_text = generation_four_summary["text"]
+        .as_str()
+        .expect("generation four summary text");
+    assert!(generation_four_text.contains("historical-anchor"));
+    assert!(generation_four_text.contains("g3-prefix-fresh-anchor-東京"));
+    assert!(generation_four_text.contains("g4-prefix-fresh-anchor-日本"));
+    assert!(generation_four_text.contains("g4-near-tail-prefix-anchor-風"));
+
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"prompt":"verify next provider summary context"}),
+            session_id: Some("summary-session".to_string()),
+            platform: "bounded-summary-provider-context".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("ordinary provider run should admit");
+    service
+        .clone()
+        .run_worker(admitted.run_id, "ignored".to_string())
+        .await;
+    assert_eq!(provider.call_count(), 1);
+    let provider_context = provider.requests()[0].to_string();
+    assert!(provider_context.contains("historical-anchor"));
+    assert!(provider_context.contains("g3-prefix-fresh-anchor-東京"));
+    assert!(provider_context.contains("g4-prefix-fresh-anchor-日本"));
+    assert!(provider_context.contains("g4-retained-tail-last"));
+
+    drop(service);
+    drop(state);
+    drop(storage);
+    fs::remove_dir_all(root).expect("private bounded-summary fixture should be removed");
 }

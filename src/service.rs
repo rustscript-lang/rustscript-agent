@@ -599,6 +599,72 @@ impl std::fmt::Display for RunContextError {
 
 impl std::error::Error for RunContextError {}
 
+#[derive(Clone, Debug)]
+pub struct CompactionError {
+    pub http_status: u16,
+    pub code: String,
+    pub message: String,
+    detail: String,
+}
+
+impl CompactionError {
+    /// Map an internal category through the shared RSS-owned public error policy.
+    pub fn from_rss(kind: &str, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let fallback = || Self {
+            http_status: 500,
+            code: "compaction_failed".to_string(),
+            message: "Compaction could not be completed.".to_string(),
+            detail: detail.clone(),
+        };
+        let Ok(policy) =
+            AgentRunner::from_bundled("rss/agent/compaction_error.rss", AgentConfig::default())
+        else {
+            return fallback();
+        };
+        let Ok(value) = policy.run_with_context(json_to_vm_value(&json!({ "kind": kind }))) else {
+            return fallback();
+        };
+        let mapped = vm_value_to_json(&value);
+        let Some(error) = mapped.get("error") else {
+            return fallback();
+        };
+        let Some(http_status) = mapped
+            .get("http_status")
+            .and_then(JsonValue::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+        else {
+            return fallback();
+        };
+        let (Some(code), Some(message)) = (
+            error.get("code").and_then(JsonValue::as_str),
+            error.get("message").and_then(JsonValue::as_str),
+        ) else {
+            return fallback();
+        };
+        Self {
+            http_status,
+            code: code.to_string(),
+            message: message.to_string(),
+            detail,
+        }
+    }
+
+    /// Raw service detail for private diagnostics; never include this in a public response.
+    #[allow(dead_code)]
+    pub(crate) fn diagnostic_detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for CompactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CompactionError {}
+
 #[derive(Debug)]
 pub enum AdmitError {
     RunLimitReached,
@@ -663,6 +729,7 @@ pub struct AgentService {
 
 struct AgentServiceInner {
     config: Arc<AgentGatewayConfig>,
+    compaction_settings: CompactionSettings,
     store: Arc<RwLock<GatewayStore>>,
     persistence: Option<Arc<GatewayPersistence>>,
     agent_source: Option<Arc<String>>,
@@ -688,6 +755,9 @@ struct AgentServiceInner {
     /// Optional one-shot injected provider host for tests. Consumed atomically
     /// by the next `run_worker`; production uses RssAdapterProvider.
     provider_host: Mutex<Option<Arc<dyn AgentProviderHost>>>,
+    /// Fault injection for compaction boundary redaction tests.
+    compaction_policy_failure: Mutex<Option<String>>,
+    compaction_worker_panic: Mutex<Option<String>>,
     /// Native auth construction installed by the owning process. Each VM
     /// receives the factory and creates its own invocation-scoped AuthHost.
     auth_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
@@ -738,6 +808,7 @@ impl AgentService {
         agent_source: Option<Arc<String>>,
         http_config: HttpConfig,
         metrics: Arc<Metrics>,
+        compaction_settings: CompactionSettings,
     ) -> Self {
         let capacity = Arc::new(Semaphore::new(config.max_concurrent_runs));
         let context_cache_capacity = config.max_concurrent_runs.saturating_mul(4).max(16);
@@ -753,6 +824,7 @@ impl AgentService {
         provider_profiles.insert(default_provider, default_profile);
         let inner = Arc::new(AgentServiceInner {
             config,
+            compaction_settings,
             store,
             persistence,
             agent_source,
@@ -776,6 +848,8 @@ impl AgentService {
             prompt_read_entered: Mutex::new(None),
             date_source: RwLock::new(Arc::new(SystemDateSource)),
             provider_host: Mutex::new(None),
+            compaction_policy_failure: Mutex::new(None),
+            compaction_worker_panic: Mutex::new(None),
             auth_host_factory: Mutex::new(None),
             workspace_host_factory: Mutex::new(None),
             trusted_legacy_workspace_root: RwLock::new(None),
@@ -809,6 +883,24 @@ impl AgentService {
     /// A second run without another inject uses the production adapter.
     pub fn inject_provider_host(&self, host: Arc<dyn AgentProviderHost>) {
         *self.inner.provider_host.lock().expect("provider host lock") = Some(host);
+    }
+
+    /// Test seam: inject one private RSS-policy diagnostic at compaction.
+    pub fn inject_compaction_policy_failure(&self, detail: impl Into<String>) {
+        *self
+            .inner
+            .compaction_policy_failure
+            .lock()
+            .expect("compaction policy failure lock") = Some(detail.into());
+    }
+
+    /// Test seam: panic once in the explicit compaction blocking worker.
+    pub fn inject_compaction_worker_panic(&self, detail: impl Into<String>) {
+        *self
+            .inner
+            .compaction_worker_panic
+            .lock()
+            .expect("compaction worker panic lock") = Some(detail.into());
     }
 
     /// Installs the native-owned factory used to construct a fresh AuthHost
@@ -1163,6 +1255,9 @@ impl AgentService {
         context: &JsonValue,
         cancellation: &RunCancellation,
     ) -> JsonValue {
+        if self.inner.persistence.is_none() {
+            return json!({ "ok": true, "storage_available": false });
+        }
         let session_context = self
             .inner
             .contexts
@@ -1214,39 +1309,69 @@ impl AgentService {
                 if let Some(items) = compacted.as_array() {
                     messages.extend(items.iter().cloned());
                 }
-                json!({ "ok": true, "messages": messages })
+                json!({ "ok": true, "storage_available": true, "messages": messages })
             }
-            Err(error) => compaction_error("context_refresh_failed", &error),
+            Err(error) => {
+                let mut result = compaction_error("context_refresh_failed", &error);
+                result["storage_available"] = json!(true);
+                result
+            }
         }
     }
 
     /// Force the same RSS compaction policy used before provider turns without
     /// issuing a provider request. A hidden service run supplies the durable
     /// lifecycle identity required by the compaction transaction.
-    pub fn compact_session_explicit(&self, session_id: &str) -> Result<JsonValue, String> {
-        let persistence = self
+    pub fn compact_session_explicit(&self, session_id: &str) -> Result<JsonValue, CompactionError> {
+        if let Some(detail) = self
             .inner
-            .persistence
-            .as_ref()
-            .ok_or_else(|| "durable storage is unavailable for compaction".to_string())?;
+            .compaction_worker_panic
+            .lock()
+            .expect("compaction worker panic lock")
+            .take()
+        {
+            panic!("{detail}");
+        }
+        let persistence = self.inner.persistence.as_ref().ok_or_else(|| {
+            CompactionError::from_rss("internal", "durable storage is unavailable for compaction")
+        })?;
+        let _admission_serial = self.inner.commit_gate.lock();
         let (model, provider) = {
             let store = self.inner.store.read();
             let session = store
                 .sessions
                 .get(session_id)
-                .ok_or_else(|| "session not found".to_string())?;
+                .ok_or_else(|| CompactionError::from_rss("not_found", "session not found"))?;
             if store.runs.values().any(|run| {
                 run.session_id == session_id
-                    && matches!(run.status.as_str(), "started" | "stopping")
+                    && matches!(
+                        run.status.as_str(),
+                        "queued" | "running" | "started" | "stopping"
+                    )
             }) {
-                return Err("session has an active run".to_string());
+                return Err(CompactionError::from_rss(
+                    "busy",
+                    "session has an active run",
+                ));
             }
             (
                 session.view.model.clone(),
                 session.view.provider.clone().unwrap_or_default(),
             )
         };
-        let (generation, _, _) = load_durable_compaction_snapshot(persistence, session_id)?;
+        let _capacity_permit =
+            self.inner
+                .capacity
+                .clone()
+                .try_acquire_owned()
+                .map_err(|error| {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::RunLimitReached);
+                    CompactionError::from_rss("capacity", error.to_string())
+                })?;
+        let (generation, _, _) = load_durable_compaction_snapshot(persistence, session_id)
+            .map_err(|error| CompactionError::from_rss("internal", error))?;
         let run_id = Uuid::new_v4().to_string();
         let now_ms = timestamp();
         persistence
@@ -1262,7 +1387,7 @@ impl AgentService {
                 "idempotency_key": "",
                 "now_ms": now_ms,
             }))
-            .map_err(|error| format!("create compaction lifecycle run: {error}"))?;
+            .map_err(|error| CompactionError::from_rss("internal", error.to_string()))?;
         self.inner.store.write().runs.insert(
             run_id.clone(),
             RunRecord {
@@ -1275,18 +1400,18 @@ impl AgentService {
                 cancel_requested: Arc::new(AtomicBool::new(false)),
             },
         );
+        drop(_admission_serial);
         if let Err(error) = self.transition_compaction_run(&run_id, "queued", "running") {
             self.inner.store.write().runs.remove(&run_id);
-            return Err(error);
+            return Err(CompactionError::from_rss("internal", error));
         }
-        let result = self.refresh_session_compaction(
+        if let Err(error) = self.refresh_session_compaction(
             session_id,
             &run_id,
             &model,
             true,
             &RunCancellation::new(),
-        );
-        if let Err(error) = result {
+        ) {
             let failed = self
                 .transition_compaction_run(&run_id, "running", "failed")
                 .or_else(|_| self.transition_compaction_run(&run_id, "compacting", "failed"));
@@ -1295,7 +1420,7 @@ impl AgentService {
             {
                 run.status = "failed".to_string();
             }
-            return Err(error);
+            return Err(CompactionError::from_rss("internal", error));
         }
         if let Err(error) = self.complete_compaction_lifecycle_run(&run_id) {
             if self
@@ -1305,9 +1430,11 @@ impl AgentService {
             {
                 run.status = "failed".to_string();
             }
-            return Err(error);
+            return Err(CompactionError::from_rss("internal", error));
         }
-        let (actual_generation, _, _) = load_durable_compaction_snapshot(persistence, session_id)?;
+        let (actual_generation, _, _) =
+            load_durable_compaction_snapshot(persistence, session_id)
+                .map_err(|error| CompactionError::from_rss("internal", error))?;
         Ok(json!({
             "ok": true,
             "session_id": session_id,
@@ -1335,14 +1462,22 @@ impl AgentService {
         if cancellation.requested().is_some() || cancellation.deadline_passed() {
             return Err("run was cancelled before RSS compaction policy".to_string());
         }
-        let settings = CompactionSettings::default();
+        if let Some(detail) = self
+            .inner
+            .compaction_policy_failure
+            .lock()
+            .expect("compaction policy failure lock")
+            .take()
+        {
+            return Err(format!("RSS compaction policy failed: {detail}"));
+        }
+        let settings = self.inner.compaction_settings.clone();
         let decision_runner =
             AgentRunner::from_bundled("rss/agent/compact.rss", AgentConfig::default())
                 .map_err(|error| format!("compile RSS compaction policy: {error}"))?;
         let policy_input = json!({
             "session_id": session_id,
             "run_id": run_id,
-            "compaction_id": format!("{run_id}:compact:g{}", generation + 1),
             "generation": generation,
             "messages": history,
             "config": {

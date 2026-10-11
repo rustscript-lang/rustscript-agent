@@ -216,6 +216,142 @@ async fn explicit_http_compaction_uses_rss_and_is_generation_idempotent() {
 }
 
 #[tokio::test]
+async fn explicit_http_compaction_redacts_private_storage_error_details() {
+    let root = private_test_root("http-compaction-error-redaction");
+    fs::create_dir_all(&root).expect("private test root");
+    let db_path = root.join("gateway.db");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+        &db_path,
+    )
+    .expect("gateway should open private SQLite fixture");
+    let app = build_agent_gateway_app(state.clone());
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"id":"http-compaction-error-session", "model":"test-model", "provider":"test-provider"}).to_string(),
+                ))
+                .expect("create-session request"),
+        )
+        .await
+        .expect("create-session response");
+    assert!(create.status().is_success());
+    let persistence = state.persistence().expect("durable repository");
+    for ordinal in 1..=40_i64 {
+        persistence
+            .message_append(&json!({
+                "id": format!("http-compaction-error-message-{ordinal}"),
+                "session_id": "http-compaction-error-session",
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content_json": json!([{"type":"text", "text":format!("http error fact {ordinal}")}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 100,
+            }))
+            .expect("append synthetic history through production RSS storage");
+    }
+    let script = r#"import sqlite3,sys
+connection=sqlite3.connect(sys.argv[1])
+connection.execute("CREATE TRIGGER f4_private_compaction_failure BEFORE INSERT ON compactions BEGIN SELECT RAISE(ABORT, 'F4_PRIVATE_STORAGE_SENTINEL'); END")
+connection.commit()
+connection.close()"#;
+    let injected = std::process::Command::new("python3")
+        .args([
+            "-c",
+            script,
+            db_path.to_str().expect("fixture database path"),
+        ])
+        .output()
+        .expect("python3 should inject the private SQLite failure");
+    assert!(
+        injected.status.success(),
+        "failure trigger setup: {}",
+        String::from_utf8_lossy(&injected.stderr)
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions/http-compaction-error-session/compact")
+                .body(Body::empty())
+                .expect("explicit compaction request"),
+        )
+        .await
+        .expect("explicit compaction response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("explicit compaction body");
+    let body: Value = serde_json::from_slice(&bytes).expect("explicit compaction JSON");
+    assert_eq!(body["error"]["code"], "compaction_failed");
+    assert!(!body.to_string().contains("F4_PRIVATE_STORAGE_SENTINEL"));
+
+    let service = state.service();
+    service.inject_compaction_policy_failure("F4_PRIVATE_VM_SENTINEL");
+    let vm_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions/http-compaction-error-session/compact")
+                .body(Body::empty())
+                .expect("VM failure compaction request"),
+        )
+        .await
+        .expect("VM failure compaction response");
+    assert_eq!(vm_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let vm_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(vm_response.into_body(), usize::MAX)
+            .await
+            .expect("VM failure body"),
+    )
+    .expect("VM failure JSON");
+    assert_eq!(vm_body["error"]["code"], "compaction_failed");
+    assert!(!vm_body.to_string().contains("F4_PRIVATE_VM_SENTINEL"));
+
+    service.inject_compaction_worker_panic("F4_PRIVATE_WORKER_SENTINEL");
+    let worker_response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions/http-compaction-error-session/compact")
+                .body(Body::empty())
+                .expect("worker failure compaction request"),
+        )
+        .await
+        .expect("worker failure compaction response");
+    assert_eq!(worker_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let worker_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(worker_response.into_body(), usize::MAX)
+            .await
+            .expect("worker failure body"),
+    )
+    .expect("worker failure JSON");
+    assert_eq!(worker_body["error"]["code"], "compaction_failed");
+    assert!(
+        !worker_body
+            .to_string()
+            .contains("F4_PRIVATE_WORKER_SENTINEL")
+    );
+    drop(persistence);
+    drop(state);
+    fs::remove_dir_all(root).expect("private HTTP compaction fixture cleanup");
+}
+
+#[tokio::test]
 async fn workspace_selector_errors_leave_no_session_and_default_resolves() {
     use rustscript_agent::service::{AdmitError, AdmitRunRequest};
 

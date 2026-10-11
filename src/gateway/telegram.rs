@@ -1410,8 +1410,12 @@ async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: 
                     result["status"].as_str().unwrap_or("finished"),
                     result["generation"].as_i64().unwrap_or_default(),
                 ),
-                Ok(Err(error)) => format!("Compaction failed: {error}"),
-                Err(error) => format!("Compaction failed: {error}"),
+                Ok(Err(error)) => format!("Compaction failed [{}]: {}", error.code, error.message),
+                Err(error) => {
+                    let safe =
+                        crate::service::CompactionError::from_rss("internal", error.to_string());
+                    format!("Compaction failed [{}]: {}", safe.code, safe.message)
+                }
             };
             let _ = reply(api, chat_id, message.message_thread_id, &response_text).await;
         }
@@ -2746,6 +2750,174 @@ mod tests {
                 "Compaction committed at generation 2."
             ]
         );
+        drop(persistence);
+        drop(runtime);
+        drop(state);
+        mock_server.abort();
+        let _ = mock_server.await;
+        std::fs::remove_dir_all(root).expect("private Telegram compaction fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn telegram_compact_command_redacts_private_storage_error_details() {
+        use crate::AgentGatewayConfig;
+        use std::path::PathBuf;
+
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+                .expect("RUSTSCRIPT_AGENT_TEST_TMPDIR must be assigned"),
+        );
+        let root = temp.join(format!(
+            "telegram-compaction-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("private compaction fixture root");
+        let database = root.join("gateway.sqlite3");
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
+            .expect("production private SQLite state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private loopback Telegram API fixture");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("loopback address")
+        );
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&replies);
+        let mock_api = axum::Router::new().route(
+            "/{token}/{method}",
+            axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured
+                        .lock()
+                        .expect("reply capture lock")
+                        .push(payload["text"].as_str().unwrap_or_default().to_string());
+                    axum::Json(json!({"ok":true, "result":{"message_id":1}}))
+                }
+            }),
+        );
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("loopback Telegram API server");
+        });
+        let mut config = TelegramConfig {
+            bot_token: "synthetic-compaction-error-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![555],
+            allowed_users: vec![555],
+            ..TelegramConfig::default()
+        };
+        config.max_429_retries = 0;
+        config.max_5xx_retries = 0;
+        let api = TelegramApi::new(&config);
+        let mut runtime = AdapterRuntime {
+            state: state.clone(),
+            config: config.clone(),
+            account: "fixture_bot".to_string(),
+            allowlist: Allowlist::from_config(&config),
+            dedup: DedupWindows::new(config.dedup_capacity),
+            active_runs: Arc::new(Mutex::new(HashMap::new())),
+            epochs: Arc::new(Mutex::new(EpochState::default())),
+            advance_failures: Arc::new(AtomicU64::new(0)),
+        };
+        let (new_update, _) = make_update(make_message(
+            555,
+            "private",
+            201,
+            None,
+            Some("/new"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &new_update).await;
+        let session_id = session_id_for("fixture_bot", 555, None);
+        let persistence = state.persistence().expect("production storage handle");
+        for ordinal in 1..=40_i64 {
+            persistence
+                .message_append(&json!({
+                    "id": format!("telegram-compaction-error-message-{ordinal}"),
+                    "session_id": session_id,
+                    "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                    "content_json": json!([{"type":"text", "text":format!("telegram error fact {ordinal}")}]).to_string(),
+                    "name": "",
+                    "tool_call_id": "",
+                    "parent_message_id": "",
+                    "token_estimate": 1,
+                    "metadata_json": "{}",
+                    "run_id": "",
+                    "finish_reason": "",
+                    "now_ms": ordinal + 100,
+                }))
+                .expect("append synthetic Telegram history through production RSS storage");
+        }
+        let script = r#"import sqlite3,sys
+connection=sqlite3.connect(sys.argv[1])
+connection.execute("CREATE TRIGGER f4_private_compaction_failure BEFORE INSERT ON compactions BEGIN SELECT RAISE(ABORT, 'F4_PRIVATE_TELEGRAM_STORAGE_SENTINEL'); END")
+connection.commit()
+connection.close()"#;
+        let injected = std::process::Command::new("python3")
+            .args([
+                "-c",
+                script,
+                database.to_str().expect("fixture database path"),
+            ])
+            .output()
+            .expect("python3 should inject the private Telegram SQLite failure");
+        assert!(
+            injected.status.success(),
+            "failure trigger setup: {}",
+            String::from_utf8_lossy(&injected.stderr)
+        );
+        let (compact_update, _) = make_update(make_message(
+            555,
+            "private",
+            202,
+            None,
+            Some("/compact"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &compact_update).await;
+        let captured_replies = replies.lock().expect("reply capture lock");
+        assert_eq!(captured_replies.len(), 2);
+        assert!(captured_replies[1].starts_with("Compaction failed [compaction_failed]:"));
+        assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_STORAGE_SENTINEL"));
+        drop(captured_replies);
+
+        let service = state.service();
+        service.inject_compaction_policy_failure("F4_PRIVATE_TELEGRAM_VM_SENTINEL");
+        let (vm_update, _) = make_update(make_message(
+            555,
+            "private",
+            203,
+            None,
+            Some("/compact"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &vm_update).await;
+        let captured_replies = replies.lock().expect("reply capture lock");
+        assert_eq!(captured_replies.len(), 3);
+        assert!(captured_replies[2].starts_with("Compaction failed [compaction_failed]:"));
+        assert!(!captured_replies[2].contains("F4_PRIVATE_TELEGRAM_VM_SENTINEL"));
+        drop(captured_replies);
+
+        service.inject_compaction_worker_panic("F4_PRIVATE_TELEGRAM_WORKER_SENTINEL");
+        let (worker_update, _) = make_update(make_message(
+            555,
+            "private",
+            204,
+            None,
+            Some("/compact"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &worker_update).await;
+        let captured_replies = replies.lock().expect("reply capture lock");
+        assert_eq!(captured_replies.len(), 4);
+        assert!(captured_replies[3].starts_with("Compaction failed [compaction_failed]:"));
+        assert!(!captured_replies[3].contains("F4_PRIVATE_TELEGRAM_WORKER_SENTINEL"));
+        drop(captured_replies);
         drop(persistence);
         drop(runtime);
         drop(state);

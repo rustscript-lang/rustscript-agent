@@ -25,6 +25,7 @@ use parking_lot::RwLock;
 use rustscript_vm::HttpConfig;
 
 use crate::config::AgentGatewayConfig;
+use crate::config_file::CompactionSettings;
 use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
 use crate::runtime::rss_runner::{AgentConfig, AgentRunner};
@@ -123,6 +124,22 @@ impl AgentGatewayState {
         selection: serde_json::Value,
         sqlite_path: Option<&FsPath>,
     ) -> Result<Self, String> {
+        Self::with_agent_selection_and_compaction(
+            config,
+            selection,
+            sqlite_path,
+            CompactionSettings::default(),
+        )
+    }
+
+    /// Selects the RSS entry and passes the existing validated compaction
+    /// settings as typed runtime data to the shared service.
+    pub fn with_agent_selection_and_compaction(
+        config: AgentGatewayConfig,
+        selection: serde_json::Value,
+        sqlite_path: Option<&FsPath>,
+        compaction_settings: CompactionSettings,
+    ) -> Result<Self, String> {
         config
             .validate()
             .map_err(|error| format!("invalid gateway configuration: {error}"))?;
@@ -153,6 +170,7 @@ impl AgentGatewayState {
                     Some(PathBuf::from(path)),
                     Some(metadata),
                     sqlite_path,
+                    compaction_settings.clone(),
                 )
             }
             AgentSourceDecision::BundledCoding {
@@ -164,7 +182,13 @@ impl AgentGatewayState {
                 // install it through the tagged bundled route. This admits a
                 // resource; it never reads the checkout module tree and it
                 // does not select a default for any other key.
-                Self::assemble_bundled(config, BUNDLED_CODING_KEY, deprecated_override, sqlite_path)
+                Self::assemble_bundled(
+                    config,
+                    BUNDLED_CODING_KEY,
+                    deprecated_override,
+                    sqlite_path,
+                    compaction_settings,
+                )
             }
         }
     }
@@ -201,6 +225,7 @@ impl AgentGatewayState {
             agent_source.clone(),
             http_config.clone(),
             Arc::clone(&metrics),
+            CompactionSettings::default(),
         ));
         service.install_agent_runner(runner);
         Ok(Self {
@@ -239,6 +264,7 @@ impl AgentGatewayState {
             None,
             http_config.clone(),
             Arc::clone(&metrics),
+            CompactionSettings::default(),
         ));
         service.install_agent_entry(path);
         service.install_agent_runner(runner);
@@ -269,7 +295,14 @@ impl AgentGatewayState {
         };
         let runner = AgentRunner::from_file(&path, agent_config)
             .map_err(|error| format!("compile RSS agent entry: {error}"))?;
-        Self::assemble(config, runner, Some(path), None, Some(sqlite_path.as_ref()))
+        Self::assemble(
+            config,
+            runner,
+            Some(path),
+            None,
+            Some(sqlite_path.as_ref()),
+            CompactionSettings::default(),
+        )
     }
 
     pub fn with_agent_source_and_sqlite(
@@ -316,6 +349,7 @@ impl AgentGatewayState {
             agent_source.clone(),
             http_config.clone(),
             Arc::clone(&metrics),
+            CompactionSettings::default(),
         ));
         service.install_agent_runner(runner);
         Ok(Self {
@@ -371,6 +405,7 @@ impl AgentGatewayState {
         entry: Option<PathBuf>,
         source_metadata: Option<AgentSourceMetadata>,
         sqlite_path: Option<&FsPath>,
+        compaction_settings: CompactionSettings,
     ) -> Result<Self, String> {
         let http_config = config.http.clone();
         let metrics = Arc::new(Metrics::default());
@@ -382,6 +417,7 @@ impl AgentGatewayState {
             None,
             http_config.clone(),
             Arc::clone(&metrics),
+            compaction_settings,
         ));
         if let Some(entry) = entry {
             service.install_agent_entry(entry);
@@ -409,6 +445,7 @@ impl AgentGatewayState {
         key: &str,
         deprecated_override: bool,
         sqlite_path: Option<&FsPath>,
+        compaction_settings: CompactionSettings,
     ) -> Result<Self, String> {
         let http_config = config.http.clone();
         let metrics = Arc::new(Metrics::default());
@@ -420,6 +457,7 @@ impl AgentGatewayState {
             None,
             http_config.clone(),
             Arc::clone(&metrics),
+            compaction_settings,
         ));
         service.install_bundled_agent_entry(key)?;
         let hash = service

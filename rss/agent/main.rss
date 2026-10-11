@@ -480,11 +480,14 @@ fn run_serial_loop(context: map) -> map {
     let mut running = true;
     let mut decision: map = failed_code("internal", "loop did not produce a decision", 0, 0, 0);
     while running {
-        let refreshed: map = agent::refresh_context({
+        let mut refreshed: map = agent::refresh_context({
             run_id: ctx_string(context, "run_id", ""),
             session_id: ctx_string(context, "session_id", ""),
             messages: messages
         });
+        if ctx_bool(refreshed, "storage_available", true) == false {
+            refreshed = { ok: true, messages: messages };
+        }
         let mut control: map = agent::control_check();
         if ctx_bool(refreshed, "ok", false) == false {
             control = { ok: false, error: ctx_map(refreshed, "error") };
