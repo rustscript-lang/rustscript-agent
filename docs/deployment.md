@@ -57,8 +57,11 @@ binaries.
 
 ## 3. Starting the gateway
 
-The gateway is configured entirely by environment variables (see
-`docs/configuration.md`). Minimal production-style start:
+The gateway is configured by environment variables (see
+`docs/configuration.md`). `RUSTSCRIPT_AGENT_HOME`, when set, supplies the
+workspace host's home; it does not choose the gateway entry from
+`config.yaml`'s `agent.source`. `RUSTSCRIPT_AGENT_STATE_DB` remains the separate
+SQLite state-file selector. Minimal production-style start:
 
 ```bash
 export RUSTSCRIPT_AGENT_GATEWAY_ADDR=127.0.0.1:8090
@@ -255,6 +258,34 @@ API server; it is enabled by setting `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`.
   secrets, never via command-line arguments or image build args. Neither
   secret is ever logged: the bearer token is compared in constant time and
   the Telegram token is redacted in every Debug/log surface.
+- Provider credentials are stored in `<RUSTSCRIPT_AGENT_HOME>/auth.yaml` when
+  the home override is set. The stored file contains secret slots for access
+  values and optional refresh values; the sanitized public snapshot exposes
+  metadata, opaque IDs, and refresh-token presence only. A stored refresh slot
+  does not mean refresh is available for every provider or flow.
+
+### Offline auth backup and restore
+
+`auth.yaml` is a credential file. Back up or restore it only as an offline file
+operation; this revision has no online auth backup or credential-recovery tool.
+
+1. Stop the gateway and every other writer using the same agent home, and wait
+   for them to exit. Do not copy `auth.yaml` while an auth writer is active.
+2. Copy the complete `auth.yaml` file to a restricted backup destination and
+   protect the copy with mode `0600` and access limited to the service account.
+   Keep the backup under the same secret-handling controls as the live file.
+3. To restore, keep writers stopped and put the copy back at the original
+   `auth.yaml` path. Restore it as a regular file, not a symlink or hard-link
+   substitute. On Unix, AuthStore requires exactly one link, ownership by the
+   process's effective user, and mode exactly `0600`; otherwise it rejects the
+   file.
+4. Reopen the auth store through the normal service startup path. A backup
+   restores stored bytes only: provider credential rotation or revocation after
+   the backup can make those copied values unusable.
+
+This procedure does not perform an online snapshot, refresh a credential, or
+recover a provider grant.
+
 - Logging: the binaries write startup/halt messages to **stderr** via
   `eprintln!`. `tracing` events exist in library code but the binaries
   install **no tracing subscriber**, so `RUST_LOG` has no effect today and

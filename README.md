@@ -47,25 +47,35 @@ Deployment, systemd/container examples, shutdown and backup: [docs/deployment.md
 
 ## Status
 
-This repository is **not v1-complete**. The table states the current
-revision's real status; blocked or excluded items are explicit, and no
-placeholder route is advertised.
+This repository is **not v1-complete**. The table describes code in this
+source checkout; it does not claim a published release, live-provider
+availability, or final composed-candidate acceptance. Blocked or excluded
+items are explicit, and no placeholder route is advertised.
 
 | Area | Status |
 | --- | --- |
 | Single-run runner (`rustscript-agent --script … --allow-host …`) | Implemented |
 | Gateway HTTP API: sessions, runs, SSE events, stop, jobs CRUD, subagent interrupt | Implemented (see [plans/2026-07-30_rustscript-agent-gateway-api.md](plans/2026-07-30_rustscript-agent-gateway-api.md)) |
 | Durable SQLite state: sessions/messages/runs/events/jobs/approvals/compactions, restart recovery | Implemented |
-| Legacy chat completion path (`/api/sessions/{id}/chat`) | Implemented; requires `RUSTSCRIPT_AGENT_SCRIPT`, otherwise answers `501 agent_source_not_configured` |
+| Gateway entry selection | `RUSTSCRIPT_AGENT_SOURCE` is authoritative; deprecated `RUSTSCRIPT_AGENT_SCRIPT` is a fallback; with neither set, RSS selects `bundled:coding`. The gateway does not yet select its entry from `config.yaml`'s `agent.source`. |
+| Legacy chat completion path (`/api/sessions/{id}/chat`) | Implemented; runs the currently selected gateway agent source. |
+| OpenAI Chat Completions (`openai`, `openai_chat`, or default) | Current source has buffered and streaming requests through the opaque native credential transport; this is source status, not live-provider validation. |
+| Codex Responses (`openai-codex` / `codex-responses`) | Access-only source path is present. Full refresh/lifecycle support is not claimed here. |
+| Generic custom Responses adapter (explicit adapter selection) | Not implemented; returns typed `not_implemented` and sends no request. |
+| Anthropic Messages | Not implemented; remains a typed `not_implemented` stub. |
 | API hardening (A7): bounded per-peer-IP/per-account rate limiting, client-disconnect policy | Implemented (disabled by default; see [docs/configuration.md](docs/configuration.md)) |
 | Observability (A9): bounded metrics registry, `GET /metrics`, structured terminal tracing | Implemented (see [docs/deployment.md](docs/deployment.md)) |
-| Provider protocol adapters (OpenAI Chat/Responses, Anthropic Messages, provider profiles) | **Partial — blocked by core (A3)**. Wire building, standard-shape guard, marker-preservation, and structured provider errors are green; buffered response parsing, streaming, and the Responses/Anthropic adapters stay typed `not_implemented` stubs until core compiler defects are fixed. See [plans/2026-08-13_a3-provider-core-blocker.md](plans/2026-08-13_a3-provider-core-blocker.md). |
-| RSS serial loop + durable compaction policies (A5) | Serial loop is wired into the library `AgentService` worker via bundled `rss/agent/main.rss`. Compaction policies remain implemented and tested (`rss/agent/compact.rss`). OpenAI-compatible buffered/streaming adapters stay A3-blocked; the gateway binary still runs `RUSTSCRIPT_AGENT_SCRIPT` and does not add an OpenAI-compatible inference path. See [plans/2026-08-13_a5-scope-split.md](plans/2026-08-13_a5-scope-split.md). |
+| RSS coding loop + durable compaction policies (A5) | The gateway's bundled coding entry runs through the agent worker; compaction policies remain implemented and tested (`rss/agent/compact.rss`). |
 | RSS coding tools + workspace-confined loop | Implemented for the library worker: `read_file`, `search_files`, `write_file`, `patch`, `terminal`, `process` run serially through `rss/tools/dispatch.rss`. Local E2E: `cargo test --test coding_agent_e2e_tests` and `cargo test --test coding_agent_edge_e2e_tests`. See [docs/configuration.md](docs/configuration.md). Parallel tools remain excluded (A6). |
 | Harness and approval machinery (A4) | Not implemented (excluded from the current milestone scope); approval **repository** CRUD exists, there is no approval flow driving runs |
 | Parallel tools and subagents (A6) | Not implemented (excluded from the current milestone scope) |
 | Scheduled / durable job execution | **Not implemented (explicitly excluded)**. Job CRUD, pause/resume, and latest-output routes exist, but there is no scheduler; `POST /api/jobs/{id}/run` is intentionally absent and answers `404`. |
 | Telegram gateway (A8) | **Implemented**: native Bot API transport (https/rustls), deny-by-default account/chat/user allowlists, durable delivery cursors (at-least-once), bounded 429/5xx/401 retries, fail-closed first-boot drain, bounded shutdown drain. See [docs/deployment.md](docs/deployment.md). |
+
+The bounded `config.yaml` / `auth.yaml` loaders and production
+`config::load_snapshot` bridge exist. Package-level end-to-end config/auth/provider
+acceptance, final composed-candidate acceptance, and remote delivery remain
+open.
 
 Current lifecycle/reliability behavior is covered by the integration
 suites in `tests/` (admission, bounded delivery, terminal-commit retries,

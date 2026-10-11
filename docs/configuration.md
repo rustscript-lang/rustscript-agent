@@ -17,8 +17,8 @@ fails the test suite.
 
 | Source | Owns | Read by |
 | --- | --- | --- |
-| Gateway environment variables (`RUSTSCRIPT_AGENT_*`, excluding library-only `RUSTSCRIPT_AGENT_HOME`) | gateway process | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
-| Library bootstrap (`RUSTSCRIPT_AGENT_HOME`) | persistent config/auth paths | library path resolver |
+| Gateway environment variables (`RUSTSCRIPT_AGENT_*`, except the separately listed home override) | gateway process settings | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
+| Agent home (`RUSTSCRIPT_AGENT_HOME`) | library config/auth path resolver and optional gateway workspace host | library path resolver and gateway workspace-host setup |
 | CLI arguments (`--script`, `--allow-host`) | one run | `rustscript-agent` binary (`src/bin/rustscript-agent.rs`) |
 | Native `AgentGatewayConfig` fields | embedding code | library API; the gateway binary maps a fixed subset from environment variables |
 
@@ -50,25 +50,24 @@ by the bounded loaders) ships under [docs/examples/](examples/).
 
 ## Environment variables (gateway binary)
 
-### Library bootstrap input (library only)
+### Agent home (library bootstrap and gateway workspace host)
 
-`RUSTSCRIPT_AGENT_HOME` is a Task 1 bootstrap input read by the library
-config/auth path resolver. It is not consumed by the current gateway binary
-and does not add a gateway CLI startup setting. This library-only input has no
-legacy environment alias. When set, it must be a non-empty absolute path
-without parent-directory components and takes precedence over `$HOME` (or
-`$USERPROFILE`). When unset, the resolver uses `$HOME/.rustscript-agent` (or
-`$USERPROFILE/.rustscript-agent`). The selected home derives these paths:
+`RUSTSCRIPT_AGENT_HOME` selects the complete agent home. The gateway reads it
+and, when set, passes the path to `with_workspace_home` to configure its
+workspace host; the host resolves `config.yaml`, `auth.yaml`, and
+`auth.yaml.lock` below that home. This setting does not select the gateway's
+agent entry: the gateway currently selects its source from `RUSTSCRIPT_AGENT_SOURCE`
+or the deprecated `RUSTSCRIPT_AGENT_SCRIPT`, not from `agent.source` in
+`config.yaml`.
 
-- `<home>/config.yaml`
-- `<home>/auth.yaml`
-- `<home>/auth.yaml.lock`
-- `<home>/state.db`
-
-The Task 1 path resolver does not derive a `skills/` path. Job `skills` values
-are stored as job data and do not select files below this home. The gateway's
-existing `RUSTSCRIPT_AGENT_STATE_DB` remains its separate state-database
-selector.
+The gateway rejects a blank value. When the workspace host resolves the home,
+`AgentPaths` requires a non-empty absolute path with no parent-directory
+components. The library path resolver uses the same override for the complete
+home; if it is unset, that resolver uses `$HOME/.rustscript-agent` (or
+`$USERPROFILE/.rustscript-agent` on Windows). The resolved home also defines
+the library's `state.db` path, but the gateway's SQLite selection remains
+separate: `RUSTSCRIPT_AGENT_STATE_DB` chooses the gateway state file and an
+unset value keeps gateway state in memory.
 
 ### Gateway variables and deprecated aliases
 
@@ -371,16 +370,30 @@ truncated overflow artifacts, that reopening a completed run is a no-op, and
 pending provider-turn restart: retry-safe replay/retry, completed-step replay
 fidelity, unsafe fail-closed, and no duplicate tool effect or metric count.
 
-## Secrets
+## Secrets and provider credentials
 
 - `RUSTSCRIPT_AGENT_BEARER_TOKEN` and `RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN`
-  are the two secrets in this revision. All examples in this document show
-  them as `[REDACTED]`; they must never be passed through process arguments
-  or committed to repositories.
-- The binaries never echo either secret: the bearer token is compared in
-  constant time and the Telegram token is redacted in every Debug/log
-  surface. Store them in an environment file or secret manager with
-  restrictive permissions (see `docs/deployment.md`).
+  are gateway environment secrets. Provider credentials are stored separately
+  in the private `<home>/auth.yaml` file, not in `config.yaml`: each stored
+  credential has private secret slots: one for its access-token value and, when
+  present, one for its optional refresh-token value.
+  The presence of a refresh slot in the schema does not establish that every
+  provider flow can refresh credentials.
+- The in-memory/public `AuthConfig` and RSS-facing snapshot are sanitized
+  projections. They expose credential metadata, opaque credential IDs, and the
+  `has_refresh_token` presence flag; raw access/refresh secret values remain in
+  the native auth store and are not exposed to RSS, events, logs, or durable
+  output. Provider entries in `config.yaml` refer to credential IDs rather
+  than embedding those secret values.
+- Keep `auth.yaml` and its backups restricted like other credentials. On Unix,
+  the AuthStore requires the auth file to be a regular file owned by the
+  process's effective user, with exactly one link and mode exactly `0600`.
+  See [deployment.md](deployment.md) for the offline auth backup and restore
+  procedure.
+- The binaries never echo gateway environment secrets: the bearer token is
+  compared in constant time and the Telegram token is redacted in every
+  Debug/log surface. Store environment secrets in a restricted environment
+  file or secret manager (see `docs/deployment.md`).
 
 ## Reserved configuration
 
