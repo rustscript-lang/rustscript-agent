@@ -38,6 +38,17 @@ fn read_relative(path: &str) -> String {
         .unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+fn source_section<'a>(source: &'a str, signature: &str, next_signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("source is missing function `{signature}`"));
+    let rest = &source[start..];
+    let end = rest
+        .find(next_signature)
+        .unwrap_or_else(|| panic!("source is missing boundary `{next_signature}`"));
+    &rest[..end]
+}
+
 /// The full 40-character revision pinned for the core Git dependency in
 /// `Cargo.toml` (`rustscript-vm = { … rev = "<sha>" … }`).
 fn manifest_core_revision() -> String {
@@ -331,6 +342,83 @@ fn readme_source_and_protocol_status_matches_current_rss_paths() {
         !readme.contains("gateway binary still runs `RUSTSCRIPT_AGENT_SCRIPT`"),
         "README.md must not claim the legacy script variable is authoritative"
     );
+}
+
+#[test]
+fn legacy_chat_documentation_matches_source_selected_gateway_behavior() {
+    let readme = read_relative("README.md");
+    let row = readme
+        .lines()
+        .find(|line| {
+            line.starts_with("| Legacy chat completion path (`/api/sessions/{id}/chat`) |")
+        })
+        .expect("README.md must retain the legacy chat status row");
+    let normalized_row = row.to_ascii_lowercase();
+    for required in [
+        "legacy-constructor-only",
+        "rustscript_agent_source",
+        "rustscript_agent_script",
+        "bundled:coding",
+        "501",
+        "agent_source_not_configured",
+        "post /v1/runs",
+    ] {
+        assert!(
+            normalized_row.contains(required),
+            "README.md legacy chat row must state `{required}`"
+        );
+    }
+    assert!(
+        !normalized_row.contains("runs the currently selected gateway agent source"),
+        "README.md must not claim source-selected production chat is available"
+    );
+
+    let gateway = read_relative("src/gateway/mod.rs");
+    let selection = source_section(
+        &gateway,
+        "    pub fn with_agent_selection(",
+        "    pub fn with_agent_source(",
+    );
+    for required in [
+        "run_source_policy(&selection)?",
+        "AgentSourceDecision::File",
+        "Self::assemble(",
+        "AgentSourceDecision::BundledCoding",
+        "Self::assemble_bundled(",
+    ] {
+        assert!(
+            selection.contains(required),
+            "production source-selection method must retain `{required}`"
+        );
+    }
+
+    let assembly = source_section(&gateway, "    fn assemble(\n", "    fn assemble_bundled(");
+    assert!(
+        assembly.contains("agent_source: None"),
+        "file-source assembly must leave the legacy chat source unset"
+    );
+    let bundled_assembly = source_section(
+        &gateway,
+        "    fn assemble_bundled(",
+        "\n}\n\n/// The in-memory or SQLite-backed store",
+    );
+    assert!(
+        bundled_assembly.contains("agent_source: None"),
+        "bundled-source assembly must leave the legacy chat source unset"
+    );
+
+    let api_server = read_relative("src/gateway/api_server.rs");
+    let chat_handler = source_section(&api_server, "async fn session_chat_handler(", "\nasync fn ");
+    for required in [
+        "let Some(source) = state.agent_source.clone() else",
+        "StatusCode::NOT_IMPLEMENTED",
+        "agent_source_not_configured",
+    ] {
+        assert!(
+            chat_handler.contains(required),
+            "legacy chat handler must retain `{required}`"
+        );
+    }
 }
 
 #[test]

@@ -58,7 +58,7 @@ items are explicit, and no placeholder route is advertised.
 | Gateway HTTP API: sessions, runs, SSE events, stop, jobs CRUD, subagent interrupt | Implemented (see [plans/2026-07-30_rustscript-agent-gateway-api.md](plans/2026-07-30_rustscript-agent-gateway-api.md)) |
 | Durable SQLite state: sessions/messages/runs/events/jobs/approvals/compactions, restart recovery | Implemented |
 | Gateway entry selection | `RUSTSCRIPT_AGENT_SOURCE` is authoritative; deprecated `RUSTSCRIPT_AGENT_SCRIPT` is a fallback; with neither set, RSS selects `bundled:coding`. The gateway does not yet select its entry from `config.yaml`'s `agent.source`. |
-| Legacy chat completion path (`/api/sessions/{id}/chat`) | Implemented; runs the currently selected gateway agent source. |
+| Legacy chat completion path (`/api/sessions/{id}/chat`) | Legacy-constructor-only; production gateway selection via `RUSTSCRIPT_AGENT_SOURCE`, legacy `RUSTSCRIPT_AGENT_SCRIPT`, or bundled `bundled:coding` returns `501 agent_source_not_configured`. Normal coded-agent runs use `POST /v1/runs`. |
 | OpenAI Chat Completions (`openai`, `openai_chat`, or default) | Current source has buffered and streaming requests through the opaque native credential transport; this is source status, not live-provider validation. |
 | Codex Responses (`openai-codex` / `codex-responses`) | Access-only source path is present. Full refresh/lifecycle support is not claimed here. |
 | Generic custom Responses adapter (explicit adapter selection) | Not implemented; returns typed `not_implemented` and sends no request. |
