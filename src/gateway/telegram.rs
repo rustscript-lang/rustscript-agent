@@ -1398,16 +1398,22 @@ async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: 
             .await
         }
         Some("compact") => {
-            // Explicitly unavailable: compaction is A5-scoped and not wired
-            // here; never advertise it as complete.
-            let _ = reply(
-                api,
-                chat_id,
-                message.message_thread_id,
-                "/compact is not available yet: compaction is blocked until the A5 integration lands; \
-                 your conversation is unchanged.",
-            )
+            let service = runtime.state.service();
+            let compact_session_id = session_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                service.compact_session_explicit(&compact_session_id)
+            })
             .await;
+            let response_text = match result {
+                Ok(Ok(result)) => format!(
+                    "Compaction {} at generation {}.",
+                    result["status"].as_str().unwrap_or("finished"),
+                    result["generation"].as_i64().unwrap_or_default(),
+                ),
+                Ok(Err(error)) => format!("Compaction failed: {error}"),
+                Err(error) => format!("Compaction failed: {error}"),
+            };
+            let _ = reply(api, chat_id, message.message_thread_id, &response_text).await;
         }
         _ => {
             admit_text(
@@ -2630,6 +2636,122 @@ mod tests {
             (Some("workspace".to_string()), String::new())
         );
         assert_eq!(parse_command("hello"), (None, "hello".to_string()));
+    }
+
+    #[tokio::test]
+    async fn telegram_compact_command_uses_shared_rss_compaction_service() {
+        use crate::AgentGatewayConfig;
+        use std::path::PathBuf;
+
+        let temp = PathBuf::from(
+            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+                .expect("RUSTSCRIPT_AGENT_TEST_TMPDIR must be assigned"),
+        );
+        let root = temp.join(format!("telegram-compaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("private compaction fixture root");
+        let database = root.join("gateway.sqlite3");
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &database)
+            .expect("production private SQLite state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("private loopback Telegram API fixture");
+        let api_base = format!(
+            "http://{}",
+            listener.local_addr().expect("loopback address")
+        );
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&replies);
+        let mock_api = axum::Router::new().route(
+            "/{token}/{method}",
+            axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured
+                        .lock()
+                        .expect("reply capture lock")
+                        .push(payload["text"].as_str().unwrap_or_default().to_string());
+                    axum::Json(json!({"ok":true, "result":{"message_id":1}}))
+                }
+            }),
+        );
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_api)
+                .await
+                .expect("loopback Telegram API server");
+        });
+        let mut config = TelegramConfig {
+            bot_token: "synthetic-compaction-token".to_string(),
+            api_base,
+            allow_insecure_localhost: true,
+            allowed_accounts: vec!["fixture_bot".to_string()],
+            allowed_chats: vec![555],
+            allowed_users: vec![555],
+            ..TelegramConfig::default()
+        };
+        config.max_429_retries = 0;
+        config.max_5xx_retries = 0;
+        let api = TelegramApi::new(&config);
+        let mut runtime = AdapterRuntime {
+            state: state.clone(),
+            config: config.clone(),
+            account: "fixture_bot".to_string(),
+            allowlist: Allowlist::from_config(&config),
+            dedup: DedupWindows::new(config.dedup_capacity),
+            active_runs: Arc::new(Mutex::new(HashMap::new())),
+            epochs: Arc::new(Mutex::new(EpochState::default())),
+            advance_failures: Arc::new(AtomicU64::new(0)),
+        };
+        let (new_update, _) = make_update(make_message(
+            555,
+            "private",
+            101,
+            None,
+            Some("/new"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &new_update).await;
+        let session_id = session_id_for("fixture_bot", 555, None);
+        let persistence = state.persistence().expect("production storage handle");
+        for ordinal in 1..=40_i64 {
+            persistence
+                .message_append(&json!({
+                    "id": format!("telegram-compaction-message-{ordinal}"),
+                    "session_id": session_id,
+                    "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                    "content_json": json!([{"type":"text", "text":format!("telegram fact {ordinal}")}]).to_string(),
+                    "name": "",
+                    "tool_call_id": "",
+                    "parent_message_id": "",
+                    "token_estimate": 1,
+                    "metadata_json": "{}",
+                    "run_id": "",
+                    "finish_reason": "",
+                    "now_ms": ordinal + 100,
+                }))
+                .expect("append synthetic Telegram history through production RSS storage");
+        }
+        let (compact_update, _) = make_update(make_message(
+            555,
+            "private",
+            102,
+            None,
+            Some("/compact"),
+            Some(555),
+        ));
+        handle_update(&mut runtime, &api, &compact_update).await;
+        assert_eq!(
+            *replies.lock().expect("reply capture lock"),
+            [
+                "New conversation started.",
+                "Compaction committed at generation 2."
+            ]
+        );
+        drop(persistence);
+        drop(runtime);
+        drop(state);
+        mock_server.abort();
+        let _ = mock_server.await;
+        std::fs::remove_dir_all(root).expect("private Telegram compaction fixture cleanup");
     }
 
     #[tokio::test]

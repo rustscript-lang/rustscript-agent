@@ -29,6 +29,9 @@ use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
 
 const PROVIDER_CALL: &str = "agent::provider_call";
+const REFRESH_CONTEXT: &str = "agent::refresh_context";
+const UTF8_BYTE_LEN: &str = "agent::utf8_byte_len";
+const UTF8_TRUNCATE: &str = "agent::utf8_truncate";
 const SLEEP_MS: &str = "agent::sleep_ms";
 const CONTROL_CHECK: &str = "agent::control_check";
 const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
@@ -62,6 +65,9 @@ pub fn agent_host_catalog() -> Arc<HostApiCatalog> {
 
 const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     provider_call_descriptor,
+    refresh_context_descriptor,
+    utf8_byte_len_descriptor,
+    utf8_truncate_descriptor,
     sleep_ms_descriptor,
     control_check_descriptor,
     tool_prepare_descriptor,
@@ -115,6 +121,36 @@ fn provider_call_descriptor() -> HostFunctionDescriptor {
         vec![HostParamSchema::value("request", HostTypeSchema::Unknown)],
         HostTypeSchema::Unknown,
         provider_call_adapter,
+    )
+}
+
+fn refresh_context_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        REFRESH_CONTEXT,
+        vec![HostParamSchema::value("context", HostTypeSchema::Unknown)],
+        HostTypeSchema::Unknown,
+        refresh_context_adapter,
+    )
+}
+
+fn utf8_byte_len_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        UTF8_BYTE_LEN,
+        vec![HostParamSchema::value("text", HostTypeSchema::String)],
+        HostTypeSchema::Int,
+        utf8_byte_len_adapter,
+    )
+}
+
+fn utf8_truncate_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        UTF8_TRUNCATE,
+        vec![
+            HostParamSchema::value("text", HostTypeSchema::String),
+            HostParamSchema::value("max_bytes", HostTypeSchema::Int),
+        ],
+        HostTypeSchema::String,
+        utf8_truncate_adapter,
     )
 }
 
@@ -415,6 +451,15 @@ impl SleepLog {
 /// Native provider invocation used by `agent::provider_call`.
 pub trait AgentProviderHost: Send + Sync {
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue;
+
+    /// Optional durable-context refresh invoked by RSS before each provider turn.
+    fn refresh_context(
+        &self,
+        _context: &JsonValue,
+        _cancellation: &RunCancellation,
+    ) -> Option<JsonValue> {
+        None
+    }
 }
 
 pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
@@ -484,6 +529,20 @@ impl AgentHostState {
             return error;
         }
         normalize_provider_envelope(self.provider.call(request, &self.cancellation))
+    }
+
+    fn refresh_context(&self, context: &JsonValue) -> JsonValue {
+        if let Some(error) = self.control_error() {
+            return error;
+        }
+        self.provider
+            .refresh_context(context, &self.cancellation)
+            .unwrap_or_else(|| {
+                json!({
+                    "ok": true,
+                    "messages": context.get("messages").cloned().unwrap_or_else(|| json!([])),
+                })
+            })
     }
 
     fn capability_prepare(&self, metadata: &JsonValue) -> JsonValue {
@@ -996,6 +1055,39 @@ fn provider_call_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let state = installed_state(vm)?;
     let json = vm_value_to_json(&request);
     return_json(state.provider_call(&json))
+}
+
+fn refresh_context_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let context = args.first().cloned().unwrap_or(Value::Null);
+    validate_provider_json_resources(vm, &context)?;
+    let state = installed_state(vm)?;
+    return_json(state.refresh_context(&vm_value_to_json(&context)))
+}
+
+fn utf8_byte_len_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let bytes = match args.first() {
+        Some(Value::String(value)) => value.len(),
+        _ => 0,
+    };
+    Ok(CallOutcome::Return(CallReturn::One(Value::Int(
+        i64::try_from(bytes).unwrap_or(i64::MAX),
+    ))))
+}
+
+fn utf8_truncate_adapter(_vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let text = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => "",
+    };
+    let limit = match args.get(1) {
+        Some(Value::Int(value)) => usize::try_from((*value).max(0)).unwrap_or(usize::MAX),
+        _ => 0,
+    };
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    return_json(JsonValue::String(text[..end].to_string()))
 }
 
 fn sleep_ms_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {

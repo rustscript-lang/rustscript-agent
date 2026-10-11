@@ -55,11 +55,12 @@ use crate::config::{
     ProviderProfileError, RunLimits, RunLimitsError, estimate_admission_query_bytes,
     validate_request_hash, validate_visible_name,
 };
+use crate::config_file::CompactionSettings;
 use crate::domain::{
     LlmContentBlock, MAX_DURABLE_TEXT_CHARS, RunContext, decode_message_blocks,
     decode_message_content, durable_message_id, durable_provider_event_id, durable_tool_event_id,
-    encode_message_content, provider_pending_may_retry, timestamp, truncate_for_log,
-    truncate_utf8_chars, vm_value_to_json,
+    encode_message_content, json_to_vm_value, provider_pending_may_retry, timestamp,
+    truncate_for_log, truncate_utf8_chars, vm_value_to_json,
 };
 use crate::events;
 use crate::events::{DurableEventCommitter, EventCommitError};
@@ -1154,6 +1155,380 @@ impl AgentService {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn refresh_provider_context(
+        &self,
+        run_id: &str,
+        context: &JsonValue,
+        cancellation: &RunCancellation,
+    ) -> JsonValue {
+        let session_context = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned();
+        let Some(session_context) = session_context else {
+            return compaction_error(
+                "run_context_missing",
+                "durable session context is unavailable",
+            );
+        };
+        if context.get("session_id").and_then(JsonValue::as_str)
+            != Some(session_context.session_id.as_str())
+        {
+            return compaction_error(
+                "run_context_mismatch",
+                "RSS session identity changed during context refresh",
+            );
+        }
+        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+            return compaction_error("cancelled", "run was cancelled before context refresh");
+        }
+        match self.refresh_session_compaction(
+            &session_context.session_id,
+            run_id,
+            &session_context.model,
+            false,
+            cancellation,
+        ) {
+            Ok(compacted) => {
+                let mut messages = context
+                    .get("messages")
+                    .and_then(JsonValue::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter(|message| {
+                                matches!(
+                                    message.get("role").and_then(JsonValue::as_str),
+                                    Some("system" | "developer")
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(items) = compacted.as_array() {
+                    messages.extend(items.iter().cloned());
+                }
+                json!({ "ok": true, "messages": messages })
+            }
+            Err(error) => compaction_error("context_refresh_failed", &error),
+        }
+    }
+
+    /// Force the same RSS compaction policy used before provider turns without
+    /// issuing a provider request. A hidden service run supplies the durable
+    /// lifecycle identity required by the compaction transaction.
+    pub fn compact_session_explicit(&self, session_id: &str) -> Result<JsonValue, String> {
+        let persistence = self
+            .inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable storage is unavailable for compaction".to_string())?;
+        let (model, provider) = {
+            let store = self.inner.store.read();
+            let session = store
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| "session not found".to_string())?;
+            if store.runs.values().any(|run| {
+                run.session_id == session_id
+                    && matches!(run.status.as_str(), "started" | "stopping")
+            }) {
+                return Err("session has an active run".to_string());
+            }
+            (
+                session.view.model.clone(),
+                session.view.provider.clone().unwrap_or_default(),
+            )
+        };
+        let (generation, _, _) = load_durable_compaction_snapshot(persistence, session_id)?;
+        let run_id = Uuid::new_v4().to_string();
+        let now_ms = timestamp();
+        persistence
+            .run_create(&json!({
+                "id": run_id,
+                "session_id": session_id,
+                "parent_run_id": "",
+                "input_json": "{\"source\":\"session.compact\"}",
+                "provider": provider,
+                "model": model,
+                "script_hash": "",
+                "idempotency_scope": "",
+                "idempotency_key": "",
+                "now_ms": now_ms,
+            }))
+            .map_err(|error| format!("create compaction lifecycle run: {error}"))?;
+        self.inner.store.write().runs.insert(
+            run_id.clone(),
+            RunRecord {
+                run_id: run_id.clone(),
+                session_id: session_id.to_string(),
+                parent_run_id: None,
+                status: "started".to_string(),
+                events: Vec::new(),
+                sender: None,
+                cancel_requested: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        if let Err(error) = self.transition_compaction_run(&run_id, "queued", "running") {
+            self.inner.store.write().runs.remove(&run_id);
+            return Err(error);
+        }
+        let result = self.refresh_session_compaction(
+            session_id,
+            &run_id,
+            &model,
+            true,
+            &RunCancellation::new(),
+        );
+        if let Err(error) = result {
+            let failed = self
+                .transition_compaction_run(&run_id, "running", "failed")
+                .or_else(|_| self.transition_compaction_run(&run_id, "compacting", "failed"));
+            if failed.is_ok()
+                && let Some(run) = self.inner.store.write().runs.get_mut(&run_id)
+            {
+                run.status = "failed".to_string();
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.complete_compaction_lifecycle_run(&run_id) {
+            if self
+                .transition_compaction_run(&run_id, "running", "failed")
+                .is_ok()
+                && let Some(run) = self.inner.store.write().runs.get_mut(&run_id)
+            {
+                run.status = "failed".to_string();
+            }
+            return Err(error);
+        }
+        let (actual_generation, _, _) = load_durable_compaction_snapshot(persistence, session_id)?;
+        Ok(json!({
+            "ok": true,
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": if actual_generation > generation { "committed" } else { "skipped" },
+            "generation": actual_generation,
+        }))
+    }
+
+    fn refresh_session_compaction(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        model: &str,
+        force: bool,
+        cancellation: &RunCancellation,
+    ) -> Result<JsonValue, String> {
+        let persistence = self
+            .inner
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "durable storage is unavailable for compaction".to_string())?;
+        let (generation, history, previous_summary) =
+            load_durable_compaction_snapshot(persistence, session_id)?;
+        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+            return Err("run was cancelled before RSS compaction policy".to_string());
+        }
+        let settings = CompactionSettings::default();
+        let decision_runner =
+            AgentRunner::from_bundled("rss/agent/compact.rss", AgentConfig::default())
+                .map_err(|error| format!("compile RSS compaction policy: {error}"))?;
+        let policy_input = json!({
+            "session_id": session_id,
+            "run_id": run_id,
+            "compaction_id": format!("{run_id}:compact:g{}", generation + 1),
+            "generation": generation,
+            "messages": history,
+            "config": {
+                "enabled": settings.enabled,
+                "max_context_messages": settings.max_context_messages,
+                "retained_tail": settings.retained_tail,
+                "force": force,
+                "previous_summary": previous_summary,
+                "now_ms": timestamp(),
+                "model": model,
+                "token_estimate": 0,
+            }
+        });
+        let decision_value = decision_runner
+            .run_with_context(json_to_vm_value(&policy_input))
+            .map_err(|error| format!("RSS compaction policy failed: {error}"))?;
+        let decision = vm_value_to_json(&decision_value);
+        let kind = decision
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        match kind {
+            "compact.skip" => Ok(decision
+                .get("context_messages")
+                .cloned()
+                .unwrap_or_else(|| json!([]))),
+            "compact.plan" => {
+                if cancellation.requested().is_some() || cancellation.deadline_passed() {
+                    return Err("run was cancelled before compaction transaction".to_string());
+                }
+                self.transition_compaction_run(run_id, "running", "compacting")?;
+                let execution =
+                    execute_rss_compaction(persistence, &decision_runner, &decision, cancellation);
+                let restore = self.transition_compaction_run(run_id, "compacting", "running");
+                execution?;
+                restore?;
+                let expected_generation = decision
+                    .get("generation")
+                    .and_then(JsonValue::as_i64)
+                    .ok_or_else(|| {
+                        "RSS compaction plan omitted its target generation".to_string()
+                    })?;
+                let (actual_generation, _, _) =
+                    load_durable_compaction_snapshot(persistence, session_id)?;
+                if actual_generation != expected_generation {
+                    return Err(format!(
+                        "committed compaction generation mismatch: expected {expected_generation}, found {actual_generation}"
+                    ));
+                }
+                Ok(decision
+                    .get("context_messages")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])))
+            }
+            "compact.error" => Err(decision
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("RSS compaction policy rejected the request")
+                .to_string()),
+            _ => Err("RSS compaction policy returned an invalid decision".to_string()),
+        }
+    }
+
+    fn transition_compaction_run(
+        &self,
+        run_id: &str,
+        from_status: &str,
+        to_status: &str,
+    ) -> Result<(), String> {
+        let persistence =
+            self.inner.persistence.as_ref().ok_or_else(|| {
+                "durable storage is unavailable for compaction lifecycle".to_string()
+            })?;
+        let _serial = self.inner.commit_gate.lock();
+        let now_ms = timestamp();
+        let (event, max_events) = {
+            let store = self.inner.store.read();
+            let run = store
+                .runs
+                .get(run_id)
+                .ok_or_else(|| "compaction run is unavailable".to_string())?;
+            if run.status != "started" {
+                return Err(format!(
+                    "compaction run is no longer active: in-memory status is {}",
+                    run.status
+                ));
+            }
+            let seq = run
+                .events
+                .last()
+                .map(|event| event.seq.saturating_add(1))
+                .unwrap_or(1);
+            (
+                GatewayEvent {
+                    event_id: format!(
+                        "run-transition:{run_id}:{now_ms}:{from_status}:{to_status}:{seq}"
+                    ),
+                    seq,
+                    event: "run.status_changed".to_string(),
+                    run_id: run_id.to_string(),
+                    timestamp: now_ms,
+                    data: json!({}),
+                },
+                self.inner.config.max_events_per_run,
+            )
+        };
+        persistence
+            .run_transition(&json!({
+                "run_id": run_id,
+                "from_status": from_status,
+                "to_status": to_status,
+                "error_code": "",
+                "error_message": "",
+                "recovery_reason": "",
+                "now_ms": now_ms,
+            }))
+            .map_err(|error| {
+                format!("transition compaction run {from_status}->{to_status}: {error}")
+            })?;
+        let mut store = self.inner.store.write();
+        let run = store
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| "compaction run disappeared after transition".to_string())?;
+        if run.status != "started" {
+            return Err("in-memory compaction run ended during transition".to_string());
+        }
+        apply_event_locked(run, &event, max_events);
+        Ok(())
+    }
+
+    fn complete_compaction_lifecycle_run(&self, run_id: &str) -> Result<(), String> {
+        let persistence =
+            self.inner.persistence.as_deref().ok_or_else(|| {
+                "durable storage is unavailable for compaction lifecycle".to_string()
+            })?;
+        let _serial = self.inner.commit_gate.lock();
+        let now_ms = timestamp();
+        let (session_id, mut event, max_events) = {
+            let store = self.inner.store.read();
+            let run = store
+                .runs
+                .get(run_id)
+                .ok_or_else(|| "compaction run is unavailable at completion".to_string())?;
+            let seq = run
+                .events
+                .last()
+                .map(|event| event.seq.saturating_add(1))
+                .unwrap_or(1);
+            (
+                run.session_id.clone(),
+                GatewayEvent {
+                    event_id: format!("{run_id}:compaction:completed"),
+                    seq,
+                    event: "run.completed".to_string(),
+                    run_id: run_id.to_string(),
+                    timestamp: now_ms,
+                    data: json!({
+                        "status": "completed",
+                        "output": {"text": "session compaction completed"},
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                    }),
+                },
+                self.inner.config.max_events_per_run,
+            )
+        };
+        let committed = terminal_commit(
+            Some(persistence),
+            run_id,
+            &session_id,
+            "completed",
+            std::slice::from_ref(&event),
+            None,
+        )
+        .map_err(|error| format!("commit compaction lifecycle terminal: {error}"))?;
+        event.seq = committed.first().map(|(_, seq)| *seq).ok_or_else(|| {
+            "compaction lifecycle terminal returned no event sequence".to_string()
+        })?;
+        let mut store = self.inner.store.write();
+        let run = store
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| "compaction run disappeared at completion".to_string())?;
+        apply_event_locked(run, &event, max_events);
+        run.status = "completed".to_string();
+        Ok(())
     }
 
     /// Persist one run event without attaching a message (tests / recovery).
@@ -4768,6 +5143,208 @@ fn persisted_run_context_json(context: &RunContext) -> Result<String, AdmitError
         ));
     }
     Ok(serialized)
+}
+
+fn compaction_error(code: &str, message: &str) -> JsonValue {
+    json!({
+        "ok": false,
+        "error": { "code": code, "message": message },
+    })
+}
+
+fn load_durable_compaction_snapshot(
+    persistence: &GatewayPersistence,
+    session_id: &str,
+) -> Result<(i64, Vec<JsonValue>, String), String> {
+    let session_data = persistence
+        .session_get(session_id)
+        .map_err(|error| format!("read compaction session: {error}"))?;
+    let session_row = crate::sqlite_storage_rows::sqlite_storage_first_row(&session_data)
+        .ok_or_else(|| "compaction session row is missing".to_string())?;
+    let generation = session_row
+        .get(7)
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| "compaction session generation is missing".to_string())?;
+
+    let mut history = Vec::new();
+    let mut after_ordinal = 0_i64;
+    loop {
+        let page = persistence
+            .message_list(session_id, after_ordinal)
+            .map_err(|error| format!("read compaction message page: {error}"))?;
+        let rows = crate::sqlite_storage_rows::sqlite_storage_rows(&page)?;
+        if rows.is_empty() {
+            break;
+        }
+        let page_len = rows.len();
+        for row in rows {
+            if row.len() < 14 {
+                return Err("compaction message row is incomplete".to_string());
+            }
+            let ordinal = row[2]
+                .as_i64()
+                .ok_or_else(|| "compaction message ordinal is invalid".to_string())?;
+            let role = row[3]
+                .as_str()
+                .ok_or_else(|| "compaction message role is invalid".to_string())?;
+            let content_json = row[4]
+                .as_str()
+                .ok_or_else(|| "compaction message content is invalid".to_string())?;
+            let content_value: JsonValue = serde_json::from_str(content_json)
+                .map_err(|error| format!("decode compaction message content: {error}"))?;
+            let mut message = json!({
+                "id": row[0],
+                "session_id": row[1],
+                "ordinal": ordinal,
+                "role": role,
+                "content": decode_message_content(&content_value),
+                "compacted": row[9].as_i64().unwrap_or_default(),
+            });
+            if let Some(object) = message.as_object_mut() {
+                for (column, field) in [(5, "name"), (6, "tool_call_id"), (7, "parent_message_id")]
+                {
+                    if let Some(value) = row
+                        .get(column)
+                        .and_then(JsonValue::as_str)
+                        .filter(|v| !v.is_empty())
+                    {
+                        object.insert(field.to_string(), JsonValue::String(value.to_string()));
+                    }
+                }
+            }
+            history.push(message);
+            after_ordinal = ordinal;
+        }
+        if page_len < 128 {
+            break;
+        }
+    }
+
+    let mut previous_summary = String::new();
+    let latest = persistence
+        .compaction_latest(session_id)
+        .map_err(|error| format!("read previous compaction summary: {error}"))?;
+    if let Ok(rows) = crate::sqlite_storage_rows::sqlite_storage_rows(&latest) {
+        for row in rows {
+            if row.get(10).and_then(JsonValue::as_str) != Some("committed") {
+                continue;
+            }
+            if let Some(summary_json) = row.get(7).and_then(JsonValue::as_str)
+                && let Ok(summary) = serde_json::from_str::<JsonValue>(summary_json)
+            {
+                previous_summary = summary
+                    .get("text")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            break;
+        }
+    }
+    Ok((generation, history, previous_summary))
+}
+
+fn execute_rss_compaction(
+    persistence: &GatewayPersistence,
+    decision_runner: &AgentRunner,
+    decision: &JsonValue,
+    cancellation: &RunCancellation,
+) -> Result<(), String> {
+    let commands = decision
+        .get("commands")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "RSS compaction plan omitted storage commands".to_string())?;
+    if commands.len() != 3 {
+        return Err(
+            "RSS compaction plan did not emit the start/compact/commit sequence".to_string(),
+        );
+    }
+    let compaction_id = commands[0]
+        .get("payload")
+        .and_then(|payload| payload.get("id"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "RSS compaction start omitted its identifier".to_string())?;
+    let mut started = false;
+    for command in commands {
+        if cancellation.requested().is_some() || cancellation.deadline_passed() {
+            if started {
+                fail_rss_compaction(
+                    persistence,
+                    decision_runner,
+                    compaction_id,
+                    "compaction cancelled",
+                )?;
+            }
+            return Err("run was cancelled during compaction".to_string());
+        }
+        let op = command
+            .get("op")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "RSS compaction command omitted its operation".to_string())?;
+        let payload = command
+            .get("payload")
+            .ok_or_else(|| "RSS compaction command omitted its payload".to_string())?;
+        let result = match op {
+            "compaction.start" => persistence.compaction_start(payload),
+            "message.compact" => persistence.message_compact(payload),
+            "compaction.commit" => persistence.compaction_commit(payload),
+            _ => {
+                return Err(format!(
+                    "RSS compaction emitted unsupported storage operation {op}"
+                ));
+            }
+        };
+        match result {
+            Ok(data) => {
+                if op == "compaction.start" {
+                    let rows = data.get("rows").and_then(JsonValue::as_array);
+                    if rows.is_none_or(Vec::is_empty) {
+                        return Err("compaction.start returned no pending durable row".to_string());
+                    }
+                    started = true;
+                }
+                if op == "compaction.commit" {
+                    started = false;
+                }
+            }
+            Err(error) => {
+                if started {
+                    fail_rss_compaction(
+                        persistence,
+                        decision_runner,
+                        compaction_id,
+                        &error.to_string(),
+                    )?;
+                }
+                return Err(format!("execute RSS storage command {op}: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fail_rss_compaction(
+    persistence: &GatewayPersistence,
+    decision_runner: &AgentRunner,
+    compaction_id: &str,
+    error_message: &str,
+) -> Result<(), String> {
+    let decision = decision_runner
+        .run_with_context(json_to_vm_value(&json!({
+            "command": "fail",
+            "compaction_id": compaction_id,
+            "error_message": truncate_utf8_chars(error_message, 1024).0,
+            "completed_at_ms": timestamp(),
+        })))
+        .map_err(|error| format!("RSS compaction failure decision failed: {error}"))?;
+    let failure = vm_value_to_json(&decision);
+    let payload = failure
+        .get("payload")
+        .ok_or_else(|| "RSS compaction failure omitted its storage payload".to_string())?;
+    persistence
+        .compaction_fail(payload)
+        .map(|_| ())
+        .map_err(|error| format!("persist RSS compaction failure: {error}"))
 }
 
 fn normalize_loaded_session_messages(store: &Arc<RwLock<GatewayStore>>) {

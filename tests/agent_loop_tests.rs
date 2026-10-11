@@ -3496,3 +3496,313 @@ async fn registry_mismatch_is_observed_as_durable_failure_before_rss_source() {
         "the RSS source must not be invoked after pre-entry context failure"
     );
 }
+
+#[tokio::test]
+async fn production_agent_loop_compacts_durable_history_before_provider_request() {
+    let root = temporary_root("production-compaction-loop");
+    let db_path = root.join("gateway.db");
+    let storage = storage_runner(&root);
+    run_storage(&storage, "gateway.db", "migrate", "migrate", json!({}), 1);
+    run_storage(
+        &storage,
+        "gateway.db",
+        "session.create",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    for ordinal in 1..=120_i64 {
+        let role = if ordinal % 2 == 1 {
+            "user"
+        } else {
+            "assistant"
+        };
+        let text = if ordinal == 1 {
+            "Keep the legacy parser rule: reject zero-length frames.".to_string()
+        } else {
+            format!("historical turn {ordinal}")
+        };
+        run_storage(
+            &storage,
+            "gateway.db",
+            &format!("history-{ordinal}"),
+            "message.append",
+            json!({
+                "id": format!("history-{ordinal}"),
+                "session_id": "session-1",
+                "role": role,
+                "content_json": json!([{"type": "text", "text": text}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 2,
+            }),
+            ordinal + 2,
+        );
+    }
+
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+        &db_path,
+    )
+    .expect("production service should open the seeded private SQLite session");
+    let service = state.service();
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("done"));
+    service.inject_provider_host(Arc::new(provider.clone()));
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "current compaction question"}),
+            session_id: Some("session-1".to_string()),
+            platform: "compaction-e2e".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("session admission should succeed");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "one real provider turn should run"
+    );
+    let request = &provider.requests()[0];
+    let request_messages = request["messages"]
+        .as_array()
+        .expect("provider request should carry canonical messages");
+    assert!(
+        request_messages.len() <= 34,
+        "provider context must contain a summary, the 32-message retained tail, and the system prompt; got {} messages",
+        request_messages.len()
+    );
+    let transcript = request_messages
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>();
+    let summary_message = request_messages
+        .iter()
+        .find(|message| {
+            message["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("zero-length frames"))
+                })
+            })
+        })
+        .expect("the extractive summary should retain a useful old coding fact");
+    assert_eq!(
+        summary_message["role"],
+        json!("user"),
+        "summary text must remain ordinary untrusted conversation content"
+    );
+    let transcript = transcript.join("\\n");
+    assert!(transcript.contains("historical turn 120"));
+    assert!(transcript.contains("current compaction question"));
+    assert!(
+        !request_messages.iter().any(|message| {
+            message["role"] == json!("assistant")
+                && message["content"].as_array().is_some_and(|parts| {
+                    parts.len() == 1 && parts[0]["text"].as_str() == Some("historical turn 2")
+                })
+        }),
+        "the old turn must not remain as a standalone uncompressed assistant message"
+    );
+
+    let session = run_storage(
+        &storage,
+        "gateway.db",
+        "session-after-turn",
+        "session.get",
+        json!({"session_id": "session-1"}),
+        1000,
+    );
+    assert_eq!(first_query_row(&session)["generation"], json!(2));
+    let latest = run_storage(
+        &storage,
+        "gateway.db",
+        "compaction-after-turn",
+        "compaction.latest",
+        json!({"session_id": "session-1"}),
+        1000,
+    );
+    let latest_row = first_query_row(&latest);
+    assert_eq!(latest_row["state"], json!("committed"));
+    let summary_json = latest_row["summary_json"]
+        .as_str()
+        .expect("committed compaction summary JSON");
+    assert!(
+        summary_json.len() <= 4096,
+        "summary is {} bytes",
+        summary_json.len()
+    );
+    let summary: JsonValue = serde_json::from_str(summary_json).expect("summary JSON");
+    assert!(
+        summary["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("zero-length frames")
+    );
+    drop(service);
+    drop(state);
+    drop(storage);
+    fs::remove_dir_all(root).expect("private production-compaction fixture should be removed");
+}
+
+#[tokio::test]
+async fn explicit_service_compaction_forces_once_and_survives_reopen_without_provider_calls() {
+    let root = temporary_root("explicit-compaction-service");
+    let db_path = root.join("gateway.db");
+    let storage = storage_runner(&root);
+    run_storage(&storage, "gateway.db", "migrate", "migrate", json!({}), 1);
+    run_storage(
+        &storage,
+        "gateway.db",
+        "session.create",
+        "session.create",
+        session_payload("session-1", 2),
+        2,
+    );
+    for ordinal in 1..=40_i64 {
+        run_storage(
+            &storage,
+            "gateway.db",
+            &format!("explicit-history-{ordinal}"),
+            "message.append",
+            json!({
+                "id": format!("explicit-history-{ordinal}"),
+                "session_id": "session-1",
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content_json": json!([{"type":"text", "text":format!("manual compaction fact {ordinal}")}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 2,
+            }),
+            ordinal + 2,
+        );
+    }
+
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+        &db_path,
+    )
+    .expect("service should open the private compaction fixture");
+    let service = state.service();
+    let provider = ScriptedProvider::new();
+    service.inject_provider_host(Arc::new(provider.clone()));
+    let first = service
+        .compact_session_explicit("session-1")
+        .expect("explicit compaction should use the RSS policy");
+    assert_eq!(first["status"], json!("committed"));
+    assert_eq!(first["generation"], json!(2));
+    let second = service
+        .compact_session_explicit("session-1")
+        .expect("replaying an already compacted prefix should be a no-op");
+    assert_eq!(second["status"], json!("skipped"));
+    assert_eq!(second["generation"], json!(2));
+    for ordinal in 41..=42_i64 {
+        run_storage(
+            &storage,
+            "gateway.db",
+            &format!("explicit-history-{ordinal}"),
+            "message.append",
+            json!({
+                "id": format!("explicit-history-{ordinal}"),
+                "session_id": "session-1",
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content_json": json!([{"type":"text", "text":format!("new manual detail {ordinal}")}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 100,
+            }),
+            ordinal + 100,
+        );
+    }
+    let third = service
+        .compact_session_explicit("session-1")
+        .expect("new durable messages should compact with the prior summary");
+    assert_eq!(third["status"], json!("committed"));
+    assert_eq!(third["generation"], json!(3));
+    let replay = service
+        .compact_session_explicit("session-1")
+        .expect("replaying generation three should not create another generation");
+    assert_eq!(replay["status"], json!("skipped"));
+    assert_eq!(replay["generation"], json!(3));
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "explicit compaction must not call a model"
+    );
+    let maintenance_run_id = third["run_id"].as_str().expect("maintenance run id");
+    assert!(service.run_events(maintenance_run_id).iter().all(|event| {
+        !event["event"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("model.")
+    }));
+
+    drop(service);
+    drop(state);
+    drop(storage);
+    let reopened = AgentGatewayState::with_agent_file_and_sqlite(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+        &db_path,
+    )
+    .expect("compacted session should reopen from durable SQLite");
+    let reopened_storage = storage_runner(&root);
+    let session = run_storage(
+        &reopened_storage,
+        "gateway.db",
+        "session-after-reopen",
+        "session.get",
+        json!({"session_id":"session-1"}),
+        1000,
+    );
+    assert_eq!(first_query_row(&session)["generation"], json!(3));
+    let latest = run_storage(
+        &reopened_storage,
+        "gateway.db",
+        "compaction-after-reopen",
+        "compaction.latest",
+        json!({"session_id":"session-1"}),
+        1000,
+    );
+    let reopened_latest_row = first_query_row(&latest);
+    let reopened_summary_json = reopened_latest_row["summary_json"]
+        .as_str()
+        .expect("reopened summary JSON");
+    assert!(reopened_summary_json.len() <= 4096);
+    let reopened_summary: JsonValue =
+        serde_json::from_str(reopened_summary_json).expect("reopened summary JSON");
+    assert_eq!(first_query_row(&latest)["state"], json!("committed"));
+    assert!(
+        reopened_summary["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("manual compaction fact 1")
+    );
+    drop(reopened_storage);
+    drop(reopened);
+    fs::remove_dir_all(root).expect("private explicit compaction fixture should be removed");
+}

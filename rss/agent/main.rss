@@ -480,7 +480,15 @@ fn run_serial_loop(context: map) -> map {
     let mut running = true;
     let mut decision: map = failed_code("internal", "loop did not produce a decision", 0, 0, 0);
     while running {
-        let control: map = agent::control_check();
+        let refreshed: map = agent::refresh_context({
+            run_id: ctx_string(context, "run_id", ""),
+            session_id: ctx_string(context, "session_id", ""),
+            messages: messages
+        });
+        let mut control: map = agent::control_check();
+        if ctx_bool(refreshed, "ok", false) == false {
+            control = { ok: false, error: ctx_map(refreshed, "error") };
+        }
         if ctx_bool(control, "ok", false) == false {
             decision = control_failed(control, turn, retry_count, tool_calls_used);
             running = false;
@@ -488,6 +496,7 @@ fn run_serial_loop(context: map) -> map {
             decision = failed_code("max_turns", "max_turns exceeded", turn, retry_count, tool_calls_used);
             running = false;
         } else {
+            messages = ctx_array(refreshed, "messages");
             let mut events: array = [];
             events[events.length] = { type: "model.started", turn: turn, model: model };
             let request: map = build_llm_request(context, messages);

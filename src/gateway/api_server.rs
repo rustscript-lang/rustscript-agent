@@ -172,6 +172,10 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
             post(set_session_workspace_handler),
         )
         .route(
+            "/v1/sessions/{session_id}/compact",
+            post(compact_session_handler),
+        )
+        .route(
             "/api/sessions/{session_id}/messages",
             get(session_messages_handler),
         )
@@ -777,6 +781,32 @@ async fn session_messages_handler(
         StatusCode::OK,
         json!({"object":"list", "session_id":session_id, "data":session.messages}),
     )
+}
+
+async fn compact_session_handler(
+    State(state): State<AgentGatewayState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let service = state.service();
+    match tokio::task::spawn_blocking(move || service.compact_session_explicit(&session_id)).await {
+        Ok(Ok(result)) => json_response(StatusCode::OK, result),
+        Ok(Err(error)) if error == "session not found" => {
+            json_error(StatusCode::NOT_FOUND, "session_not_found", &error)
+        }
+        Ok(Err(error)) if error == "session has an active run" => {
+            json_error(StatusCode::CONFLICT, "session_busy", &error)
+        }
+        Ok(Err(error)) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "compaction_failed",
+            &error,
+        ),
+        Err(error) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "compaction_task_failed",
+            &error.to_string(),
+        ),
+    }
 }
 
 async fn session_chat_handler(

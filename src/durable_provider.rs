@@ -131,6 +131,17 @@ impl DurableProviderHost {
 }
 
 impl AgentProviderHost for DurableProviderHost {
+    fn refresh_context(
+        &self,
+        context: &JsonValue,
+        cancellation: &RunCancellation,
+    ) -> Option<JsonValue> {
+        Some(
+            self.service
+                .refresh_provider_context(&self.run_id, context, cancellation),
+        )
+    }
+
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
         let turn = self.turn.load(Ordering::SeqCst);
         match self.replay_completed(turn) {

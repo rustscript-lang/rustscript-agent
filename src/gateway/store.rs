@@ -423,6 +423,24 @@ impl GatewayPersistence {
         self.command_data("message.append", payload)
     }
 
+    pub fn message_list(
+        &self,
+        session_id: &str,
+        after_ordinal: i64,
+    ) -> Result<Value, StorageError> {
+        self.command_data(
+            "message.list",
+            &json!({
+                "session_id": session_id,
+                "after_ordinal": after_ordinal,
+            }),
+        )
+    }
+
+    pub fn message_compact(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("message.compact", payload)
+    }
+
     /// Appends one run event with transactional sequence allocation and
     /// retention pruning.
     pub fn event_append(&self, payload: &Value) -> Result<Value, StorageError> {
@@ -514,6 +532,10 @@ impl GatewayPersistence {
     /// The returned data carries the run row and the run's event rows.
     pub fn run_terminal(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("run.terminal", payload)
+    }
+
+    pub fn run_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        self.command_data("run.create", payload)
     }
 
     /// A guarded typed run status transition (0 rows is a typed

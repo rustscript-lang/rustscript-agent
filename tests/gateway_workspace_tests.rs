@@ -125,6 +125,97 @@ fn provider_tool_result(provider: &ScriptedProvider, call_id: &str) -> Value {
 }
 
 #[tokio::test]
+async fn explicit_http_compaction_uses_rss_and_is_generation_idempotent() {
+    let root = private_test_root("http-compaction");
+    fs::create_dir_all(&root).expect("private test root");
+    let db_path = root.join("gateway.db");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+        &db_path,
+    )
+    .expect("gateway should open private SQLite fixture");
+    let app = build_agent_gateway_app(state.clone());
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"id":"http-compaction-session", "model":"test-model", "provider":"test-provider"}).to_string(),
+                ))
+                .expect("create-session request"),
+        )
+        .await
+        .expect("create-session response");
+    assert!(
+        create.status().is_success(),
+        "session create: {}",
+        create.status()
+    );
+    let persistence = state.persistence().expect("durable repository");
+    for ordinal in 1..=40_i64 {
+        persistence
+            .message_append(&json!({
+                "id": format!("http-compaction-message-{ordinal}"),
+                "session_id": "http-compaction-session",
+                "role": if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content_json": json!([{"type":"text", "text":format!("http fact {ordinal}")}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": ordinal + 100,
+            }))
+            .expect("append synthetic history through production RSS storage");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions/http-compaction-session/compact")
+                .body(Body::empty())
+                .expect("explicit compaction request"),
+        )
+        .await
+        .expect("explicit compaction response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("explicit compaction body");
+    let first: Value = serde_json::from_slice(&bytes).expect("explicit compaction JSON");
+    assert_eq!(first["status"], "committed", "{first}");
+    assert_eq!(first["generation"], 2, "{first}");
+
+    let replay = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions/http-compaction-session/compact")
+                .body(Body::empty())
+                .expect("replayed compaction request"),
+        )
+        .await
+        .expect("replayed compaction response");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .expect("replayed compaction body");
+    let second: Value = serde_json::from_slice(&bytes).expect("replayed compaction JSON");
+    assert_eq!(second["status"], "skipped", "{second}");
+    assert_eq!(second["generation"], 2, "{second}");
+    drop(persistence);
+    drop(state);
+    fs::remove_dir_all(root).expect("private HTTP compaction fixture cleanup");
+}
+
+#[tokio::test]
 async fn workspace_selector_errors_leave_no_session_and_default_resolves() {
     use rustscript_agent::service::{AdmitError, AdmitRunRequest};
 
