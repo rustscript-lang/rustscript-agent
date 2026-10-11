@@ -320,15 +320,9 @@ fn classify_target(fd: RawFd) -> Result<(TargetKind, u64, u64), OAuthError> {
     let file_type = (status.st_mode as libc::mode_t) & libc::S_IFMT;
     let kind = match file_type {
         libc::S_IFIFO => TargetKind::Pipe,
-        libc::S_IFCHR => {
-            // A character device is admitted only when it is a real terminal.
-            // SAFETY: isatty only inspects the descriptor.
-            if unsafe { libc::isatty(fd) } == 1 {
-                TargetKind::Tty
-            } else {
-                return Err(transport_failure());
-            }
-        }
+        // A character device is admitted only when it is a real terminal.
+        // SAFETY: isatty only inspects the descriptor.
+        libc::S_IFCHR if unsafe { libc::isatty(fd) } == 1 => TargetKind::Tty,
         _ => return Err(transport_failure()),
     };
     Ok((kind, status.st_dev as u64, status.st_ino as u64))

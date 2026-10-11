@@ -269,6 +269,24 @@ fn oversize_control_and_secret_instructions_produce_no_output() {
 }
 
 #[test]
+fn non_tty_character_device_fails_closed() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let device = fs::File::open("/dev/null").expect("open non-TTY character device");
+    assert!(
+        device
+            .metadata()
+            .expect("stat character device")
+            .file_type()
+            .is_char_device()
+    );
+    let owned: OwnedFd = device.into();
+    // SAFETY: isatty only inspects the owned descriptor.
+    assert_eq!(unsafe { libc::isatty(owned.as_raw_fd()) }, 0);
+    assert!(NativeAuthorizationInstructionOutput::from_fd(owned).is_err());
+}
+
+#[test]
 fn unsupported_regular_file_and_socket_owned_fds_fail_closed() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let file = fs::File::open(&manifest).expect("readable regular manifest file");
