@@ -2,12 +2,14 @@
 
 mod common;
 
+use std::any::Any;
 use std::fs;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -317,21 +319,43 @@ struct OwnedLoopbackRequest {
     body_bytes: usize,
 }
 
+type OwnedServerPanic = Box<dyn Any + Send + 'static>;
+type OwnedServerIo = Pin<Box<dyn Future<Output = Result<(), OwnedServerPanic>> + Send>>;
+
+const OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND: Duration = Duration::from_secs(5);
+
 struct OwnedLoopbackServer {
     address: SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    io: Option<OwnedServerIo>,
+    completed: Option<Result<(), OwnedServerPanic>>,
 }
 
 impl OwnedLoopbackServer {
-    fn spawn(
+    fn from_future<F>(
+        address: SocketAddr,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        future: F,
+    ) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            address,
+            shutdown: Some(shutdown),
+            io: Some(Box::pin(AssertUnwindSafe(future).catch_unwind())),
+            completed: None,
+        }
+    }
+
+    fn start(
         listener: tokio::net::TcpListener,
         address: SocketAddr,
         server_tls: Arc<rustls::ServerConfig>,
         accepted_tx: tokio::sync::oneshot::Sender<OwnedLoopbackRequest>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
+        let io = async move {
             use tokio::io::AsyncReadExt;
 
             let mut shutdown_rx = shutdown_rx;
@@ -371,96 +395,89 @@ impl OwnedLoopbackServer {
             };
             let _ = accepted_tx.send(request);
             let _ = shutdown_rx.await;
-        });
-        Self {
-            address,
-            shutdown: Some(shutdown_tx),
-            task: Some(task),
-        }
+        };
+        Self::from_future(address, shutdown_tx, io)
     }
 
-    async fn shutdown_and_reap(&mut self) -> Result<(), String> {
+    async fn shutdown_and_reap(&mut self, graceful_bound: Duration) -> Result<(), String> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let first_join = match self.task.as_mut() {
-            Some(task) => tokio::time::timeout(Duration::from_secs(5), task).await,
-            None => return Err("owned TLS server handle was already consumed".to_string()),
-        };
+        let graceful_bound = graceful_bound.min(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND);
+        let mut completion = self.completed.take();
+        let mut io = self.io.take();
         let mut failure = None;
-        match first_join {
-            Ok(Ok(())) => {
-                let _ = self.task.take();
-            }
-            Ok(Err(error)) => {
-                let _ = self.task.take();
-                failure = Some(format!("owned TLS server task failed: {error}"));
-            }
-            Err(_) => {
-                if let Some(task) = self.task.as_ref() {
-                    task.abort();
+        match (completion.is_some(), io.as_mut()) {
+            (true, _) => {}
+            (false, Some(io)) => match tokio::time::timeout(graceful_bound, io.as_mut()).await {
+                Ok(result) => completion = Some(result),
+                Err(_) => {
+                    failure = Some(
+                        "owned TLS server exceeded graceful shutdown bound; owned future was dropped",
+                    );
                 }
-                let abort_join = match self.task.as_mut() {
-                    Some(task) => tokio::time::timeout(Duration::from_secs(1), task).await,
-                    None => {
-                        return Err(
-                            "owned TLS server handle disappeared before reaping".to_string()
-                        );
-                    }
-                };
-                match abort_join {
-                    Ok(Err(error)) if error.is_cancelled() => {
-                        let _ = self.task.take();
-                        failure = Some(
-                            "owned TLS server exceeded graceful join bound; aborted and reaped"
-                                .to_string(),
-                        );
-                    }
-                    Ok(Ok(())) => {
-                        let _ = self.task.take();
-                        failure = Some(
-                            "owned TLS server exceeded graceful join bound before exit".to_string(),
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        let _ = self.task.take();
-                        failure = Some(format!(
-                            "owned TLS server failed while being reaped: {error}"
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(
-                            "owned TLS server was not reaped within the abort join bound"
-                                .to_string(),
-                        );
-                    }
-                }
+            },
+            (false, None) => {
+                failure = Some("owned TLS server future was already consumed");
             }
         }
-        let probe = std::net::TcpListener::bind(self.address).map_err(|error| {
-            format!("owned TLS server socket was not released after reaping: {error}")
-        })?;
-        drop(probe);
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if matches!(completion.as_ref(), Some(Err(_))) {
+            failure = Some("owned TLS server future panicked");
+        }
+
+        // The future owns the listener and accepted stream; drop it before probing the exact address.
+        drop(io);
+        let socket_failure = match std::net::TcpListener::bind(self.address) {
+            Ok(probe) => {
+                drop(probe);
+                None
+            }
+            Err(error) => Some(format!(
+                "owned TLS server socket was not released after dropping its future: {error}"
+            )),
+        };
+        match (failure, socket_failure) {
+            (None, None) => Ok(()),
+            (Some(message), None) => Err(message.to_string()),
+            (None, Some(error)) => Err(error),
+            (Some(message), Some(error)) => Err(format!("{message}; {error}")),
         }
     }
 }
 
-async fn run_with_owned_loopback_server<T, F>(
-    mut server: OwnedLoopbackServer,
+async fn poll_during_operation<T, F>(
+    server: &mut OwnedLoopbackServer,
     operation: F,
-) -> (
-    Result<T, Box<dyn std::any::Any + Send + 'static>>,
-    Result<(), String>,
-)
+) -> Result<T, OwnedServerPanic>
 where
     F: Future<Output = T>,
 {
-    let operation = AssertUnwindSafe(operation).catch_unwind().await;
-    let cleanup = server.shutdown_and_reap().await;
-    (operation, cleanup)
+    let mut operation = Box::pin(AssertUnwindSafe(operation).catch_unwind());
+    loop {
+        if server.completed.is_some() || server.io.is_none() {
+            return operation.await;
+        }
+        let server_io = server
+            .io
+            .as_mut()
+            .expect("owned TLS server future is present")
+            .as_mut();
+        tokio::select! {
+            result = operation.as_mut() => return result,
+            result = server_io => server.completed = Some(result),
+        }
+    }
+}
+
+fn resume_observation_panic<T>(observation: Result<T, OwnedServerPanic>) -> T {
+    match observation {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn panic_with_owned_marker(marker: Arc<()>) {
+    std::panic::panic_any(marker);
 }
 
 struct OwnedLoopbackHttpsTransport {
@@ -1619,6 +1636,134 @@ async fn non_expired_restart_keeps_remaining_deadline() {
     worker.await.expect("worker join");
 }
 
+async fn pending_owned_loopback_server() -> (OwnedLoopbackServer, SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind pending owned loopback server");
+    let address = listener.local_addr().expect("pending owned server address");
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = OwnedLoopbackServer::from_future(address, shutdown, async move {
+        let _listener = listener;
+        let _ = shutdown_rx.await;
+        std::future::pending::<()>().await;
+    });
+    (server, address)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_loopback_pending_future_is_dropped_and_socket_rebound() {
+    let (mut server, address) = pending_owned_loopback_server().await;
+    let started = Instant::now();
+    let observation = poll_during_operation(&mut server, async {}).await;
+    let cleanup = server.shutdown_and_reap(Duration::from_millis(40)).await;
+    let elapsed = started.elapsed();
+    let rebound = std::net::TcpListener::bind(address).map(drop).is_ok();
+    let cleanup_failed = cleanup.is_err();
+    let cleanup_failure_panicked = AssertUnwindSafe(async move {
+        cleanup.expect("cleanup failure without an observation panic must fail closed");
+    })
+    .catch_unwind()
+    .await
+    .is_err();
+
+    assert!(observation.is_ok(), "injected observation must complete");
+    assert!(
+        cleanup_failed,
+        "shutdown-ignoring owned future must report cleanup failure"
+    );
+    assert!(
+        cleanup_failure_panicked,
+        "an unmasked cleanup error must fail the caller"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(5),
+        "cleanup exceeded its bound"
+    );
+    assert!(
+        rebound,
+        "dropping the owned future must release the exact address"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn observation_panic_keeps_payload_after_server_cleanup_failure() {
+    let (mut server, address) = pending_owned_loopback_server().await;
+    let auth_home = unique_temp_dir("tls-reap-panic-auth");
+    let mut auth_home_guard = OwnedPrivateFixtureDirectory::create(auth_home.clone())
+        .expect("create owned private synthetic auth home");
+    write_private_fixture_file(&auth_home.join("auth.yaml"), "token: synthetic-only\n");
+    let marker = Arc::new(());
+    let observation = poll_during_operation(&mut server, async {
+        panic_with_owned_marker(Arc::clone(&marker));
+    })
+    .await;
+    let server_cleanup = server.shutdown_and_reap(Duration::from_millis(40)).await;
+    let auth_cleanup = auth_home_guard.cleanup();
+    let server_cleanup_failed = server_cleanup.is_err();
+    let auth_cleanup_succeeded = auth_cleanup.is_ok();
+    let auth_home_removed = !auth_home.exists();
+    let socket_rebound = std::net::TcpListener::bind(address).map(drop).is_ok();
+    let captured = AssertUnwindSafe(async move {
+        resume_observation_panic(observation);
+        server_cleanup.expect("cleanup failure must follow the original observation panic");
+        auth_cleanup.expect("private synthetic auth home cleanup");
+    })
+    .catch_unwind()
+    .await;
+    let original_payload_preserved = captured
+        .as_ref()
+        .err()
+        .and_then(|payload| payload.downcast_ref::<Arc<()>>())
+        .is_some_and(|payload| Arc::ptr_eq(payload, &marker));
+
+    assert!(
+        server_cleanup_failed,
+        "pending server cleanup must fail closed"
+    );
+    assert!(
+        auth_cleanup_succeeded,
+        "auth cleanup must be attempted before rethrow"
+    );
+    assert!(
+        auth_home_removed,
+        "auth directory must be absent after cleanup"
+    );
+    assert!(socket_rebound, "server socket must be absent after cleanup");
+    assert!(
+        original_payload_preserved,
+        "the original observation panic payload must retain identity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_loopback_server_future_panic_is_captured_and_socket_rebound() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind panicking owned loopback server");
+    let address = listener
+        .local_addr()
+        .expect("panicking owned server address");
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut server = OwnedLoopbackServer::from_future(address, shutdown, async move {
+        let _listener = listener;
+        let _ = shutdown_rx.await;
+        panic!("injected owned TLS server future panic");
+    });
+    let observation = poll_during_operation(&mut server, async {}).await;
+    let cleanup = server.shutdown_and_reap(Duration::from_secs(5)).await;
+    let rebound = std::net::TcpListener::bind(address).map(drop).is_ok();
+
+    assert!(observation.is_ok(), "observation itself must not panic");
+    assert!(
+        cleanup.is_err(),
+        "server future panic must be recorded as cleanup failure"
+    );
+    assert!(
+        rebound,
+        "captured server panic must still release the socket"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn owned_loopback_server_is_reaped_after_postspawn_error_and_panic() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1628,15 +1773,19 @@ async fn owned_loopback_server_is_reaped_after_postspawn_error_and_panic() {
     let (server_tls, _) = owned_loopback_tls_configs();
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     drop(accepted_rx);
-    let server = OwnedLoopbackServer::spawn(listener, address, server_tls, accepted_tx);
-    let (operation, cleanup) =
-        run_with_owned_loopback_server(server, async { Err::<(), _>("injected post-spawn error") })
-            .await;
+    let mut server = OwnedLoopbackServer::start(listener, address, server_tls, accepted_tx);
+    let operation = poll_during_operation(&mut server, async {
+        Err::<(), _>("injected post-spawn error")
+    })
+    .await;
+    let cleanup = server
+        .shutdown_and_reap(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND)
+        .await;
     assert_eq!(
-        operation.expect("error path must not panic"),
+        resume_observation_panic(operation),
         Err("injected post-spawn error")
     );
-    cleanup.expect("error path must signal, join, and close the owned socket");
+    cleanup.expect("error path must signal and close the owned socket");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1645,14 +1794,19 @@ async fn owned_loopback_server_is_reaped_after_postspawn_error_and_panic() {
     let (server_tls, _) = owned_loopback_tls_configs();
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     drop(accepted_rx);
-    let server = OwnedLoopbackServer::spawn(listener, address, server_tls, accepted_tx);
-    let (operation, cleanup) =
-        run_with_owned_loopback_server(server, async { panic!("injected post-spawn panic") }).await;
+    let mut server = OwnedLoopbackServer::start(listener, address, server_tls, accepted_tx);
+    let operation = poll_during_operation(&mut server, async {
+        panic!("injected post-spawn panic");
+    })
+    .await;
+    let cleanup = server
+        .shutdown_and_reap(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND)
+        .await;
     assert!(
         operation.is_err(),
         "post-spawn panic must be captured for cleanup"
     );
-    cleanup.expect("unwind path must signal, join, and close the owned socket");
+    cleanup.expect("unwind path must signal and close the owned socket");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1778,9 +1932,9 @@ async fn hanging_http_adapter_stop_cancels() {
         "dispatch",
         AgentConfig::default(),
     );
-    let mut server = OwnedLoopbackServer::spawn(listener, address, server_tls, accepted_tx);
+    let mut server = OwnedLoopbackServer::start(listener, address, server_tls, accepted_tx);
     let mut worker = None;
-    let observation_result = AssertUnwindSafe(async {
+    let observation_result = poll_during_operation(&mut server, async {
         worker = Some(tokio::spawn({
             let service = service.clone();
             let run_id = admitted.run_id.clone();
@@ -1875,7 +2029,6 @@ async fn hanging_http_adapter_stop_cancels() {
         });
         (request_observation, connected, pre_stop_diagnostic)
     })
-    .catch_unwind()
     .await;
     let stop_result = service.stop(&admitted.run_id);
     let worker_result = match worker.as_mut() {
@@ -1896,14 +2049,20 @@ async fn hanging_http_adapter_stop_cancels() {
     };
     let terminal = terminal_events(&service, &admitted.run_id);
     let reason = cancel_reason(&service, &admitted.run_id);
-    let server_cleanup = server.shutdown_and_reap().await;
+    let server_cleanup = server
+        .shutdown_and_reap(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND)
+        .await;
     let auth_cleanup = auth_home_guard.cleanup();
+    let auth_home_removed = !auth_home.exists();
+    let (request_observation, connected, pre_stop_diagnostic) =
+        resume_observation_panic(observation_result);
 
     assert!(worker_reaped, "timed-out HTTP worker task was not reaped");
-    server_cleanup.expect("hanging HTTP server must be joined and its socket closed");
+    server_cleanup
+        .expect("hanging HTTP server must be gracefully closed and its socket rebindable");
     auth_cleanup.expect("private synthetic auth home cleanup");
     assert!(
-        !auth_home.exists(),
+        auth_home_removed,
         "private synthetic auth home must be absent after cleanup"
     );
     if let Some(worker_result) = worker_result {
@@ -1911,10 +2070,6 @@ async fn hanging_http_adapter_stop_cancels() {
             .expect("hanging HTTP stop must stay bounded")
             .expect("worker join");
     }
-    let (request_observation, connected, pre_stop_diagnostic) = match observation_result {
-        Ok(observation) => observation,
-        Err(panic) => std::panic::resume_unwind(panic),
-    };
     assert!(
         connected,
         "RssAdapterProvider should connect within the run setup window; pre-stop state: {pre_stop_diagnostic:?}; request: {request_observation:?}"
