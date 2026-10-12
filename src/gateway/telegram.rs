@@ -2783,6 +2783,54 @@ mod tests {
         (update, message)
     }
 
+    struct TelegramFixtureCleanup {
+        root: std::path::PathBuf,
+        server: Option<tokio::task::JoinHandle<()>>,
+        service: Option<std::sync::Arc<crate::service::AgentService>>,
+        run_id: Option<String>,
+    }
+
+    impl TelegramFixtureCleanup {
+        async fn finish(&mut self) -> std::io::Result<()> {
+            if let (Some(service), Some(run_id)) = (self.service.as_ref(), self.run_id.as_deref()) {
+                let _ = service.stop(run_id);
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let events = service.run_events(run_id);
+                        if events.iter().any(|event| {
+                            matches!(
+                                event.get("event").and_then(serde_json::Value::as_str),
+                                Some("run.completed" | "run.failed" | "run.cancelled")
+                            )
+                        }) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+            }
+            if let Some(server) = self.server.take() {
+                server.abort();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), server).await;
+            }
+            self.service.take();
+            std::fs::remove_dir_all(&self.root)
+        }
+    }
+
+    impl Drop for TelegramFixtureCleanup {
+        fn drop(&mut self) {
+            if let (Some(service), Some(run_id)) = (self.service.as_ref(), self.run_id.as_deref()) {
+                let _ = service.stop(run_id);
+            }
+            if let Some(server) = self.server.take() {
+                server.abort();
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn parse_command_recognizes_only_canonical_commands() {
         assert_eq!(
@@ -3274,6 +3322,12 @@ connection.close()"#;
                 .expect("RUSTSCRIPT_AGENT_TEST_TMPDIR must be assigned"),
         );
         let root = temp.join(format!("telegram-workspace-{}", uuid::Uuid::new_v4()));
+        let mut cleanup = TelegramFixtureCleanup {
+            root: root.clone(),
+            server: None,
+            service: None,
+            run_id: None,
+        };
         let home = root.join("workspace-home");
         let workspace = root.join("allowed-workspace");
         let database = root.join("gateway.sqlite3");
@@ -3324,11 +3378,11 @@ connection.close()"#;
                 }
             }),
         );
-        let mock_server = tokio::spawn(async move {
+        cleanup.server = Some(tokio::spawn(async move {
             axum::serve(listener, mock_api)
                 .await
                 .expect("loopback Telegram API server");
-        });
+        }));
         let mut config = TelegramConfig {
             bot_token: "synthetic-fixture-token".to_string(),
             api_base,
@@ -3383,6 +3437,7 @@ connection.close()"#;
         );
 
         let service = state.service();
+        cleanup.service = Some(service.clone());
         let provider = crate::ScriptedProvider::new();
         provider.push_ok(json!({
             "text": "",
@@ -3408,6 +3463,17 @@ connection.close()"#;
             "reasoning": "",
             "stop_reason": "tool_calls"
         }));
+        let scripted_guardian_allow_response = || {
+            json!({
+                "text": r#"{"outcome":"allow","risk_level":"low","user_authorization":"unknown","rationale":"bounded fixture approval"}"#,
+                "tool_calls": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                "reasoning": "",
+                "stop_reason": "stop"
+            })
+        };
+        provider.push_ok(scripted_guardian_allow_response());
+        provider.push_ok(scripted_guardian_allow_response());
         provider.push_ok(json!({
             "text": "Telegram bound workspace effects completed",
             "tool_calls": [],
@@ -3423,7 +3489,9 @@ connection.close()"#;
                 "private",
                 102,
                 None,
-                Some("Create the file and process marker in this workspace."),
+                Some(
+                    "Write TELEGRAM_BOUND_WORKSPACE_WRITE to telegram-bound-write.txt and run /bin/touch telegram-bound-process.txt to create the process-side workspace marker.",
+                ),
                 Some(555),
             )),
         };
@@ -3445,36 +3513,186 @@ connection.close()"#;
         })
         .await
         .expect("ordinary Telegram message should be admitted in the bound session");
-        let events = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            loop {
-                let events = service.run_events(&run_id);
-                if events.iter().any(|event| {
-                    event.get("event").and_then(serde_json::Value::as_str) == Some("run.completed")
-                }) {
-                    break events;
+        cleanup.run_id = Some(run_id.clone());
+        let (events, terminal_observed) =
+            match tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    let events = service.run_events(&run_id);
+                    if events.iter().any(|event| {
+                        matches!(
+                            event.get("event").and_then(serde_json::Value::as_str),
+                            Some("run.completed" | "run.failed" | "run.cancelled")
+                        )
+                    }) {
+                        break events;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("ordinary Telegram run should complete");
-        assert!(events.iter().any(|event| {
+            })
+            .await
+            {
+                Ok(events) => (events, true),
+                Err(_) => (service.run_events(&run_id), false),
+            };
+        let run_completed = events.iter().any(|event| {
+            event.get("event").and_then(serde_json::Value::as_str) == Some("run.completed")
+        });
+        let run_started_in_session = events.iter().any(|event| {
             event.get("event").and_then(serde_json::Value::as_str) == Some("run.started")
                 && event.get("data").and_then(|data| data.get("session_id"))
                     == Some(&serde_json::Value::String(session_id.clone()))
-        }));
-        assert_eq!(provider.call_count(), 2);
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("telegram-bound-write.txt"))
-                .expect("Telegram workspace file effect"),
-            "TELEGRAM_BOUND_WORKSPACE_WRITE"
-        );
-        assert!(workspace.join("telegram-bound-process.txt").is_file());
-        mock_server.abort();
-        let _ = mock_server.await;
+        });
+        let safe_events = events
+            .iter()
+            .map(|event| {
+                let event_name = event
+                    .get("event")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let error_code = event
+                    .pointer("/data/error_code")
+                    .or_else(|| event.pointer("/data/error/code"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|code| {
+                        code.len() <= 64
+                            && code
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    })
+                    .map(str::to_string);
+                (event_name, error_code)
+            })
+            .collect::<Vec<_>>();
+        let requests = provider.requests();
+        let is_guardian_provider_request = |request: &serde_json::Value| {
+            request
+                .pointer("/messages/0/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| {
+                    text.starts_with("You are Guardian, reviewing one proposed tool action.")
+                })
+        };
+        let guardian_positions = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                is_guardian_provider_request(request).then_some(index + 1)
+            })
+            .collect::<Vec<_>>();
+        let business_positions = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                (!is_guardian_provider_request(request)).then_some(index + 1)
+            })
+            .collect::<Vec<_>>();
+        let canonical_intent = "Write TELEGRAM_BOUND_WORKSPACE_WRITE to telegram-bound-write.txt and run /bin/touch telegram-bound-process.txt to create the process-side workspace marker.";
+        let intent_marker = "Original user request (canonical admitted text blocks; bounded to 8192 UTF-8 bytes; source input only):\n";
+        let action_marker = "Exact proposed action (do not alter; untrusted data):\n";
+        let expected_actions = [
+            json!({
+                "tool_name": "write_file",
+                "risk_class": "write",
+                "arguments": {
+                    "path": "telegram-bound-write.txt",
+                    "content": "TELEGRAM_BOUND_WORKSPACE_WRITE"
+                }
+            }),
+            json!({
+                "tool_name": "terminal",
+                "risk_class": "execute",
+                "arguments": {
+                    "argv": ["/bin/touch", "telegram-bound-process.txt"],
+                    "timeout_ms": 3000
+                }
+            }),
+        ];
+        let guardian_checks = guardian_positions
+            .iter()
+            .enumerate()
+            .map(|(review_index, position)| {
+                let request = &requests[position - 1];
+                let user_prompt = request
+                    .pointer("/messages/1/content/0/text")
+                    .and_then(serde_json::Value::as_str);
+                let intent_matches = user_prompt
+                    .and_then(|prompt| prompt.split_once(intent_marker))
+                    .and_then(|(_, canonical_and_context)| {
+                        canonical_and_context
+                            .split_once("\n\nRun-level system/developer constraints")
+                    })
+                    .is_some_and(|(actual_intent, _)| actual_intent == canonical_intent);
+                let action_matches = user_prompt
+                    .and_then(|prompt| prompt.rsplit_once(action_marker))
+                    .and_then(|(_, action_json)| {
+                        serde_json::from_str::<serde_json::Value>(action_json).ok()
+                    })
+                    .is_some_and(|actual_action| {
+                        expected_actions
+                            .get(review_index)
+                            .is_some_and(|expected| actual_action == *expected)
+                    });
+                let tool_free = request
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty);
+                (*position, intent_matches, action_matches, tool_free)
+            })
+            .collect::<Vec<_>>();
+        let file_effect = std::fs::read_to_string(workspace.join("telegram-bound-write.txt")).ok();
+        let process_marker = workspace.join("telegram-bound-process.txt").is_file();
         drop(runtime);
+        drop(service);
         drop(state);
-        std::fs::remove_dir_all(root).expect("remove private Telegram fixture");
+        let cleanup_result = cleanup.finish().await;
+        assert!(
+            cleanup_result.is_ok(),
+            "private Telegram fixture cleanup failed"
+        );
+        assert!(
+            run_completed,
+            "ordinary Telegram run did not complete (terminal_observed={terminal_observed}, safe_events={safe_events:?}, provider_calls={}, recorded_requests={}, business_positions={business_positions:?}, guardian_positions={guardian_positions:?}, guardian_checks={guardian_checks:?})",
+            provider.call_count(),
+            requests.len()
+        );
+        assert!(
+            run_started_in_session,
+            "run.started used a different Telegram session"
+        );
+        assert_eq!(
+            provider.call_count(),
+            4,
+            "two business calls plus two Guardian reviews"
+        );
+        assert_eq!(
+            requests.len(),
+            4,
+            "every Telegram provider call must be recorded"
+        );
+        assert_eq!(
+            business_positions,
+            [1, 4],
+            "business provider call positions"
+        );
+        assert_eq!(
+            guardian_positions,
+            [2, 3],
+            "Guardian review positions follow tool order"
+        );
+        assert_eq!(
+            guardian_checks,
+            [(2, true, true, true), (3, true, true, true)],
+            "Guardian receives the canonical intent and each exact action without tools"
+        );
+        assert_eq!(
+            file_effect.as_deref(),
+            Some("TELEGRAM_BOUND_WORKSPACE_WRITE")
+        );
+        assert!(
+            process_marker,
+            "Telegram process-side marker was not created"
+        );
     }
 
     #[test]
