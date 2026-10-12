@@ -55,9 +55,26 @@ fn background_sleep_call() -> JsonValue {
     }])
 }
 
+fn guardian_high_authorized_response() -> JsonValue {
+    text_response(
+        r#"{"outcome":"allow","risk_level":"high","user_authorization":"high","rationale":"The admitted request explicitly authorizes this exact synthetic child process."}"#,
+    )
+}
+
 fn admit_request() -> AdmitRunRequest {
     AdmitRunRequest {
         input: json!({"message": "hello"}),
+        platform: "run_lifecycle_tests".to_string(),
+        ..AdmitRunRequest::default()
+    }
+}
+
+const STOP_CHILD_USER_INTENT: &str = "For this lifecycle test, start exactly one `/bin/sleep 30` process as a background child inside the selected `lifecycle` workspace. I explicitly authorize this process launch; I will stop it immediately.";
+const DEADLINE_CHILD_USER_INTENT: &str = "For this deadline test, start exactly one `/bin/sleep 30` process as a background child. I explicitly authorize this exact process launch; the admitted deadline must terminate it.";
+
+fn admit_stop_child_request() -> AdmitRunRequest {
+    AdmitRunRequest {
+        input: json!({"message": STOP_CHILD_USER_INTENT}),
         platform: "run_lifecycle_tests".to_string(),
         ..AdmitRunRequest::default()
     }
@@ -155,8 +172,7 @@ struct LifecycleWorkspaceFixture {
     workspace: PathBuf,
 }
 
-fn lifecycle_workspace_fixture(label: &str) -> LifecycleWorkspaceFixture {
-    let root = unique_temp_dir(label);
+fn lifecycle_workspace_fixture_at(root: PathBuf) -> LifecycleWorkspaceFixture {
     let home = root.join("workspace-home");
     let workspace = root.join("workspace");
     fs::create_dir_all(&home).expect("private workspace home");
@@ -185,6 +201,19 @@ fn lifecycle_workspace_fixture(label: &str) -> LifecycleWorkspaceFixture {
         home,
         workspace,
     }
+}
+
+fn lifecycle_workspace_fixture(label: &str) -> LifecycleWorkspaceFixture {
+    lifecycle_workspace_fixture_at(unique_temp_dir(label))
+}
+
+fn lifecycle_workspace_fixture_with_guard(
+    label: &str,
+) -> (LifecycleWorkspaceFixture, OwnedPrivateFixtureDirectory) {
+    let root = unique_temp_dir(label);
+    let guard = OwnedPrivateFixtureDirectory::create(root.clone())
+        .expect("create owned private lifecycle fixture root");
+    (lifecycle_workspace_fixture_at(root), guard)
 }
 
 fn loop_service_with_workspace(
@@ -925,12 +954,26 @@ async fn stop_hanging_provider_cancels_once() {
 async fn stop_terminates_child_process_without_residue() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response("", background_sleep_call()));
+    provider.push_ok(guardian_high_authorized_response());
     provider.push_hang();
-    let workspace = lifecycle_workspace_fixture("stop-child");
-    let state = loop_service_with_workspace(AgentGatewayConfig::default(), &provider, &workspace);
+    let (workspace, mut workspace_guard) = lifecycle_workspace_fixture_with_guard("stop-child");
+    let database = workspace.root.join("stop-child.sqlite3");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        AgentGatewayConfig::default(),
+        rustscript_agent::bundled_agent_main_path(),
+        &database,
+    )
+    .expect("private lifecycle approval database")
+    .with_workspace_home(workspace.home.clone());
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
     let service = state.service();
     let admitted = service
-        .admit_external_with_workspace_selector(admit_request(), Some("name:lifecycle".to_string()))
+        .admit_external_with_workspace_selector(
+            admit_stop_child_request(),
+            Some("name:lifecycle".to_string()),
+        )
         .await
         .expect("admission should succeed");
     let worker = tokio::spawn({
@@ -940,46 +983,182 @@ async fn stop_terminates_child_process_without_residue() {
             service.run_worker(run_id, "ignored".to_string()).await;
         }
     });
+    let observation_started = Instant::now();
     let spawned = wait_until(Duration::from_secs(8), || {
         service.process_owner_count(&admitted.run_id) > 0
     })
     .await;
-    assert!(spawned, "child process should be owned before stop");
+    let business_followup_reached = if spawned {
+        wait_until(
+            Duration::from_secs(8).saturating_sub(observation_started.elapsed()),
+            || provider.call_count() >= 3,
+        )
+        .await
+    } else {
+        false
+    };
+    let requests = provider.requests();
+    let guardian_positions: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            request
+                .to_string()
+                .contains("You are Guardian, reviewing one proposed tool action.")
+                .then_some(index + 1)
+        })
+        .collect();
+    let context = service.run_context(&admitted.run_id);
+    let admitted_user_intent = context
+        .as_ref()
+        .and_then(|run| run.input.get("message"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let guardian_has_admitted_intent = !admitted_user_intent.is_empty()
+        && guardian_positions.iter().any(|position| {
+            requests
+                .get(position - 1)
+                .is_some_and(|request| request.to_string().contains(admitted_user_intent))
+        });
+    let guardian_has_terminal_action = guardian_positions.iter().any(|position| {
+        requests.get(position - 1).is_some_and(|request| {
+            let request = request.to_string();
+            request.contains("terminal") && request.contains("/bin/sleep")
+        })
+    });
+    let input_is_canonical_stop_intent = context
+        .as_ref()
+        .is_some_and(|run| run.input == json!({"message": STOP_CHILD_USER_INTENT}));
+    let workspace_binding_matches = context
+        .as_ref()
+        .and_then(|run| run.limits["workspace_root"].as_str())
+        .is_some_and(|path| workspace.workspace.to_str() == Some(path));
+    let events = service.run_events(&admitted.run_id);
+    let pre_stop_events: Vec<String> = events
+        .iter()
+        .filter_map(|event| event.get("event").and_then(JsonValue::as_str))
+        .map(str::to_string)
+        .collect();
+    let typed_error_codes: Vec<String> = events
+        .iter()
+        .filter_map(|event| {
+            let name = event.get("event").and_then(JsonValue::as_str)?;
+            let code = event
+                .pointer("/data/error_code")
+                .or_else(|| event.pointer("/data/error/code"))
+                .and_then(JsonValue::as_str)?;
+            Some(format!("{name}:{code}"))
+        })
+        .collect();
     let pids = service.process_owner_pids(&admitted.run_id);
-    assert!(!pids.is_empty());
-    for pid in &pids {
-        assert!(
-            pid_alive(*pid),
-            "owned PID {pid} should be live before stop"
-        );
-    }
-    let _ = service.stop(&admitted.run_id);
-    worker.await.expect("worker join");
-
-    assert_eq!(
-        terminal_events(&service, &admitted.run_id),
-        vec!["run.cancelled".to_string()]
+    let live_pids_before_stop = pids.iter().filter(|pid| pid_alive(**pid)).count();
+    let pre_stop_provider_calls = provider.call_count();
+    let pre_stop_provider_requests = requests.len();
+    let business_requests = pre_stop_provider_requests.saturating_sub(guardian_positions.len());
+    let diagnostic = format!(
+        "pre-stop: provider_calls={pre_stop_provider_calls} provider_requests={pre_stop_provider_requests} business_requests={business_requests} business_followup_reached={business_followup_reached} guardian_positions={guardian_positions:?} guardian_has_admitted_intent={guardian_has_admitted_intent} guardian_has_terminal_action={guardian_has_terminal_action} input_is_canonical_stop_intent={input_is_canonical_stop_intent} workspace_binding_matches={workspace_binding_matches} workspace_config_exists={} capability_host_retained={} capability_host_closed={} process_owners={} owned_pids={} live_owned_pids={live_pids_before_stop} events={pre_stop_events:?} typed_error_codes={typed_error_codes:?} run_error_code={}",
+        workspace.home.join("config.yaml").is_file(),
+        service.capability_host_retained(&admitted.run_id),
+        service.capability_host_closed(&admitted.run_id),
+        service.process_owner_count(&admitted.run_id),
+        pids.len(),
+        failed_error_code(&service, &admitted.run_id)
     );
-    assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
-    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
-    for pid in pids {
-        assert!(!pid_alive(pid), "PID {pid} should be dead after cleanup");
-    }
-    assert!(service.capability_host_closed(&admitted.run_id));
+
+    let stop_result = service.stop(&admitted.run_id);
+    let worker_result = worker.await;
+    let terminals = terminal_events(&service, &admitted.run_id);
+    let reason = cancel_reason(&service, &admitted.run_id);
+    let owners_after_stop = service.process_owner_count(&admitted.run_id);
+    let live_pids_after_stop = pids.iter().filter(|pid| pid_alive(**pid)).count();
+    let capability_closed = service.capability_host_closed(&admitted.run_id);
     drop(service);
     drop(state);
-    fs::remove_dir_all(workspace.root).expect("remove private stop workspace fixture");
+    let fixture_cleanup = workspace_guard.cleanup();
+
+    assert_eq!(stop_result.as_deref(), Some("stopping"), "{diagnostic}");
+    assert!(worker_result.is_ok(), "worker join failed: {diagnostic}");
+    assert_eq!(terminals, vec!["run.cancelled".to_string()], "{diagnostic}");
+    assert_eq!(reason, "requested", "{diagnostic}");
+    assert_eq!(owners_after_stop, 0, "{diagnostic}");
+    assert_eq!(live_pids_after_stop, 0, "{diagnostic}");
+    assert!(capability_closed, "{diagnostic}");
+    fixture_cleanup.expect("remove private stop workspace fixture");
+    assert!(
+        spawned,
+        "child process should be owned before stop: {diagnostic}"
+    );
+    assert!(
+        business_followup_reached,
+        "live follow-up provider call should be held before stop: {diagnostic}"
+    );
+    assert_eq!(
+        pre_stop_provider_calls, 3,
+        "business/review/business call sequence: {diagnostic}"
+    );
+    assert_eq!(
+        pre_stop_provider_requests, 3,
+        "business/review/business request sequence: {diagnostic}"
+    );
+    assert_eq!(
+        business_requests, 2,
+        "business request count excludes one Guardian review: {diagnostic}"
+    );
+    assert_eq!(
+        guardian_positions,
+        vec![2],
+        "Guardian must review between business turns: {diagnostic}"
+    );
+    assert!(
+        guardian_has_admitted_intent,
+        "Guardian must receive canonical admitted user intent: {diagnostic}"
+    );
+    assert!(
+        guardian_has_terminal_action,
+        "Guardian must receive the exact native terminal action: {diagnostic}"
+    );
+    assert!(
+        input_is_canonical_stop_intent,
+        "admitted run input must remain canonical: {diagnostic}"
+    );
+    assert!(
+        workspace_binding_matches,
+        "run must remain bound to the selected private workspace: {diagnostic}"
+    );
+    assert!(!pids.is_empty(), "no owned PID was observed: {diagnostic}");
+    assert_eq!(
+        live_pids_before_stop,
+        pids.len(),
+        "every owned PID should be live before stop: {diagnostic}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deadline_terminates_child_process_without_residue() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response("", background_sleep_call()));
+    provider.push_ok(guardian_high_authorized_response());
     provider.push_hang();
-    let state = loop_service(short_config(Duration::from_millis(250)), &provider);
+    let fixture_root = unique_temp_dir("deadline-child");
+    let mut fixture_guard = OwnedPrivateFixtureDirectory::create(fixture_root.clone())
+        .expect("create private deadline approval fixture");
+    let database = fixture_root.join("deadline-child.sqlite3");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
+        short_config(Duration::from_millis(250)),
+        rustscript_agent::bundled_agent_main_path(),
+        &database,
+    )
+    .expect("private deadline approval database");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
     let service = state.service();
     let admitted = service
-        .admit(admit_request())
+        .admit(AdmitRunRequest {
+            input: json!({"message": DEADLINE_CHILD_USER_INTENT}),
+            platform: "run_lifecycle_tests".to_string(),
+            ..AdmitRunRequest::default()
+        })
         .await
         .expect("admission should succeed");
     let started = Instant::now();
@@ -988,14 +1167,19 @@ async fn deadline_terminates_child_process_without_residue() {
         .run_worker(admitted.run_id.clone(), "ignored".to_string())
         .await;
     let elapsed = started.elapsed();
+    let terminals = terminal_events(&service, &admitted.run_id);
+    let reason = cancel_reason(&service, &admitted.run_id);
+    let owners_after_deadline = service.process_owner_count(&admitted.run_id);
+    let capability_closed = service.capability_host_closed(&admitted.run_id);
+    drop(service);
+    drop(state);
+    let fixture_cleanup = fixture_guard.cleanup();
 
-    assert_eq!(
-        terminal_events(&service, &admitted.run_id),
-        vec!["run.cancelled".to_string()]
-    );
-    assert_eq!(cancel_reason(&service, &admitted.run_id), "deadline");
-    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
-    assert!(service.capability_host_closed(&admitted.run_id));
+    assert_eq!(terminals, vec!["run.cancelled".to_string()]);
+    assert_eq!(reason, "deadline");
+    assert_eq!(owners_after_deadline, 0);
+    assert!(capability_closed);
+    fixture_cleanup.expect("remove private deadline workspace fixture");
     assert!(
         elapsed < Duration::from_secs(2),
         "deadline should not wait for the child sleep: {elapsed:?}"
