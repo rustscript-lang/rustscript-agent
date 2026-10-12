@@ -11,9 +11,11 @@ use rustscript_agent::runtime::{
 use rustscript_agent::{CancellationReason, RunCancellation};
 use rustscript_vm::Value;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -704,8 +706,175 @@ fn factory_validation_redacts_failures_and_disarms_cancellation() {
     assert!(!failed_setup.watcher_is_armed());
 }
 
+const AUTH_BUNDLE_OBSERVER_MARKER_ENV: &str = "AUTH_BUNDLE_OBSERVER_CHILD_MARKER";
+const AUTH_BUNDLE_OBSERVER_COMPLETION_PREFIX: &str = "AUTH_BUNDLE_OBSERVER_CHILD_COMPLETED:";
+const AUTH_BUNDLE_OBSERVER_OUTPUT_LIMIT: usize = 16 * 1024;
+
+fn auth_bundle_observer_case_key(test_name: &str) -> &'static str {
+    match test_name {
+        "imported_entry_cancellation_uses_child_token_and_cleans_the_epoch_watcher" => {
+            "child-token"
+        }
+        "imported_entry_cancels_during_native_oauth_wait_and_cleans_up" => "native-wait",
+        _ => panic!("unknown isolated auth bundle observer test"),
+    }
+}
+
+fn run_isolated_auth_bundle_observer(test_name: &str) -> Option<String> {
+    match std::env::var(AUTH_BUNDLE_OBSERVER_MARKER_ENV) {
+        Ok(marker) => {
+            assert!(marker.len() <= 128, "observer marker is bounded");
+            let mut fields = marker.splitn(4, ':');
+            assert_eq!(fields.next(), Some("auth-bundle-observer"));
+            let parent_id = fields
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .expect("observer marker has a parent process id");
+            assert_eq!(
+                fields.next(),
+                Some(auth_bundle_observer_case_key(test_name))
+            );
+            let nonce = fields.next().expect("observer marker has a nonce");
+            assert!(
+                uuid::Uuid::parse_str(nonce).is_ok(),
+                "observer nonce is owned"
+            );
+            assert_ne!(parent_id, std::process::id());
+            Some(marker)
+        }
+        Err(std::env::VarError::NotPresent) => {
+            run_auth_bundle_observer_child(test_name);
+            None
+        }
+        Err(_) => panic!("observer marker must be valid UTF-8"),
+    }
+}
+
+fn run_auth_bundle_observer_child(test_name: &str) {
+    let fixture_temp = std::env::var("RUSTSCRIPT_AGENT_TEST_TMP")
+        .expect("assigned fixture temp is required by FixtureHome");
+    assert!(
+        !fixture_temp.is_empty(),
+        "assigned fixture temp is nonempty"
+    );
+    let parent_id = std::process::id();
+    let marker = format!(
+        "auth-bundle-observer:{parent_id}:{}:{}",
+        auth_bundle_observer_case_key(test_name),
+        uuid::Uuid::new_v4()
+    );
+    assert!(marker.len() <= 128, "observer marker is bounded");
+
+    let executable = std::env::current_exe().expect("test executable path");
+    let mut child = Command::new(executable)
+        .args(["--exact", test_name, "--nocapture"])
+        .env_clear()
+        .env(AUTH_BUNDLE_OBSERVER_MARKER_ENV, &marker)
+        .env("RUSTSCRIPT_AGENT_TEST_TMP", fixture_temp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn exact isolated auth bundle observer test");
+    let stdout = child.stdout.take().expect("child stdout pipe");
+    let stderr = child.stderr.take().expect("child stderr pipe");
+    let stdout_reader = thread::spawn(move || drain_bounded_child_stream(stdout));
+    let stderr_reader = thread::spawn(move || drain_bounded_child_stream(stderr));
+
+    let rescue = Instant::now() + Duration::from_secs(12);
+    let mut rescued = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < rescue => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                rescued = true;
+                let _ = child.kill();
+                break;
+            }
+        }
+    }
+    let status = child.wait().expect("reap exact isolated auth bundle child");
+    let stdout = stdout_reader
+        .join()
+        .expect("join child stdout drainer")
+        .expect("drain child stdout");
+    let stderr = stderr_reader
+        .join()
+        .expect("join child stderr drainer")
+        .expect("drain child stderr");
+
+    assert!(
+        !rescued,
+        "isolated auth bundle child exceeded its rescue bound"
+    );
+    assert!(
+        status.success(),
+        "isolated auth bundle child exited successfully"
+    );
+    assert!(stdout.len() <= AUTH_BUNDLE_OBSERVER_OUTPUT_LIMIT);
+    assert!(stderr.len() <= AUTH_BUNDLE_OBSERVER_OUTPUT_LIMIT);
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    let test_line = format!("test {test_name} ...");
+    assert_eq!(
+        stdout.matches(&test_line).count(),
+        1,
+        "child ran the exact named test"
+    );
+    let completion = format!("{AUTH_BUNDLE_OBSERVER_COMPLETION_PREFIX}{marker}");
+    assert_eq!(
+        stdout.matches(&completion).count(),
+        1,
+        "child returned its parent-owned marker"
+    );
+    let summary = stdout
+        .lines()
+        .find(|line| line.starts_with("test result:"))
+        .map(str::trim)
+        .expect("exact child test emitted a result summary");
+    assert!(
+        summary.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+            && summary.contains(" filtered out; finished in "),
+        "exact child test must report exactly one passing test"
+    );
+    let control_summary = if test_name
+        == "imported_entry_cancels_during_native_oauth_wait_and_cleans_up"
+    {
+        assert!(
+                stdout.contains(
+                    "auth-bundle observer control: live_count=1, zero_while_live=false, zero_after_join=true"
+                ),
+                "native-wait child must verify the live-watcher negative control"
+            );
+        "; live-watcher control verified (1/false/true)"
+    } else {
+        ""
+    };
+    println!(
+        "isolated auth bundle child verified: test={test_name}; status=success; {summary}; owned marker verified{control_summary}"
+    );
+}
+
+fn drain_bounded_child_stream(mut stream: impl Read) -> io::Result<Vec<u8>> {
+    let mut captured = Vec::with_capacity(AUTH_BUNDLE_OBSERVER_OUTPUT_LIMIT);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        let remaining = AUTH_BUNDLE_OBSERVER_OUTPUT_LIMIT - captured.len();
+        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
 #[test]
 fn imported_entry_cancellation_uses_child_token_and_cleans_the_epoch_watcher() {
+    let Some(observer_marker) = run_isolated_auth_bundle_observer(
+        "imported_entry_cancellation_uses_child_token_and_cleans_the_epoch_watcher",
+    ) else {
+        return;
+    };
     let sources = [
         (
             "main.rss",
@@ -720,11 +889,12 @@ fn imported_entry_cancellation_uses_child_token_and_cleans_the_epoch_watcher() {
     let child_capture = Arc::clone(&child_slot);
     let request = cancellation.clone();
     let observer = thread::spawn(move || {
+        let observed = wait_for_epoch_watcher(Duration::from_secs(3));
+        request.request(CancellationReason::Requested);
         assert!(
-            wait_for_epoch_watcher(Duration::from_secs(3)),
+            observed.expect("read epoch watcher task table"),
             "bundle run arms a finite watcher"
         );
-        request.request(CancellationReason::Requested);
     });
     let result = runner.run_with_host_factory(input("spin", None), &cancellation, {
         let home = home.0.clone();
@@ -750,8 +920,17 @@ fn imported_entry_cancellation_uses_child_token_and_cleans_the_epoch_watcher() {
             .is_some_and(|child| { child.requested() == Some(CancellationReason::Requested) })
     );
     assert!(!cancellation.watcher_is_armed());
-    assert_eq!(epoch_watcher_count(), 0);
+    assert!(
+        wait_for_no_epoch_watchers(Duration::from_secs(3))
+            .expect("read epoch watcher task table after join"),
+        "joined epoch watcher becomes invisible within the bounded observation"
+    );
+    assert_eq!(
+        epoch_watcher_count().expect("read epoch watcher count after join"),
+        0
+    );
     cleanup_home(&home.0);
+    println!("{AUTH_BUNDLE_OBSERVER_COMPLETION_PREFIX}{observer_marker}");
 }
 
 struct CancellationAwareTransport {
@@ -774,6 +953,11 @@ impl BoundedHttpsTransport for CancellationAwareTransport {
 
 #[test]
 fn imported_entry_cancels_during_native_oauth_wait_and_cleans_up() {
+    let Some(observer_marker) = run_isolated_auth_bundle_observer(
+        "imported_entry_cancels_during_native_oauth_wait_and_cleans_up",
+    ) else {
+        return;
+    };
     let sources = [
         (
             "main.rss",
@@ -827,11 +1011,15 @@ pub fn wait(home: resource<auth.host_home>) -> map {
     let observer = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(3);
         let observed = loop {
-            if started_by_transport.load(Ordering::Acquire) && epoch_watcher_count() > 0 {
-                break true;
+            if started_by_transport.load(Ordering::Acquire) {
+                match epoch_watcher_count() {
+                    Ok(count) if count > 0 => break Ok(true),
+                    Ok(_) => {}
+                    Err(error) => break Err(error),
+                }
             }
             if Instant::now() >= deadline {
-                break false;
+                break Ok(false);
             }
             thread::sleep(Duration::from_millis(2));
         };
@@ -842,7 +1030,12 @@ pub fn wait(home: resource<auth.host_home>) -> map {
         let home = home.0.clone();
         move |child| AuthHost::new(home, child).map(|host| host.with_oauth_host(oauth))
     });
-    assert!(observer.join().expect("native-wait observer"));
+    assert!(
+        observer
+            .join()
+            .expect("native-wait observer")
+            .expect("read epoch watcher task table in native-wait observer")
+    );
     assert!(
         started.load(Ordering::Acquire),
         "native transport reached its cancellable wait"
@@ -852,34 +1045,116 @@ pub fn wait(home: resource<auth.host_home>) -> map {
         Err(AuthEntryError::Cancelled(CancellationReason::Requested))
     ));
     assert!(!cancellation.watcher_is_armed());
-    assert_eq!(epoch_watcher_count(), 0);
+    assert!(
+        wait_for_no_epoch_watchers(Duration::from_secs(3))
+            .expect("read epoch watcher task table after join"),
+        "joined epoch watcher becomes invisible within the bounded observation"
+    );
+    assert_eq!(
+        epoch_watcher_count().expect("read epoch watcher count after join"),
+        0
+    );
+    #[cfg(target_os = "linux")]
+    assert_live_epoch_watcher_observer_control();
     cleanup_home(&home.0);
+    println!("{AUTH_BUNDLE_OBSERVER_COMPLETION_PREFIX}{observer_marker}");
 }
 
-fn wait_for_epoch_watcher(timeout: Duration) -> bool {
+fn wait_for_epoch_watcher(timeout: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
-        if epoch_watcher_count() > 0 {
-            return true;
+        if epoch_watcher_count()? > 0 {
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(2));
     }
 }
 
-fn epoch_watcher_count() -> usize {
-    let Ok(tasks) = fs::read_dir("/proc/self/task") else {
-        return 0;
-    };
-    tasks
-        .filter_map(Result::ok)
-        .filter(|task| {
-            fs::read_to_string(task.path().join("comm"))
-                .is_ok_and(|name| name.starts_with("run-epoch"))
+fn wait_for_no_epoch_watchers(timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if epoch_watcher_count()? == 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn epoch_watcher_count() -> io::Result<usize> {
+    let mut count = 0;
+    for task in fs::read_dir("/proc/self/task")? {
+        let task = task?;
+        let task_path = task.path();
+        match fs::read_to_string(task_path.join("comm")) {
+            Ok(name) if name.starts_with("run-epoch") => count += 1,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if task_path.try_exists()? {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epoch_watcher_count() -> io::Result<usize> {
+    Ok(0)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_live_epoch_watcher_observer_control() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let watcher = thread::Builder::new()
+        .name("run-epoch-watcher".to_owned())
+        .spawn(move || {
+            started_sender
+                .send(())
+                .expect("signal named watcher control readiness");
+            release_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bounded release for named watcher control");
         })
-        .count()
+        .expect("spawn named watcher observer control");
+
+    let started = started_receiver.recv_timeout(Duration::from_secs(3));
+    let live_count = epoch_watcher_count();
+    let zero_while_live = wait_for_no_epoch_watchers(Duration::from_secs(3));
+    let released = release_sender.send(());
+    let joined = watcher.join();
+
+    assert!(started.is_ok(), "named watcher control must start");
+    let live_count = live_count.expect("read live named watcher count");
+    assert_eq!(live_count, 1, "a live named watcher must be counted");
+    let zero_while_live = zero_while_live.expect("read live watcher during bounded zero check");
+    assert!(
+        !zero_while_live,
+        "bounded zero observer must reject a genuinely live named watcher"
+    );
+    assert!(
+        released.is_ok(),
+        "release the bounded named watcher control"
+    );
+    joined.expect("join named watcher observer control");
+    let zero_after_join = wait_for_no_epoch_watchers(Duration::from_secs(3))
+        .expect("read epoch watcher task table after join");
+    assert!(
+        zero_after_join,
+        "bounded zero observer must succeed after named watcher termination and join"
+    );
+    println!(
+        "auth-bundle observer control: live_count={live_count}, zero_while_live={zero_while_live}, zero_after_join={zero_after_join}"
+    );
 }
 
 #[test]
