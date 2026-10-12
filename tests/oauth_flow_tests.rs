@@ -32,7 +32,6 @@ const DEVICE_ID: &str = "SYNTHETIC_DEVICE_ID";
 fn policy() -> TrustedTransportPolicy {
     TrustedTransportPolicy {
         generation: 1,
-        transport_identity: None,
         run_id: "oauth-primitive-run".to_string(),
         deadline: Instant::now() + Duration::from_secs(60),
         endpoints: vec![

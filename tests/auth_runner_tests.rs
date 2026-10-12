@@ -6,6 +6,7 @@ use rustscript_vm::{
     compile_source_with_flavor_and_options,
 };
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier, mpsc};
@@ -425,6 +426,19 @@ fn run_cancellation_helper(case: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let diagnostics = String::from_utf8_lossy(&output.stdout);
+    let child_summary = diagnostics
+        .lines()
+        .find(|line| line.starts_with("test result:"))
+        .expect("CPU-loop helper must report its test summary");
+    println!("CPU helper child case={case}: {child_summary}");
+    if case == "reuse-requested-root" {
+        let control = diagnostics
+            .lines()
+            .find(|line| line.contains("epoch-watcher observer control:"))
+            .expect("reused-parent helper must report its live-thread control");
+        println!("{control}");
+    }
 }
 
 fn cleanup_cpu_helper_homes(process_id: u32) {
@@ -477,8 +491,14 @@ fn run_cpu_case_in_helper(case: &str) {
                 )
                 .expect("success run under shared parent");
             assert!(!parent.watcher_is_armed());
-            assert_eq!(epoch_watcher_count(), 0);
+            assert!(
+                wait_for_no_epoch_watchers(Duration::from_secs(3))
+                    .expect("read epoch watcher task table"),
+                "successful invocation watcher must be joined"
+            );
         }
+        #[cfg(target_os = "linux")]
+        assert_live_epoch_watcher_observer_control();
         cleanup_home(&home);
     }
 
@@ -490,7 +510,8 @@ fn run_cpu_case_in_helper(case: &str) {
     let request_cancellation = parent.clone();
     let requests = case.starts_with("requested-") || reuses_parent;
     let observer = thread::spawn(move || {
-        let observed = wait_for_epoch_watcher_count(1, Duration::from_secs(3));
+        let observed = wait_for_epoch_watcher_count(1, Duration::from_secs(3))
+            .expect("read epoch watcher task table");
         if requests {
             if observed {
                 thread::sleep(Duration::from_millis(10));
@@ -524,10 +545,55 @@ fn run_cpu_case_in_helper(case: &str) {
         !parent.watcher_is_armed(),
         "parent watcher must remain untouched"
     );
-    assert_eq!(
-        epoch_watcher_count(),
-        0,
+    assert!(
+        wait_for_no_epoch_watchers(Duration::from_secs(3)).expect("read epoch watcher task table"),
         "invocation watcher must be joined"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_live_epoch_watcher_observer_control() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let watcher = thread::Builder::new()
+        .name("run-epoch-watcher".to_owned())
+        .spawn(move || {
+            started_sender
+                .send(())
+                .expect("signal named watcher control readiness");
+            release_receiver
+                .recv_timeout(Duration::from_secs(9))
+                .expect("bounded release for named watcher control");
+        })
+        .expect("spawn named watcher observer control");
+
+    let started = started_receiver.recv_timeout(Duration::from_secs(3));
+    let live_count = epoch_watcher_count();
+    let zero_while_live = wait_for_no_epoch_watchers(Duration::from_secs(3));
+    let released = release_sender.send(());
+    let joined = watcher.join();
+
+    assert!(started.is_ok(), "named watcher control must start");
+    let live_count = live_count.expect("read live named watcher count");
+    assert_eq!(live_count, 1, "a live named watcher must be counted");
+    let zero_while_live = zero_while_live.expect("read live watcher during bounded zero check");
+    assert!(
+        !zero_while_live,
+        "bounded zero observer must reject a genuinely live named watcher"
+    );
+    assert!(
+        released.is_ok(),
+        "release the bounded named watcher control"
+    );
+    joined.expect("join named watcher observer control");
+    let zero_after_join = wait_for_no_epoch_watchers(Duration::from_secs(3))
+        .expect("read epoch watcher task table after join");
+    assert!(
+        zero_after_join,
+        "bounded zero observer must succeed after named watcher termination and join"
+    );
+    println!(
+        "epoch-watcher observer control: live_count={live_count}, zero_while_live={zero_while_live}, zero_after_join={zero_after_join}"
     );
 }
 
@@ -555,7 +621,8 @@ fn run_concurrent_cpu_cases(runner: Arc<AuthEntryRunner>, home: PathBuf, parent:
     }
     drop(result_sender);
     gate.wait();
-    let observed = wait_for_epoch_watcher_count(2, Duration::from_secs(3));
+    let observed = wait_for_epoch_watcher_count(2, Duration::from_secs(3))
+        .expect("read epoch watcher task table");
     parent.request(CancellationReason::Requested);
 
     let receive_deadline = Instant::now() + Duration::from_secs(9);
@@ -596,37 +663,61 @@ fn run_concurrent_cpu_cases(runner: Arc<AuthEntryRunner>, home: PathBuf, parent:
         !parent.watcher_is_armed(),
         "the shared request root owns no invocation watcher"
     );
-    assert_eq!(
-        epoch_watcher_count(),
-        0,
+    assert!(
+        wait_for_no_epoch_watchers(Duration::from_secs(3)).expect("read epoch watcher task table"),
         "both invocation watchers must be joined"
     );
 }
 
-fn wait_for_epoch_watcher_count(expected: usize, timeout: Duration) -> bool {
+fn wait_for_epoch_watcher_count(expected: usize, timeout: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
-        if epoch_watcher_count() >= expected {
-            return true;
+        if epoch_watcher_count()? >= expected {
+            return Ok(true);
         }
         if Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(2));
     }
 }
 
-fn epoch_watcher_count() -> usize {
-    let Ok(tasks) = fs::read_dir("/proc/self/task") else {
-        return 0;
-    };
-    tasks
-        .filter_map(Result::ok)
-        .filter(|task| {
-            fs::read_to_string(task.path().join("comm"))
-                .is_ok_and(|name| name.starts_with("run-epoch"))
-        })
-        .count()
+fn wait_for_no_epoch_watchers(timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if epoch_watcher_count()? == 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn epoch_watcher_count() -> io::Result<usize> {
+    let mut count = 0;
+    for task in fs::read_dir("/proc/self/task")? {
+        let task = task?;
+        let task_path = task.path();
+        match fs::read_to_string(task_path.join("comm")) {
+            Ok(name) if name.starts_with("run-epoch") => count += 1,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if task_path.try_exists()? {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epoch_watcher_count() -> io::Result<usize> {
+    Ok(0)
 }
 
 #[test]

@@ -119,7 +119,6 @@ impl BrowserOpener for RedirectingBrowser {
 fn policy() -> TrustedTransportPolicy {
     TrustedTransportPolicy {
         generation: 1,
-        transport_identity: None,
         run_id: "native-loopback-tests".into(),
         deadline: Instant::now() + Duration::from_secs(10),
         endpoints: vec![TrustedEndpoint {

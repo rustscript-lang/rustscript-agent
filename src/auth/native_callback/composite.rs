@@ -152,13 +152,14 @@ fn transport(message: &'static str) -> OAuthError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::auth::native_callback) mod tests {
     use std::{
         ffi::c_char,
         fs::File,
-        io::Write,
+        io::{Read, Write},
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
         path::PathBuf,
+        process::{Command, Stdio},
         sync::{
             Arc, Barrier,
             atomic::{AtomicBool, Ordering},
@@ -331,8 +332,219 @@ mod tests {
         );
     }
 
+    const RESOURCE_CHILD_ENV: &str = "RUSTSCRIPT_TEST_NATIVE_CALLBACK_COMPOSITE_CHILD";
+    const RESOURCE_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
+    const RESOURCE_CHILD_OUTPUT_LIMIT: usize = 16 * 1024;
+
+    #[derive(Clone, Copy)]
+    pub(in crate::auth::native_callback) enum ExpectedChildResult {
+        Pass,
+        AssertionFailure(&'static str),
+    }
+
+    struct ChildResult {
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        timed_out: bool,
+        output_truncated: bool,
+    }
+
+    fn capture_child_output(mut reader: impl Read) -> (Vec<u8>, bool) {
+        let mut captured = Vec::new();
+        let mut truncated = false;
+        let mut buffer = [0_u8; 2048];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let remaining = RESOURCE_CHILD_OUTPUT_LIMIT.saturating_sub(captured.len());
+                    captured.extend_from_slice(&buffer[..read.min(remaining)]);
+                    truncated |= read > remaining;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        (captured, truncated)
+    }
+
+    pub(in crate::auth::native_callback) fn run_resource_test_child(
+        test_name: &str,
+        expected: ExpectedChildResult,
+    ) -> bool {
+        if let Some(marker) = std::env::var_os(RESOURCE_CHILD_ENV) {
+            let marker = marker.to_string_lossy();
+            let (parent, selected_test) = marker
+                .split_once('|')
+                .expect("resource-observation child marker shape");
+            let parent = parent
+                .parse::<u32>()
+                .expect("resource-observation parent process id");
+            let args = std::env::args().collect::<Vec<_>>();
+            assert_eq!(parent, unsafe { libc::getppid() as u32 });
+            assert_ne!(parent, std::process::id());
+            assert!(
+                args.windows(2)
+                    .any(|pair| { pair[0] == "--exact" && pair[1] == test_name })
+            );
+            assert_eq!(selected_test, test_name);
+            return false;
+        }
+
+        let executable = std::env::current_exe().expect("current test executable");
+        let marker = format!("{}|{test_name}", std::process::id());
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .current_dir(std::env::current_dir().expect("test working directory"))
+            .env_clear()
+            .env(RESOURCE_CHILD_ENV, marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated native callback resource test");
+        let stdout = child.stdout.take().expect("isolated child stdout");
+        let stderr = child.stderr.take().expect("isolated child stderr");
+        let stdout_reader = thread::spawn(move || capture_child_output(stdout));
+        let stderr_reader = thread::spawn(move || capture_child_output(stderr));
+        let deadline = Instant::now() + RESOURCE_CHILD_TIMEOUT;
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) => {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child.wait().expect("reap timed-out resource-test child");
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("failed to observe isolated resource-test child status");
+                }
+            }
+        };
+        let (stdout, stdout_truncated) =
+            stdout_reader.join().expect("capture isolated child stdout");
+        let (stderr, stderr_truncated) =
+            stderr_reader.join().expect("capture isolated child stderr");
+        let result = ChildResult {
+            status,
+            stdout,
+            stderr,
+            timed_out,
+            output_truncated: stdout_truncated || stderr_truncated,
+        };
+        assert!(
+            child_result_is_valid(test_name, expected, &result),
+            "isolated native callback child did not meet its expected result: {}",
+            sanitized_child_result(test_name, &result)
+        );
+        true
+    }
+
+    fn child_result_is_valid(
+        test_name: &str,
+        expected: ExpectedChildResult,
+        result: &ChildResult,
+    ) -> bool {
+        if result.timed_out || result.output_truncated {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let lines = stdout.lines().chain(stderr.lines()).collect::<Vec<_>>();
+        let run_once = lines
+            .iter()
+            .filter(|line| **line == "running 1 test")
+            .count()
+            == 1;
+        let passed = format!("test {test_name} ... ok");
+        let failed = format!("test {test_name} ... FAILED");
+        match expected {
+            ExpectedChildResult::Pass => {
+                result.status.success()
+                    && run_once
+                    && lines.iter().filter(|line| **line == passed).count() == 1
+                    && lines.iter().any(|line| {
+                        line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                    })
+            }
+            ExpectedChildResult::AssertionFailure(witness) => {
+                result.status.code() == Some(101)
+                    && run_once
+                    && lines.iter().filter(|line| **line == failed).count() == 1
+                    && lines.iter().any(|line| {
+                        line.starts_with("test result: FAILED. 0 passed; 1 failed; 0 ignored;")
+                    })
+                    && stderr.contains(witness)
+                    && stderr.contains("assertion `left == right` failed")
+                    && stderr.contains("left: 1")
+                    && stderr.contains("right: -1")
+            }
+        }
+    }
+
+    fn sanitized_child_result(test_name: &str, result: &ChildResult) -> String {
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let mut safe_lines = Vec::new();
+        for line in stdout.lines().chain(stderr.lines()) {
+            if line == "running 1 test"
+                || line == "running 0 tests"
+                || line == format!("test {test_name} ... ok")
+                || line == format!("test {test_name} ... FAILED")
+                || line.starts_with("test result:")
+            {
+                safe_lines.push(line.to_string());
+            }
+        }
+        if stderr.contains("panicked at ") {
+            safe_lines.push("stderr: panic observed (details suppressed)".to_string());
+        }
+        if stderr.contains("assertion `left == right` failed") {
+            safe_lines.push("stderr: assertion `left == right` failed".to_string());
+        }
+        for witness in ["numeric-fd-reuse-established", "leaked-open-fd-established"] {
+            if stderr.contains(witness) {
+                safe_lines.push(format!("stderr: {witness}"));
+            }
+        }
+        if stderr.contains("left: 1") && stderr.contains("right: -1") {
+            safe_lines
+                .push("stderr: observed numeric descriptor result 1 versus EBADF -1".to_string());
+        }
+        format!(
+            "exit={:?}, timed_out={}, output_truncated={}, stdout_bytes={}, stderr_bytes={}, sanitized=[{}]",
+            result.status.code(),
+            result.timed_out,
+            result.output_truncated,
+            result.stdout.len(),
+            result.stderr.len(),
+            safe_lines.join(" | ")
+        )
+    }
+
     #[test]
     fn deadline_after_redirect_allocation_releases_reserved_fd_and_socket() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::deadline_after_redirect_allocation_releases_reserved_fd_and_socket"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let raw_fd = reader.as_raw_fd();
         let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
@@ -349,6 +561,15 @@ mod tests {
 
     #[test]
     fn browser_prepare_does_not_consume_manual_fd_and_manual_reserves_it_once() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::browser_prepare_does_not_consume_manual_fd_and_manual_reserves_it_once"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
         let (context, _, _) = context();
@@ -378,6 +599,15 @@ mod tests {
 
     #[test]
     fn manual_and_none_modes_forward_exact_host_url_once() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::manual_and_none_modes_forward_exact_host_url_once"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         for mode in [CallbackMode::Manual, CallbackMode::None] {
             let (reader, writer) = pipe_pair();
             let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
@@ -402,6 +632,15 @@ mod tests {
 
     #[test]
     fn concurrent_manual_preparation_reserves_the_single_fd_once() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::concurrent_manual_preparation_reserves_the_single_fd_once"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let inputs = Arc::new(NativeCallbackInputs::new(Some(reader)).expect("own manual input"));
         let (context, _, _) = context();
@@ -436,6 +675,15 @@ mod tests {
 
     #[test]
     fn revoking_pending_manual_read_cancels_wait_and_releases_owned_resources() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::revoking_pending_manual_read_cancels_wait_and_releases_owned_resources"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let fd = reader.as_raw_fd();
         let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
@@ -461,6 +709,15 @@ mod tests {
 
     #[test]
     fn host_cancellation_during_pending_manual_read_closes_input_and_redirect() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::host_cancellation_during_pending_manual_read_closes_input_and_redirect"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let fd = reader.as_raw_fd();
         let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
@@ -493,6 +750,15 @@ mod tests {
 
     #[test]
     fn deadline_during_pending_manual_read_closes_input_and_redirect() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::deadline_during_pending_manual_read_closes_input_and_redirect"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let fd = reader.as_raw_fd();
         let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
@@ -512,6 +778,15 @@ mod tests {
 
     #[test]
     fn revoking_before_wait_closes_idle_fd_and_redirect_listener() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::revoking_before_wait_closes_idle_fd_and_redirect_listener"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let fd = reader.as_raw_fd();
         let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
@@ -529,6 +804,15 @@ mod tests {
 
     #[test]
     fn panic_during_manual_wait_still_revokes_fd_and_redirect_listener() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::panic_during_manual_wait_still_revokes_fd_and_redirect_listener"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, _writer) = pipe_pair();
         let fd = reader.as_raw_fd();
         let inputs = NativeCallbackInputs::new(Some(reader)).expect("own manual input");
@@ -549,6 +833,15 @@ mod tests {
 
     #[test]
     fn pty_manual_read_suppresses_echo_and_restores_flags_and_termios() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::pty_manual_read_suppresses_echo_and_restores_flags_and_termios"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (master, slave) = pty_pair();
         let input_fd = slave.as_raw_fd();
         let observer = duplicate(input_fd);
@@ -608,5 +901,73 @@ mod tests {
         assert_termios_restored(&termios(observer.as_raw_fd()), &original_termios);
         assert_fd_closed(input_fd);
         assert_port_released(&redirect);
+    }
+
+    #[test]
+    fn numeric_fd_reuse_is_a_deterministic_native_close_red_case() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::numeric_fd_reuse_is_a_deterministic_native_close_red_case"
+            ),
+            ExpectedChildResult::AssertionFailure("numeric-fd-reuse-established"),
+        ) {
+            return;
+        }
+        let (reader, writer) = pipe_pair();
+        let input_fd = reader.as_raw_fd();
+        let inputs = NativeCallbackInputs::new(Some(reader)).expect("own native manual input");
+        let (context, _, _) = context();
+        let session = inputs
+            .prepare(CallbackMode::Manual, &context)
+            .expect("manual preparation")
+            .expect("prepared session");
+        let mut writer = File::from(writer);
+        writer
+            .write_all(b"callback-test-value\n")
+            .expect("write bounded test input");
+        drop(writer);
+        let result = session
+            .wait_one(&context)
+            .expect("native input reader closes after one callback");
+        assert!(matches!(
+            result,
+            RawCallbackInput::ManualUrl(value) if value == "callback-test-value"
+        ));
+        drop(session);
+        drop(inputs);
+
+        // Prove the native owner already closed the original descriptor before
+        // forcing an unrelated descriptor to reuse the exact integer.
+        assert_fd_closed(input_fd);
+        let replacement =
+            unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert_eq!(replacement, input_fd, "force exact descriptor-number reuse");
+        let _replacement = unsafe { OwnedFd::from_raw_fd(replacement) };
+        eprintln!("numeric-fd-reuse-established");
+        assert_fd_closed(input_fd);
+    }
+
+    #[test]
+    fn leaked_open_fd_negative_control_keeps_closed_assertion_strict() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::composite::tests",
+                "::leaked_open_fd_negative_control_keeps_closed_assertion_strict"
+            ),
+            ExpectedChildResult::AssertionFailure("leaked-open-fd-established"),
+        ) {
+            return;
+        }
+        let (reader, _writer) = pipe_pair();
+        let input_fd = reader.as_raw_fd();
+        let inputs = NativeCallbackInputs::new(Some(reader)).expect("own native manual input");
+
+        // Test-only leaked-owner mutant: the still-open fd exists only in this
+        // expected-failure child and is reclaimed when that process exits.
+        std::mem::forget(inputs);
+        assert!(unsafe { libc::fcntl(input_fd, libc::F_GETFD) } >= 0);
+        eprintln!("leaked-open-fd-established");
+        assert_fd_closed(input_fd);
     }
 }
