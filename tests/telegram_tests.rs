@@ -1006,19 +1006,56 @@ async fn adapter_deduplicates_duplicate_updates_and_messages() {
 #[tokio::test]
 async fn adapter_commands_new_status_compact_respond_explicitly() {
     let (base, state) = spawn_fixture().await;
+    let release = hold_first_send(&state, "New conversation started.");
     push_update(&state, fixture_json("updates_commands.json"));
     let db = telegram_db_path("commands");
     let gateway = test_state(ECHO_SOURCE, &db, |config| config);
     let adapter = spawn_adapter(gateway.clone(), test_config(&base)).await;
     wait_until(std::time::Duration::from_secs(15), || {
-        adapter.processed_updates() >= 3
-    })
-    .await;
-    wait_until(std::time::Duration::from_secs(15), || {
         state
             .sent_texts()
             .iter()
             .any(|text| text.contains("New conversation started"))
+    })
+    .await;
+
+    let persistence = gateway.persistence().expect("persistence");
+    let session_id = "telegram:fixture_bot:555:";
+    let session_before = persistence
+        .session_get(session_id)
+        .expect("fresh session read");
+    let generation_before = session_before["rows"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(7))
+        .and_then(Value::as_i64)
+        .expect("fresh session generation");
+    let messages_before = persistence
+        .message_list(session_id, 0)
+        .expect("fresh session messages read")["rows"]
+        .as_array()
+        .expect("fresh session message rows")
+        .clone();
+    assert!(
+        messages_before.is_empty(),
+        "/new must leave the fresh session without model messages: {messages_before:?}"
+    );
+    let compactions_before = persistence
+        .compaction_latest(session_id)
+        .expect("fresh session compactions read")["rows"]
+        .as_array()
+        .expect("fresh session compaction rows")
+        .clone();
+    assert!(
+        compactions_before.is_empty(),
+        "/new must leave the fresh session without a compaction summary: {compactions_before:?}"
+    );
+    release
+        .send(())
+        .expect("release the deterministic new-command send barrier");
+
+    wait_until(std::time::Duration::from_secs(15), || {
+        adapter.processed_updates() >= 3
     })
     .await;
     let sends = state.sent_texts();
@@ -1029,17 +1066,54 @@ async fn adapter_commands_new_status_compact_respond_explicitly() {
                 && text.contains("no runs yet")),
         "/status must describe the fresh session: {sends:?}"
     );
-    let compact = sends
+    let compact_replies = sends
         .iter()
-        .find(|text| text.contains("/compact"))
-        .expect("/compact must reply");
-    assert!(
-        compact.contains("not available") || compact.contains("blocked"),
-        "/compact must be explicitly unavailable, got: {compact}"
+        .filter(|text| text.starts_with("Compaction "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_replies.len(),
+        1,
+        "one /compact command must produce exactly one reply: {sends:?}"
     );
-    assert!(
-        !compact.contains("completed"),
-        "/compact must not advertise itself as done: {compact}"
+    let expected_compact_reply = format!("Compaction skipped at generation {generation_before}.");
+    assert_eq!(
+        compact_replies[0].as_str(),
+        expected_compact_reply,
+        "empty fresh-session compaction must report its exact skipped status"
+    );
+
+    let session_after = persistence
+        .session_get(session_id)
+        .expect("session after compaction read");
+    let generation_after = session_after["rows"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(7))
+        .and_then(Value::as_i64)
+        .expect("session generation after compaction");
+    assert_eq!(
+        generation_after, generation_before,
+        "a skipped empty-history compaction must preserve durable generation"
+    );
+    let messages_after = persistence
+        .message_list(session_id, 0)
+        .expect("session messages after compaction read")["rows"]
+        .as_array()
+        .expect("message rows after compaction")
+        .clone();
+    assert_eq!(
+        messages_after, messages_before,
+        "a skipped compaction must not fabricate messages"
+    );
+    let compactions_after = persistence
+        .compaction_latest(session_id)
+        .expect("session compactions after compaction read")["rows"]
+        .as_array()
+        .expect("compaction rows after compaction")
+        .clone();
+    assert_eq!(
+        compactions_after, compactions_before,
+        "a skipped compaction must not persist a summary"
     );
     adapter.shutdown().await;
     gateway.cleanup();
