@@ -824,6 +824,12 @@ pub struct AgentService {
     inner: Arc<AgentServiceInner>,
 }
 
+#[derive(Clone, Default)]
+struct AuthHostFactoryPair {
+    legacy_top_level: Option<crate::runtime::agent_host::AuthHostFactory>,
+    provider_child: Option<crate::runtime::agent_host::AuthHostFactory>,
+}
+
 struct AgentServiceInner {
     config: Arc<AgentGatewayConfig>,
     compaction_settings: CompactionSettings,
@@ -859,9 +865,9 @@ struct AgentServiceInner {
     compaction_worker_panic: Mutex<Option<String>>,
     #[cfg(test)]
     compaction_maintenance_published: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Native auth construction installed by the owning process. Each VM
-    /// receives the factory and creates its own invocation-scoped AuthHost.
-    auth_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
+    /// Legacy and provider-child auth factories are one configuration
+    /// snapshot so worker admission cannot observe an interleaved pair.
+    auth_host_factories: Mutex<AuthHostFactoryPair>,
     /// Workspace admission uses a separate trusted-home factory so opting
     /// into filesystem policy never opts provider RSS into OAuth authority.
     workspace_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
@@ -955,7 +961,7 @@ impl AgentService {
             compaction_worker_panic: Mutex::new(None),
             #[cfg(test)]
             compaction_maintenance_published: Mutex::new(None),
-            auth_host_factory: Mutex::new(None),
+            auth_host_factories: Mutex::new(AuthHostFactoryPair::default()),
             workspace_host_factory: Mutex::new(None),
             trusted_legacy_workspace_root: RwLock::new(None),
             runner: Mutex::new(None),
@@ -1020,11 +1026,26 @@ impl AgentService {
                 + Sync,
         >,
     ) {
-        *self
+        let mut factories = self
             .inner
-            .auth_host_factory
+            .auth_host_factories
             .lock()
-            .expect("auth host factory lock") = Some(factory);
+            .expect("auth host factory lock");
+        factories.legacy_top_level = Some(Arc::clone(&factory));
+        factories.provider_child = Some(factory);
+    }
+
+    /// Installs a native factory only for the default provider's child RSS
+    /// invocation. Top-level RSS auth and workspace admission are unchanged.
+    pub(crate) fn set_provider_auth_host_factory(
+        &self,
+        factory: crate::runtime::agent_host::AuthHostFactory,
+    ) {
+        self.inner
+            .auth_host_factories
+            .lock()
+            .expect("auth host factory lock")
+            .provider_child = Some(factory);
     }
 
     /// Installs only the trusted-home factory used by workspace admission.
@@ -4960,14 +4981,14 @@ impl AgentService {
                 .lock()
                 .expect("provider host lock")
                 .take();
-            let auth_host_factory = self
+            let auth_host_factories = self
                 .inner
-                .auth_host_factory
+                .auth_host_factories
                 .lock()
                 .expect("auth host factory lock")
                 .clone();
             let raw_provider = provider_override.unwrap_or_else(|| {
-                if let Some(factory) = auth_host_factory.clone() {
+                if let Some(factory) = auth_host_factories.provider_child.clone() {
                     crate::runtime::rss_runner::default_agent_provider_host_with_auth_factory(Some(
                         factory,
                     ))
@@ -4987,7 +5008,7 @@ impl AgentService {
             )) as Arc<dyn AgentProviderHost>);
             let host = AgentHostBridges {
                 provider,
-                auth_host_factory,
+                auth_host_factory: auth_host_factories.legacy_top_level,
                 cancellation: Some(cancellation.clone()),
                 sleeps: Default::default(),
                 skip_sleep: false,

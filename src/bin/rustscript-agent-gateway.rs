@@ -10,7 +10,7 @@ use std::{
 
 use rustscript_agent::{
     AgentGatewayConfig, AgentGatewayState, ConfigFile, TelegramConfig, build_agent_gateway_app,
-    config_file::{CompactionSettings, ConfigFileError},
+    config_file::{AgentPaths, CompactionSettings, ConfigFileError},
     gateway::telegram::{TelegramAdapter, spawn_telegram_adapter},
 };
 
@@ -51,13 +51,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telegram: telegram.clone(),
         ..AgentGatewayConfig::default()
     };
-    let (config_present, config_source, compaction_settings) = match ConfigFile::load_from_home() {
-        Ok(config) => (true, Some(config.agent.source), config.compaction),
-        Err(ConfigFileError::MissingFile { .. }) => (false, None, CompactionSettings::default()),
-        Err(_) => {
-            return Err(std::io::Error::other("agent config.yaml could not be loaded").into());
-        }
-    };
+    let explicit_home = env::var_os("RUSTSCRIPT_AGENT_HOME").is_some();
+    let paths = AgentPaths::resolve()
+        .map_err(|_| std::io::Error::other("agent home could not be resolved"))?;
+    let (config_present, config_source, compaction_settings) =
+        match ConfigFile::load(paths.config_path()) {
+            Ok(config) => (true, Some(config.agent.source), config.compaction),
+            Err(ConfigFileError::MissingFile { .. }) => {
+                (false, None, CompactionSettings::default())
+            }
+            Err(_) => {
+                return Err(std::io::Error::other("agent config.yaml could not be loaded").into());
+            }
+        };
     if let Some(hosts) = env_value("RUSTSCRIPT_AGENT_ALLOW_HOSTS", "PD_EDGE_AGENT_ALLOW_HOSTS")? {
         config.http.allowed_hosts = split_list(&hosts);
     }
@@ -182,15 +188,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compaction_settings,
     )
     .map_err(std::io::Error::other)?;
-    let state = match std::env::var_os("RUSTSCRIPT_AGENT_HOME") {
-        Some(home) => {
-            let home = std::path::PathBuf::from(home);
-            if home.as_os_str().is_empty() {
-                return Err("RUSTSCRIPT_AGENT_HOME must not be blank".into());
-            }
-            state.with_workspace_home(home)
-        }
-        None => state,
+    let home = paths.home.clone();
+    let state = state
+        .with_operator_auth_home(home.clone())
+        .map_err(std::io::Error::other)?;
+    let state = if explicit_home {
+        state.with_workspace_home(home)
+    } else {
+        state
     };
 
     let listener = tokio::net::TcpListener::bind(address).await?;

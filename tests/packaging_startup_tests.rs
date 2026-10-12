@@ -706,6 +706,28 @@ async fn http_get(host_port: &str, path: &str) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
+/// One raw HTTP POST over a plain TCP stream (no HTTP client dependency).
+async fn http_post(host_port: &str, path: &str, body: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(host_port)
+        .await
+        .expect("connect to the gateway");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 /// Polls the child's stderr file for the listening line and returns the bound
 /// address, or `None` if the child exited first or the bound elapsed.
 async fn wait_for_listening(
@@ -855,6 +877,8 @@ async fn binary_config_file_source_beats_invalid_environment_source() {
     let root = binary_root("config-file-source");
     let configured = write_marker_source("config-file", "CONFIG_FILE_SOURCE_MARKER");
     write_config_file(&root, Some(&format!("file:{}", configured.display())));
+    assert!(root.join(".rustscript-agent/config.yaml").is_file());
+    assert!(!root.join(".rustscript-agent/auth.yaml").exists());
     let stderr_path = root.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
@@ -862,6 +886,7 @@ async fn binary_config_file_source_beats_invalid_environment_source() {
         .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
         .env("RUSTSCRIPT_AGENT_SOURCE", "other:thing")
         .env("HOME", &root)
+        .env_remove("RUSTSCRIPT_AGENT_HOME")
         .current_dir(&root)
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
@@ -878,10 +903,20 @@ async fn binary_config_file_source_beats_invalid_environment_source() {
         }
     };
     let health = http_get(&address, "/health/detailed").await;
+    let workspace_response = http_post(
+        &address,
+        "/v1/runs",
+        r#"{"input":"plain source must not grant workspace","workspace":"name:missing"}"#,
+    )
+    .await;
     stop_child(&mut child).await;
     assert!(
         health.contains("200 OK"),
         "health must answer 200: {health}"
+    );
+    assert!(
+        workspace_response.starts_with("HTTP/1.1 422"),
+        "default-home provider binding must not grant workspace authority"
     );
     let body = health.split("\r\n\r\n").nth(1).unwrap_or("");
     let json: Value = serde_json::from_str(body).expect("health body must be JSON");
@@ -889,6 +924,57 @@ async fn binary_config_file_source_beats_invalid_environment_source() {
     assert_eq!(json["source"]["kind"], "file");
     assert_eq!(json["source"]["deprecated_override"], false);
     assert!(!health.contains(configured.to_string_lossy().as_ref()));
+}
+
+#[tokio::test]
+async fn binary_malformed_operator_home_fails_before_listen() {
+    let root = binary_root("malformed-operator-home");
+    let stderr_path = root.join("stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("stderr file");
+    let malformed_home = "relative/../operator-home-sentinel";
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustscript-agent-gateway"))
+        .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
+        .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
+        .env("RUSTSCRIPT_AGENT_HOME", malformed_home)
+        .env("HOME", &root)
+        .current_dir(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .kill_on_drop(true)
+        .env_remove("RUSTSCRIPT_AGENT_SOURCE")
+        .env_remove("RUSTSCRIPT_AGENT_SCRIPT")
+        .env_remove("PD_EDGE_AGENT_SOURCE")
+        .env_remove("PD_EDGE_AGENT_SCRIPT")
+        .env_remove("RUSTSCRIPT_AGENT_STATE_DB")
+        .spawn()
+        .expect("gateway binary should spawn");
+
+    let listening = wait_for_listening(&mut child, &stderr_path, Duration::from_secs(25)).await;
+    if listening.is_some() {
+        stop_child(&mut child).await;
+        panic!("a malformed operator home must fail before listener bind");
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("gateway should exit after home validation failure")
+        .expect("child wait");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        !status.success(),
+        "malformed operator home must fail startup"
+    );
+    assert!(
+        !stderr.contains("listening on http://"),
+        "malformed operator home must fail before listener bind"
+    );
+    assert!(
+        stderr.contains("agent home could not be resolved"),
+        "startup should report the static home error"
+    );
+    assert!(
+        !stderr.contains(malformed_home),
+        "startup diagnostics must not echo the supplied home"
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -1,11 +1,12 @@
 #![cfg(feature = "config-fixture")]
 
+use std::collections::VecDeque;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Barrier,
+    Arc, Barrier, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::thread;
@@ -14,13 +15,15 @@ use std::time::Duration;
 use rustscript_agent::auth::{
     host::AuthHost,
     oauth::{
-        BoundedHttpsTransport, OAuthError, OAuthHost, OAuthIoContext, PreparedHttpsRequest,
-        RawHttpsResponse, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
-        ScriptedHttpsTransport,
+        BoundedHttpsStream, BoundedHttpsTransport, OAuthError, OAuthHost, OAuthIoContext,
+        PreparedHttpsRequest, RawHttpsResponse, RawHttpsResponseHead, ScriptedBrowser,
+        ScriptedCallback, ScriptedCancel, ScriptedClock, ScriptedHttpsTransport,
     },
 };
+use rustscript_agent::config::ProviderProfile;
 use rustscript_agent::{
-    AgentConfig, AgentHostBridges, AgentRunner, CancellationReason, RunCancellation,
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentHostBridges,
+    AgentRunner, CancellationReason, RunCancellation,
 };
 use rustscript_vm::Value;
 use serde_json::json;
@@ -779,4 +782,495 @@ pub fn run(context: map) -> map {
             "nested": { "label": "public", "values": [1, 2, 3] }
         }))
     );
+}
+
+const OPERATOR_PROVIDER: &str = "openai-codex";
+const OPERATOR_MODEL: &str = "gpt-5-codex";
+const OPERATOR_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPERATOR_ANSWER: &str = "operator bootstrap fixture answer";
+
+fn fixture_home_without_refresh_token() -> FixtureHome {
+    let home = FixtureHome::new();
+    let auth_path = home.0.join("auth.yaml");
+    let auth = fs::read_to_string(&auth_path).expect("read private fixture auth");
+    let without_refresh = auth.replace("    refresh_token: SYNTHETIC_REFRESH_TOKEN\n", "");
+    assert!(
+        auth != without_refresh,
+        "fixture refresh token field must exist"
+    );
+    fs::write(auth_path, without_refresh).expect("remove fixture refresh token");
+    home
+}
+
+type TestAuthHostFactory = Arc<dyn Fn(RunCancellation) -> Result<AuthHost, String> + Send + Sync>;
+
+struct OperatorSseTransport {
+    responses: Mutex<VecDeque<Vec<u8>>>,
+    sent: Mutex<Vec<PreparedHttpsRequest>>,
+}
+
+impl OperatorSseTransport {
+    fn new(transcript: String) -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::from([transcript.into_bytes()])),
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_sent(&self) -> Vec<PreparedHttpsRequest> {
+        std::mem::take(&mut *self.sent.lock().expect("provider requests"))
+    }
+}
+
+struct OperatorSseReader {
+    head: RawHttpsResponseHead,
+    chunks: VecDeque<Vec<u8>>,
+}
+
+impl BoundedHttpsStream for OperatorSseReader {
+    fn head(&self) -> &RawHttpsResponseHead {
+        &self.head
+    }
+
+    fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, OAuthError> {
+        Ok(self.chunks.pop_front())
+    }
+
+    fn cancel(&mut self) {
+        self.chunks.clear();
+    }
+}
+
+impl BoundedHttpsTransport for OperatorSseTransport {
+    fn send(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<RawHttpsResponse, OAuthError> {
+        context.check()?;
+        self.sent
+            .lock()
+            .expect("provider requests")
+            .push(request.clone());
+        Err(OAuthError::Transport {
+            message: "unexpected buffered request".to_string(),
+        })
+    }
+
+    fn start_stream(
+        &self,
+        request: &PreparedHttpsRequest,
+        context: &OAuthIoContext,
+    ) -> Result<Box<dyn BoundedHttpsStream>, OAuthError> {
+        context.check()?;
+        self.sent
+            .lock()
+            .expect("provider requests")
+            .push(request.clone());
+        let chunk = self
+            .responses
+            .lock()
+            .expect("provider stream fixtures")
+            .pop_front()
+            .ok_or_else(|| OAuthError::Transport {
+                message: "no queued provider stream fixture".to_string(),
+            })?;
+        Ok(Box::new(OperatorSseReader {
+            head: RawHttpsResponseHead {
+                status: 200,
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
+            },
+            chunks: VecDeque::from([chunk]),
+        }))
+    }
+}
+
+fn operator_auth_factory(
+    home: &FixtureHome,
+    transport: Arc<OperatorSseTransport>,
+    calls: Arc<AtomicUsize>,
+) -> TestAuthHostFactory {
+    let oauth = Arc::new(OAuthHost::new(
+        transport,
+        Arc::new(ScriptedCallback::new()),
+        Arc::new(ScriptedBrowser::new()),
+        Arc::new(ScriptedClock::new(1_800_000_000_000)),
+        Arc::new(ScriptedCancel::new()),
+    ));
+    let home = home.0.clone();
+    Arc::new(move |cancellation| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        AuthHost::new(home.clone(), cancellation)
+            .map(|host| host.with_oauth_host(Arc::clone(&oauth)))
+    })
+}
+
+fn operator_response() -> serde_json::Value {
+    json!({
+        "id": "resp_operator_fixture",
+        "object": "response",
+        "status": "completed",
+        "model": OPERATOR_MODEL,
+        "output": [{
+            "type": "message",
+            "id": "msg_operator_fixture",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": OPERATOR_ANSWER}]
+        }],
+        "usage": {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13},
+        "error": null
+    })
+}
+
+fn operator_response_sse() -> String {
+    format!(
+        "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"type": "response.completed", "response": operator_response()})
+    )
+}
+
+fn operator_config() -> AgentGatewayConfig {
+    AgentGatewayConfig {
+        provider: Some(OPERATOR_PROVIDER.to_string()),
+        model: OPERATOR_MODEL.to_string(),
+        run_timeout: Duration::from_secs(30),
+        ..AgentGatewayConfig::default()
+    }
+}
+
+fn operator_profile() -> ProviderProfile {
+    ProviderProfile::new(
+        OPERATOR_PROVIDER,
+        json!({
+            "profile": OPERATOR_PROVIDER,
+            "protocol": "codex-responses",
+            "base_url": OPERATOR_BASE_URL,
+            "credential_id": "fixture-codex"
+        }),
+    )
+    .expect("construct bounded public provider profile")
+}
+
+fn operator_state_with_factory(
+    home: &FixtureHome,
+    selection: serde_json::Value,
+    factory: TestAuthHostFactory,
+) -> AgentGatewayState {
+    let state = AgentGatewayState::with_agent_selection(operator_config(), selection, None)
+        .expect("construct operator service state")
+        .with_operator_auth_home_and_factory_for_test(home.0.clone(), factory)
+        .expect("install provider-only operator factory");
+    state.service().upsert_provider_profile(operator_profile());
+    state
+}
+
+async fn run_operator_service(
+    service: &Arc<rustscript_agent::service::AgentService>,
+    platform: &str,
+) -> String {
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "return the operator fixture answer"}),
+            model: Some(OPERATOR_MODEL.to_string()),
+            provider: Some(OPERATOR_PROVIDER.to_string()),
+            platform: platform.to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit operator service run");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    admitted.run_id
+}
+
+fn service_event_count(events: &[serde_json::Value], name: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| event.get("event").and_then(serde_json::Value::as_str) == Some(name))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_home_factory_forwards_through_service_to_child_auth() {
+    let home = fixture_home_without_refresh_token();
+    let workspace = home.0.join("workspace");
+    fs::create_dir_all(&workspace).expect("create fixture workspace");
+    let config_path = home.0.join("config.yaml");
+    let config = fs::read_to_string(&config_path).expect("read private fixture config");
+    let config = config.replace(
+        "/tmp/rustscript-agent-workspace",
+        workspace.to_str().expect("fixture workspace path"),
+    );
+    fs::write(config_path, config).expect("set private fixture workspace root");
+    let transport = Arc::new(OperatorSseTransport::new(operator_response_sse()));
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let auth_factory =
+        operator_auth_factory(&home, Arc::clone(&transport), Arc::clone(&factory_calls));
+    let config = AgentGatewayConfig {
+        provider: Some(OPERATOR_PROVIDER.to_string()),
+        model: OPERATOR_MODEL.to_string(),
+        run_timeout: Duration::from_secs(30),
+        ..AgentGatewayConfig::default()
+    };
+    let state = AgentGatewayState::with_agent_selection(config, json!({}), None)
+        .expect("construct bundled service state")
+        .with_operator_auth_home_and_factory_for_test(home.0.clone(), auth_factory)
+        .expect("install provider-only operator factory");
+    let service = state.service();
+    service.upsert_provider_profile(
+        ProviderProfile::new(
+            OPERATOR_PROVIDER,
+            json!({
+                "profile": OPERATOR_PROVIDER,
+                "protocol": "codex-responses",
+                "base_url": OPERATOR_BASE_URL,
+                "credential_id": "fixture-codex"
+            }),
+        )
+        .expect("construct bounded public provider profile"),
+    );
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "return the operator fixture answer"}),
+            model: Some(OPERATOR_MODEL.to_string()),
+            provider: Some(OPERATOR_PROVIDER.to_string()),
+            platform: "provider_auth_rss_entry_tests".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit bundled service run");
+
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+
+    let workspace_admission = service
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!("operator auth must not grant workspace authority"),
+                platform: "http".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:project".to_string()),
+        )
+        .await;
+    assert!(
+        workspace_admission.is_err(),
+        "operator provider binding must not grant workspace authority"
+    );
+
+    let events = service.run_events(&admitted.run_id);
+    let named_event_count = |name: &str| {
+        events
+            .iter()
+            .filter(|event| event.get("event").and_then(serde_json::Value::as_str) == Some(name))
+            .count()
+    };
+    assert_eq!(named_event_count("run.completed"), 1);
+    assert_eq!(named_event_count("model.requested"), 1);
+    assert_eq!(named_event_count("model.completed"), 1);
+    let messages = service.session_messages(&admitted.session_id);
+    let assistants = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(assistants.len(), 1);
+    assert!(assistants[0].to_string().contains(OPERATOR_ANSWER));
+    let sent = transport.take_sent();
+    assert_eq!(sent.len(), 1, "exactly one scripted provider request");
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(sent[0].url, format!("{OPERATOR_BASE_URL}/responses"));
+    assert!(
+        sent[0]
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value.starts_with("Bearer "))
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|request| request.url.contains("/oauth/token"))
+            .count(),
+        0,
+        "access-only fixture must not refresh"
+    );
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    let context = service
+        .run_context(&admitted.run_id)
+        .expect("public run context");
+    let public_output = format!(
+        "{}{}{}",
+        serde_json::to_string(&events).expect("events JSON"),
+        serde_json::to_string(&messages).expect("messages JSON"),
+        serde_json::to_string(&context).expect("context JSON")
+    );
+    assert!(!public_output.contains("SYNTHETIC_ACCESS_TOKEN"));
+    assert!(!public_output.contains("SYNTHETIC_REFRESH_TOKEN"));
+    assert!(!public_output.contains("access_token"));
+    assert!(!public_output.contains("refresh_token"));
+}
+
+async fn assert_operator_auth_failure_without_send(
+    home: &FixtureHome,
+    transport: Arc<OperatorSseTransport>,
+    factory_calls: Arc<AtomicUsize>,
+    platform: &str,
+) {
+    let factory = operator_auth_factory(home, Arc::clone(&transport), Arc::clone(&factory_calls));
+    let state = operator_state_with_factory(home, json!({}), factory);
+    let service = state.service();
+    let run_id = run_operator_service(&service, platform).await;
+    let events = service.run_events(&run_id);
+    assert_eq!(
+        service_event_count(&events, "run.failed"),
+        1,
+        "invalid auth home must fail the provider run"
+    );
+    assert_eq!(
+        service_event_count(&events, "run.completed"),
+        0,
+        "invalid auth home must not complete the provider run"
+    );
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        transport.take_sent().is_empty(),
+        "invalid auth must send nothing"
+    );
+    let public_output = serde_json::to_string(&events).expect("events JSON");
+    assert!(!public_output.contains("SYNTHETIC_ACCESS_TOKEN"));
+    assert!(!public_output.contains("SYNTHETIC_REFRESH_TOKEN"));
+    assert!(!public_output.contains("access_token"));
+    assert!(!public_output.contains("refresh_token"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_entry_fails_closed_without_auth_factory() {
+    let state = AgentGatewayState::with_agent_selection(operator_config(), json!({}), None)
+        .expect("construct bundled service state");
+    let service = state.service();
+    service.upsert_provider_profile(operator_profile());
+    let run_id = run_operator_service(&service, "provider_auth_missing_factory").await;
+    let events = service.run_events(&run_id);
+    assert_eq!(service_event_count(&events, "run.failed"), 1);
+    assert_eq!(service_event_count(&events, "run.completed"), 0);
+    assert!(events.iter().any(|event| {
+        event["event"] == "model.failed" && event["data"]["error_code"] == "auth_unavailable"
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_factory_is_lazy_for_plain_selected_rss_entry() {
+    let home = FixtureHome::new();
+    fs::remove_file(home.0.join("auth.yaml")).expect("remove auth file for no-auth entry");
+    let source_path = home.0.join("plain.rss");
+    fs::write(
+        &source_path,
+        r#"pub fn run(context: map) -> map { { answer: "plain selected RSS completed" } }"#,
+    )
+    .expect("write plain RSS entry");
+    let transport = Arc::new(OperatorSseTransport::new(operator_response_sse()));
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let factory = operator_auth_factory(&home, Arc::clone(&transport), Arc::clone(&factory_calls));
+    let selection = json!({
+        "config_present": true,
+        "config_source": format!("file:{}", source_path.display())
+    });
+    let state = AgentGatewayState::with_agent_selection(operator_config(), selection, None)
+        .expect("select plain RSS entry")
+        .with_operator_auth_home_and_factory_for_test(home.0.clone(), factory)
+        .expect("install lazy provider-only factory");
+    state.service().upsert_provider_profile(operator_profile());
+    let service = state.service();
+    let run_id = run_operator_service(&service, "operator_plain_selected_rss").await;
+    let events = service.run_events(&run_id);
+    assert_eq!(service_event_count(&events, "run.completed"), 1);
+    assert_eq!(service_event_count(&events, "model.requested"), 0);
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+    assert!(transport.take_sent().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_factory_rejects_insecure_auth_permissions_without_send() {
+    let home = fixture_home_without_refresh_token();
+    fs::set_permissions(home.0.join("auth.yaml"), fs::Permissions::from_mode(0o644))
+        .expect("set insecure fixture auth mode");
+    let transport = Arc::new(OperatorSseTransport::new(operator_response_sse()));
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    assert_operator_auth_failure_without_send(
+        &home,
+        transport,
+        factory_calls,
+        "operator_insecure_auth_permissions",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_factory_rejects_symlink_auth_without_send() {
+    let home = fixture_home_without_refresh_token();
+    let auth_path = home.0.join("auth.yaml");
+    fs::remove_file(&auth_path).expect("remove fixture auth file");
+    std::os::unix::fs::symlink(home.0.join("config.yaml"), &auth_path)
+        .expect("replace fixture auth file with symlink");
+    let transport = Arc::new(OperatorSseTransport::new(operator_response_sse()));
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    assert_operator_auth_failure_without_send(
+        &home,
+        transport,
+        factory_calls,
+        "operator_symlink_auth",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_auth_home_preserves_legacy_top_level_factory() {
+    let home = FixtureHome::new();
+    let workspace = home.0.join("workspace");
+    fs::create_dir_all(&workspace).expect("create trusted fixture workspace");
+    let config_path = home.0.join("config.yaml");
+    let config = fs::read_to_string(&config_path).expect("read trusted fixture config");
+    let config = config.replace(
+        "/tmp/rustscript-agent-workspace",
+        workspace.to_str().expect("trusted workspace fixture path"),
+    );
+    fs::write(config_path, config).expect("set trusted fixture workspace root");
+    let source = r#"
+use auth;
+use config;
+pub fn run(context: map) -> map {
+    let host: resource<auth.host_home> = context["host_home"];
+    let snapshot = config::load_snapshot(&host);
+    let snapshot_ok: bool = snapshot.ok;
+    { snapshot_ok: snapshot_ok }
+}
+"#;
+    let state = AgentGatewayState::with_agent_source(AgentGatewayConfig::default(), source)
+        .expect("compile trusted embedding RSS entry")
+        .with_trusted_auth_home(home.0.clone());
+    let service = state.service();
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "inspect the trusted fixture"}),
+            platform: "trusted_embedding_compatibility".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit trusted embedding run");
+    service
+        .clone()
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(service_event_count(&events, "run.completed"), 1);
+    assert_eq!(service_event_count(&events, "run.failed"), 0);
+    assert_eq!(service_event_count(&events, "model.requested"), 0);
 }

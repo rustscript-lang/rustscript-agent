@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 use rustscript_vm::HttpConfig;
 
 use crate::config::AgentGatewayConfig;
-use crate::config_file::CompactionSettings;
+use crate::config_file::{AgentPaths, CompactionSettings};
 use crate::domain::{json_to_vm_value, vm_value_to_json};
 use crate::metrics::Metrics;
 use crate::runtime::rss_runner::{AgentConfig, AgentRunner};
@@ -97,6 +97,45 @@ impl AgentGatewayState {
             .set_workspace_host_factory(Arc::new(move |cancellation| {
                 crate::auth::host::AuthHost::new(home.clone(), cancellation)
             }));
+        self
+    }
+
+    /// Installs operator authentication for the default provider child only.
+    /// AuthStore admission remains lazy until a finite provider invocation.
+    pub fn with_operator_auth_home(self, home: impl Into<PathBuf>) -> Result<Self, String> {
+        let home = Self::validated_operator_home(home)?.home;
+        let factory: crate::runtime::agent_host::AuthHostFactory = Arc::new(move |cancellation| {
+            crate::auth::host::AuthHost::new(home.clone(), cancellation)
+        });
+        Ok(self.attach_operator_auth_factory(factory))
+    }
+
+    #[cfg(feature = "config-fixture")]
+    pub fn with_operator_auth_home_and_factory_for_test(
+        self,
+        home: impl Into<PathBuf>,
+        factory: Arc<
+            dyn Fn(
+                    crate::runtime::RunCancellation,
+                ) -> std::result::Result<crate::auth::host::AuthHost, String>
+                + Send
+                + Sync,
+        >,
+    ) -> Result<Self, String> {
+        let _paths = Self::validated_operator_home(home)?;
+        Ok(self.attach_operator_auth_factory(factory))
+    }
+
+    fn validated_operator_home(home: impl Into<PathBuf>) -> Result<AgentPaths, String> {
+        AgentPaths::from_home(home.into())
+            .map_err(|_| "agent home could not be resolved".to_string())
+    }
+
+    fn attach_operator_auth_factory(
+        self,
+        factory: crate::runtime::agent_host::AuthHostFactory,
+    ) -> Self {
+        self.service.set_provider_auth_host_factory(factory);
         self
     }
 
