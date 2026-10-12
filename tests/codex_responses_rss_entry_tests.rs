@@ -13,7 +13,7 @@
 
 #[path = "support/provider_opaque_fixture.rs"]
 #[allow(dead_code)]
-mod provider_opaque_fixture;
+pub mod provider_opaque_fixture;
 
 #[path = "support/opaque_chat_stream.rs"]
 #[allow(dead_code)]

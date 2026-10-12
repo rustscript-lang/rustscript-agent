@@ -14,7 +14,7 @@
 mod opaque_chat_stream;
 
 #[path = "support/provider_opaque_fixture.rs"]
-mod provider_opaque_fixture;
+pub mod provider_opaque_fixture;
 
 use std::path::PathBuf;
 use std::sync::Arc;
