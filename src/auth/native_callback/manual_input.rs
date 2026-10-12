@@ -311,6 +311,9 @@ fn transport(message: &'static str) -> OAuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::native_callback::composite::tests::{
+        ExpectedChildResult, run_resource_test_child,
+    };
     use crate::auth::oauth::{OAuthCancel, OAuthClock};
     use std::ffi::c_char;
     use std::fs::File;
@@ -466,6 +469,15 @@ mod tests {
 
     #[test]
     fn accepts_lf_crlf_and_nonempty_eof_lines() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::accepts_lf_crlf_and_nonempty_eof_lines"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         for (bytes, expected) in [
             (&b"callback-url\n"[..], "callback-url"),
             (&b"callback-url\r\n"[..], "callback-url"),
@@ -489,6 +501,15 @@ mod tests {
 
     #[test]
     fn fragmented_socket_input_is_read_as_one_crlf_line() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::fragmented_socket_input_is_read_as_one_crlf_line"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, writer) = socket_pair();
         let waiter = NativeManualCallbackInput::new(reader).expect("input owner");
         let mut writer = File::from(writer);
@@ -510,6 +531,15 @@ mod tests {
 
     #[test]
     fn rejects_empty_invalid_utf8_controls_and_trailing_bytes_without_reflection() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::rejects_empty_invalid_utf8_controls_and_trailing_bytes_without_reflection"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let payloads: &[&[u8]] = &[
             b"\n",
             b"",
@@ -529,6 +559,15 @@ mod tests {
 
     #[test]
     fn enforces_the_8192_byte_limit_including_a_delimiter() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::enforces_the_8192_byte_limit_including_a_delimiter"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let mut exact_limit = vec![b'a'; MAX_INPUT_BYTES - 1];
         exact_limit.push(b'\n');
         let (reader, writer) = pipe_pair();
@@ -554,6 +593,15 @@ mod tests {
 
     #[test]
     fn owned_descriptor_is_cloexec_one_shot_and_restores_shared_status_flags() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::owned_descriptor_is_cloexec_one_shot_and_restores_shared_status_flags"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, writer) = pipe_pair();
         let raw_fd = reader.as_raw_fd();
         let observer = duplicate(raw_fd);
@@ -588,6 +636,15 @@ mod tests {
 
     #[test]
     fn cancellation_and_deadline_terminate_without_input_and_close_the_fd() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::cancellation_and_deadline_terminate_without_input_and_close_the_fd"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, writer) = pipe_pair();
         let raw_fd = reader.as_raw_fd();
         let waiter = NativeManualCallbackInput::new(reader).expect("input owner");
@@ -617,6 +674,15 @@ mod tests {
 
     #[test]
     fn poisoned_owner_lock_still_consumes_the_descriptor() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::poisoned_owner_lock_still_consumes_the_descriptor"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (reader, writer) = pipe_pair();
         let raw_fd = reader.as_raw_fd();
         let waiter = Arc::new(NativeManualCallbackInput::new(reader).expect("input owner"));
@@ -643,6 +709,15 @@ mod tests {
 
     #[test]
     fn cancellation_restores_tty_echo_and_flags_without_echoing_input() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::cancellation_restores_tty_echo_and_flags_without_echoing_input"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (master, slave) = pty_pair();
         let raw_fd = slave.as_raw_fd();
         let observer = duplicate(raw_fd);
@@ -679,6 +754,15 @@ mod tests {
 
     #[test]
     fn restores_tty_state_during_unwind_after_io_setup() {
+        if run_resource_test_child(
+            concat!(
+                "auth::native_callback::manual_input::tests",
+                "::restores_tty_state_during_unwind_after_io_setup"
+            ),
+            ExpectedChildResult::Pass,
+        ) {
+            return;
+        }
         let (master, slave) = pty_pair();
         let raw_fd = slave.as_raw_fd();
         let observer = duplicate(raw_fd);

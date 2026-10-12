@@ -152,7 +152,7 @@ fn transport(message: &'static str) -> OAuthError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::auth::native_callback) mod tests {
     use std::{
         ffi::c_char,
         fs::File,
@@ -337,7 +337,7 @@ mod tests {
     const RESOURCE_CHILD_OUTPUT_LIMIT: usize = 16 * 1024;
 
     #[derive(Clone, Copy)]
-    enum ExpectedChildResult {
+    pub(in crate::auth::native_callback) enum ExpectedChildResult {
         Pass,
         AssertionFailure(&'static str),
     }
@@ -372,7 +372,10 @@ mod tests {
         (captured, truncated)
     }
 
-    fn run_resource_test_child(test_name: &str, expected: ExpectedChildResult) -> bool {
+    pub(in crate::auth::native_callback) fn run_resource_test_child(
+        test_name: &str,
+        expected: ExpectedChildResult,
+    ) -> bool {
         if let Some(marker) = std::env::var_os(RESOURCE_CHILD_ENV) {
             let marker = marker.to_string_lossy();
             let (parent, selected_test) = marker
