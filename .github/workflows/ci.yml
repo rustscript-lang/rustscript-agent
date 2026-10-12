@@ -36,13 +36,18 @@ jobs:
         # (actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5).
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      # Integration tests honor RUSTSCRIPT_AGENT_TEST_TMP for SQLite state and
-      # fixture scripts; without it they fall back to /mnt/TEMP/rustscript/...
-      # which is not writable on CI runners. `runner` is unavailable in
-      # workflow-level and job-level `env`, so export the runner default
-      # RUNNER_TEMP path from a step instead.
+      # Native helpers and integration fixtures use three assigned scratch
+      # aliases; keep them on one runner-owned root. Fixtures create private
+      # directories beneath it, and the root must exist before tests start.
       - name: Configure test temp root
-        run: echo "RUSTSCRIPT_AGENT_TEST_TMP=${RUNNER_TEMP}/rustscript-agent-tests" >> "$GITHUB_ENV"
+        run: |
+          test_tmp="${RUNNER_TEMP}/rustscript-agent-tests"
+          mkdir -p "$test_tmp"
+          {
+            printf 'RUSTSCRIPT_AGENT_TEST_TMP=%s\n' "$test_tmp"
+            printf 'TEST_TMPDIR=%s\n' "$test_tmp"
+            printf 'RUSTSCRIPT_AGENT_TEST_TMPDIR=%s\n' "$test_tmp"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         # Full-SHA pin, matching the rustscript-lang/rustscript CI policy

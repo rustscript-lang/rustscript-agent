@@ -30,6 +30,7 @@ fn policy() -> TrustedTransportPolicy {
             path_prefix: "/oauth".to_string(),
         }],
         allowed_header_names: BTreeSet::from(["content-type".to_string()]),
+        transport_identity: None,
     }
 }
 

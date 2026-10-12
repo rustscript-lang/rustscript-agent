@@ -120,6 +120,74 @@ fn explicit_file_source_is_selected() {
 }
 
 #[test]
+fn present_config_source_beats_invalid_legacy_source_facts() {
+    let path = "/configured/エージェント.rss";
+    assert_eq!(
+        decide(json!({
+            "config_present": true,
+            "config_source": format!("file:{path}"),
+            "source": false,
+            "legacy_script": "x".repeat(5000),
+        })),
+        file_success(&format!("file:{path}"), path, false)
+    );
+}
+
+#[test]
+fn present_config_default_source_beats_environment_file_source() {
+    assert_eq!(
+        decide(json!({
+            "config_present": true,
+            "config_source": "bundled:coding",
+            "source": "file:/environment/agent.rss",
+            "legacy_script": "/legacy/agent.rss",
+        })),
+        bundled_success()
+    );
+}
+
+#[test]
+fn invalid_present_config_source_never_rescues_from_legacy_facts() {
+    assert_eq!(
+        decide(json!({
+            "config_present": true,
+            "config_source": "other:thing",
+            "source": "file:/environment/agent.rss",
+            "legacy_script": "/legacy/agent.rss",
+        })),
+        failure("unsupported_agent_source", "agent source is unsupported")
+    );
+}
+
+#[test]
+fn malformed_config_observations_fail_closed() {
+    let expected = failure("invalid_agent_source", "agent source is invalid");
+    assert_eq!(
+        decide(json!({
+            "config_present": "yes",
+            "config_source": "file:/configured/agent.rss",
+            "source": "file:/environment/agent.rss",
+        })),
+        expected
+    );
+    assert_eq!(
+        decide(json!({
+            "config_present": true,
+            "config_source": 12,
+            "source": "file:/environment/agent.rss",
+        })),
+        expected
+    );
+    assert_eq!(
+        decide(json!({
+            "config_present": false,
+            "config_source": "file:/configured/agent.rss",
+        })),
+        expected
+    );
+}
+
+#[test]
 fn explicit_file_source_preserves_spaces_and_unicode() {
     let path = "/srv/エージェント dir/my agent.rss";
     assert_eq!(

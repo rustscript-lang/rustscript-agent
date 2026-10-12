@@ -1,9 +1,10 @@
 # Example version-one credential store.
 #
 # Intentionally empty: this shipped sample carries no credentials, no token
-# values, and no credential IDs. `auth.yaml` holds only structural metadata
-# (see ../configuration.md); the real tokens never cross the native auth
-# boundary. Populate credentials only through the auth CLI/host flows and
-# never commit real secrets here. Mode 0600 in every deployment.
+# values, and no credential IDs. A populated auth.yaml stores provider access
+# values and optional refresh values in private secret slots; its public
+# snapshot exposes sanitized metadata and credential-presence information.
+# Keep real values out of samples and repositories. On Unix the live file must
+# meet AuthStore's exact 0600/owner/file-type checks; see ../deployment.md.
 version: 1
 credentials: {}

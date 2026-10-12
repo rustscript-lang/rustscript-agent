@@ -38,6 +38,17 @@ fn read_relative(path: &str) -> String {
         .unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+fn source_section<'a>(source: &'a str, signature: &str, next_signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("source is missing function `{signature}`"));
+    let rest = &source[start..];
+    let end = rest
+        .find(next_signature)
+        .unwrap_or_else(|| panic!("source is missing boundary `{next_signature}`"));
+    &rest[..end]
+}
+
 /// The full 40-character revision pinned for the core Git dependency in
 /// `Cargo.toml` (`rustscript-vm = { … rev = "<sha>" … }`).
 fn manifest_core_revision() -> String {
@@ -158,6 +169,273 @@ fn gateway_startup_examples_use_admitted_bundled_coding_source() {
                 .lines()
                 .any(|line| line.trim_start().starts_with("RUSTSCRIPT_AGENT_SCRIPT=")),
             "{path} gateway startup example must not use the rejected relative legacy script"
+        );
+    }
+}
+
+#[test]
+fn gateway_home_documentation_matches_workspace_host_contract() {
+    let gateway = read_relative("src/bin/rustscript-agent-gateway.rs");
+    assert!(gateway.contains("var_os(\"RUSTSCRIPT_AGENT_HOME\")"));
+    assert!(gateway.contains("state.with_workspace_home(home)"));
+    let gateway_module = read_relative("src/gateway/mod.rs");
+    assert!(gateway_module.contains("set_workspace_host_factory"));
+    assert!(gateway_module.contains("AuthHost::new(home.clone(), cancellation)"));
+    let config_paths = read_relative("src/config_file.rs");
+    assert!(config_paths.contains("home.join(STATE_FILE_NAME)"));
+    assert!(config_paths.contains("home.is_relative()"));
+    assert!(config_paths.contains("Component::ParentDir"));
+
+    let configuration = read_relative("docs/configuration.md");
+    let source_start = configuration
+        .find("## Configuration sources")
+        .expect("configuration.md must document its source table");
+    let source_rest = &configuration[source_start..];
+    let source_end = source_rest
+        .find("\n## ")
+        .expect("configuration source section must end before the next section");
+    let source_section = &source_rest[..source_end];
+    assert!(
+        source_section.contains("workspace host"),
+        "the source table must include the gateway's workspace-host HOME use"
+    );
+    assert!(
+        !source_section.contains("library-only `RUSTSCRIPT_AGENT_HOME`"),
+        "the source table must not classify HOME as library-only"
+    );
+    let start = configuration
+        .find("### Agent home (library bootstrap and gateway workspace host)")
+        .expect("configuration.md must retain the HOME section");
+    let rest = &configuration[start..];
+    let end = rest
+        .find("\n### Gateway variables")
+        .expect("HOME section must end before gateway variables");
+    let home_section = &rest[..end];
+    assert!(
+        home_section.contains("workspace host"),
+        "HOME docs must describe the gateway's workspace-host use"
+    );
+    assert!(
+        !home_section.contains("It is not consumed by the current gateway binary"),
+        "HOME docs must not claim the gateway ignores RUSTSCRIPT_AGENT_HOME"
+    );
+    assert!(
+        home_section.contains("absolute") && home_section.contains("parent-directory"),
+        "HOME docs must retain source-backed path validation"
+    );
+    assert!(
+        home_section.contains("RUSTSCRIPT_AGENT_STATE_DB"),
+        "HOME docs must distinguish the SQLite path selector"
+    );
+}
+
+#[test]
+fn auth_storage_documentation_matches_secret_and_unix_file_contract() {
+    let auth_config = read_relative("src/auth/config.rs");
+    assert!(auth_config.contains("pub(crate) access_token: SecretText"));
+    assert!(auth_config.contains("pub(crate) refresh_token: Option<SecretText>"));
+    assert!(auth_config.contains("has_refresh_token: self.refresh_token.is_some()"));
+    let auth_store = read_relative("src/auth/store.rs");
+    for required in [
+        "stat.st_nlink != 1",
+        "stat.st_uid != unsafe { libc::geteuid() }",
+        "mode != 0o600",
+        "libc::S_IFREG",
+    ] {
+        assert!(
+            auth_store.contains(required),
+            "AuthStore must retain the Unix file guard `{required}`"
+        );
+    }
+
+    let configuration = read_relative("docs/configuration.md");
+    for required in [
+        "secret slots",
+        "access",
+        "refresh",
+        "sanitized",
+        "opaque",
+        "has_refresh_token",
+    ] {
+        assert!(
+            configuration.contains(required),
+            "configuration docs must distinguish stored secrets from public metadata (`{required}`)"
+        );
+    }
+    assert!(
+        !configuration.contains("the two secrets in this revision"),
+        "configuration docs must include provider credentials stored in auth.yaml"
+    );
+
+    let deployment = read_relative("docs/deployment.md");
+    for required in [
+        "auth.yaml",
+        "offline",
+        "regular file",
+        "exactly one link",
+        "effective user",
+        "0600",
+        "rotation",
+    ] {
+        assert!(
+            deployment.contains(required),
+            "deployment docs must cover protected auth backup/restore (`{required}`)"
+        );
+    }
+    let example = read_relative("docs/examples/auth.yaml");
+    assert!(example.contains("credentials: {}"));
+    assert!(example.contains("secret slots"));
+    assert!(example.contains("access") && example.contains("refresh"));
+    assert!(!example.contains("only structural metadata"));
+}
+
+#[test]
+fn readme_source_and_protocol_status_matches_current_rss_paths() {
+    let gateway = read_relative("src/bin/rustscript-agent-gateway.rs");
+    assert!(gateway.contains("source_env_value(\"RUSTSCRIPT_AGENT_SOURCE\""));
+    assert!(gateway.contains("source_env_value(\"RUSTSCRIPT_AGENT_SCRIPT\""));
+    let source_policy = read_relative("rss/agent/source_policy.rss");
+    assert!(source_policy.contains("decision: map = bundled_success()"));
+    assert!(source_policy.contains("field_present(context, \"source\")"));
+    assert!(source_policy.contains("field_present(context, \"legacy_script\")"));
+
+    let dispatch = read_relative("rss/llm/provider_dispatch.rss");
+    assert!(dispatch.contains("provider == \"openai-codex\" && protocol == \"codex-responses\""));
+    assert!(dispatch.contains("dispatch_openai_chat(context, request, credential_id)"));
+    let openai_chat = read_relative("rss/llm/openai_opaque_chat.rss");
+    assert!(openai_chat.contains("chat_send_buffered"));
+    assert!(openai_chat.contains("chat_send_stream"));
+    assert!(openai_chat.contains("provider_runtime::call"));
+    let codex_responses = read_relative("rss/providers/opaque_responses.rss");
+    assert!(codex_responses.contains("Task8 access-only scope"));
+    assert!(codex_responses.contains("run_responses_stream"));
+    let custom_responses = read_relative("rss/llm/openai_responses.rss");
+    assert!(custom_responses.contains("\"not_implemented\""));
+    assert!(custom_responses.contains("never sends"));
+    let anthropic = read_relative("rss/llm/anthropic_messages.rss");
+    assert!(anthropic.contains("\"not_implemented\""));
+
+    let readme = read_relative("README.md");
+    for required in [
+        "RUSTSCRIPT_AGENT_SOURCE",
+        "RUSTSCRIPT_AGENT_SCRIPT",
+        "bundled:coding",
+        "agent.source",
+        "OpenAI Chat Completions",
+        "Codex Responses",
+        "custom Responses",
+        "Anthropic Messages",
+        "Access-only",
+        "refresh",
+        "not_implemented",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README.md must state the current source/protocol boundary (`{required}`)"
+        );
+    }
+    assert!(
+        !readme.contains("blocked by core (A3)"),
+        "README.md must not retain the obsolete blanket A3-blocked status"
+    );
+    assert!(
+        !readme.contains("gateway binary still runs `RUSTSCRIPT_AGENT_SCRIPT`"),
+        "README.md must not claim the legacy script variable is authoritative"
+    );
+}
+
+#[test]
+fn legacy_chat_documentation_matches_source_selected_gateway_behavior() {
+    let readme = read_relative("README.md");
+    let row = readme
+        .lines()
+        .find(|line| {
+            line.starts_with("| Legacy chat completion path (`/api/sessions/{id}/chat`) |")
+        })
+        .expect("README.md must retain the legacy chat status row");
+    let normalized_row = row.to_ascii_lowercase();
+    for required in [
+        "legacy-constructor-only",
+        "rustscript_agent_source",
+        "rustscript_agent_script",
+        "bundled:coding",
+        "501",
+        "agent_source_not_configured",
+        "post /v1/runs",
+    ] {
+        assert!(
+            normalized_row.contains(required),
+            "README.md legacy chat row must state `{required}`"
+        );
+    }
+    assert!(
+        !normalized_row.contains("runs the currently selected gateway agent source"),
+        "README.md must not claim source-selected production chat is available"
+    );
+
+    let gateway = read_relative("src/gateway/mod.rs");
+    let selection = source_section(
+        &gateway,
+        "    pub fn with_agent_selection(",
+        "    pub fn with_agent_source(",
+    );
+    for required in [
+        "run_source_policy(&selection)?",
+        "AgentSourceDecision::File",
+        "Self::assemble(",
+        "AgentSourceDecision::BundledCoding",
+        "Self::assemble_bundled(",
+    ] {
+        assert!(
+            selection.contains(required),
+            "production source-selection method must retain `{required}`"
+        );
+    }
+
+    let assembly = source_section(&gateway, "    fn assemble(\n", "    fn assemble_bundled(");
+    assert!(
+        assembly.contains("agent_source: None"),
+        "file-source assembly must leave the legacy chat source unset"
+    );
+    let bundled_assembly = source_section(
+        &gateway,
+        "    fn assemble_bundled(",
+        "\n}\n\n/// The in-memory or SQLite-backed store",
+    );
+    assert!(
+        bundled_assembly.contains("agent_source: None"),
+        "bundled-source assembly must leave the legacy chat source unset"
+    );
+
+    let api_server = read_relative("src/gateway/api_server.rs");
+    let chat_handler = source_section(&api_server, "async fn session_chat_handler(", "\nasync fn ");
+    for required in [
+        "let Some(source) = state.agent_source.clone() else",
+        "StatusCode::NOT_IMPLEMENTED",
+        "agent_source_not_configured",
+    ] {
+        assert!(
+            chat_handler.contains(required),
+            "legacy chat handler must retain `{required}`"
+        );
+    }
+}
+
+#[test]
+fn readme_distinguishes_config_bridge_from_composed_package_acceptance() {
+    let auth_host = read_relative("src/auth/host.rs");
+    assert!(auth_host.contains("\"config::load_snapshot\""));
+    let readme = read_relative("README.md");
+    let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        "config::load_snapshot",
+        "Package-level end-to-end config/auth/provider acceptance",
+        "final composed-candidate acceptance",
+        "remote delivery remain open",
+    ] {
+        assert!(
+            normalized_readme.contains(required),
+            "README.md must separate the current bridge from later acceptance (`{required}`)"
         );
     }
 }

@@ -7,10 +7,11 @@
 
 use std::{
     fs,
+    io::Read,
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{Arc, Barrier, mpsc::Receiver, mpsc::SyncSender, mpsc::sync_channel},
     thread,
     time::{Duration, Instant},
@@ -146,6 +147,152 @@ fn open_fd_count() -> usize {
         .count()
 }
 
+const FD_OBSERVER_CHILD_MARKER: &str = "RUSTSCRIPT_NATIVE_FD_OBSERVER_CHILD";
+const FD_OBSERVER_CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+const FD_OBSERVER_CHILD_OUTPUT_LIMIT: usize = 64 * 1024;
+
+struct OwnedTestChild(Option<Child>);
+
+impl OwnedTestChild {
+    fn wait_before(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            let child = self.0.as_mut().expect("owned child is still present");
+            if let Some(status) = child.try_wait()? {
+                self.0.take();
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                self.kill_and_wait();
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill_and_wait(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for OwnedTestChild {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+struct BoundedChildOutput {
+    bytes: Vec<u8>,
+    discarded: usize,
+}
+
+fn capture_child_output(mut reader: impl Read) -> std::io::Result<BoundedChildOutput> {
+    let mut output = BoundedChildOutput {
+        bytes: Vec::with_capacity(FD_OBSERVER_CHILD_OUTPUT_LIMIT),
+        discarded: 0,
+    };
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(read) => {
+                let keep = read.min(FD_OBSERVER_CHILD_OUTPUT_LIMIT - output.bytes.len());
+                output.bytes.extend_from_slice(&buffer[..keep]);
+                output.discarded += read - keep;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn fd_observer_child_is_current_test(test_name: &str) -> bool {
+    let Ok(marker) = std::env::var(FD_OBSERVER_CHILD_MARKER) else {
+        return false;
+    };
+    let mut parts = marker.splitn(3, ':');
+    let (Some(marked_test), Some(parent_pid), Some(nonce)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if marked_test != test_name
+        || parent_pid.parse::<libc::pid_t>().ok() != Some(unsafe { libc::getppid() })
+        || uuid::Uuid::parse_str(nonce).is_err()
+    {
+        return false;
+    }
+    std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|args| args[0] == "--exact" && args[1] == test_name)
+}
+
+fn spawn_fd_observer_child_unless_child(test_name: &str) -> bool {
+    if fd_observer_child_is_current_test(test_name) {
+        return false;
+    }
+
+    let deadline = Instant::now() + FD_OBSERVER_CHILD_TIMEOUT;
+    let nonce = uuid::Uuid::new_v4();
+    let marker = format!("{test_name}:{}:{nonce}", std::process::id());
+    let mut child = OwnedTestChild(Some(
+        Command::new(std::env::current_exe().expect("native test executable path"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env_remove(FD_OBSERVER_CHILD_MARKER)
+            .env(FD_OBSERVER_CHILD_MARKER, marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated FD-observer child"),
+    ));
+    let stdout = child
+        .0
+        .as_mut()
+        .expect("owned child is still present")
+        .stdout
+        .take()
+        .expect("child stdout is piped");
+    let stderr = child
+        .0
+        .as_mut()
+        .expect("owned child is still present")
+        .stderr
+        .take()
+        .expect("child stderr is piped");
+    let stdout_reader = thread::spawn(move || capture_child_output(stdout));
+    let stderr_reader = thread::spawn(move || capture_child_output(stderr));
+
+    let status = child.wait_before(deadline);
+    let stdout = stdout_reader
+        .join()
+        .expect("child stdout reader joined")
+        .expect("read child stdout");
+    let stderr = stderr_reader
+        .join()
+        .expect("child stderr reader joined")
+        .expect("read child stderr");
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    let output = format!("{stdout_text}\n{stderr_text}");
+    let truncated = stdout.discarded + stderr.discarded;
+    let ran_exactly_one_named_test = output.lines().any(|line| line.trim() == "running 1 test")
+        && output
+            .lines()
+            .any(|line| line.trim() == format!("test {test_name} ... ok"));
+    let status = status.expect("child wait completed without an I/O error");
+    assert!(
+        matches!(status, Some(ref exit) if exit.success()) && ran_exactly_one_named_test,
+        "isolated FD-observer child {test_name} did not pass its one exact test: status={status:?}, ran_exactly_one_named_test={ran_exactly_one_named_test}, truncated_output_bytes={truncated}, stdout={stdout_text}, stderr={stderr_text}"
+    );
+    true
+}
+
 /// Whether an observed Linux thread id is still live in this process.
 fn thread_alive(tid: i64) -> bool {
     Path::new(&format!("/proc/self/task/{tid}")).exists()
@@ -266,6 +413,24 @@ fn oversize_control_and_secret_instructions_produce_no_output() {
             "rejected instruction wrote output"
         );
     }
+}
+
+#[test]
+fn non_tty_character_device_fails_closed() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let device = fs::File::open("/dev/null").expect("open non-TTY character device");
+    assert!(
+        device
+            .metadata()
+            .expect("stat character device")
+            .file_type()
+            .is_char_device()
+    );
+    let owned: OwnedFd = device.into();
+    // SAFETY: isatty only inspects the owned descriptor.
+    assert_eq!(unsafe { libc::isatty(owned.as_raw_fd()) }, 0);
+    assert!(NativeAuthorizationInstructionOutput::from_fd(owned).is_err());
 }
 
 #[test]
@@ -706,6 +871,11 @@ fn worker_aborted_pending_output_is_not_reported_delivered() {
 
 #[test]
 fn worker_idle_stop_is_ok_and_leaves_no_detached_thread_or_fd() {
+    if spawn_fd_observer_child_unless_child(
+        "worker_idle_stop_is_ok_and_leaves_no_detached_thread_or_fd",
+    ) {
+        return;
+    }
     let fds_before = open_fd_count();
     let (read_fd, write_fd) = pipe(false);
     let output = Arc::new(
@@ -808,6 +978,11 @@ fn worker_finish_draining_flushes_all_records_before_join() {
 
 #[test]
 fn worker_finish_draining_reports_child_cancellation_after_idle_exit() {
+    if spawn_fd_observer_child_unless_child(
+        "worker_finish_draining_reports_child_cancellation_after_idle_exit",
+    ) {
+        return;
+    }
     let fds_before = open_fd_count();
     let (read_fd, write_fd) = pipe(false);
     let output = Arc::new(
@@ -842,6 +1017,11 @@ fn worker_finish_draining_reports_child_cancellation_after_idle_exit() {
 
 #[test]
 fn worker_finish_draining_reports_original_deadline_after_idle_exit() {
+    if spawn_fd_observer_child_unless_child(
+        "worker_finish_draining_reports_original_deadline_after_idle_exit",
+    ) {
+        return;
+    }
     let fds_before = open_fd_count();
     let (read_fd, write_fd) = pipe(false);
     let output = Arc::new(

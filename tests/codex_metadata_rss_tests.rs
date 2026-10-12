@@ -2,7 +2,7 @@
 
 #[path = "support/provider_opaque_fixture.rs"]
 #[allow(dead_code)]
-mod provider_opaque_fixture;
+pub mod provider_opaque_fixture;
 
 use provider_opaque_fixture::{
     canonical_request, harness_context, read_provider_fixture, sse_events, vm_value_to_json,
