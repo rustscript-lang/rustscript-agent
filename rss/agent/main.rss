@@ -410,7 +410,9 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
     let approval_id: string = "guardian-approval:" + run_id + ":" + call_id;
     let created_at_ms: int = ctx_int(ctx_map(context, "metadata"), "created_at_ms", 0);
     let deadline_at_ms: int = ctx_int(ctx_map(context, "metadata"), "deadline_at_ms", 0);
-    let request: map = {
+    let preview_result: map = guardian::action_preview(action);
+    let owner_preview: string = ctx_string(preview_result, "text", "");
+    let mut request: map = {
         id: approval_id,
         run_id: run_id,
         session_id: session_id,
@@ -423,9 +425,19 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
         requested_at_ms: created_at_ms,
         expires_at_ms: deadline_at_ms
     };
-    let stored: map = agent::approval_storage("request", request);
+    request.owner_preview = owner_preview;
+    let mut stored: map = {
+        ok: false,
+        result: { rows: [] },
+        error: { code: "approval_preview_unavailable" }
+    };
+    if ctx_bool(preview_result, "ok", false) && owner_preview != "" && agent::utf8_byte_len(owner_preview) <= 2048 {
+        stored = agent::approval_storage("request", request);
+    }
     let data: map = ctx_map(stored, "result");
     let rows: array = ctx_array(data, "rows");
+    let error: map = ctx_map(stored, "error");
+    let code: string = ctx_string(error, "code", "approval_storage_unavailable");
     let mut valid: bool = ctx_bool(stored, "ok", false) && rows.length == 1;
     if valid {
         let row: array = rows[0];
@@ -435,7 +447,7 @@ fn persist_approval_request(context: map, metadata: map, action: map) -> map {
             valid = false;
         }
     }
-    { ok: valid, approval_id: approval_id }
+    { ok: valid, approval_id: approval_id, code: code }
 }
 
 fn resolve_approval(context: map, approval_id: string, state: string, reason: string) -> bool {
@@ -614,7 +626,7 @@ fn dispatch_reviewed(context: map, call: map) -> map {
                 if ctx_bool(persisted, "ok", false) == false {
                     result = tools::approval_failure(
                         dispatch_input,
-                        "approval_persist_failed",
+                        ctx_string(persisted, "code", "approval_persist_failed"),
                         "approval request could not be durably recorded; no action was executed"
                     );
                 } else {

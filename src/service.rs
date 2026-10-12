@@ -777,6 +777,48 @@ struct ContextAdmissionInput {
     system_prompt: Option<String>,
 }
 
+const MAX_PENDING_APPROVAL_PREVIEWS: usize = 256;
+const MAX_APPROVAL_PREVIEW_BYTES: usize = 2048;
+
+#[derive(Clone)]
+struct PendingApprovalPreview {
+    session_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    risk_class: String,
+    expires_at_ms: i64,
+    text: String,
+}
+
+pub(crate) struct PendingApprovalPreviewBinding<'a> {
+    session_id: &'a str,
+    approval_id: &'a str,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    risk_class: &'a str,
+    expires_at_ms: i64,
+}
+
+impl<'a> PendingApprovalPreviewBinding<'a> {
+    pub(crate) fn new(
+        session_id: &'a str,
+        approval_id: &'a str,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        risk_class: &'a str,
+        expires_at_ms: i64,
+    ) -> Self {
+        Self {
+            session_id,
+            approval_id,
+            tool_call_id,
+            tool_name,
+            risk_class,
+            expires_at_ms,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentService {
     inner: Arc<AgentServiceInner>,
@@ -794,6 +836,7 @@ struct AgentServiceInner {
     provider_profiles: RwLock<HashMap<String, ProviderProfile>>,
     run_limits: RwLock<RunLimits>,
     contexts: Mutex<HashMap<String, RunContext>>,
+    approval_previews: Mutex<HashMap<(String, String), PendingApprovalPreview>>,
     context_registries: Mutex<HashMap<String, ToolRegistrySnapshot>>,
     context_cache_capacity: usize,
     capacity: Arc<Semaphore>,
@@ -892,6 +935,7 @@ impl AgentService {
             provider_profiles: RwLock::new(provider_profiles),
             run_limits: RwLock::new(RunLimits::default()),
             contexts: Mutex::new(HashMap::new()),
+            approval_previews: Mutex::new(HashMap::new()),
             context_registries: Mutex::new(HashMap::new()),
             context_cache_capacity,
             capacity,
@@ -3235,11 +3279,189 @@ impl AgentService {
         self.inner.runs.lock().expect("runs lock").len()
     }
 
-    /// Lists sanitized pending approvals for one live run owner.
+    /// Stores one exact-call action preview outside durable approval storage.
+    pub(crate) fn store_pending_approval_preview(
+        &self,
+        run_id: &str,
+        binding: &PendingApprovalPreviewBinding<'_>,
+        text: &str,
+    ) -> Result<(), &'static str> {
+        if binding.approval_id.is_empty()
+            || binding.tool_call_id.is_empty()
+            || binding.tool_name.is_empty()
+            || binding.risk_class.is_empty()
+            || binding.session_id.len() > 256
+            || binding.approval_id.len() > 512
+            || binding.tool_call_id.len() > 256
+            || binding.tool_name.len() > 128
+            || binding.risk_class.len() > 32
+            || text.trim().is_empty()
+            || text.len() > MAX_APPROVAL_PREVIEW_BYTES
+        {
+            return Err("approval_preview_invalid");
+        }
+        let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+        if binding.expires_at_ms <= now {
+            return Err("approval_expired");
+        }
+        let Some(handle) = self.handle(run_id) else {
+            return Err("run_not_active");
+        };
+        if handle.is_terminal() || handle.cancel.requested().is_some() {
+            return Err("run_not_active");
+        }
+        let Some(context) = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+        else {
+            return Err("run_not_active");
+        };
+        if context.session_id != binding.session_id {
+            return Err("approval_owner_mismatch");
+        }
+        let Some(persistence) = self.persistence_handle() else {
+            return Err("storage_unavailable");
+        };
+        let Ok(current) = persistence.approval_get(binding.approval_id) else {
+            return Err("storage_unavailable");
+        };
+        let Some(row) = current
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+        else {
+            return Err("approval_not_found");
+        };
+        if row.first().and_then(JsonValue::as_str) != Some(binding.approval_id)
+            || row.get(1).and_then(JsonValue::as_str) != Some(run_id)
+            || row.get(2).and_then(JsonValue::as_str) != Some(binding.session_id)
+            || row.get(3).and_then(JsonValue::as_str) != Some(binding.tool_call_id)
+            || row.get(4).and_then(JsonValue::as_str) != Some(binding.tool_name)
+            || row.get(5).and_then(JsonValue::as_str) != Some("{}")
+            || row.get(6).and_then(JsonValue::as_str) != Some(binding.risk_class)
+            || row.get(7).and_then(JsonValue::as_str) != Some("pending")
+            || row.get(11).and_then(JsonValue::as_i64) != Some(binding.expires_at_ms)
+        {
+            return Err("approval_call_mismatch");
+        }
+        let key = (run_id.to_string(), binding.approval_id.to_string());
+        let mut previews = self
+            .inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock");
+        previews.retain(|_, preview| preview.expires_at_ms > now);
+        if let Some(existing) = previews.get(&key) {
+            return if existing.session_id == binding.session_id
+                && existing.tool_call_id == binding.tool_call_id
+                && existing.tool_name == binding.tool_name
+                && existing.risk_class == binding.risk_class
+                && existing.expires_at_ms == binding.expires_at_ms
+                && existing.text == text
+            {
+                Ok(())
+            } else {
+                Err("approval_preview_conflict")
+            };
+        }
+        if previews
+            .keys()
+            .any(|(owner_run_id, _)| owner_run_id == run_id)
+        {
+            return Err("approval_preview_conflict");
+        }
+        let capacity = self
+            .inner
+            .config
+            .max_concurrent_runs
+            .clamp(1, MAX_PENDING_APPROVAL_PREVIEWS);
+        if previews.len() >= capacity {
+            return Err("approval_preview_capacity");
+        }
+        previews.insert(
+            key,
+            PendingApprovalPreview {
+                session_id: binding.session_id.to_string(),
+                tool_call_id: binding.tool_call_id.to_string(),
+                tool_name: binding.tool_name.to_string(),
+                risk_class: binding.risk_class.to_string(),
+                expires_at_ms: binding.expires_at_ms,
+                text: text.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn clear_pending_approval_preview(&self, run_id: &str, approval_id: &str) {
+        self.inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock")
+            .remove(&(run_id.to_string(), approval_id.to_string()));
+    }
+
+    fn clear_run_approval_previews(&self, run_id: &str) {
+        self.inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock")
+            .retain(|(owner_run_id, _), _| owner_run_id != run_id);
+    }
+
+    fn matching_pending_approval_preview(
+        &self,
+        run_id: &str,
+        binding: &PendingApprovalPreviewBinding<'_>,
+        now_ms: i64,
+    ) -> Option<String> {
+        let previews = self
+            .inner
+            .approval_previews
+            .lock()
+            .expect("approval previews lock");
+        let preview = previews.get(&(run_id.to_string(), binding.approval_id.to_string()))?;
+        if preview.session_id != binding.session_id
+            || preview.tool_call_id != binding.tool_call_id
+            || preview.tool_name != binding.tool_name
+            || preview.risk_class != binding.risk_class
+            || preview.expires_at_ms != binding.expires_at_ms
+            || preview.expires_at_ms <= now_ms
+            || preview.text.len() > MAX_APPROVAL_PREVIEW_BYTES
+        {
+            return None;
+        }
+        Some(preview.text.clone())
+    }
+
+    /// Lists bounded pending approval previews for the exact live run owner.
     pub fn pending_approvals(
         &self,
         run_id: &str,
         expected_session_id: Option<&str>,
+    ) -> Result<Vec<JsonValue>, &'static str> {
+        self.pending_approvals_for_owner(run_id, expected_session_id, None)
+    }
+
+    /// Telegram preview reads also bind the actor to the persisted session owner.
+    pub fn pending_approvals_for_actor(
+        &self,
+        run_id: &str,
+        expected_session_id: &str,
+        expected_actor_id: &str,
+    ) -> Result<Vec<JsonValue>, &'static str> {
+        self.pending_approvals_for_owner(run_id, Some(expected_session_id), Some(expected_actor_id))
+    }
+
+    fn pending_approvals_for_owner(
+        &self,
+        run_id: &str,
+        expected_session_id: Option<&str>,
+        expected_actor_id: Option<&str>,
     ) -> Result<Vec<JsonValue>, &'static str> {
         let handle = self.handle(run_id).ok_or("run_not_active")?;
         if handle.is_terminal() || handle.cancel.requested().is_some() {
@@ -3257,6 +3479,21 @@ impl AgentService {
             return Err("approval_owner_mismatch");
         }
         let persistence = self.persistence_handle().ok_or("storage_unavailable")?;
+        if let Some(actor_id) = expected_actor_id {
+            let session = persistence
+                .session_get(&context.session_id)
+                .map_err(|_| "storage_unavailable")?;
+            let owner_id = session
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(JsonValue::as_array)
+                .and_then(|row| row.get(6))
+                .and_then(JsonValue::as_str);
+            if owner_id != Some(actor_id) {
+                return Err("approval_owner_mismatch");
+            }
+        }
         let data = persistence
             .approval_list(run_id, &context.session_id)
             .map_err(|_| "storage_unavailable")?;
@@ -3265,27 +3502,59 @@ impl AgentService {
             .get("rows")
             .and_then(JsonValue::as_array)
             .ok_or("storage_unavailable")?;
-        Ok(rows
-            .iter()
-            .filter_map(JsonValue::as_array)
-            .filter(|row| row.get(7).and_then(JsonValue::as_str) == Some("pending"))
-            .filter(|row| {
-                row.get(11)
-                    .and_then(JsonValue::as_i64)
-                    .is_none_or(|expiry| expiry <= 0 || expiry > now)
-            })
-            .filter_map(|row| {
-                Some(json!({
-                    "approval_id": row.first()?.as_str()?,
-                    "run_id": row.get(1)?.as_str()?,
-                    "session_id": row.get(2)?.as_str()?,
-                    "tool_name": row.get(4)?.as_str()?,
-                    "risk_class": row.get(6)?.as_str()?,
-                    "state": row.get(7)?.as_str()?,
-                    "expires_at_ms": row.get(11)?.as_i64()?,
-                }))
-            })
-            .collect())
+        let mut approvals = Vec::new();
+        for row in rows.iter().filter_map(JsonValue::as_array) {
+            if row.get(7).and_then(JsonValue::as_str) != Some("pending") {
+                continue;
+            }
+            let approval_id = row
+                .first()
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let expires_at_ms = row
+                .get(11)
+                .and_then(JsonValue::as_i64)
+                .ok_or("storage_unavailable")?;
+            if expires_at_ms <= now {
+                self.clear_pending_approval_preview(run_id, approval_id);
+                continue;
+            }
+            let tool_call_id = row
+                .get(3)
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let tool_name = row
+                .get(4)
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let risk_class = row
+                .get(6)
+                .and_then(JsonValue::as_str)
+                .ok_or("storage_unavailable")?;
+            let binding = PendingApprovalPreviewBinding::new(
+                &context.session_id,
+                approval_id,
+                tool_call_id,
+                tool_name,
+                risk_class,
+                expires_at_ms,
+            );
+            let Some(preview) = self.matching_pending_approval_preview(run_id, &binding, now)
+            else {
+                continue;
+            };
+            approvals.push(json!({
+                "approval_id": approval_id,
+                "run_id": run_id,
+                "session_id": context.session_id,
+                "tool_name": tool_name,
+                "risk_class": risk_class,
+                "state": "pending",
+                "expires_at_ms": expires_at_ms,
+                "preview": preview,
+            }));
+        }
+        Ok(approvals)
     }
 
     /// Resolves one durable, pending approval only while its owning run is
@@ -3367,6 +3636,34 @@ impl AgentService {
         {
             return Err("approval_expired");
         }
+        if decision == "approved" {
+            let tool_call_id = row
+                .get(3)
+                .and_then(JsonValue::as_str)
+                .ok_or("approval_not_found")?;
+            let tool_name = row
+                .get(4)
+                .and_then(JsonValue::as_str)
+                .ok_or("approval_not_found")?;
+            let risk_class = row
+                .get(6)
+                .and_then(JsonValue::as_str)
+                .ok_or("approval_not_found")?;
+            let expires_at_ms = row
+                .get(11)
+                .and_then(JsonValue::as_i64)
+                .ok_or("approval_not_found")?;
+            let binding = PendingApprovalPreviewBinding::new(
+                &context.session_id,
+                approval_id,
+                tool_call_id,
+                tool_name,
+                risk_class,
+                expires_at_ms,
+            );
+            self.matching_pending_approval_preview(run_id, &binding, now)
+                .ok_or("approval_preview_unavailable")?;
+        }
         let resolution = persistence
             .approval_resolve(&json!({
                 "id": approval_id,
@@ -3396,6 +3693,7 @@ impl AgentService {
         {
             return Err("storage_unavailable");
         }
+        self.clear_pending_approval_preview(run_id, approval_id);
         Ok(())
     }
 
@@ -4469,6 +4767,7 @@ impl AgentService {
         drop(terminal_at);
         handle.permit.lock().expect("permit lock").take();
         handle.release_capability_host();
+        self.clear_run_approval_previews(run_id);
         if let Some(persistence) = self.persistence_handle() {
             let now_ms = i64::try_from(timestamp()).unwrap_or(i64::MAX);
             if let Err(error) = persistence.approval_expire(&json!({

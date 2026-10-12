@@ -1429,6 +1429,7 @@ async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: 
                 chat_id,
                 message.message_thread_id,
                 &session_id,
+                &envelope.user_id,
             )
             .await
         }
@@ -1784,6 +1785,7 @@ async fn cmd_list_approvals(
     chat_id: i64,
     thread_id: Option<i64>,
     session_id: &str,
+    actor_id: &str,
 ) {
     let run_id = {
         let store = runtime.state.store.read();
@@ -1795,9 +1797,14 @@ async fn cmd_list_approvals(
     };
     let service = runtime.state.service();
     let expected_session_id = session_id.to_string();
+    let expected_actor_id = actor_id.to_string();
     let lookup_run_id = run_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        service.pending_approvals(&lookup_run_id, Some(&expected_session_id))
+        service.pending_approvals_for_actor(
+            &lookup_run_id,
+            &expected_session_id,
+            &expected_actor_id,
+        )
     })
     .await;
     let text = match result {
@@ -1817,7 +1824,12 @@ async fn cmd_list_approvals(
                     .get("risk_class")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                lines.push(format!("{id} — {tool} ({risk})"));
+                let preview = approval
+                    .get("preview")
+                    .and_then(Value::as_str)
+                    .filter(|preview| !preview.trim().is_empty())
+                    .unwrap_or("Action preview unavailable; do not approve this action.");
+                lines.push(format!("{id} — {tool} ({risk})\n{preview}"));
             }
             if approvals.len() > 5 {
                 lines.push(format!(
@@ -1829,7 +1841,9 @@ async fn cmd_list_approvals(
         }
         _ => "Pending approvals are unavailable for this run.".to_string(),
     };
-    let _ = reply(api, chat_id, thread_id, &text).await;
+    for chunk in crate::gateway::chunk_text(&text) {
+        let _ = reply(api, chat_id, thread_id, &chunk).await;
+    }
 }
 
 struct ApprovalCommand<'a> {

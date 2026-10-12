@@ -23,7 +23,7 @@ use crate::events::EventCommitError;
 use crate::metrics::Metrics;
 use crate::runtime::agent_host::{provider_error_is_retryable, typed_fail};
 use crate::runtime::rss_runner::RunCancellation;
-use crate::service::{AgentService, ProviderCommitOutcome};
+use crate::service::{AgentService, PendingApprovalPreviewBinding, ProviderCommitOutcome};
 use crate::{AgentProviderHost, ProviderPendingDecision};
 
 /// Counts actual inner provider calls. Turn metrics are recorded by
@@ -167,7 +167,88 @@ impl AgentProviderHost for DurableProviderHost {
             );
         };
         let result = match operation {
-            "request" => persistence.approval_request(payload),
+            "request" => {
+                let preview = payload
+                    .get("owner_preview")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| crate::gateway::store::StorageError {
+                        code: "approval_preview_unavailable".to_string(),
+                        message: "approval preview is unavailable".to_string(),
+                    });
+                preview.and_then(|preview| {
+                    let session_id = payload
+                        .get("session_id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_session_invalid".to_string(),
+                            message: "approval session is missing".to_string(),
+                        })?;
+                    let approval_id =
+                        payload
+                            .get("id")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| crate::gateway::store::StorageError {
+                                code: "approval_id_invalid".to_string(),
+                                message: "approval id is missing".to_string(),
+                            })?;
+                    let tool_call_id = payload
+                        .get("tool_call_id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_call_invalid".to_string(),
+                            message: "approval call is missing".to_string(),
+                        })?;
+                    let tool_name = payload
+                        .get("tool_name")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_tool_invalid".to_string(),
+                            message: "approval tool is missing".to_string(),
+                        })?;
+                    let risk_class = payload
+                        .get("risk_class")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_risk_invalid".to_string(),
+                            message: "approval risk is missing".to_string(),
+                        })?;
+                    let expires_at_ms = payload
+                        .get("expires_at_ms")
+                        .and_then(JsonValue::as_i64)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_expiry_invalid".to_string(),
+                            message: "approval expiry is missing".to_string(),
+                        })?;
+                    let mut durable_payload = payload.clone();
+                    if let Some(object) = durable_payload.as_object_mut() {
+                        object.remove("owner_preview");
+                    }
+                    let binding = PendingApprovalPreviewBinding::new(
+                        session_id,
+                        approval_id,
+                        tool_call_id,
+                        tool_name,
+                        risk_class,
+                        expires_at_ms,
+                    );
+                    persistence
+                        .approval_request(&durable_payload)
+                        .and_then(|result| {
+                            match self.service.store_pending_approval_preview(
+                                &self.run_id,
+                                &binding,
+                                preview,
+                            ) {
+                                Ok(()) => Ok(result),
+                                Err(code) => Err(crate::gateway::store::StorageError {
+                                    code: code.to_string(),
+                                    message: "approval preview could not be bound to the live call"
+                                        .to_string(),
+                                }),
+                            }
+                        })
+                })
+            }
             "get" => payload
                 .get("approval_id")
                 .and_then(JsonValue::as_str)
@@ -184,7 +265,17 @@ impl AgentProviderHost for DurableProviderHost {
                     message: "approval session is missing".to_string(),
                 })
                 .and_then(|session_id| persistence.approval_list(&self.run_id, session_id)),
-            "resolve" => persistence.approval_resolve(payload),
+            "resolve" => {
+                let result = persistence.approval_resolve(payload);
+                if result.as_ref().is_ok_and(|result| {
+                    result.get("rows_affected").and_then(JsonValue::as_i64) == Some(1)
+                }) && let Some(approval_id) = payload.get("id").and_then(JsonValue::as_str)
+                {
+                    self.service
+                        .clear_pending_approval_preview(&self.run_id, approval_id);
+                }
+                result
+            }
             _ => {
                 return typed_fail(
                     "approval_operation_invalid",
@@ -194,10 +285,28 @@ impl AgentProviderHost for DurableProviderHost {
         };
         match result {
             Ok(result) => json!({ "ok": true, "result": result }),
-            Err(_) => typed_fail(
-                "approval_storage_unavailable",
-                "approval storage is unavailable",
-            ),
+            Err(error) => {
+                let code = if operation == "request" {
+                    match error.code.as_str() {
+                        "approval_preview_invalid"
+                        | "approval_expired"
+                        | "run_not_active"
+                        | "approval_owner_mismatch"
+                        | "storage_unavailable"
+                        | "approval_not_found"
+                        | "approval_call_mismatch"
+                        | "approval_preview_conflict"
+                        | "approval_preview_capacity" => error.code.as_str(),
+                        _ => "approval_storage_unavailable",
+                    }
+                } else {
+                    "approval_storage_unavailable"
+                };
+                typed_fail(
+                    code,
+                    "approval request could not be bound to its live action",
+                )
+            }
         }
     }
 
