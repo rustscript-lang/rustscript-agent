@@ -20,8 +20,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 const SOURCE_AUTH: &str = "/home/wow/.hermes/auth.json";
-const TEST_TMP: &str =
-    "/mnt/TEMP/workspace/rustscript-agent/tmp/codex-access-responses-e2e-40cf68a2";
 const PROVIDER: &str = "openai-codex";
 const CREDENTIAL_ID: &str = "live-codex-access-only";
 const RESPONSE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -261,14 +259,15 @@ struct LiveArtifacts {
 
 impl LiveArtifacts {
     fn create() -> Self {
-        let assigned = PathBuf::from(
-            std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned test temp"),
-        );
-        assert_eq!(
-            assigned,
-            PathBuf::from(TEST_TMP),
-            "live artifacts must use assigned temp"
-        );
+        let assigned = [
+            "RUSTSCRIPT_AGENT_TEST_TMP",
+            "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+            "TEST_TMPDIR",
+        ]
+        .into_iter()
+        .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .expect("caller must provide assigned live E2E scratch");
         let root = assigned.join(format!("codex-access-live-{}", uuid::Uuid::new_v4()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]

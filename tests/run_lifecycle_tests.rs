@@ -2,13 +2,20 @@
 
 mod common;
 
+use std::any::Any;
 use std::fs;
+use std::future::Future;
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use rustscript_agent::config::{ProviderProfile, RunLimits};
 use rustscript_agent::{
     AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner, AgentService,
@@ -216,6 +223,410 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         std::process::id(),
         uuid::Uuid::new_v4()
     ))
+}
+
+struct OwnedPrivateFixtureDirectory {
+    path: PathBuf,
+    owned: bool,
+}
+
+impl OwnedPrivateFixtureDirectory {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        Ok(Self { path, owned: true })
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        if self.owned {
+            fs::remove_dir_all(&self.path)?;
+            self.owned = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedPrivateFixtureDirectory {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn write_private_fixture_file(path: &std::path::Path, contents: &str) {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).expect("create private fixture file");
+    file.write_all(contents.as_bytes())
+        .expect("write private fixture file");
+}
+
+#[test]
+fn private_auth_home_is_removed_after_fixture_setup_error() {
+    let auth_home = unique_temp_dir("tls-fixture-setup-error");
+    let setup_result = (|| -> std::io::Result<()> {
+        let _auth_home = OwnedPrivateFixtureDirectory::create(auth_home.clone())?;
+        write_private_fixture_file(&auth_home.join("config.yaml"), "synthetic: config\n");
+        write_private_fixture_file(&auth_home.join("auth.yaml"), "token: synthetic-only\n");
+        Err(std::io::Error::other(
+            "injected setup failure after private fixture files",
+        ))
+    })();
+    let remained_after_error = auth_home.exists();
+    if remained_after_error {
+        fs::remove_dir_all(&auth_home).expect("remove RED-test fixture residue");
+    }
+
+    assert!(setup_result.is_err(), "the setup failure must be injected");
+    assert!(
+        !remained_after_error,
+        "owned synthetic auth home must be removed when setup returns an error"
+    );
+
+    let preexisting = unique_temp_dir("tls-fixture-preexisting");
+    fs::create_dir(&preexisting).expect("create test-owned preexisting directory");
+    let marker = preexisting.join("owner-marker");
+    fs::write(&marker, b"test-owned").expect("write test-owned marker");
+    let creation_error = OwnedPrivateFixtureDirectory::create(preexisting.clone());
+    let marker_preserved = fs::read(&marker).is_ok_and(|bytes| bytes == b"test-owned");
+    fs::remove_dir_all(&preexisting).expect("remove test-owned preexisting directory");
+    assert!(
+        creation_error.is_err(),
+        "guard must refuse a preexisting path"
+    );
+    assert!(
+        marker_preserved,
+        "refusing a path must preserve its existing contents"
+    );
+}
+
+#[derive(Debug)]
+struct OwnedLoopbackRequest {
+    method: String,
+    path: String,
+    has_bearer: bool,
+    body_bytes: usize,
+}
+
+type OwnedServerPanic = Box<dyn Any + Send + 'static>;
+type OwnedServerIo = Pin<Box<dyn Future<Output = Result<(), OwnedServerPanic>> + Send>>;
+
+const OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND: Duration = Duration::from_secs(5);
+
+struct OwnedLoopbackServer {
+    address: SocketAddr,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    io: Option<OwnedServerIo>,
+    completed: Option<Result<(), OwnedServerPanic>>,
+}
+
+impl OwnedLoopbackServer {
+    fn from_future<F>(
+        address: SocketAddr,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        future: F,
+    ) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            address,
+            shutdown: Some(shutdown),
+            io: Some(Box::pin(AssertUnwindSafe(future).catch_unwind())),
+            completed: None,
+        }
+    }
+
+    fn start(
+        listener: tokio::net::TcpListener,
+        address: SocketAddr,
+        server_tls: Arc<rustls::ServerConfig>,
+        accepted_tx: tokio::sync::oneshot::Sender<OwnedLoopbackRequest>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let io = async move {
+            use tokio::io::AsyncReadExt;
+
+            let mut shutdown_rx = shutdown_rx;
+            let tcp = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(_) => return,
+                },
+                _ = &mut shutdown_rx => return,
+            };
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_tls);
+            let Ok(Ok(mut stream)) =
+                tokio::time::timeout(Duration::from_secs(2), acceptor.accept(tcp)).await
+            else {
+                return;
+            };
+            let request = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut received = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut chunk).await.map_err(|_| ())?;
+                    if count == 0 {
+                        return Err(());
+                    }
+                    received.extend_from_slice(&chunk[..count]);
+                    if received.len() > 128 * 1024 {
+                        return Err(());
+                    }
+                    if let Some(request) = parse_owned_loopback_request(&received) {
+                        return Ok(request);
+                    }
+                }
+            })
+            .await;
+            let Ok(Ok(request)) = request else {
+                return;
+            };
+            let _ = accepted_tx.send(request);
+            let _ = shutdown_rx.await;
+        };
+        Self::from_future(address, shutdown_tx, io)
+    }
+
+    async fn shutdown_and_reap(&mut self, graceful_bound: Duration) -> Result<(), String> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let graceful_bound = graceful_bound.min(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND);
+        let mut completion = self.completed.take();
+        let mut io = self.io.take();
+        let mut failure = None;
+        match (completion.is_some(), io.as_mut()) {
+            (true, _) => {}
+            (false, Some(io)) => match tokio::time::timeout(graceful_bound, io.as_mut()).await {
+                Ok(result) => completion = Some(result),
+                Err(_) => {
+                    failure = Some(
+                        "owned TLS server exceeded graceful shutdown bound; owned future was dropped",
+                    );
+                }
+            },
+            (false, None) => {
+                failure = Some("owned TLS server future was already consumed");
+            }
+        }
+        if matches!(completion.as_ref(), Some(Err(_))) {
+            failure = Some("owned TLS server future panicked");
+        }
+
+        // The future owns the listener and accepted stream; drop it before probing the exact address.
+        drop(io);
+        let socket_failure = match std::net::TcpListener::bind(self.address) {
+            Ok(probe) => {
+                drop(probe);
+                None
+            }
+            Err(error) => Some(format!(
+                "owned TLS server socket was not released after dropping its future: {error}"
+            )),
+        };
+        match (failure, socket_failure) {
+            (None, None) => Ok(()),
+            (Some(message), None) => Err(message.to_string()),
+            (None, Some(error)) => Err(error),
+            (Some(message), Some(error)) => Err(format!("{message}; {error}")),
+        }
+    }
+}
+
+async fn poll_during_operation<T, F>(
+    server: &mut OwnedLoopbackServer,
+    operation: F,
+) -> Result<T, OwnedServerPanic>
+where
+    F: Future<Output = T>,
+{
+    let mut operation = Box::pin(AssertUnwindSafe(operation).catch_unwind());
+    loop {
+        if server.completed.is_some() || server.io.is_none() {
+            return operation.await;
+        }
+        let server_io = server
+            .io
+            .as_mut()
+            .expect("owned TLS server future is present")
+            .as_mut();
+        tokio::select! {
+            result = operation.as_mut() => return result,
+            result = server_io => server.completed = Some(result),
+        }
+    }
+}
+
+fn resume_observation_panic<T>(observation: Result<T, OwnedServerPanic>) -> T {
+    match observation {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn panic_with_owned_marker(marker: Arc<()>) {
+    std::panic::panic_any(marker);
+}
+
+struct OwnedLoopbackHttpsTransport {
+    port: u16,
+    tls: Arc<rustls::ClientConfig>,
+}
+
+fn owned_loopback_transport_error() -> rustscript_agent::auth::oauth::OAuthError {
+    rustscript_agent::auth::oauth::OAuthError::Transport {
+        message: "owned loopback TLS fixture transport failed".to_string(),
+    }
+}
+
+impl rustscript_agent::auth::oauth::BoundedHttpsTransport for OwnedLoopbackHttpsTransport {
+    fn send(
+        &self,
+        request: &rustscript_agent::auth::oauth::PreparedHttpsRequest,
+        context: &rustscript_agent::auth::oauth::OAuthIoContext,
+    ) -> Result<
+        rustscript_agent::auth::oauth::RawHttpsResponse,
+        rustscript_agent::auth::oauth::OAuthError,
+    > {
+        context.check()?;
+        let url = url::Url::parse(&request.url).map_err(|_| owned_loopback_transport_error())?;
+        if url.scheme() != "https"
+            || url.host_str() != Some("127.0.0.1")
+            || url.port() != Some(self.port)
+            || request.body.len() > context.max_request_body_bytes()
+        {
+            return Err(owned_loopback_transport_error());
+        }
+        let timeout = context.remaining()?.max(Duration::from_millis(1));
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+        let socket = std::net::TcpStream::connect_timeout(&address, timeout)
+            .map_err(|_| owned_loopback_transport_error())?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|_| owned_loopback_transport_error())?;
+        socket
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .map_err(|_| owned_loopback_transport_error())?;
+        let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
+            .map_err(|_| owned_loopback_transport_error())?;
+        let connection = rustls::ClientConnection::new(Arc::clone(&self.tls), server_name)
+            .map_err(|_| owned_loopback_transport_error())?;
+        let mut stream = rustls::StreamOwned::new(connection, socket);
+        let target = format!(
+            "{}{}",
+            url.path(),
+            url.query()
+                .map(|query| format!("?{query}"))
+                .unwrap_or_default()
+        );
+        let mut wire = format!(
+            "{} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: keep-alive\r\nContent-Length: {}\r\n",
+            request.method,
+            self.port,
+            request.body.len()
+        )
+        .into_bytes();
+        for (name, value) in &request.headers {
+            if name.eq_ignore_ascii_case("host")
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("connection")
+            {
+                continue;
+            }
+            wire.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(request.body.as_bytes());
+        context.check()?;
+        stream
+            .write_all(&wire)
+            .map_err(|_| owned_loopback_transport_error())?;
+        stream
+            .flush()
+            .map_err(|_| owned_loopback_transport_error())?;
+        stream
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .map_err(|_| owned_loopback_transport_error())?;
+        let mut response_byte = [0_u8; 1];
+        loop {
+            context.check()?;
+            match stream.read(&mut response_byte) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(_) | Err(_) => return Err(owned_loopback_transport_error()),
+            }
+        }
+    }
+}
+
+fn owned_loopback_tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+    let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])
+        .expect("generate owned loopback TLS certificate");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(certified.cert.der().clone())
+        .expect("trust only the owned loopback TLS certificate");
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .expect("configure owned loopback TLS server");
+    let client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    (Arc::new(server), Arc::new(client))
+}
+
+fn parse_owned_loopback_request(bytes: &[u8]) -> Option<OwnedLoopbackRequest> {
+    let header_end = bytes.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&bytes[..header_end]).ok()?;
+    let mut lines = headers.split("\r\n");
+    let mut request_line = lines.next()?.split_whitespace();
+    let method = request_line.next()?.to_string();
+    let path = request_line.next()?.to_string();
+    if request_line.next()? != "HTTP/1.1" {
+        return None;
+    }
+    let mut content_length = None;
+    let mut has_bearer = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+        if name.eq_ignore_ascii_case("authorization") {
+            has_bearer = value.trim().to_ascii_lowercase().starts_with("bearer ");
+        }
+    }
+    let body_bytes = content_length?;
+    if bytes.len() < header_end + 4 + body_bytes {
+        return None;
+    }
+    Some(OwnedLoopbackRequest {
+        method,
+        path,
+        has_bearer,
+        body_bytes,
+    })
 }
 
 fn assert_temp_path_is_lease_safe(path: &std::path::Path) {
@@ -1225,42 +1636,286 @@ async fn non_expired_restart_keeps_remaining_deadline() {
     worker.await.expect("worker join");
 }
 
+async fn pending_owned_loopback_server() -> (OwnedLoopbackServer, SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind pending owned loopback server");
+    let address = listener.local_addr().expect("pending owned server address");
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = OwnedLoopbackServer::from_future(address, shutdown, async move {
+        let _listener = listener;
+        let _ = shutdown_rx.await;
+        std::future::pending::<()>().await;
+    });
+    (server, address)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_loopback_pending_future_is_dropped_and_socket_rebound() {
+    let (mut server, address) = pending_owned_loopback_server().await;
+    let started = Instant::now();
+    let observation = poll_during_operation(&mut server, async {}).await;
+    let cleanup = server.shutdown_and_reap(Duration::from_millis(40)).await;
+    let elapsed = started.elapsed();
+    let rebound = std::net::TcpListener::bind(address).map(drop).is_ok();
+    let cleanup_failed = cleanup.is_err();
+    let cleanup_failure_panicked = AssertUnwindSafe(async move {
+        cleanup.expect("cleanup failure without an observation panic must fail closed");
+    })
+    .catch_unwind()
+    .await
+    .is_err();
+
+    assert!(observation.is_ok(), "injected observation must complete");
+    assert!(
+        cleanup_failed,
+        "shutdown-ignoring owned future must report cleanup failure"
+    );
+    assert!(
+        cleanup_failure_panicked,
+        "an unmasked cleanup error must fail the caller"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(5),
+        "cleanup exceeded its bound"
+    );
+    assert!(
+        rebound,
+        "dropping the owned future must release the exact address"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn observation_panic_keeps_payload_after_server_cleanup_failure() {
+    let (mut server, address) = pending_owned_loopback_server().await;
+    let auth_home = unique_temp_dir("tls-reap-panic-auth");
+    let mut auth_home_guard = OwnedPrivateFixtureDirectory::create(auth_home.clone())
+        .expect("create owned private synthetic auth home");
+    write_private_fixture_file(&auth_home.join("auth.yaml"), "token: synthetic-only\n");
+    let marker = Arc::new(());
+    let observation = poll_during_operation(&mut server, async {
+        panic_with_owned_marker(Arc::clone(&marker));
+    })
+    .await;
+    let server_cleanup = server.shutdown_and_reap(Duration::from_millis(40)).await;
+    let auth_cleanup = auth_home_guard.cleanup();
+    let server_cleanup_failed = server_cleanup.is_err();
+    let auth_cleanup_succeeded = auth_cleanup.is_ok();
+    let auth_home_removed = !auth_home.exists();
+    let socket_rebound = std::net::TcpListener::bind(address).map(drop).is_ok();
+    let captured = AssertUnwindSafe(async move {
+        resume_observation_panic(observation);
+        server_cleanup.expect("cleanup failure must follow the original observation panic");
+        auth_cleanup.expect("private synthetic auth home cleanup");
+    })
+    .catch_unwind()
+    .await;
+    let original_payload_preserved = captured
+        .as_ref()
+        .err()
+        .and_then(|payload| payload.downcast_ref::<Arc<()>>())
+        .is_some_and(|payload| Arc::ptr_eq(payload, &marker));
+
+    assert!(
+        server_cleanup_failed,
+        "pending server cleanup must fail closed"
+    );
+    assert!(
+        auth_cleanup_succeeded,
+        "auth cleanup must be attempted before rethrow"
+    );
+    assert!(
+        auth_home_removed,
+        "auth directory must be absent after cleanup"
+    );
+    assert!(socket_rebound, "server socket must be absent after cleanup");
+    assert!(
+        original_payload_preserved,
+        "the original observation panic payload must retain identity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_loopback_server_future_panic_is_captured_and_socket_rebound() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind panicking owned loopback server");
+    let address = listener
+        .local_addr()
+        .expect("panicking owned server address");
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut server = OwnedLoopbackServer::from_future(address, shutdown, async move {
+        let _listener = listener;
+        let _ = shutdown_rx.await;
+        panic!("injected owned TLS server future panic");
+    });
+    let observation = poll_during_operation(&mut server, async {}).await;
+    let cleanup = server.shutdown_and_reap(Duration::from_secs(5)).await;
+    let rebound = std::net::TcpListener::bind(address).map(drop).is_ok();
+
+    assert!(observation.is_ok(), "observation itself must not panic");
+    assert!(
+        cleanup.is_err(),
+        "server future panic must be recorded as cleanup failure"
+    );
+    assert!(
+        rebound,
+        "captured server panic must still release the socket"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_loopback_server_is_reaped_after_postspawn_error_and_panic() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind first owned loopback server");
+    let address = listener.local_addr().expect("first owned server address");
+    let (server_tls, _) = owned_loopback_tls_configs();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    drop(accepted_rx);
+    let mut server = OwnedLoopbackServer::start(listener, address, server_tls, accepted_tx);
+    let operation = poll_during_operation(&mut server, async {
+        Err::<(), _>("injected post-spawn error")
+    })
+    .await;
+    let cleanup = server
+        .shutdown_and_reap(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND)
+        .await;
+    assert_eq!(
+        resume_observation_panic(operation),
+        Err("injected post-spawn error")
+    );
+    cleanup.expect("error path must signal and close the owned socket");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind second owned loopback server");
+    let address = listener.local_addr().expect("second owned server address");
+    let (server_tls, _) = owned_loopback_tls_configs();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    drop(accepted_rx);
+    let mut server = OwnedLoopbackServer::start(listener, address, server_tls, accepted_tx);
+    let operation = poll_during_operation(&mut server, async {
+        panic!("injected post-spawn panic");
+    })
+    .await;
+    let cleanup = server
+        .shutdown_and_reap(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND)
+        .await;
+    assert!(
+        operation.is_err(),
+        "post-spawn panic must be captured for cleanup"
+    );
+    cleanup.expect("unwind path must signal and close the owned socket");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn hanging_http_adapter_stop_cancels() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind hang server");
-    let port = listener.local_addr().expect("local addr").port();
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        let mut shutdown_rx = shutdown_rx;
-        tokio::select! {
-            accepted = listener.accept() => {
-                if let Ok((stream, _)) = accepted {
-                    let _ = accepted_tx.send(());
-                    let _ = shutdown_rx.await;
-                    drop(stream);
-                }
-            }
-            _ = &mut shutdown_rx => {}
-        }
-    });
+        .expect("bind owned TLS fixture server");
+    let address = listener.local_addr().expect("local addr");
+    let port = address.port();
+    let base_url = format!("https://127.0.0.1:{port}/v1");
+    let (server_tls, client_tls) = owned_loopback_tls_configs();
+    let transport: Arc<dyn rustscript_agent::auth::oauth::BoundedHttpsTransport> =
+        Arc::new(OwnedLoopbackHttpsTransport {
+            port,
+            tls: client_tls,
+        });
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<OwnedLoopbackRequest>();
     let mut config = short_config(Duration::from_secs(8));
+    config.provider = Some("custom".to_string());
+    config.model = "loopback-hang-model".to_string();
     config.http.allowed_hosts = vec!["127.0.0.1".to_string()];
-    config.http.allowed_schemes = vec!["http".to_string()];
+    config.http.allowed_schemes = vec!["https".to_string()];
     config.http.allowed_ports = vec![port];
     config.http.allow_private_ips = true;
     let state =
         AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
             .expect("compile adapter run");
     let service = state.service();
+    let auth_home = unique_temp_dir("hanging-http-auth");
+    let mut auth_home_guard = OwnedPrivateFixtureDirectory::create(auth_home.clone())
+        .expect("create owned private synthetic auth home");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/config_auth_rss");
+    let auth_config_yaml = fs::read_to_string(fixture.join("config.yaml"))
+        .expect("read synthetic provider config")
+        .replace("openai-codex", "custom")
+        .replace("https://chatgpt.com/backend-api/codex", &base_url)
+        .replace("fixture-codex", "synthetic-custom");
+    let mut auth_config_value: serde_yaml::Value =
+        serde_yaml::from_str(&auth_config_yaml).expect("parse synthetic provider config");
+    auth_config_value["providers"]["custom"]["oauth"] = serde_yaml::Value::Null;
+    let auth_config =
+        serde_yaml::to_string(&auth_config_value).expect("serialize synthetic provider config");
+    let auth_data = fs::read_to_string(fixture.join("auth.yaml"))
+        .expect("read synthetic provider credential")
+        .replace("1788440000000", "1900003600000")
+        .replace("openai-codex", "custom")
+        .replace("fixture-codex", "synthetic-custom")
+        .replace("SYNTHETIC_ACCESS_TOKEN", "SYNTHETIC_CUSTOM_ACCESS")
+        .replace("SYNTHETIC_REFRESH_TOKEN", "SYNTHETIC_CUSTOM_REFRESH");
+    rustscript_agent::config_file::ConfigFile::from_str(&auth_config)
+        .expect("strict synthetic provider config");
+    let auth_config_path = auth_home.join("config.yaml");
+    let auth_data_path = auth_home.join("auth.yaml");
+    write_private_fixture_file(&auth_config_path, &auth_config);
+    write_private_fixture_file(&auth_data_path, &auth_data);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&auth_home)
+                .expect("fixture directory mode")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "synthetic auth home must exclude group and other"
+        );
+        assert_eq!(
+            fs::metadata(&auth_config_path)
+                .expect("synthetic config mode")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "synthetic config must exclude group and other"
+        );
+        assert_eq!(
+            fs::metadata(&auth_data_path)
+                .expect("synthetic credential mode")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "synthetic credential must exclude group and other"
+        );
+    }
+    let factory_home = auth_home.clone();
+    let oauth = Arc::new(rustscript_agent::auth::oauth::OAuthHost::new(
+        transport,
+        Arc::new(rustscript_agent::auth::oauth::ScriptedCallback::new()),
+        Arc::new(rustscript_agent::auth::oauth::ScriptedBrowser::new()),
+        Arc::new(rustscript_agent::auth::oauth::ScriptedClock::new(
+            1_900_000_000_000,
+        )),
+        Arc::new(rustscript_agent::auth::oauth::ScriptedCancel::new()),
+    ));
+    service.set_auth_host_factory(std::sync::Arc::new(move |cancellation| {
+        rustscript_agent::auth::host::AuthHost::new(factory_home.clone(), cancellation)
+            .map(|host| host.with_oauth_host(Arc::clone(&oauth)))
+    }));
     service.upsert_provider_profile(
         ProviderProfile::new(
-            "local-agent",
-            json!({ "base_url": format!("http://127.0.0.1:{port}") }),
+            "custom",
+            json!({
+                "base_url": base_url,
+                "credential_id": "synthetic-custom"
+            }),
         )
-        .expect("profile"),
+        .expect("synthetic custom profile"),
     );
     // The provider adapter is compiled on its first call. Prepare that RSS
     // snapshot before admission so the test's four-second window measures the
@@ -1272,31 +1927,167 @@ async fn hanging_http_adapter_stop_cancels() {
         .admit(admit_request())
         .await
         .expect("admission should succeed");
-    let worker = tokio::spawn({
-        let service = service.clone();
-        let run_id = admitted.run_id.clone();
-        async move {
-            service.run_worker(run_id, "ignored".to_string()).await;
-        }
-    });
-    tokio::time::timeout(Duration::from_secs(4), accepted_rx)
-        .await
-        .expect("RssAdapterProvider should connect within the run setup window")
-        .expect("hanging HTTP server should report its accepted connection");
-    assert_eq!(service.stop(&admitted.run_id).as_deref(), Some("stopping"));
-    tokio::time::timeout(Duration::from_secs(6), worker)
-        .await
-        .expect("hanging HTTP stop must stay bounded")
-        .expect("worker join");
-    assert_eq!(
-        terminal_events(&service, &admitted.run_id),
-        vec!["run.cancelled".to_string()],
-        "{:?}",
-        service.run_events(&admitted.run_id)
+    let named_dispatch_runner = AgentRunner::from_bundled_named(
+        "rss/llm/provider_dispatch.rss",
+        "dispatch",
+        AgentConfig::default(),
     );
-    assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
-    let _ = shutdown_tx.send(());
-    server.await.expect("hanging HTTP server task");
+    let mut server = OwnedLoopbackServer::start(listener, address, server_tls, accepted_tx);
+    let mut worker = None;
+    let observation_result = poll_during_operation(&mut server, async {
+        worker = Some(tokio::spawn({
+            let service = service.clone();
+            let run_id = admitted.run_id.clone();
+            async move {
+                service.run_worker(run_id, "ignored".to_string()).await;
+            }
+        }));
+        let accepted = tokio::time::timeout(Duration::from_secs(4), accepted_rx).await;
+        let request_observation = match accepted {
+            Ok(Ok(observation)) => Some(observation),
+            _ => None,
+        };
+        let connected = request_observation.as_ref().is_some_and(|request| {
+            request.method == "POST"
+                && request.path == "/v1/chat/completions"
+                && request.has_bearer
+                && request.body_bytes > 0
+        });
+        let named_dispatch_diagnostic = (!connected).then(|| {
+            let runner = match &named_dispatch_runner {
+                Ok(runner) => runner,
+                Err(error) => return format!("constructor_error={error}"),
+            };
+            let request = rustscript_vm::Value::map(vec![
+                (
+                    rustscript_vm::Value::string("provider"),
+                    rustscript_vm::Value::string("local-agent"),
+                ),
+                (
+                    rustscript_vm::Value::string("provider_options"),
+                    rustscript_vm::Value::map(vec![]),
+                ),
+            ]);
+            let context = rustscript_vm::Value::map(vec![(
+                rustscript_vm::Value::string("request"),
+                request,
+            )]);
+            struct DiagnosticSink;
+            impl rustscript_agent::RunEventSink for DiagnosticSink {
+                fn deliver(
+                    &mut self,
+                    _value: rustscript_vm::Value,
+                ) -> Result<(), rustscript_agent::RunDeliveryError> {
+                    Ok(())
+                }
+            }
+            let cancellation =
+                rustscript_agent::RunCancellation::with_timeout(Duration::from_secs(2));
+            match runner.run_named_with_context_and_events(
+                "dispatch",
+                context,
+                &mut DiagnosticSink,
+                &cancellation,
+            ) {
+                Ok(value) => format!("dispatch_value={value:?}"),
+                Err(error) => format!("dispatch_error={error:?}"),
+            }
+        });
+        let worker_finished_before_stop = worker
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished);
+        let pre_stop_diagnostic = (!connected).then(|| {
+            let run_context = service.run_context(&admitted.run_id);
+            let provider_binding = run_context
+                .as_ref()
+                .and_then(|context| context.provider.as_deref())
+                .unwrap_or("<missing>");
+            let profile_binding = run_context
+                .as_ref()
+                .and_then(|context| context.metadata.pointer("/provider_profile"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("<missing>");
+            let provider_error_codes = service
+                .run_events(&admitted.run_id)
+                .into_iter()
+                .filter(|event| event["event"] == "model.failed")
+                .filter_map(|event| {
+                    event
+                        .pointer("/data/error_code")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "provider={provider_binding}; profile={profile_binding}; events={:?}; terminal={:?}; provider_error_codes={provider_error_codes:?}; run_error_code={}; worker_finished={worker_finished_before_stop}; cancel_reason={}; model_calls={}; loopback_request={request_observation:?}; named_dispatcher={named_dispatch_diagnostic:?}",
+                event_names(&service, &admitted.run_id),
+                terminal_events(&service, &admitted.run_id),
+                failed_error_code(&service, &admitted.run_id),
+                cancel_reason(&service, &admitted.run_id),
+                service.metrics().snapshot().model_calls
+            )
+        });
+        (request_observation, connected, pre_stop_diagnostic)
+    })
+    .await;
+    let stop_result = service.stop(&admitted.run_id);
+    let worker_result = match worker.as_mut() {
+        Some(worker) => Some(tokio::time::timeout(Duration::from_secs(6), worker).await),
+        None => None,
+    };
+    let worker_reaped = match worker_result.as_ref() {
+        Some(Err(_)) => match worker.as_mut() {
+            Some(worker) => {
+                worker.abort();
+                tokio::time::timeout(Duration::from_secs(1), worker)
+                    .await
+                    .is_ok()
+            }
+            None => false,
+        },
+        Some(Ok(_)) | None => true,
+    };
+    let terminal = terminal_events(&service, &admitted.run_id);
+    let reason = cancel_reason(&service, &admitted.run_id);
+    let server_cleanup = server
+        .shutdown_and_reap(OWNED_LOOPBACK_SERVER_GRACEFUL_BOUND)
+        .await;
+    let auth_cleanup = auth_home_guard.cleanup();
+    let auth_home_removed = !auth_home.exists();
+    let (request_observation, connected, pre_stop_diagnostic) =
+        resume_observation_panic(observation_result);
+
+    assert!(worker_reaped, "timed-out HTTP worker task was not reaped");
+    server_cleanup
+        .expect("hanging HTTP server must be gracefully closed and its socket rebindable");
+    auth_cleanup.expect("private synthetic auth home cleanup");
+    assert!(
+        auth_home_removed,
+        "private synthetic auth home must be absent after cleanup"
+    );
+    if let Some(worker_result) = worker_result {
+        worker_result
+            .expect("hanging HTTP stop must stay bounded")
+            .expect("worker join");
+    }
+    assert!(
+        connected,
+        "RssAdapterProvider should connect within the run setup window; pre-stop state: {pre_stop_diagnostic:?}; request: {request_observation:?}"
+    );
+    assert_eq!(
+        stop_result.as_deref(),
+        Some("stopping"),
+        "pre-stop state: {pre_stop_diagnostic:?}"
+    );
+    assert_eq!(
+        terminal,
+        vec!["run.cancelled".to_string()],
+        "pre-stop state: {pre_stop_diagnostic:?}"
+    );
+    assert_eq!(
+        reason, "requested",
+        "pre-stop state: {pre_stop_diagnostic:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
