@@ -309,19 +309,6 @@ fn preview_has_sensitive_marker(text: string) -> bool {
     found
 }
 
-fn preview_sensitive_flag(text: string) -> bool {
-    text == "-p" || text == "-u" || text == "-d" || text == "-H" || text == "-F" ||
-    text == "--password" || text == "--passwd" || text == "--token" || text == "--secret" ||
-    text == "--api-key" || text == "--api_key" || text == "--apikey" ||
-    text == "--authorization" || text == "--cookie" || text == "--credential" ||
-    text == "--private-key" || text == "--private_key" || text == "--client-secret" ||
-    text == "--client_secret" || text == "--access-key" || text == "--access_key" ||
-    text == "--refresh-token" || text == "--refresh_token" || text == "--user" ||
-    text == "--data" || text == "--data-raw" || text == "--data-binary" || text == "--body" ||
-    text == "--header" || text == "--json" || text == "--form" || text == "--form-string" ||
-    text == "--content" || text == "--text" || text == "--message" || text == "--input"
-}
-
 /// Build a bounded, owner-facing description from the validated exact action.
 /// Never include file/process content or output; unsupported/unreviewable forms fail closed.
 pub fn action_preview(action: map) -> map {
@@ -360,7 +347,6 @@ pub fn action_preview(action: map) -> map {
         let mut safe_argv: array = [];
         let mut program: string = "";
         let mut argv_bytes: int = 0;
-        let mut redact_next: bool = false;
         let mut argv_valid: bool = argv.length > 0 && argv.length <= 16;
         let mut index: int = 0;
         while argv_valid && index < argv.length {
@@ -382,12 +368,7 @@ pub fn action_preview(action: map) -> map {
                         }
                     } else if argument == "-c" || argument == "--command" || argument == "-e" || argument == "--eval" {
                         argv_valid = false;
-                    } else if redact_next {
-                        safe_argument = "<redacted>";
-                        redact_next = false;
-                    } else if preview_sensitive_flag(argument) {
-                        redact_next = true;
-                    } else if preview_has_sensitive_marker(argument) {
+                    } else {
                         safe_argument = "<redacted>";
                     }
                     safe_argv[safe_argv.length] = safe_argument;

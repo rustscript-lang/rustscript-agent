@@ -1822,6 +1822,200 @@ async fn user_reviewer_waits_for_authenticated_http_approval_before_exactly_one_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn authenticated_http_terminal_preview_withholds_unrecognized_argv_values() {
+    let temp = PathBuf::from(
+        std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
+    );
+    let root = temp.join(format!("terminal-http-preview-{}", uuid::Uuid::new_v4()));
+    let (workspace_home, workspace) = guardian_workspace(&root);
+    let effect_path = workspace.join("terminal-effect.txt");
+    let home = fixture_home();
+    let transport = Arc::new(EffectObservedTransport::new(effect_path.clone()));
+    transport.inner.push_json(
+        200,
+        json!({
+            "id": "chatcmpl-terminal-http-preview",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "http-terminal-call",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"argv\":[\"printf\",\"--access-token\",\"HTTP_OPAQUE_VALUE_SENTINEL\",\"HTTP_POSITIONAL_VALUE_SENTINEL\",\"--AcCeSs-ToKeN=HTTP_MIXEDCASE_INLINE_SENTINEL\",\"--future-flag=HTTP_UNKNOWN_FLAG_SENTINEL\",\"--data=HTTP_INLINE_DATA_SENTINEL\"],\"cwd\":\"project\",\"timeout_ms\":1000,\"max_output_bytes\":128,\"background\":false}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        }),
+    );
+
+    let mut config = service_config();
+    config.bearer_token = Some("approval-fixture-token".to_string());
+    config.approvals.reviewer = Some("user".to_string());
+    let db_path = root.join("gateway.sqlite3");
+    let state =
+        open_sqlite_service_with_config(&db_path, config).with_workspace_home(workspace_home);
+    let service = state.service();
+    service.set_auth_host_factory(home.auth_factory(Arc::clone(&transport)));
+    service.upsert_provider_profile(public_profile(CREDENTIAL));
+    let admitted = service
+        .admit_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message": "Run the requested check with approval."}),
+                model: Some("durable-request-model".to_string()),
+                provider: Some(PROVIDER.to_string()),
+                platform: "terminal_http_preview_test".to_string(),
+                ..AdmitRunRequest::default()
+            },
+            Some("name:project".to_string()),
+        )
+        .await
+        .expect("run admission");
+    let worker_service = service.clone();
+    let worker_run_id = admitted.run_id.clone();
+    let worker = tokio::spawn(async move {
+        worker_service
+            .run_worker(worker_run_id, "ignored".to_string())
+            .await;
+    });
+
+    let pending = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let approvals = service
+                .pending_approvals(&admitted.run_id, None)
+                .expect("active run approval listing");
+            if !approvals.is_empty() {
+                break approvals;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal approval request should become pending");
+    let approval_id = pending[0]["approval_id"]
+        .as_str()
+        .expect("terminal approval id")
+        .to_string();
+    assert_eq!(
+        approval_id,
+        format!("guardian-approval:{}:http-terminal-call", admitted.run_id)
+    );
+    let service_preview = pending[0]["preview"]
+        .as_str()
+        .expect("pending terminal approval must expose a preview");
+
+    let app = build_agent_gateway_app(state.clone());
+    let listed_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::GET)
+                .uri(format!("/v1/runs/{}/approvals", admitted.run_id))
+                .header("authorization", "Bearer approval-fixture-token")
+                .body(Body::empty())
+                .expect("terminal approval list request"),
+        )
+        .await
+        .expect("terminal approval list response");
+    assert_eq!(listed_response.status(), StatusCode::OK);
+    let listed: JsonValue = serde_json::from_slice(
+        &listed_response
+            .into_body()
+            .collect()
+            .await
+            .expect("terminal approval list body")
+            .to_bytes(),
+    )
+    .expect("terminal approval list JSON");
+    assert_eq!(listed["approvals"][0]["approval_id"], approval_id);
+    assert_eq!(listed["approvals"][0]["tool_name"], "terminal");
+    assert!(listed["approvals"][0].get("arguments_json").is_none());
+    let http_preview = listed["approvals"][0]["preview"]
+        .as_str()
+        .expect("serialized HTTP response must include terminal preview");
+    assert_eq!(http_preview, service_preview);
+    assert!(http_preview.contains("terminal"));
+    assert!(http_preview.contains("printf"));
+    assert!(http_preview.contains("argv_bytes"));
+    assert!(http_preview.contains("stdin_bytes"));
+    assert!(http_preview.contains("cwd"));
+    assert!(http_preview.contains("project"));
+    assert!(http_preview.contains("timeout_ms"));
+    assert!(http_preview.contains("max_output_bytes"));
+    assert!(http_preview.contains("<redacted>"));
+    assert!(http_preview.len() <= 2048);
+    for marker in [
+        "HTTP_OPAQUE_VALUE_SENTINEL",
+        "HTTP_POSITIONAL_VALUE_SENTINEL",
+        "HTTP_MIXEDCASE_INLINE_SENTINEL",
+        "HTTP_UNKNOWN_FLAG_SENTINEL",
+        "HTTP_INLINE_DATA_SENTINEL",
+        "--access-token",
+        "--AcCeSs-ToKeN",
+        "--future-flag",
+    ] {
+        assert!(!listed.to_string().contains(marker));
+    }
+    assert!(
+        !effect_path.exists(),
+        "pending terminal approval has no effect"
+    );
+    let pending_events = service.run_events(&admitted.run_id);
+    assert_eq!(named_event_count(&pending_events, "tool.started"), 0);
+    assert_eq!(named_event_count(&pending_events, "tool.completed"), 0);
+
+    let denied = app
+        .oneshot(
+            Request::builder()
+                .method(axum::http::Method::POST)
+                .uri(format!(
+                    "/v1/runs/{}/approvals/{approval_id}",
+                    admitted.run_id
+                ))
+                .header("authorization", "Bearer approval-fixture-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"decision":"denied"}"#))
+                .expect("terminal denial request"),
+        )
+        .await
+        .expect("terminal denial response");
+    assert_eq!(denied.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(8), worker)
+        .await
+        .expect("denied terminal action should stop the run")
+        .expect("worker task");
+
+    let events = service.run_events(&admitted.run_id);
+    let stored = state
+        .persistence()
+        .expect("production SQLite persistence")
+        .approval_get(&approval_id)
+        .expect("denied terminal approval row");
+    let sent = transport.inner.take_sent();
+    let observed = transport.observed_effects();
+    let effect_exists_after_denial = effect_path.exists();
+    drop(service);
+    drop(state);
+    drop(home);
+    fs::remove_dir_all(&root).expect("remove private terminal HTTP fixture");
+
+    assert_eq!(named_event_count(&events, "run.failed"), 1);
+    assert_eq!(named_event_count(&events, "tool.started"), 0);
+    assert_eq!(named_event_count(&events, "tool.completed"), 0);
+    assert_eq!(stored["rows"][0][7], "denied");
+    assert_eq!(stored["rows"][0][13], "http-bearer");
+    assert_eq!(stored["rows"][0][5], "{}");
+    assert!(!effect_exists_after_denial);
+    assert_eq!(observed, vec![false]);
+    assert_eq!(sent.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stopping_pending_user_approval_expires_it_without_effect_or_replay() {
     let temp = PathBuf::from(
         std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned fixture temp"),
@@ -2628,7 +2822,7 @@ async fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
                             "type": "function",
                             "function": {
                                 "name": "terminal",
-                                "arguments": "{\"argv\":[\"printf\",\"--api-key=TELEGRAM_SECRET_PREVIEW_SENTINEL\",\"--data=TELEGRAM_INLINE_DATA_SENTINEL\"]}"
+                                "arguments": "{\"argv\":[\"printf\",\"--api-key=TELEGRAM_SECRET_PREVIEW_SENTINEL\",\"--data=TELEGRAM_INLINE_DATA_SENTINEL\",\"--access-token\",\"TELEGRAM_OPAQUE_VALUE_SENTINEL\",\"TELEGRAM_POSITIONAL_VALUE_SENTINEL\",\"--AcCeSs-ToKeN=TELEGRAM_MIXEDCASE_INLINE_SENTINEL\",\"--future-flag=TELEGRAM_UNKNOWN_FLAG_SENTINEL\"],\"cwd\":\"project\",\"timeout_ms\":1000,\"max_output_bytes\":128,\"background\":false}"
                             }
                         }
                     ]
@@ -2822,8 +3016,27 @@ async fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
     assert!(terminal_preview.contains("terminal"));
     assert!(terminal_preview.contains("printf"));
     assert!(terminal_preview.contains("<redacted>"));
-    assert!(!terminal_preview.contains("TELEGRAM_SECRET_PREVIEW_SENTINEL"));
-    assert!(!terminal_preview.contains("TELEGRAM_INLINE_DATA_SENTINEL"));
+    assert!(terminal_preview.contains("argv_bytes"));
+    assert!(terminal_preview.contains("stdin_bytes"));
+    assert!(terminal_preview.contains("cwd"));
+    assert!(terminal_preview.contains("project"));
+    assert!(terminal_preview.contains("timeout_ms"));
+    assert!(terminal_preview.contains("max_output_bytes"));
+    assert!(terminal_preview.len() <= 2048);
+    for marker in [
+        "TELEGRAM_SECRET_PREVIEW_SENTINEL",
+        "TELEGRAM_INLINE_DATA_SENTINEL",
+        "TELEGRAM_OPAQUE_VALUE_SENTINEL",
+        "TELEGRAM_POSITIONAL_VALUE_SENTINEL",
+        "TELEGRAM_MIXEDCASE_INLINE_SENTINEL",
+        "TELEGRAM_UNKNOWN_FLAG_SENTINEL",
+        "--api-key",
+        "--access-token",
+        "--AcCeSs-ToKeN",
+        "--future-flag",
+    ] {
+        assert!(!terminal_preview.contains(marker));
+    }
     telegram_fixture.push_update(6, 106, 101, "/approvals");
     let terminal_preview_reply = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
@@ -2843,8 +3056,27 @@ async fn telegram_adapter_resolves_same_run_approvals_only_for_session_owner() {
     assert!(terminal_preview_reply.contains("terminal"));
     assert!(terminal_preview_reply.contains("printf"));
     assert!(terminal_preview_reply.contains("<redacted>"));
-    assert!(!terminal_preview_reply.contains("TELEGRAM_SECRET_PREVIEW_SENTINEL"));
-    assert!(!terminal_preview_reply.contains("TELEGRAM_INLINE_DATA_SENTINEL"));
+    assert!(terminal_preview_reply.contains("argv_bytes"));
+    assert!(terminal_preview_reply.contains("stdin_bytes"));
+    assert!(terminal_preview_reply.contains("cwd"));
+    assert!(terminal_preview_reply.contains("project"));
+    assert!(terminal_preview_reply.contains("timeout_ms"));
+    assert!(terminal_preview_reply.contains("max_output_bytes"));
+    assert!(terminal_preview_reply.len() <= 2048);
+    for marker in [
+        "TELEGRAM_SECRET_PREVIEW_SENTINEL",
+        "TELEGRAM_INLINE_DATA_SENTINEL",
+        "TELEGRAM_OPAQUE_VALUE_SENTINEL",
+        "TELEGRAM_POSITIONAL_VALUE_SENTINEL",
+        "TELEGRAM_MIXEDCASE_INLINE_SENTINEL",
+        "TELEGRAM_UNKNOWN_FLAG_SENTINEL",
+        "--api-key",
+        "--access-token",
+        "--AcCeSs-ToKeN",
+        "--future-flag",
+    ] {
+        assert!(!terminal_preview_reply.contains(marker));
+    }
     telegram_fixture.push_update(7, 107, 101, &format!("/approve {first_id}"));
     let after_reuse = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
