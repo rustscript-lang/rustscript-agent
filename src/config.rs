@@ -699,13 +699,9 @@ pub const ADMISSION_MESSAGE_QUERY_COLUMNS: &[AdmissionQueryColumn] = &[
 
 /// Pre-commit idempotency lookup SELECT (8192-byte budget).
 pub const ADMISSION_IDEMPOTENCY_LOOKUP_COLUMNS: &[AdmissionQueryColumn] = &[
-    AdmissionQueryColumn::text("scope"),
-    AdmissionQueryColumn::text("key"),
     AdmissionQueryColumn::text("request_hash"),
-    AdmissionQueryColumn::text("resource_type"),
     AdmissionQueryColumn::text("resource_id"),
-    AdmissionQueryColumn::text("state"),
-    AdmissionQueryColumn::text("response_json"),
+    AdmissionQueryColumn::integer("workspace_identity_match"),
 ];
 
 /// Post-commit idempotency SELECT columns.
@@ -868,9 +864,9 @@ impl std::fmt::Display for AdmissionQueryBudgetError {
 
 impl std::error::Error for AdmissionQueryBudgetError {}
 
-/// Estimates every post-commit admission SELECT against the sqlite host's
-/// column-name + raw-cell accounting. Checked addition fail-closes on
-/// overflow instead of wrapping.
+/// Estimates every admission SELECT against the sqlite host's column-name +
+/// raw-cell accounting. Checked addition fail-closes on overflow instead of
+/// wrapping.
 pub fn estimate_admission_query_bytes(
     lens: AdmissionSqliteCellLens,
 ) -> Result<AdmissionQueryEstimate, AdmissionQueryBudgetError> {
@@ -1052,7 +1048,11 @@ fn idempotency_response_bytes(lens: AdmissionSqliteCellLens) -> usize {
 }
 
 fn idempotency_lookup_select_cells(lens: AdmissionSqliteCellLens) -> Vec<usize> {
-    vec![
+    vec![lens.request_hash, lens.run_id, 0]
+}
+
+fn idempotency_select_cells(lens: AdmissionSqliteCellLens) -> Vec<usize> {
+    let mut cells = vec![
         lens.idempotency_scope,
         lens.idempotency_key,
         lens.request_hash,
@@ -1060,11 +1060,7 @@ fn idempotency_lookup_select_cells(lens: AdmissionSqliteCellLens) -> Vec<usize> 
         lens.run_id,
         ADMISSION_IDEMPOTENCY_STATE.len(),
         idempotency_response_bytes(lens),
-    ]
-}
-
-fn idempotency_select_cells(lens: AdmissionSqliteCellLens) -> Vec<usize> {
-    let mut cells = idempotency_lookup_select_cells(lens);
+    ];
     cells.extend_from_slice(&[0, 0, 0]);
     cells
 }
@@ -2442,16 +2438,52 @@ mod tests {
             parse_select_columns(&source, "FROM messages"),
             admission_query_column_names(ADMISSION_MESSAGE_QUERY_COLUMNS)
         );
-        let lookup = parse_first_select_columns(&source, "FROM idempotency_records");
+        let idempotency_queries = parse_all_select_columns(&source, "FROM idempotency_records");
         assert_eq!(
-            lookup,
-            admission_query_column_names(ADMISSION_IDEMPOTENCY_LOOKUP_COLUMNS)
+            idempotency_queries.len(),
+            3,
+            "two pre-commit and one post-commit SELECT"
+        );
+        let precommit_columns = admission_query_column_names(ADMISSION_IDEMPOTENCY_LOOKUP_COLUMNS);
+        assert_eq!(
+            idempotency_queries[0], precommit_columns,
+            "the first admission lookup must match the native pre-commit projection"
+        );
+        assert_eq!(
+            idempotency_queries[2], precommit_columns,
+            "the replay lookup must match the native pre-commit projection"
+        );
+        assert_eq!(
+            ADMISSION_IDEMPOTENCY_LOOKUP_COLUMNS,
+            &[
+                AdmissionQueryColumn::text("request_hash"),
+                AdmissionQueryColumn::text("resource_id"),
+                AdmissionQueryColumn::integer("workspace_identity_match"),
+            ]
+        );
+        assert_eq!(
+            idempotency_queries[1],
+            admission_query_column_names(ADMISSION_IDEMPOTENCY_QUERY_COLUMNS),
+            "the post-commit lookup must retain all ten native columns"
         );
         assert!(
             source.contains("sql_limits(1, 8192)"),
             "pre-commit idempotency SELECT must keep the 8192-byte budget"
         );
         assert_eq!(ADMISSION_IDEMPOTENCY_QUERY_LIMIT_BYTES, 8192);
+    }
+
+    #[test]
+    fn select_column_parser_splits_nested_commas_and_extracts_as_aliases() {
+        let query = "SELECT request_hash, resource_id, CASE WHEN json_type(response_json, '$.workspace_identity') IS NULL THEN CASE WHEN ? = '' OR json_extract(?, '$.request_selector_present') = 0 THEN 1 ELSE 0 END ELSE 0 END AS workspace_identity_match FROM idempotency_records";
+        assert_eq!(
+            parse_select_columns(query, "FROM idempotency_records"),
+            vec![
+                "request_hash".to_string(),
+                "resource_id".to_string(),
+                "workspace_identity_match".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2462,6 +2494,22 @@ mod tests {
         lens.has_idempotency = true;
         let estimate =
             estimate_admission_query_bytes(lens).expect("max key+hash lookup must estimate");
+        let expected_lookup_bytes = slice_column_name_bytes(ADMISSION_IDEMPOTENCY_LOOKUP_COLUMNS)
+            + lens.request_hash
+            + lens.run_id
+            + SQLITE_QUERY_INT_BYTES;
+        assert_eq!(estimate.idempotency_lookup_bytes, expected_lookup_bytes);
+        let expected_postcommit_bytes =
+            slice_column_name_bytes(ADMISSION_IDEMPOTENCY_QUERY_COLUMNS)
+                + lens.idempotency_scope
+                + lens.idempotency_key
+                + lens.request_hash
+                + ADMISSION_RESOURCE_TYPE.len()
+                + lens.run_id
+                + ADMISSION_IDEMPOTENCY_STATE.len()
+                + idempotency_response_bytes(lens)
+                + SQLITE_QUERY_INT_BYTES * 3;
+        assert_eq!(estimate.idempotency_bytes, expected_postcommit_bytes);
         assert!(estimate.idempotency_lookup_bytes > 0);
         assert!(estimate.idempotency_lookup_bytes <= ADMISSION_IDEMPOTENCY_QUERY_LIMIT_BYTES);
         assert!(estimate.idempotency_bytes <= ADMISSION_IDEMPOTENCY_QUERY_LIMIT_BYTES);
@@ -2518,22 +2566,15 @@ mod tests {
             .expect("SELECT list")
     }
 
-    fn parse_first_select_columns(source: &str, from_clause: &str) -> Vec<String> {
-        parse_all_select_columns(source, from_clause)
-            .into_iter()
-            .next()
-            .expect("first SELECT list")
-    }
-
     fn parse_all_select_columns(source: &str, from_clause: &str) -> Vec<Vec<String>> {
         let mut lists = Vec::new();
         let mut rest = source;
         while let Some(from_at) = rest.find(from_clause) {
             let prefix = &rest[..from_at];
             if let Some(select_at) = prefix.rfind("SELECT") {
-                let list = prefix[select_at + "SELECT".len()..]
-                    .split(',')
-                    .map(|part| part.trim().to_string())
+                let list = split_top_level_select_items(&prefix[select_at + "SELECT".len()..])
+                    .into_iter()
+                    .map(select_item_output_name)
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<_>>();
                 if !list.is_empty() {
@@ -2543,6 +2584,86 @@ mod tests {
             rest = &rest[from_at + from_clause.len()..];
         }
         lists
+    }
+
+    fn split_top_level_select_items(select_list: &str) -> Vec<&str> {
+        let mut items = Vec::new();
+        let mut start = 0;
+        let mut depth = 0usize;
+        let mut quote = None;
+        let mut chars = select_list.char_indices().peekable();
+        while let Some((index, character)) = chars.next() {
+            if let Some(delimiter) = quote {
+                if character == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    items.push(select_list[start..index].trim());
+                    start = index + character.len_utf8();
+                }
+                _ => {}
+            }
+        }
+        items.push(select_list[start..].trim());
+        items
+    }
+
+    fn select_item_output_name(item: &str) -> String {
+        let item = item.trim();
+        let mut depth = 0usize;
+        let mut quote = None;
+        let mut alias_start = None;
+        let mut chars = item.char_indices().peekable();
+        while let Some((index, character)) = chars.next() {
+            if let Some(delimiter) = quote {
+                if character == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+            match character {
+                '\'' | '"' => quote = Some(character),
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                'A' | 'a' if depth == 0 => {
+                    let keyword_end = index.saturating_add(2);
+                    if item
+                        .get(index..keyword_end)
+                        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("AS"))
+                    {
+                        let preceded_by_space = item[..index]
+                            .chars()
+                            .next_back()
+                            .is_some_and(char::is_whitespace);
+                        let followed_by_space = item
+                            .get(keyword_end..)
+                            .and_then(|suffix| suffix.chars().next())
+                            .is_some_and(char::is_whitespace);
+                        if preceded_by_space && followed_by_space {
+                            alias_start = Some(keyword_end);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let name = alias_start.map_or(item, |start| item[start..].trim());
+        name.trim_matches(|character| matches!(character, '"' | '`' | '[' | ']'))
+            .to_string()
     }
 
     fn utf8_visible_token(byte_limit: usize) -> String {
