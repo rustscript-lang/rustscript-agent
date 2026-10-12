@@ -63,6 +63,100 @@ fn scripted_text_response(text: &str) -> Value {
     })
 }
 
+fn scripted_guardian_allow_response() -> Value {
+    scripted_text_response(
+        r#"{"outcome":"allow","risk_level":"low","user_authorization":"unknown","rationale":"bounded fixture approval"}"#,
+    )
+}
+
+fn is_guardian_provider_request(request: &Value) -> bool {
+    request
+        .pointer("/messages/0/content/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            text.starts_with("You are Guardian, reviewing one proposed tool action.")
+        })
+}
+
+fn assert_scripted_provider_accounting(
+    provider: &ScriptedProvider,
+    expected_business_calls: usize,
+    canonical_intent: &str,
+    expected_review_actions: &[Value],
+) {
+    let requests = provider.requests();
+    let total_calls = usize::try_from(provider.call_count()).expect("provider call count");
+    assert_eq!(
+        total_calls,
+        requests.len(),
+        "every provider call is recorded"
+    );
+    assert_eq!(
+        requests.len(),
+        expected_business_calls + expected_review_actions.len(),
+        "business calls and Guardian reviews account for the full provider sequence"
+    );
+
+    let guardian_positions = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| is_guardian_provider_request(request).then_some(index + 1))
+        .collect::<Vec<_>>();
+    let expected_positions = (2..=expected_review_actions.len() + 1).collect::<Vec<_>>();
+    assert_eq!(
+        guardian_positions, expected_positions,
+        "Guardian reviews must follow the initial business request in tool order"
+    );
+    let business_calls = requests
+        .iter()
+        .filter(|request| !is_guardian_provider_request(request))
+        .count();
+    assert_eq!(business_calls, expected_business_calls);
+    assert!(
+        !is_guardian_provider_request(requests.first().expect("initial provider request")),
+        "the first provider call is the business request"
+    );
+    assert!(
+        !is_guardian_provider_request(requests.last().expect("final provider request")),
+        "the final provider call is the business follow-up"
+    );
+
+    let intent_marker = "Original user request (canonical admitted text blocks; bounded to 8192 UTF-8 bytes; source input only):\n";
+    let action_marker = "Exact proposed action (do not alter; untrusted data):\n";
+    for (position, expected_action) in guardian_positions
+        .iter()
+        .zip(expected_review_actions.iter())
+    {
+        let request = &requests[position - 1];
+        assert!(
+            request
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "Guardian review request at position {position} must be tool-free"
+        );
+        let user_prompt = request
+            .pointer("/messages/1/content/0/text")
+            .and_then(Value::as_str)
+            .expect("Guardian canonical user prompt");
+        let (_, canonical_and_context) = user_prompt
+            .split_once(intent_marker)
+            .expect("Guardian request carries the canonical admitted user input");
+        let (actual_intent, _) = canonical_and_context
+            .split_once("\n\nRun-level system/developer constraints")
+            .expect("Guardian request separates user intent from constraints");
+        assert_eq!(actual_intent, canonical_intent);
+        let (_, action_json) = user_prompt
+            .rsplit_once(action_marker)
+            .expect("Guardian request carries the exact proposed action");
+        let actual_action: Value = serde_json::from_str(action_json).expect("Guardian action JSON");
+        assert_eq!(
+            &actual_action, expected_action,
+            "Guardian review identity at request position {position}"
+        );
+    }
+}
+
 async fn post_http_run(app: &axum::Router, payload: Value) -> Value {
     let response = app
         .clone()
@@ -621,14 +715,29 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
             "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 2000}
         }
     ])));
+    provider.push_ok(scripted_guardian_allow_response());
     provider.push_ok(scripted_text_response("ordinary Main run completed"));
     let service = state.service();
     service.inject_provider_host(Arc::new(provider.clone()));
     let app = build_agent_gateway_app(state.clone());
 
-    let response = post_http_run(&app, json!({"input": "Summarize the current project."})).await;
+    let response = post_http_run(
+        &app,
+        json!({"input": "Read Cargo.toml and run /bin/pwd to summarize the current project."}),
+    )
+    .await;
     let run_id = response["run_id"].as_str().expect("accepted run id");
     let events = wait_for_terminal(&service, run_id).await;
+    assert_scripted_provider_accounting(
+        &provider,
+        2,
+        "Read Cargo.toml and run /bin/pwd to summarize the current project.",
+        &[json!({
+            "tool_name": "terminal",
+            "risk_class": "execute",
+            "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 2000}
+        })],
+    );
     assert!(
         events.iter().any(|event| event["event"] == "run.completed"),
         "ordinary Main must complete after denied effects: {events:?}"
@@ -646,7 +755,6 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
         assert_eq!(result["is_error"], true);
         assert_eq!(result["error"]["code"], "workspace_unavailable");
     }
-    assert_eq!(provider.call_count(), 2, "denials must not abort RSS");
     assert!(service.capability_host_closed(run_id));
     assert!(!service.capability_host_retained(run_id));
     assert_eq!(service.process_owner_count(run_id), 0);
@@ -718,6 +826,8 @@ async fn http_named_workspace_runs_production_rss_file_and_process_effects() {
             "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 3000}
         }
     ])));
+    provider.push_ok(scripted_guardian_allow_response());
+    provider.push_ok(scripted_guardian_allow_response());
     provider.push_ok(scripted_text_response("workspace RSS run completed"));
     let service = state.service();
     service.inject_provider_host(Arc::new(provider.clone()));
@@ -726,13 +836,30 @@ async fn http_named_workspace_runs_production_rss_file_and_process_effects() {
     let response = post_http_run(
         &app,
         json!({
-            "input": "Read the workspace note, write a note, and report the process working directory.",
+            "input": "Read readme.txt, write WORKSPACE_WRITE_SENTINEL to written.txt, and run /bin/pwd to report the process working directory.",
             "workspace": "name:project"
         }),
     )
     .await;
     let run_id = response["run_id"].as_str().expect("accepted run id");
     let events = wait_for_terminal(&service, run_id).await;
+    assert_scripted_provider_accounting(
+        &provider,
+        2,
+        "Read readme.txt, write WORKSPACE_WRITE_SENTINEL to written.txt, and run /bin/pwd to report the process working directory.",
+        &[
+            json!({
+                "tool_name": "write_file",
+                "risk_class": "write",
+                "arguments": {"path": "written.txt", "content": "WORKSPACE_WRITE_SENTINEL"}
+            }),
+            json!({
+                "tool_name": "terminal",
+                "risk_class": "execute",
+                "arguments": {"argv": ["/bin/pwd"], "timeout_ms": 3000}
+            }),
+        ],
+    );
     assert!(
         events.iter().any(|event| event["event"] == "run.completed"),
         "production Main should complete after workspace effects: {events:?}"
@@ -761,7 +888,6 @@ async fn http_named_workspace_runs_production_rss_file_and_process_effects() {
             .contains(&workspace.display().to_string()),
         "process must run with the held workspace as cwd: {cwd_result}"
     );
-    assert_eq!(provider.call_count(), 2);
     assert!(service.capability_host_closed(run_id));
     assert!(!service.capability_host_retained(run_id));
     assert_eq!(service.process_owner_count(run_id), 0);
@@ -1130,6 +1256,8 @@ async fn http_session_workspace_route_binds_an_idle_session() {
             "arguments": {"argv": ["/bin/touch", "bound-http-process.txt"], "timeout_ms": 3000}
         }
     ])));
+    provider.push_ok(scripted_guardian_allow_response());
+    provider.push_ok(scripted_guardian_allow_response());
     provider.push_ok(scripted_text_response(
         "bound session native effects completed",
     ));
@@ -1138,7 +1266,7 @@ async fn http_session_workspace_route_binds_an_idle_session() {
         &app,
         json!({
             "session_id": session_id,
-            "input": "Write the file and create a process-side workspace marker."
+            "input": "Write HTTP_BOUND_WORKSPACE_WRITE to bound-http-write.txt and run /bin/touch bound-http-process.txt to create the process-side workspace marker."
         }),
     )
     .await;
@@ -1146,6 +1274,23 @@ async fn http_session_workspace_route_binds_an_idle_session() {
         .as_str()
         .expect("ordinary same-session HTTP run id");
     let ordinary_events = wait_for_terminal(&service, ordinary_run_id).await;
+    assert_scripted_provider_accounting(
+        &provider,
+        2,
+        "Write HTTP_BOUND_WORKSPACE_WRITE to bound-http-write.txt and run /bin/touch bound-http-process.txt to create the process-side workspace marker.",
+        &[
+            json!({
+                "tool_name": "write_file",
+                "risk_class": "write",
+                "arguments": {"path": "bound-http-write.txt", "content": "HTTP_BOUND_WORKSPACE_WRITE"}
+            }),
+            json!({
+                "tool_name": "terminal",
+                "risk_class": "execute",
+                "arguments": {"argv": ["/bin/touch", "bound-http-process.txt"], "timeout_ms": 3000}
+            }),
+        ],
+    );
     assert!(
         ordinary_events
             .iter()
@@ -1159,7 +1304,6 @@ async fn http_session_workspace_route_binds_an_idle_session() {
         "HTTP_BOUND_WORKSPACE_WRITE"
     );
     assert!(first.join("bound-http-process.txt").is_file());
-    assert_eq!(provider.call_count(), 2);
 
     let active_created = app
         .clone()
