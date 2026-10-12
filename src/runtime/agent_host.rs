@@ -35,6 +35,9 @@ const UTF8_TRUNCATE: &str = "agent::utf8_truncate";
 const SLEEP_MS: &str = "agent::sleep_ms";
 const CONTROL_CHECK: &str = "agent::control_check";
 const TOOL_PREPARE: &str = "agent_runtime::tool_prepare";
+const TOOL_REPLAY: &str = "agent_runtime::tool_replay";
+const APPROVAL_ATTEST: &str = "agent_runtime::approval_attest";
+const APPROVAL_STORAGE: &str = "agent::approval_storage";
 const TOOL_COMMIT: &str = "agent_runtime::tool_commit";
 const CAP_FS_METADATA: &str = "cap::fs_metadata";
 const CAP_FS_READ_RANGE: &str = "cap::fs_read_range";
@@ -70,6 +73,9 @@ const AGENT_HOST_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[
     utf8_truncate_descriptor,
     sleep_ms_descriptor,
     control_check_descriptor,
+    tool_replay_descriptor,
+    approval_attest_descriptor,
+    approval_storage_descriptor,
     tool_prepare_descriptor,
     tool_commit_descriptor,
     cap_fs_metadata_descriptor,
@@ -169,6 +175,36 @@ fn control_check_descriptor() -> HostFunctionDescriptor {
         vec![],
         super::host_types::AgentControlResult::host_type_schema(),
         control_check_adapter,
+    )
+}
+
+fn tool_replay_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        TOOL_REPLAY,
+        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        super::host_types::AgentToolEnvelope::host_type_schema(),
+        tool_replay_adapter,
+    )
+}
+
+fn approval_attest_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        APPROVAL_ATTEST,
+        vec![HostParamSchema::value("metadata", HostTypeSchema::Unknown)],
+        super::host_types::AgentToolEnvelope::host_type_schema(),
+        approval_attest_adapter,
+    )
+}
+
+fn approval_storage_descriptor() -> HostFunctionDescriptor {
+    stack_desc(
+        APPROVAL_STORAGE,
+        vec![
+            HostParamSchema::value("operation", HostTypeSchema::String),
+            HostParamSchema::value("payload", HostTypeSchema::Unknown),
+        ],
+        HostTypeSchema::Unknown,
+        approval_storage_adapter,
     )
 }
 
@@ -460,6 +496,19 @@ pub trait AgentProviderHost: Send + Sync {
     ) -> Option<JsonValue> {
         None
     }
+
+    /// Forwards RSS-owned approval persistence commands through the active run.
+    fn approval_storage(
+        &self,
+        _operation: &str,
+        _payload: &JsonValue,
+        _cancellation: &RunCancellation,
+    ) -> JsonValue {
+        typed_fail(
+            "approval_storage_unavailable",
+            "approval storage is unavailable",
+        )
+    }
 }
 
 pub type ControlCheckHook = Arc<dyn Fn(&RunCancellation) + Send + Sync>;
@@ -531,6 +580,14 @@ impl AgentHostState {
         normalize_provider_envelope(self.provider.call(request, &self.cancellation))
     }
 
+    fn approval_storage(&self, operation: &str, payload: &JsonValue) -> JsonValue {
+        if let Some(error) = self.control_error() {
+            return error;
+        }
+        self.provider
+            .approval_storage(operation, payload, &self.cancellation)
+    }
+
     fn refresh_context(&self, context: &JsonValue) -> JsonValue {
         if let Some(error) = self.control_error() {
             return error;
@@ -571,6 +628,47 @@ impl AgentHostState {
                 .insert(token.to_string(), lease);
         }
         envelope
+    }
+
+    fn capability_replay(&self, metadata: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        match parse_prepare_metadata(metadata)
+            .and_then(|metadata| lifecycle.replay_completed(owner, &metadata))
+        {
+            Ok(replayed) => json!({
+                "ok": true,
+                "kind": if replayed { "replay" } else { "fresh" }
+            }),
+            Err(error) => crate::capabilities::host::error_envelope(&error),
+        }
+    }
+
+    fn capability_approval_attest(&self, metadata: &JsonValue) -> JsonValue {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability lifecycle is not installed".to_string(),
+            ));
+        };
+        let Some(owner) = self.capability_owner.as_ref() else {
+            return crate::capabilities::host::error_envelope(&LifecycleError::InvalidMetadata(
+                "capability owner is not installed".to_string(),
+            ));
+        };
+        let result = parse_prepare_metadata(metadata)
+            .and_then(|metadata| lifecycle.attest_approval(owner, metadata));
+        match result {
+            Ok(()) => json!({ "ok": true, "kind": "attested" }),
+            Err(error) => crate::capabilities::host::error_envelope(&error),
+        }
     }
 
     fn capability_commit(&self, token: &str, result: &JsonValue) -> JsonValue {
@@ -1136,6 +1234,29 @@ fn parse_json_object(text: &str) -> JsonValue {
         }),
         _ => malformed_json_object(),
     }
+}
+
+fn tool_replay_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let metadata = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_replay(&vm_value_to_json(&metadata)))
+}
+
+fn approval_attest_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let metadata = args.first().cloned().unwrap_or(Value::Null);
+    let state = installed_state(vm)?;
+    return_json(state.capability_approval_attest(&vm_value_to_json(&metadata)))
+}
+
+fn approval_storage_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    let operation = match args.first() {
+        Some(Value::String(value)) => value.as_str(),
+        _ => "",
+    };
+    let payload = args.get(1).cloned().unwrap_or(Value::Null);
+    validate_provider_json_resources(vm, &payload)?;
+    let state = installed_state(vm)?;
+    return_json(state.approval_storage(operation, &vm_value_to_json(&payload)))
 }
 
 fn tool_prepare_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {

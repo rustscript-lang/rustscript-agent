@@ -729,7 +729,10 @@ pub(crate) fn parse_command(text: &str) -> (Option<String>, String) {
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if matches!(name.as_str(), "new" | "stop" | "status" | "compact") {
+        if matches!(
+            name.as_str(),
+            "new" | "stop" | "status" | "compact" | "approve" | "deny" | "approvals"
+        ) {
             return (Some(name), args.to_string());
         }
     }
@@ -1419,6 +1422,31 @@ async fn handle_update(runtime: &mut AdapterRuntime, api: &TelegramApi, update: 
             };
             let _ = reply(api, chat_id, message.message_thread_id, &response_text).await;
         }
+        Some("approvals") => {
+            cmd_list_approvals(
+                runtime,
+                api,
+                chat_id,
+                message.message_thread_id,
+                &session_id,
+            )
+            .await
+        }
+        Some("approve") | Some("deny") => {
+            cmd_approval(
+                runtime,
+                api,
+                chat_id,
+                message.message_thread_id,
+                ApprovalCommand {
+                    session_id: &session_id,
+                    user_id: &envelope.user_id,
+                    approval_arguments: &envelope.content,
+                    approved: envelope.command.as_deref() == Some("approve"),
+                },
+            )
+            .await
+        }
         _ => {
             admit_text(
                 runtime,
@@ -1559,6 +1587,11 @@ async fn cmd_new(
     let chat_id_for_block = envelope.chat_id.clone();
     let thread_id_for_block = envelope.thread_id.clone().unwrap_or_default();
     let model = state.config.model.clone();
+    let provider = state
+        .config
+        .provider
+        .clone()
+        .filter(|provider| !provider.is_empty());
     let now = timestamp();
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
         let mut store = state.store.write();
@@ -1598,7 +1631,7 @@ async fn cmd_new(
                 "generation": 1,
                 "system_prompt": "",
                 "model": model,
-                "provider": "",
+                "provider": provider.as_deref().unwrap_or_default(),
                 "toolset_hash": "",
                 "metadata_json": "{}",
                 "title": "",
@@ -1617,7 +1650,7 @@ async fn cmd_new(
                     object: "hermes.session".to_string(),
                     title: None,
                     model,
-                    provider: None,
+                    provider: provider.clone(),
                     source: "telegram".to_string(),
                     system_prompt: None,
                     workspace: None,
@@ -1744,6 +1777,124 @@ async fn cmd_workspace(
     }
 }
 
+/// `/approvals`: show pending approvals for this allowlisted chat session.
+async fn cmd_list_approvals(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_id: &str,
+) {
+    let run_id = {
+        let store = runtime.state.store.read();
+        session_active_run(&runtime.active_runs, &store, session_id)
+    };
+    let Some(run_id) = run_id else {
+        let _ = reply(api, chat_id, thread_id, "No active run in this chat.").await;
+        return;
+    };
+    let service = runtime.state.service();
+    let expected_session_id = session_id.to_string();
+    let lookup_run_id = run_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        service.pending_approvals(&lookup_run_id, Some(&expected_session_id))
+    })
+    .await;
+    let text = match result {
+        Ok(Ok(approvals)) if approvals.is_empty() => "No pending approvals.".to_string(),
+        Ok(Ok(approvals)) => {
+            let mut lines = vec!["Pending approvals:".to_string()];
+            for approval in approvals.iter().take(5) {
+                let id = approval
+                    .get("approval_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable");
+                let tool = approval
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let risk = approval
+                    .get("risk_class")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                lines.push(format!("{id} — {tool} ({risk})"));
+            }
+            if approvals.len() > 5 {
+                lines.push(format!(
+                    "{} additional pending approval(s).",
+                    approvals.len() - 5
+                ));
+            }
+            lines.join("\n")
+        }
+        _ => "Pending approvals are unavailable for this run.".to_string(),
+    };
+    let _ = reply(api, chat_id, thread_id, &text).await;
+}
+
+struct ApprovalCommand<'a> {
+    session_id: &'a str,
+    user_id: &'a str,
+    approval_arguments: &'a str,
+    approved: bool,
+}
+
+/// `/approve <id>` and `/deny <id>` resolve only an active approval owned by
+/// this allowlisted chat's exact session.
+async fn cmd_approval(
+    runtime: &AdapterRuntime,
+    api: &TelegramApi,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    command: ApprovalCommand<'_>,
+) {
+    let tokens: Vec<&str> = command.approval_arguments.split_whitespace().collect();
+    if tokens.len() != 1 || tokens[0].len() > 512 || !tokens[0].starts_with("guardian-approval:") {
+        let _ = reply(
+            api,
+            chat_id,
+            thread_id,
+            "Use /approve <approval-id> or /deny <approval-id> for a pending approval in this chat.",
+        )
+        .await;
+        return;
+    }
+    let run_id = {
+        let store = runtime.state.store.read();
+        session_active_run(&runtime.active_runs, &store, command.session_id)
+    };
+    let Some(run_id) = run_id else {
+        let _ = reply(api, chat_id, thread_id, "No active approval in this chat.").await;
+        return;
+    };
+    let service = runtime.state.service();
+    let approval_id = tokens[0].to_string();
+    let decision = if command.approved {
+        "approved"
+    } else {
+        "denied"
+    }
+    .to_string();
+    let resolver = format!("telegram:{}", command.user_id);
+    let expected_session_id = command.session_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        service.resolve_pending_approval(
+            &run_id,
+            &approval_id,
+            &decision,
+            &resolver,
+            Some(&expected_session_id),
+        )
+    })
+    .await;
+    let response = match result {
+        Ok(Ok(())) if command.approved => "Approval recorded for this action.",
+        Ok(Ok(())) => "Denial recorded; this action will not run.",
+        _ => "No matching pending approval was found in this chat.",
+    };
+    let _ = reply(api, chat_id, thread_id, response).await;
+}
+
 /// `/stop`: cancels the session's active run through the shared
 /// AgentService (the first stop wins; later stops report the status).
 async fn cmd_stop(
@@ -1843,6 +1994,11 @@ async fn ensure_session(
     let thread_id_for_block = thread_id.unwrap_or_default().to_string();
     let user_id_for_block = user_id.to_string();
     let model = state.config.model.clone();
+    let provider = state
+        .config
+        .provider
+        .clone()
+        .filter(|provider| !provider.is_empty());
     let now = timestamp();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let mut store = state_for_block.store.write();
@@ -1861,7 +2017,7 @@ async fn ensure_session(
                 "generation": 1,
                 "system_prompt": "",
                 "model": model,
-                "provider": "",
+                "provider": provider.as_deref().unwrap_or_default(),
                 "toolset_hash": "",
                 "metadata_json": "{}",
                 "title": "",
@@ -1880,7 +2036,7 @@ async fn ensure_session(
                     object: "hermes.session".to_string(),
                     title: None,
                     model,
-                    provider: None,
+                    provider: provider.clone(),
                     source: "telegram".to_string(),
                     system_prompt: None,
                     workspace: None,
@@ -2630,6 +2786,20 @@ mod tests {
         assert_eq!(
             parse_command("/status detail"),
             (Some("status".to_string()), "detail".to_string())
+        );
+        assert_eq!(
+            parse_command("/approve guardian-approval:run:call"),
+            (
+                Some("approve".to_string()),
+                "guardian-approval:run:call".to_string()
+            )
+        );
+        assert_eq!(
+            parse_command("/deny guardian-approval:run:call"),
+            (
+                Some("deny".to_string()),
+                "guardian-approval:run:call".to_string()
+            )
         );
         assert_eq!(
             parse_command("/unknown x"),

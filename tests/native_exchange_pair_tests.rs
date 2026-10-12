@@ -22,6 +22,7 @@ const REFRESH_SECRET: &str = "DEVICE_EXCHANGE_PAIR_REFRESH_SECRET";
 fn policy() -> TrustedTransportPolicy {
     TrustedTransportPolicy {
         generation: 7,
+        transport_identity: None,
         run_id: "native-exchange-pair-test".to_string(),
         deadline: Instant::now() + Duration::from_secs(60),
         endpoints: vec![TrustedEndpoint {

@@ -142,6 +142,65 @@ impl AgentProviderHost for DurableProviderHost {
         )
     }
 
+    fn approval_storage(
+        &self,
+        operation: &str,
+        payload: &JsonValue,
+        cancellation: &RunCancellation,
+    ) -> JsonValue {
+        if cancellation.deadline_passed() {
+            return typed_fail("deadline_elapsed", "run deadline elapsed");
+        }
+        if cancellation.requested().is_some() {
+            return typed_fail("cancelled", "run was cancelled");
+        }
+        if payload.get("run_id").and_then(JsonValue::as_str) != Some(self.run_id.as_str()) {
+            return typed_fail(
+                "approval_owner_mismatch",
+                "approval run identity does not match",
+            );
+        }
+        let Some(persistence) = self.service.persistence_handle() else {
+            return typed_fail(
+                "approval_storage_unavailable",
+                "approval storage is unavailable",
+            );
+        };
+        let result = match operation {
+            "request" => persistence.approval_request(payload),
+            "get" => payload
+                .get("approval_id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| crate::gateway::store::StorageError {
+                    code: "approval_id_invalid".to_string(),
+                    message: "approval id is missing".to_string(),
+                })
+                .and_then(|approval_id| persistence.approval_get(approval_id)),
+            "list" => payload
+                .get("session_id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| crate::gateway::store::StorageError {
+                    code: "approval_session_invalid".to_string(),
+                    message: "approval session is missing".to_string(),
+                })
+                .and_then(|session_id| persistence.approval_list(&self.run_id, session_id)),
+            "resolve" => persistence.approval_resolve(payload),
+            _ => {
+                return typed_fail(
+                    "approval_operation_invalid",
+                    "approval operation is invalid",
+                );
+            }
+        };
+        match result {
+            Ok(result) => json!({ "ok": true, "result": result }),
+            Err(_) => typed_fail(
+                "approval_storage_unavailable",
+                "approval storage is unavailable",
+            ),
+        }
+    }
+
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
         let turn = self.turn.load(Ordering::SeqCst);
         match self.replay_completed(turn) {

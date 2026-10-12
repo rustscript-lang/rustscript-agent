@@ -83,6 +83,7 @@ fn duplicate(fd: i32) -> OwnedFd {
 fn policy() -> TrustedTransportPolicy {
     TrustedTransportPolicy {
         generation: 1,
+        transport_identity: None,
         run_id: "manual-input-fixture".to_owned(),
         deadline: Instant::now() + Duration::from_secs(10),
         endpoints: vec![TrustedEndpoint {

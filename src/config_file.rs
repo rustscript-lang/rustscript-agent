@@ -295,6 +295,10 @@ pub struct ApprovalSettings {
     pub read: String,
     pub write: String,
     pub process: String,
+    pub reviewer: Option<String>,
+    pub reviewer_model: Option<String>,
+    pub allow_user_fallback: Option<bool>,
+    pub required: Option<bool>,
 }
 
 impl Default for ApprovalSettings {
@@ -303,7 +307,38 @@ impl Default for ApprovalSettings {
             read: "allow".to_string(),
             write: "ask".to_string(),
             process: "ask".to_string(),
+            reviewer: None,
+            reviewer_model: None,
+            allow_user_fallback: None,
+            required: None,
         }
+    }
+}
+
+impl ApprovalSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .reviewer
+            .as_deref()
+            .is_some_and(|reviewer| !matches!(reviewer, "guardian" | "user"))
+        {
+            return Err("approvals.reviewer must be guardian or user".to_string());
+        }
+        if let Some(model) = self.reviewer_model.as_deref()
+            && (model.is_empty()
+                || model.len() > 128
+                || model.chars().any(char::is_control)
+                || model.trim() != model)
+        {
+            return Err("approvals.reviewer_model must be a bounded model name".to_string());
+        }
+        if self.read == "ask" {
+            return Err(
+                "approvals.read ask is unsupported by the current native permission primitive"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -568,6 +603,9 @@ impl ConfigFile {
                 ));
             }
         }
+        self.approvals
+            .validate()
+            .map_err(|reason| invalid_value(source, "approvals", &reason))?;
         if self.compaction.max_context_messages == 0 {
             return Err(invalid_value(
                 source,
@@ -1023,7 +1061,15 @@ fn validate_config_shape(source: &Path, value: &Value) -> Result<(), ConfigFileE
             source,
             "approvals",
             approvals,
-            &["read", "write", "process"],
+            &[
+                "read",
+                "write",
+                "process",
+                "reviewer",
+                "reviewer_model",
+                "allow_user_fallback",
+                "required",
+            ],
         )?;
     }
     if let Some(compaction) = root.get(Value::String("compaction".to_string())) {
@@ -2096,6 +2142,10 @@ mod fixture_policy {
         pub approval_read: String,
         pub approval_write: String,
         pub approval_process: String,
+        pub approval_reviewer: Option<String>,
+        pub approval_reviewer_model: Option<String>,
+        pub approval_allow_user_fallback: Option<bool>,
+        pub approval_required: Option<bool>,
         pub policy_generation: u64,
         pub max_turns: u64,
         pub max_tool_calls: u64,
@@ -2150,6 +2200,14 @@ mod fixture_policy {
         approval_write: String,
         #[allow(dead_code)]
         approval_process: String,
+        #[allow(dead_code)]
+        approval_reviewer: Option<String>,
+        #[allow(dead_code)]
+        approval_reviewer_model: Option<String>,
+        #[allow(dead_code)]
+        approval_allow_user_fallback: Option<bool>,
+        #[allow(dead_code)]
+        approval_required: Option<bool>,
         allowed_header_names: BTreeSet<String>,
         #[allow(dead_code)]
         provider_authorities: Vec<String>,
@@ -2255,6 +2313,10 @@ mod fixture_policy {
                 approval_read: loaded.config.approvals.read.clone(),
                 approval_write: loaded.config.approvals.write.clone(),
                 approval_process: loaded.config.approvals.process.clone(),
+                approval_reviewer: loaded.config.approvals.reviewer.clone(),
+                approval_reviewer_model: loaded.config.approvals.reviewer_model.clone(),
+                approval_allow_user_fallback: loaded.config.approvals.allow_user_fallback,
+                approval_required: loaded.config.approvals.required,
                 policy_generation: generation,
                 max_turns: loaded.config.agent.max_turns,
                 max_tool_calls: loaded.config.agent.max_tool_calls,
@@ -2280,6 +2342,10 @@ mod fixture_policy {
                         approval_read: summary.approval_read.clone(),
                         approval_write: summary.approval_write.clone(),
                         approval_process: summary.approval_process.clone(),
+                        approval_reviewer: summary.approval_reviewer.clone(),
+                        approval_reviewer_model: summary.approval_reviewer_model.clone(),
+                        approval_allow_user_fallback: summary.approval_allow_user_fallback,
+                        approval_required: summary.approval_required,
                         allowed_header_names: ["content-type", "accept"]
                             .into_iter()
                             .map(str::to_string)

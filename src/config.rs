@@ -15,7 +15,7 @@ use crate::capabilities::vm_io::{
 use rustscript_vm::{HttpConfig, SqlitePolicy};
 use serde_json::{Map, Value, json};
 
-pub use crate::config_file::{AgentPaths, BoundedPublicConfig, ConfigPaths};
+pub use crate::config_file::{AgentPaths, ApprovalSettings, BoundedPublicConfig, ConfigPaths};
 
 /// Hard upper bounds for the coding file-tool budgets.
 ///
@@ -1704,6 +1704,7 @@ pub struct AgentGatewayConfig {
 
     pub http: HttpConfig,
     pub sqlite: SqlitePolicy,
+    pub approvals: ApprovalSettings,
     pub fuel: Option<u64>,
     /// Optional Telegram adapter configuration. When present, the gateway
     /// binary starts the Telegram poller alongside the API server on the
@@ -1759,6 +1760,7 @@ impl AgentGatewayConfig {
             return Err("sse_keepalive_interval must be positive".to_string());
         }
         self.rate_limit.validate()?;
+        self.approvals.validate()?;
         validate_visible_name(&self.model, "model", MAX_MODEL_NAME_BYTES)?;
         if let Some(provider) = self.provider.as_deref().filter(|value| !value.is_empty()) {
             validate_visible_name(provider, "provider", MAX_PROVIDER_NAME_BYTES)?;
@@ -1905,6 +1907,7 @@ impl Default for AgentGatewayConfig {
 
             http: HttpConfig::default(),
             sqlite,
+            approvals: ApprovalSettings::default(),
             fuel: Some(10_000_000),
             telegram: None,
         }

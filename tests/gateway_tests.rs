@@ -1528,6 +1528,17 @@ async fn approval_and_compaction_repository_round_trip_restart() {
         .expect("approval should be requested");
     assert_eq!(approval["rows"][0][0], json!("approval-1"));
     assert_eq!(approval["rows"][0][7], json!("pending"));
+    let foreign_resolution = first
+        .approval_resolve(&json!({
+            "id": "approval-1",
+            "run_id": "other-run",
+            "state": "approved",
+            "resolver": "test-user",
+            "decision_reason": "must not cross run ownership",
+            "resolved_at_ms": now,
+        }))
+        .expect("foreign-run resolution is a typed no-op");
+    assert_eq!(foreign_resolution["rows_affected"], json!(0));
     first
         .run_transition(&json!({
             "run_id": "repo-run",
@@ -1568,6 +1579,7 @@ async fn approval_and_compaction_repository_round_trip_restart() {
     second
         .approval_resolve(&json!({
             "id": "approval-1",
+            "run_id": "repo-run",
             "state": "approved",
             "resolver": "test-user",
             "decision_reason": "ok",

@@ -41,9 +41,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::capabilities::{
-    AllowAllApproval, ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle,
-    CapabilityOwner, DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
-    LifecycleError, LifecycleLimits, ProcessCapability, ProcessLimits, SystemClock, UuidIssuer,
+    ArtifactCapability, ArtifactLimits, CancellationFlag, CapabilityLifecycle, CapabilityOwner,
+    DurableStarted, DurableToolLifecycle, FilesystemCapability, FilesystemLimits,
+    GuardianApprovalGate, LifecycleError, LifecycleLimits, ProcessCapability, ProcessLimits,
+    SystemClock, UuidIssuer,
 };
 use crate::config::{
     ADMISSION_IDEMPOTENCY_SCOPE, ADMISSION_RUN_COL_ID, ADMISSION_RUN_COL_INPUT_JSON,
@@ -2603,7 +2604,10 @@ impl AgentService {
             .durable(Arc::new(ServiceDurableLifecycle {
                 events: Arc::clone(&events),
             }) as Arc<dyn DurableToolLifecycle>)
-            .approval(Arc::new(AllowAllApproval))
+            .approval(Arc::new(GuardianApprovalGate::new(
+                Arc::new(SystemClock),
+                1,
+            )))
             .cancellation(Arc::new(HandleCancelFlag {
                 cancel: handle.cancel.clone(),
             }) as Arc<dyn CancellationFlag>)
@@ -3229,6 +3233,170 @@ impl AgentService {
     /// Number of in-memory lifecycle handles (active + retained terminal).
     pub fn handle_count(&self) -> usize {
         self.inner.runs.lock().expect("runs lock").len()
+    }
+
+    /// Lists sanitized pending approvals for one live run owner.
+    pub fn pending_approvals(
+        &self,
+        run_id: &str,
+        expected_session_id: Option<&str>,
+    ) -> Result<Vec<JsonValue>, &'static str> {
+        let handle = self.handle(run_id).ok_or("run_not_active")?;
+        if handle.is_terminal() || handle.cancel.requested().is_some() {
+            return Err("run_not_active");
+        }
+        let context = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+            .ok_or("run_not_active")?;
+        if expected_session_id.is_some_and(|session| context.session_id != session) {
+            return Err("approval_owner_mismatch");
+        }
+        let persistence = self.persistence_handle().ok_or("storage_unavailable")?;
+        let data = persistence
+            .approval_list(run_id, &context.session_id)
+            .map_err(|_| "storage_unavailable")?;
+        let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+        let rows = data
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .ok_or("storage_unavailable")?;
+        Ok(rows
+            .iter()
+            .filter_map(JsonValue::as_array)
+            .filter(|row| row.get(7).and_then(JsonValue::as_str) == Some("pending"))
+            .filter(|row| {
+                row.get(11)
+                    .and_then(JsonValue::as_i64)
+                    .is_none_or(|expiry| expiry <= 0 || expiry > now)
+            })
+            .filter_map(|row| {
+                Some(json!({
+                    "approval_id": row.first()?.as_str()?,
+                    "run_id": row.get(1)?.as_str()?,
+                    "session_id": row.get(2)?.as_str()?,
+                    "tool_name": row.get(4)?.as_str()?,
+                    "risk_class": row.get(6)?.as_str()?,
+                    "state": row.get(7)?.as_str()?,
+                    "expires_at_ms": row.get(11)?.as_i64()?,
+                }))
+            })
+            .collect())
+    }
+
+    /// Resolves one durable, pending approval only while its owning run is
+    /// live. The caller supplies a trusted transport identity and, for
+    /// Telegram, the session selected from the allowlisted chat.
+    pub fn resolve_pending_approval(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        decision: &str,
+        resolver: &str,
+        expected_session_id: Option<&str>,
+    ) -> Result<(), &'static str> {
+        if !matches!(decision, "approved" | "denied") {
+            return Err("decision_invalid");
+        }
+        let resolver_valid = resolver == "http-bearer"
+            || resolver
+                .strip_prefix("telegram:")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()));
+        if !resolver_valid {
+            return Err("resolver_invalid");
+        }
+        let handle = self.handle(run_id).ok_or("run_not_active")?;
+        if handle.is_terminal() || handle.cancel.requested().is_some() {
+            return Err("run_not_active");
+        }
+        let context = self
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .get(run_id)
+            .cloned()
+            .ok_or("run_not_active")?;
+        let persistence = self.persistence_handle().ok_or("storage_unavailable")?;
+        let current = persistence
+            .approval_get(approval_id)
+            .map_err(|_| "storage_unavailable")?;
+        let row = current
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .ok_or("approval_not_found")?;
+        if row.first().and_then(JsonValue::as_str) != Some(approval_id)
+            || row.get(1).and_then(JsonValue::as_str) != Some(run_id)
+            || row.get(2).and_then(JsonValue::as_str) != Some(context.session_id.as_str())
+            || expected_session_id.is_some_and(|session| {
+                row.get(2).and_then(JsonValue::as_str) != Some(session)
+                    || context.session_id != session
+            })
+        {
+            return Err("approval_owner_mismatch");
+        }
+        if let Some(actor_id) = resolver.strip_prefix("telegram:") {
+            let session = persistence
+                .session_get(&context.session_id)
+                .map_err(|_| "storage_unavailable")?;
+            let session_owner = session
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(JsonValue::as_array)
+                .and_then(|row| row.get(6))
+                .and_then(JsonValue::as_str);
+            if session_owner != Some(actor_id) {
+                return Err("approval_owner_mismatch");
+            }
+        }
+        if row.get(7).and_then(JsonValue::as_str) != Some("pending") {
+            return Err("approval_not_pending");
+        }
+        let now = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+        if row
+            .get(11)
+            .and_then(JsonValue::as_i64)
+            .is_some_and(|expiry| expiry > 0 && expiry <= now)
+        {
+            return Err("approval_expired");
+        }
+        let resolution = persistence
+            .approval_resolve(&json!({
+                "id": approval_id,
+                "run_id": run_id,
+                "state": decision,
+                "resolver": resolver,
+                "decision_reason": "user_decision",
+                "resolved_at_ms": now,
+            }))
+            .map_err(|_| "storage_unavailable")?;
+        if resolution.get("rows_affected").and_then(JsonValue::as_i64) != Some(1) {
+            return Err("approval_not_pending");
+        }
+        let resolved = persistence
+            .approval_get(approval_id)
+            .map_err(|_| "storage_unavailable")?;
+        let resolved_row = resolved
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(JsonValue::as_array)
+            .ok_or("storage_unavailable")?;
+        if resolved_row.first().and_then(JsonValue::as_str) != Some(approval_id)
+            || resolved_row.get(1).and_then(JsonValue::as_str) != Some(run_id)
+            || resolved_row.get(7).and_then(JsonValue::as_str) != Some(decision)
+            || resolved_row.get(13).and_then(JsonValue::as_str) != Some(resolver)
+        {
+            return Err("storage_unavailable");
+        }
+        Ok(())
     }
 
     /// The persistence handle for typed repository commands; `None` when no
@@ -4301,6 +4469,16 @@ impl AgentService {
         drop(terminal_at);
         handle.permit.lock().expect("permit lock").take();
         handle.release_capability_host();
+        if let Some(persistence) = self.persistence_handle() {
+            let now_ms = i64::try_from(timestamp()).unwrap_or(i64::MAX);
+            if let Err(error) = persistence.approval_expire(&json!({
+                "now_ms": now_ms,
+                "run_id": run_id,
+                "force": 1,
+            })) {
+                tracing::warn!(run_id, error = %error, "failed to expire pending approvals after terminal run");
+            }
+        }
     }
 
     /// Records one run's terminal state for the bounded durable-first retry
@@ -4773,6 +4951,7 @@ impl AgentService {
         tokio::task::spawn_blocking(move || {
             let _serial = service.inner.commit_gate.lock();
             let persistence = service.persistence_handle();
+            let terminal_timestamp = timestamp();
             let reserved = {
                 let store = service.inner.store.read();
                 let Some(run) = store.runs.get(&run_id_for_commit) else {
@@ -4789,7 +4968,7 @@ impl AgentService {
                     .iter()
                     .any(|event| event.event == "model.completed");
                 if provider_step_present {
-                    let completed_event = event_candidate(
+                    let mut completed_event = event_candidate(
                         run,
                         "run.completed",
                         json!({
@@ -4803,6 +4982,7 @@ impl AgentService {
                         }),
                         max_event_bytes,
                     );
+                    completed_event.timestamp = terminal_timestamp;
                     (None, vec![completed_event])
                 } else {
                     let ordinal = next_message_ordinal(session);
@@ -4823,7 +5003,7 @@ impl AgentService {
                         metadata: JsonValue::Null,
                         ordinal: Some(ordinal),
                     };
-                    let delta_event = event_candidate(
+                    let mut delta_event = event_candidate(
                         run,
                         "message.delta",
                         json!({
@@ -4833,6 +5013,7 @@ impl AgentService {
                         }),
                         max_event_bytes,
                     );
+                    delta_event.timestamp = terminal_timestamp;
                     let mut completed_event = event_candidate(
                         run,
                         "run.completed",
@@ -4847,6 +5028,7 @@ impl AgentService {
                         }),
                         max_event_bytes,
                     );
+                    completed_event.timestamp = terminal_timestamp;
                     completed_event.seq = delta_event.seq + 1;
                     (Some(message), vec![delta_event, completed_event])
                 }
@@ -5155,6 +5337,11 @@ impl AgentService {
         metadata.insert(
             "toolset_hash".to_string(),
             JsonValue::String(snapshot.registry.identity().to_string()),
+        );
+        metadata.insert(
+            "approval_settings".to_string(),
+            serde_json::to_value(&self.inner.config.approvals)
+                .expect("approval settings must be serializable"),
         );
         metadata.insert(
             "provider_profile".to_string(),
@@ -6854,7 +7041,10 @@ fn terminal_commit(
             .and_then(|message| message.finish_reason.clone())
             .unwrap_or_default(),
         "message_ordinal": assistant_message.and_then(|message| message.ordinal).unwrap_or(0),
-        "now_ms": timestamp(),
+        "now_ms": events
+            .first()
+            .map(|event| event.timestamp)
+            .unwrap_or_else(timestamp),
     });
     let data = persistence
         .run_terminal(&payload)

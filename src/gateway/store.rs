@@ -647,6 +647,13 @@ impl GatewayPersistence {
         self.command_data("approval.get", &json!({ "approval_id": approval_id }))
     }
 
+    pub fn approval_list(&self, run_id: &str, session_id: &str) -> Result<Value, StorageError> {
+        self.command_data(
+            "approval.list",
+            &json!({ "run_id": run_id, "session_id": session_id }),
+        )
+    }
+
     pub fn approval_resolve(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("approval.resolve", payload)
     }

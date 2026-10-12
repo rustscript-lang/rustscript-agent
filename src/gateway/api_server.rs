@@ -146,6 +146,12 @@ struct JobRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalResolveRequest {
+    decision: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct JobListQuery {
     include_disabled: Option<bool>,
 }
@@ -186,6 +192,14 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
         .route("/v1/runs", post(create_run_handler))
         .route("/v1/runs/{run_id}/events", get(run_events_handler))
         .route("/v1/runs/{run_id}/stop", post(stop_run_handler))
+        .route(
+            "/v1/runs/{run_id}/approvals",
+            get(list_pending_approvals_handler),
+        )
+        .route(
+            "/v1/runs/{run_id}/approvals/{approval_id}",
+            post(resolve_approval_handler),
+        )
         .route("/api/jobs", get(list_jobs_handler).post(create_job_handler))
         .route(
             "/api/jobs/{job_id}",
@@ -1185,6 +1199,104 @@ async fn run_events_handler(
                 .text("keepalive"),
         )
         .into_response()
+}
+
+async fn list_pending_approvals_handler(
+    State(state): State<AgentGatewayState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    if state.config.bearer_token.is_none() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "approval_resolver_unconfigured",
+            "HTTP user approval requires bearer authentication",
+        );
+    }
+    let service = state.service.clone();
+    let lookup_run_id = run_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || service.pending_approvals(&lookup_run_id, None)).await;
+    match result {
+        Ok(Ok(approvals)) => json_response(
+            StatusCode::OK,
+            json!({ "run_id": run_id, "approvals": approvals }),
+        ),
+        Ok(Err("run_not_active")) => {
+            json_error(StatusCode::CONFLICT, "run_not_active", "run is not active")
+        }
+        Ok(Err(_)) | Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "approval_storage_unavailable",
+            "pending approvals could not be read",
+        ),
+    }
+}
+
+async fn resolve_approval_handler(
+    State(state): State<AgentGatewayState>,
+    Path((run_id, approval_id)): Path<(String, String)>,
+    Json(request): Json<ApprovalResolveRequest>,
+) -> Response {
+    if state.config.bearer_token.is_none() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "approval_resolver_unconfigured",
+            "HTTP user approval requires bearer authentication",
+        );
+    }
+    if !matches!(request.decision.as_str(), "approved" | "denied") {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "decision_invalid",
+            "decision must be approved or denied",
+        );
+    }
+    let service = state.service.clone();
+    let resolution_run_id = run_id.clone();
+    let resolution_approval_id = approval_id.clone();
+    let decision = request.decision.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        service.resolve_pending_approval(
+            &resolution_run_id,
+            &resolution_approval_id,
+            &decision,
+            "http-bearer",
+            None,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => json_response(
+            StatusCode::OK,
+            json!({ "run_id": run_id, "approval_id": approval_id, "state": request.decision }),
+        ),
+        Ok(Err("approval_not_found")) => json_error(
+            StatusCode::NOT_FOUND,
+            "approval_not_found",
+            "approval not found",
+        ),
+        Ok(Err("approval_owner_mismatch")) => json_error(
+            StatusCode::NOT_FOUND,
+            "approval_not_found",
+            "approval not found",
+        ),
+        Ok(Err("approval_expired")) => {
+            json_error(StatusCode::GONE, "approval_expired", "approval has expired")
+        }
+        Ok(Err("approval_not_pending")) => json_error(
+            StatusCode::CONFLICT,
+            "approval_not_pending",
+            "approval is no longer pending",
+        ),
+        Ok(Err("run_not_active")) => {
+            json_error(StatusCode::CONFLICT, "run_not_active", "run is not active")
+        }
+        Ok(Err(_)) | Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "approval_storage_unavailable",
+            "approval could not be resolved",
+        ),
+    }
 }
 
 async fn stop_run_handler(

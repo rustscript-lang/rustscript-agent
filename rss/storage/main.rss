@@ -121,6 +121,10 @@ struct ApprovalIdInput {
     approval_id: string
 }
 
+struct ApprovalListInput {
+    run_id: string,
+    session_id: string
+}
 
 struct CompactionIdInput {
     compaction_id: string
@@ -449,6 +453,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     } else if command.op == "approval.get" {
         let input: ApprovalIdInput = json::decode::<ApprovalIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, approvals::storage_approval_get(db_id, input.approval_id, command.max_rows, command.max_bytes));
+    } else if command.op == "approval.list" {
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_list(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "approval.resolve" {
         result = storage_execute_ok(request_id, op, approvals::storage_approval_resolve(db_id, command.payload_json));
     } else if command.op == "approval.expire" {

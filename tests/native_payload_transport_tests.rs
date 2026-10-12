@@ -23,6 +23,7 @@ const REDIRECT_URI: &str = "https://redirect.example.test/callback?state=public"
 fn policy() -> TrustedTransportPolicy {
     TrustedTransportPolicy {
         generation: 23,
+        transport_identity: None,
         run_id: "native-selected-payload-test".to_string(),
         deadline: Instant::now() + Duration::from_secs(120),
         endpoints: vec![TrustedEndpoint {

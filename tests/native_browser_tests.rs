@@ -136,6 +136,7 @@ impl OAuthClock for RealClock {
 fn policy(budget: Duration) -> TrustedTransportPolicy {
     TrustedTransportPolicy {
         generation: 7,
+        transport_identity: None,
         run_id: "native-browser-os-tests".into(),
         deadline: Instant::now() + budget,
         endpoints: vec![TrustedEndpoint {
