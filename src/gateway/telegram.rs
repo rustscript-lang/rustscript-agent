@@ -2884,11 +2884,12 @@ connection.close()"#;
             Some(555),
         ));
         handle_update(&mut runtime, &api, &compact_update).await;
-        let captured_replies = replies.lock().expect("reply capture lock");
-        assert_eq!(captured_replies.len(), 2);
-        assert!(captured_replies[1].starts_with("Compaction failed [compaction_failed]:"));
-        assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_STORAGE_SENTINEL"));
-        drop(captured_replies);
+        {
+            let captured_replies = replies.lock().expect("reply capture lock");
+            assert_eq!(captured_replies.len(), 2);
+            assert!(captured_replies[1].starts_with("Compaction failed [compaction_failed]:"));
+            assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_STORAGE_SENTINEL"));
+        }
 
         let service = state.service();
         service.inject_compaction_policy_failure("F4_PRIVATE_TELEGRAM_VM_SENTINEL");
@@ -2901,11 +2902,12 @@ connection.close()"#;
             Some(555),
         ));
         handle_update(&mut runtime, &api, &vm_update).await;
-        let captured_replies = replies.lock().expect("reply capture lock");
-        assert_eq!(captured_replies.len(), 3);
-        assert!(captured_replies[2].starts_with("Compaction failed [compaction_failed]:"));
-        assert!(!captured_replies[2].contains("F4_PRIVATE_TELEGRAM_VM_SENTINEL"));
-        drop(captured_replies);
+        {
+            let captured_replies = replies.lock().expect("reply capture lock");
+            assert_eq!(captured_replies.len(), 3);
+            assert!(captured_replies[2].starts_with("Compaction failed [compaction_failed]:"));
+            assert!(!captured_replies[2].contains("F4_PRIVATE_TELEGRAM_VM_SENTINEL"));
+        }
 
         service.inject_compaction_worker_panic("F4_PRIVATE_TELEGRAM_WORKER_SENTINEL");
         let (worker_update, _) = make_update(make_message(
@@ -2917,11 +2919,12 @@ connection.close()"#;
             Some(555),
         ));
         handle_update(&mut runtime, &api, &worker_update).await;
-        let captured_replies = replies.lock().expect("reply capture lock");
-        assert_eq!(captured_replies.len(), 4);
-        assert!(captured_replies[3].starts_with("Compaction failed [compaction_failed]:"));
-        assert!(!captured_replies[3].contains("F4_PRIVATE_TELEGRAM_WORKER_SENTINEL"));
-        drop(captured_replies);
+        {
+            let captured_replies = replies.lock().expect("reply capture lock");
+            assert_eq!(captured_replies.len(), 4);
+            assert!(captured_replies[3].starts_with("Compaction failed [compaction_failed]:"));
+            assert!(!captured_replies[3].contains("F4_PRIVATE_TELEGRAM_WORKER_SENTINEL"));
+        }
         drop(persistence);
         drop(runtime);
         drop(state);
@@ -3046,14 +3049,16 @@ connection.close()"#;
         let after = persistence
             .session_get(&session_id)
             .expect("read Telegram session after compaction");
-        let captured_replies = replies.lock().expect("reply capture lock");
-        assert_eq!(captured_replies.len(), 2);
-        assert_eq!(
-            captured_replies[1],
-            "Compaction failed [invalid_compaction]: The compaction request is invalid."
-        );
-        assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_PREFIX_SENTINEL"));
-        assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_TAIL_SENTINEL"));
+        {
+            let captured_replies = replies.lock().expect("reply capture lock");
+            assert_eq!(captured_replies.len(), 2);
+            assert_eq!(
+                captured_replies[1],
+                "Compaction failed [invalid_compaction]: The compaction request is invalid."
+            );
+            assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_PREFIX_SENTINEL"));
+            assert!(!captured_replies[1].contains("F4_PRIVATE_TELEGRAM_TAIL_SENTINEL"));
+        }
         assert_eq!(
             before["rows"][0][7], after["rows"][0][7],
             "generation changed"
@@ -3067,7 +3072,6 @@ connection.close()"#;
             0,
             "explicit compaction must not call a model"
         );
-        drop(captured_replies);
         drop(persistence);
         drop(runtime);
         drop(state);

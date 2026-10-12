@@ -56,6 +56,7 @@ fn policy() -> TrustedTransportPolicy {
             .into_iter()
             .map(str::to_string)
             .collect(),
+        transport_identity: None,
     }
 }
 

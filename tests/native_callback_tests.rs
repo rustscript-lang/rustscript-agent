@@ -126,6 +126,7 @@ fn policy() -> TrustedTransportPolicy {
             path_prefix: "/oauth".into(),
         }],
         allowed_header_names: BTreeSet::new(),
+        transport_identity: None,
     }
 }
 

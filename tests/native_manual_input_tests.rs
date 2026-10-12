@@ -90,6 +90,7 @@ fn policy() -> TrustedTransportPolicy {
             path_prefix: "/oauth".to_owned(),
         }],
         allowed_header_names: BTreeSet::new(),
+        transport_identity: None,
     }
 }
 
