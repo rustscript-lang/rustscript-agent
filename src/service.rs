@@ -832,6 +832,13 @@ struct AuthHostFactoryPair {
     provider_child: Option<crate::runtime::agent_host::AuthHostFactory>,
 }
 
+/// Only unbound bundled code for one effective configuration is retained.
+struct WorkspaceRunnerTemplates {
+    config: AgentConfig,
+    open: Option<Arc<AgentRunner>>,
+    bind: Option<Arc<AgentRunner>>,
+}
+
 #[cfg(test)]
 type CompactionPolicyObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -880,6 +887,9 @@ struct AgentServiceInner {
     /// Workspace admission uses a separate trusted-home factory so opting
     /// into filesystem policy never opts provider RSS into OAuth authority.
     workspace_host_factory: Mutex<Option<crate::runtime::agent_host::AuthHostFactory>>,
+    workspace_runners: Mutex<Option<WorkspaceRunnerTemplates>>,
+    #[cfg(test)]
+    workspace_runner_constructions: [AtomicUsize; 2],
     /// Explicit embedding-supplied legacy root; default RunLimits never
     /// become ambient authority for production HTTP or Telegram requests.
     trusted_legacy_workspace_root: RwLock<Option<PathBuf>>,
@@ -980,6 +990,9 @@ impl AgentService {
             compaction_policy_entered: Mutex::new(None),
             auth_host_factories: Mutex::new(AuthHostFactoryPair::default()),
             workspace_host_factory: Mutex::new(None),
+            workspace_runners: Mutex::new(None),
+            #[cfg(test)]
+            workspace_runner_constructions: [AtomicUsize::new(0), AtomicUsize::new(0)],
             trusted_legacy_workspace_root: RwLock::new(None),
             runner: Mutex::new(None),
             compaction_runner: Mutex::new(None),
@@ -1107,16 +1120,9 @@ impl AgentService {
             "session_canonical_path": existing.map_or("", |binding| binding.canonical_path.as_str()),
         });
         let entry = if allow_switch { "bind" } else { "open" };
-        let runner = AgentRunner::from_bundled_named(
-            "rss/agent/workspace.rss",
-            entry,
-            AgentConfig {
-                http: self.inner.http_config.clone(),
-                sqlite: self.inner.config.sqlite.clone(),
-                fuel: self.inner.config.fuel,
-            },
-        )
-        .map_err(|_| AdmitError::Invalid("workspace admission is unavailable".to_string()))?;
+        let runner = self
+            .cached_workspace_runner(entry, self.workspace_runner_config())
+            .map_err(|_| AdmitError::Invalid("workspace admission is unavailable".to_string()))?;
         let bridges = AgentHostBridges {
             auth_host_factory: factory,
             cancellation: Some(cancellation.clone()),
@@ -1163,6 +1169,61 @@ impl AgentService {
             generation,
         };
         Ok((Some(binding), Some(authority)))
+    }
+
+    fn workspace_runner_config(&self) -> AgentConfig {
+        AgentConfig {
+            http: self.inner.http_config.clone(),
+            sqlite: self.inner.config.sqlite.clone(),
+            fuel: self.inner.config.fuel,
+        }
+    }
+
+    fn cached_workspace_runner(
+        &self,
+        entry: &str,
+        config: AgentConfig,
+    ) -> Result<AgentRunner, String> {
+        let index = match entry {
+            "open" => 0,
+            "bind" => 1,
+            _ => return Err("workspace entry is unavailable".to_string()),
+        };
+        let template = {
+            let mut cache = self
+                .inner
+                .workspace_runners
+                .lock()
+                .expect("workspace runner lock");
+            if cache
+                .as_ref()
+                .is_none_or(|current| current.config != config)
+            {
+                *cache = Some(WorkspaceRunnerTemplates {
+                    config: config.clone(),
+                    open: None,
+                    bind: None,
+                });
+            }
+            let current = cache.as_mut().expect("workspace config installed");
+            let slot = if index == 0 {
+                &mut current.open
+            } else {
+                &mut current.bind
+            };
+            if slot.is_none() {
+                let runner =
+                    AgentRunner::from_bundled_named("rss/agent/workspace.rss", entry, config)
+                        .map_err(|error| format!("compile RSS workspace policy: {error}"))?;
+                #[cfg(test)]
+                self.inner.workspace_runner_constructions[index].fetch_add(1, Ordering::SeqCst);
+                *slot = Some(Arc::new(runner));
+            }
+            Arc::clone(slot.as_ref().expect("workspace template installed"))
+        };
+        // Clone code outside initialization synchronization. Each invocation
+        // subsequently replaces default bridges and creates its own native VM.
+        Ok(template.as_ref().clone())
     }
 
     /// Installs or replaces a provider profile used by later admissions.
@@ -1229,6 +1290,17 @@ impl AgentService {
         if self.inner.persistence.is_some() {
             self.cached_compaction_runner()
                 .map_err(|error| error.detail().to_string())?;
+        }
+        let workspace_enabled = self
+            .inner
+            .workspace_host_factory
+            .lock()
+            .expect("workspace host factory lock")
+            .is_some();
+        if workspace_enabled {
+            let config = self.workspace_runner_config();
+            self.cached_workspace_runner("open", config.clone())?;
+            self.cached_workspace_runner("bind", config)?;
         }
         Ok(runner.config().clone())
     }
@@ -7560,6 +7632,459 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod workspace_template_tests {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    struct Fixture {
+        root: PathBuf,
+        home: PathBuf,
+        first: PathBuf,
+        second: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR").unwrap())
+                .join(format!("workspace-template-{}", uuid::Uuid::new_v4()));
+            let fixture = Self {
+                home: root.join("home"),
+                first: root.join("first"),
+                second: root.join("second"),
+                root,
+            };
+            for path in [&fixture.home, &fixture.first, &fixture.second] {
+                fs::create_dir_all(path).unwrap();
+            }
+            fixture.write_policy(&fixture.first);
+            fixture
+        }
+
+        fn write_policy(&self, default: &Path) {
+            let text = format!(
+                "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n    - '{}'\n  default: '{}'\n  named:\n    first: '{}'\n    second: '{}'\n",
+                self.first.display(),
+                self.second.display(),
+                default.display(),
+                self.first.display(),
+                self.second.display()
+            );
+            crate::config_file::ConfigFile::from_str(&text).unwrap();
+            fs::write(self.home.join("config.yaml"), text).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&self.home, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(
+                    self.home.join("config.yaml"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        }
+
+        fn install(&self, service: &AgentService, calls: Arc<AtomicUsize>) {
+            let home = self.home.clone();
+            service.set_workspace_host_factory(Arc::new(move |cancellation| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                crate::auth::host::AuthHost::new(home.clone(), cancellation)
+            }));
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).expect("private workspace fixture cleanup");
+        }
+    }
+
+    fn resolve(
+        service: &AgentService,
+        selector: &str,
+        existing: Option<&WorkspaceBinding>,
+        bind: bool,
+    ) -> (
+        WorkspaceBinding,
+        Arc<crate::runtime::rss_runner::WorkspaceAuthority>,
+    ) {
+        let root = RunCancellation::with_timeout(Duration::from_secs(10));
+        let started = Instant::now();
+        let (binding, authority) = service
+            .resolve_workspace_admission(Some(selector), existing, &root, bind)
+            .unwrap();
+        let authority = authority.unwrap();
+        authority.check().unwrap();
+        eprintln!(
+            "workspace_resolution_success entry={} elapsed_ns={} generation={} grant_path={}",
+            if bind { "bind" } else { "open" },
+            started.elapsed().as_nanos(),
+            authority.generation(),
+            authority.canonical_path()
+        );
+        (binding.unwrap(), authority)
+    }
+
+    fn counts(service: &AgentService) -> [usize; 2] {
+        std::array::from_fn(|index| {
+            service.inner.workspace_runner_constructions[index].load(Ordering::SeqCst)
+        })
+    }
+
+    #[tokio::test]
+    async fn materialize_prepares_both_entries_only_with_factory_without_authority() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.materialize_cached_runner().unwrap();
+        assert_eq!(counts(&service), [0, 0]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        for _ in 0..2 {
+            service.materialize_cached_runner().unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "preparation cannot invoke native factory"
+        );
+        assert_eq!(counts(&service), [1, 1]);
+        let (first, owner1) = resolve(&service, "name:first", None, false);
+        let (second, owner2) = resolve(&service, "name:second", Some(&first), true);
+        assert_ne!(first.canonical_path, second.canonical_path);
+        owner1.revoke();
+        owner2.check().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(counts(&service), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn exact_config_replacement_retains_at_most_two_entry_templates() {
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let base = service.workspace_runner_config();
+        let mut configs = vec![base.clone()];
+        let mut http = base.clone();
+        http.http.max_redirects += 1;
+        configs.push(http);
+        let mut sqlite = base.clone();
+        sqlite.sqlite.limits.max_rows += 1;
+        configs.push(sqlite);
+        let mut sqlite_root = base.clone();
+        sqlite_root.sqlite.database_root = Some("/synthetic/code-only".to_string());
+        configs.push(sqlite_root);
+        let mut unsafe_sql = base.clone();
+        unsafe_sql.sqlite.allow_unsafe_sql = true;
+        configs.push(unsafe_sql);
+        let mut fuel = base.clone();
+        fuel.fuel = Some(base.fuel.unwrap() - 1);
+        configs.push(fuel);
+        configs.push(base);
+        for (position, config) in configs.into_iter().enumerate() {
+            for entry in ["open", "bind"] {
+                for _ in 0..2 {
+                    let runner = service
+                        .cached_workspace_runner(entry, config.clone())
+                        .unwrap();
+                    assert_eq!(runner.config(), &config);
+                }
+            }
+            let cache = service.inner.workspace_runners.lock().unwrap();
+            let current = cache.as_ref().unwrap();
+            assert_eq!(current.config, config);
+            assert_eq!(
+                usize::from(current.open.is_some()) + usize::from(current.bind.is_some()),
+                2
+            );
+            assert_eq!(counts(&service), [position + 1, position + 1]);
+        }
+        let before = counts(&service);
+        assert!(
+            service
+                .cached_workspace_runner(
+                    "replay_identity_matches",
+                    service.workspace_runner_config()
+                )
+                .is_err()
+        );
+        assert_eq!(counts(&service), before);
+    }
+
+    #[tokio::test]
+    async fn warm_resolution_uses_current_factory_policy_generation_and_held_directory() {
+        let fixture = Fixture::new();
+        let replacement = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let (first, owner1) = resolve(&service, "name:first", None, false);
+        fixture.write_policy(&fixture.second);
+        let home = fixture.home.clone();
+        let generation_calls = calls.clone();
+        service.set_workspace_host_factory(Arc::new(move |root| {
+            generation_calls.fetch_add(1, Ordering::SeqCst);
+            let host = crate::auth::host::AuthHost::new(home.clone(), root)?;
+            assert_eq!(host.reload()?, 2);
+            Ok(host)
+        }));
+        let root = RunCancellation::with_timeout(Duration::from_secs(10));
+        let (binding, authority) = service
+            .resolve_workspace_admission(None, None, &root, false)
+            .unwrap();
+        let current = binding.unwrap();
+        let owner2 = authority.unwrap();
+        assert_eq!(first.generation, 1);
+        assert_eq!(current.generation, 2);
+        assert_eq!(current.canonical_path, fixture.second.to_str().unwrap());
+        assert_eq!(owner2.generation(), 2);
+        owner2.check().unwrap();
+        // Held directory facts are current; renaming one admitted root cannot
+        // revoke an independent directory admitted by a different native owner.
+        fs::rename(&fixture.second, fixture.root.join("moved-second")).unwrap();
+        assert!(owner2.check().is_err());
+        owner1.check().unwrap();
+        replacement.install(&service, calls.clone());
+        let (third, owner3) = resolve(&service, "name:first", None, false);
+        assert_eq!(third.canonical_path, replacement.first.to_str().unwrap());
+        assert_eq!(third.generation, 1);
+        owner1.revoke();
+        owner3.check().unwrap();
+        assert_eq!(counts(&service), [1, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn warmed_denied_expired_cancelled_and_optional_paths_do_not_reuse_authority() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let (binding, owner) = resolve(&service, "name:first", None, false);
+        let fresh = RunCancellation::with_timeout(Duration::from_secs(10));
+        let denied = service.resolve_workspace_admission(
+            Some(fixture.root.to_str().unwrap()),
+            None,
+            &fresh,
+            false,
+        );
+        assert!(matches!(denied, Err(AdmitError::Invalid(ref code)) if code == "workspace_denied"));
+        let switching =
+            service.resolve_workspace_admission(Some("name:second"), Some(&binding), &fresh, false);
+        assert!(
+            matches!(switching, Err(AdmitError::Invalid(ref code)) if code == "workspace_conflict")
+        );
+        let cancelled = RunCancellation::with_timeout(Duration::from_secs(10));
+        cancelled.request(CancellationReason::Requested);
+        for root in [RunCancellation::with_deadline(Instant::now()), cancelled] {
+            assert!(
+                service
+                    .resolve_workspace_admission(Some("name:first"), Some(&binding), &root, false)
+                    .is_err()
+            );
+            let optional = service
+                .resolve_workspace_admission(None, None, &root, false)
+                .unwrap();
+            assert!(optional.0.is_none() && optional.1.is_none());
+        }
+        owner.check().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fixture.home, fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                service
+                    .resolve_workspace_admission(Some("name:first"), None, &fresh, false)
+                    .is_err()
+            );
+            fs::set_permissions(&fixture.home, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        *service.inner.workspace_host_factory.lock().unwrap() = None;
+        assert!(
+            service
+                .resolve_workspace_admission(Some("name:first"), None, &fresh, false)
+                .is_err()
+        );
+        let optional = service
+            .resolve_workspace_admission(None, None, &fresh, false)
+            .unwrap();
+        assert!(optional.0.is_none() && optional.1.is_none());
+        assert_eq!(counts(&service), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn parallel_native_factories_run_outside_template_initialization_lock() {
+        use std::sync::mpsc;
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        fixture.install(&service, Arc::new(AtomicUsize::new(0)));
+        service.materialize_cached_runner().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release1_tx, release1_rx) = mpsc::channel();
+        let (release2_tx, release2_rx) = mpsc::channel();
+        let releases = [Mutex::new(release1_rx), Mutex::new(release2_rx)];
+        let call = AtomicUsize::new(0);
+        let home = fixture.home.clone();
+        let inner = Arc::downgrade(&service.inner);
+        service.set_workspace_host_factory(Arc::new(move |root| {
+            let index = call.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                inner
+                    .upgrade()
+                    .unwrap()
+                    .workspace_runners
+                    .try_lock()
+                    .is_ok()
+            );
+            entered_tx.send(index).unwrap();
+            releases[index]
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| "bounded release expired".to_string())?;
+            crate::auth::host::AuthHost::new(home.clone(), root)
+        }));
+        let threads: Vec<_> = ["name:first", "name:second"]
+            .into_iter()
+            .map(|selector| {
+                let service = service.clone();
+                std::thread::spawn(move || resolve(&service, selector, None, false))
+            })
+            .collect();
+        let entered1 = entered_rx.recv_timeout(Duration::from_secs(5));
+        let entered2 = entered_rx.recv_timeout(Duration::from_secs(5));
+        // Always release and join both owned workers before any assertion.
+        let _ = release1_tx.send(());
+        let _ = release2_tx.send(());
+        let outcomes: Vec<_> = threads.into_iter().map(|worker| worker.join()).collect();
+        assert!(
+            entered1.is_ok() && entered2.is_ok(),
+            "both native factories must enter before release"
+        );
+        let mut owners = Vec::new();
+        for outcome in outcomes {
+            owners.push(outcome.unwrap().1);
+        }
+        assert!(!Arc::ptr_eq(&owners[0].grant(), &owners[1].grant()));
+        owners[0].revoke();
+        owners[1].check().unwrap();
+        assert_eq!(counts(&service), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn warm_template_clone_and_successful_native_adoption_measurements() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let config = service.workspace_runner_config();
+        let started = Instant::now();
+        let runner = service.cached_workspace_runner("open", config).unwrap();
+        let clone_ns = started.elapsed().as_nanos();
+        let root = RunCancellation::with_timeout(Duration::from_secs(10));
+        let factory = service.inner.workspace_host_factory.lock().unwrap().clone();
+        let runner = runner
+            .with_host(AgentHostBridges {
+                auth_host_factory: factory,
+                cancellation: Some(root.clone()),
+                ..AgentHostBridges::default()
+            })
+            .with_cancellation(root.clone());
+        let started = Instant::now();
+        let outcome = runner.run_workspace_admission("open", crate::domain::json_to_vm_value(&json!({"selector":"name:first", "selector_present":true, "session_selector":"", "session_canonical_path":""})), &root).unwrap();
+        let native_ns = started.elapsed().as_nanos();
+        assert!(outcome.ok);
+        let owner = outcome.authority.unwrap();
+        owner.check().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(counts(&service), [1, 1]);
+        eprintln!(
+            "workspace_measured template_hit_clone_ns={clone_ns} successful_native_vm_policy_grant_adoption_ns={native_ns} generation={} path={}",
+            owner.generation(),
+            owner.canonical_path()
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sessions_retain_independent_current_native_grants() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        service.materialize_cached_runner().unwrap();
+        let mut runs = Vec::new();
+        for selector in ["name:first", "name:second"] {
+            runs.push(
+                service
+                    .admit_external_with_workspace_selector(
+                        AdmitRunRequest {
+                            input: json!("synthetic session ownership"),
+                            platform: "http".to_string(),
+                            ..AdmitRunRequest::default()
+                        },
+                        Some(selector.to_string()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_ne!(runs[0].session_id, runs[1].session_id);
+        let owner1 = service
+            .handle(&runs[0].run_id)
+            .unwrap()
+            .workspace_authority
+            .clone()
+            .unwrap();
+        let owner2 = service
+            .handle(&runs[1].run_id)
+            .unwrap()
+            .workspace_authority
+            .clone()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&owner1.grant(), &owner2.grant()));
+        assert_eq!(owner1.canonical_path(), fixture.first.to_str().unwrap());
+        assert_eq!(owner2.canonical_path(), fixture.second.to_str().unwrap());
+        service.stop(&runs[0].run_id);
+        assert!(owner1.check().is_err());
+        owner2.check().unwrap();
+        service.stop(&runs[1].run_id);
+        assert!(owner2.check().is_err());
+        assert_eq!(counts(&service), [1, 1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_open_resolution_constructs_one_template_with_fresh_grants() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let calls = Arc::new(AtomicUsize::new(0));
+        fixture.install(&service, calls.clone());
+        let (first, owner1) = resolve(&service, "name:first", None, false);
+        let (second, owner2) = resolve(&service, "name:second", None, false);
+        assert_ne!(first.canonical_path, second.canonical_path);
+        assert!(!Arc::ptr_eq(&owner1.grant(), &owner2.grant()));
+        owner1.revoke();
+        assert!(owner1.check().is_err());
+        owner2.check().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            service.inner.workspace_runner_constructions[0].load(Ordering::SeqCst),
+            1
+        );
+    }
 }
 
 #[cfg(test)]
