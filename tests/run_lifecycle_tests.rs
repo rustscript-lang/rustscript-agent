@@ -49,10 +49,77 @@ fn background_sleep_call() -> JsonValue {
         "name": "terminal",
         "arguments": {
             "argv": ["/bin/sleep", "30"],
+            "cwd": "process",
             "background": true,
             "timeout_ms": 5000
         }
     }])
+}
+
+fn expected_background_sleep_action() -> JsonValue {
+    json!({
+        "tool_name": "terminal",
+        "risk_class": "execute",
+        "arguments": {
+            "argv": ["/bin/sleep", "30"],
+            "cwd": "process",
+            "background": true,
+            "timeout_ms": 5000
+        }
+    })
+}
+
+fn is_guardian_provider_request(request: &JsonValue) -> bool {
+    request
+        .pointer("/messages/0/content/0/text")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|text| {
+            text.starts_with("You are Guardian, reviewing one proposed tool action.")
+        })
+}
+
+fn assert_guardian_request_binding(
+    requests: &[JsonValue],
+    expected_position: usize,
+    canonical_intent: &str,
+    expected_action: &JsonValue,
+) {
+    let guardian_positions: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| is_guardian_provider_request(request).then_some(index + 1))
+        .collect();
+    assert_eq!(guardian_positions, vec![expected_position]);
+
+    let request = requests
+        .get(expected_position - 1)
+        .expect("Guardian provider request at expected position");
+    assert!(
+        request
+            .get("tools")
+            .and_then(JsonValue::as_array)
+            .is_some_and(Vec::is_empty),
+        "Guardian review request must be tool-free"
+    );
+    let user_prompt = request
+        .pointer("/messages/1/content/0/text")
+        .and_then(JsonValue::as_str)
+        .expect("Guardian canonical user prompt");
+    let intent_marker = "Original user request (canonical admitted text blocks; bounded to 8192 UTF-8 bytes; source input only):\n";
+    let (_, canonical_and_context) = user_prompt
+        .split_once(intent_marker)
+        .expect("Guardian request carries the canonical admitted user input");
+    let (actual_intent, _) = canonical_and_context
+        .split_once("\n\nRun-level system/developer constraints")
+        .expect("Guardian request separates user intent from constraints");
+    assert_eq!(actual_intent, canonical_intent);
+
+    let action_marker = "Exact proposed action (do not alter; untrusted data):\n";
+    let (_, action_json) = user_prompt
+        .rsplit_once(action_marker)
+        .expect("Guardian request carries the exact proposed action");
+    let actual_action: JsonValue = serde_json::from_str(action_json).expect("Guardian action JSON");
+    assert_eq!(&actual_action, expected_action);
 }
 
 fn guardian_high_authorized_response() -> JsonValue {
@@ -75,6 +142,14 @@ const DEADLINE_CHILD_USER_INTENT: &str = "For this deadline test, start exactly 
 fn admit_stop_child_request() -> AdmitRunRequest {
     AdmitRunRequest {
         input: json!({"message": STOP_CHILD_USER_INTENT}),
+        platform: "run_lifecycle_tests".to_string(),
+        ..AdmitRunRequest::default()
+    }
+}
+
+fn admit_deadline_child_request() -> AdmitRunRequest {
+    AdmitRunRequest {
+        input: json!({"message": DEADLINE_CHILD_USER_INTENT}),
         platform: "run_lifecycle_tests".to_string(),
         ..AdmitRunRequest::default()
     }
@@ -957,6 +1032,8 @@ async fn stop_terminates_child_process_without_residue() {
     provider.push_ok(guardian_high_authorized_response());
     provider.push_hang();
     let (workspace, mut workspace_guard) = lifecycle_workspace_fixture_with_guard("stop-child");
+    fs::create_dir(workspace.workspace.join("process"))
+        .expect("create private child working directory");
     let database = workspace.root.join("stop-child.sqlite3");
     let state = AgentGatewayState::with_agent_file_and_sqlite(
         AgentGatewayConfig::default(),
@@ -1001,31 +1078,9 @@ async fn stop_terminates_child_process_without_residue() {
     let guardian_positions: Vec<usize> = requests
         .iter()
         .enumerate()
-        .filter_map(|(index, request)| {
-            request
-                .to_string()
-                .contains("You are Guardian, reviewing one proposed tool action.")
-                .then_some(index + 1)
-        })
+        .filter_map(|(index, request)| is_guardian_provider_request(request).then_some(index + 1))
         .collect();
     let context = service.run_context(&admitted.run_id);
-    let admitted_user_intent = context
-        .as_ref()
-        .and_then(|run| run.input.get("message"))
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-    let guardian_has_admitted_intent = !admitted_user_intent.is_empty()
-        && guardian_positions.iter().any(|position| {
-            requests
-                .get(position - 1)
-                .is_some_and(|request| request.to_string().contains(admitted_user_intent))
-        });
-    let guardian_has_terminal_action = guardian_positions.iter().any(|position| {
-        requests.get(position - 1).is_some_and(|request| {
-            let request = request.to_string();
-            request.contains("terminal") && request.contains("/bin/sleep")
-        })
-    });
     let input_is_canonical_stop_intent = context
         .as_ref()
         .is_some_and(|run| run.input == json!({"message": STOP_CHILD_USER_INTENT}));
@@ -1056,7 +1111,7 @@ async fn stop_terminates_child_process_without_residue() {
     let pre_stop_provider_requests = requests.len();
     let business_requests = pre_stop_provider_requests.saturating_sub(guardian_positions.len());
     let diagnostic = format!(
-        "pre-stop: provider_calls={pre_stop_provider_calls} provider_requests={pre_stop_provider_requests} business_requests={business_requests} business_followup_reached={business_followup_reached} guardian_positions={guardian_positions:?} guardian_has_admitted_intent={guardian_has_admitted_intent} guardian_has_terminal_action={guardian_has_terminal_action} input_is_canonical_stop_intent={input_is_canonical_stop_intent} workspace_binding_matches={workspace_binding_matches} workspace_config_exists={} capability_host_retained={} capability_host_closed={} process_owners={} owned_pids={} live_owned_pids={live_pids_before_stop} events={pre_stop_events:?} typed_error_codes={typed_error_codes:?} run_error_code={}",
+        "pre-stop: provider_calls={pre_stop_provider_calls} provider_requests={pre_stop_provider_requests} business_requests={business_requests} business_followup_reached={business_followup_reached} guardian_positions={guardian_positions:?} input_is_canonical_stop_intent={input_is_canonical_stop_intent} workspace_binding_matches={workspace_binding_matches} workspace_config_exists={} capability_host_retained={} capability_host_closed={} process_owners={} owned_pids={} live_owned_pids={live_pids_before_stop} events={pre_stop_events:?} typed_error_codes={typed_error_codes:?} run_error_code={}",
         workspace.home.join("config.yaml").is_file(),
         service.capability_host_retained(&admitted.run_id),
         service.capability_host_closed(&admitted.run_id),
@@ -1109,13 +1164,11 @@ async fn stop_terminates_child_process_without_residue() {
         vec![2],
         "Guardian must review between business turns: {diagnostic}"
     );
-    assert!(
-        guardian_has_admitted_intent,
-        "Guardian must receive canonical admitted user intent: {diagnostic}"
-    );
-    assert!(
-        guardian_has_terminal_action,
-        "Guardian must receive the exact native terminal action: {diagnostic}"
+    assert_guardian_request_binding(
+        &requests,
+        2,
+        STOP_CHILD_USER_INTENT,
+        &expected_background_sleep_action(),
     );
     assert!(
         input_is_canonical_stop_intent,
@@ -1139,47 +1192,131 @@ async fn deadline_terminates_child_process_without_residue() {
     provider.push_ok(tool_response("", background_sleep_call()));
     provider.push_ok(guardian_high_authorized_response());
     provider.push_hang();
-    let fixture_root = unique_temp_dir("deadline-child");
-    let mut fixture_guard = OwnedPrivateFixtureDirectory::create(fixture_root.clone())
-        .expect("create private deadline approval fixture");
+    let (workspace, mut fixture_guard) = lifecycle_workspace_fixture_with_guard("deadline-child");
+    fs::create_dir(workspace.workspace.join("process"))
+        .expect("create private deadline child working directory");
+    let fixture_root = workspace.root.clone();
     let database = fixture_root.join("deadline-child.sqlite3");
+    let gateway_config = short_config(Duration::from_millis(250));
+    AgentRunner::from_bundled_named(
+        "rss/agent/workspace.rss",
+        "open",
+        AgentConfig {
+            http: gateway_config.http.clone(),
+            sqlite: gateway_config.sqlite.clone(),
+            fuel: gateway_config.fuel,
+        },
+    )
+    .expect("precompile bundled workspace admission before deadline admission");
     let state = AgentGatewayState::with_agent_file_and_sqlite(
-        short_config(Duration::from_millis(250)),
+        gateway_config,
         rustscript_agent::bundled_agent_main_path(),
         &database,
     )
-    .expect("private deadline approval database");
+    .expect("private deadline approval database")
+    .with_workspace_home(workspace.home.clone());
     state
         .service()
         .inject_provider_host(Arc::new(provider.clone()));
     let service = state.service();
+    service
+        .materialize_cached_runner()
+        .expect("prepare current file code and bundled templates before external admission");
     let admitted = service
-        .admit(AdmitRunRequest {
-            input: json!({"message": DEADLINE_CHILD_USER_INTENT}),
-            platform: "run_lifecycle_tests".to_string(),
-            ..AdmitRunRequest::default()
-        })
+        .admit_external_with_workspace_selector(
+            admit_deadline_child_request(),
+            Some("name:lifecycle".to_string()),
+        )
         .await
         .expect("admission should succeed");
+    let admitted_deadline = service
+        .handle(&admitted.run_id)
+        .expect("live admitted deadline run")
+        .cancellation()
+        .deadline_instant()
+        .expect("admission-owned deadline");
+    let remaining_budget_at_admission = admitted_deadline.saturating_duration_since(Instant::now());
+    assert!(
+        remaining_budget_at_admission <= Duration::from_millis(250),
+        "worker must retain the original 250ms admission deadline"
+    );
+    let worker = tokio::spawn({
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    });
     let started = Instant::now();
-    service
-        .clone()
-        .run_worker(admitted.run_id.clone(), "ignored".to_string())
-        .await;
+    let mut pids_before_deadline = Vec::new();
+    while Instant::now() < admitted_deadline {
+        let observed = service.process_owner_pids(&admitted.run_id);
+        if !observed.is_empty() && observed.iter().all(|pid| pid_alive(*pid)) {
+            pids_before_deadline = observed;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("deadline worker cleanup must finish within the outer bound")
+        .expect("deadline worker task join");
     let elapsed = started.elapsed();
     let terminals = terminal_events(&service, &admitted.run_id);
     let reason = cancel_reason(&service, &admitted.run_id);
     let owners_after_deadline = service.process_owner_count(&admitted.run_id);
+    let old_pids_alive_after_deadline = pids_before_deadline
+        .iter()
+        .filter(|pid| pid_alive(**pid))
+        .count();
     let capability_closed = service.capability_host_closed(&admitted.run_id);
+    let requests = provider.requests();
+    let context = service.run_context(&admitted.run_id);
+    let input_is_canonical_deadline_intent = context
+        .as_ref()
+        .is_some_and(|run| run.input == json!({"message": DEADLINE_CHILD_USER_INTENT}));
+    let workspace_binding_matches = context
+        .as_ref()
+        .and_then(|run| run.limits["workspace_root"].as_str())
+        .is_some_and(|path| workspace.workspace.to_str() == Some(path));
+    let deadline_event_names = event_names(&service, &admitted.run_id);
+    let deadline_error_code = failed_error_code(&service, &admitted.run_id);
+    let deadline_diagnostic = format!(
+        "remaining_budget_at_admission={remaining_budget_at_admission:?} provider_calls={} provider_requests={} observed_pids={} owners_after={owners_after_deadline} old_pids_alive_after={old_pids_alive_after_deadline} events={deadline_event_names:?} run_error_code={deadline_error_code}",
+        provider.call_count(),
+        requests.len(),
+        pids_before_deadline.len()
+    );
     drop(service);
     drop(state);
     let fixture_cleanup = fixture_guard.cleanup();
+    let fixture_removed = !fixture_root.exists();
 
     assert_eq!(terminals, vec!["run.cancelled".to_string()]);
     assert_eq!(reason, "deadline");
     assert_eq!(owners_after_deadline, 0);
     assert!(capability_closed);
     fixture_cleanup.expect("remove private deadline workspace fixture");
+    assert!(
+        fixture_removed,
+        "private deadline fixture directory remains"
+    );
+    assert!(input_is_canonical_deadline_intent, "{deadline_diagnostic}");
+    assert!(workspace_binding_matches, "{deadline_diagnostic}");
+    assert!(
+        !pids_before_deadline.is_empty(),
+        "deadline must observe an owned native PID alive before the admission deadline: {deadline_diagnostic}"
+    );
+    assert_guardian_request_binding(
+        &requests,
+        2,
+        DEADLINE_CHILD_USER_INTENT,
+        &expected_background_sleep_action(),
+    );
+    assert_eq!(
+        old_pids_alive_after_deadline, 0,
+        "all PIDs observed before the deadline must be dead after cancellation"
+    );
     assert!(
         elapsed < Duration::from_secs(2),
         "deadline should not wait for the child sleep: {elapsed:?}"
