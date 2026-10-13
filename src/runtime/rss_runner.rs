@@ -184,6 +184,7 @@ fn program_cache() -> std::sync::MutexGuard<'static, ProgramLru> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(test)] // Compatibility wrapper used by the non-memo unit regression.
 fn snapshot_module_tree(entry: &Path) -> Result<String> {
     super::module_snapshot::module_tree_digest(entry)
 }
@@ -413,8 +414,16 @@ pub fn bundled_agent_main_path() -> PathBuf {
     rss_root().join("agent/main.rss")
 }
 
+#[cfg(test)] // Compatibility wrapper used by the non-memo unit regression.
 pub(crate) fn module_tree_digest(path: impl AsRef<Path>) -> Result<String> {
     snapshot_module_tree(path.as_ref())
+}
+
+pub(crate) fn module_tree_digest_with_import_memo(
+    path: impl AsRef<Path>,
+    memo: &super::module_snapshot::ImportValidationMemo,
+) -> Result<String> {
+    super::module_snapshot::module_tree_digest_with_import_memo(path.as_ref(), memo)
 }
 
 /// Admits the production RSS tool-registry descriptors after generic bounds.

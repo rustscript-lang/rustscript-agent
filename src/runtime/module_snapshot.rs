@@ -16,9 +16,9 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -30,7 +30,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use rustscript_vm::{
     ParserDialect, SharedParserOptions, UsePathSegment, parse_source_with_dialect,
@@ -116,6 +116,39 @@ fn snapshot_parser_prelude() -> &'static str {
             prelude
         })
         .as_str()
+}
+
+type ImportValidationFiles = Vec<(String, Vec<u8>)>;
+
+/// One service's last positive input for the fixed snapshot parser dialect/options.
+/// This stores no filesystem authority, entry identity, digest, or failures.
+#[derive(Default)]
+pub(crate) struct ImportValidationMemo {
+    last_success: Mutex<Option<Arc<ImportValidationFiles>>>,
+}
+
+impl ImportValidationMemo {
+    fn validate(&self, root: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+        let previous = self
+            .last_success
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if previous.as_ref().is_some_and(|old| old.as_slice() == files) {
+            return Ok(());
+        }
+        // Parsing and allocation are outside the slot lock. Concurrent misses
+        // can independently validate their own immutable current capture.
+        assert_imports_stay_in_root(root, files)?;
+        let successful = Arc::new(files.to_vec());
+        let replaced = self
+            .last_success
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(successful);
+        drop(replaced);
+        Ok(())
+    }
 }
 
 /// Owned module-tree bytes used for digesting and isolated compilation.
@@ -206,9 +239,32 @@ impl Drop for MaterializedSnapshot {
 
 #[cfg(test)]
 thread_local! {
+    static PURE_VALIDATION_NS: Cell<u128> = const { Cell::new(0) };
+    static CAPTURE_NS: Cell<u128> = const { Cell::new(0) };
+    static VALIDATION_NS: Cell<u128> = const { Cell::new(0) };
+    static BEFORE_IMPORT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static CAPTURE_COUNT: Cell<usize> = const { Cell::new(0) };
+    static IMPORT_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
     static AFTER_OPEN_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
     static AFTER_DIRECTORY_OPEN_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
     static AFTER_SANDBOX_DIR_HOOK: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn import_validation_timings() -> (u128, u128, u128) {
+    (
+        CAPTURE_NS.with(Cell::get),
+        VALIDATION_NS.with(Cell::get),
+        PURE_VALIDATION_NS.with(Cell::get),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn import_validation_counts() -> (usize, usize) {
+    (
+        CAPTURE_COUNT.with(Cell::get),
+        IMPORT_SCAN_COUNT.with(Cell::get),
+    )
 }
 
 /// Test-only hook invoked after a regular file is opened and before its bytes
@@ -233,6 +289,7 @@ pub fn set_after_sandbox_dir_hook(hook: Option<fn(&Path)>) {
     AFTER_SANDBOX_DIR_HOOK.with(|cell| cell.set(hook));
 }
 
+#[cfg(test)] // Internal non-memo regression helper; production captures stay unchanged.
 pub fn module_tree_digest(entry: &Path) -> Result<String> {
     Ok(capture_module_snapshot(entry)?.digest)
 }
@@ -260,6 +317,24 @@ pub(crate) fn owned_memory_snapshot_digest(files: &[(String, Vec<u8>)], entry_re
 }
 
 pub fn capture_module_snapshot(entry: &Path) -> Result<ModuleSnapshot> {
+    capture_module_snapshot_with_memo(entry, None)
+}
+
+pub(crate) fn module_tree_digest_with_import_memo(
+    entry: &Path,
+    memo: &ImportValidationMemo,
+) -> Result<String> {
+    Ok(capture_module_snapshot_with_memo(entry, Some(memo))?.digest)
+}
+
+fn capture_module_snapshot_with_memo(
+    entry: &Path,
+    memo: Option<&ImportValidationMemo>,
+) -> Result<ModuleSnapshot> {
+    #[cfg(test)]
+    CAPTURE_COUNT.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    let capture_started = std::time::Instant::now();
     let root = module_tree_root(entry)?;
     let entry_rel = relative_posix(&root, entry)?;
     assert_safe_rel(&entry_rel)?;
@@ -281,7 +356,18 @@ pub fn capture_module_snapshot(entry: &Path) -> Result<ModuleSnapshot> {
     if !files.iter().any(|(rel, _)| rel == &entry_rel) {
         return Err(tree_error(ERR_MODULE_TREE_WALK));
     }
-    assert_imports_stay_in_root(&root, &files)?;
+    #[cfg(test)]
+    CAPTURE_NS.with(|value| value.set(capture_started.elapsed().as_nanos()));
+    #[cfg(test)]
+    let validation_started = std::time::Instant::now();
+    #[cfg(test)]
+    PURE_VALIDATION_NS.with(|value| value.set(0));
+    match memo {
+        Some(memo) => memo.validate(&root, &files)?,
+        None => assert_imports_stay_in_root(&root, &files)?,
+    }
+    #[cfg(test)]
+    VALIDATION_NS.with(|value| value.set(validation_started.elapsed().as_nanos()));
     let digest = owned_memory_snapshot_digest(&files, &entry_rel);
     Ok(ModuleSnapshot {
         files,
@@ -710,6 +796,14 @@ fn invoke_after_directory_open(_path: &Path) {}
 fn invoke_after_sandbox_dir(_path: &Path) {}
 
 fn assert_imports_stay_in_root(_root: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+    #[cfg(test)]
+    BEFORE_IMPORT_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    #[cfg(test)]
+    let pure_validation_started = std::time::Instant::now();
     for (rel, bytes) in files {
         let source = std::str::from_utf8(bytes)
             .map_err(|_| tree_error("module tree file is not valid UTF-8"))?;
@@ -724,10 +818,14 @@ fn assert_imports_stay_in_root(_root: &Path, files: &[(String, Vec<u8>)]) -> Res
             }
         }
     }
+    #[cfg(test)]
+    PURE_VALIDATION_NS.with(|value| value.set(pure_validation_started.elapsed().as_nanos()));
     Ok(())
 }
 
 fn scan_use_declarations(source: &str) -> Result<Vec<Vec<UsePathSegment>>> {
+    #[cfg(test)]
+    IMPORT_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     let mut scan_source = String::with_capacity(snapshot_parser_prelude().len() + source.len());
     scan_source.push_str(snapshot_parser_prelude());
     scan_source.push_str(source);
@@ -1209,6 +1307,398 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    mod positive_memo_tests {
+        use super::*;
+        use std::sync::mpsc;
+
+        const OLD: &str = "pub fn run(input: map) -> string { \"old\"; }\n";
+        const NEW: &str = "pub fn run(input: map) -> string { \"new\"; }\n";
+
+        struct Fixture(PathBuf);
+        impl Fixture {
+            fn new() -> Self {
+                let root = test_root("positive-memo");
+                fs::write(root.join("main.rss"), OLD).unwrap();
+                Self(root)
+            }
+            fn entry(&self) -> PathBuf {
+                self.0.join("main.rss")
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                set_after_open_hook(None);
+                set_after_directory_open_hook(None);
+                BEFORE_IMPORT_HOOK.with(|hook| {
+                    hook.borrow_mut().take();
+                });
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        fn capture(f: &Fixture, memo: &ImportValidationMemo) -> ModuleSnapshot {
+            capture_module_snapshot_with_memo(&f.entry(), Some(memo)).unwrap()
+        }
+        fn retained(memo: &ImportValidationMemo) -> Arc<Vec<(String, Vec<u8>)>> {
+            memo.last_success.lock().unwrap().as_ref().unwrap().clone()
+        }
+
+        #[test]
+        fn first_failure_leaves_slot_empty_and_default_digest_keeps_parsing() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            fs::write(f.entry(), "use super::outside;\n").unwrap();
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            assert!(memo.last_success.lock().unwrap().is_none());
+            fs::write(f.entry(), OLD).unwrap();
+            let positive = capture(&f, &memo);
+            let before = import_validation_counts();
+            for _ in 0..2 {
+                assert_eq!(
+                    super::super::super::rss_runner::module_tree_digest(f.entry()).unwrap(),
+                    positive.digest()
+                );
+            }
+            assert_eq!(import_validation_counts().0 - before.0, 2);
+            assert_eq!(import_validation_counts().1 - before.1, 2);
+        }
+
+        #[test]
+        fn equal_size_preserved_mtime_mutation_and_one_slot_replacement() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            let old = capture(&f, &memo);
+            let retained_old = retained(&memo);
+            let modified = fs::metadata(f.entry()).unwrap().modified().unwrap();
+            fs::write(f.entry(), NEW).unwrap();
+            File::options()
+                .write(true)
+                .open(f.entry())
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(
+                fs::metadata(f.entry()).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_eq!(OLD.len(), NEW.len());
+            let before = import_validation_counts();
+            let new = capture(&f, &memo);
+            assert_eq!(import_validation_counts().1 - before.1, 1);
+            assert_ne!(new.digest(), old.digest());
+            assert_eq!(new.entry_source().unwrap(), NEW);
+            assert_eq!(old.entry_source().unwrap(), OLD);
+            assert!(!Arc::ptr_eq(&retained_old, &retained(&memo)));
+            assert_eq!(retained(&memo).len(), 1);
+            fs::write(f.entry(), OLD).unwrap();
+            let before = import_validation_counts();
+            capture(&f, &memo);
+            assert_eq!(
+                import_validation_counts().1 - before.1,
+                1,
+                "only last input is retained"
+            );
+        }
+
+        #[test]
+        fn additions_deletions_renames_and_entry_identity_are_current() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            let initial = capture(&f, &memo);
+            fs::write(f.0.join("helper.rss"), "pub fn helper() -> i64 { 1; }\n").unwrap();
+            let before = import_validation_counts();
+            let added = capture(&f, &memo);
+            assert_eq!(import_validation_counts().1 - before.1, 2);
+            assert_ne!(added.digest(), initial.digest());
+            fs::rename(f.0.join("helper.rss"), f.0.join("renamed.rss")).unwrap();
+            let before = import_validation_counts();
+            let renamed = capture(&f, &memo);
+            assert_eq!(import_validation_counts().1 - before.1, 2);
+            assert_ne!(renamed.digest(), added.digest());
+            let before = import_validation_counts();
+            let other_entry =
+                capture_module_snapshot_with_memo(&f.0.join("renamed.rss"), Some(&memo)).unwrap();
+            assert_eq!(import_validation_counts().1, before.1);
+            assert_ne!(
+                other_entry.digest(),
+                renamed.digest(),
+                "entry identity remains separately current"
+            );
+            fs::remove_file(f.0.join("renamed.rss")).unwrap();
+            let before = import_validation_counts();
+            assert_eq!(capture(&f, &memo).digest(), initial.digest());
+            assert_eq!(import_validation_counts().1 - before.1, 1);
+            let other = Fixture::new();
+            let before = import_validation_counts();
+            assert_eq!(capture(&other, &memo).digest(), initial.digest());
+            assert_eq!(import_validation_counts().0 - before.0, 1);
+            assert_eq!(import_validation_counts().1, before.1);
+        }
+
+        #[test]
+        fn warm_negative_sources_never_publish_or_cache_failure_and_recover() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            capture(&f, &memo);
+            let positive = retained(&memo);
+            for source in [
+                b"pub fn broken( {".as_slice(),
+                b"use super::outside;\n",
+                b"use crate::outside;\n",
+                b"\xff",
+            ] {
+                fs::write(f.entry(), source).unwrap();
+                let before = import_validation_counts();
+                for _ in 0..2 {
+                    assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+                    assert!(Arc::ptr_eq(&positive, &retained(&memo)));
+                }
+                assert_eq!(import_validation_counts().0 - before.0, 2);
+                if source != b"\xff" {
+                    assert_eq!(
+                        import_validation_counts().1 - before.1,
+                        2,
+                        "failures parse again"
+                    );
+                }
+            }
+            fs::write(f.entry(), OLD).unwrap();
+            let before = import_validation_counts();
+            assert_eq!(capture(&f, &memo).entry_source().unwrap(), OLD);
+            assert_eq!(import_validation_counts().1, before.1);
+            fs::write(f.entry(), NEW).unwrap();
+            assert_eq!(capture(&f, &memo).entry_source().unwrap(), NEW);
+        }
+
+        #[test]
+        fn warm_memo_enforces_ambiguous_identity_and_all_tree_bounds() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            capture(&f, &memo);
+            let positive = retained(&memo);
+            fs::write(f.0.join("ambiguous\\name.rss"), OLD).unwrap();
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            fs::remove_file(f.0.join("ambiguous\\name.rss")).unwrap();
+            fs::write(f.entry(), vec![b' '; MAX_AGENT_SOURCE_BYTES + 1]).unwrap();
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            fs::write(f.entry(), OLD).unwrap();
+            for i in 0..MAX_TREE_FILES {
+                fs::write(f.0.join(format!("file{i}.rss")), OLD).unwrap();
+            }
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            for i in 0..MAX_TREE_FILES {
+                fs::remove_file(f.0.join(format!("file{i}.rss"))).unwrap();
+            }
+            for i in 0..MAX_TREE_NODES {
+                fs::write(f.0.join(format!("junk{i}")), b"").unwrap();
+            }
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            for i in 0..MAX_TREE_NODES {
+                fs::remove_file(f.0.join(format!("junk{i}"))).unwrap();
+            }
+            let mut deep = f.0.clone();
+            for _ in 0..=MAX_TREE_DEPTH {
+                deep = deep.join("nested");
+            }
+            fs::create_dir_all(deep).unwrap();
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            fs::remove_dir_all(f.0.join("nested")).unwrap();
+            for i in 0..8 {
+                fs::write(
+                    f.0.join(format!("large{i}.rss")),
+                    vec![b' '; MAX_AGENT_SOURCE_BYTES],
+                )
+                .unwrap();
+            }
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            for i in 0..8 {
+                fs::remove_file(f.0.join(format!("large{i}.rss"))).unwrap();
+            }
+            assert!(Arc::ptr_eq(&positive, &retained(&memo)));
+            assert!(positive.len() <= MAX_TREE_FILES);
+            assert!(positive.iter().map(|(_, b)| b.len()).sum::<usize>() <= MAX_TREE_BYTES);
+            capture(&f, &memo);
+        }
+
+        #[test]
+        fn warm_memo_rejects_current_file_directory_and_root_symlinks() {
+            use std::os::unix::fs::symlink;
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            capture(&f, &memo);
+            fs::rename(f.entry(), f.0.join("saved.rss")).unwrap();
+            symlink(f.0.join("saved.rss"), f.entry()).unwrap();
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            fs::remove_file(f.entry()).unwrap();
+            fs::rename(f.0.join("saved.rss"), f.entry()).unwrap();
+            let outside = Fixture::new();
+            symlink(&outside.0, f.0.join("alias")).unwrap();
+            assert!(capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).is_err());
+            fs::remove_file(f.0.join("alias")).unwrap();
+            let root_alias = outside.0.join("alias");
+            symlink(&f.0, &root_alias).unwrap();
+            assert!(
+                capture_module_snapshot_with_memo(&root_alias.join("main.rss"), Some(&memo))
+                    .is_err()
+            );
+            capture(&f, &memo);
+        }
+
+        #[test]
+        fn warm_file_swap_after_open_still_rejects_current_replacement() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            capture(&f, &memo);
+            set_after_open_hook(Some(|path| {
+                fs::rename(path, path.with_extension("saved")).unwrap();
+                fs::write(path, OLD).unwrap();
+            }));
+            let result = capture_module_snapshot_with_memo(&f.entry(), Some(&memo));
+            set_after_open_hook(None);
+            assert!(result.is_err());
+            capture(&f, &memo);
+        }
+
+        #[test]
+        fn warm_root_handle_swap_retains_owned_bytes_then_rejects_alias() {
+            let f = Fixture::new();
+            let outside = Fixture::new();
+            fs::write(outside.entry(), NEW).unwrap();
+            let memo = ImportValidationMemo::default();
+            capture(&f, &memo);
+            let root = f.0.clone();
+            let moved = outside.0.join("moved");
+            thread_local! { static SWAP: RefCell<Option<(PathBuf, PathBuf, PathBuf)>> = const { RefCell::new(None) }; }
+            SWAP.with(|slot| {
+                *slot.borrow_mut() = Some((root.clone(), moved.clone(), outside.0.clone()))
+            });
+            set_after_directory_open_hook(Some(|_| {
+                SWAP.with(|slot| {
+                    if let Some((root, moved, target)) = slot.borrow_mut().take() {
+                        fs::rename(&root, moved).unwrap();
+                        std::os::unix::fs::symlink(target, root).unwrap();
+                    }
+                })
+            }));
+            let result = capture_module_snapshot_with_memo(&f.entry(), Some(&memo));
+            set_after_directory_open_hook(None);
+            let current = capture_module_snapshot_with_memo(&f.entry(), Some(&memo));
+            fs::remove_file(&root).unwrap();
+            fs::rename(&moved, &root).unwrap();
+            assert_eq!(result.unwrap().entry_source().unwrap(), OLD);
+            assert!(current.is_err());
+            capture(&f, &memo);
+        }
+
+        #[test]
+        fn current_file_read_runs_outside_memo_lock() {
+            let f = Fixture::new();
+            let memo = Arc::new(ImportValidationMemo::default());
+            capture(&f, &memo);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let path = f.entry();
+            let worker_memo = memo.clone();
+            thread_local! { static READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) }; }
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(move || {
+                    READ_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            entered_tx.send(()).unwrap();
+                            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                        }))
+                    });
+                    set_after_open_hook(Some(|_| {
+                        READ_HOOK.with(|slot| {
+                            if let Some(hook) = slot.borrow_mut().take() {
+                                hook();
+                            }
+                        })
+                    }));
+                    let result = capture_module_snapshot_with_memo(&path, Some(&worker_memo));
+                    set_after_open_hook(None);
+                    result
+                });
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+                let started = Instant::now();
+                let current = capture_module_snapshot_with_memo(&f.entry(), Some(&memo));
+                let elapsed = started.elapsed();
+                let _ = release_tx.send(());
+                let owned = worker.join();
+                assert!(entered.is_ok());
+                assert!(
+                    elapsed < Duration::from_secs(5),
+                    "current capture completes before first read release"
+                );
+                assert_eq!(current.unwrap().entry_source().unwrap(), OLD);
+                assert_eq!(owned.unwrap().unwrap().entry_source().unwrap(), OLD);
+            });
+        }
+
+        #[test]
+        fn parser_panic_does_not_poison_positive_slot() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            capture(&f, &memo);
+            let old = retained(&memo);
+            fs::write(f.entry(), NEW).unwrap();
+            BEFORE_IMPORT_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| panic!("memo-test parser boundary panic")))
+            });
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_module_snapshot_with_memo(&f.entry(), Some(&memo))
+            }));
+            assert!(panic.is_err());
+            assert!(Arc::ptr_eq(&old, &retained(&memo)));
+            assert_eq!(capture(&f, &memo).entry_source().unwrap(), NEW);
+        }
+
+        #[test]
+        fn concurrent_parse_miss_allows_other_current_capture_and_mutation() {
+            let f = Fixture::new();
+            let memo = Arc::new(ImportValidationMemo::default());
+            capture(&f, &memo);
+            fs::write(f.entry(), NEW).unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let path = f.entry();
+            let worker_memo = memo.clone();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(move || {
+                    BEFORE_IMPORT_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            entered_tx.send(()).unwrap();
+                            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                        }))
+                    });
+                    capture_module_snapshot_with_memo(&path, Some(&worker_memo))
+                });
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+                let third = "pub fn run(input: map) -> string { \"end\"; }\n";
+                fs::write(f.entry(), third).unwrap();
+                let before = import_validation_counts();
+                let started = Instant::now();
+                let current = capture_module_snapshot_with_memo(&f.entry(), Some(&memo));
+                let elapsed = started.elapsed();
+                let _ = release_tx.send(());
+                let owned = worker.join();
+                assert!(entered.is_ok());
+                assert!(
+                    elapsed < Duration::from_secs(5),
+                    "other capture must finish before parser release"
+                );
+                assert_eq!(
+                    import_validation_counts().1 - before.1,
+                    1,
+                    "second concurrent miss parses independently"
+                );
+                assert_eq!(current.unwrap().entry_source().unwrap(), third);
+                assert_eq!(owned.unwrap().unwrap().entry_source().unwrap(), NEW);
+                assert_eq!(capture(&f, &memo).entry_source().unwrap(), third);
+            });
+        }
+    }
 
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::var_os("TEST_TMPDIR")

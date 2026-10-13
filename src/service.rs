@@ -895,6 +895,7 @@ struct AgentServiceInner {
     trusted_legacy_workspace_root: RwLock<Option<PathBuf>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
     runner: Mutex<Option<CachedAgentRunner>>,
+    import_validation_memo: crate::runtime::module_snapshot::ImportValidationMemo,
     /// Immutable bundled compaction program reused by persisted context refreshes.
     compaction_runner: Mutex<Option<AgentRunner>>,
     #[cfg(test)]
@@ -995,6 +996,7 @@ impl AgentService {
             workspace_runner_constructions: [AtomicUsize::new(0), AtomicUsize::new(0)],
             trusted_legacy_workspace_root: RwLock::new(None),
             runner: Mutex::new(None),
+            import_validation_memo: Default::default(),
             compaction_runner: Mutex::new(None),
             #[cfg(test)]
             compaction_runner_constructions: AtomicUsize::new(0),
@@ -2992,7 +2994,11 @@ impl AgentService {
                         {
                             hook();
                         }
-                        let live_a = crate::runtime::rss_runner::module_tree_digest(&entry)
+                        let live_a =
+                            crate::runtime::rss_runner::module_tree_digest_with_import_memo(
+                                &entry,
+                                &self.inner.import_validation_memo,
+                            )
                             .map_err(|error| error.to_string())?;
                         {
                             let cache = self
@@ -3020,7 +3026,11 @@ impl AgentService {
                             hook();
                         }
                         let compiled_b = runner.snapshot_digest().to_string();
-                        let live_c = crate::runtime::rss_runner::module_tree_digest(&entry)
+                        let live_c =
+                            crate::runtime::rss_runner::module_tree_digest_with_import_memo(
+                                &entry,
+                                &self.inner.import_validation_memo,
+                            )
                             .map_err(|error| error.to_string())?;
                         if live_c == compiled_b {
                             let mut cache = self
@@ -7632,6 +7642,192 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod import_validation_memo_tests {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+    use crate::runtime::module_snapshot::import_validation_counts;
+    use std::fs;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+                .join(format!("service-import-memo-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("main.rss"),
+                "pub fn run(input: map) -> string { \"old\"; }\n",
+            )
+            .unwrap();
+            Self(root)
+        }
+
+        fn entry(&self) -> PathBuf {
+            self.0.join("main.rss")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_current_file_lookup_reuses_import_validation_but_captures_again() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.install_agent_entry(fixture.entry());
+        service.cached_agent_runner(None).unwrap();
+        let before = import_validation_counts();
+        for _ in 0..3 {
+            service.cached_agent_runner(None).unwrap();
+        }
+        let after = import_validation_counts();
+        assert_eq!(after.0 - before.0, 3, "each lookup captures current files");
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "warm identical files need no additional full import parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_services_validate_independently_and_current_config_rebuilds() {
+        let fixture = Fixture::new();
+        let first_state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let second_state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let first = first_state.service();
+        let second = second_state.service();
+        first.install_agent_entry(fixture.entry());
+        second.install_agent_entry(fixture.entry());
+        first.cached_agent_runner(None).unwrap();
+        let before = import_validation_counts();
+        second.cached_agent_runner(None).unwrap();
+        assert!(
+            import_validation_counts().1 > before.1,
+            "another service has its own positive slot"
+        );
+        let mut different = first.effective_agent_config();
+        different.fuel = Some(different.fuel.unwrap_or(1_000_000).saturating_add(1));
+        first.install_agent_runner(AgentRunner::from_file(fixture.entry(), different).unwrap());
+        let before = import_validation_counts();
+        let rebuilt = first.cached_agent_runner(None).unwrap();
+        assert_eq!(rebuilt.config(), &first.effective_agent_config());
+        assert!(
+            import_validation_counts().0 - before.0 >= 3,
+            "live A, compile B and live C remain"
+        );
+        assert!(
+            import_validation_counts().1 > before.1,
+            "compile retains original non-memo capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_current_file_mutation_compiles_new_bytes() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.install_agent_entry(fixture.entry());
+        let old = service.cached_agent_runner(None).unwrap();
+        let mtime = fs::metadata(fixture.entry()).unwrap().modified().unwrap();
+        fs::write(
+            fixture.entry(),
+            "pub fn run(input: map) -> string { \"new\"; }\n",
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(fixture.entry())
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let current = service.cached_agent_runner(None).unwrap();
+        assert_ne!(old.snapshot_digest(), current.snapshot_digest());
+        assert_eq!(
+            current
+                .run_with_context(crate::domain::json_to_vm_value(&json!({})))
+                .unwrap(),
+            crate::domain::json_to_vm_value(&json!("new"))
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_postcheck_mutation_retries_then_rejects_continuous_changes() {
+        let fixture = Fixture::new();
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        service.install_agent_entry(fixture.entry());
+        service.cached_agent_runner(None).unwrap();
+        let path = fixture.entry();
+        let once = AtomicBool::new(false);
+        service.inject_agent_compile_postcheck_observer(Arc::new(move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                fs::write(&path, "pub fn run(input: map) -> string { \"end\"; }\n").unwrap();
+            }
+        }));
+        fs::write(
+            fixture.entry(),
+            "pub fn run(input: map) -> string { \"new\"; }\n",
+        )
+        .unwrap();
+        let current = service.cached_agent_runner(None).unwrap();
+        assert_eq!(
+            current
+                .run_with_context(crate::domain::json_to_vm_value(&json!({})))
+                .unwrap(),
+            crate::domain::json_to_vm_value(&json!("end"))
+        );
+        let path = fixture.entry();
+        service.inject_agent_compile_lookup_observer(Arc::new(move || {
+            fs::write(&path, "pub fn run(input: map) -> string { \"new\"; }\n").unwrap();
+        }));
+        let path = fixture.entry();
+        service.inject_agent_compile_postcheck_observer(Arc::new(move || {
+            fs::write(&path, "pub fn run(input: map) -> string { \"end\"; }\n").unwrap();
+        }));
+        let error = service.cached_agent_runner(None).err().unwrap();
+        assert_eq!(
+            error,
+            "RustScript compile error: module tree changed during compile"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_production_tree_miss_hit_lookup_phase_measurements() {
+        let state = AgentGatewayState::with_agent_file(
+            AgentGatewayConfig::default(),
+            crate::runtime::rss_runner::bundled_agent_main_path(),
+        )
+        .unwrap();
+        let service = state.service();
+        for label in ["miss", "hit"] {
+            let before = import_validation_counts();
+            let started = Instant::now();
+            service.cached_agent_runner(None).unwrap();
+            let lookup_ns = started.elapsed().as_nanos();
+            let after = import_validation_counts();
+            let (capture_ns, validation_ns, pure_validation_ns) =
+                crate::runtime::module_snapshot::import_validation_timings();
+            eprintln!(
+                "IMPORT_MEMO_PHASE label={label} capture_ns={capture_ns} validation_including_memo_ns={validation_ns} pure_validation_ns={pure_validation_ns} lookup_ns={lookup_ns} capture_count={} import_scan_count={}",
+                after.0 - before.0,
+                after.1 - before.1
+            );
+            assert_eq!(after.0 - before.0, 1);
+            if label == "hit" {
+                assert_eq!(after.1 - before.1, 0);
+            } else {
+                assert!(after.1 > before.1);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
