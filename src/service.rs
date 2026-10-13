@@ -25,6 +25,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -830,6 +832,9 @@ struct AuthHostFactoryPair {
     provider_child: Option<crate::runtime::agent_host::AuthHostFactory>,
 }
 
+#[cfg(test)]
+type CompactionPolicyObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct AgentServiceInner {
     config: Arc<AgentGatewayConfig>,
     compaction_settings: CompactionSettings,
@@ -865,6 +870,10 @@ struct AgentServiceInner {
     compaction_worker_panic: Mutex<Option<String>>,
     #[cfg(test)]
     compaction_maintenance_published: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    compaction_runner_lookup_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    compaction_policy_entered: Mutex<Option<CompactionPolicyObserver>>,
     /// Legacy and provider-child auth factories are one configuration
     /// snapshot so worker admission cannot observe an interleaved pair.
     auth_host_factories: Mutex<AuthHostFactoryPair>,
@@ -876,6 +885,10 @@ struct AgentServiceInner {
     trusted_legacy_workspace_root: RwLock<Option<PathBuf>>,
     /// Compiled agent source reused across workers so compile does not reset the deadline.
     runner: Mutex<Option<CachedAgentRunner>>,
+    /// Immutable bundled compaction program reused by persisted context refreshes.
+    compaction_runner: Mutex<Option<AgentRunner>>,
+    #[cfg(test)]
+    compaction_runner_constructions: AtomicUsize,
     /// Test seam: invoked after file-agent lookup digest and before compile.
     agent_compile_lookup_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test seam: invoked after file-agent compile and before postcheck digest.
@@ -961,10 +974,17 @@ impl AgentService {
             compaction_worker_panic: Mutex::new(None),
             #[cfg(test)]
             compaction_maintenance_published: Mutex::new(None),
+            #[cfg(test)]
+            compaction_runner_lookup_entered: Mutex::new(None),
+            #[cfg(test)]
+            compaction_policy_entered: Mutex::new(None),
             auth_host_factories: Mutex::new(AuthHostFactoryPair::default()),
             workspace_host_factory: Mutex::new(None),
             trusted_legacy_workspace_root: RwLock::new(None),
             runner: Mutex::new(None),
+            compaction_runner: Mutex::new(None),
+            #[cfg(test)]
+            compaction_runner_constructions: AtomicUsize::new(0),
             agent_compile_lookup_entered: Mutex::new(None),
             agent_compile_postcheck_entered: Mutex::new(None),
             uncooperative_dispatch: Mutex::new(None),
@@ -1200,15 +1220,17 @@ impl AgentService {
 
     /// Compiles or reuses the cached runner using current source + effective config.
     pub fn materialize_cached_runner(&self) -> Result<AgentConfig, String> {
-        Ok(self
-            .cached_agent_runner(
-                self.inner
-                    .agent_source
-                    .as_ref()
-                    .map(|source| source.as_str()),
-            )?
-            .config()
-            .clone())
+        let runner = self.cached_agent_runner(
+            self.inner
+                .agent_source
+                .as_ref()
+                .map(|source| source.as_str()),
+        )?;
+        if self.inner.persistence.is_some() {
+            self.cached_compaction_runner()
+                .map_err(|error| error.detail().to_string())?;
+        }
+        Ok(runner.config().clone())
     }
 
     /// Test failpoint: panic after a successful provider-step commit, before
@@ -1590,6 +1612,27 @@ impl AgentService {
         }))
     }
 
+    fn cached_compaction_runner(&self) -> Result<AgentRunner, CompactionFailure> {
+        let mut cache = self
+            .inner
+            .compaction_runner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(runner) = cache.as_ref() {
+            return Ok(runner.clone());
+        }
+        let runner = AgentRunner::from_bundled("rss/agent/compact.rss", AgentConfig::default())
+            .map_err(|error| {
+                CompactionFailure::host(format!("compile RSS compaction policy: {error}"))
+            })?;
+        #[cfg(test)]
+        self.inner
+            .compaction_runner_constructions
+            .fetch_add(1, Ordering::Relaxed);
+        *cache = Some(runner.clone());
+        Ok(runner)
+    }
+
     fn refresh_session_compaction(
         &self,
         session_id: &str,
@@ -1622,10 +1665,17 @@ impl AgentService {
             )));
         }
         let settings = self.inner.compaction_settings.clone();
-        let decision_runner =
-            AgentRunner::from_bundled("rss/agent/compact.rss", AgentConfig::default()).map_err(
-                |error| CompactionFailure::host(format!("compile RSS compaction policy: {error}")),
-            )?;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .inner
+            .compaction_runner_lookup_entered
+            .lock()
+            .expect("compaction runner lookup observer lock")
+            .clone()
+        {
+            hook();
+        }
+        let decision_runner = self.cached_compaction_runner()?;
         let policy_input = json!({
             "session_id": session_id,
             "run_id": run_id,
@@ -1642,6 +1692,20 @@ impl AgentService {
                 "token_estimate": 0,
             }
         });
+        #[cfg(test)]
+        {
+            // Observe only session identity at the real invocation boundary.
+            // Release the observer mutex before callbacks, including barriers.
+            let observer = self
+                .inner
+                .compaction_policy_entered
+                .lock()
+                .expect("compaction policy observer lock")
+                .clone();
+            if let Some(observer) = observer {
+                observer(session_id);
+            }
+        }
         let decision_value = decision_runner
             .run_with_context(json_to_vm_value(&policy_input))
             .map_err(|error| {
@@ -7508,7 +7572,9 @@ mod f3_session_maintenance_tests {
     use serde_json::{Value, json};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
     use tower::ServiceExt;
 
     struct MaintenanceBarrierRelease(Option<mpsc::Sender<()>>);
@@ -7524,6 +7590,25 @@ mod f3_session_maintenance_tests {
     impl Drop for MaintenanceBarrierRelease {
         fn drop(&mut self) {
             self.release();
+        }
+    }
+
+    struct CompactionTimingProvider {
+        inner: crate::runtime::agent_host::ScriptedProvider,
+        lookup_at: Arc<Mutex<Option<Instant>>>,
+        elapsed_us: Arc<Mutex<Option<u128>>>,
+        first_call: AtomicBool,
+    }
+
+    impl crate::AgentProviderHost for CompactionTimingProvider {
+        fn call(&self, request: &Value, cancellation: &crate::RunCancellation) -> Value {
+            if !self.first_call.swap(true, Ordering::SeqCst)
+                && let Some(lookup_at) = *self.lookup_at.lock().expect("lookup timestamp lock")
+            {
+                *self.elapsed_us.lock().expect("provider timestamp lock") =
+                    Some(lookup_at.elapsed().as_micros());
+            }
+            self.inner.call(request, cancellation)
         }
     }
 
@@ -7581,6 +7666,106 @@ mod f3_session_maintenance_tests {
                 }))
                 .expect("append private production history");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_worker_measures_compaction_lookup_to_first_provider() {
+        const SESSION_ID: &str = "compaction-cache-measure-session";
+
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let setup = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+            .expect("open private durable measurement fixture");
+        let persistence = setup.persistence().expect("private persistence");
+        seed_session(&persistence, SESSION_ID, 10);
+        drop(persistence);
+        drop(setup);
+
+        let state = AgentGatewayState::with_agent_file_and_sqlite(
+            AgentGatewayConfig::default(),
+            crate::runtime::rss_runner::bundled_agent_main_path(),
+            &db_path,
+        )
+        .expect("reload durable measurement fixture with production service");
+        let service = state.service();
+        let scripted = crate::runtime::agent_host::ScriptedProvider::new();
+        scripted.push_ok(json!({
+            "text": "measurement answer",
+            "tool_calls": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "reasoning": "",
+            "stop_reason": "stop"
+        }));
+        let lookup_at = Arc::new(Mutex::new(None));
+        let elapsed_us = Arc::new(Mutex::new(None));
+        *service
+            .inner
+            .compaction_runner_lookup_entered
+            .lock()
+            .expect("compaction runner lookup observer lock") = Some(Arc::new({
+            let lookup_at = Arc::clone(&lookup_at);
+            move || {
+                let mut started = lookup_at.lock().expect("lookup timestamp lock");
+                if started.is_none() {
+                    *started = Some(Instant::now());
+                }
+            }
+        }));
+        service.inject_provider_host(Arc::new(CompactionTimingProvider {
+            inner: scripted.clone(),
+            lookup_at: Arc::clone(&lookup_at),
+            elapsed_us: Arc::clone(&elapsed_us),
+            first_call: AtomicBool::new(false),
+        }));
+
+        let admitted = service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"measure durable compaction refresh"}),
+                session_id: Some(SESSION_ID.to_string()),
+                platform: "compaction-cache-measurement".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit durable measurement run");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            service
+                .clone()
+                .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+        )
+        .await
+        .expect("durable measurement worker should complete");
+
+        let measured_us = *elapsed_us.lock().expect("provider timestamp lock");
+        let constructions = service
+            .inner
+            .compaction_runner_constructions
+            .load(Ordering::Relaxed);
+        let provider_calls = scripted.call_count();
+        let completed = service
+            .run_events(&admitted.run_id)
+            .iter()
+            .any(|event| event["event"] == "run.completed");
+
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(root).expect("private durable measurement cleanup");
+        assert!(
+            measured_us.is_some(),
+            "first provider call must follow compaction lookup"
+        );
+        assert_eq!(
+            constructions, 1,
+            "one service should build one immutable Runner"
+        );
+        assert_eq!(provider_calls, 1, "one provider call is expected");
+        assert!(completed, "durable production worker should complete");
+        eprintln!(
+            "COMPACTION_CACHE_METRIC label=durable_lookup_to_first_provider elapsed_us={} runner_constructions={} provider_calls={} persisted_history_messages=40",
+            measured_us.expect("measured provider boundary"),
+            constructions,
+            provider_calls
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7850,6 +8035,751 @@ mod f3_session_maintenance_tests {
         drop(service);
         drop(state);
         fs::remove_dir_all(root).expect("private maintenance fixture cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_prepares_compaction_runner_only_for_persisted_services() {
+        let root = private_root();
+        let state = AgentGatewayState::with_sqlite_path(
+            AgentGatewayConfig::default(),
+            root.join("gateway.db"),
+        )
+        .expect("open private persisted preparation fixture");
+        let service = state.service();
+        service
+            .materialize_cached_runner()
+            .expect("materialize the existing bundled agent runner");
+        let persisted_constructions = service
+            .inner
+            .compaction_runner_constructions
+            .load(Ordering::Relaxed);
+        drop(service);
+        drop(state);
+        fs::remove_dir_all(&root).expect("private preparation fixture cleanup");
+        assert_eq!(
+            persisted_constructions, 1,
+            "persistence-enabled preparation should warm one compaction Runner"
+        );
+
+        let memory_state = AgentGatewayState::with_agent_file(
+            AgentGatewayConfig::default(),
+            crate::runtime::rss_runner::bundled_agent_main_path(),
+        )
+        .expect("open in-memory preparation service");
+        let memory_service = memory_state.service();
+        memory_service
+            .materialize_cached_runner()
+            .expect("materialize the in-memory agent runner");
+        assert_eq!(
+            memory_service
+                .inner
+                .compaction_runner_constructions
+                .load(Ordering::Relaxed),
+            0,
+            "in-memory preparation should not compile the unused compaction Runner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persisted_context_refreshes_reuse_one_compaction_runner() {
+        const SESSION_ID: &str = "compaction-cache-session";
+        const RUN_ID: &str = "compaction-cache-run";
+
+        let root = private_root();
+        let db_path = root.join("gateway.db");
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &db_path)
+            .expect("open private persisted compaction fixture");
+        let persistence = state.persistence().expect("private persistence");
+        seed_session(&persistence, SESSION_ID, 10);
+        let service = state.service();
+        service
+            .inner
+            .contexts
+            .lock()
+            .expect("contexts lock")
+            .insert(
+                RUN_ID.to_string(),
+                crate::domain::RunContext {
+                    run_id: RUN_ID.to_string(),
+                    session_id: SESSION_ID.to_string(),
+                    parent_run_id: None,
+                    platform: "compaction-cache-test".to_string(),
+                    input: json!({}),
+                    messages: json!([]),
+                    system_prompt: None,
+                    model: "test-model".to_string(),
+                    provider: Some("test-provider".to_string()),
+                    provider_options: json!({}),
+                    tool_schemas: json!([]),
+                    limits: json!({}),
+                    metadata: json!({}),
+                    coding_system_prompt: None,
+                },
+            );
+        let context = json!({ "session_id": SESSION_ID, "messages": [] });
+
+        let first =
+            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        assert_eq!(
+            first["ok"],
+            json!(true),
+            "first durable refresh must succeed"
+        );
+        assert_eq!(
+            first["messages"].as_array().expect("first messages").len(),
+            40
+        );
+
+        persistence
+            .message_append(&json!({
+                "id": format!("{SESSION_ID}-history-41"),
+                "session_id": SESSION_ID,
+                "role": "user",
+                "content_json": json!([{"type":"text", "text":"new durable fact"}]).to_string(),
+                "name": "",
+                "tool_call_id": "",
+                "parent_message_id": "",
+                "token_estimate": 1,
+                "metadata_json": "{}",
+                "run_id": "",
+                "finish_reason": "",
+                "now_ms": 51,
+            }))
+            .expect("append current durable history through persistence API");
+        let second =
+            service.refresh_provider_context(RUN_ID, &context, &super::RunCancellation::new());
+        assert_eq!(
+            second["ok"],
+            json!(true),
+            "second durable refresh must succeed"
+        );
+        assert_eq!(
+            second["messages"]
+                .as_array()
+                .expect("second messages")
+                .len(),
+            41,
+            "refresh must reload current persisted history"
+        );
+        let constructions = service
+            .inner
+            .compaction_runner_constructions
+            .load(Ordering::Relaxed);
+
+        drop(service);
+        drop(persistence);
+        drop(state);
+        fs::remove_dir_all(root).expect("private compaction fixture cleanup");
+        assert_eq!(
+            constructions, 1,
+            "one service should construct its fixed compaction Runner once"
+        );
+    }
+
+    // Coverage-only fixtures: real native storage and the unchanged bundled policy.
+    struct CacheCoverageRoot(PathBuf);
+
+    impl Drop for CacheCoverageRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct CacheCoverageFixture {
+        service: Arc<super::AgentService>,
+        _state: AgentGatewayState,
+        persistence: Arc<crate::gateway::store::GatewayPersistence>,
+        _root: CacheCoverageRoot,
+    }
+
+    fn coverage_summary(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        session: &str,
+        generation: i64,
+        ordinal: i64,
+        text: &str,
+    ) {
+        let run = format!("{session}-summary-run-{generation}");
+        let id = format!("{session}-summary-{generation}");
+        let now = super::timestamp() as i64 + generation;
+        persistence
+            .run_create(&json!({
+                "id":run, "session_id":session, "parent_run_id":"", "input_json":"{}",
+                "provider":"test-provider", "model":"test-model", "script_hash":"",
+                "idempotency_scope":"", "idempotency_key":"", "now_ms":now
+            }))
+            .expect("create native summary run");
+        for (from, to) in [("queued", "running"), ("running", "compacting")] {
+            persistence
+                .run_transition(&json!({
+                    "run_id":run, "from_status":from, "to_status":to,
+                    "error_code":"", "error_message":"", "recovery_reason":"", "now_ms":now
+                }))
+                .expect("transition native summary run");
+        }
+        persistence
+            .compaction_start(&json!({
+                "id":id, "session_id":session, "run_id":run, "generation":generation,
+                "source_start_ordinal":ordinal, "source_end_ordinal":ordinal,
+                "retained_tail_ordinal":ordinal, "summary_json":json!({"text":text}).to_string(),
+                "token_estimate":1, "model":"test-model", "now_ms":now
+            }))
+            .expect("start native summary transaction");
+        persistence
+            .compaction_commit(&json!({
+                "id":id, "session_id":session, "start_ordinal":ordinal, "end_ordinal":ordinal,
+                "generation":generation, "completed_at_ms":now
+            }))
+            .expect("commit native summary transaction");
+        persistence
+            .run_transition(&json!({
+                "run_id":run, "from_status":"compacting", "to_status":"completed",
+                "error_code":"", "error_message":"", "recovery_reason":"", "now_ms":now
+            }))
+            .expect("complete native summary run");
+        assert_eq!(
+            super::load_durable_compaction_snapshot(persistence, session)
+                .expect("read committed summary")
+                .0,
+            generation
+        );
+    }
+
+    fn coverage_fixture() -> CacheCoverageFixture {
+        let root = CacheCoverageRoot(private_root());
+        let path = root.0.join("gateway.db");
+        let setup = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+            .expect("open coverage fixture");
+        let persistence = setup.persistence().expect("native fixture persistence");
+        seed_session(&persistence, "cache-coverage-a", 10);
+        seed_session(&persistence, "cache-coverage-b", 100);
+        coverage_summary(
+            &persistence,
+            "cache-coverage-a",
+            2,
+            1,
+            "alpha summary generation two",
+        );
+        coverage_summary(
+            &persistence,
+            "cache-coverage-b",
+            2,
+            1,
+            "beta summary generation two",
+        );
+        coverage_summary(
+            &persistence,
+            "cache-coverage-b",
+            3,
+            2,
+            "beta summary generation three",
+        );
+        drop(persistence);
+        drop(setup);
+        let state = AgentGatewayState::with_sqlite_path(AgentGatewayConfig::default(), &path)
+            .expect("reload native coverage fixture");
+        let service = state.service();
+        let persistence = state.persistence().expect("reloaded persistence");
+        service
+            .materialize_cached_runner()
+            .expect("warm real preparation path");
+        assert_eq!(
+            service
+                .inner
+                .compaction_runner_constructions
+                .load(Ordering::Relaxed),
+            1
+        );
+        CacheCoverageFixture {
+            service,
+            _state: state,
+            persistence,
+            _root: root,
+        }
+    }
+
+    fn coverage_expected(session: &str, summary: &str, start: i64) -> Value {
+        let mut messages =
+            vec![json!({"role":"user", "content":[{"type":"text", "text":summary}]})];
+        for ordinal in start..=40 {
+            messages.push(json!({
+                "id":format!("{session}-history-{ordinal}"), "session_id":session,
+                "ordinal":ordinal, "role":if ordinal % 2 == 0 { "assistant" } else { "user" },
+                "content":[{"type":"text", "text":format!("{session} fact {ordinal}")}],
+                "compacted":0
+            }));
+        }
+        json!(messages)
+    }
+
+    fn coverage_refresh(service: &super::AgentService, session: &str) -> Value {
+        service
+            .refresh_session_compaction(
+                session,
+                "coverage-skip-run",
+                "test-model",
+                false,
+                &crate::RunCancellation::new(),
+            )
+            .expect("real RSS coverage refresh")
+    }
+
+    fn coverage_count(service: &super::AgentService) {
+        assert_eq!(
+            service
+                .inner
+                .compaction_runner_constructions
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_keeps_two_durable_snapshots_current_and_isolated() {
+        let f = coverage_fixture();
+        let a = coverage_refresh(&f.service, "cache-coverage-a");
+        let b = coverage_refresh(&f.service, "cache-coverage-b");
+        assert_eq!(
+            a,
+            coverage_expected("cache-coverage-a", "alpha summary generation two", 2)
+        );
+        assert_eq!(
+            b,
+            coverage_expected("cache-coverage-b", "beta summary generation three", 3)
+        );
+        coverage_summary(
+            &f.persistence,
+            "cache-coverage-a",
+            3,
+            2,
+            "alpha replacement generation three",
+        );
+        let changed_a = coverage_refresh(&f.service, "cache-coverage-a");
+        assert_eq!(
+            changed_a,
+            coverage_expected("cache-coverage-a", "alpha replacement generation three", 3)
+        );
+        assert_ne!(changed_a, a);
+        assert_eq!(coverage_refresh(&f.service, "cache-coverage-b"), b);
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            3
+        );
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-b")
+                .unwrap()
+                .0,
+            3
+        );
+        coverage_count(&f.service);
+    }
+
+    // All test-owned threads are joined on success and unwind; the first barrier
+    // is released before joining. Its own receive is bounded even if setup fails.
+    struct CoverageThreads {
+        release: Option<mpsc::Sender<()>>,
+        threads: Vec<std::thread::JoinHandle<Value>>,
+    }
+
+    impl Drop for CoverageThreads {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_allows_overlapping_real_policy_contexts() {
+        let f = coverage_fixture();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = Some(Arc::new({
+            let invocations = Arc::clone(&invocations);
+            move |session| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                if session == "cache-coverage-a" {
+                    entered_tx.send(()).expect("publish first policy boundary");
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("bounded policy release");
+                }
+            }
+        }));
+        let mut owned = CoverageThreads {
+            release: Some(release_tx),
+            threads: Vec::new(),
+        };
+        owned.threads.push(std::thread::spawn({
+            let service = Arc::clone(&f.service);
+            move || coverage_refresh(&service, "cache-coverage-a")
+        }));
+        let first_entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let (done_tx, done_rx) = mpsc::channel();
+        if first_entered.is_ok() {
+            owned.threads.push(std::thread::spawn({
+                let service = Arc::clone(&f.service);
+                move || {
+                    let result = coverage_refresh(&service, "cache-coverage-b");
+                    let _ = done_tx.send(());
+                    result
+                }
+            }));
+        }
+        let second_completed_while_first_paused = done_rx.recv_timeout(Duration::from_secs(5));
+        if let Some(release) = owned.release.take() {
+            let _ = release.send(());
+        }
+        let joined = owned
+            .threads
+            .drain(..)
+            .map(|thread| thread.join())
+            .collect::<Vec<_>>();
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = None;
+        assert!(
+            first_entered.is_ok(),
+            "first invocation must reach the policy boundary"
+        );
+        assert!(
+            second_completed_while_first_paused.is_ok(),
+            "other cache acquisition and actual RSS evaluation must complete before first release"
+        );
+        assert_eq!(joined.len(), 2);
+        let mut outputs = joined
+            .into_iter()
+            .map(|result| result.expect("owned policy thread joined"));
+        assert_eq!(
+            outputs.next().unwrap(),
+            coverage_expected("cache-coverage-a", "alpha summary generation two", 2)
+        );
+        assert_eq!(
+            outputs.next().unwrap(),
+            coverage_expected("cache-coverage-b", "beta summary generation three", 3)
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        coverage_count(&f.service);
+    }
+
+    fn coverage_event_count(
+        persistence: &crate::gateway::store::GatewayPersistence,
+        run: &str,
+        name: &str,
+    ) -> usize {
+        let page = persistence
+            .event_replay(
+                &json!({"run_id":run, "after_seq":0, "max_events":256, "max_bytes":65536}),
+            )
+            .expect("read actual durable event boundary");
+        let columns = page["columns"].as_array().expect("durable event columns");
+        let event_type = columns
+            .iter()
+            .position(|value| value == "event_type")
+            .expect("event type column");
+        page["rows"]
+            .as_array()
+            .expect("durable events")
+            .iter()
+            .filter(|row| row[event_type] == name)
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_failures_cancel_deadline_reload_without_request_effects() {
+        let f = coverage_fixture();
+        use crate::AgentProviderHost;
+        let admitted = f
+            .service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"coverage failure"}),
+                session_id: Some("cache-coverage-a".to_string()),
+                platform: "cache-coverage".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit real failure context");
+        let raw = crate::runtime::agent_host::ScriptedProvider::new();
+        let host = crate::durable_provider::DurableProviderHost::new(
+            super::AgentService::clone(f.service.as_ref()),
+            admitted.run_id.clone(),
+            Arc::new(raw.clone()),
+            Arc::clone(&f.service.inner.metrics),
+        );
+        let context = json!({"session_id":"cache-coverage-a", "messages":[]});
+        assert_eq!(
+            host.refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        coverage_count(&f.service);
+        f.service
+            .inject_compaction_policy_failure("CACHE_COVERAGE_POLICY_FAILURE");
+        let policy = host
+            .refresh_context(&context, &crate::RunCancellation::new())
+            .unwrap();
+        assert_eq!(policy["ok"], false);
+        assert_eq!(policy["error"]["code"], "context_refresh_failed");
+        let cancelled = crate::RunCancellation::new();
+        cancelled.request(super::CancellationReason::Requested);
+        let expired = crate::RunCancellation::with_deadline(Instant::now());
+        for cancellation in [&cancelled, &expired] {
+            let failure = host.refresh_context(&context, cancellation).unwrap();
+            assert_eq!(failure["ok"], false);
+            assert_eq!(failure["error"]["code"], "cancelled");
+        }
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        // Exercise the production main RSS refresh -> control -> provider path,
+        // not only the provider bridge. Await the owned worker to completion;
+        // no diagnostic timeout drops a worker future.
+        f.service.inject_provider_host(Arc::new(raw.clone()));
+        f.service
+            .inject_compaction_policy_failure("CACHE_COVERAGE_WORKER_FAILURE");
+        Arc::clone(&f.service)
+            .run_worker(admitted.run_id.clone(), "ignored".to_string())
+            .await;
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "run.failed"),
+            1
+        );
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        coverage_summary(
+            &f.persistence,
+            "cache-coverage-a",
+            3,
+            2,
+            "alpha after failure generation three",
+        );
+        let current = host
+            .refresh_context(&context, &crate::RunCancellation::new())
+            .unwrap();
+        assert_eq!(current["ok"], true);
+        assert_eq!(
+            current["messages"][0],
+            json!({"role":"user", "content":[{"type":"text", "text":"alpha after failure generation three"}]})
+        );
+        assert_eq!(
+            current["messages"][1]["content"],
+            json!([{"type":"text", "text":"cache-coverage-a fact 3"}])
+        );
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            3
+        );
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        coverage_count(&f.service);
+        f.service
+            .finish_failed(
+                &admitted.run_id,
+                json!({"error":"coverage fixture completed"}),
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_rejects_real_native_generation_conflict_then_refreshes() {
+        let f = coverage_fixture();
+        assert_eq!(
+            coverage_refresh(&f.service, "cache-coverage-a"),
+            coverage_expected("cache-coverage-a", "alpha summary generation two", 2)
+        );
+        let once = Arc::new(AtomicBool::new(false));
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = Some(Arc::new({
+            let persistence = Arc::clone(&f.persistence);
+            move |session| {
+                if session == "cache-coverage-a" && !once.swap(true, Ordering::SeqCst) {
+                    // Snapshot was loaded at generation 2. A real competing native
+                    // transaction commits generation 3 before the RSS plan executes.
+                    coverage_summary(
+                        &persistence,
+                        session,
+                        3,
+                        2,
+                        "alpha competing generation three",
+                    );
+                }
+            }
+        }));
+        let stale = f.service.compact_session_explicit("cache-coverage-a");
+        *f.service.inner.compaction_policy_entered.lock().unwrap() = None;
+        let stale = stale.expect_err("stale generation plan must fail closed");
+        assert_eq!(stale.code, "compaction_failed");
+        assert!(
+            stale
+                .diagnostic_detail()
+                .contains("compaction_already_committed"),
+            "native typed conflict must propagate"
+        );
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            3
+        );
+        assert_eq!(
+            coverage_refresh(&f.service, "cache-coverage-a"),
+            coverage_expected("cache-coverage-a", "alpha competing generation three", 3)
+        );
+        let valid = f
+            .service
+            .compact_session_explicit("cache-coverage-a")
+            .expect("fresh generation plan commits");
+        assert_eq!(valid["generation"], 4);
+        assert_eq!(valid["status"], "committed");
+        assert_eq!(
+            super::load_durable_compaction_snapshot(&f.persistence, "cache-coverage-a")
+                .unwrap()
+                .0,
+            4
+        );
+        coverage_count(&f.service);
+    }
+
+    struct CoverageOrderedProvider {
+        persistence: Arc<crate::gateway::store::GatewayPersistence>,
+        run: String,
+        inner: crate::runtime::agent_host::ScriptedProvider,
+        committed_entries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::AgentProviderHost for CoverageOrderedProvider {
+        fn call(&self, request: &Value, cancellation: &crate::RunCancellation) -> Value {
+            assert_eq!(
+                coverage_event_count(&self.persistence, &self.run, "model.requested"),
+                1,
+                "raw provider entry requires the durable request commit"
+            );
+            self.committed_entries.fetch_add(1, Ordering::SeqCst);
+            self.inner.call(request, cancellation)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warmed_cache_durable_request_commit_precedes_raw_call_and_replay() {
+        use crate::AgentProviderHost;
+        let f = coverage_fixture();
+        let admitted = f
+            .service
+            .admit(AdmitRunRequest {
+                input: json!({"prompt":"coverage durable ordering"}),
+                session_id: Some("cache-coverage-a".to_string()),
+                platform: "cache-coverage".to_string(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .expect("admit actual durable provider run");
+        let raw = crate::runtime::agent_host::ScriptedProvider::new();
+        raw.push_ok(json!({"text":"coverage answer", "tool_calls":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}, "reasoning":"", "stop_reason":"stop"}));
+        let committed_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ordered: Arc<dyn crate::AgentProviderHost> = Arc::new(CoverageOrderedProvider {
+            persistence: Arc::clone(&f.persistence),
+            run: admitted.run_id.clone(),
+            inner: raw.clone(),
+            committed_entries: Arc::clone(&committed_entries),
+        });
+        let make_host = || {
+            crate::durable_provider::DurableProviderHost::new(
+                super::AgentService::clone(f.service.as_ref()),
+                admitted.run_id.clone(),
+                Arc::clone(&ordered),
+                Arc::clone(&f.service.inner.metrics),
+            )
+        };
+        let host = make_host();
+        let context = json!({"session_id":"cache-coverage-a", "messages":[]});
+        assert_eq!(
+            host.refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        coverage_count(&f.service);
+        let request = json!({"model":"test-model", "provider":"test-provider"});
+        f.persistence.inject_fail_model_requested_append();
+        let failed = host.call(&request, &crate::RunCancellation::new());
+        assert_eq!(failed["error"]["code"], "provider_step_persist_failed");
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(committed_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            0
+        );
+        f.service.inject_crash_after_provider_request();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.call(&request, &crate::RunCancellation::new())
+        }));
+        assert!(crash.is_err());
+        assert_eq!(raw.call_count(), 0);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            1
+        );
+        let redrive = make_host();
+        assert_eq!(
+            redrive
+                .refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        let success = redrive.call(&request, &crate::RunCancellation::new());
+        assert_eq!(success["ok"], true);
+        assert_eq!(raw.call_count(), 1);
+        assert_eq!(committed_entries.load(Ordering::SeqCst), 1);
+        let replay = make_host();
+        assert_eq!(
+            replay
+                .refresh_context(&context, &crate::RunCancellation::new())
+                .unwrap()["ok"],
+            true
+        );
+        let replayed = replay.call(&request, &crate::RunCancellation::new());
+        assert_eq!(replayed, success);
+        assert_eq!(raw.call_count(), 1);
+        assert_eq!(committed_entries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.requested"),
+            1
+        );
+        assert_eq!(
+            coverage_event_count(&f.persistence, &admitted.run_id, "model.completed"),
+            1
+        );
+        assert_eq!(
+            f.service
+                .session_messages("cache-coverage-a")
+                .iter()
+                .filter(|message| message["content"]
+                    == json!([{"type":"text", "text":"coverage answer"}]))
+                .count(),
+            1
+        );
+        coverage_count(&f.service);
+        f.service
+            .finish_failed(
+                &admitted.run_id,
+                json!({"error":"coverage fixture completed"}),
+            )
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
