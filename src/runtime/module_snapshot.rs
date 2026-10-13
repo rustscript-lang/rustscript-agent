@@ -120,34 +120,63 @@ fn snapshot_parser_prelude() -> &'static str {
 
 type ImportValidationFiles = Vec<(String, Vec<u8>)>;
 
-/// One service's last positive input for the fixed snapshot parser dialect/options.
-/// This stores no filesystem authority, entry identity, digest, or failures.
+struct SuccessfulSnapshotMetadata {
+    files: Arc<ImportValidationFiles>,
+    entry_rel: String,
+    identity: String,
+}
+
+/// One service's last successful owned input and its existing snapshot identity.
+/// Current filesystem authority and failed or partial results are never retained.
 #[derive(Default)]
 pub(crate) struct ImportValidationMemo {
-    last_success: Mutex<Option<Arc<ImportValidationFiles>>>,
+    last_success: Mutex<Option<Arc<SuccessfulSnapshotMetadata>>>,
 }
 
 impl ImportValidationMemo {
-    fn validate(&self, root: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+    fn snapshot_identity(
+        &self,
+        root: &Path,
+        files: &[(String, Vec<u8>)],
+        entry_rel: &str,
+    ) -> Result<String> {
         let previous = self
             .last_success
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if previous.as_ref().is_some_and(|old| old.as_slice() == files) {
-            return Ok(());
+        let same_files = previous
+            .as_ref()
+            .filter(|old| old.files.as_slice() == files);
+        if let Some(old) = same_files
+            && old.entry_rel == entry_rel
+        {
+            return Ok(old.identity.clone());
         }
-        // Parsing and allocation are outside the slot lock. Concurrent misses
-        // can independently validate their own immutable current capture.
-        assert_imports_stay_in_root(root, files)?;
-        let successful = Arc::new(files.to_vec());
+        // Import validity depends on the file vector, independently of entry.
+        // Identity reuse additionally requires the exact current relative entry.
+        if same_files.is_none() {
+            assert_imports_stay_in_root(root, files)?;
+        }
+        #[cfg(test)]
+        SNAPSHOT_METADATA_PRODUCTIONS.with(|count| count.set(count.get() + 1));
+        let identity = owned_memory_snapshot_digest(files, entry_rel);
+        let successful = Arc::new(SuccessfulSnapshotMetadata {
+            files: same_files.map_or_else(|| Arc::new(files.to_vec()), |old| old.files.clone()),
+            entry_rel: entry_rel.to_owned(),
+            identity: identity.clone(),
+        });
+        #[cfg(test)]
+        SNAPSHOT_PUBLICATION_PANIC.with(|flag| {
+            assert!(!flag.replace(false), "snapshot publication panic injection");
+        });
         let replaced = self
             .last_success
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .replace(successful);
         drop(replaced);
-        Ok(())
+        Ok(identity)
     }
 }
 
@@ -239,6 +268,8 @@ impl Drop for MaterializedSnapshot {
 
 #[cfg(test)]
 thread_local! {
+    static SNAPSHOT_METADATA_PRODUCTIONS: Cell<usize> = const { Cell::new(0) };
+    static SNAPSHOT_PUBLICATION_PANIC: Cell<bool> = const { Cell::new(false) };
     static PURE_VALIDATION_NS: Cell<u128> = const { Cell::new(0) };
     static CAPTURE_NS: Cell<u128> = const { Cell::new(0) };
     static VALIDATION_NS: Cell<u128> = const { Cell::new(0) };
@@ -362,13 +393,17 @@ fn capture_module_snapshot_with_memo(
     let validation_started = std::time::Instant::now();
     #[cfg(test)]
     PURE_VALIDATION_NS.with(|value| value.set(0));
-    match memo {
-        Some(memo) => memo.validate(&root, &files)?,
-        None => assert_imports_stay_in_root(&root, &files)?,
-    }
+    let digest = match memo {
+        Some(memo) => memo.snapshot_identity(&root, &files, &entry_rel)?,
+        None => {
+            assert_imports_stay_in_root(&root, &files)?;
+            #[cfg(test)]
+            SNAPSHOT_METADATA_PRODUCTIONS.with(|count| count.set(count.get() + 1));
+            owned_memory_snapshot_digest(&files, &entry_rel)
+        }
+    };
     #[cfg(test)]
     VALIDATION_NS.with(|value| value.set(validation_started.elapsed().as_nanos()));
-    let digest = owned_memory_snapshot_digest(&files, &entry_rel);
     Ok(ModuleSnapshot {
         files,
         entry_rel,
@@ -1341,7 +1376,113 @@ mod tests {
             capture_module_snapshot_with_memo(&f.entry(), Some(memo)).unwrap()
         }
         fn retained(memo: &ImportValidationMemo) -> Arc<Vec<(String, Vec<u8>)>> {
-            memo.last_success.lock().unwrap().as_ref().unwrap().clone()
+            memo.last_success
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .files
+                .clone()
+        }
+
+        #[test]
+        fn unchanged_capture_reuses_metadata_but_recaptures_current_files() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            let capture_before = import_validation_counts().0;
+            let production_before = SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get);
+            let first = capture(&f, &memo);
+            let second = capture(&f, &memo);
+            assert_eq!(first.entry_source().unwrap(), OLD);
+            assert_eq!(second.entry_source().unwrap(), OLD);
+            assert_eq!(import_validation_counts().0 - capture_before, 2);
+            assert_eq!(
+                SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get) - production_before,
+                1,
+                "identical owned input must reuse successful snapshot metadata"
+            );
+        }
+
+        #[test]
+        fn same_files_different_entry_recomputes_identity_without_reimport_scan() {
+            let f = Fixture::new();
+            fs::write(f.0.join("other.rss"), OLD).unwrap();
+            let memo = ImportValidationMemo::default();
+            let main = capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).unwrap();
+            assert_eq!(main.entry_rel(), "main.rss");
+            let production_before = SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get);
+            let scan_before = import_validation_counts().1;
+            let other =
+                capture_module_snapshot_with_memo(&f.0.join("other.rss"), Some(&memo)).unwrap();
+            assert_eq!(other.entry_rel(), "other.rss");
+            assert_eq!(other.entry_source().unwrap(), OLD);
+            assert_ne!(
+                other.digest(),
+                main.digest(),
+                "identity must stay bound to the current entry"
+            );
+            assert_eq!(
+                SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get) - production_before,
+                1,
+                "entry switch with identical files must recompute identity"
+            );
+            assert_eq!(
+                import_validation_counts().1,
+                scan_before,
+                "pure import success may reuse exact identical files across entries"
+            );
+            let production_before = SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get);
+            let scan_before = import_validation_counts().1;
+            let repeated =
+                capture_module_snapshot_with_memo(&f.0.join("other.rss"), Some(&memo)).unwrap();
+            assert_eq!(repeated.digest(), other.digest());
+            assert_eq!(
+                SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get),
+                production_before,
+                "unchanged entry must hit the one-slot record"
+            );
+            assert_eq!(import_validation_counts().1, scan_before);
+            let production_before = SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get);
+            let scan_before = import_validation_counts().1;
+            let back = capture_module_snapshot_with_memo(&f.entry(), Some(&memo)).unwrap();
+            assert_eq!(back.digest(), main.digest());
+            assert_eq!(
+                SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get) - production_before,
+                1,
+                "one-slot switch-back recomputes, no per-entry map"
+            );
+            assert_eq!(import_validation_counts().1, scan_before);
+        }
+
+        #[test]
+        fn panic_before_publication_preserves_only_completed_success() {
+            let f = Fixture::new();
+            let memo = ImportValidationMemo::default();
+            SNAPSHOT_PUBLICATION_PANIC.with(|flag| flag.set(true));
+            let cold = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_module_snapshot_with_memo(&f.entry(), Some(&memo))
+            }));
+            assert!(cold.is_err());
+            assert!(memo.last_success.lock().unwrap().is_none());
+            assert_eq!(capture(&f, &memo).entry_source().unwrap(), OLD);
+            let previous = memo.last_success.lock().unwrap().as_ref().unwrap().clone();
+            fs::write(f.entry(), NEW).unwrap();
+            SNAPSHOT_PUBLICATION_PANIC.with(|flag| flag.set(true));
+            let warm = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_module_snapshot_with_memo(&f.entry(), Some(&memo))
+            }));
+            assert!(warm.is_err());
+            assert!(Arc::ptr_eq(
+                &previous,
+                memo.last_success.lock().unwrap().as_ref().unwrap()
+            ));
+            let before = SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get);
+            assert_eq!(capture(&f, &memo).entry_source().unwrap(), NEW);
+            assert_eq!(SNAPSHOT_METADATA_PRODUCTIONS.with(Cell::get) - before, 1);
+            assert!(!Arc::ptr_eq(
+                &previous,
+                memo.last_success.lock().unwrap().as_ref().unwrap()
+            ));
         }
 
         #[test]
