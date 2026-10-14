@@ -791,3 +791,202 @@ fn docs_example_selection_runs_through_the_real_rss_source_selection() {
     );
     assert_eq!(text(field(&empty_override, "error")), "provider_required");
 }
+
+/// Runs the real `rss/agent/source_policy.rss` `run` entry with the given
+/// selection-fact context. The policy performs no host calls, so the proven
+/// pure-RSS pattern (fresh VM, module root driven to halt, exported callable
+/// invoked) is sufficient.
+fn run_agent_source_policy(context: Vec<(Value, Value)>) -> Value {
+    let source = read_relative("rss/agent/source_policy.rss");
+    let catalog = rustscript_agent::auth::host::auth_host_catalog();
+    let options = CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+    let program =
+        compile_source_with_flavor_and_options(source.as_str(), SourceFlavor::RustScript, options)
+            .expect("rss/agent/source_policy.rss must compile against the auth host catalog")
+            .program;
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .install_named_struct_schemas(catalog_named_struct_schemas(catalog.as_ref()))
+        .expect("install catalog named-struct schemas");
+    let mut vm = Vm::try_new(program).expect("fresh VM for the agent source policy");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("bind source-policy VM registry");
+    assert_eq!(
+        vm.run().expect("run source-policy module root"),
+        VmStatus::Halted
+    );
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("source-policy module must export run");
+    vm.set_fuel(5_000_000);
+    let mut invocation = vm
+        .start_invocation(callable, vec![Value::map(context)])
+        .expect("start source-policy invocation");
+    loop {
+        match invocation.poll_next().expect("poll invocation") {
+            InvocationPoll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+            InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(value)))) => return value,
+            InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) => {
+                panic!("source policy emitted an unexpected event: {value:?}")
+            }
+            InvocationPoll::Ready(Some(Err(error))) => {
+                panic!("source-policy invocation failed: {error:?}")
+            }
+            InvocationPoll::Ready(None) => panic!("source-policy stream ended early"),
+        }
+    }
+}
+
+#[test]
+fn gateway_source_and_home_docs_match_config_load_and_rss_priority() {
+    // The gateway binary loads `config.yaml` from the resolved agent home and
+    // forwards the loaded facts; RSS owns the priority, never Rust.
+    let gateway = read_relative("src/bin/rustscript-agent-gateway.rs");
+    for required in [
+        "ConfigFile::load(paths.config_path())",
+        "\"config_present\"",
+        "\"config_source\"",
+        "with_operator_auth_home(home.clone())",
+        "if explicit_home",
+        "state.with_workspace_home(home)",
+    ] {
+        assert!(
+            gateway.contains(required),
+            "gateway binary must retain the config-load/selection wiring `{required}`"
+        );
+    }
+    // The owning RSS policy resolves a present config to its validated source
+    // (fail closed, no env fallback) and a missing config to legacy facts.
+    let policy = read_relative("rss/agent/source_policy.rss");
+    for required in ["select_config_source", "select_legacy_facts"] {
+        assert!(
+            policy.contains(required),
+            "source policy must own the config/legacy selection entry `{required}`"
+        );
+    }
+    fn fact(key: &str, value: Value) -> (Value, Value) {
+        (Value::string(key), value)
+    }
+    // A present valid config source is authoritative over legacy env facts.
+    let authoritative = run_agent_source_policy(vec![
+        fact("config_present", Value::Bool(true)),
+        fact("config_source", Value::string("file:/srv/agent.rss")),
+        fact("source", Value::string("file:/legacy/agent.rss")),
+    ]);
+    assert_eq!(
+        field(&authoritative, "ok"),
+        &Value::Bool(true),
+        "{authoritative:?}"
+    );
+    assert_eq!(
+        text(field(&authoritative, "source")),
+        "file:/srv/agent.rss",
+        "{authoritative:?}"
+    );
+    assert_eq!(
+        field(&authoritative, "deprecated_override"),
+        &Value::Bool(false),
+        "{authoritative:?}"
+    );
+    // A present but invalid config source fails closed: no legacy fallback.
+    let fail_closed = run_agent_source_policy(vec![
+        fact("config_present", Value::Bool(true)),
+        fact("config_source", Value::string("bogus-token")),
+        fact("source", Value::string("file:/legacy/agent.rss")),
+    ]);
+    assert_eq!(
+        field(&fail_closed, "ok"),
+        &Value::Bool(false),
+        "{fail_closed:?}"
+    );
+    // A missing config falls back to the source env fact ...
+    let legacy = run_agent_source_policy(vec![
+        fact("config_present", Value::Bool(false)),
+        fact("source", Value::string("file:/legacy/agent.rss")),
+    ]);
+    assert_eq!(field(&legacy, "ok"), &Value::Bool(true), "{legacy:?}");
+    assert_eq!(
+        text(field(&legacy, "source")),
+        "file:/legacy/agent.rss",
+        "{legacy:?}"
+    );
+    // ... then the deprecated legacy script fact (with the override marker)
+    // ... then the bundled coding entry.
+    let script = run_agent_source_policy(vec![
+        fact("config_present", Value::Bool(false)),
+        fact("legacy_script", Value::string("/legacy/agent.rss")),
+    ]);
+    assert_eq!(field(&script, "ok"), &Value::Bool(true), "{script:?}");
+    assert_eq!(
+        text(field(&script, "source")),
+        "file:/legacy/agent.rss",
+        "{script:?}"
+    );
+    assert_eq!(
+        field(&script, "deprecated_override"),
+        &Value::Bool(true),
+        "{script:?}"
+    );
+    let bundled = run_agent_source_policy(vec![fact("config_present", Value::Bool(false))]);
+    assert_eq!(field(&bundled, "ok"), &Value::Bool(true), "{bundled:?}");
+    assert_eq!(
+        text(field(&bundled, "source")),
+        "bundled:coding",
+        "{bundled:?}"
+    );
+
+    // Both docs must state the config-load/RSS-priority facts and the
+    // operator-always / workspace-explicit home wiring ...
+    for (path, document) in [
+        ("docs/deployment.md", read_relative("docs/deployment.md")),
+        (
+            "docs/configuration.md",
+            read_relative("docs/configuration.md"),
+        ),
+    ] {
+        for required in [
+            "config_present",
+            "config_source",
+            "fails closed",
+            "operator auth home",
+            "explicitly set",
+        ] {
+            assert!(
+                document.contains(required),
+                "{path} must document the current gateway source/home contract (`{required}`)"
+            );
+        }
+        // ... and must not retain the stale config-ignored clauses.
+        for stale in [
+            "does not choose the gateway entry",
+            "not from `agent.source`",
+        ] {
+            assert!(
+                !document.contains(stale),
+                "{path} must not claim the gateway ignores config.yaml agent.source ({stale:?})"
+            );
+        }
+    }
+
+    // The shipped sample is the same document the gateway binary loads from
+    // the resolved home (`config.agent.source` bootstrap and `compaction`
+    // settings), not a loader-only fixture: its header must say so and must
+    // not claim the packaged gateway is configured through env instead.
+    let sample = read_relative("docs/examples/config.yaml");
+    for required in ["config.agent.source", "compaction", "gateway binary loads"] {
+        assert!(
+            sample.contains(required),
+            "docs/examples/config.yaml header must describe the gateway bootstrap contract (`{required}`)"
+        );
+    }
+    for stale in [
+        "configured through\n# environment variables instead",
+        "rather than a gateway setting",
+    ] {
+        assert!(
+            !sample.contains(stale),
+            "docs/examples/config.yaml must not claim the gateway ignores the sample ({stale:?})"
+        );
+    }
+}

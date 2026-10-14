@@ -58,9 +58,17 @@ binaries.
 ## 3. Starting the gateway
 
 The gateway is configured by environment variables (see
-`docs/configuration.md`). `RUSTSCRIPT_AGENT_HOME`, when set, supplies the
-workspace host's home; it does not choose the gateway entry from
-`config.yaml`'s `agent.source`. `RUSTSCRIPT_AGENT_STATE_DB` remains the separate
+`docs/configuration.md`). The gateway binary loads `ConfigFile` from the
+resolved agent home (`ConfigFile::load(paths.config_path())`) and forwards
+`config_present` plus the loaded `config_source` (`config.agent.source`) to
+the RSS source policy `rss/agent/source_policy.rss`, which owns every
+decision: a present config is authoritative, and a present-but-invalid config
+source fails closed with no env fallback; a missing config falls back to
+`RUSTSCRIPT_AGENT_SOURCE`, then the deprecated `RUSTSCRIPT_AGENT_SCRIPT`,
+then the bundled coding entry. The resolved home is also the provider
+operator auth home, attached unconditionally, and the workspace host's home
+only when `RUSTSCRIPT_AGENT_HOME` is explicitly set.
+`RUSTSCRIPT_AGENT_STATE_DB` remains the separate
 SQLite state-file selector. Minimal production-style start:
 
 ```bash

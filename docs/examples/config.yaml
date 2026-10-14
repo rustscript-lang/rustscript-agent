@@ -2,10 +2,12 @@
 #
 # This is a documentation sample decoded by the bounded `ConfigFile` loader
 # (`src/config_file.rs`) and by the real RSS source-selection entry
-# (`rss/config/selection.rss`). It is the same document the library/bootstrap
-# config path consumes; the packaged gateway binary is configured through
-# environment variables instead (see ../configuration.md), so this file is a
-# loader sample rather than a gateway setting.
+# (`rss/config/selection.rss`). It is the same document the gateway binary loads
+# from the resolved agent home: `config.agent.source` bootstraps the RSS agent
+# source decision (authoritative when present; a missing config falls back to
+# `RUSTSCRIPT_AGENT_SOURCE`, then legacy script, then bundled) and `compaction`
+# supplies the gateway compaction settings, alongside the environment-variable
+# process settings (see ../configuration.md).
 #
 # The companion auth.yaml is intentionally empty: the provider below carries
 # no `auth:` credential reference, so the loader's reference-integrity check

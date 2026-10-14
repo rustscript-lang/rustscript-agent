@@ -18,7 +18,7 @@ fails the test suite.
 | Source | Owns | Read by |
 | --- | --- | --- |
 | Gateway environment variables (`RUSTSCRIPT_AGENT_*`, except the separately listed home override) | gateway process settings | `rustscript-agent-gateway` binary (`src/bin/rustscript-agent-gateway.rs`) |
-| Agent home (`RUSTSCRIPT_AGENT_HOME`) | library config/auth path resolver and optional gateway workspace host | library path resolver and gateway workspace-host setup |
+| Agent home (`RUSTSCRIPT_AGENT_HOME`) | library config/auth path resolver, always-attached gateway provider operator auth home, and optional gateway workspace host (only when explicitly set) | library path resolver and gateway home wiring |
 | CLI arguments (`--script`, `--allow-host`) | one run | `rustscript-agent` binary (`src/bin/rustscript-agent.rs`) |
 | Native `AgentGatewayConfig` fields | embedding code | library API; the gateway binary maps a fixed subset from environment variables |
 
@@ -53,12 +53,16 @@ by the bounded loaders) ships under [docs/examples/](examples/).
 ### Agent home (library bootstrap and gateway workspace host)
 
 `RUSTSCRIPT_AGENT_HOME` selects the complete agent home. The gateway reads it
-and, when set, passes the path to `with_workspace_home` to configure its
-workspace host; the host resolves `config.yaml`, `auth.yaml`, and
-`auth.yaml.lock` below that home. This setting does not select the gateway's
-agent entry: the gateway currently selects its source from `RUSTSCRIPT_AGENT_SOURCE`
-or the deprecated `RUSTSCRIPT_AGENT_SCRIPT`, not from `agent.source` in
-`config.yaml`.
+and, when explicitly set, passes the path to `with_workspace_home` to
+configure its workspace host; the resolved home is always attached as the
+provider operator auth home. The host resolves `config.yaml`, `auth.yaml`, and
+`auth.yaml.lock` below that home. The gateway binary loads `ConfigFile` from
+the resolved home and forwards `config_present` plus the loaded
+`config_source` (`config.agent.source`) to the RSS source policy, which owns
+every decision: a present config is authoritative, and a present-but-invalid
+config source fails closed with no env fallback; a missing config falls back
+to `RUSTSCRIPT_AGENT_SOURCE`, then the deprecated `RUSTSCRIPT_AGENT_SCRIPT`,
+then the bundled coding entry.
 
 The gateway rejects a blank value. When the workspace host resolves the home,
 `AgentPaths` requires a non-empty absolute path with no parent-directory
@@ -86,8 +90,8 @@ do not rely on them.
 | `RUSTSCRIPT_AGENT_ALLOW_SCHEMES` | `PD_EDGE_AGENT_ALLOW_SCHEMES` | comma-separated list | `https,wss` | Replaces the default scheme set when set. |
 | `RUSTSCRIPT_AGENT_ALLOW_PORTS` | `PD_EDGE_AGENT_ALLOW_PORTS` | comma-separated list of `u16` | empty (deny all) | When set it must contain at least one valid port and no empty entries; otherwise startup fails. Empty list denies all ports — with the default configuration no request can be made, so production deployments must list the ports scripts may reach (for example `443`). |
 | `RUSTSCRIPT_AGENT_ALLOW_PRIVATE_IPS` | `PD_EDGE_AGENT_ALLOW_PRIVATE_IPS` | flag | unset (`false`) | Only the exact value `1` allows destinations on private/loopback IP ranges. |
-| `RUSTSCRIPT_AGENT_SOURCE` | `PD_EDGE_AGENT_SOURCE` | string token | unset (bundled coding default) | **Authoritative** RSS agent-source selection, read by `rustscript-agent-gateway`. The bundled RSS policy `rss/agent/source_policy.rss` owns every decision: `bundled:coding` selects the immutable bundled coding entry, and a `file:` prefix with an **absolute** path selects that entry file (a relative `file:` path is rejected). A present-but-invalid or unsupported token is a static startup failure (`invalid_agent_source` / `unsupported_agent_source`) with no bundled or legacy fallback, and it fails before the listener binds. Values are never trimmed, normalized, or reparsed in Rust — non-UTF-8 bytes are admitted to the policy as a present non-string so the policy classifies them. |
-| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path (legacy) | unset | **Deprecated** legacy entry-file path, read only when `RUSTSCRIPT_AGENT_SOURCE` is unset. A bare absolute path migrates to a `file:` source and raises the migration indicator (published as `deprecated_override` on `/health/detailed`); it is not a source string. When neither variable is set, the RSS policy selects the bundled coding entry. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
+| `RUSTSCRIPT_AGENT_SOURCE` | `PD_EDGE_AGENT_SOURCE` | string token | unset (bundled coding default) | **Authoritative** RSS agent-source selection when `config.yaml` is absent, read by `rustscript-agent-gateway`. A present config is authoritative instead, including fail-closed rejection of an invalid config source. The bundled RSS policy `rss/agent/source_policy.rss` owns every decision: `bundled:coding` selects the immutable bundled coding entry, and a `file:` prefix with an **absolute** path selects that entry file (a relative `file:` path is rejected). A present-but-invalid or unsupported token is a static startup failure (`invalid_agent_source` / `unsupported_agent_source`) with no bundled or legacy fallback, and it fails before the listener binds. Values are never trimmed, normalized, or reparsed in Rust — non-UTF-8 bytes are admitted to the policy as a present non-string so the policy classifies them. |
+| `RUSTSCRIPT_AGENT_SCRIPT` | `PD_EDGE_AGENT_SCRIPT` | filesystem path (legacy) | unset | **Deprecated** legacy entry-file path, read only when `config.yaml` is absent and `RUSTSCRIPT_AGENT_SOURCE` is unset. A bare absolute path migrates to a `file:` source and raises the migration indicator (published as `deprecated_override` on `/health/detailed`); it is not a source string. When config is absent and neither variable is set, the RSS policy selects the bundled coding entry. Trees over 1 MiB per file (`MAX_AGENT_SOURCE_BYTES`) or that fail to compile reject startup. |
 | `RUSTSCRIPT_AGENT_STATE_DB` | `PD_EDGE_AGENT_STATE_DB` | filesystem path | unset (in-memory) | SQLite state file (sessions, messages, runs, events, jobs, approvals, compactions). Without it the gateway runs in-memory only and state is lost on restart. See `docs/deployment.md`. |
 | Rate limiting (A7) |
 | `RUSTSCRIPT_AGENT_RATE_LIMIT_ENABLED` | `PD_EDGE_AGENT_RATE_LIMIT_ENABLED` | flag | `0` (disabled) | Only the exact values `0`/`1` are accepted; anything else fails startup. When enabled, every API request consumes one per-peer-IP token and verified requests additionally consume one per-account token. |
@@ -178,6 +182,7 @@ above; every other field is set by embedding code.
 | `telegram` | `Option<TelegramConfig>` | `None` (disabled) | When present, the gateway starts the Telegram poller alongside the API server on the same service/store. Validated by `TelegramConfig::validate` (non-blank token, bare-origin https api_base, positive bounds, allowlists may stay empty — deny-by-default). See the `RUSTSCRIPT_AGENT_TELEGRAM_*` variables and `docs/deployment.md`. |
 | `http` | `HttpConfig` | core defaults (below) | Validated by the core (`HttpConfig::validate`). |
 | `sqlite` | `SqlitePolicy` | core defaults, `max_statements = 1024` | — |
+| `approvals` | `ApprovalSettings` | `read = "allow"`, `write = "ask"`, `process = "ask"`; reviewer/model/fallback/required overrides unset (`None`) | Validated by `ApprovalSettings::validate`: `reviewer` must be `guardian` or `user` when set; `reviewer_model` must be non-empty, at most 128 characters, with no control characters or surrounding whitespace; `read = "ask"` is unsupported. |
 | `fuel` | `Option<u64>` | `Some(10_000_000)` | VM fuel budget; `None` disables the fuel cap. |
 
 `RateLimitConfig` bounds: `enabled` (master switch), `ip_burst`, `account_burst`,
