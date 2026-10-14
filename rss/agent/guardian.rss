@@ -565,7 +565,11 @@ pub fn review(context: map, action: map) -> map {
             result = empty_result(false, map_string(error, "code", "cancelled"), "Guardian review was interrupted; no action was executed");
             done = true;
         } else {
-            let request: map = reviewer_request(context, action, user_input, system_prompt, coding_prompt);
+            let mut request: map = reviewer_request(context, action, user_input, system_prompt, coding_prompt);
+            let step_key: string = map_string(action, "_provider_step_key", "");
+            if step_key != "" {
+                request["_provider_step_key"] = step_key + ":" + json::encode(attempt);
+            }
             let envelope: map = agent::provider_call(request);
             let after: map = agent::control_check();
             if map_bool(after, "ok", false) == false {

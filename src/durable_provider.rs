@@ -311,7 +311,33 @@ impl AgentProviderHost for DurableProviderHost {
     }
 
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
-        let turn = self.turn.load(Ordering::SeqCst);
+        let positional = self.turn.load(Ordering::SeqCst);
+        let key = match request.get("_provider_step_key") {
+            None => None,
+            Some(JsonValue::String(key))
+                if !key.is_empty() && key.len() <= 512 && !key.chars().any(char::is_control) =>
+            {
+                Some(key.as_str())
+            }
+            Some(_) => {
+                return typed_fail(
+                    "provider_step_identity_invalid",
+                    "provider step identity is invalid",
+                );
+            }
+        };
+        let turn = if let Some(key) = key {
+            match self
+                .service
+                .provider_turn_for_step(&self.run_id, key, positional, request)
+            {
+                Ok(turn) => turn,
+                Err(error) => return Self::map_commit_error(error),
+            }
+        } else {
+            positional
+        };
+        self.turn.store(turn, Ordering::SeqCst);
         match self.replay_completed(turn) {
             Ok(Some(envelope)) => {
                 self.advance_turn();
@@ -360,7 +386,19 @@ impl AgentProviderHost for DurableProviderHost {
             panic!("provider_request_crash");
         }
 
-        let envelope = self.inner.call(request, cancellation);
+        // The private replay address never reaches the provider transport.
+        let mut transport_request;
+        let inner_request = if key.is_some() {
+            transport_request = request.clone();
+            transport_request
+                .as_object_mut()
+                .expect("scoped request object")
+                .remove("_provider_step_key");
+            &transport_request
+        } else {
+            request
+        };
+        let envelope = self.inner.call(inner_request, cancellation);
         if envelope.get("ok").and_then(JsonValue::as_bool) != Some(true) {
             if let Err(error) = self.persist_classified_failure(turn, attempt, &envelope) {
                 return Self::map_commit_error(error);
@@ -930,6 +968,147 @@ mod tests {
             Arc::new(inner),
             state.service().metrics(),
         )
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_keeps_review_and_business_steps_distinct() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("first business"));
+        inner.push_ok(text_ok("review assessment"));
+        inner.push_ok(text_ok("final business"));
+        let host = host_for(&state, &run_id, inner.clone());
+        let cancel = RunCancellation::new();
+        let mut first = request();
+        first["_provider_step_key"] = json!("business:0");
+        let mut review = request();
+        review["_provider_step_key"] = json!("nested:call:1");
+        assert_eq!(
+            host.call(&first, &cancel)["response"]["text"],
+            "first business"
+        );
+        assert_eq!(
+            host.call(&review, &cancel)["response"]["text"],
+            "review assessment"
+        );
+        let resumed = host_for(&state, &run_id, inner.clone());
+        assert_eq!(
+            resumed.call(&first, &cancel)["response"]["text"],
+            "first business"
+        );
+        let mut next = request();
+        next["_provider_step_key"] = json!("business:1");
+        assert_eq!(
+            resumed.call(&next, &cancel)["response"]["text"],
+            "final business"
+        );
+        assert_eq!(inner.call_count(), 3);
+        assert!(
+            inner
+                .requests()
+                .iter()
+                .all(|r| r.get("_provider_step_key").is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_rejects_changed_request_and_malformed_identity() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("recorded"));
+        let host = host_for(&state, &run_id, inner.clone());
+        let cancel = RunCancellation::new();
+        for invalid in [
+            json!(""),
+            json!("x".repeat(513)),
+            json!("x\n"),
+            json!({"value":"x"}),
+        ] {
+            let mut value = request();
+            value["_provider_step_key"] = invalid;
+            let failed = host.call(&value, &cancel);
+            assert_eq!(failed["error"]["code"], "provider_step_identity_invalid");
+        }
+        assert_eq!(inner.call_count(), 0);
+        let mut original = request();
+        original["_provider_step_key"] = json!("business:0");
+        assert_eq!(host.call(&original, &cancel)["ok"], true);
+        let mut changed = original.clone();
+        changed["model"] = json!("different-model");
+        let resumed = host_for(&state, &run_id, inner.clone());
+        assert_eq!(
+            resumed.call(&changed, &cancel)["error"]["code"],
+            "corrupt_provider_step"
+        );
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_refuses_ambiguous_legacy_completed_response() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("legacy"));
+        let cancel = RunCancellation::new();
+        assert_eq!(
+            host_for(&state, &run_id, inner.clone()).call(&request(), &cancel)["ok"],
+            true
+        );
+        let mut scoped = request();
+        scoped["_provider_step_key"] = json!("business:0");
+        assert_eq!(
+            host_for(&state, &run_id, inner.clone()).call(&scoped, &cancel)["error"]["code"],
+            "corrupt_provider_step"
+        );
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_does_not_reissue_a_pruned_completed_step() {
+        let mut config = AgentGatewayConfig::default();
+        config.max_events_per_run = 4;
+        let state = AgentGatewayState::new(config).expect("in-memory gateway");
+        let admitted = state
+            .service()
+            .admit(AdmitRunRequest {
+                input: json!({"text":"retention"}),
+                platform: "durable_provider_tests".into(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .unwrap();
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("first"));
+        inner.push_ok(text_ok("second"));
+        let host = host_for(&state, &admitted.run_id, inner.clone());
+        let cancel = RunCancellation::new();
+        let mut first = request();
+        first["_provider_step_key"] = json!("business:0");
+        let mut second = request();
+        second["_provider_step_key"] = json!("business:1");
+        assert_eq!(host.call(&first, &cancel)["ok"], true);
+        assert_eq!(host.call(&second, &cancel)["ok"], true);
+        state
+            .service()
+            .persist_run_event(
+                &admitted.run_id,
+                "retention-marker",
+                "model.audit",
+                json!({"turn":2}),
+            )
+            .unwrap();
+        let events = state.service().run_events(&admitted.run_id);
+        assert!(events.first().unwrap()["seq"].as_u64().unwrap() > 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["data"].get("step_key") == Some(&json!("business:0")))
+        );
+        let resumed = host_for(&state, &admitted.run_id, inner.clone());
+        assert_eq!(
+            resumed.call(&first, &cancel)["error"]["code"],
+            "corrupt_provider_step"
+        );
+        assert_eq!(inner.call_count(), 2);
     }
 
     fn tool_event_count(state: &AgentGatewayState, run_id: &str) -> usize {

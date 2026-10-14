@@ -2353,6 +2353,17 @@ impl AgentService {
             "request_fingerprint": crate::durable_provider::canonical_provider_request_fingerprint(request),
             "retry_safe": request_is_idempotent,
         });
+        if let Some(value) = request.get("_provider_step_key") {
+            let key = value
+                .as_str()
+                .filter(|key| {
+                    !key.is_empty() && key.len() <= 512 && !key.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    EventCommitError::Corrupt("provider step identity is invalid".into())
+                })?;
+            payload["step_key"] = json!(key);
+        }
         if let JsonValue::Object(map) = &mut payload {
             for key in SECRET_PROVIDER_REQUEST_KEYS {
                 map.remove(*key);
@@ -2480,6 +2491,91 @@ impl AgentService {
             "retryable": false,
         });
         self.persist_provider_event(run_id, &event_id, "model.failed", payload)
+    }
+
+    /// Locate a caller-owned logical provider step without interpreting policy.
+    /// Legacy pending boundaries retain their interruption checks; completed
+    /// legacy steps cannot be selected as a different scoped request.
+    pub(crate) fn provider_turn_for_step(
+        &self,
+        run_id: &str,
+        key: &str,
+        positional: u64,
+        request: &JsonValue,
+    ) -> Result<u64, EventCommitError> {
+        let store = self.inner.store.read();
+        let run = store.runs.get(run_id).ok_or(EventCommitError::Terminal)?;
+        let mut found = None;
+        let mut max_turn = 0;
+        for event in &run.events {
+            if event.event.starts_with("model.") {
+                max_turn = max_turn.max(
+                    event
+                        .data
+                        .get("turn")
+                        .and_then(JsonValue::as_u64)
+                        .unwrap_or(0),
+                );
+            }
+            if event.event == "model.requested" {
+                let turn = event
+                    .data
+                    .get("turn")
+                    .and_then(JsonValue::as_u64)
+                    .ok_or_else(|| EventCommitError::Corrupt("provider turn is missing".into()))?;
+                match event.data.get("step_key") {
+                    Some(JsonValue::String(stored)) if stored == key => {
+                        let current =
+                            crate::durable_provider::canonical_provider_request_fingerprint(
+                                request,
+                            );
+                        if event
+                            .data
+                            .get("request_fingerprint")
+                            .and_then(JsonValue::as_str)
+                            != Some(current.as_str())
+                        {
+                            return Err(EventCommitError::Corrupt(
+                                "provider step request identity changed".into(),
+                            ));
+                        }
+                        if found.replace(turn).is_some() {
+                            return Err(EventCommitError::Corrupt(
+                                "provider step identity is duplicated".into(),
+                            ));
+                        }
+                    }
+                    None if turn == positional => {
+                        if run.events.iter().any(|item| {
+                            item.event_id
+                                == durable_provider_event_id(run_id, turn, "model.completed")
+                        }) {
+                            return Err(EventCommitError::Corrupt(
+                                "legacy completed step has no caller identity".into(),
+                            ));
+                        }
+                        return Ok(turn);
+                    }
+                    Some(JsonValue::String(_)) | None => {}
+                    _ => {
+                        return Err(EventCommitError::Corrupt(
+                            "provider step identity is invalid".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(turn) = found {
+            return Ok(turn);
+        }
+        if positional <= max_turn && run.events.first().is_some_and(|event| event.seq > 1) {
+            return Err(EventCommitError::Corrupt(
+                "provider replay identity was pruned".into(),
+            ));
+        }
+        max_turn
+            .checked_add(1)
+            .ok_or_else(|| EventCommitError::Corrupt("provider turn overflow".into()))
     }
 
     pub(crate) fn has_provider_request(&self, run_id: &str, turn: u64) -> bool {
@@ -3212,6 +3308,30 @@ impl AgentService {
         })?;
         let cancel = RunCancellation::from_wall_deadline_ms(deadline_at_ms, timestamp());
         let prompt = context.coding_system_prompt.clone().unwrap_or_default();
+        // A persisted limits path is never a grant. Re-open only an originally
+        // admitted trusted binding through the current RSS workspace policy.
+        let workspace_authority = context
+            .metadata
+            .get("admitted_workspace_binding")
+            .and_then(|value| serde_json::from_value::<WorkspaceBinding>(value.clone()).ok())
+            .and_then(|binding| {
+                if status != "started" || cancel.requested().is_some() || cancel.deadline_passed() {
+                    return None;
+                }
+                let (current, authority) = self
+                    .resolve_workspace_admission(
+                        Some(binding.selector.as_str()),
+                        Some(&binding),
+                        &cancel,
+                        false,
+                    )
+                    .ok()?;
+                let current = current?;
+                if serde_json::to_value(&current).ok()? != serde_json::to_value(&binding).ok()? {
+                    return None;
+                }
+                authority
+            });
         let handle = Arc::new(RunHandle {
             tool_cancel: cancel.token(),
             cancel,
@@ -3227,20 +3347,23 @@ impl AgentService {
             started_at: Instant::now(),
             capability_host: Mutex::new(CapabilityHostPhase::Empty),
             capability_host_cv: Condvar::new(),
-            workspace_authority: None,
+            workspace_authority,
             legacy_workspace_root: None,
             coding_system_prompt: Arc::from(prompt),
             occupancy: AtomicBool::new(false),
         });
-        self.inner
-            .runs
-            .lock()
-            .expect("runs lock")
-            .insert(run_id.to_string(), Arc::clone(&handle));
+        let registered = Arc::clone(
+            self.inner
+                .runs
+                .lock()
+                .expect("runs lock")
+                .entry(run_id.to_string())
+                .or_insert_with(|| Arc::clone(&handle)),
+        );
         if status == "stopping" {
-            handle.request_user_stop();
+            registered.request_user_stop();
         }
-        Some(handle)
+        Some(registered)
     }
 
     /// Shared in-memory artifact capability for an initialized run, if any.
@@ -4327,8 +4450,12 @@ impl AgentService {
                 .admission_rejected(AdmitRejectReason::Invalid);
             AdmitError::Invalid(error.to_string())
         })?;
-        let context =
+        let mut context =
             self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
+        if let Some(binding) = workspace_binding.as_ref() {
+            context.metadata["admitted_workspace_binding"] = serde_json::to_value(binding)
+                .map_err(|error| AdmitError::Invalid(error.to_string()))?;
+        }
         let persisted_input = persisted_run_context_json(&context)?;
         let provider = effective_provider.clone().unwrap_or_default();
         let idempotency_key = request.idempotency_key.clone().unwrap_or_default();

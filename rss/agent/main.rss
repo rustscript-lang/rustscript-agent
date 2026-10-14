@@ -525,7 +525,9 @@ fn decide_approval(context: map, action: map, approval_id: string) -> map {
         if reviewer != "guardian" {
             result = { ok: false, code: "reviewer_invalid", message: "configured approval reviewer is invalid; no action was executed" };
         } else {
-            let assessment: map = guardian::review(context, action);
+            let mut review_action: map = action;
+            review_action["_provider_step_key"] = "review:" + approval_id;
+            let assessment: map = guardian::review(context, review_action);
             if ctx_string(assessment, "code", "") == "guardian_context_insufficient"
                 && allow_user_fallback
                 && ctx_bool(settings, "required", true) == false
@@ -782,7 +784,8 @@ fn run_serial_loop(context: map) -> map {
             messages = ctx_array(refreshed, "messages");
             let mut events: array = [];
             events[events.length] = { type: "model.started", turn: turn, model: model };
-            let request: map = build_llm_request(context, messages);
+            let mut request: map = build_llm_request(context, messages);
+            request["_provider_step_key"] = "business:" + json::encode(turn);
             let provider_result: map = agent::provider_call(request);
             let after: map = agent::control_check();
             if ctx_bool(after, "ok", false) == false {
