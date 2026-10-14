@@ -8257,17 +8257,8 @@ mod workspace_template_tests {
         let releases = [Mutex::new(release1_rx), Mutex::new(release2_rx)];
         let call = AtomicUsize::new(0);
         let home = fixture.home.clone();
-        let inner = Arc::downgrade(&service.inner);
         service.set_workspace_host_factory(Arc::new(move |root| {
             let index = call.fetch_add(1, Ordering::SeqCst);
-            assert!(
-                inner
-                    .upgrade()
-                    .unwrap()
-                    .workspace_runners
-                    .try_lock()
-                    .is_ok()
-            );
             entered_tx.send(index).unwrap();
             releases[index]
                 .lock()
@@ -8285,6 +8276,23 @@ mod workspace_template_tests {
             .collect();
         let entered1 = entered_rx.recv_timeout(Duration::from_secs(5));
         let entered2 = entered_rx.recv_timeout(Duration::from_secs(5));
+        // Both factories are now held past cache lookup. A callback-local
+        // try_lock could race another lookup or even the other test probe.
+        let (cache_available, owned_lock_control) = if entered1.is_ok() && entered2.is_ok() {
+            match service.inner.workspace_runners.try_lock() {
+                Ok(guard) => {
+                    let rejected = matches!(
+                        service.inner.workspace_runners.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    );
+                    drop(guard);
+                    (true, rejected)
+                }
+                Err(_) => (false, false),
+            }
+        } else {
+            (false, false)
+        };
         // Always release and join both owned workers before any assertion.
         let _ = release1_tx.send(());
         let _ = release2_tx.send(());
@@ -8292,6 +8300,14 @@ mod workspace_template_tests {
         assert!(
             entered1.is_ok() && entered2.is_ok(),
             "both native factories must enter before release"
+        );
+        assert!(
+            cache_available,
+            "initialization lock must be free while both factories are held"
+        );
+        assert!(
+            owned_lock_control,
+            "an actually owned cache lock must reject the probe"
         );
         let mut owners = Vec::new();
         for outcome in outcomes {
