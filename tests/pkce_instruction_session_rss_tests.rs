@@ -10,6 +10,9 @@
 //! captured authorization URL and writes the callback URL to the owned private
 //! descriptor; no guest-supplied URL is ever injected.
 
+#[path = "support/owned_fd_observer.rs"]
+mod owned_fd_observer;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -693,11 +696,27 @@ fn close_session_family(vm: &mut Vm, session: &Value) {
 }
 
 #[test]
+fn fd_observer_rejects_retained_owner_and_reused_integer() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "fd_observer_rejects_retained_owner_and_reused_integer",
+    ) {
+        return;
+    }
+    owned_fd_observer::retained_and_reused_control(assert_fd_closed);
+}
+
+#[test]
 fn manual_mode_real_runner_enqueues_before_finish_and_closes_family() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "manual_mode_real_runner_enqueues_before_finish_and_closes_family",
+    ) {
+        return;
+    }
     let runner = runner_bundle();
     let home = TempHome::new("runner-manual");
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(raw_fd);
     let (sender, receiver) = authorization_instruction_channel();
     let server = serve_queue(receiver, Some(writer), 1);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
@@ -711,6 +730,8 @@ fn manual_mode_real_runner_enqueues_before_finish_and_closes_family() {
         &cancellation,
     )
     .expect("closed runner executes the real instruction session");
+    let fd_observation =
+        owned_fd_observer::observe_closed(raw_fd, input_identity, assert_fd_closed);
     assert_eq!(
         field(&result, "ok"),
         Value::Bool(true),
@@ -726,16 +747,22 @@ fn manual_mode_real_runner_enqueues_before_finish_and_closes_family() {
     );
     assert!(!format!("{result:?}").contains(CALLBACK_CODE));
     assert!(!format!("{observed:?}").contains(CALLBACK_CODE));
-    assert_fd_closed(raw_fd);
+    fd_observation.assert();
     assert!(!cancellation.watcher_is_armed());
 }
 
 #[test]
 fn none_mode_real_runner_enqueues_before_finish_and_closes_family() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "none_mode_real_runner_enqueues_before_finish_and_closes_family",
+    ) {
+        return;
+    }
     let runner = runner_bundle();
     let home = TempHome::new("runner-none");
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(raw_fd);
     let (sender, receiver) = authorization_instruction_channel();
     let server = serve_queue(receiver, Some(writer), 1);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
@@ -749,20 +776,28 @@ fn none_mode_real_runner_enqueues_before_finish_and_closes_family() {
         &cancellation,
     )
     .expect("closed runner executes the real instruction session");
+    let fd_observation =
+        owned_fd_observer::observe_closed(raw_fd, input_identity, assert_fd_closed);
     assert_eq!(field(&result, "ok"), Value::Bool(true));
     assert_eq!(field(&result, "status"), Value::string("success"));
     assert_eq!(server.join().expect("native queue observer").len(), 1);
-    assert_fd_closed(raw_fd);
+    fd_observation.assert();
     assert!(!cancellation.watcher_is_armed());
 }
 
 #[test]
 fn browser_transport_failure_single_manual_fallback_succeeds_and_delivers() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "browser_transport_failure_single_manual_fallback_succeeds_and_delivers",
+    ) {
+        return;
+    }
     let runner = runner_bundle();
     let home = TempHome::new("runner-fallback");
     let (browser, launcher_pids, attempted_urls) = failing_native_browser(&home);
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(raw_fd);
     let (sender, receiver) = authorization_instruction_channel();
     let server = serve_queue(receiver, Some(writer), 1);
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
@@ -776,6 +811,8 @@ fn browser_transport_failure_single_manual_fallback_succeeds_and_delivers() {
         &cancellation,
     )
     .expect("closed runner executes the real instruction session");
+    let fd_observation =
+        owned_fd_observer::observe_closed(raw_fd, input_identity, assert_fd_closed);
     assert_eq!(field(&result, "ok"), Value::Bool(true));
     assert_eq!(field(&result, "status"), Value::string("success"));
     let observed = server.join().expect("native queue observer");
@@ -806,15 +843,21 @@ fn browser_transport_failure_single_manual_fallback_succeeds_and_delivers() {
         })
         .expect("private failed-browser redirect");
     assert_port_released(&failed_redirect);
-    assert_fd_closed(raw_fd);
+    fd_observation.assert();
     assert!(!cancellation.watcher_is_armed());
 }
 
 #[test]
 fn manual_success_reports_manual_mode_and_opaque_capability() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "manual_success_reports_manual_mode_and_opaque_capability",
+    ) {
+        return;
+    }
     let home = TempHome::new("inspect-manual");
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(raw_fd);
     let (sender, receiver) = authorization_instruction_channel();
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
     let mut vm = inspect_vm();
@@ -834,6 +877,8 @@ fn manual_success_reports_manual_mode_and_opaque_capability() {
         &[policy.clone(), public_intent("manual"), Value::Bool(false)],
     )
     .expect("same-invocation instruction session");
+    let fd_observation =
+        owned_fd_observer::observe_closed(raw_fd, input_identity, assert_fd_closed);
 
     assert_eq!(
         field(&session, "ok"),
@@ -872,14 +917,20 @@ fn manual_success_reports_manual_mode_and_opaque_capability() {
     close_session_family(&mut vm, &session);
     assert_eq!(vm.host_context().resource_count(), 2);
     assert_port_released(&string_field(&begin, "redirect_uri"));
-    assert_fd_closed(raw_fd);
+    fd_observation.assert();
 }
 
 #[test]
 fn browser_fallback_reports_manual_mode_with_one_enqueue() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "browser_fallback_reports_manual_mode_with_one_enqueue",
+    ) {
+        return;
+    }
     let home = TempHome::new("inspect-fallback");
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(raw_fd);
     let (sender, receiver) = authorization_instruction_channel();
     let cancellation = RunCancellation::with_timeout(Duration::from_secs(10));
     let mut vm = inspect_vm();
@@ -899,6 +950,8 @@ fn browser_fallback_reports_manual_mode_with_one_enqueue() {
         &[policy, public_intent("browser"), Value::Bool(true)],
     )
     .expect("same-invocation instruction session");
+    let fd_observation =
+        owned_fd_observer::observe_closed(raw_fd, input_identity, assert_fd_closed);
 
     assert_eq!(field(&session, "ok"), Value::Bool(true));
     assert_eq!(field(&session, "selected_mode"), Value::string("manual"));
@@ -906,7 +959,7 @@ fn browser_fallback_reports_manual_mode_with_one_enqueue() {
     assert_eq!(server.join().expect("native queue observer").len(), 1);
     close_session_family(&mut vm, &session);
     assert_eq!(vm.host_context().resource_count(), 2);
-    assert_fd_closed(raw_fd);
+    fd_observation.assert();
 }
 
 #[test]

@@ -1,4 +1,7 @@
 #![cfg(unix)]
+#[path = "support/owned_fd_observer.rs"]
+mod owned_fd_observer;
+
 use rustscript_agent::cli::execute_auth_cli;
 use rustscript_agent::{
     CancellationReason, RunCancellation,
@@ -160,6 +163,16 @@ fn result_ok(value: &Value) -> bool {
     fields.iter().any(|(key, value)| {
         matches!(key, Value::String(name) if name.as_ref() == "ok") && value == &Value::Bool(true)
     })
+}
+
+#[test]
+fn fd_observer_rejects_retained_owner_and_reused_integer() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "fd_observer_rejects_retained_owner_and_reused_integer",
+    ) {
+        return;
+    }
+    owned_fd_observer::retained_and_reused_control(assert_fd_closed);
 }
 
 #[test]
@@ -540,10 +553,16 @@ const VALID_TOKEN_RESPONSE: &str = r#"{"access_token":"SYNTHETIC_ACCESS_SECRET",
 
 #[test]
 fn production_entry_falls_back_to_native_manual_fd_after_browser_failure() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "production_entry_falls_back_to_native_manual_fd_after_browser_failure",
+    ) {
+        return;
+    }
     let runner = production_runner();
     let home = IsolatedHome::configured_pkce();
     let (reader, writer) = pipe_pair();
     let reader_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(reader_fd);
     let attempted_redirect = Arc::new(Mutex::new(None));
     let browser_attempts = Arc::new(AtomicUsize::new(0));
     let browser = Arc::new(FailingBrowser {
@@ -576,6 +595,8 @@ fn production_entry_falls_back_to_native_manual_fd_after_browser_failure() {
         Arc::new(ScriptedClock::new(1_900_000_000_000)),
         sender,
     );
+    let fd_observation =
+        owned_fd_observer::observe_closed(reader_fd, input_identity, assert_fd_closed);
     let manual_redirect = callback_writer.join().expect("manual callback producer");
     assert!(outcome.as_ref().is_ok_and(result_ok));
     assert_eq!(browser_attempts.load(Ordering::Acquire), 1);
@@ -586,7 +607,7 @@ fn production_entry_falls_back_to_native_manual_fd_after_browser_failure() {
         .expect("failed browser callback listener");
     assert_listener_released(&browser_redirect);
     assert_listener_released(&manual_redirect);
-    assert_fd_closed(reader_fd);
+    fd_observation.assert();
     assert_eq!(transport.take_sent().len(), 1);
     let saved: serde_yaml::Value = serde_yaml::from_slice(
         &fs::read(home.0.join("auth.yaml")).expect("native credential store after fallback"),
@@ -759,10 +780,16 @@ fn production_entry_preserves_newer_store_generation_during_token_exchange() {
 
 #[test]
 fn production_entry_child_cancellation_closes_pending_manual_callback_resources() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "production_entry_child_cancellation_closes_pending_manual_callback_resources",
+    ) {
+        return;
+    }
     let runner = production_runner();
     let home = IsolatedHome::configured_pkce();
     let (reader, _writer) = pipe_pair();
     let reader_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(reader_fd);
     let attempted_redirect = Arc::new(Mutex::new(None));
     let browser = Arc::new(FailingBrowser {
         attempts: Arc::new(AtomicUsize::new(0)),
@@ -788,22 +815,30 @@ fn production_entry_child_cancellation_closes_pending_manual_callback_resources(
         Arc::new(ScriptedClock::new(1_900_000_000_000)),
         sender,
     );
+    let fd_observation =
+        owned_fd_observer::observe_closed(reader_fd, input_identity, assert_fd_closed);
     let redirect = callback_waiting.join().expect("child cancellation trigger");
     assert!(failed_entry(&outcome));
     assert!(cancellation.requested().is_some());
     assert!(transport.take_sent().is_empty());
     assert!(!home.0.join("auth.yaml").exists());
-    assert_fd_closed(reader_fd);
+    fd_observation.assert();
     assert_listener_released(&redirect);
     assert!(!cancellation.watcher_is_armed());
 }
 
 #[test]
 fn production_entry_callback_timeout_closes_pending_manual_callback_resources() {
+    if owned_fd_observer::spawn_fd_observer_child_unless_child(
+        "production_entry_callback_timeout_closes_pending_manual_callback_resources",
+    ) {
+        return;
+    }
     let runner = production_runner();
     let home = IsolatedHome::configured_pkce();
     let (reader, _writer) = pipe_pair();
     let reader_fd = reader.as_raw_fd();
+    let input_identity = owned_fd_observer::input_identity(reader_fd);
     let attempted_redirect = Arc::new(Mutex::new(None));
     let browser = Arc::new(FailingBrowser {
         attempts: Arc::new(AtomicUsize::new(0)),
@@ -830,12 +865,14 @@ fn production_entry_callback_timeout_closes_pending_manual_callback_resources() 
         clock,
         sender,
     );
+    let fd_observation =
+        owned_fd_observer::observe_closed(reader_fd, input_identity, assert_fd_closed);
     let redirect = callback_waiting.join().expect("callback timeout trigger");
     assert!(outcome.as_ref().is_ok_and(|value| !result_ok(value)));
     assert_failed_code(&outcome, "callback_timeout");
     assert!(transport.take_sent().is_empty());
     assert!(!home.0.join("auth.yaml").exists());
-    assert_fd_closed(reader_fd);
+    fd_observation.assert();
     assert_listener_released(&redirect);
     assert!(!cancellation.watcher_is_armed());
 }
