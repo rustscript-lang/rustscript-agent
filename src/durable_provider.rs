@@ -1064,8 +1064,10 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_replay_does_not_reissue_a_pruned_completed_step() {
-        let mut config = AgentGatewayConfig::default();
-        config.max_events_per_run = 4;
+        let config = AgentGatewayConfig {
+            max_events_per_run: 4,
+            ..AgentGatewayConfig::default()
+        };
         let state = AgentGatewayState::new(config).expect("in-memory gateway");
         let admitted = state
             .service()
