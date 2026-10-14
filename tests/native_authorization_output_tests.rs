@@ -298,6 +298,64 @@ fn thread_alive(tid: i64) -> bool {
     Path::new(&format!("/proc/self/task/{tid}")).exists()
 }
 
+fn task_absent_before(task: &Path, deadline: Instant) -> std::io::Result<bool> {
+    loop {
+        match fs::metadata(task) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "task path is not a directory",
+                ));
+            }
+            Ok(_) => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(2)));
+    }
+}
+
+#[test]
+fn joined_task_observer_propagates_proc_read_errors() {
+    let error = task_absent_before(Path::new("/proc/self/stat/not-a-task"), Instant::now())
+        .expect_err("an unreadable task path must not be accepted as zero threads");
+    assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+}
+
+#[test]
+fn joined_task_observer_rejects_a_still_live_owned_worker() {
+    if spawn_fd_observer_child_unless_child(
+        "joined_task_observer_rejects_a_still_live_owned_worker",
+    ) {
+        return;
+    }
+    let fds_before = open_fd_count();
+    let (read_fd, write_fd) = pipe(false);
+    let output = Arc::new(NativeAuthorizationInstructionOutput::from_fd(write_fd).unwrap());
+    let (_sender, receiver) = queue();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let cancellation = RunCancellation::with_deadline(deadline);
+    let observation_started = Instant::now();
+    let worker =
+        NativeAuthorizationInstructionWorker::start(output, receiver, cancellation).unwrap();
+    assert_eq!(worker.deadline(), deadline);
+    let tid = wait_for_thread_id(&worker);
+    let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+    assert!(thread_alive(tid), "owned worker is genuinely live");
+    assert!(
+        !task_absent_before(&task, Instant::now()).unwrap(),
+        "live owner must reject zero-thread observation"
+    );
+    assert!(worker.finish().is_ok());
+    assert!(task_absent_before(&task, observation_started + Duration::from_secs(2)).unwrap());
+    drop(read_fd);
+    assert_eq!(open_fd_count(), fds_before, "no descriptor leaked");
+}
+
 fn public_instruction() -> PublicAuthorizationInstruction {
     PublicAuthorizationInstruction {
         authorization_url:
@@ -886,6 +944,9 @@ fn worker_idle_stop_is_ok_and_leaves_no_detached_thread_or_fd() {
     let cancellation = RunCancellation::with_deadline(deadline);
     // The worker owns the sink (and its reopened descriptor) and releases it on
     // a joined orderly stop.
+    // Reuse the existing 2 s engagement bound for the joined-task observation.
+    // Native deadline and outer child timeout remain exactly unchanged.
+    let observation_started = Instant::now();
     let worker = NativeAuthorizationInstructionWorker::start(output, receiver, cancellation)
         .expect("finite-deadline worker");
     assert_eq!(worker.deadline(), deadline);
@@ -895,7 +956,14 @@ fn worker_idle_stop_is_ok_and_leaves_no_detached_thread_or_fd() {
     assert!(thread_alive(tid), "worker thread is live");
     // Nothing was queued: this is an idle orderly stop.
     assert!(worker.finish().is_ok());
-    assert!(!thread_alive(tid), "worker thread was joined, not detached");
+    // Join completion can precede disappearance of its kernel task directory.
+    // Require exact absence, propagate read errors, and reject a live owner.
+    let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+    assert!(
+        task_absent_before(&task, observation_started + Duration::from_secs(2))
+            .expect("joined task observation must not hide a read error"),
+        "worker thread was joined, not detached"
+    );
     drop(read_fd);
     assert_eq!(open_fd_count(), fds_before, "no descriptor leaked");
 }
