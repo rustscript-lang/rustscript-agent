@@ -1,11 +1,11 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::Write,
+    io::{Read, Write},
     net::TcpListener,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -181,6 +181,183 @@ impl BrowserOpener for NoopBrowser {
         self.opens.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
+}
+
+const FD_OBSERVER_CHILD_MARKER: &str = "RUSTSCRIPT_NATIVE_CALLBACK_RSS_FD_OBSERVER_CHILD";
+const FD_OBSERVER_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+const FD_OBSERVER_CHILD_OUTPUT_LIMIT: usize = 64 * 1024;
+
+struct OwnedTestChild(Option<Child>);
+
+impl OwnedTestChild {
+    fn wait_before(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            let child = self.0.as_mut().expect("owned child is still present");
+            if let Some(status) = child.try_wait()? {
+                self.0.take();
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                self.kill_and_wait();
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill_and_wait(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for OwnedTestChild {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+struct BoundedChildOutput {
+    bytes: Vec<u8>,
+    discarded: usize,
+}
+
+fn capture_child_output(mut reader: impl Read) -> std::io::Result<BoundedChildOutput> {
+    let mut output = BoundedChildOutput {
+        bytes: Vec::with_capacity(FD_OBSERVER_CHILD_OUTPUT_LIMIT),
+        discarded: 0,
+    };
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(read) => {
+                let keep = read.min(FD_OBSERVER_CHILD_OUTPUT_LIMIT - output.bytes.len());
+                output.bytes.extend_from_slice(&buffer[..keep]);
+                output.discarded += read - keep;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn fd_observer_child_is_current_test(test_name: &str) -> bool {
+    let Ok(marker) = std::env::var(FD_OBSERVER_CHILD_MARKER) else {
+        return false;
+    };
+    let mut parts = marker.splitn(3, ':');
+    let (Some(marked_test), Some(parent_pid), Some(nonce)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if marked_test != test_name
+        || parent_pid.parse::<libc::pid_t>().ok() != Some(unsafe { libc::getppid() })
+        || uuid::Uuid::parse_str(nonce).is_err()
+    {
+        return false;
+    }
+    std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|args| args[0] == "--exact" && args[1] == test_name)
+}
+
+fn spawn_fd_observer_child_unless_child(test_name: &str) -> bool {
+    if fd_observer_child_is_current_test(test_name) {
+        return false;
+    }
+
+    let deadline = Instant::now() + FD_OBSERVER_CHILD_TIMEOUT;
+    let nonce = uuid::Uuid::new_v4();
+    let marker = format!("{test_name}:{}:{nonce}", std::process::id());
+    let mut child = OwnedTestChild(Some(
+        Command::new(std::env::current_exe().expect("native test executable path"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env_clear()
+            .envs(
+                [
+                    "PATH",
+                    "HOME",
+                    "RUSTC",
+                    "RUSTUP_HOME",
+                    "RUSTUP_TOOLCHAIN",
+                    "CARGO_HOME",
+                    "LD_LIBRARY_PATH",
+                    "TMPDIR",
+                    "TEMP",
+                    "TMP",
+                    "TEST_TMPDIR",
+                    "RUSTSCRIPT_AGENT_TEST_TMP",
+                    "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+                ]
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+            )
+            .env(FD_OBSERVER_CHILD_MARKER, marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated FD-observer child"),
+    ));
+    let stdout = child
+        .0
+        .as_mut()
+        .expect("owned child is still present")
+        .stdout
+        .take()
+        .expect("child stdout is piped");
+    let stderr = child
+        .0
+        .as_mut()
+        .expect("owned child is still present")
+        .stderr
+        .take()
+        .expect("child stderr is piped");
+    let stdout_reader = thread::spawn(move || capture_child_output(stdout));
+    let stderr_reader = thread::spawn(move || capture_child_output(stderr));
+
+    let status = child.wait_before(deadline);
+    let stdout = stdout_reader
+        .join()
+        .expect("child stdout reader joined")
+        .expect("read child stdout");
+    let stderr = stderr_reader
+        .join()
+        .expect("child stderr reader joined")
+        .expect("read child stderr");
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    let output = format!("{stdout_text}\n{stderr_text}");
+    let truncated = stdout.discarded + stderr.discarded;
+    let ran_exactly_one_named_test = output
+        .lines()
+        .filter(|line| line.trim() == "running 1 test")
+        .count()
+        == 1
+        && output
+            .lines()
+            .filter(|line| line.trim() == format!("test {test_name} ... ok"))
+            .count()
+            == 1
+        && output.lines().any(|line| {
+            line.trim()
+                .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        });
+    let status = status.expect("child wait completed without an I/O error");
+    assert!(
+        matches!(status, Some(ref exit) if exit.success())
+            && ran_exactly_one_named_test
+            && truncated == 0,
+        "isolated FD-observer child {test_name} did not pass its one exact test: status={status:?}, ran_exactly_one_named_test={ran_exactly_one_named_test}, truncated_output_bytes={truncated}, stdout={stdout_text}, stderr={stderr_text}"
+    );
+    true
 }
 
 fn pipe_pair() -> (OwnedFd, OwnedFd) {
@@ -531,7 +708,41 @@ fn main() {
 }
 
 #[test]
+fn fd_observer_rejects_retained_owner_and_reused_integer() {
+    if spawn_fd_observer_child_unless_child("fd_observer_rejects_retained_owner_and_reused_integer")
+    {
+        return;
+    }
+    let (reader, writer) = pipe_pair();
+    let number = reader.as_raw_fd();
+    assert!(
+        std::panic::catch_unwind(|| assert_fd_closed(number)).is_err(),
+        "retained owned descriptor must reject closure"
+    );
+    drop(reader);
+    assert_fd_closed(number);
+    let replacement = File::open("/dev/null").expect("open a different owned descriptor");
+    assert_eq!(
+        replacement.as_raw_fd(),
+        number,
+        "isolated namespace reuses the lowest free descriptor"
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_fd_closed(number)).is_err(),
+        "a reused integer is not proof the original owner leaked"
+    );
+    drop(replacement);
+    assert_fd_closed(number);
+    drop(writer);
+}
+
+#[test]
 fn real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable() {
+    if spawn_fd_observer_child_unless_child(
+        "real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable",
+    ) {
+        return;
+    }
     for mode in ["manual", "none"] {
         let home = FreshLoginHome::new(mode);
         let mut vm = typed_vm();
@@ -569,6 +780,9 @@ fn real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable() 
         assert_eq!(vm.host_context().resource_count(), 5);
         assert_native_flow_count(&auth, 1);
         assert_redacted(&waited);
+        // The consumed input closes when wait returns. Check before pair probes
+        // perform config file IO which may reuse the released FD integer.
+        assert_fd_closed(raw_fd);
 
         // Duplicate public headers fail after the real code/verifier pair has passed
         // native owner/provenance admission, but before any HTTPS request is sent.
@@ -602,13 +816,17 @@ fn real_native_manual_and_none_typed_results_drive_guest_and_keep_pair_usable() 
         close_success_family(&mut vm, &begin_result, &wait_result);
         assert_eq!(vm.host_context().resource_count(), 2);
         assert_native_flow_count(&auth, 0);
-        assert_fd_closed(raw_fd);
         assert_callback_port_released(&redirect_uri);
     }
 }
 
 #[test]
 fn native_browser_wait_and_manual_flow_share_host_without_reserving_fd_in_browser() {
+    if spawn_fd_observer_child_unless_child(
+        "native_browser_wait_and_manual_flow_share_host_without_reserving_fd_in_browser",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("browser-manual-isolation");
     // Compile the trusted Rust launcher before any callback wait timing begins.
     let (launcher, report) = compiled_loopback_launcher(home.path());
@@ -689,6 +907,11 @@ fn native_browser_wait_and_manual_flow_share_host_without_reserving_fd_in_browse
 
 #[test]
 fn consumed_input_and_wrong_vm_or_type_leave_the_live_sibling_flow_usable() {
+    if spawn_fd_observer_child_unless_child(
+        "consumed_input_and_wrong_vm_or_type_leave_the_live_sibling_flow_usable",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("consumed-input-foreign-vm");
     let mut vm = typed_vm();
     let (reader, writer) = pipe_pair();
@@ -778,6 +1001,11 @@ fn consumed_input_and_wrong_vm_or_type_leave_the_live_sibling_flow_usable() {
 
 #[test]
 fn manual_state_mismatch_and_malformed_url_are_typed_sanitized_guest_failures() {
+    if spawn_fd_observer_child_unless_child(
+        "manual_state_mismatch_and_malformed_url_are_typed_sanitized_guest_failures",
+    ) {
+        return;
+    }
     for (label, input, expected_code) in [
         ("state-mismatch", "state", "state_mismatch"),
         ("malformed-url", "malformed", "malformed_response"),
@@ -869,6 +1097,11 @@ fn missing_native_manual_input_is_returned_as_typed_begin_failure() {
 
 #[test]
 fn pending_manual_result_cancellation_closes_fd_listener_and_guest_resources() {
+    if spawn_fd_observer_child_unless_child(
+        "pending_manual_result_cancellation_closes_fd_listener_and_guest_resources",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("pending-cancel");
     // Compile the real restricted RSS fixture and prepare the OS pipe before timing.
     let mut vm = typed_vm();
@@ -930,6 +1163,11 @@ fn pending_manual_result_cancellation_closes_fd_listener_and_guest_resources() {
 
 #[test]
 fn pending_manual_result_uses_real_deadline_and_rolls_back_native_resources() {
+    if spawn_fd_observer_child_unless_child(
+        "pending_manual_result_uses_real_deadline_and_rolls_back_native_resources",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("pending-deadline");
     // Build RSS and prepare the pipe before starting the original 750ms deadline.
     let mut vm = typed_vm();
@@ -977,6 +1215,11 @@ fn pending_manual_result_uses_real_deadline_and_rolls_back_native_resources() {
 
 #[test]
 fn vm_teardown_closes_unread_manual_fd_and_redirect_for_typed_begin_result() {
+    if spawn_fd_observer_child_unless_child(
+        "vm_teardown_closes_unread_manual_fd_and_redirect_for_typed_begin_result",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("vm-teardown");
     let mut vm = typed_vm();
     let (reader, writer) = pipe_pair();
