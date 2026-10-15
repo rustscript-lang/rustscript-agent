@@ -10197,7 +10197,10 @@ mod external_legacy_admission_tests {
         }
     }
 
-    async fn assert_external_without_legacy_root(service: &AgentService, trusted: &PathBuf) {
+    async fn assert_external_without_legacy_root(
+        service: &AgentService,
+        trusted: &std::path::Path,
+    ) {
         let admitted = service
             .admit_external_with_workspace_selector(external_request(), None)
             .await
@@ -10239,7 +10242,7 @@ mod external_legacy_admission_tests {
         );
         assert_eq!(
             internal_handle.legacy_workspace_root.as_deref(),
-            Some(trusted.as_path()),
+            Some(trusted),
             "ordinary legacy-enabled admission still captures the normalized trusted root"
         );
         service.stop(&admitted.run_id);
