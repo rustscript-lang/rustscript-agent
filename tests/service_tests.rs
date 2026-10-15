@@ -3837,3 +3837,486 @@ async fn agent_file_cache_fails_typed_when_digest_never_stabilizes() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Prepare pair uses ONE durable StorageOp and publishes requested-before-started.
+#[tokio::test]
+async fn prepare_pair_single_storage_op_and_ordered_events() {
+    use rustscript_agent::capabilities::LifecycleError;
+    use rustscript_agent::metrics::StorageOp;
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-pair-op-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-pair-op".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let before = service
+        .metrics()
+        .snapshot()
+        .storage_op_successes(StorageOp::EventAppend);
+    let outcome = lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-pair-op".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "pair op".to_string(),
+            },
+        )
+        .expect("prepare should issue a token");
+    let PrepareOutcome::Execute {
+        execution_token, ..
+    } = outcome
+    else {
+        panic!("expected execute token, got {outcome:?}");
+    };
+    let _ = execution_token;
+    let after = service
+        .metrics()
+        .snapshot()
+        .storage_op_successes(StorageOp::EventAppend);
+    assert_eq!(
+        after,
+        before + 1,
+        "one prepare must use exactly one durable StorageOp (was two)"
+    );
+    let events = service.run_events(&admitted.run_id);
+    let requested_pos = events
+        .iter()
+        .position(|event| event["event"] == "tool.requested")
+        .expect("requested must be durable");
+    let started_pos = events
+        .iter()
+        .position(|event| event["event"] == "tool.started")
+        .expect("started must be durable");
+    assert!(
+        requested_pos < started_pos,
+        "requested must broadcast before started: {events:?}"
+    );
+    let requested_seq = events[requested_pos]["seq"]
+        .as_u64()
+        .expect("requested seq");
+    let started_seq = events[started_pos]["seq"].as_u64().expect("started seq");
+    assert_eq!(
+        started_seq,
+        requested_seq + 1,
+        "pair seqs must be contiguous: {events:?}"
+    );
+    let _ = LifecycleError::Cancelled;
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Legacy requested-only completes with a pair retry that adds only started.
+#[tokio::test]
+async fn prepare_pair_legacy_requested_only_completes_with_single() {
+    use rustscript_agent::metrics::StorageOp;
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-pair-legacy-req-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-legacy-req".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let requested_id = format!("{}:tool:{}:tool.requested", admitted.run_id, call.id);
+    service
+        .persist_run_event(
+            &admitted.run_id,
+            &requested_id,
+            "tool.requested",
+            json!({"tool_call_id": call.id}),
+        )
+        .expect("seed requested-only in both memory and durable");
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let before_ops = service
+        .metrics()
+        .snapshot()
+        .storage_op_successes(StorageOp::EventAppend);
+    lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-legacy-req".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "legacy requested".to_string(),
+            },
+        )
+        .expect("legacy requested-only must complete");
+    let after_ops = service
+        .metrics()
+        .snapshot()
+        .storage_op_successes(StorageOp::EventAppend);
+    assert_eq!(
+        after_ops,
+        before_ops + 1,
+        "legacy path uses one single append"
+    );
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        event_type_count(&events, "tool.requested"),
+        1,
+        "no duplicate requested: {events:?}"
+    );
+    assert_eq!(
+        event_type_count(&events, "tool.started"),
+        1,
+        "missing started added: {events:?}"
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Legacy started-only completes with a pair retry that adds only requested.
+#[tokio::test]
+async fn prepare_pair_legacy_started_only_no_duplicate() {
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-pair-legacy-started-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-legacy-started".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    let started_id = format!("{}:tool:{}:tool.started", admitted.run_id, call.id);
+    service
+        .persist_run_event(
+            &admitted.run_id,
+            &started_id,
+            "tool.started",
+            json!({"tool_call_id": call.id}),
+        )
+        .expect("seed started-only in both memory and durable");
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-legacy-started".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "legacy started".to_string(),
+            },
+        )
+        .expect("legacy started-only must complete");
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        event_type_count(&events, "tool.started"),
+        1,
+        "no duplicate started: {events:?}"
+    );
+    assert_eq!(
+        event_type_count(&events, "tool.requested"),
+        1,
+        "missing requested added: {events:?}"
+    );
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Pair failpoint after partial write: no token, no publish, retry succeeds.
+#[tokio::test]
+async fn prepare_pair_fail_after_partial_write_no_token_no_publish() {
+    use rustscript_agent::capabilities::LifecycleError;
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-pair-partial-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-pair-partial".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    state
+        .persistence()
+        .expect("persistence")
+        .inject_fail_after_partial_write();
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let error = lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-pair-partial".to_string(),
+                registry_identity: registry_identity.clone(),
+                risk_class: CapabilityRisk::Read,
+                summary: "pair partial".to_string(),
+            },
+        )
+        .expect_err("partial-write pair must fail");
+    assert!(
+        matches!(error, LifecycleError::StartedCommitFailed(_)),
+        "must surface StartedCommitFailed, got {error:?}"
+    );
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(
+        event_type_count(&events, "tool.requested"),
+        0,
+        "no partial publish: {events:?}"
+    );
+    assert_eq!(event_type_count(&events, "tool.started"), 0);
+    lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-pair-partial".to_string(),
+                registry_identity,
+                risk_class: CapabilityRisk::Read,
+                summary: "pair partial".to_string(),
+            },
+        )
+        .expect("retry after rollback must issue a token");
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&events, "tool.requested"), 1);
+    assert_eq!(event_type_count(&events, "tool.started"), 1);
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Pair failpoint after commit: durable yet unpublished; reopen replays both once.
+#[tokio::test]
+async fn prepare_pair_fail_after_commit_before_publish_replayable_once() {
+    use rustscript_agent::capabilities::LifecycleError;
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-pair-after-commit-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-pair-crash".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    state
+        .persistence()
+        .expect("persistence")
+        .inject_fail_after_commit_before_publish();
+    let (lifecycle, owner) = service
+        .capability_lifecycle(&admitted.run_id)
+        .expect("production lifecycle");
+    let registry_identity = service.tool_registry_snapshot().identity().to_string();
+    let error = lifecycle
+        .prepare(
+            &owner,
+            PrepareMetadata {
+                run_id: admitted.run_id.clone(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: "digest-pair-crash".to_string(),
+                registry_identity: registry_identity.clone(),
+                risk_class: CapabilityRisk::Read,
+                summary: "pair crash".to_string(),
+            },
+        )
+        .expect_err("after-commit pair must report failure");
+    assert!(
+        matches!(error, LifecycleError::StartedCommitFailed(_)),
+        "must surface StartedCommitFailed, got {error:?}"
+    );
+    assert_eq!(
+        event_type_count(&service.run_events(&admitted.run_id), "tool.requested"),
+        0,
+        "live view stays on the pre-commit snapshot"
+    );
+    let session_id = admitted.session_id.clone();
+    let run_id = admitted.run_id.clone();
+    drop(state);
+    let resumed = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("reopen");
+    let events = resumed.service().run_events(&run_id);
+    assert_eq!(
+        event_type_count(&events, "tool.requested"),
+        1,
+        "durable requested survives: {events:?}"
+    );
+    assert_eq!(
+        event_type_count(&events, "tool.started"),
+        1,
+        "durable started survives: {events:?}"
+    );
+    let _ = session_id;
+    drop(resumed);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Terminal runs persist nothing and publish nothing.
+#[tokio::test]
+async fn prepare_pair_terminal_no_persist_no_publish() {
+    use rustscript_agent::capabilities::LifecycleError;
+    let path = temporary_db_path();
+    let workspace = path.with_file_name(format!("ws-pair-terminal-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        test_source(),
+        &path,
+    )
+    .expect("SQLite gateway should open");
+    let service = state.service();
+    service
+        .set_run_limits(RunLimits::new(8, 8, 65_536, &workspace).expect("limits"))
+        .expect("set limits");
+    let admitted = service
+        .admit(admit_request(None))
+        .await
+        .expect("admit should succeed");
+    let call = ToolCall {
+        id: "call-pair-terminal".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "note.txt"}),
+    };
+    commit_tool_parent(&service, &admitted.run_id, &call);
+    service.mark_terminal(&admitted.run_id);
+    match service.capability_lifecycle(&admitted.run_id) {
+        Err(error) => {
+            assert!(
+                matches!(
+                    error,
+                    rustscript_agent::service::RunContextError::InvalidMetadata { .. }
+                ),
+                "terminal must close the capability host: {error:?}"
+            );
+        }
+        Ok((lifecycle, owner)) => {
+            let registry_identity = service.tool_registry_snapshot().identity().to_string();
+            let error = lifecycle
+                .prepare(
+                    &owner,
+                    PrepareMetadata {
+                        run_id: admitted.run_id.clone(),
+                        call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        argument_digest: "digest-pair-terminal".to_string(),
+                        registry_identity,
+                        risk_class: CapabilityRisk::Read,
+                        summary: "pair terminal".to_string(),
+                    },
+                )
+                .expect_err("terminal prepare must fail");
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::InactiveRun | LifecycleError::Cancelled
+                ),
+                "terminal must block prepare, got {error:?}"
+            );
+        }
+    }
+    let events = service.run_events(&admitted.run_id);
+    assert_eq!(event_type_count(&events, "tool.requested"), 0);
+    assert_eq!(event_type_count(&events, "tool.started"), 0);
+    drop(state);
+    std::fs::remove_file(path).expect("temporary SQLite state should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}

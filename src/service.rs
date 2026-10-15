@@ -6760,15 +6760,7 @@ impl DurableToolLifecycle for ServiceDurableLifecycle {
             "generation": record.generation,
         });
         self.events
-            .commit("tool.requested", data.clone())
-            .map_err(|error| match error {
-                EventCommitError::PersistFailed(message) => {
-                    LifecycleError::StartedCommitFailed(message)
-                }
-                other => map_event_commit_error(other),
-            })?;
-        self.events
-            .commit("tool.started", data)
+            .commit_pair(("tool.requested", data.clone()), ("tool.started", data))
             .map_err(|error| match error {
                 EventCommitError::PersistFailed(message) => {
                     LifecycleError::StartedCommitFailed(message)
@@ -7127,6 +7119,162 @@ impl DurableEventCommitter for ServiceEventCommitter {
         }
         persist
     }
+
+    fn commit_pair(
+        &self,
+        first: (&str, JsonValue),
+        second: (&str, JsonValue),
+    ) -> Result<(), EventCommitError> {
+        if self.is_terminal() {
+            return Err(EventCommitError::Terminal);
+        }
+        let _serial = self.commit_gate.lock();
+        let first_call_id = first
+            .1
+            .get("tool_call_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let second_call_id = second
+            .1
+            .get("tool_call_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let first_event_id = if first_call_id.is_empty() {
+            String::new()
+        } else {
+            durable_tool_event_id(&self.run_id, &first_call_id, first.0)
+        };
+        let second_event_id = if second_call_id.is_empty() {
+            String::new()
+        } else {
+            durable_tool_event_id(&self.run_id, &second_call_id, second.0)
+        };
+        enum PairAction {
+            BothPresent,
+            MissingFirst(ReservedCommit),
+            MissingSecond(ReservedCommit),
+            Pair(ReservedPair),
+        }
+        let action = {
+            let store = self.store.read();
+            let Some(run) = store.runs.get(&self.run_id) else {
+                return Err(EventCommitError::Terminal);
+            };
+            if run_is_terminal(&run.status) {
+                return Err(EventCommitError::Terminal);
+            }
+            let first_present = !first_event_id.is_empty()
+                && run
+                    .events
+                    .iter()
+                    .any(|event| event.event_id == first_event_id);
+            let second_present = !second_event_id.is_empty()
+                && run
+                    .events
+                    .iter()
+                    .any(|event| event.event_id == second_event_id);
+            match (first_present, second_present) {
+                (true, true) => PairAction::BothPresent,
+                (false, true) => {
+                    let mut event =
+                        event_candidate(run, first.0, first.1.clone(), self.max_event_bytes);
+                    if !first_event_id.is_empty() {
+                        event.event_id = first_event_id.clone();
+                    }
+                    let payload_json =
+                        serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string());
+                    let persist_payload = json!({
+                        "run_id": self.run_id,
+                        "event_id": event.event_id,
+                        "event_type": event.event,
+                        "payload_json": payload_json,
+                        "now_ms": timestamp(),
+                        "max_events": self.max_events_per_run,
+                        "seq": event.seq,
+                    });
+                    PairAction::MissingFirst(ReservedCommit {
+                        event,
+                        message: None,
+                        persist_payload,
+                        kind: PersistKind::EventAppend,
+                        max_events_per_run: self.max_events_per_run,
+                    })
+                }
+                (true, false) => {
+                    let mut event =
+                        event_candidate(run, second.0, second.1.clone(), self.max_event_bytes);
+                    if !second_event_id.is_empty() {
+                        event.event_id = second_event_id.clone();
+                    }
+                    let payload_json =
+                        serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_string());
+                    let persist_payload = json!({
+                        "run_id": self.run_id,
+                        "event_id": event.event_id,
+                        "event_type": event.event,
+                        "payload_json": payload_json,
+                        "now_ms": timestamp(),
+                        "max_events": self.max_events_per_run,
+                        "seq": event.seq,
+                    });
+                    PairAction::MissingSecond(ReservedCommit {
+                        event,
+                        message: None,
+                        persist_payload,
+                        kind: PersistKind::EventAppend,
+                        max_events_per_run: self.max_events_per_run,
+                    })
+                }
+                (false, false) => {
+                    let mut first_event =
+                        event_candidate(run, first.0, first.1.clone(), self.max_event_bytes);
+                    if !first_event_id.is_empty() {
+                        first_event.event_id = first_event_id.clone();
+                    }
+                    let mut second_event =
+                        event_candidate(run, second.0, second.1.clone(), self.max_event_bytes);
+                    if !second_event_id.is_empty() {
+                        second_event.event_id = second_event_id.clone();
+                    }
+                    second_event.seq = first_event.seq + 1;
+                    let payload_json_a = serde_json::to_string(&first_event.data)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let payload_json_b = serde_json::to_string(&second_event.data)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let persist_payload = json!({
+                        "run_id": self.run_id,
+                        "event_id_a": first_event.event_id,
+                        "event_type_a": first_event.event,
+                        "payload_json_a": payload_json_a,
+                        "event_id_b": second_event.event_id,
+                        "event_type_b": second_event.event,
+                        "payload_json_b": payload_json_b,
+                        "now_ms": timestamp(),
+                        "max_events": self.max_events_per_run,
+                        "seq_a": first_event.seq,
+                        "seq_b": second_event.seq,
+                    });
+                    PairAction::Pair(ReservedPair {
+                        first: first_event,
+                        second: second_event,
+                        persist_payload,
+                        max_events_per_run: self.max_events_per_run,
+                    })
+                }
+            }
+        };
+        match action {
+            PairAction::BothPresent => Ok(()),
+            PairAction::MissingFirst(reserved) | PairAction::MissingSecond(reserved) => {
+                persist_and_apply(&self.store, self.persistence.as_deref(), reserved)
+            }
+            PairAction::Pair(reserved) => {
+                persist_and_apply_pair(&self.store, self.persistence.as_deref(), reserved)
+            }
+        }
+    }
 }
 
 fn lookup_tool_call_parent(
@@ -7265,6 +7413,13 @@ struct ReservedCommit {
     max_events_per_run: usize,
 }
 
+struct ReservedPair {
+    first: GatewayEvent,
+    second: GatewayEvent,
+    persist_payload: JsonValue,
+    max_events_per_run: usize,
+}
+
 fn persist_and_apply(
     store: &RwLock<GatewayStore>,
     persistence: Option<&GatewayPersistence>,
@@ -7313,6 +7468,43 @@ fn apply_reserved(store: &mut GatewayStore, reserved: &ReservedCommit) {
         session.messages.push(message.clone());
         session.view.message_count = session.messages.len();
         session.view.updated_at = timestamp();
+    }
+}
+
+fn persist_and_apply_pair(
+    store: &RwLock<GatewayStore>,
+    persistence: Option<&GatewayPersistence>,
+    reserved: ReservedPair,
+) -> Result<(), EventCommitError> {
+    let durable = match persistence {
+        Some(persistence) => persistence
+            .event_append_pair(&reserved.persist_payload)
+            .map(|_| ()),
+        None => Ok(()),
+    };
+    match durable {
+        Ok(()) => {
+            let mut store = store.write();
+            apply_reserved_pair(&mut store, &reserved);
+            let sender = store
+                .runs
+                .get(&reserved.first.run_id)
+                .and_then(|run| run.sender.clone());
+            drop(store);
+            if let Some(sender) = sender {
+                let _ = sender.send(reserved.first);
+                let _ = sender.send(reserved.second);
+            }
+            Ok(())
+        }
+        Err(error) => Err(EventCommitError::PersistFailed(error.to_string())),
+    }
+}
+
+fn apply_reserved_pair(store: &mut GatewayStore, reserved: &ReservedPair) {
+    if let Some(run) = store.runs.get_mut(&reserved.first.run_id) {
+        apply_event_locked(run, &reserved.first, reserved.max_events_per_run);
+        apply_event_locked(run, &reserved.second, reserved.max_events_per_run);
     }
 }
 

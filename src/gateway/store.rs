@@ -498,6 +498,25 @@ impl GatewayPersistence {
         self.command_data("step.commit", &payload)
     }
 
+    /// Atomic two-event commit for one prepare pair (`tool.requested` then
+    /// `tool.started`, same run, no message). Single SQLite transaction;
+    /// failpoint passthrough mirrors [`Self::step_commit`].
+    pub fn event_append_pair(&self, payload: &Value) -> Result<Value, StorageError> {
+        let mut payload = payload.clone();
+        if self
+            .fail_after_partial_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            payload["failpoint"] = json!("after_partial_write");
+        } else if self
+            .fail_after_commit_before_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            payload["failpoint"] = json!("after_commit_before_publish");
+        }
+        self.command_data("event.append_pair", &payload)
+    }
+
     /// Reconcile requested/started tool effects that lack durable output.
     pub fn reconcile_effects(&self, payload: &Value) -> Result<Value, StorageError> {
         self.command_data("recovery.reconcile_effects", payload)

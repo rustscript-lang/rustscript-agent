@@ -5130,3 +5130,452 @@ fn load_all_snapshot_stage_leaves_a_colliding_main_table_intact() {
     assert_eq!(rows[0][0], json!("preserve-me"));
     fs::remove_dir_all(root).expect("temporary storage root should be removed");
 }
+
+/// Prepare pair: one `event.append_pair` durably persists BOTH tool.requested
+/// and tool.started in a single transaction, ordered requested-before-started
+/// with contiguous seqs. TDD RED on the current generic runner (unknown op).
+#[test]
+fn prepare_pair_atomic_both_durable_ordered() {
+    let root = temporary_root("prepare-pair");
+    let runner = storage_runner(&root);
+    let db_name = "prepare-pair.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+    let committed = run_storage(
+        &runner,
+        db_name,
+        "pair-1",
+        "event.append_pair",
+        json!({
+            "run_id": "run-1",
+            "event_id_a": "run-1:call:pair-1:tool.requested",
+            "event_type_a": "tool.requested",
+            "payload_json_a": "{\"tool_call_id\":\"pair-1\",\"status\":\"requested\"}",
+            "event_id_b": "run-1:call:pair-1:tool.started",
+            "event_type_b": "tool.started",
+            "payload_json_b": "{\"tool_call_id\":\"pair-1\",\"status\":\"started\"}",
+            "now_ms": 20,
+            "max_events": 128,
+        }),
+        20,
+    );
+    assert_eq!(committed["ok"], json!(true), "{committed}");
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-1",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        21,
+    );
+    let rows = query_rows(&replay);
+    let requested = rows
+        .iter()
+        .find(|row| row["event_id"] == json!("run-1:call:pair-1:tool.requested"))
+        .expect("requested row must be durable");
+    let started = rows
+        .iter()
+        .find(|row| row["event_id"] == json!("run-1:call:pair-1:tool.started"))
+        .expect("started row must be durable");
+    assert_eq!(requested["event_type"], json!("tool.requested"));
+    assert_eq!(started["event_type"], json!("tool.started"));
+    let requested_seq = requested["seq"].as_i64().expect("requested seq");
+    let started_seq = started["seq"].as_i64().expect("started seq");
+    assert_eq!(
+        started_seq,
+        requested_seq + 1,
+        "pair seqs must be contiguous: {rows:?}"
+    );
+    assert!(
+        requested_seq < started_seq,
+        "requested must precede started: {rows:?}"
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Pair rollback: distinct event_ids sharing one reserved seq fail the whole
+/// transaction; reopen sees NEITHER row (no first-only partial).
+#[test]
+fn prepare_pair_rollback_on_second_conflict_neither_row() {
+    let root = temporary_root("prepare-pair-conflict");
+    let runner = storage_runner(&root);
+    let db_name = "prepare-pair-conflict.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+    let conflicted = run_storage_result(
+        &runner,
+        db_name,
+        "pair-conflict",
+        "event.append_pair",
+        json!({
+            "run_id": "run-1",
+            "event_id_a": "run-1:call:conflict:tool.requested",
+            "event_type_a": "tool.requested",
+            "payload_json_a": "{\"tool_call_id\":\"conflict\",\"status\":\"requested\"}",
+            "event_id_b": "run-1:call:conflict-other:tool.started",
+            "event_type_b": "tool.started",
+            "payload_json_b": "{\"tool_call_id\":\"conflict-other\",\"status\":\"started\"}",
+            "now_ms": 20,
+            "max_events": 128,
+            "seq_a": 5,
+            "seq_b": 5,
+        }),
+        20,
+    );
+    assert!(
+        conflicted.is_err()
+            || conflicted
+                .as_ref()
+                .is_ok_and(|value| value["ok"] == json!(false)),
+        "reserved-seq conflict must fail the whole pair: {conflicted:?}"
+    );
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-1",
+        "event.replay",
+        json!({
+            "run_id": "run-1",
+            "after_seq": 0,
+            "max_events": 128,
+            "max_bytes": 65_536,
+        }),
+        21,
+    );
+    let rows = query_rows(&replay);
+    assert!(
+        rows.iter()
+            .all(|row| row["event_id"] != json!("run-1:call:conflict:tool.requested")),
+        "first row must roll back with the pair: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["event_id"] != json!("run-1:call:conflict-other:tool.started")),
+        "second row must not persist alone: {rows:?}"
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Duplicate pair is idempotent: no new rows, high-water unchanged.
+#[test]
+fn prepare_pair_duplicate_idempotent_highwater_unchanged() {
+    let root = temporary_root("prepare-pair-dup");
+    let runner = storage_runner(&root);
+    let db_name = "prepare-pair-dup.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+    let payload = json!({
+        "run_id": "run-1",
+        "event_id_a": "run-1:call:dup-1:tool.requested",
+        "event_type_a": "tool.requested",
+        "payload_json_a": "{\"tool_call_id\":\"dup-1\",\"status\":\"requested\"}",
+        "event_id_b": "run-1:call:dup-1:tool.started",
+        "event_type_b": "tool.started",
+        "payload_json_b": "{\"tool_call_id\":\"dup-1\",\"status\":\"started\"}",
+        "now_ms": 20,
+        "max_events": 128,
+    });
+    let first = run_storage(
+        &runner,
+        db_name,
+        "pair-1",
+        "event.append_pair",
+        payload.clone(),
+        20,
+    );
+    assert_eq!(first["ok"], json!(true), "{first}");
+    let before = run_storage(
+        &runner,
+        db_name,
+        "replay-before",
+        "event.replay",
+        json!({"run_id": "run-1", "after_seq": 0, "max_events": 128, "max_bytes": 65_536}),
+        21,
+    );
+    let before_rows = query_rows(&before);
+    let before_high = before["high_water_seq"].clone();
+    let second = run_storage(
+        &runner,
+        db_name,
+        "pair-1-retry",
+        "event.append_pair",
+        payload,
+        22,
+    );
+    assert_eq!(
+        second["ok"],
+        json!(true),
+        "duplicate pair must stay ok: {second}"
+    );
+    let after = run_storage(
+        &runner,
+        db_name,
+        "replay-after",
+        "event.replay",
+        json!({"run_id": "run-1", "after_seq": 0, "max_events": 128, "max_bytes": 65_536}),
+        23,
+    );
+    assert_eq!(
+        query_rows(&after).len(),
+        before_rows.len(),
+        "duplicate pair must add no rows"
+    );
+    assert_eq!(
+        after["high_water_seq"], before_high,
+        "high-water must not advance on duplicate"
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// In-transaction pair failpoint rolls back; reopen sees nothing.
+#[test]
+fn prepare_pair_failpoint_after_partial_write_rolls_back_on_reopen() {
+    let root = temporary_root("prepare-pair-partial");
+    let db_name = "prepare-pair-partial.db";
+    {
+        let runner = storage_runner(&root);
+        run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+        seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+        let failed = run_storage_result(
+            &runner,
+            db_name,
+            "pair-fail",
+            "event.append_pair",
+            json!({
+                "run_id": "run-1",
+                "event_id_a": "run-1:call:partial-1:tool.requested",
+                "event_type_a": "tool.requested",
+                "payload_json_a": "{\"tool_call_id\":\"partial-1\"}",
+                "event_id_b": "run-1:call:partial-1:tool.started",
+                "event_type_b": "tool.started",
+                "payload_json_b": "{\"tool_call_id\":\"partial-1\"}",
+                "now_ms": 20,
+                "max_events": 128,
+                "failpoint": "after_partial_write",
+            }),
+            20,
+        );
+        assert!(
+            failed.is_err()
+                || failed
+                    .as_ref()
+                    .is_ok_and(|value| value["ok"] == json!(false)),
+            "in-txn pair failpoint must fail: {failed:?}"
+        );
+    }
+    let runner = storage_runner(&root);
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-reopen",
+        "event.replay",
+        json!({"run_id": "run-1", "after_seq": 0, "max_events": 128, "max_bytes": 65_536}),
+        21,
+    );
+    let rows = query_rows(&replay);
+    assert!(
+        rows.iter()
+            .all(|row| row["event_id"] != json!("run-1:call:partial-1:tool.requested")),
+        "rollback must leave no requested row after reopen: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["event_id"] != json!("run-1:call:partial-1:tool.started")),
+        "rollback must leave no started row after reopen: {rows:?}"
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Post-commit pair failpoint leaves both durable; reopen replays both once.
+#[test]
+fn prepare_pair_failpoint_after_commit_replayable_once_on_reopen() {
+    let root = temporary_root("prepare-pair-after-commit");
+    let db_name = "prepare-pair-after-commit.db";
+    {
+        let runner = storage_runner(&root);
+        run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+        seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+        let crashed = run_storage_result(
+            &runner,
+            db_name,
+            "pair-crash",
+            "event.append_pair",
+            json!({
+                "run_id": "run-1",
+                "event_id_a": "run-1:call:crash-1:tool.requested",
+                "event_type_a": "tool.requested",
+                "payload_json_a": "{\"tool_call_id\":\"crash-1\"}",
+                "event_id_b": "run-1:call:crash-1:tool.started",
+                "event_type_b": "tool.started",
+                "payload_json_b": "{\"tool_call_id\":\"crash-1\"}",
+                "now_ms": 20,
+                "max_events": 128,
+                "failpoint": "after_commit_before_publish",
+            }),
+            20,
+        )
+        .expect("typed failpoint after durable commit");
+        assert_eq!(crashed["ok"], json!(false), "{crashed}");
+        assert_eq!(
+            crashed["code"],
+            json!("failpoint_after_commit_before_publish")
+        );
+    }
+    let runner = storage_runner(&root);
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-reopen",
+        "event.replay",
+        json!({"run_id": "run-1", "after_seq": 0, "max_events": 128, "max_bytes": 65_536}),
+        21,
+    );
+    let rows = query_rows(&replay);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event_id"] == json!("run-1:call:crash-1:tool.requested"))
+            .count(),
+        1,
+        "durable requested must survive crash: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event_id"] == json!("run-1:call:crash-1:tool.started"))
+            .count(),
+        1,
+        "durable started must survive crash: {rows:?}"
+    );
+    let retry = run_storage(
+        &runner,
+        db_name,
+        "pair-retry",
+        "event.append_pair",
+        json!({
+            "run_id": "run-1",
+            "event_id_a": "run-1:call:crash-1:tool.requested",
+            "event_type_a": "tool.requested",
+            "payload_json_a": "{\"tool_call_id\":\"crash-1\"}",
+            "event_id_b": "run-1:call:crash-1:tool.started",
+            "event_type_b": "tool.started",
+            "payload_json_b": "{\"tool_call_id\":\"crash-1\"}",
+            "now_ms": 22,
+            "max_events": 128,
+        }),
+        22,
+    );
+    assert_eq!(retry["ok"], json!(true), "{retry}");
+    let replayed = query_rows(&run_storage(
+        &runner,
+        db_name,
+        "replay-again",
+        "event.replay",
+        json!({"run_id": "run-1", "after_seq": 0, "max_events": 128, "max_bytes": 65_536}),
+        23,
+    ));
+    assert_eq!(
+        replayed
+            .iter()
+            .filter(|row| row["event_id"] == json!("run-1:call:crash-1:tool.requested"))
+            .count(),
+        1,
+        "retry must stay idempotent: {replayed:?}"
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Retention: max_events=1 keeps only the last pair row; high-water stays monotonic.
+#[test]
+fn prepare_pair_retention_prune_floor_highwater() {
+    let root = temporary_root("prepare-pair-retention");
+    let runner = storage_runner(&root);
+    let db_name = "prepare-pair-retention.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+    let committed = run_storage(
+        &runner,
+        db_name,
+        "pair-1",
+        "event.append_pair",
+        json!({
+            "run_id": "run-1",
+            "event_id_a": "run-1:call:ret-1:tool.requested",
+            "event_type_a": "tool.requested",
+            "payload_json_a": "{\"tool_call_id\":\"ret-1\"}",
+            "event_id_b": "run-1:call:ret-1:tool.started",
+            "event_type_b": "tool.started",
+            "payload_json_b": "{\"tool_call_id\":\"ret-1\"}",
+            "now_ms": 20,
+            "max_events": 1,
+        }),
+        20,
+    );
+    assert_eq!(committed["ok"], json!(true), "{committed}");
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-1",
+        "event.replay",
+        json!({"run_id": "run-1", "after_seq": 3, "max_events": 128, "max_bytes": 65_536}),
+        21,
+    );
+    assert_eq!(replay["high_water_seq"], json!(3));
+    let rows = query_rows(&replay);
+    assert_eq!(
+        rows.len(),
+        1,
+        "max_events=1 retains only the last pair row: {rows:?}"
+    );
+    assert_eq!(rows[0]["event_type"], json!("tool.started"));
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}
+
+/// Oversized pair payloads are rejected before any write.
+#[test]
+fn prepare_pair_rejects_oversized_payload() {
+    let root = temporary_root("prepare-pair-large");
+    let runner = storage_runner(&root);
+    let db_name = "prepare-pair-large.db";
+    run_storage(&runner, db_name, "migrate-1", "migrate", json!({}), 1);
+    seed_session_and_run(&runner, db_name, "session-1", "run-1", 10);
+    let oversized = format!("{{\"blob\":\"{}\"}}", "y".repeat(70_000));
+    let rejected = run_storage(
+        &runner,
+        db_name,
+        "pair-large",
+        "event.append_pair",
+        json!({
+            "run_id": "run-1",
+            "event_id_a": "run-1:call:large-1:tool.requested",
+            "event_type_a": "tool.requested",
+            "payload_json_a": oversized,
+            "event_id_b": "run-1:call:large-1:tool.started",
+            "event_type_b": "tool.started",
+            "payload_json_b": "{\"tool_call_id\":\"large-1\"}",
+            "now_ms": 20,
+            "max_events": 128,
+        }),
+        20,
+    );
+    assert_eq!(rejected["ok"], json!(false), "{rejected}");
+    assert_eq!(rejected["code"], json!("payload_too_large"));
+    let replay = run_storage(
+        &runner,
+        db_name,
+        "replay-1",
+        "event.replay",
+        json!({"run_id": "run-1", "after_seq": 0, "max_events": 128, "max_bytes": 65_536}),
+        21,
+    );
+    assert!(
+        query_rows(&replay)
+            .iter()
+            .all(|row| row["event_id"] != json!("run-1:call:large-1:tool.requested")),
+        "oversized pair must leave nothing: {replay:?}"
+    );
+    fs::remove_dir_all(root).expect("temporary storage root should be removed");
+}

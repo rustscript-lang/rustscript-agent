@@ -63,6 +63,18 @@ struct CursorInput {
     now_ms: int
 }
 
+struct EventAppendPairInput {
+    run_id: string,
+    event_id_a: string,
+    event_type_a: string,
+    payload_json_a: string,
+    event_id_b: string,
+    event_type_b: string,
+    payload_json_b: string,
+    now_ms: int,
+    max_events: int
+}
+
 pub fn storage_event_append(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let raw_payload: map = json::decode(payload_json);
     let input: EventAppendInput = json::decode::<EventAppendInput>(payload_json);
@@ -102,6 +114,76 @@ pub fn storage_event_append(db_id: resource<sqlite.connection>, payload_json: st
                         }
         ];
         result = { ok: true, code: "ok", message: "", result: sqlite::transaction(&db_id, statements) };
+    }
+    result
+}
+
+pub fn storage_event_append_pair(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let raw_payload: map = json::decode(payload_json);
+    let mut failpoint: string = "";
+    if raw_payload.has("failpoint") {
+        failpoint = raw_payload["failpoint"].copy();
+    }
+    let input: EventAppendPairInput = json::decode::<EventAppendPairInput>(payload_json);
+    let mut reserved_seq_a: int = 0;
+    let mut reserved_seq_b: int = 0;
+    if raw_payload.has("seq_a") {
+        reserved_seq_a = raw_payload["seq_a"].copy();
+    }
+    if raw_payload.has("seq_b") {
+        reserved_seq_b = raw_payload["seq_b"].copy();
+    }
+    let mut result = { ok: true, code: "ok", message: "", result: [] };
+    if input.payload_json_a.copy().length > 65536 || input.payload_json_b.copy().length > 65536 {
+        result = { ok: false, code: "payload_too_large", message: "pair event payload exceeds 65536 bytes", result: [] };
+    } else {
+        if !(sqlite::query(&db_id, existence::run_exists_sql(), [sql_text(input.run_id.copy())], sql_limits(1, 4096)).rows.length > 0) {
+            result = { ok: false, code: "run_not_found", message: "event append targets an unknown run", result: [] };
+        } else {
+            let max_events: int = schema::max_events_limit(input.max_events.copy());
+            let statements: array<SqliteStatement> = [
+                {
+                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
+                    params: [sql_text(input.run_id.copy()), sql_int(reserved_seq_a.copy()), sql_int(reserved_seq_a.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id_a.copy()), sql_text(input.event_type_a.copy()), sql_text(input.payload_json_a.copy()), sql_int(input.now_ms.copy()), sql_text(input.event_id_a.copy())],
+                            query: false,
+                            limits: sql_limits(1000, 4194304)
+                            },
+                {
+                    sql: "INSERT INTO run_events (run_id, seq, event_id, event_type, payload_json, created_at_ms) SELECT ?, CASE WHEN ? > 0 THEN ? ELSE COALESCE((SELECT MAX(events.seq) FROM run_events events WHERE events.run_id = ?), 0) + 1 END, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM run_events existing WHERE existing.event_id = ?)",
+                    params: [sql_text(input.run_id.copy()), sql_int(reserved_seq_b.copy()), sql_int(reserved_seq_b.copy()), sql_text(input.run_id.copy()), sql_text(input.event_id_b.copy()), sql_text(input.event_type_b.copy()), sql_text(input.payload_json_b.copy()), sql_int(input.now_ms.copy()), sql_text(input.event_id_b.copy())],
+                            query: false,
+                            limits: sql_limits(1000, 4194304)
+                            },
+                {
+                    sql: "DELETE FROM run_events WHERE rowid IN (SELECT rowid FROM run_events WHERE run_id = ? ORDER BY seq ASC LIMIT CASE WHEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) > ? THEN (SELECT COUNT(*) FROM run_events WHERE run_id = ?) - ? ELSE 0 END)",
+                    params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(max_events.copy()), sql_text(input.run_id.copy()), sql_int(max_events.copy())],
+                            query: false,
+                            limits: sql_limits(1000, 4194304)
+                            },
+                {
+                    sql: "INSERT INTO run_retention (run_id, first_seq, high_water_seq, updated_at_ms) SELECT ?, COALESCE((SELECT MIN(seq) FROM run_events WHERE run_id = ?), 0), COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?), 0), ? ON CONFLICT (run_id) DO UPDATE SET first_seq = excluded.first_seq, high_water_seq = MAX(run_retention.high_water_seq, excluded.high_water_seq), updated_at_ms = excluded.updated_at_ms",
+                    params: [sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_text(input.run_id.copy()), sql_int(input.now_ms.copy())],
+                            query: false,
+                            limits: sql_limits(1000, 4194304)
+                            },
+                {
+                    sql: "UPDATE runs SET updated_at_ms = ? WHERE id = ?",
+                    params: [sql_int(input.now_ms.copy()), sql_text(input.run_id.copy())],
+                            query: false,
+                            limits: sql_limits(1000, 4194304)
+                            },
+                {
+                    sql: "UPDATE runs SET status = 'after_partial_write' WHERE ? = 'after_partial_write' AND id = ?",
+                    params: [sql_text(failpoint), sql_text(input.run_id.copy())],
+                            query: false,
+                            limits: sql_limits(1000, 4194304)
+                            }
+            ];
+            result = { ok: true, code: "ok", message: "", result: sqlite::transaction(&db_id, statements) };
+            if failpoint == "after_commit_before_publish" {
+                result = { ok: false, code: "failpoint_after_commit_before_publish", message: "durable commit succeeded; live publish skipped", result: [] };
+            }
+        }
     }
     result
 }

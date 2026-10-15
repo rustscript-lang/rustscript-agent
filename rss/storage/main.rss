@@ -393,6 +393,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         };
     } else if command.op == "event.append" {
         result = storage_unwrap_array(request_id, op, events::storage_event_append(db_id, command.payload_json));
+    } else if command.op == "event.append_pair" {
+        result = storage_unwrap_array(request_id, op, events::storage_event_append_pair(db_id, command.payload_json));
     } else if command.op == "step.commit" {
         result = storage_unwrap_array(request_id, op, events::storage_step_commit(db_id, command.payload_json));
     } else if command.op == "recovery.reconcile_effects" {

@@ -1375,3 +1375,74 @@ fn commit_rejects_invalid_canonical_results_without_closing_token() {
         LifecycleError::DuplicateClose
     );
 }
+
+/// Default `commit_pair` is sequential and explicitly NOT atomic (test fallback only).
+#[test]
+fn default_commit_pair_is_sequential_non_atomic_fallback() {
+    use rustscript_agent::{DurableEventCommitter, EventCommitError};
+    struct RecordingCommitter {
+        commits: Mutex<Vec<String>>,
+    }
+    impl DurableEventCommitter for RecordingCommitter {
+        fn is_terminal(&self) -> bool {
+            false
+        }
+        fn commit(&self, event_type: &str, _data: Value) -> Result<(), EventCommitError> {
+            self.commits
+                .lock()
+                .expect("commits")
+                .push(event_type.to_string());
+            Ok(())
+        }
+    }
+    let committer = RecordingCommitter {
+        commits: Mutex::new(Vec::new()),
+    };
+    committer
+        .commit_pair(
+            ("tool.requested", json!({"tool_call_id": "pair-doc"})),
+            ("tool.started", json!({"tool_call_id": "pair-doc"})),
+        )
+        .expect("default pair forwards sequentially");
+    assert_eq!(
+        committer.commits.lock().expect("commits").clone(),
+        vec!["tool.requested".to_string(), "tool.started".to_string()],
+        "default must preserve requested-before-started order without atomicity promise"
+    );
+}
+
+/// Cancelled prepare persists nothing and issues no token (pair path included).
+#[test]
+fn prepare_pair_cancelled_no_persist_no_token() {
+    let log = SequenceLog::new();
+    let durable = MemoryDurable::new(Arc::clone(&log));
+    let cancel = FlagCancel::new();
+    cancel.cancel();
+    let lifecycle = CapabilityLifecycle::builder()
+        .owner(owner())
+        .registry_identity("registry-a")
+        .workspace("/tmp/workspace-a")
+        .limits(LifecycleLimits {
+            max_tool_calls: 8,
+            max_output_bytes: 4096,
+            max_summary_bytes: 256,
+        })
+        .deadline_ms(10_000)
+        .clock(Arc::clone(&ScriptedClock::new(1_000)) as Arc<dyn LifecycleClock>)
+        .tokens(LoggingIssuer::new(Arc::clone(&log)) as Arc<dyn TokenIssuer>)
+        .durable(durable.clone() as Arc<dyn DurableToolLifecycle>)
+        .approval(Arc::new(AllowAll) as Arc<dyn ApprovalGate>)
+        .cancellation(Arc::clone(&cancel) as Arc<dyn CancellationFlag>)
+        .generation(1)
+        .build()
+        .expect("lifecycle");
+    let error = lifecycle
+        .prepare(&owner(), metadata("call-cancel-pair", "fixture_only_tool"))
+        .expect_err("cancelled prepare must not start");
+    assert_eq!(error, LifecycleError::Cancelled);
+    assert!(
+        log.snapshot().is_empty(),
+        "no commit and no token on cancel"
+    );
+    assert!(durable.started_records().is_empty());
+}
