@@ -1668,25 +1668,40 @@ async fn durable_tool_replay_does_not_increment_activity() {
             service.run_worker(run_id, "ignored".to_string()).await;
         })
     };
-    assert!(
-        wait_until(Duration::from_secs(2), || {
-            has_tool_result_event(&service, &admitted.run_id, &call.id)
-        })
-        .await,
-        "worker should commit the first tool result: {:?}",
-        service.run_events(&admitted.run_id)
-    );
-    let before = activity_values(&service);
-    assert_eq!(before, [1, 1, 1, 1, 0]);
-    let replayed = common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
-        .expect("durable replay");
-    assert_eq!(replayed.len(), 1);
-    assert!(!replayed[0].ok);
-    assert_eq!(activity_values(&service), before);
-    assert_prometheus_matches_snapshot(&service);
-
+    let observation = AssertUnwindSafe(async {
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                has_tool_result_event(&service, &admitted.run_id, &call.id)
+                    && activity_values(&service) == [1, 1, 1, 1, 0]
+            })
+            .await,
+            "worker should commit the first tool result: {:?}",
+            service.run_events(&admitted.run_id)
+        );
+        let before = activity_values(&service);
+        assert_eq!(before, [1, 1, 1, 1, 0]);
+        let replayed =
+            common::dispatch_rss(&service, &admitted.run_id, std::slice::from_ref(&call))
+                .expect("durable replay");
+        assert_eq!(replayed.len(), 1);
+        assert!(!replayed[0].ok);
+        assert_eq!(activity_values(&service), before);
+        assert_prometheus_matches_snapshot(&service);
+    })
+    .catch_unwind()
+    .await;
+    let cleanup_started = Instant::now();
     service.stop(&admitted.run_id);
-    worker.await.expect("worker join");
+    let remaining = Duration::from_secs(8).saturating_sub(cleanup_started.elapsed());
+    let join_outcome = tokio::time::timeout(remaining, worker).await;
+    let captured = AssertUnwindSafe(async move {
+        resume_observation_panic(observation);
+        let worker = join_outcome.expect("owned worker must join within shared 8s cleanup budget");
+        worker.expect("worker join");
+    })
+    .catch_unwind()
+    .await;
+    resume_observation_panic(captured);
     assert_eq!(
         terminal_events(&service, &admitted.run_id),
         vec!["run.cancelled".to_string()]
