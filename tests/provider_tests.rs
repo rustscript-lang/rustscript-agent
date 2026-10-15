@@ -654,15 +654,31 @@ fn openai_chat_provider_error_is_structured() {
 }
 
 #[test]
-fn openai_chat_unauthorized_and_rate_limited_are_structured() {
-    // 401 denies without retry; 429 admits retry. Both stay canonical with
-    // the provider `code` field sanitized away and no secret echo.
+fn openai_chat_api_key_unauthorized_and_rate_limited_are_structured() {
+    // API-key generic HTTP 401/429 classification: the API-key credential
+    // kind never enters the production OAuth 401 refresh path
+    // (rss/agent/provider_runtime.rss refreshes `oauth` on 401 only; the
+    // OAuth 401 refresh behavior stays covered by
+    // provider_401_refresh_loop_tests). 401 denies without retry; 429 admits
+    // retry. Both stay canonical with the provider `code` field sanitized
+    // away and no secret echo.
     let cases: [(u16, &str, bool); 2] = [
         (401, "invalid_request_error", false),
         (429, "rate_limit_error", true),
     ];
     for (status, error_type, retryable) in cases {
-        let home = openai_home();
+        let home = openai_home().with_api_key("synthetic-openai");
+        let stored = home.stored_auth();
+        assert_eq!(
+            stored["credentials"]["synthetic-openai"]["kind"].as_str(),
+            Some("api_key"),
+            "HTTP {status} fixture must store the api_key kind"
+        );
+        assert!(
+            stored["credentials"]["synthetic-openai"]["refresh_token"].is_null(),
+            "HTTP {status} API-key fixture must hold no refresh token"
+        );
+        let before = home.stored_auth();
         let transport = Arc::new(ScriptedHttpsTransport::new());
         transport.push_json(
             status,
@@ -692,7 +708,29 @@ fn openai_chat_unauthorized_and_rate_limited_are_structured() {
             json!("Synthetic provider rejection"),
             "HTTP {status}"
         );
-        assert_eq!(transport.take_sent().len(), 1, "HTTP {status}");
+        let sent = transport.take_sent();
+        assert_eq!(sent.len(), 1, "HTTP {status}");
+        assert_eq!(sent[0].method, "POST", "HTTP {status}");
+        assert_eq!(
+            sent[0].url, "https://fixture.example.test/v1/chat/completions",
+            "HTTP {status} native trusted authority owns the request URL"
+        );
+        assert_eq!(
+            sent[0].headers.get("authorization").map(String::as_str),
+            Some("Bearer SYNTHETIC_OPENAI_ACCESS"),
+            "HTTP {status}"
+        );
+        assert!(
+            !sent.iter().any(
+                |request| request.url.contains("oauth/token") || request.url.contains("/token")
+            ),
+            "HTTP {status} must send no token request"
+        );
+        assert_eq!(
+            home.stored_auth(),
+            before,
+            "HTTP {status} failure must not persist an auth store change"
+        );
         let rendered = result.to_string();
         assert!(
             !rendered.contains("SYNTHETIC_PRIVATE_CODE_FIELD"),
