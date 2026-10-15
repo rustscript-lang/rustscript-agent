@@ -2326,6 +2326,12 @@ impl BoundedProcessHandle {
     }
 
     pub fn write_stdin(&self, bytes: &[u8]) -> Result<usize, BoundedProcessError> {
+        if !bytes.is_empty()
+            && bytes.len() <= MAX_STDIN_WRITE_BYTES
+            && self.terminal_status().is_some()
+        {
+            return Err(BoundedProcessError::StdinClosed);
+        }
         self.process.stdin.write(bytes)
     }
 
