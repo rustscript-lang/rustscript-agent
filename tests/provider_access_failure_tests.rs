@@ -1,9 +1,21 @@
-//! Real default-RSS adoption of the fallible access result.
+//! Real default-RSS preflight-refresh adoption for expired OAuth credentials.
 //!
-//! A stored credential that is still readable but past its access lifetime
-//! must surface the canonical public `access_unavailable` result without any
-//! native transport, while a valid credential keeps producing the existing
-//! authenticated canonical OpenAI Chat result.
+//! An expired refreshable credential preflight-refreshes through the
+//! production `rss/agent/provider_runtime.rss` before any model send. A
+//! rejected preflight refresh (`400 {"error":"invalid_grant"}`) surfaces the
+//! canonical public `reauth_required` result with exactly one token POST and
+//! zero model POSTs, without persisting. A repaired expiry then succeeds
+//! through the same runner with the canonical authenticated Chat result.
+//! A valid credential keeps producing the existing authenticated canonical
+//! OpenAI Chat result. Direct native `access_handle` denial still surfaces
+//! `access_unavailable` with zero sends; that direct-catalog path is distinct
+//! from the default preflight path.
+//!
+//! Mapping (old -> new, same 4 behavior cases, no added cases):
+//! - default_provider_expired_credential_is_access_unavailable_without_send
+//!   -> default_provider_expired_credential_preflight_reauth_without_model_send
+//! - default_provider_recovers_after_synthetic_credential_expiry_repair
+//!   -> default_provider_preflight_reauth_recovers_after_expiry_repair
 
 #![cfg(feature = "config-fixture")]
 
@@ -36,6 +48,12 @@ const FUTURE_EXPIRY_MS: &str = "1900003600000";
 
 const ACCESS_MARKER: &str = "SYNTHETIC_OPENAI_ACCESS";
 const REFRESH_MARKER: &str = "SYNTHETIC_REFRESH_TOKEN";
+
+/// Fixture-configured token endpoint (synthetic config keeps the frozen
+/// `https://auth.openai.com/oauth/token` while the model base is rewritten).
+const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+/// Fixture-configured model endpoint (synthetic base `https://api.openai.com/v1`).
+const MODEL_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 /// Outer RSS entry: forward the public request through the production bridge.
 /// The default provider (not an injected one) handles dispatch.
@@ -153,6 +171,17 @@ impl FixtureHome {
         #[cfg(unix)]
         fs::set_permissions(self.0.join("auth.yaml"), fs::Permissions::from_mode(0o600))
             .expect("restore private file mode");
+    }
+
+    fn stored_auth_bytes(&self) -> Vec<u8> {
+        fs::read(self.0.join("auth.yaml")).expect("read stored synthetic auth")
+    }
+
+    fn stored_auth_yaml(&self) -> serde_yaml::Value {
+        serde_yaml::from_str(
+            &fs::read_to_string(self.0.join("auth.yaml")).expect("read stored auth text"),
+        )
+        .expect("stored auth YAML")
     }
 }
 
@@ -298,10 +327,33 @@ fn assert_no_secret_leak(rendered: &str) {
     }
 }
 
+/// Exact scripted refresh rejection: the only approved preflight failure
+/// signal. The private description must never reach the public result.
+fn invalid_grant_rejection() -> JsonValue {
+    json!({"error": "invalid_grant", "error_description": "private refresh description"})
+}
+
+fn assert_store_generation_active(home: &FixtureHome) {
+    let stored = home.stored_auth_yaml();
+    assert_eq!(
+        stored["credentials"]["synthetic-openai"]["generation"].as_i64(),
+        Some(4),
+        "stored generation stays unchanged"
+    );
+    assert_eq!(
+        stored["credentials"]["synthetic-openai"]["status"].as_str(),
+        Some("active"),
+        "stored status stays unchanged"
+    );
+}
+
 #[test]
-fn default_provider_expired_credential_is_access_unavailable_without_send() {
+fn default_provider_expired_credential_preflight_reauth_without_model_send() {
     let home = FixtureHome::new(PAST_EXPIRY_MS);
+    let before_bytes = home.stored_auth_bytes();
+    assert_store_generation_active(&home);
     let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_json(400, invalid_grant_rejection());
     let runner = outer_runner(&home, transport.clone(), finite());
 
     let result = vm_value_to_json(
@@ -313,18 +365,45 @@ fn default_provider_expired_credential_is_access_unavailable_without_send() {
     assert_eq!(
         result["ok"],
         json!(false),
-        "expired access must not report success: {result}"
+        "expired preflight refresh must not report success: {result}"
     );
     assert_eq!(
         result["error"]["code"],
-        json!("access_unavailable"),
-        "expired stored credential must surface the canonical access code: {result}"
-    );
-    assert!(
-        transport.take_sent().is_empty(),
-        "expired access must not reach the native transport"
+        json!("reauth_required"),
+        "rejected preflight refresh must surface the single canonical reauth code: {result}"
     );
     assert_no_secret_leak(&result.to_string());
+    assert!(
+        !result.to_string().contains("private refresh description"),
+        "private refresh detail must not leak: {result}"
+    );
+
+    let sent = transport.take_sent();
+    assert_eq!(
+        sent.len(),
+        1,
+        "exactly one preflight token POST and nothing else: {sent:?}"
+    );
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(
+        sent[0].url, TOKEN_URL,
+        "the fixture-configured token endpoint must win"
+    );
+    assert!(
+        sent[0].body.contains("grant_type=refresh_token"),
+        "the single send must be the refresh attempt"
+    );
+    assert!(
+        sent.iter().all(|request| request.url != MODEL_URL),
+        "zero model endpoint posts on the rejected refresh"
+    );
+
+    assert_eq!(
+        home.stored_auth_bytes(),
+        before_bytes,
+        "rejected refresh leaves persistence unchanged"
+    );
+    assert_store_generation_active(&home);
 }
 
 #[test]
@@ -371,9 +450,12 @@ fn default_provider_valid_credential_is_authenticated_control() {
 }
 
 #[test]
-fn default_provider_recovers_after_synthetic_credential_expiry_repair() {
+fn default_provider_preflight_reauth_recovers_after_expiry_repair() {
     let home = FixtureHome::new(PAST_EXPIRY_MS);
+    let before_bytes = home.stored_auth_bytes();
+    assert_store_generation_active(&home);
     let transport = Arc::new(ScriptedHttpsTransport::new());
+    transport.push_json(400, invalid_grant_rejection());
     transport.push_json(200, canonical_chat_body());
     let runner = outer_runner(&home, transport.clone(), finite());
 
@@ -383,13 +465,41 @@ fn default_provider_recovers_after_synthetic_credential_expiry_repair() {
             .expect("expired invocation returns a canonical public result"),
     );
     assert_eq!(failed["ok"], json!(false), "expired run: {failed}");
-    assert_eq!(failed["error"]["code"], json!("access_unavailable"));
-    assert!(
-        transport.take_sent().is_empty(),
-        "the failed invocation must not send"
+    assert_eq!(
+        failed["error"]["code"],
+        json!("reauth_required"),
+        "rejected preflight refresh must surface the single canonical reauth code: {failed}"
     );
+    assert_no_secret_leak(&failed.to_string());
+    assert!(
+        !failed.to_string().contains("private refresh description"),
+        "private refresh detail must not leak: {failed}"
+    );
+    let first_sent = transport.take_sent();
+    assert_eq!(
+        first_sent.len(),
+        1,
+        "exactly one preflight token POST on the failed invocation: {first_sent:?}"
+    );
+    assert_eq!(first_sent[0].method, "POST");
+    assert_eq!(
+        first_sent[0].url, TOKEN_URL,
+        "the fixture-configured token endpoint must win"
+    );
+    assert!(
+        first_sent.iter().all(|request| request.url != MODEL_URL),
+        "zero model endpoint posts on the rejected refresh"
+    );
+    assert_eq!(
+        home.stored_auth_bytes(),
+        before_bytes,
+        "rejected refresh leaves persistence unchanged"
+    );
+    assert_store_generation_active(&home);
 
     // Controlled repair of the synthetic stored expiry, then the same runner.
+    // The queued canonical chat body is still pending: the rejected refresh
+    // must not have consumed it.
     home.set_expiry(FUTURE_EXPIRY_MS);
     let recovered = vm_value_to_json(
         &runner
@@ -402,12 +512,51 @@ fn default_provider_recovers_after_synthetic_credential_expiry_repair() {
         "the prior expiry failure must not persist as a caller failure: {recovered}"
     );
     assert_eq!(recovered["response"]["text"], json!("Found one match."));
-    let sent = transport.take_sent();
-    assert_eq!(sent.len(), 1, "only the repaired invocation sends");
+    assert_eq!(recovered["response"]["stop_reason"], json!("tool_calls"));
+    assert_eq!(recovered["response"]["usage"]["input_tokens"], json!(3));
+    assert_eq!(recovered["response"]["usage"]["output_tokens"], json!(4));
+    assert_eq!(recovered["response"]["usage"]["total_tokens"], json!(7));
     assert_eq!(
-        sent[0].headers.get("authorization").map(String::as_str),
+        recovered["response"]["tool_calls"][0]["id"],
+        json!("call_access")
+    );
+    assert_eq!(
+        recovered["response"]["tool_calls"][0]["name"],
+        json!("lookup")
+    );
+    assert_eq!(
+        recovered["response"]["tool_calls"][0]["arguments"]["query"],
+        json!("rustscript")
+    );
+    let second_sent = transport.take_sent();
+    assert_eq!(
+        second_sent.len(),
+        1,
+        "only the repaired invocation sends a model request: {second_sent:?}"
+    );
+    assert_eq!(second_sent[0].method, "POST");
+    assert_eq!(
+        second_sent[0].url, MODEL_URL,
+        "the repaired invocation posts the model endpoint"
+    );
+    assert_eq!(
+        second_sent[0]
+            .headers
+            .get("authorization")
+            .map(String::as_str),
         Some(format!("Bearer {ACCESS_MARKER}").as_str())
     );
+    assert!(
+        second_sent.iter().all(|request| request.url != TOKEN_URL),
+        "no additional refresh on the repaired invocation"
+    );
+    assert_eq!(
+        first_sent.len() + second_sent.len(),
+        2,
+        "combined requests are token THEN model exactly"
+    );
+    assert_eq!(first_sent[0].url, TOKEN_URL);
+    assert_eq!(second_sent[0].url, MODEL_URL);
     assert_no_secret_leak(&failed.to_string());
     assert_no_secret_leak(&recovered.to_string());
 }
