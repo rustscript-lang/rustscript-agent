@@ -1018,9 +1018,144 @@ mod tests {
         assert_ne!(observed, self_tid, "worker id is a distinct thread");
         // No instruction was queued: this is an idle orderly stop.
         assert!(worker.finish().is_ok());
-        // A joined worker's thread is gone.
-        assert!(!std::path::Path::new(&format!("/proc/self/task/{observed}")).exists());
+        // A joined worker's thread is gone within the original budget.
+        wait_owned_tid_absence(observed, deadline, None)
+            .expect("joined worker TID must disappear within original deadline");
         assert_eq!(status_flags(read_fd.as_raw_fd()) & libc::O_NONBLOCK, 0);
+    }
+
+    /// Strict OS-TID absence within the original budget (bounded observer).
+    ///
+    /// Uses the fixed `/proc/self/task/<tid>` path with `symlink_metadata`;
+    /// only `NotFound` means absent. Any other I/O error or unexpected type
+    /// fails explicitly. Present samples invoke `on_present` once, then poll
+    /// with the existing 2ms granularity bounded by the remaining original
+    /// budget; no fresh timeout is created.
+    fn wait_owned_tid_absence(
+        tid: i64,
+        original_deadline: Instant,
+        mut on_present: Option<&mut dyn FnMut()>,
+    ) -> Result<(), String> {
+        let path = format!("/proc/self/task/{tid}");
+        if Instant::now() >= original_deadline {
+            return Err(format!("owned TID {tid} still present (bound expired)"));
+        }
+        let mut notified = false;
+        loop {
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if Instant::now() <= original_deadline {
+                        return Ok(());
+                    }
+                    return Err(format!("owned TID {tid} disappeared after original bound"));
+                }
+                Err(error) => {
+                    return Err(format!("owned TID {tid} observer failed: {error:?}"));
+                }
+                Ok(metadata) => {
+                    if !metadata.is_dir() {
+                        return Err(format!("owned TID {tid} has unexpected type"));
+                    }
+                    if !notified {
+                        notified = true;
+                        if let Some(callback) = on_present.as_mut() {
+                            callback();
+                        }
+                    }
+                    if Instant::now() >= original_deadline {
+                        return Err(format!("owned TID {tid} still present (bound expired)"));
+                    }
+                    let remaining = original_deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or_default();
+                    if remaining.is_zero() {
+                        return Err(format!("owned TID {tid} still present (bound expired)"));
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(2)));
+                }
+            }
+        }
+    }
+
+    struct HeldThreadGuard {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for HeldThreadGuard {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[test]
+    fn owned_tid_observer_rejects_live_and_observes_absence_after_release() {
+        let control_deadline = Instant::now() + Duration::from_secs(3);
+        let (tid_sender, tid_receiver) = std::sync::mpsc::channel::<i64>();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+        let handle = thread::Builder::new()
+            .name("owned-tid-control".to_owned())
+            .spawn(move || {
+                // SAFETY: SYS_gettid reads this thread's id.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+                let _ = tid_sender.send(tid);
+                let _ = release_receiver.recv();
+            })
+            .expect("spawn held control thread");
+        let mut guard = HeldThreadGuard {
+            release: Some(release_sender),
+            handle: Some(handle),
+        };
+        let release_clone = guard
+            .release
+            .as_ref()
+            .expect("held release channel")
+            .clone();
+        let live_tid = tid_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("control thread reports TID");
+        // SAFETY: SYS_gettid reads the test thread's id.
+        let self_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+        assert_ne!(live_tid, self_tid, "control TID is distinct");
+        // An already-expired bound must reject the LIVE tid without releasing it.
+        let expired = Instant::now();
+        assert!(
+            wait_owned_tid_absence(live_tid, expired, None).is_err(),
+            "expired bound must reject live TID"
+        );
+        {
+            let path = format!("/proc/self/task/{live_tid}");
+            assert!(
+                std::fs::symlink_metadata(&path).is_ok(),
+                "control thread must still be live after expired rejection"
+            );
+        }
+        // Bounded observation releases SAME thread on first present, then sees real absence.
+        let mut released = false;
+        {
+            let mut on_present = || {
+                if !released {
+                    released = true;
+                    let _ = release_clone.send(());
+                }
+            };
+            wait_owned_tid_absence(live_tid, control_deadline, Some(&mut on_present))
+                .expect("bounded observer must see real absence after release");
+        }
+        assert!(released, "callback must fire on present");
+        if let Some(handle) = guard.handle.take() {
+            handle.join().expect("control thread joins after release");
+        }
+        let path = format!("/proc/self/task/{live_tid}");
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            other => panic!("control TID must be gone after join, got {other:?}"),
+        }
     }
 
     fn wait_for_thread_id(worker: &NativeAuthorizationInstructionWorker) -> i64 {
