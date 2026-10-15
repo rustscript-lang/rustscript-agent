@@ -20,10 +20,10 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1027,6 +1027,71 @@ fn with_native_auth_home(
     Ok(Value::map(fields))
 }
 
+/// Upper bound of one idle wait slice in the synchronous invocation pump. This
+/// matches the historical unconditional sleep; signaled readiness wakes resume
+/// earlier through the shared notification below.
+const INVOCATION_PUMP_IDLE_WAIT: Duration = Duration::from_millis(1);
+
+/// Per-invocation readiness notification for the synchronous invocation pump.
+/// One allocation per [`AgentRunner::run_invocation`]; no global state, no new
+/// runtime, and no interference with other threads or runs.
+struct InvocationWakeState {
+    notified: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl InvocationWakeState {
+    fn new() -> Self {
+        Self {
+            notified: Mutex::new(false),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+/// [`Wake`] backed by [`InvocationWakeState`]. Notifications coalesce in the
+/// flag: every wake is preserved until the pump consumes it, so a wake that
+/// lands before or during the idle wait is never lost.
+struct InvocationWaker {
+    state: Arc<InvocationWakeState>,
+}
+
+impl Wake for InvocationWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let mut notified = self.state.notified.lock().expect("invocation wake flag");
+        *notified = true;
+        self.state.ready.notify_one();
+    }
+}
+
+/// Parks the pump until the pending native operation signals readiness or the
+/// bounded idle slice elapses. A notification that arrived before the wait is
+/// consumed immediately without blocking; every notification is consumed
+/// exactly once. Returns true when a notification was consumed.
+fn await_invocation_readiness(state: &InvocationWakeState) -> bool {
+    let mut notified = state.notified.lock().expect("invocation wake flag");
+    let deadline = Instant::now() + INVOCATION_PUMP_IDLE_WAIT;
+    loop {
+        if *notified {
+            *notified = false;
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        notified = state
+            .ready
+            .wait_timeout(notified, remaining)
+            .expect("invocation wake wait")
+            .0;
+    }
+}
+
 impl AgentRunner {
     pub fn from_source(source: &str, config: AgentConfig) -> Result<Self> {
         let (program, digest) = compiled_source_program(source)?;
@@ -1504,6 +1569,17 @@ impl AgentRunner {
             let mut invocation = vm
                 .start_invocation(callable, vec![context])
                 .map_err(RunError::Setup)?;
+            // Wake-aware synchronous pump: one per-invocation readiness
+            // notification. The live waker is forwarded into the pending
+            // native operation through the public context-aware poll entry
+            // point, so signaled readiness resumes the pump immediately. The
+            // bounded idle wait below only covers operations that never
+            // signal, and never exceeds the historical sleep.
+            let wake_state = Arc::new(InvocationWakeState::new());
+            let waker = Waker::from(Arc::new(InvocationWaker {
+                state: Arc::clone(&wake_state),
+            }));
+            let mut poll_cx = Context::from_waker(&waker);
             loop {
                 if let Some(reason) = cancellation.and_then(|cancel| cancel.requested()) {
                     invocation.cancel(reason).map_err(RunError::Setup)?;
@@ -1517,11 +1593,13 @@ impl AgentRunner {
                 // context for the duration of each poll.
                 let runtime = agent_runtime_handle();
                 let guard = runtime.enter();
-                let poll = invocation.poll_next().map_err(RunError::Setup);
+                let poll = invocation
+                    .poll_next_with_context(&mut poll_cx)
+                    .map_err(RunError::Setup);
                 drop(guard);
                 match poll? {
                     InvocationPoll::Pending => {
-                        thread::sleep(Duration::from_millis(1));
+                        await_invocation_readiness(&wake_state);
                     }
                     InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) => {
                         if let Some(sink) = sink.as_deref_mut() {
@@ -2027,6 +2105,284 @@ mod restricted_registry_tests {
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "the guest must not make a network request"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wake_aware_pump_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Waker sightings recorded by the forwarding bridge wrapper below. The
+    /// pump's waker is fingerprinted by raw identity: a std no-op waker always
+    /// carries a null data pointer, while the wake-aware pump's `Arc` waker
+    /// carries one stable non-null allocation. (`Waker::will_wake` is
+    /// documented best-effort address comparison and cannot reliably compare
+    /// no-op wakers across crates, so identity pointers are used instead.)
+    #[derive(Default)]
+    struct WakerSightings {
+        polls: AtomicUsize,
+        wakers: Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl WakerSightings {
+        fn saw_only_null_wakers(&self) -> bool {
+            let wakers = self.wakers.lock().expect("sightings lock");
+            !wakers.is_empty() && wakers.iter().all(|(data, _)| *data == 0)
+        }
+
+        fn saw_single_shared_waker(&self) -> bool {
+            let wakers = self.wakers.lock().expect("sightings lock");
+            !wakers.is_empty() && wakers.iter().all(|entry| *entry == wakers[0]) && wakers[0].0 != 0
+        }
+    }
+
+    /// Test-only [`HostAsyncBridge`] wrapper that forwards submitted futures to
+    /// the real [`AgentAsyncBridge`] and drives external pending operations
+    /// itself with a real Tokio timer future, while observing which waker the
+    /// invocation pump supplies on every poll.
+    struct RecordingBridge {
+        inner: AgentAsyncBridge,
+        runtime: tokio::runtime::Handle,
+        seen: Arc<WakerSightings>,
+        timers: HashMap<rustscript_vm::HostOpId, std::pin::Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl RecordingBridge {
+        fn new(seen: Arc<WakerSightings>) -> Self {
+            Self {
+                inner: AgentAsyncBridge::new(),
+                runtime: agent_runtime_handle(),
+                seen,
+                timers: HashMap::new(),
+            }
+        }
+
+        fn observe(&self, cx: &mut Context<'_>) {
+            self.seen.polls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.seen.wakers.lock().expect("sightings lock").push((
+                cx.waker().data() as usize,
+                cx.waker().vtable() as *const _ as usize,
+            ));
+        }
+    }
+
+    impl HostAsyncBridge for RecordingBridge {
+        fn submit_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            future: HostFuture,
+        ) -> VmResult<()> {
+            self.inner.submit_op(op_id, future)
+        }
+
+        fn poll_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            cx: &mut Context<'_>,
+        ) -> Poll<VmResult<CallReturn>> {
+            self.observe(cx);
+            let timer = self
+                .timers
+                .entry(op_id)
+                .or_insert_with(|| Box::pin(tokio::time::sleep(DEFERRED_NATIVE_COMPLETION)));
+            let _guard = self.runtime.enter();
+            match timer.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    self.timers.remove(&op_id);
+                    Poll::Ready(Ok(CallReturn::one(Value::map(vec![]))))
+                }
+            }
+        }
+
+        fn poll_submitted_op(
+            &mut self,
+            op_id: rustscript_vm::HostOpId,
+            cx: &mut Context<'_>,
+        ) -> Poll<VmResult<HostFutureOutput<CallReturn>>> {
+            self.observe(cx);
+            self.inner.poll_submitted_op(op_id, cx)
+        }
+
+        fn cancel_op(&mut self, op_id: rustscript_vm::HostOpId) {
+            self.timers.remove(&op_id);
+            self.inner.cancel_op(op_id);
+        }
+    }
+
+    /// Completion latency of the deferred native operation: a real Tokio timer
+    /// future. No test asserts on this duration; it only bounds the run.
+    const DEFERRED_NATIVE_COMPLETION: Duration = Duration::from_millis(20);
+    /// Fixed completion value of the deferred native operation.
+    const DEFERRED_NATIVE_OUTPUT: &str = "deferred-encode";
+
+    /// Test-only stand-in for a pending native operation. It keeps a real
+    /// `agent::*` guest contract (one string argument, open return) but returns
+    /// a genuinely pending host operation instead of computing synchronously,
+    /// so the VM parks the invocation on the async bridge and the pump must
+    /// drive it. Installed only in this test's registry copy; the production
+    /// registry is untouched.
+    fn deferred_pending_wake(vm: &mut Vm, _args: &[Value]) -> VmResult<rustscript_vm::CallOutcome> {
+        Ok(rustscript_vm::CallOutcome::Pending(
+            vm.allocate_host_op_id(),
+        ))
+    }
+
+    /// Guest name of the deferred native operation.
+    const DEFERRED_WAKE_FN: &str = "agent::test_deferred_wake";
+
+    fn deferred_wake_function_schema() -> rustscript_vm::HostFunctionSchema {
+        rustscript_vm::HostFunctionSchema::with_return(
+            DEFERRED_WAKE_FN,
+            vec![rustscript_vm::HostParamSchema::value(
+                "text",
+                rustscript_vm::HostTypeSchema::String,
+            )],
+            rustscript_vm::HostTypeSchema::Unknown,
+        )
+    }
+
+    /// Real agent catalog extended by exactly one test function, so the fixture
+    /// compiles through the genuine compiler path with a consistent catalog
+    /// fingerprint.
+    fn deferred_wake_catalog() -> Arc<rustscript_vm::HostApiCatalog> {
+        let mut builder = rustscript_vm::HostApiBuilder::new();
+        super::super::host_compose::absorb_catalog(&mut builder, agent_host_catalog().as_ref());
+        builder.function(deferred_wake_function_schema());
+        Arc::new(builder.build().expect("extended test catalog must build"))
+    }
+
+    /// The synchronous invocation pump must forward a live caller waker to a
+    /// pending native operation so readiness can resume the pump early. Drives
+    /// the actual [`AgentRunner::run_invocation`] over a genuinely compiled
+    /// fixture whose deferred native call pends on the async bridge, driven
+    /// there by a real Tokio timer future through the real `poll_op` path.
+    #[test]
+    fn invocation_pump_forwards_live_waker_to_pending_native_operation() {
+        const SOURCE: &str = r#"use agent;
+pub fn run(context: map) -> string {
+    agent::test_deferred_wake("probe");
+    "deferred-encode"
+}"#;
+        let catalog = deferred_wake_catalog();
+        let schema = rustscript_vm::HostImportSchema::from_function(
+            &catalog,
+            &deferred_wake_function_schema(),
+        );
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let program =
+            compile_source_with_flavor_and_options(SOURCE, SourceFlavor::RustScript, options)
+                .expect("deferred fixture must compile")
+                .program;
+        let runner = AgentRunner::from_program(
+            program,
+            AgentConfig::default(),
+            "deferred-wake-fixture".to_string(),
+        )
+        .expect("deferred fixture runner");
+        let mut registry = build_restricted_registry().expect("real restricted registry");
+        registry
+            .register_catalog_static(schema, deferred_pending_wake)
+            .expect("register deferred native operation");
+        registry.authorize_registered_builtin_import(DEFERRED_WAKE_FN);
+        let mut runner = runner;
+        runner.registry = Arc::new(registry);
+        let (mut vm, callable, _auth_binding) = runner.prepare_vm("run", None).expect("prepare vm");
+        let seen = Arc::new(WakerSightings::default());
+        vm.set_async_bridge(Box::new(RecordingBridge::new(Arc::clone(&seen))))
+            .expect("install recording bridge");
+        let output = runner
+            .run_invocation(&mut vm, callable, json_to_vm_value(&json!({})), None, None)
+            .expect("deferred run completes");
+        assert_eq!(
+            vm_value_to_json(&output),
+            json!(DEFERRED_NATIVE_OUTPUT),
+            "the deferred native operation must complete the run"
+        );
+        assert!(
+            seen.polls.load(AtomicOrdering::SeqCst) > 0,
+            "the pending native operation must be polled through the bridge"
+        );
+        assert!(
+            !seen.saw_only_null_wakers(),
+            "the pump must not poll a pending native operation with a no-op waker"
+        );
+        assert!(
+            seen.saw_single_shared_waker(),
+            "the pump must forward one live waker to the pending native operation"
+        );
+    }
+
+    fn test_waker_for(state: &Arc<InvocationWakeState>) -> Waker {
+        Waker::from(Arc::new(InvocationWaker {
+            state: Arc::clone(state),
+        }))
+    }
+
+    #[test]
+    fn wake_before_wait_is_consumed_without_blocking() {
+        let state = Arc::new(InvocationWakeState::new());
+        test_waker_for(&state).wake();
+        assert!(
+            await_invocation_readiness(&state),
+            "a wake before the wait must be consumed"
+        );
+        assert!(
+            !await_invocation_readiness(&state),
+            "the notification must be consumed exactly once"
+        );
+    }
+
+    #[test]
+    fn coalesced_wakes_consume_once() {
+        let state = Arc::new(InvocationWakeState::new());
+        let waker = test_waker_for(&state);
+        waker.wake_by_ref();
+        waker.wake_by_ref();
+        waker.wake();
+        assert!(
+            await_invocation_readiness(&state),
+            "coalesced wakes must surface"
+        );
+        assert!(
+            !await_invocation_readiness(&state),
+            "coalesced wakes must consume exactly once"
+        );
+    }
+
+    #[test]
+    fn idle_wait_without_notification_is_bounded() {
+        let state = InvocationWakeState::new();
+        assert!(
+            !await_invocation_readiness(&state),
+            "an unsignaled wait must report the bounded idle slice"
+        );
+    }
+
+    #[test]
+    fn wake_during_wait_is_observed() {
+        use std::thread;
+
+        let state = Arc::new(InvocationWakeState::new());
+        let waker_state = Arc::clone(&state);
+        let handle = thread::spawn(move || {
+            test_waker_for(&waker_state).wake();
+        });
+        let mut observed = false;
+        for _ in 0..1000 {
+            if await_invocation_readiness(&state) {
+                observed = true;
+                break;
+            }
+        }
+        handle.join().expect("waker thread joins");
+        assert!(observed, "a wake during the wait must be observed");
+        assert!(
+            !await_invocation_readiness(&state),
+            "the notification must be consumed exactly once"
         );
     }
 }
