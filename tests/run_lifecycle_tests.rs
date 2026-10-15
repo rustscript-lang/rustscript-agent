@@ -11,15 +11,15 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use rustscript_agent::config::{ProviderProfile, RunLimits};
 use rustscript_agent::{
-    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentRunner, AgentService,
-    LlmContentBlock, ScriptedProvider, ToolCall,
+    AdmitRunRequest, AgentConfig, AgentGatewayConfig, AgentGatewayState, AgentProviderHost,
+    AgentRunner, AgentService, LlmContentBlock, RunCancellation, ScriptedProvider, ToolCall,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -229,6 +229,57 @@ fn failed_error_code(service: &AgentService, run_id: &str) -> String {
                 .flatten()
         })
         .unwrap_or_default()
+}
+
+// Bounded scalar extraction for the actual `tool.failed` producer envelope.
+// Producer shape is readonly here (from `AgentService::commit_result` / `interrupt`):
+// `event == "tool.failed"` with `data` carrying scalar `error_code: String` alongside
+// `tool_call_id`, `ok`, `truncated` (plus optional `artifacts`). Only `error_code`
+// is rendered, capped at 64 chars with `...` marking truncation; absence, type, and
+// empty are explicit. No messages, prompts, bodies, paths, or credentials.
+fn bounded_tool_failed_code_from_events(events: &[JsonValue]) -> String {
+    let mut saw_missing = false;
+    let mut saw_non_string = false;
+    for event in events.iter().rev() {
+        if event.get("event").and_then(JsonValue::as_str) != Some("tool.failed") {
+            continue;
+        }
+        match event.pointer("/data/error_code") {
+            Some(JsonValue::String(code)) => {
+                if code.is_empty() {
+                    return "empty".to_string();
+                }
+                if code.chars().count() > DEADLINE_TOOL_CODE_LIMIT {
+                    let head: String = code.chars().take(DEADLINE_TOOL_CODE_LIMIT - 3).collect();
+                    return format!("{head}...");
+                }
+                return code.clone();
+            }
+            None => {
+                saw_missing = true;
+            }
+            Some(_) => {
+                saw_non_string = true;
+            }
+        }
+    }
+    if events
+        .iter()
+        .all(|event| event.get("event").and_then(JsonValue::as_str) != Some("tool.failed"))
+    {
+        return "none".to_string();
+    }
+    if saw_non_string {
+        return "non_string".to_string();
+    }
+    if saw_missing {
+        return "absent".to_string();
+    }
+    "absent".to_string()
+}
+
+fn tool_failed_error_code(service: &AgentService, run_id: &str) -> String {
+    bounded_tool_failed_code_from_events(&service.run_events(run_id))
 }
 
 fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> AgentGatewayState {
@@ -1186,12 +1237,260 @@ async fn stop_terminates_child_process_without_residue() {
     );
 }
 
+// Diagnostic-only bounded failure trace for `deadline_terminates_child_process_without_residue`.
+// Observability only: it never changes pass/fail and never replaces the owned-PID assertions.
+// Hot-path pushes are preallocated in-memory only (no IO/serde/sleep/threads/barrier); the
+// bounded text summary is rendered after cleanup and appended to the existing failure
+// diagnostic, so successful runs stay quiet.
+const DEADLINE_TRACE_CAP: usize = 64;
+const DEADLINE_TRACE_RENDER_LIMIT: usize = 1024;
+const DEADLINE_TOOL_CODE_LIMIT: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadlineTraceKind {
+    Admit,
+    WorkerSpawn,
+    ProviderEnter,
+    ProviderExit,
+    NativeBeforeSpawn,
+    NativeAfterSpawn,
+    PollSample,
+    Cleanup,
+    Attach,
+}
+
+struct DeadlineTraceRecord {
+    kind: DeadlineTraceKind,
+    elapsed_ms: u64,
+    detail: u64,
+}
+
+struct DeadlineFailureTrace {
+    start: Instant,
+    records: Vec<DeadlineTraceRecord>,
+    dropped: u64,
+}
+
+impl DeadlineFailureTrace {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            records: Vec::with_capacity(DEADLINE_TRACE_CAP),
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, kind: DeadlineTraceKind, detail: u64) {
+        if self.records.len() < DEADLINE_TRACE_CAP {
+            let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.records.push(DeadlineTraceRecord {
+                kind,
+                elapsed_ms,
+                detail,
+            });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    fn count(&self, kind: DeadlineTraceKind) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.kind == kind)
+            .count()
+    }
+
+    fn first_ms(&self, kind: DeadlineTraceKind) -> Option<u64> {
+        self.records
+            .iter()
+            .find(|record| record.kind == kind)
+            .map(|record| record.elapsed_ms)
+    }
+
+    fn last_ms(&self, kind: DeadlineTraceKind) -> Option<u64> {
+        self.records
+            .iter()
+            .rev()
+            .find(|record| record.kind == kind)
+            .map(|record| record.elapsed_ms)
+    }
+
+    fn attach_state(&self) -> &'static str {
+        let mut saw_miss = false;
+        for record in &self.records {
+            if record.kind == DeadlineTraceKind::Attach {
+                if record.detail == 1 {
+                    return "ok";
+                }
+                saw_miss = true;
+            }
+        }
+        if saw_miss { "miss" } else { "none" }
+    }
+
+    fn render_bounded(&self) -> String {
+        let span_ms = self
+            .records
+            .first()
+            .and_then(|first| {
+                self.records
+                    .last()
+                    .map(|last| last.elapsed_ms.saturating_sub(first.elapsed_ms))
+            })
+            .unwrap_or(0);
+        let last_poll = self
+            .records
+            .iter()
+            .rev()
+            .find(|record| record.kind == DeadlineTraceKind::PollSample)
+            .map(|record| record.detail);
+        let last_poll_text =
+            last_poll.map_or_else(|| "none".to_string(), |value| value.to_string());
+        let ms_text = |value: Option<u64>| {
+            value.map_or_else(|| "none".to_string(), |inner| inner.to_string())
+        };
+        let mut rendered = format!(
+            "cap={} records={} dropped={} span_ms={} admit={} worker={} prov_enter={} prov_exit={} native_before={} native_after={} poll={} cleanup={} attach={} attach_n={} last_poll_n={} t_admit_first={} t_admit_last={} t_worker_first={} t_worker_last={} t_prov_enter_first={} t_prov_enter_last={} t_prov_exit_first={} t_prov_exit_last={} t_native_before_first={} t_native_before_last={} t_native_after_first={} t_native_after_last={} t_poll_first={} t_poll_last={} t_cleanup_first={} t_cleanup_last={} t_attach_first={} t_attach_last={}",
+            DEADLINE_TRACE_CAP,
+            self.records.len(),
+            self.dropped,
+            span_ms,
+            self.count(DeadlineTraceKind::Admit),
+            self.count(DeadlineTraceKind::WorkerSpawn),
+            self.count(DeadlineTraceKind::ProviderEnter),
+            self.count(DeadlineTraceKind::ProviderExit),
+            self.count(DeadlineTraceKind::NativeBeforeSpawn),
+            self.count(DeadlineTraceKind::NativeAfterSpawn),
+            self.count(DeadlineTraceKind::PollSample),
+            self.count(DeadlineTraceKind::Cleanup),
+            self.attach_state(),
+            self.count(DeadlineTraceKind::Attach),
+            last_poll_text,
+            ms_text(self.first_ms(DeadlineTraceKind::Admit)),
+            ms_text(self.last_ms(DeadlineTraceKind::Admit)),
+            ms_text(self.first_ms(DeadlineTraceKind::WorkerSpawn)),
+            ms_text(self.last_ms(DeadlineTraceKind::WorkerSpawn)),
+            ms_text(self.first_ms(DeadlineTraceKind::ProviderEnter)),
+            ms_text(self.last_ms(DeadlineTraceKind::ProviderEnter)),
+            ms_text(self.first_ms(DeadlineTraceKind::ProviderExit)),
+            ms_text(self.last_ms(DeadlineTraceKind::ProviderExit)),
+            ms_text(self.first_ms(DeadlineTraceKind::NativeBeforeSpawn)),
+            ms_text(self.last_ms(DeadlineTraceKind::NativeBeforeSpawn)),
+            ms_text(self.first_ms(DeadlineTraceKind::NativeAfterSpawn)),
+            ms_text(self.last_ms(DeadlineTraceKind::NativeAfterSpawn)),
+            ms_text(self.first_ms(DeadlineTraceKind::PollSample)),
+            ms_text(self.last_ms(DeadlineTraceKind::PollSample)),
+            ms_text(self.first_ms(DeadlineTraceKind::Cleanup)),
+            ms_text(self.last_ms(DeadlineTraceKind::Cleanup)),
+            ms_text(self.first_ms(DeadlineTraceKind::Attach)),
+            ms_text(self.last_ms(DeadlineTraceKind::Attach)),
+        );
+        if rendered.len() > DEADLINE_TRACE_RENDER_LIMIT {
+            rendered.truncate(DEADLINE_TRACE_RENDER_LIMIT);
+        }
+        rendered
+    }
+}
+
+// Pure PID guard mirroring the deadline poll condition (`!empty && all alive`).
+// Used only by the deterministic trace-control unit test with synthetic PIDs;
+// hook presence never substitutes for a real owned PID in the lifecycle test.
+fn deadline_trace_pid_guard_all_alive(pids: &[u32], is_alive: impl Fn(u32) -> bool) -> bool {
+    !pids.is_empty() && pids.iter().all(|pid| is_alive(*pid))
+}
+
+struct DeadlineTracingProvider {
+    inner: ScriptedProvider,
+    trace: Arc<Mutex<DeadlineFailureTrace>>,
+    service: Weak<AgentService>,
+    run_id: Arc<OnceLock<String>>,
+    hook_attached: AtomicBool,
+}
+
+impl DeadlineTracingProvider {
+    fn record(&self, kind: DeadlineTraceKind, detail: u64) {
+        if let Ok(mut trace) = self.trace.lock() {
+            trace.push(kind, detail);
+        }
+    }
+
+    fn maybe_attach_native_hooks(&self) {
+        // Passive attach only: the first provider call runs after `run_worker` installed
+        // the capability host, so bridges are ready here. No early init, probe process,
+        // direct handler, new threads, barrier, sleep, or extra model call. The weak
+        // service/run-id avoids cycles; hooks capture only the trace.
+        // Attach outcome is witnessed as one bounded `Attach` record (detail 1=ok,
+        // 0=miss); the render reports `attach=ok/miss/none` after cleanup.
+        if self.hook_attached.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(run_id) = self.run_id.get() else {
+            self.record(DeadlineTraceKind::Attach, 0);
+            return;
+        };
+        let Some(service) = self.service.upgrade() else {
+            self.record(DeadlineTraceKind::Attach, 0);
+            return;
+        };
+        let bridges = match service.capability_host_bridges(run_id) {
+            Ok(Some(bridges)) => bridges,
+            _ => {
+                self.record(DeadlineTraceKind::Attach, 0);
+                return;
+            }
+        };
+        let Some(processes) = bridges.processes else {
+            self.record(DeadlineTraceKind::Attach, 0);
+            return;
+        };
+        let before_trace = Arc::clone(&self.trace);
+        processes.set_before_os_spawn_hook(Arc::new(move || {
+            if let Ok(mut trace) = before_trace.lock() {
+                trace.push(DeadlineTraceKind::NativeBeforeSpawn, 0);
+            }
+        }));
+        let after_trace = Arc::clone(&self.trace);
+        processes.set_after_os_spawn_hook(Arc::new(move || {
+            if let Ok(mut trace) = after_trace.lock() {
+                trace.push(DeadlineTraceKind::NativeAfterSpawn, 0);
+            }
+        }));
+        self.record(DeadlineTraceKind::Attach, 1);
+        self.hook_attached.store(true, Ordering::SeqCst);
+    }
+}
+
+impl AgentProviderHost for DeadlineTracingProvider {
+    fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
+        // No trace lock is held across the delegated provider call; request, cancel,
+        // and envelope semantics stay owned by the wrapped `ScriptedProvider`, so the
+        // observed call sequence keeps entry semantics (2 completed provider turns,
+        // tool-call + Guardian authorization, exclude the 3rd hang).
+        let entry_calls = self.inner.call_count();
+        self.record(DeadlineTraceKind::ProviderEnter, entry_calls);
+        self.maybe_attach_native_hooks();
+        let outcome = self.inner.call(request, cancellation);
+        self.record(DeadlineTraceKind::ProviderExit, self.inner.call_count());
+        outcome
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn deadline_terminates_child_process_without_residue() {
     let provider = ScriptedProvider::new();
     provider.push_ok(tool_response("", background_sleep_call()));
     provider.push_ok(guardian_high_authorized_response());
     provider.push_hang();
+    let deadline_trace = Arc::new(Mutex::new(DeadlineFailureTrace::new()));
+    let deadline_run_id = Arc::new(OnceLock::new());
     let (workspace, mut fixture_guard) = lifecycle_workspace_fixture_with_guard("deadline-child");
     fs::create_dir(workspace.workspace.join("process"))
         .expect("create private deadline child working directory");
@@ -1215,10 +1514,14 @@ async fn deadline_terminates_child_process_without_residue() {
     )
     .expect("private deadline approval database")
     .with_workspace_home(workspace.home.clone());
-    state
-        .service()
-        .inject_provider_host(Arc::new(provider.clone()));
     let service = state.service();
+    service.inject_provider_host(Arc::new(DeadlineTracingProvider {
+        inner: provider.clone(),
+        trace: Arc::clone(&deadline_trace),
+        service: Arc::downgrade(&service),
+        run_id: Arc::clone(&deadline_run_id),
+        hook_attached: AtomicBool::new(false),
+    }));
     service
         .materialize_cached_runner()
         .expect("prepare current file code and bundled templates before external admission");
@@ -1229,6 +1532,10 @@ async fn deadline_terminates_child_process_without_residue() {
         )
         .await
         .expect("admission should succeed");
+    let _ = deadline_run_id.set(admitted.run_id.clone());
+    if let Ok(mut trace) = deadline_trace.lock() {
+        trace.push(DeadlineTraceKind::Admit, 0);
+    }
     let admitted_deadline = service
         .handle(&admitted.run_id)
         .expect("live admitted deadline run")
@@ -1247,10 +1554,19 @@ async fn deadline_terminates_child_process_without_residue() {
             service.run_worker(run_id, "ignored".to_string()).await;
         }
     });
+    if let Ok(mut trace) = deadline_trace.lock() {
+        trace.push(DeadlineTraceKind::WorkerSpawn, 0);
+    }
     let started = Instant::now();
     let mut pids_before_deadline = Vec::new();
     while Instant::now() < admitted_deadline {
         let observed = service.process_owner_pids(&admitted.run_id);
+        if let Ok(mut trace) = deadline_trace.lock() {
+            trace.push(
+                DeadlineTraceKind::PollSample,
+                u64::try_from(observed.len()).unwrap_or(u64::MAX),
+            );
+        }
         if !observed.is_empty() && observed.iter().all(|pid| pid_alive(*pid)) {
             pids_before_deadline = observed;
             break;
@@ -1261,6 +1577,9 @@ async fn deadline_terminates_child_process_without_residue() {
         .await
         .expect("deadline worker cleanup must finish within the outer bound")
         .expect("deadline worker task join");
+    if let Ok(mut trace) = deadline_trace.lock() {
+        trace.push(DeadlineTraceKind::Cleanup, 0);
+    }
     let elapsed = started.elapsed();
     let terminals = terminal_events(&service, &admitted.run_id);
     let reason = cancel_reason(&service, &admitted.run_id);
@@ -1281,8 +1600,9 @@ async fn deadline_terminates_child_process_without_residue() {
         .is_some_and(|path| workspace.workspace.to_str() == Some(path));
     let deadline_event_names = event_names(&service, &admitted.run_id);
     let deadline_error_code = failed_error_code(&service, &admitted.run_id);
+    let deadline_tool_code = tool_failed_error_code(&service, &admitted.run_id);
     let deadline_diagnostic = format!(
-        "remaining_budget_at_admission={remaining_budget_at_admission:?} provider_calls={} provider_requests={} observed_pids={} owners_after={owners_after_deadline} old_pids_alive_after={old_pids_alive_after_deadline} events={deadline_event_names:?} run_error_code={deadline_error_code}",
+        "remaining_budget_at_admission={remaining_budget_at_admission:?} provider_calls={} provider_requests={} observed_pids={} owners_after={owners_after_deadline} old_pids_alive_after={old_pids_alive_after_deadline} events={deadline_event_names:?} run_error_code={deadline_error_code} tool_error_code={deadline_tool_code}",
         provider.call_count(),
         requests.len(),
         pids_before_deadline.len()
@@ -1291,6 +1611,14 @@ async fn deadline_terminates_child_process_without_residue() {
     drop(state);
     let fixture_cleanup = fixture_guard.cleanup();
     let fixture_removed = !fixture_root.exists();
+    // Render the bounded trace summary only after the original cleanup, and append it to
+    // the existing failure diagnostic. Successful runs stay quiet: the summary is only
+    // surfaced through assertion messages and never printed or asserted on its own.
+    let deadline_trace_summary = deadline_trace
+        .lock()
+        .map(|trace| trace.render_bounded())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().render_bounded());
+    let deadline_diagnostic = format!("{deadline_diagnostic} trace=[{deadline_trace_summary}]");
 
     assert_eq!(terminals, vec!["run.cancelled".to_string()]);
     assert_eq!(reason, "deadline");
@@ -1321,6 +1649,134 @@ async fn deadline_terminates_child_process_without_residue() {
         elapsed < Duration::from_secs(2),
         "deadline should not wait for the child sleep: {elapsed:?}"
     );
+}
+
+#[test]
+fn deadline_failure_trace_is_bounded_and_rejects_missing_pid() {
+    // Synthetic unit data only: exercises the bounded trace store and its render path.
+    // These record values are hand-built here and are never presented as native evidence.
+    let mut trace = DeadlineFailureTrace::new();
+    trace.push(DeadlineTraceKind::Admit, 0);
+    trace.push(DeadlineTraceKind::WorkerSpawn, 0);
+    trace.push(DeadlineTraceKind::ProviderEnter, 0);
+    trace.push(DeadlineTraceKind::ProviderExit, 1);
+    trace.push(DeadlineTraceKind::NativeBeforeSpawn, 0);
+    trace.push(DeadlineTraceKind::NativeAfterSpawn, 0);
+    trace.push(DeadlineTraceKind::PollSample, 1);
+    trace.push(DeadlineTraceKind::Cleanup, 0);
+    trace.push(DeadlineTraceKind::Attach, 1);
+    assert_eq!(trace.len(), 9);
+    assert_eq!(trace.dropped(), 0);
+    assert_eq!(trace.attach_state(), "ok");
+    let early = trace.render_bounded();
+    assert!(
+        early.contains("attach=ok"),
+        "bounded render must witness attach success: {early}"
+    );
+    for field in [
+        "t_admit_first=",
+        "t_admit_last=",
+        "t_worker_first=",
+        "t_worker_last=",
+        "t_prov_enter_first=",
+        "t_prov_enter_last=",
+        "t_prov_exit_first=",
+        "t_prov_exit_last=",
+        "t_native_before_first=",
+        "t_native_after_first=",
+        "t_poll_first=",
+        "t_poll_last=",
+        "t_cleanup_first=",
+        "t_attach_first=",
+    ] {
+        assert!(
+            early.contains(field),
+            "bounded render must carry per-kind timing {field}: {early}"
+        );
+    }
+    for index in 0..(DEADLINE_TRACE_CAP as u64 + 8) {
+        trace.push(DeadlineTraceKind::PollSample, index);
+    }
+    assert_eq!(trace.len(), DEADLINE_TRACE_CAP);
+    assert_eq!(trace.dropped(), 17);
+    let rendered = trace.render_bounded();
+    assert!(
+        rendered.contains("dropped=17"),
+        "bounded render must report overflow explicitly: {rendered}"
+    );
+    assert!(
+        rendered.contains("attach=ok"),
+        "attach witness must survive overflow: {rendered}"
+    );
+    assert!(
+        rendered.len() <= DEADLINE_TRACE_RENDER_LIMIT,
+        "bounded render must stay within the fixed limit"
+    );
+    // Synthetic attach-miss/none witnesses only: same bounded path, never native proof.
+    let mut miss_trace = DeadlineFailureTrace::new();
+    miss_trace.push(DeadlineTraceKind::Attach, 0);
+    assert_eq!(miss_trace.attach_state(), "miss");
+    assert!(miss_trace.render_bounded().contains("attach=miss"));
+    let empty_trace = DeadlineFailureTrace::new();
+    assert_eq!(empty_trace.attach_state(), "none");
+    assert!(empty_trace.render_bounded().contains("attach=none"));
+    assert!(empty_trace.render_bounded().contains("t_admit_first=none"));
+    // Synthetic `tool.failed` producer envelopes only, shaped like the actual
+    // `commit_result`/`interrupt` data (`tool_call_id`/`ok`/`truncated`/`error_code`).
+    // These JSON values are hand-built unit inputs, never actual runtime evidence.
+    let ok_events = vec![
+        json!({"event": "tool.requested", "data": {"tool_call_id": "call-sleep"}}),
+        json!({"event": "tool.started", "data": {"tool_call_id": "call-sleep"}}),
+        json!({
+            "event": "tool.failed",
+            "data": {
+                "tool_call_id": "call-sleep",
+                "ok": false,
+                "truncated": false,
+                "error_code": "terminal_spawn_failed"
+            }
+        }),
+    ];
+    assert_eq!(
+        bounded_tool_failed_code_from_events(&ok_events),
+        "terminal_spawn_failed"
+    );
+    let absent_events = vec![json!({
+        "event": "tool.failed",
+        "data": {"tool_call_id": "call-sleep", "ok": false, "truncated": false}
+    })];
+    assert_eq!(
+        bounded_tool_failed_code_from_events(&absent_events),
+        "absent"
+    );
+    let type_events = vec![json!({
+        "event": "tool.failed",
+        "data": {"tool_call_id": "call-sleep", "ok": false, "error_code": 42}
+    })];
+    assert_eq!(
+        bounded_tool_failed_code_from_events(&type_events),
+        "non_string"
+    );
+    let empty_events = vec![json!({
+        "event": "tool.failed",
+        "data": {"tool_call_id": "call-sleep", "ok": false, "error_code": ""}
+    })];
+    assert_eq!(bounded_tool_failed_code_from_events(&empty_events), "empty");
+    let long_code = "x".repeat(DEADLINE_TOOL_CODE_LIMIT + 36);
+    let long_events = vec![json!({
+        "event": "tool.failed",
+        "data": {"tool_call_id": "call-sleep", "ok": false, "error_code": long_code}
+    })];
+    let long_rendered = bounded_tool_failed_code_from_events(&long_events);
+    assert_eq!(long_rendered.chars().count(), DEADLINE_TOOL_CODE_LIMIT);
+    assert!(long_rendered.ends_with("..."));
+    let no_failed = vec![json!({"event": "tool.completed", "data": {"tool_call_id": "c"}})];
+    assert_eq!(bounded_tool_failed_code_from_events(&no_failed), "none");
+    assert_eq!(bounded_tool_failed_code_from_events(&[]), "none");
+    // A missing native PID is still rejected even when synthetic hook records exist.
+    assert!(!deadline_trace_pid_guard_all_alive(&[], |_| true));
+    assert!(deadline_trace_pid_guard_all_alive(&[4242], |_| true));
+    assert!(!deadline_trace_pid_guard_all_alive(&[4242], |_| false));
 }
 
 #[tokio::test(flavor = "multi_thread")]
