@@ -4711,7 +4711,7 @@ impl AgentService {
                     {
                         continue;
                     }
-                    if workspace_binding.is_none() {
+                    if workspace_binding.is_none() && allow_legacy_workspace_root {
                         let cur_legacy = self.inner.trusted_legacy_workspace_root.read().clone();
                         if cur_legacy != legacy_workspace_root {
                             continue;
@@ -10162,5 +10162,130 @@ mod f3_session_maintenance_tests {
         drop(service);
         drop(state);
         fs::remove_dir_all(root).expect("private maintenance fixture cleanup");
+    }
+}
+
+#[cfg(test)]
+mod external_legacy_admission_tests {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+
+    const INLINE_SOURCE: &str = "pub fn run(input: map) -> string { \"ok\"; }";
+
+    fn short_config() -> AgentGatewayConfig {
+        AgentGatewayConfig {
+            run_timeout: Duration::from_secs(2),
+            ..AgentGatewayConfig::default()
+        }
+    }
+
+    fn private_root(tag: &str) -> PathBuf {
+        let base = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
+            .or_else(|| std::env::var_os("TEST_TMPDIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("external-legacy-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("private external-legacy fixture directory");
+        root
+    }
+
+    fn external_request() -> AdmitRunRequest {
+        AdmitRunRequest {
+            input: json!({"message": "external legacy eligibility probe"}),
+            platform: "external-legacy-test".to_string(),
+            ..AdmitRunRequest::default()
+        }
+    }
+
+    async fn assert_external_without_legacy_root(service: &AgentService, trusted: &PathBuf) {
+        let admitted = service
+            .admit_external_with_workspace_selector(external_request(), None)
+            .await
+            .expect("external selector-None admission must start without the legacy root");
+        assert_eq!(admitted.status, "started");
+        let handle = service
+            .handle(&admitted.run_id)
+            .expect("admitted external run handle exists");
+        assert!(
+            handle.workspace_authority.is_none(),
+            "external admission must not adopt workspace authority"
+        );
+        assert!(
+            handle.legacy_workspace_root.is_none(),
+            "external admission must not capture the legacy root"
+        );
+        let binding = service
+            .inner
+            .store
+            .read()
+            .sessions
+            .get(&admitted.session_id)
+            .and_then(|session| session.view.workspace.clone());
+        assert!(
+            binding.is_none(),
+            "external admission must leave the session unbound"
+        );
+        let internal = service
+            .admit(external_request())
+            .await
+            .expect("ordinary legacy-enabled admission must still start");
+        assert_eq!(internal.status, "started");
+        let internal_handle = service
+            .handle(&internal.run_id)
+            .expect("admitted internal run handle exists");
+        assert!(
+            internal_handle.workspace_authority.is_none(),
+            "selector-None internal admission adopts no authority without a factory"
+        );
+        assert_eq!(
+            internal_handle.legacy_workspace_root.as_deref(),
+            Some(trusted.as_path()),
+            "ordinary legacy-enabled admission still captures the normalized trusted root"
+        );
+        service.stop(&admitted.run_id);
+        service.stop(&internal.run_id);
+    }
+
+    #[tokio::test]
+    async fn external_selector_none_admits_without_legacy_root_memory() {
+        let root = private_root("memory");
+        let guard = root.join("legacy-workspace");
+        std::fs::create_dir_all(&guard).expect("private legacy workspace guard");
+        let state = AgentGatewayState::with_agent_source(short_config(), INLINE_SOURCE)
+            .expect("inline RSS source should compile");
+        let service = state.service();
+        let limits = RunLimits::new(64, 128, 1024 * 1024, &guard)
+            .expect("legacy workspace guard should validate");
+        service
+            .set_run_limits(limits.clone())
+            .expect("trusted legacy root should install");
+        assert_external_without_legacy_root(&service, &limits.workspace_root).await;
+        drop(service);
+        drop(state);
+        std::fs::remove_dir_all(&root).expect("private external-legacy fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn external_selector_none_admits_without_legacy_root_sqlite() {
+        let root = private_root("sqlite");
+        let guard = root.join("legacy-workspace");
+        std::fs::create_dir_all(&guard).expect("private legacy workspace guard");
+        let db_path = root.join("gateway.db");
+        let state = AgentGatewayState::with_agent_source_and_sqlite(
+            short_config(),
+            INLINE_SOURCE,
+            &db_path,
+        )
+        .expect("SQLite state should open");
+        let service = state.service();
+        let limits = RunLimits::new(64, 128, 1024 * 1024, &guard)
+            .expect("legacy workspace guard should validate");
+        service
+            .set_run_limits(limits.clone())
+            .expect("trusted legacy root should install");
+        assert_external_without_legacy_root(&service, &limits.workspace_root).await;
+        drop(service);
+        drop(state);
+        std::fs::remove_dir_all(&root).expect("private external-legacy fixture cleanup");
     }
 }

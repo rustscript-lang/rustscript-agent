@@ -17,7 +17,7 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use rustscript_agent::config::{RunLimits, TelegramConfig};
 use rustscript_agent::gateway::telegram::{TelegramApi, TelegramError};
 use rustscript_agent::service::AdmitRunRequest;
@@ -732,6 +732,206 @@ fn telegram_test_artifacts_land_under_an_explicit_root() {
         "explicit workspace cleanup must remove the unique directory"
     );
     std::fs::remove_dir_all(&base).expect("temporary root should be removed");
+}
+
+/// Owned unique directory for one gateway-binary spawn beneath the assigned
+/// suite root. Each fixture owns exactly one `main.rss` entry plus its
+/// SQLite file, so the File snapshot closure can never include a sibling
+/// binary's script. The shared suite root itself is never removed.
+struct BinaryFixture {
+    dir: std::path::PathBuf,
+    script: std::path::PathBuf,
+    db: std::path::PathBuf,
+    cleaned: bool,
+}
+
+impl BinaryFixture {
+    fn create_in(root: &std::path::Path, label: &str, source: &str) -> Self {
+        std::fs::create_dir_all(root).expect("telegram test root");
+        let dir = root.join(format!("{label}-{}", Uuid::new_v4()));
+        assert!(!dir.exists(), "binary fixture dir must be fresh: {dir:?}");
+        std::fs::create_dir_all(&dir).expect("binary fixture dir should be created");
+        let script = dir.join("main.rss");
+        std::fs::write(&script, source).expect("write agent script");
+        let db = dir.join("gateway.db");
+        Self {
+            dir,
+            script,
+            db,
+            cleaned: false,
+        }
+    }
+
+    fn script(&self) -> &std::path::Path {
+        &self.script
+    }
+
+    fn db(&self) -> &std::path::Path {
+        &self.db
+    }
+
+    fn cleanup(mut self) -> Result<(), String> {
+        match std::fs::remove_dir_all(&self.dir) {
+            Ok(()) => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "binary fixture dir should be removed ({}): {error}",
+                self.dir.display()
+            )),
+        }
+    }
+}
+
+impl Drop for BinaryFixture {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Redacts only the synthetic fixture token before failure diagnostics.
+fn redact_fixture_token(line: &str) -> String {
+    line.replace("TEST-SECRET-TOKEN", "[REDACTED]")
+}
+
+/// Verifies the pid is still our owned gateway child (exe plus cwd) then
+/// signals only that exact pid via libc (never pkill, groups, or other pids).
+fn signal_owned_child(pid: u32, signal: libc::c_int) -> Result<(), String> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map_err(|error| format!("owned exe link for {pid} unreadable: {error}"))?;
+    let name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if name != "rustscript-agent-gateway" {
+        return Err(format!(
+            "refusing to signal pid {pid}: unexpected exe {exe:?}"
+        ));
+    }
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .map_err(|error| format!("owned cwd link for {pid} unreadable: {error}"))?;
+    let expected =
+        std::env::current_dir().map_err(|error| format!("current dir unreadable: {error}"))?;
+    if cwd != expected {
+        return Err(format!(
+            "refusing to signal pid {pid}: cwd {cwd:?} != {expected:?}"
+        ));
+    }
+    let target: libc::pid_t = pid
+        .try_into()
+        .map_err(|_| format!("refusing to signal pid {pid}: out of pid_t range"))?;
+    if target <= 0 {
+        return Err(format!("refusing to signal pid {pid}: non-positive pid_t"));
+    }
+    // SAFETY: `target` is the strictly positive, range-checked pid of the
+    // still-owned unreaped child (exe plus cwd verified above); a positive
+    // pid addresses exactly one process, never a process group, and `signal`
+    // is a valid SIGINT/SIGKILL number supplied by the caller.
+    let ret = unsafe { libc::kill(target, signal) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "kill {signal} {pid} failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// Shared absolute-bound shutdown for an owned gateway binary child.
+///
+/// Captures ONE absolute 15s Tokio deadline BEFORE the procfs ownership
+/// checks and SIGINT; the signal, child wait, drainer join, and verdict all
+/// spend that SAME deadline via `timeout_at` on a borrowed drainer handle
+/// (never detached). Any primary error or expiry is a failure; a single
+/// separate 5s absolute cleanup-only fallback then KILL/reaps an unreaped
+/// child and aborts/joins the drainer without ever producing success or
+/// resetting budgets, preserving the primary failure for the caller.
+async fn shutdown_owned_gateway(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    drainer: &mut tokio::task::JoinHandle<()>,
+) -> (Option<std::process::ExitStatus>, Option<String>) {
+    let primary_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    if let Err(error) = signal_owned_child(pid, libc::SIGINT) {
+        let primary = format!("SIGINT failed: {error}");
+        let fallback_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let _ = signal_owned_child(pid, libc::SIGKILL);
+        let _ = tokio::time::timeout_at(fallback_deadline, child.wait()).await;
+        drainer.abort();
+        let _ = tokio::time::timeout_at(fallback_deadline, &mut *drainer).await;
+        return (None, Some(primary));
+    }
+    let exit_status = match tokio::time::timeout_at(primary_deadline, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(error)) => {
+            let primary = format!("child wait failed: {error}");
+            let fallback_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let _ = signal_owned_child(pid, libc::SIGKILL);
+            let _ = tokio::time::timeout_at(fallback_deadline, child.wait()).await;
+            drainer.abort();
+            let _ = tokio::time::timeout_at(fallback_deadline, &mut *drainer).await;
+            return (None, Some(primary));
+        }
+        Err(_) => {
+            let primary = "the gateway must exit within the bound after SIGINT".to_string();
+            let fallback_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let _ = signal_owned_child(pid, libc::SIGKILL);
+            let _ = tokio::time::timeout_at(fallback_deadline, child.wait()).await;
+            drainer.abort();
+            let _ = tokio::time::timeout_at(fallback_deadline, &mut *drainer).await;
+            return (None, Some(primary));
+        }
+    };
+    match tokio::time::timeout_at(primary_deadline, &mut *drainer).await {
+        Ok(Ok(())) => (exit_status, None),
+        Ok(Err(error)) => (exit_status, Some(format!("stderr drainer failed: {error}"))),
+        Err(_) => {
+            let primary = "stderr drainer join timed out".to_string();
+            let fallback_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            drainer.abort();
+            let _ = tokio::time::timeout_at(fallback_deadline, &mut *drainer).await;
+            (exit_status, Some(primary))
+        }
+    }
+}
+
+/// File-snapshot isolation: two binary fixtures must live under distinct
+/// module-root entry parents, otherwise the shared-root File closure couples
+/// their digests. No processes are spawned here.
+#[test]
+fn binary_fixtures_require_distinct_module_roots() {
+    let root = telegram_test_root();
+    std::fs::create_dir_all(&root).expect("telegram test root");
+    let first = BinaryFixture::create_in(&root, "layout-a", ECHO_SOURCE);
+    let second = BinaryFixture::create_in(&root, "layout-b", ECHO_SOURCE);
+    let first_parent = first
+        .script()
+        .parent()
+        .expect("first script parent")
+        .to_path_buf();
+    let second_parent = second
+        .script()
+        .parent()
+        .expect("second script parent")
+        .to_path_buf();
+    assert_eq!(
+        first.db().parent(),
+        Some(first_parent.as_path()),
+        "each SQLite file must live alongside its own entry"
+    );
+    assert_eq!(
+        second.db().parent(),
+        Some(second_parent.as_path()),
+        "each SQLite file must live alongside its own entry"
+    );
+    assert_ne!(
+        first_parent, second_parent,
+        "binary fixtures must live under distinct module-root entry parents, \
+         got {first_parent:?} and {second_parent:?}"
+    );
+    first.cleanup().expect("first fixture should be removed");
+    second.cleanup().expect("second fixture should be removed");
 }
 
 /// Polls until `condition` holds, panicking after the timeout.
@@ -2550,17 +2750,13 @@ async fn adapter_shutdown_is_bounded() {
 async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
     let (base, state) = spawn_fixture().await;
     push_update(&state, fixture_json("updates_dm.json"));
-    let db = telegram_db_path("binary");
-    let root = telegram_test_root();
-    std::fs::create_dir_all(&root).expect("telegram test root");
-    let script = root.join(format!("binary-{}.rss", Uuid::new_v4()));
-    std::fs::write(&script, ECHO_SOURCE).expect("write agent script");
+    let fixture = BinaryFixture::create_in(&telegram_test_root(), "binary", ECHO_SOURCE);
     let bin = env!("CARGO_BIN_EXE_rustscript-agent-gateway");
     let mut child = tokio::process::Command::new(bin)
         .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
         .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
-        .env("RUSTSCRIPT_AGENT_SCRIPT", &script)
+        .env("RUSTSCRIPT_AGENT_STATE_DB", fixture.db())
+        .env("RUSTSCRIPT_AGENT_SCRIPT", fixture.script())
         .env(
             "RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN",
             "123456:TEST-SECRET-TOKEN",
@@ -2574,29 +2770,76 @@ async fn gateway_binary_runs_telegram_and_api_on_one_agent_service() {
         // safe first-boot drop so it is processed.
         .env("RUSTSCRIPT_AGENT_TELEGRAM_DROP_PENDING_UPDATES", "0")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("gateway binary should spawn");
-    // The binary's Telegram adapter must process the queued update through
-    // the shared AgentService and render it to the fixture.
-    wait_until(std::time::Duration::from_secs(20), || {
-        state.sent_texts().iter().any(|text| text == "hello world")
+    let pid = child.id().expect("child pid");
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr = child.stderr.take().expect("stderr piped");
+    let captured_drain = Arc::clone(&captured);
+    let mut drainer = tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let mut guard = captured_drain.lock().expect("capture lock");
+            let total: usize = guard.iter().map(String::len).sum();
+            if guard.len() >= 200 || total >= 64 * 1024 {
+                break;
+            }
+            guard.push(line);
+        }
+    });
+    let state_for_obs = state.clone();
+    let observation = std::panic::AssertUnwindSafe(async move {
+        // The binary's Telegram adapter must process the queued update through
+        // the shared AgentService and render it to the fixture.
+        wait_until(std::time::Duration::from_secs(20), || {
+            state_for_obs
+                .sent_texts()
+                .iter()
+                .any(|text| text == "hello world")
+        })
+        .await;
     })
+    .catch_unwind()
     .await;
     // Graceful stop: SIGINT halts the service and shuts the adapter down
-    // (bounded), then the process exits.
-    let pid = child.id().expect("child pid");
-    std::process::Command::new("kill")
-        .args(["-INT", &pid.to_string()])
-        .status()
-        .expect("send SIGINT");
-    let exited = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait())
-        .await
-        .expect("the gateway must exit within the bound after SIGINT")
-        .expect("child wait");
+    // (bounded), then the process exits. This cleanup always runs before the
+    // original observation verdict is resumed.
+    let (exit_status, mut cleanup_error) =
+        shutdown_owned_gateway(&mut child, pid, &mut drainer).await;
+    if let Err(error) = fixture.cleanup()
+        && cleanup_error.is_none()
+    {
+        cleanup_error = Some(error);
+    }
+    if let Err(payload) = observation {
+        let snapshot = captured
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let redacted: Vec<String> = snapshot
+            .iter()
+            .take(20)
+            .map(|line| {
+                let clean = redact_fixture_token(line);
+                if clean.len() > 500 {
+                    format!("{}...[truncated]", &clean[..500])
+                } else {
+                    clean
+                }
+            })
+            .collect();
+        eprintln!("binary observation failed; redacted stderr: {redacted:?}");
+        if let Some(error) = cleanup_error {
+            eprintln!("cleanup also failed: {error}");
+        }
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(error) = cleanup_error {
+        panic!("{error}");
+    }
+    let exited = exit_status.expect("child wait produced a status");
     assert!(exited.success(), "graceful shutdown must exit cleanly");
-    std::fs::remove_file(&script).expect("temporary script should be removed");
-    std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
 // ---------------------------------------------------------------------------
@@ -2670,17 +2913,13 @@ fn install_log_capture() -> Arc<Mutex<Vec<String>>> {
 
 #[tokio::test]
 async fn gateway_binary_survives_telegram_startup_failure_and_serves_the_api() {
-    let db = telegram_db_path("binary-degraded");
-    let root = telegram_test_root();
-    std::fs::create_dir_all(&root).expect("telegram test root");
-    let script = root.join(format!("binary-degraded-{}.rss", Uuid::new_v4()));
-    std::fs::write(&script, ECHO_SOURCE).expect("write agent script");
+    let fixture = BinaryFixture::create_in(&telegram_test_root(), "binary-degraded", ECHO_SOURCE);
     let bin = env!("CARGO_BIN_EXE_rustscript-agent-gateway");
     let mut child = tokio::process::Command::new(bin)
         .env("RUSTSCRIPT_AGENT_GATEWAY_ADDR", "127.0.0.1:0")
         .env("RUSTSCRIPT_AGENT_ALLOW_ANONYMOUS", "1")
-        .env("RUSTSCRIPT_AGENT_STATE_DB", &db)
-        .env("RUSTSCRIPT_AGENT_SCRIPT", &script)
+        .env("RUSTSCRIPT_AGENT_STATE_DB", fixture.db())
+        .env("RUSTSCRIPT_AGENT_SCRIPT", fixture.script())
         .env(
             "RUSTSCRIPT_AGENT_TELEGRAM_BOT_TOKEN",
             "123456:TEST-SECRET-TOKEN",
@@ -2694,61 +2933,126 @@ async fn gateway_binary_survives_telegram_startup_failure_and_serves_the_api() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("gateway binary should spawn");
-    let stderr = child.stderr.take().expect("stderr");
-    let mut lines = tokio::io::BufReader::new(stderr).lines();
-    // The API must come up: read stderr until the listening line.
-    let mut address = None;
-    while let Some(line) =
-        tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line())
-            .await
-            .expect("the gateway must print its listening address")
-            .expect("stderr line")
-    {
-        if let Some(position) = line.find("listening on http://") {
-            address = Some(line[position + "listening on http://".len()..].to_string());
-            break;
-        }
-    }
-    let address = address.expect("listening address");
-    // The API is alive despite the telegram startup failure.
-    let health = http_get(&address, "/health/detailed").await;
-    assert!(
-        health.contains("200 OK") && health.contains("\"status\":\"ok\""),
-        "the API must serve health with the telegram adapter degraded: {health}"
-    );
-    // The degraded state is recorded (redacted) on stderr.
-    let mut degraded = false;
-    while let Some(line) =
-        tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line())
-            .await
-            .expect("the degraded line must be printed")
-            .expect("stderr line")
-    {
-        if line.contains("degraded") {
-            degraded = true;
-            assert!(
-                !line.contains("TEST-SECRET-TOKEN"),
-                "the degraded log must not leak the token: {line}"
-            );
-            break;
-        }
-    }
-    assert!(
-        degraded,
-        "the telegram startup failure must be logged as degraded"
-    );
     let pid = child.id().expect("child pid");
-    std::process::Command::new("kill")
-        .args(["-INT", &pid.to_string()])
-        .status()
-        .expect("send SIGINT");
-    let exited = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait())
-        .await
-        .expect("the gateway must exit within the bound after SIGINT")
-        .expect("child wait");
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr = child.stderr.take().expect("stderr");
+    let captured_drain = Arc::clone(&captured);
+    let mut drainer = tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let mut guard = captured_drain.lock().expect("capture lock");
+            let total: usize = guard.iter().map(String::len).sum();
+            if guard.len() >= 200 || total >= 64 * 1024 {
+                break;
+            }
+            guard.push(line);
+        }
+    });
+    let captured_obs = Arc::clone(&captured);
+    let observation = std::panic::AssertUnwindSafe(async move {
+        // The API must come up: poll the bounded capture until the listening line.
+        let address = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut found = None;
+            loop {
+                {
+                    let guard = captured_obs.lock().expect("capture lock");
+                    for line in guard.iter() {
+                        if let Some(position) = line.find("listening on http://") {
+                            found = Some(
+                                line[position + "listening on http://".len()..]
+                                    .trim()
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the gateway must print its listening address"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            found.expect("listening address")
+        };
+        // The API is alive despite the telegram startup failure.
+        let health = http_get(&address, "/health/detailed").await;
+        assert!(
+            health.contains("200 OK") && health.contains("\"status\":\"ok\""),
+            "the API must serve health with the telegram adapter degraded: {health}"
+        );
+        // The degraded state is recorded (redacted) on stderr.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut degraded = false;
+        loop {
+            {
+                let guard = captured_obs.lock().expect("capture lock");
+                for line in guard.iter() {
+                    if line.contains("degraded") {
+                        degraded = true;
+                        assert!(
+                            !line.contains("TEST-SECRET-TOKEN"),
+                            "the degraded log must not leak the token: {line}"
+                        );
+                        break;
+                    }
+                }
+            }
+            if degraded {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the degraded line must be printed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            degraded,
+            "the telegram startup failure must be logged as degraded"
+        );
+    })
+    .catch_unwind()
+    .await;
+    let (exit_status, mut cleanup_error) =
+        shutdown_owned_gateway(&mut child, pid, &mut drainer).await;
+    if let Err(error) = fixture.cleanup()
+        && cleanup_error.is_none()
+    {
+        cleanup_error = Some(error);
+    }
+    if let Err(payload) = observation {
+        let snapshot = captured
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let redacted: Vec<String> = snapshot
+            .iter()
+            .take(20)
+            .map(|line| {
+                let clean = redact_fixture_token(line);
+                if clean.len() > 500 {
+                    format!("{}...[truncated]", &clean[..500])
+                } else {
+                    clean
+                }
+            })
+            .collect();
+        eprintln!("binary degraded observation failed; redacted stderr: {redacted:?}");
+        if let Some(error) = cleanup_error {
+            eprintln!("cleanup also failed: {error}");
+        }
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(error) = cleanup_error {
+        panic!("{error}");
+    }
+    let exited = exit_status.expect("child wait produced a status");
     assert!(exited.success(), "graceful shutdown must exit cleanly");
-    std::fs::remove_file(&script).expect("temporary script should be removed");
-    std::fs::remove_file(&db).expect("temporary db should be removed");
 }
 
 #[tokio::test]
