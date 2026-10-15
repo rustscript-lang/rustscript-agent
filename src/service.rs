@@ -4197,6 +4197,23 @@ impl AgentService {
         })?
     }
 
+    /// Observed original-deadline/cancellation state before any durable or
+    /// memory linearization. The rejection follows the existing workspace-RSS
+    /// taxonomy: generic `Invalid`, never `Persistence`, never with
+    /// credential/input details.
+    fn admission_cancelled_before_commit(cancellation: &RunCancellation) -> bool {
+        cancellation.requested().is_some() || cancellation.deadline_passed()
+    }
+
+    /// Exactly one generic invalid rejection for an admission whose original
+    /// absolute deadline/cancellation was observed before linearization.
+    fn admission_deadline_rejection(&self) -> AdmitError {
+        self.inner
+            .metrics
+            .admission_rejected(AdmitRejectReason::Invalid);
+        AdmitError::Invalid("admission cancelled before commit".to_string())
+    }
+
     fn admit_blocking(
         &self,
         request: AdmitRunRequest,
@@ -4204,468 +4221,740 @@ impl AgentService {
         allow_legacy_workspace_root: bool,
         capacity_permit: OwnedSemaphorePermit,
     ) -> Result<AdmittedRun, AdmitError> {
-        let _admission_serial = self.inner.commit_gate.lock();
+        // Optimistic two-phase admission: slow preparation (store snapshot
+        // reads, RSS workspace admission, prompt observer + filesystem IO)
+        // runs outside `commit_gate` so an unrelated admission, store writer,
+        // or terminal event never waits on prompt IO. Only the fresh
+        // revalidation + durable commit + in-memory publication holds the
+        // gate. ONE capacity permit and ONE original absolute
+        // cancellation/deadline are reused across re-preparation attempts;
+        // clocks are never reset and budgets never refreshed.
+        let cancellation = RunCancellation::with_timeout(self.inner.config.run_timeout);
         let run_id = Uuid::new_v4().to_string();
         let now = timestamp();
         let message_id = Uuid::new_v4().to_string();
         let event_id = Uuid::new_v4().to_string();
-        let registry = self.inner.tool_registry.read().snapshot();
-        if registry.is_empty() {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            return Err(AdmitError::Invalid(
-                "tool registry must not be empty".to_string(),
-            ));
-        }
-        let run_limits = self.inner.run_limits.read().clone();
-        run_limits
-            .validate()
-            .map_err(|error| AdmitError::Invalid(format!("invalid run limits: {error}")))?;
-        let cancellation = RunCancellation::with_timeout(self.inner.config.run_timeout);
-        let generation = self.inner.store_generation.load(Ordering::Acquire);
-        let store = self.inner.store.read();
+        let mut permit_opt = Some(capacity_permit);
+        // Re-preparation loops under the ONE original absolute
+        // cancellation/deadline above: the clock is never reset and the
+        // budget never refreshed. Only observed expiry ends the loop without
+        // a commit; relevant-input drift reprepares within the budget.
+        loop {
+            if Self::admission_cancelled_before_commit(&cancellation) {
+                return Err(self.admission_deadline_rejection());
+            }
+            let registry = self.inner.tool_registry.read().snapshot();
+            if registry.is_empty() {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                return Err(AdmitError::Invalid(
+                    "tool registry must not be empty".to_string(),
+                ));
+            }
+            let run_limits = self.inner.run_limits.read().clone();
+            run_limits
+                .validate()
+                .map_err(|error| AdmitError::Invalid(format!("invalid run limits: {error}")))?;
+            // Fresh per-attempt base snapshot; the global generation alone never
+            // invalidates (only relevant prepared inputs trigger a reprepare).
+            let base_limits = run_limits.clone();
+            let store = self.inner.store.read();
 
-        // Session resolution: reuse an existing session or prepare a new one
-        // (applied in memory only after the durable commit).
-        let replay_session_id = request
-            .idempotency_key
-            .as_deref()
-            .and_then(|key| store.idempotency.get(key))
-            .and_then(|record| store.runs.get(&record.run_id))
-            .map(|run| run.session_id.clone());
-        let has_idempotency_replay = replay_session_id.is_some();
-        let session_id = match request.session_id.clone().or(replay_session_id) {
-            Some(session_id) => {
-                if !store.sessions.contains_key(&session_id) {
+            // Session resolution: reuse an existing session or prepare a new one
+            // (applied in memory only after the durable commit).
+            let replay_session_id = request
+                .idempotency_key
+                .as_deref()
+                .and_then(|key| store.idempotency.get(key))
+                .and_then(|record| store.runs.get(&record.run_id))
+                .map(|run| run.session_id.clone());
+            let has_idempotency_replay = replay_session_id.is_some();
+            let session_id = match request.session_id.clone().or(replay_session_id) {
+                Some(session_id) => {
+                    if !store.sessions.contains_key(&session_id) {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::SessionNotFound);
+                        return Err(AdmitError::SessionNotFound);
+                    }
+                    session_id
+                }
+                None => Uuid::new_v4().to_string(),
+            };
+            let session_new = !store.sessions.contains_key(&session_id);
+            let existing_workspace_binding = store
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.view.workspace.clone());
+            let (effective_model, effective_provider, effective_system_prompt) = if session_new {
+                (
+                    request
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| self.inner.config.model.clone()),
+                    request
+                        .provider
+                        .clone()
+                        .or_else(|| self.inner.config.provider.clone()),
+                    request.instructions.clone(),
+                )
+            } else {
+                let session = store
+                    .sessions
+                    .get(&session_id)
+                    .expect("existing admission session should be present");
+                (
+                    request
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| session.view.model.clone()),
+                    request
+                        .provider
+                        .clone()
+                        .or_else(|| session.view.provider.clone()),
+                    request
+                        .instructions
+                        .clone()
+                        .or_else(|| session.view.system_prompt.clone()),
+                )
+            };
+            if let Err(message) =
+                validate_visible_name(&effective_model, "model", MAX_MODEL_NAME_BYTES)
+            {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                return Err(AdmitError::Invalid(message));
+            }
+            if let Some(provider) = effective_provider
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                && let Err(message) =
+                    validate_visible_name(provider, "provider", MAX_PROVIDER_NAME_BYTES)
+            {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                return Err(AdmitError::Invalid(message));
+            }
+            let mut new_session_view = if session_new {
+                let view = SessionView {
+                    id: session_id.clone(),
+                    object: "hermes.session".to_string(),
+                    title: None,
+                    model: effective_model.clone(),
+                    provider: effective_provider.clone(),
+                    source: request.platform.clone(),
+                    system_prompt: effective_system_prompt.clone(),
+                    workspace: None,
+                    created_at: now,
+                    updated_at: now,
+                    message_count: 0,
+                    end_reason: None,
+                };
+                Some(view)
+            } else {
+                None
+            };
+            if let Some(parent_run_id) = request.parent_run_id.as_deref()
+                && !store.runs.contains_key(parent_run_id)
+            {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::ParentNotFound);
+                return Err(AdmitError::ParentNotFound);
+            }
+            let provider_profile = self
+                .resolve_provider_profile(effective_provider.as_deref())
+                .map_err(|error| {
+                    AdmitError::Invalid(format!("invalid provider profile: {error}"))
+                })?;
+            let mut snapshot = RunAdmissionSnapshot {
+                registry,
+                provider_profile,
+                limits: run_limits,
+            };
+            let context_message = SessionMessage {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                role: "user".to_string(),
+                content: decode_message_content(&request.input),
+                created_at: now,
+                run_id: Some(run_id.clone()),
+                finish_reason: None,
+                name: None,
+                tool_call_id: None,
+                parent_message_id: None,
+                token_estimate: None,
+                metadata: JsonValue::Null,
+                ordinal: None,
+            };
+            let mut context_messages = store
+                .sessions
+                .get(&session_id)
+                .map(|session| session.messages.clone())
+                .unwrap_or_default();
+            context_messages.push(context_message.clone());
+            let context_input = ContextAdmissionInput {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                message_id: message_id.clone(),
+                parent_run_id: request.parent_run_id.clone(),
+                platform: request.platform.clone(),
+                input: request.input.clone(),
+                messages: context_messages,
+                model: effective_model.clone(),
+                provider: effective_provider.clone(),
+                system_prompt: effective_system_prompt.clone(),
+            };
+            drop(store);
+
+            let replay_identity = AdmissionReplayIdentity {
+                key: request.idempotency_key.as_deref(),
+                request_hash: request.idempotency_hash.as_deref(),
+                request_selector: workspace_selector.as_deref(),
+            };
+            if let Some(replayed) =
+                self.replay_existing_admission(replay_identity, &cancellation)?
+            {
+                return Ok(replayed);
+            }
+
+            if self.inner.session_maintenance.lock().contains(&session_id) {
+                return Err(AdmitError::SessionMaintenanceBusy(
+                    CompactionError::from_rss("busy", "session maintenance is in progress"),
+                ));
+            }
+
+            let (workspace_binding, workspace_authority) = self.resolve_workspace_admission(
+                workspace_selector.as_deref(),
+                existing_workspace_binding.as_ref(),
+                &cancellation,
+                has_idempotency_replay,
+            )?;
+
+            let legacy_workspace_root =
+                if workspace_binding.is_none() && allow_legacy_workspace_root {
+                    self.inner.trusted_legacy_workspace_root.read().clone()
+                } else {
+                    None
+                };
+            let effective_request_hash = request.idempotency_hash.clone();
+            let workspace_identity_json = workspace_identity_json(
+                workspace_binding.as_ref(),
+                legacy_workspace_root.as_deref(),
+                workspace_selector.as_deref(),
+            )?;
+            if let Some(binding) = &workspace_binding {
+                snapshot.limits.workspace_root = PathBuf::from(&binding.canonical_path);
+            } else if let Some(root) = &legacy_workspace_root {
+                snapshot.limits.workspace_root = root.clone();
+            }
+            if let Some(view) = new_session_view.as_mut() {
+                view.workspace = workspace_binding.clone();
+            }
+            let session_metadata_json = match &workspace_binding {
+                Some(binding) => serde_json::to_string(&json!({"workspace": binding}))
+                    .map_err(|error| AdmitError::Invalid(error.to_string()))?,
+                None => "{}".to_string(),
+            };
+            let date = self.inner.date_source.read().current_date();
+            let platform = std::env::consts::OS.to_string();
+            let arch = std::env::consts::ARCH.to_string();
+            let workspace_root = snapshot.limits.workspace_root.clone();
+            let tool_descriptors = snapshot.registry.descriptors().to_vec();
+            let run_limits = snapshot.limits.clone();
+
+            let prompt_read_observer = self
+                .inner
+                .prompt_read_entered
+                .lock()
+                .expect("prompt read observer lock")
+                .clone();
+            if let Some(observer) = prompt_read_observer {
+                observer();
+            }
+
+            let coding_system_prompt = build_coding_prompt(
+                &workspace_root,
+                &tool_descriptors,
+                &run_limits,
+                &date,
+                &platform,
+                &arch,
+                CodingPromptBudgets::default(),
+            )
+            .map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                AdmitError::Invalid(error.to_string())
+            })?;
+            let mut context =
+                self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
+            if let Some(binding) = workspace_binding.as_ref() {
+                context.metadata["admitted_workspace_binding"] = serde_json::to_value(binding)
+                    .map_err(|error| AdmitError::Invalid(error.to_string()))?;
+            }
+            let persisted_input = persisted_run_context_json(&context)?;
+            let provider = effective_provider.clone().unwrap_or_default();
+            let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
+            let estimate = estimate_admission_query_bytes(AdmissionSqliteCellLens {
+                run_id: run_id.len(),
+                session_id: session_id.len(),
+                parent_run_id: request.parent_run_id.as_deref().unwrap_or("").len(),
+                input_json: persisted_input.len(),
+                provider: provider.len(),
+                model: effective_model.len(),
+                script_hash: snapshot.registry.identity().len(),
+                idempotency_scope: ADMISSION_IDEMPOTENCY_SCOPE.len(),
+                idempotency_key: idempotency_key.len(),
+                platform: request.platform.len(),
+                profile: ADMISSION_SESSION_PROFILE.len(),
+                system_prompt: effective_system_prompt.as_deref().unwrap_or("").len(),
+                message_id: message_id.len(),
+                // The existing lens also budgets identity bytes stored in the durable response.
+                request_hash: request
+                    .idempotency_hash
+                    .as_deref()
+                    .unwrap_or("")
+                    .len()
+                    .saturating_add(workspace_identity_json.as_deref().map_or(0, str::len)),
+                has_idempotency: !idempotency_key.is_empty(),
+            })
+            .map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                AdmitError::Invalid(error.to_string())
+            })?;
+            estimate.ensure_fits().map_err(|error| {
+                self.inner
+                    .metrics
+                    .admission_rejected(AdmitRejectReason::Invalid);
+                AdmitError::Invalid(error.to_string())
+            })?;
+
+            let payload = json!({
+                "session_id": session_id,
+                "session_new": if session_new { 1 } else { 0 },
+                "profile": ADMISSION_SESSION_PROFILE,
+                "platform": request.platform.clone(),
+                "account_id": session_id,
+                "model": effective_model.clone(),
+                "provider": effective_provider.clone().unwrap_or_default(),
+                "system_prompt": effective_system_prompt.clone().unwrap_or_default(),
+                "session_metadata_json": session_metadata_json,
+                "run_id": run_id,
+                "parent_run_id": request.parent_run_id.clone().unwrap_or_default(),
+                "input_json": persisted_input,
+                "message_id": message_id,
+                "message_run_id": run_id,
+                "script_hash": snapshot.registry.identity(),
+                "idempotency_scope": ADMISSION_IDEMPOTENCY_SCOPE,
+                "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
+                "request_hash": effective_request_hash.clone().unwrap_or_default(),
+                "workspace_identity_json": workspace_identity_json.clone().unwrap_or_default(),
+                "event_id": event_id,
+                "now_ms": now,
+                "expires_at_ms": 0,
+            });
+
+            // Commit phase: fresh revalidation then atomic durable + in-memory
+            // publication while holding the gate. Unrelated global generation
+            // drift alone never invalidates; only relevant prepared inputs
+            // trigger a reprepare outside the gate within the original budget.
+            {
+                let _admission_serial = self.inner.commit_gate.lock();
+                if self.inner.halting.load(Ordering::Acquire) {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::Halting);
+                    return Err(AdmitError::Halting);
+                }
+                // Halting keeps priority above. The original absolute
+                // deadline/cancellation is enforced next, still before any
+                // durable write or memory publication.
+                if Self::admission_cancelled_before_commit(&cancellation) {
+                    return Err(self.admission_deadline_rejection());
+                }
+                let (
+                    cur_exists,
+                    cur_view,
+                    cur_messages_len,
+                    cur_message_ids,
+                    cur_parent_ok,
+                    cur_maintenance,
+                    cur_idem,
+                    cur_run_exists,
+                ) = {
+                    let store = self.inner.store.read();
+                    let cur_exists = store.sessions.contains_key(&session_id);
+                    let cur_view = store.sessions.get(&session_id).map(|s| s.view.clone());
+                    let (cur_len, cur_ids) = store
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| {
+                            (
+                                s.messages.len(),
+                                s.messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    let cur_parent_ok = match request.parent_run_id.as_deref() {
+                        None => true,
+                        Some(parent) => store.runs.contains_key(parent),
+                    };
+                    let cur_maintenance =
+                        self.inner.session_maintenance.lock().contains(&session_id);
+                    let cur_idem = request
+                        .idempotency_key
+                        .as_deref()
+                        .and_then(|k| store.idempotency.get(k).cloned());
+                    let cur_run_exists = store.runs.contains_key(&run_id);
+                    (
+                        cur_exists,
+                        cur_view,
+                        cur_len,
+                        cur_ids,
+                        cur_parent_ok,
+                        cur_maintenance,
+                        cur_idem,
+                        cur_run_exists,
+                    )
+                };
+                if session_new && cur_exists {
+                    continue;
+                }
+                if !session_new && !cur_exists {
                     self.inner
                         .metrics
                         .admission_rejected(AdmitRejectReason::SessionNotFound);
                     return Err(AdmitError::SessionNotFound);
                 }
-                session_id
-            }
-            None => Uuid::new_v4().to_string(),
-        };
-        let session_new = !store.sessions.contains_key(&session_id);
-        let existing_workspace_binding = store
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.view.workspace.clone());
-        let (effective_model, effective_provider, effective_system_prompt) = if session_new {
-            (
-                request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.inner.config.model.clone()),
-                request
-                    .provider
-                    .clone()
-                    .or_else(|| self.inner.config.provider.clone()),
-                request.instructions.clone(),
-            )
-        } else {
-            let session = store
-                .sessions
-                .get(&session_id)
-                .expect("existing admission session should be present");
-            (
-                request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| session.view.model.clone()),
-                request
-                    .provider
-                    .clone()
-                    .or_else(|| session.view.provider.clone()),
-                request
-                    .instructions
-                    .clone()
-                    .or_else(|| session.view.system_prompt.clone()),
-            )
-        };
-        if let Err(message) = validate_visible_name(&effective_model, "model", MAX_MODEL_NAME_BYTES)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            return Err(AdmitError::Invalid(message));
-        }
-        if let Some(provider) = effective_provider
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            && let Err(message) =
-                validate_visible_name(provider, "provider", MAX_PROVIDER_NAME_BYTES)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            return Err(AdmitError::Invalid(message));
-        }
-        let mut new_session_view = if session_new {
-            let view = SessionView {
-                id: session_id.clone(),
-                object: "hermes.session".to_string(),
-                title: None,
-                model: effective_model.clone(),
-                provider: effective_provider.clone(),
-                source: request.platform.clone(),
-                system_prompt: effective_system_prompt.clone(),
-                workspace: None,
-                created_at: now,
-                updated_at: now,
-                message_count: 0,
-                end_reason: None,
-            };
-            Some(view)
-        } else {
-            None
-        };
-        if let Some(parent_run_id) = request.parent_run_id.as_deref()
-            && !store.runs.contains_key(parent_run_id)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::ParentNotFound);
-            return Err(AdmitError::ParentNotFound);
-        }
-        let provider_profile = self
-            .resolve_provider_profile(effective_provider.as_deref())
-            .map_err(|error| AdmitError::Invalid(format!("invalid provider profile: {error}")))?;
-        let mut snapshot = RunAdmissionSnapshot {
-            registry,
-            provider_profile,
-            limits: run_limits,
-        };
-        let context_message = SessionMessage {
-            id: message_id.clone(),
-            session_id: session_id.clone(),
-            role: "user".to_string(),
-            content: decode_message_content(&request.input),
-            created_at: now,
-            run_id: Some(run_id.clone()),
-            finish_reason: None,
-            name: None,
-            tool_call_id: None,
-            parent_message_id: None,
-            token_estimate: None,
-            metadata: JsonValue::Null,
-            ordinal: None,
-        };
-        let mut context_messages = store
-            .sessions
-            .get(&session_id)
-            .map(|session| session.messages.clone())
-            .unwrap_or_default();
-        context_messages.push(context_message.clone());
-        let context_input = ContextAdmissionInput {
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            message_id: message_id.clone(),
-            parent_run_id: request.parent_run_id.clone(),
-            platform: request.platform.clone(),
-            input: request.input.clone(),
-            messages: context_messages,
-            model: effective_model.clone(),
-            provider: effective_provider.clone(),
-            system_prompt: effective_system_prompt.clone(),
-        };
-        drop(store);
-
-        let replay_identity = AdmissionReplayIdentity {
-            key: request.idempotency_key.as_deref(),
-            request_hash: request.idempotency_hash.as_deref(),
-            request_selector: workspace_selector.as_deref(),
-        };
-        if let Some(replayed) = self.replay_existing_admission(replay_identity, &cancellation)? {
-            return Ok(replayed);
-        }
-
-        if self.inner.session_maintenance.lock().contains(&session_id) {
-            return Err(AdmitError::SessionMaintenanceBusy(
-                CompactionError::from_rss("busy", "session maintenance is in progress"),
-            ));
-        }
-
-        let (workspace_binding, workspace_authority) = self.resolve_workspace_admission(
-            workspace_selector.as_deref(),
-            existing_workspace_binding.as_ref(),
-            &cancellation,
-            has_idempotency_replay,
-        )?;
-
-        let legacy_workspace_root = if workspace_binding.is_none() && allow_legacy_workspace_root {
-            self.inner.trusted_legacy_workspace_root.read().clone()
-        } else {
-            None
-        };
-        let effective_request_hash = request.idempotency_hash.clone();
-        let workspace_identity_json = workspace_identity_json(
-            workspace_binding.as_ref(),
-            legacy_workspace_root.as_deref(),
-            workspace_selector.as_deref(),
-        )?;
-        if let Some(binding) = &workspace_binding {
-            snapshot.limits.workspace_root = PathBuf::from(&binding.canonical_path);
-        } else if let Some(root) = &legacy_workspace_root {
-            snapshot.limits.workspace_root = root.clone();
-        }
-        if let Some(view) = new_session_view.as_mut() {
-            view.workspace = workspace_binding.clone();
-        }
-        let session_metadata_json = match &workspace_binding {
-            Some(binding) => serde_json::to_string(&json!({"workspace": binding}))
-                .map_err(|error| AdmitError::Invalid(error.to_string()))?,
-            None => "{}".to_string(),
-        };
-        let date = self.inner.date_source.read().current_date();
-        let platform = std::env::consts::OS.to_string();
-        let arch = std::env::consts::ARCH.to_string();
-        let workspace_root = snapshot.limits.workspace_root.clone();
-        let tool_descriptors = snapshot.registry.descriptors().to_vec();
-        let run_limits = snapshot.limits.clone();
-
-        let prompt_read_observer = self
-            .inner
-            .prompt_read_entered
-            .lock()
-            .expect("prompt read observer lock")
-            .clone();
-        if let Some(observer) = prompt_read_observer {
-            observer();
-        }
-
-        let coding_system_prompt = build_coding_prompt(
-            &workspace_root,
-            &tool_descriptors,
-            &run_limits,
-            &date,
-            &platform,
-            &arch,
-            CodingPromptBudgets::default(),
-        )
-        .map_err(|error| {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            AdmitError::Invalid(error.to_string())
-        })?;
-        let mut context =
-            self.make_admitted_context(&context_input, &snapshot, coding_system_prompt.clone());
-        if let Some(binding) = workspace_binding.as_ref() {
-            context.metadata["admitted_workspace_binding"] = serde_json::to_value(binding)
-                .map_err(|error| AdmitError::Invalid(error.to_string()))?;
-        }
-        let persisted_input = persisted_run_context_json(&context)?;
-        let provider = effective_provider.clone().unwrap_or_default();
-        let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
-        let estimate = estimate_admission_query_bytes(AdmissionSqliteCellLens {
-            run_id: run_id.len(),
-            session_id: session_id.len(),
-            parent_run_id: request.parent_run_id.as_deref().unwrap_or("").len(),
-            input_json: persisted_input.len(),
-            provider: provider.len(),
-            model: effective_model.len(),
-            script_hash: snapshot.registry.identity().len(),
-            idempotency_scope: ADMISSION_IDEMPOTENCY_SCOPE.len(),
-            idempotency_key: idempotency_key.len(),
-            platform: request.platform.len(),
-            profile: ADMISSION_SESSION_PROFILE.len(),
-            system_prompt: effective_system_prompt.as_deref().unwrap_or("").len(),
-            message_id: message_id.len(),
-            // The existing lens also budgets identity bytes stored in the durable response.
-            request_hash: request
-                .idempotency_hash
-                .as_deref()
-                .unwrap_or("")
-                .len()
-                .saturating_add(workspace_identity_json.as_deref().map_or(0, str::len)),
-            has_idempotency: !idempotency_key.is_empty(),
-        })
-        .map_err(|error| {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            AdmitError::Invalid(error.to_string())
-        })?;
-        estimate.ensure_fits().map_err(|error| {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::Invalid);
-            AdmitError::Invalid(error.to_string())
-        })?;
-
-        let payload = json!({
-            "session_id": session_id,
-            "session_new": if session_new { 1 } else { 0 },
-            "profile": ADMISSION_SESSION_PROFILE,
-            "platform": request.platform.clone(),
-            "account_id": session_id,
-            "model": effective_model.clone(),
-            "provider": effective_provider.clone().unwrap_or_default(),
-            "system_prompt": effective_system_prompt.clone().unwrap_or_default(),
-            "session_metadata_json": session_metadata_json,
-            "run_id": run_id,
-            "parent_run_id": request.parent_run_id.clone().unwrap_or_default(),
-            "input_json": persisted_input,
-            "message_id": message_id,
-            "message_run_id": run_id,
-            "script_hash": snapshot.registry.identity(),
-            "idempotency_scope": ADMISSION_IDEMPOTENCY_SCOPE,
-            "idempotency_key": request.idempotency_key.clone().unwrap_or_default(),
-            "request_hash": effective_request_hash.clone().unwrap_or_default(),
-            "workspace_identity_json": workspace_identity_json.clone().unwrap_or_default(),
-            "event_id": event_id,
-            "now_ms": now,
-            "expires_at_ms": 0,
-        });
-
-        let durable = match self.inner.persistence.as_ref() {
-            Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::Persistence);
-                match error.code.as_str() {
-                    "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
-                    _ => AdmitError::Persistence(format!(
-                        "run admission could not be durably committed: {error}"
-                    )),
+                if !cur_parent_ok {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::ParentNotFound);
+                    return Err(AdmitError::ParentNotFound);
                 }
-            }),
-            None => Ok(JsonValue::Null),
-        };
-        let data = durable?;
+                if cur_maintenance {
+                    return Err(AdmitError::SessionMaintenanceBusy(
+                        CompactionError::from_rss("busy", "session maintenance is in progress"),
+                    ));
+                }
+                if let Some(authority) = workspace_authority.as_ref()
+                    && authority.check().is_err()
+                {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::Invalid);
+                    return Err(AdmitError::Invalid(
+                        "workspace authority was revoked before admission commit".to_string(),
+                    ));
+                }
+                if let Some(cur) = cur_view.as_ref() {
+                    if cur.workspace != existing_workspace_binding {
+                        continue;
+                    }
+                    if !session_new {
+                        let cur_eff_model =
+                            request.model.clone().unwrap_or_else(|| cur.model.clone());
+                        let cur_eff_provider =
+                            request.provider.clone().or_else(|| cur.provider.clone());
+                        let cur_eff_prompt = request
+                            .instructions
+                            .clone()
+                            .or_else(|| cur.system_prompt.clone());
+                        if cur_eff_model != effective_model
+                            || cur_eff_provider != effective_provider
+                            || cur_eff_prompt != effective_system_prompt
+                        {
+                            continue;
+                        }
+                        let prepared_base_len = context_input.messages.len().saturating_sub(1);
+                        if cur_messages_len != prepared_base_len {
+                            continue;
+                        }
+                        let base_match = context_input
+                            .messages
+                            .iter()
+                            .take(prepared_base_len)
+                            .enumerate()
+                            .all(|(i, m)| cur_message_ids.get(i).is_some_and(|id| id == &m.id));
+                        if !base_match {
+                            continue;
+                        }
+                    }
+                } else if !session_new {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::SessionNotFound);
+                    return Err(AdmitError::SessionNotFound);
+                }
+                {
+                    let cur_registry_id = self.inner.tool_registry.read().identity().to_string();
+                    if cur_registry_id != snapshot.registry.identity() {
+                        continue;
+                    }
+                    let cur_base = self.inner.run_limits.read().clone();
+                    if cur_base.max_turns != base_limits.max_turns
+                        || cur_base.max_tool_calls != base_limits.max_tool_calls
+                        || cur_base.max_tool_output_bytes != base_limits.max_tool_output_bytes
+                    {
+                        continue;
+                    }
+                    if workspace_binding.is_none()
+                        && legacy_workspace_root.is_none()
+                        && cur_base.workspace_root != base_limits.workspace_root
+                    {
+                        continue;
+                    }
+                    if workspace_binding.is_none() {
+                        let cur_legacy = self.inner.trusted_legacy_workspace_root.read().clone();
+                        if cur_legacy != legacy_workspace_root {
+                            continue;
+                        }
+                    }
+                    let cur_profile = self
+                        .resolve_provider_profile(effective_provider.as_deref())
+                        .map_err(|error| {
+                            AdmitError::Invalid(format!("invalid provider profile: {error}"))
+                        })?;
+                    if cur_profile.to_json() != snapshot.provider_profile.to_json() {
+                        continue;
+                    }
+                    let cur_date = self.inner.date_source.read().current_date();
+                    if cur_date != date {
+                        continue;
+                    }
+                }
+                if let (Some(_key), Some(hash)) = (
+                    request.idempotency_key.as_deref(),
+                    effective_request_hash.as_deref(),
+                ) && let Some(existing) = cur_idem
+                {
+                    if !self.workspace_replay_identity_matches(
+                        &existing,
+                        hash,
+                        replay_identity.request_selector,
+                        &cancellation,
+                    )? {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                        return Err(AdmitError::IdempotencyConflict);
+                    }
+                    let store = self.inner.store.read();
+                    let (sid, status) = store
+                        .runs
+                        .get(&existing.run_id)
+                        .map(|r| (r.session_id.clone(), r.status.clone()))
+                        .unwrap_or_else(|| (String::new(), "unknown".to_string()));
+                    return Ok(AdmittedRun {
+                        run_id: existing.run_id.clone(),
+                        session_id: sid,
+                        status,
+                        replayed: true,
+                    });
+                }
+                if cur_run_exists {
+                    let store = self.inner.store.read();
+                    if let Some(existing) = store.runs.get(&run_id) {
+                        return Ok(AdmittedRun {
+                            run_id: run_id.clone(),
+                            session_id: existing.session_id.clone(),
+                            status: existing.status.clone(),
+                            replayed: true,
+                        });
+                    }
+                }
+                // Pre-linearization check: deadline/cancel rejection is
+                // BEFORE linearization. After a successful durable commit the
+                // in-memory publication below completes unconditionally (no
+                // post-durable rejection may orphan rows); the
+                // non-persistent path is likewise covered here before its
+                // memory linearization.
+                if Self::admission_cancelled_before_commit(&cancellation) {
+                    return Err(self.admission_deadline_rejection());
+                }
+                let durable = match self.inner.persistence.as_ref() {
+                    Some(persistence) => persistence.admission_create(&payload).map_err(|error| {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::Persistence);
+                        match error.code.as_str() {
+                            "idempotency_key_conflict" => AdmitError::IdempotencyConflict,
+                            _ => AdmitError::Persistence(format!(
+                                "run admission could not be durably committed: {error}"
+                            )),
+                        }
+                    }),
+                    None => Ok(JsonValue::Null),
+                };
+                let data = durable?;
+                if data.get("replayed") == Some(&JsonValue::Bool(true)) {
+                    return self.finish_durable_replay(&data);
+                }
+                let mut store = self.inner.store.write();
+                if store.runs.contains_key(&run_id)
+                    && let Some(existing) = store.runs.get(&run_id)
+                {
+                    return Ok(AdmittedRun {
+                        run_id: run_id.clone(),
+                        session_id: existing.session_id.clone(),
+                        status: existing.status.clone(),
+                        replayed: true,
+                    });
+                }
+                if let (Some(key), Some(hash)) = (
+                    request.idempotency_key.as_deref(),
+                    effective_request_hash.as_deref(),
+                ) && let Some(existing) = store.idempotency.get(key)
+                {
+                    if !self.workspace_replay_identity_matches(
+                        existing,
+                        hash,
+                        replay_identity.request_selector,
+                        &cancellation,
+                    )? {
+                        self.inner
+                            .metrics
+                            .admission_rejected(AdmitRejectReason::IdempotencyConflict);
+                        return Err(AdmitError::IdempotencyConflict);
+                    }
+                    let (sid, status) = store
+                        .runs
+                        .get(&existing.run_id)
+                        .map(|r| (r.session_id.clone(), r.status.clone()))
+                        .unwrap_or_else(|| (String::new(), "unknown".to_string()));
+                    return Ok(AdmittedRun {
+                        run_id: existing.run_id.clone(),
+                        session_id: sid,
+                        status,
+                        replayed: true,
+                    });
+                }
+                if !session_new && !store.sessions.contains_key(&session_id) {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::SessionNotFound);
+                    return Err(AdmitError::SessionNotFound);
+                }
+                if let Some(parent_run_id) = request.parent_run_id.as_deref()
+                    && !store.runs.contains_key(parent_run_id)
+                {
+                    self.inner
+                        .metrics
+                        .admission_rejected(AdmitRejectReason::ParentNotFound);
+                    return Err(AdmitError::ParentNotFound);
+                }
+                self.inner.store_generation.fetch_add(1, Ordering::Release);
+                if session_new {
+                    store.sessions.insert(
+                        session_id.clone(),
+                        SessionRecord {
+                            view: new_session_view.expect("new session view was prepared"),
+                            messages: Vec::new(),
+                        },
+                    );
+                }
+                let session = store
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("admission session exists after commit");
+                if let Some(model) = request.model.clone() {
+                    session.view.model = model;
+                }
+                if request.provider.is_some() {
+                    session.view.provider = request.provider.clone();
+                }
+                if request.instructions.is_some() {
+                    session.view.system_prompt = request.instructions.clone();
+                }
+                if let Some(binding) = workspace_binding.clone() {
+                    session.view.workspace = Some(binding);
+                }
+                session.messages.push(context_message);
+                session.view.message_count = session.messages.len();
+                session.view.updated_at = now;
 
-        // The transactional admission may have replayed an existing key (a
-        // restart race the in-memory fast path cannot see).
-        if data.get("replayed") == Some(&JsonValue::Bool(true)) {
-            return self.finish_durable_replay(&data);
-        }
-
-        // Durable commit succeeded: apply the matching in-memory state under
-        // the write lock with a generation recheck so concurrent admits cannot
-        // duplicate runs after the storage roundtrip.
-        let mut store = self.inner.store.write();
-        if let Some(replayed) = self.recheck_admission_after_commit(
-            &store,
-            generation,
-            replay_identity,
-            &run_id,
-            &cancellation,
-        )? {
-            return Ok(replayed);
-        }
-        if !session_new && !store.sessions.contains_key(&session_id) {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::SessionNotFound);
-            return Err(AdmitError::SessionNotFound);
-        }
-        if let Some(parent_run_id) = request.parent_run_id.as_deref()
-            && !store.runs.contains_key(parent_run_id)
-        {
-            self.inner
-                .metrics
-                .admission_rejected(AdmitRejectReason::ParentNotFound);
-            return Err(AdmitError::ParentNotFound);
-        }
-        self.inner.store_generation.fetch_add(1, Ordering::Release);
-        if session_new {
-            store.sessions.insert(
-                session_id.clone(),
-                SessionRecord {
-                    view: new_session_view.expect("new session view was prepared"),
-                    messages: Vec::new(),
-                },
-            );
-        }
-        let session = store
-            .sessions
-            .get_mut(&session_id)
-            .expect("admission session exists after commit");
-        if let Some(model) = request.model.clone() {
-            session.view.model = model;
-        }
-        if request.provider.is_some() {
-            session.view.provider = request.provider.clone();
-        }
-        if request.instructions.is_some() {
-            session.view.system_prompt = request.instructions.clone();
-        }
-        if let Some(binding) = workspace_binding.clone() {
-            session.view.workspace = Some(binding);
-        }
-        session.messages.push(context_message);
-        session.view.message_count = session.messages.len();
-        session.view.updated_at = now;
-
-        let (sender, _) = tokio::sync::broadcast::channel(self.inner.config.broadcast_capacity);
-        let started_event = GatewayEvent {
-            event_id: event_id.clone(),
-            seq: 1,
-            event: "run.started".to_string(),
-            run_id: run_id.clone(),
-            timestamp: now,
-            data: json!({"status": "running", "session_id": session_id}),
-        };
-        let run = RunRecord {
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            parent_run_id: request.parent_run_id.clone(),
-            status: "started".to_string(),
-            events: vec![started_event],
-            sender: Some(sender),
-            cancel_requested: Arc::new(AtomicBool::new(false)),
-        };
-        store.runs.insert(run_id.clone(), run);
-        if let (Some(key), Some(hash)) = (
-            request.idempotency_key.as_deref(),
-            effective_request_hash.as_deref(),
-        ) {
-            store.idempotency.insert(
-                key.to_string(),
-                IdempotencyRecord {
-                    request_hash: hash.to_string(),
+                let (sender, _) =
+                    tokio::sync::broadcast::channel(self.inner.config.broadcast_capacity);
+                let started_event = GatewayEvent {
+                    event_id: event_id.clone(),
+                    seq: 1,
+                    event: "run.started".to_string(),
                     run_id: run_id.clone(),
-                    workspace_identity_json: workspace_identity_json.clone(),
-                },
-            );
-        }
+                    timestamp: now,
+                    data: json!({"status": "running", "session_id": session_id}),
+                };
+                let run = RunRecord {
+                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
+                    parent_run_id: request.parent_run_id.clone(),
+                    status: "started".to_string(),
+                    events: vec![started_event],
+                    sender: Some(sender),
+                    cancel_requested: Arc::new(AtomicBool::new(false)),
+                };
+                store.runs.insert(run_id.clone(), run);
+                if let (Some(key), Some(hash)) = (
+                    request.idempotency_key.as_deref(),
+                    effective_request_hash.as_deref(),
+                ) {
+                    store.idempotency.insert(
+                        key.to_string(),
+                        IdempotencyRecord {
+                            request_hash: hash.to_string(),
+                            run_id: run_id.clone(),
+                            workspace_identity_json: workspace_identity_json.clone(),
+                        },
+                    );
+                }
 
-        let handle = Arc::new(RunHandle {
-            tool_cancel: cancellation.token(),
-            cancel: cancellation,
-            terminal_at: Mutex::new(None),
-            permit: Mutex::new(Some(capacity_permit)),
-            terminal: AtomicBool::new(false),
-            cancel_reason: Mutex::new(None),
-            subscribers: Mutex::new(SubscriberState {
-                count: 0,
-                notified: false,
-            }),
-            disconnect_policy: self.inner.config.client_disconnect_policy,
-            started_at: Instant::now(),
-            capability_host: Mutex::new(CapabilityHostPhase::Empty),
-            capability_host_cv: Condvar::new(),
-            workspace_authority,
-            legacy_workspace_root,
-            coding_system_prompt: Arc::from(coding_system_prompt),
-            occupancy: AtomicBool::new(false),
-        });
-        self.inner
-            .runs
-            .lock()
-            .expect("runs lock")
-            .insert(run_id.clone(), handle);
-        self.cache_context(context, Some(snapshot.registry));
-        self.inner.metrics.admission_accepted();
-        self.inner.metrics.active_runs_inc();
-        Ok(AdmittedRun {
-            run_id: run_id.clone(),
-            session_id,
-            status: "started".to_string(),
-            replayed: false,
-        })
+                let permit = permit_opt
+                    .take()
+                    .expect("admission capacity permit retained until commit");
+                let handle = Arc::new(RunHandle {
+                    tool_cancel: cancellation.token(),
+                    cancel: cancellation.clone(),
+                    terminal_at: Mutex::new(None),
+                    permit: Mutex::new(Some(permit)),
+                    terminal: AtomicBool::new(false),
+                    cancel_reason: Mutex::new(None),
+                    subscribers: Mutex::new(SubscriberState {
+                        count: 0,
+                        notified: false,
+                    }),
+                    disconnect_policy: self.inner.config.client_disconnect_policy,
+                    started_at: Instant::now(),
+                    capability_host: Mutex::new(CapabilityHostPhase::Empty),
+                    capability_host_cv: Condvar::new(),
+                    workspace_authority,
+                    legacy_workspace_root,
+                    coding_system_prompt: Arc::from(coding_system_prompt),
+                    occupancy: AtomicBool::new(false),
+                });
+                self.inner
+                    .runs
+                    .lock()
+                    .expect("runs lock")
+                    .insert(run_id.clone(), handle);
+                self.cache_context(context, Some(snapshot.registry));
+                self.inner.metrics.admission_accepted();
+                self.inner.metrics.active_runs_inc();
+                return Ok(AdmittedRun {
+                    run_id: run_id.clone(),
+                    session_id,
+                    status: "started".to_string(),
+                    replayed: false,
+                });
+            }
+        }
+        // Unreachable: the loop only exits via commit, replay, or a typed
+        // rejection; drift reprepares while the original deadline holds.
     }
 
     fn replay_existing_admission(
@@ -4843,59 +5132,9 @@ impl AgentService {
         })
     }
 
-    fn recheck_admission_after_commit(
-        &self,
-        store: &GatewayStore,
-        generation: u64,
-        replay: AdmissionReplayIdentity<'_>,
-        run_id: &str,
-        cancellation: &RunCancellation,
-    ) -> Result<Option<AdmittedRun>, AdmitError> {
-        let current_generation = self.inner.store_generation.load(Ordering::Acquire);
-        if current_generation != generation {
-            tracing::debug!(
-                current_generation,
-                generation,
-                "admission store generation changed during durable commit"
-            );
-        }
-        if let Some(existing) = store.runs.get(run_id) {
-            return Ok(Some(AdmittedRun {
-                run_id: run_id.to_string(),
-                session_id: existing.session_id.clone(),
-                status: existing.status.clone(),
-                replayed: true,
-            }));
-        }
-        if let (Some(key), Some(hash)) = (replay.key, replay.request_hash)
-            && let Some(existing) = store.idempotency.get(key)
-        {
-            if !self.workspace_replay_identity_matches(
-                existing,
-                hash,
-                replay.request_selector,
-                cancellation,
-            )? {
-                self.inner
-                    .metrics
-                    .admission_rejected(AdmitRejectReason::IdempotencyConflict);
-                return Err(AdmitError::IdempotencyConflict);
-            }
-            let (session_id, status) = store
-                .runs
-                .get(&existing.run_id)
-                .map(|run| (run.session_id.clone(), run.status.clone()))
-                .unwrap_or_else(|| (String::new(), "unknown".to_string()));
-            return Ok(Some(AdmittedRun {
-                run_id: existing.run_id.clone(),
-                session_id,
-                status,
-                replayed: true,
-            }));
-        }
-        Ok(None)
-    }
-
+    // Admission linearization is validated before the durable write in
+    // `admit_blocking`; no post-commit generation log can replace the full
+    // pre-commit revalidation above.
     fn reconstruct_admitted_messages(
         &self,
         context: &RunContext,
