@@ -290,8 +290,8 @@ fn assert_redacted(output: &Output, home: &Path) {
 fn copied_binary_runs_login_pre_oauth_gates_outside_checkout_without_auth_mutation() {
     let area = TestArea::new("login-pre-oauth-outside-checkout");
     assert!(!area.caller.starts_with(env!("CARGO_MANIFEST_DIR")));
-    let copied_binary = area.caller.join("rustscript-agent");
-    fs::copy(area.binary(), &copied_binary).expect("copy the actual executable outside checkout");
+    let staged = stage_executable_copy(&area.binary(), &area.caller.join("rustscript-agent"));
+    let copied_binary = staged.path;
 
     let unknown = area.home("unknown-provider-home");
     fs::remove_file(unknown.join("auth.yaml")).expect("remove auth fixture");
@@ -1644,11 +1644,79 @@ fn device_login_home(area: &TestArea, label: &str, port: u16) -> PathBuf {
     home
 }
 
+/// Test-only executable staging provenance: the PID of the process that opened
+/// the destination writer. On Linux the writer lives only in an owned copier
+/// child's FD table, never in the shared harness parent FD table.
+struct StagedExecutable {
+    path: PathBuf,
+    writer_pid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn stage_executable_copy(source: &Path, destination: &Path) -> StagedExecutable {
+    const COPIERS: [&str; 2] = ["/bin/cp", "/usr/bin/cp"];
+    let copier = COPIERS
+        .iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.is_file())
+        .expect("an available system file copier for executable staging");
+    let mut child = Command::new(&copier)
+        .arg(source)
+        .arg(destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn owned executable staging copier");
+    let writer_pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait().expect("poll owned staging copier") {
+            Some(status) => {
+                assert!(
+                    status.success(),
+                    "owned staging copier exited with {status}"
+                );
+                break;
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("owned staging copier timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(source)
+            .expect("stat staging source")
+            .permissions()
+            .mode();
+        fs::set_permissions(destination, fs::Permissions::from_mode(mode))
+            .expect("mirror staged executable mode");
+    }
+    StagedExecutable {
+        path: destination.to_path_buf(),
+        writer_pid,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stage_executable_copy(source: &Path, destination: &Path) -> StagedExecutable {
+    fs::copy(source, destination).expect("stage the actual executable outside checkout");
+    StagedExecutable {
+        path: destination.to_path_buf(),
+        writer_pid: std::process::id(),
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
 fn copied_binary(area: &TestArea) -> PathBuf {
-    let copied = area.caller.join("rustscript-agent");
-    fs::copy(area.binary(), &copied).expect("stage actual Cargo executable outside checkout");
-    copied
+    stage_executable_copy(&area.binary(), &area.caller.join("rustscript-agent")).path
 }
 
 #[cfg(all(target_os = "linux", feature = "config-fixture"))]
@@ -1986,4 +2054,105 @@ fn failed_stdout_sink_returns_the_static_output_error_without_panicking() {
     area.record(&argv, pid, &output, group);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stderr, b"cli_output_closed\n");
+}
+
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
+fn parent_holds_writable_fd_for(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let target = fs::metadata(path).expect("stat staged destination");
+    let (device, inode) = (target.dev(), target.ino());
+    let handles = fs::read_dir("/proc/self/fd").expect("list harness file descriptors");
+    for entry in handles {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let fd: libc::c_int = match entry.file_name().to_string_lossy().parse() {
+            Ok(fd) => fd,
+            Err(_) => continue,
+        };
+        let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut file_stat) } != 0 {
+            continue;
+        }
+        if file_stat.st_dev as u64 != device || file_stat.st_ino as u64 != inode {
+            continue;
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            continue;
+        }
+        let access = flags & libc::O_ACCMODE;
+        if access == libc::O_WRONLY || access == libc::O_RDWR {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(target_os = "linux", feature = "config-fixture"))]
+#[test]
+fn staged_executable_copy_is_owned_by_child_copier_without_parent_writer_fd() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = {
+        let area = TestArea::new("login-staging-ownership");
+        assert!(!area.caller.starts_with(env!("CARGO_MANIFEST_DIR")));
+        let destination = area.caller.join("rustscript-agent");
+        let staged = stage_executable_copy(&area.binary(), &destination);
+        assert_eq!(staged.path, destination);
+        // Safety property: the destination writer must live in an owned copier
+        // child, never in the shared harness parent FD table.
+        assert!(
+            staged.writer_pid != std::process::id(),
+            "staged copy writer must be an owned child, not the harness parent"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{}", staged.writer_pid)).exists(),
+            "owned staging copier was reaped before returning the staged path"
+        );
+        let source_meta = fs::metadata(area.binary()).expect("stat Cargo executable");
+        let staged_meta = fs::metadata(&destination).expect("stat staged executable");
+        assert!(
+            (staged_meta.dev(), staged_meta.ino()) != (source_meta.dev(), source_meta.ino()),
+            "staged executable is an independent copy, not a link to the Cargo artifact"
+        );
+        assert!(
+            !destination.starts_with(env!("CARGO_MANIFEST_DIR")),
+            "staged executable stays outside the checkout"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read staged bytes"),
+            fs::read(area.binary()).expect("read Cargo artifact bytes"),
+            "staged executable preserves the exact Cargo artifact bytes"
+        );
+        assert_ne!(
+            staged_meta.permissions().mode() & 0o111,
+            0,
+            "staged executable keeps an owner-executable mode"
+        );
+        assert!(
+            !parent_holds_writable_fd_for(&destination),
+            "harness parent holds no writable descriptor for the staged inode"
+        );
+        let help = Command::new(&destination)
+            .arg("--help")
+            .env("RUSTSCRIPT_AGENT_HOME", "")
+            .env("HOME", area.root.join("isolated-default-home"))
+            .env_remove("USERPROFILE")
+            .current_dir(&area.caller)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run staged copy --help");
+        assert_eq!(
+            help.status.code(),
+            Some(0),
+            "staged copy --help stderr={}",
+            String::from_utf8_lossy(&help.stderr)
+        );
+        area.root.clone()
+    };
+    assert!(!root.exists(), "private staging area is cleaned up");
 }
