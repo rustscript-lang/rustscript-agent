@@ -1,16 +1,17 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::Write,
+    io::{Read, Write},
     net::TcpListener,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use rustscript_agent::{
@@ -218,6 +219,198 @@ fn assert_fd_closed(fd: i32) {
     );
 }
 
+const FD_OBSERVER_CHILD_MARKER: &str = "RUSTSCRIPT_NATIVE_CALLBACK_COMPOSITE_RSS_FD_OBSERVER_CHILD";
+
+fn expect_fd_observer_rejection(fd: i32, stage: &str) {
+    let payload = std::panic::catch_unwind(|| assert_fd_closed(fd))
+        .expect_err("FD observer must reject an actually-retained or reused integer");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("left == right"),
+        "FD observer rejection at {stage} must carry the actual assert payload, got {message:?}"
+    );
+}
+
+fn fd_observer_child_is_current_test(test_name: &str) -> bool {
+    let Ok(marker) = std::env::var(FD_OBSERVER_CHILD_MARKER) else {
+        return false;
+    };
+    let mut parts = marker.splitn(3, ':');
+    let (Some(marked_test), Some(parent_pid), Some(nonce)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if marked_test != test_name
+        || parent_pid.parse::<libc::pid_t>().ok() != Some(unsafe { libc::getppid() })
+        || uuid::Uuid::parse_str(nonce).is_err()
+    {
+        return false;
+    }
+    std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|args| args[0] == "--exact" && args[1] == test_name)
+}
+
+const FD_OBSERVER_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+const FD_OBSERVER_CHILD_OUTPUT_LIMIT: usize = 64 * 1024;
+
+struct OwnedTestChild(Option<Child>);
+
+impl OwnedTestChild {
+    fn wait_before(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            let child = self.0.as_mut().expect("owned child is still present");
+            if let Some(status) = child.try_wait()? {
+                self.0.take();
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                self.kill_and_wait();
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill_and_wait(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for OwnedTestChild {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+struct BoundedChildOutput {
+    bytes: Vec<u8>,
+    discarded: usize,
+}
+
+fn capture_child_output(mut reader: impl Read) -> std::io::Result<BoundedChildOutput> {
+    let mut output = BoundedChildOutput {
+        bytes: Vec::with_capacity(FD_OBSERVER_CHILD_OUTPUT_LIMIT),
+        discarded: 0,
+    };
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(read) => {
+                let keep = read.min(FD_OBSERVER_CHILD_OUTPUT_LIMIT - output.bytes.len());
+                output.bytes.extend_from_slice(&buffer[..keep]);
+                output.discarded += read - keep;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn spawn_fd_observer_child_unless_child(test_name: &str) -> bool {
+    if fd_observer_child_is_current_test(test_name) {
+        return false;
+    }
+
+    let deadline = Instant::now() + FD_OBSERVER_CHILD_TIMEOUT;
+    let nonce = uuid::Uuid::new_v4();
+    let marker = format!("{test_name}:{}:{nonce}", std::process::id());
+    let mut child = OwnedTestChild(Some(
+        Command::new(std::env::current_exe().expect("native test executable path"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env_clear()
+            .envs(
+                [
+                    "PATH",
+                    "HOME",
+                    "RUSTC",
+                    "RUSTUP_HOME",
+                    "RUSTUP_TOOLCHAIN",
+                    "CARGO_HOME",
+                    "LD_LIBRARY_PATH",
+                    "TMPDIR",
+                    "TEMP",
+                    "TMP",
+                    "TEST_TMPDIR",
+                    "RUSTSCRIPT_AGENT_TEST_TMP",
+                    "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+                ]
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+            )
+            .env(FD_OBSERVER_CHILD_MARKER, marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated FD-observer child"),
+    ));
+    let stdout = child
+        .0
+        .as_mut()
+        .expect("owned child is still present")
+        .stdout
+        .take()
+        .expect("child stdout is piped");
+    let stderr = child
+        .0
+        .as_mut()
+        .expect("owned child is still present")
+        .stderr
+        .take()
+        .expect("child stderr is piped");
+    let stdout_reader = thread::spawn(move || capture_child_output(stdout));
+    let stderr_reader = thread::spawn(move || capture_child_output(stderr));
+
+    let status = child.wait_before(deadline);
+    let stdout = stdout_reader
+        .join()
+        .expect("child stdout reader joined")
+        .expect("read child stdout");
+    let stderr = stderr_reader
+        .join()
+        .expect("child stderr reader joined")
+        .expect("read child stderr");
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    let output = format!("{stdout_text}\n{stderr_text}");
+    let truncated = stdout.discarded + stderr.discarded;
+    let ran_exactly_one_named_test = output
+        .lines()
+        .filter(|line| line.trim() == "running 1 test")
+        .count()
+        == 1
+        && output
+            .lines()
+            .filter(|line| line.trim() == format!("test {test_name} ... ok"))
+            .count()
+            == 1
+        && output.lines().any(|line| {
+            line.trim()
+                .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        });
+    let status = status.expect("child wait completed without an I/O error");
+    assert!(
+        matches!(status, Some(ref exit) if exit.success())
+            && ran_exactly_one_named_test
+            && truncated == 0,
+        "isolated FD-observer child {test_name} did not pass its one exact test: status={status:?}, ran_exactly_one_named_test={ran_exactly_one_named_test}, truncated_output_bytes={truncated}, stdout={stdout_text}, stderr={stderr_text}"
+    );
+    true
+}
+
 fn compiled_loopback_launcher(directory: &Path) -> (PathBuf, PathBuf) {
     let source_path = directory.join("owned-loopback-launcher.rs");
     let executable = directory.join("owned-loopback-launcher");
@@ -308,6 +501,11 @@ fn close_flow_resources(vm: &mut Vm, begun: &Value, waited: &Value) {
 
 #[test]
 fn real_default_typed_rss_manual_wait_uses_owned_input_and_opaque_code() {
+    if spawn_fd_observer_child_unless_child(
+        "real_default_typed_rss_manual_wait_uses_owned_input_and_opaque_code",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("manual");
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
@@ -379,6 +577,11 @@ fn real_default_typed_rss_manual_wait_uses_owned_input_and_opaque_code() {
 
 #[test]
 fn real_default_typed_rss_manual_state_mismatch_revokes_session_resources() {
+    if spawn_fd_observer_child_unless_child(
+        "real_default_typed_rss_manual_state_mismatch_revokes_session_resources",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("manual-state-mismatch");
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
@@ -447,6 +650,11 @@ fn real_default_typed_rss_manual_state_mismatch_revokes_session_resources() {
 
 #[test]
 fn real_default_typed_rss_none_mode_uses_owned_input_and_opaque_code() {
+    if spawn_fd_observer_child_unless_child(
+        "real_default_typed_rss_none_mode_uses_owned_input_and_opaque_code",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("none");
     let (reader, writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
@@ -551,6 +759,11 @@ fn missing_native_fd_fails_closed_before_publishing_rss_resources() {
 
 #[test]
 fn vm_owner_teardown_revokes_unwaited_manual_fd_and_redirect_socket() {
+    if spawn_fd_observer_child_unless_child(
+        "vm_owner_teardown_revokes_unwaited_manual_fd_and_redirect_socket",
+    ) {
+        return;
+    }
     let home = FreshLoginHome::new("vm-teardown");
     let (reader, _writer) = pipe_pair();
     let raw_fd = reader.as_raw_fd();
@@ -695,4 +908,27 @@ fn real_default_typed_rss_browser_launcher_and_manual_fd_are_isolated() {
     assert_callback_port_released(&manual_redirect);
     close_flow_resources(&mut vm, &manual_begun, &manual_waited);
     assert_eq!(vm.host_context().resource_count(), 2);
+}
+
+#[test]
+fn fd_observer_rejects_retained_owner_and_reused_integer() {
+    if spawn_fd_observer_child_unless_child("fd_observer_rejects_retained_owner_and_reused_integer")
+    {
+        return;
+    }
+    let (reader, writer) = pipe_pair();
+    let number = reader.as_raw_fd();
+    expect_fd_observer_rejection(number, "retained owned descriptor");
+    drop(reader);
+    assert_fd_closed(number);
+    let replacement = File::open("/dev/null").expect("open a different owned descriptor");
+    assert_eq!(
+        replacement.as_raw_fd(),
+        number,
+        "isolated namespace reuses the lowest free descriptor"
+    );
+    expect_fd_observer_rejection(number, "reused integer");
+    drop(replacement);
+    assert_fd_closed(number);
+    drop(writer);
 }

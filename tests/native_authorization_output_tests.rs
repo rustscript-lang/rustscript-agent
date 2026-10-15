@@ -532,6 +532,11 @@ fn blocked_full_pipe_deadline_within_budget_leaves_no_partial_record() {
 
 #[test]
 fn peer_close_is_sanitized_failure_without_process_signal() {
+    if spawn_fd_observer_child_unless_child(
+        "peer_close_is_sanitized_failure_without_process_signal",
+    ) {
+        return;
+    }
     let (read_fd, write_fd) = pipe(false);
     let output =
         NativeAuthorizationInstructionOutput::from_fd(write_fd).expect("admitted pipe descriptor");
@@ -545,6 +550,44 @@ fn peer_close_is_sanitized_failure_without_process_signal() {
         "{result:?}"
     );
     // Reaching here proves SIGPIPE did not terminate the process.
+    assert_eq!(std::process::id(), std::process::id());
+}
+
+#[test]
+fn peer_close_held_then_closed_reader_in_isolated_child() {
+    if spawn_fd_observer_child_unless_child("peer_close_held_then_closed_reader_in_isolated_child")
+    {
+        return;
+    }
+    assert!(
+        fd_observer_child_is_current_test("peer_close_held_then_closed_reader_in_isolated_child"),
+        "peer-close control must run in its isolated child namespace (marker selected-test:parent-pid:nonce + --exact)"
+    );
+    let instruction = public_instruction();
+    let (read_fd, write_fd) = pipe(false);
+    let output =
+        NativeAuthorizationInstructionOutput::from_fd(write_fd).expect("admitted pipe descriptor");
+    output
+        .emit(
+            &instruction,
+            &context_for(Instant::now() + Duration::from_secs(2)),
+        )
+        .expect("held reader delivers the genuine native record");
+    assert_eq!(
+        drain_nonblocking(read_fd.as_raw_fd()),
+        EXPECTED_RECORD,
+        "held-reader emit must deliver the actual expected record"
+    );
+    drop(read_fd);
+    let result = output.emit(
+        &instruction,
+        &context_for(Instant::now() + Duration::from_secs(1)),
+    );
+    assert!(
+        matches!(result, Err(OAuthError::Transport { .. })),
+        "{result:?}"
+    );
+    // Reaching here proves the closed-peer SIGPIPE did not terminate the process.
     assert_eq!(std::process::id(), std::process::id());
 }
 
