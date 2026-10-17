@@ -19,24 +19,56 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 fn temp_root(label: &str) -> PathBuf {
-    let base =
-        PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned test temp"));
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    temp_root_at(label, nanos)
+}
+
+fn temp_root_at(label: &str, nanos: u128) -> PathBuf {
+    // Clock readings can repeat; identity must remain unique within this process.
+    static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+    let sequence = NEXT_ROOT
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("temp root sequence exhausted");
+    let base =
+        PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned test temp"));
     let dir = base.join(format!(
-        "pin-tracer-{}-{}-{}",
+        "pin-tracer-{}-{}-{}-{}",
         label,
         std::process::id(),
-        nanos
+        nanos,
+        sequence
     ));
     fs::create_dir(&dir).unwrap_or_else(|err| panic!("create {}: {err}", dir.display()));
     dir
+}
+
+#[test]
+fn temp_roots_with_same_label_and_timestamp_are_distinct() {
+    struct Root(PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            fs::remove_dir(&self.0).unwrap();
+        }
+    }
+
+    let nanos = 123_456_789;
+    let first = Root(temp_root_at("outcome", nanos));
+    let second = Root(temp_root_at("outcome", nanos));
+    assert_ne!(first.0, second.0);
+    assert!(first.0.is_dir());
+    assert!(second.0.is_dir());
 }
 
 struct Signer {
