@@ -169,6 +169,8 @@ pub fn run(context: map) -> map {
             capability_owner: Some(owner),
             cancellation: Some(cancellation),
             processes: Some(processes.clone()),
+            // This direct SDK fixture has no persistent admission service.
+            allow_stateless_pin: true,
             ..AgentHostBridges::default()
         };
         Self {
