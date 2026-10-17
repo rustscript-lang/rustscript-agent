@@ -119,6 +119,23 @@ impl PackageStore {
         self.forget_verified();
     }
 
+    /// The already verified immutable builtin capture, if policy has not
+    /// invalidated it. This exposes code preparation only, never activation,
+    /// a durable owner receipt, or mutable host state.
+    pub(crate) fn prepared_embedding_lock(&self) -> Option<GraphLock> {
+        let prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (lock, graph) = prepared.as_ref()?;
+        let [package] = lock.packages.as_slice() else {
+            return None;
+        };
+        (package.id == crate::runtime::native_tools::EMBEDDING_PACKAGE_ID
+            && graph.trust(&package.id) == Some(PackageTrust::EmbeddingOwnedBuiltin))
+        .then(|| lock.clone())
+    }
+
     pub fn signature_payload(&self, package: &Path) -> Result<Vec<u8>, PluginError> {
         let files = read_package(package)?;
         Ok(payload_bytes(&files))

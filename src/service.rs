@@ -1321,6 +1321,15 @@ impl AgentService {
         }
         // Preparation belongs to the existing setup path, before any run's
         // original absolute admission deadline begins.
+        self.prepare_native_tool_runtime()?;
+        Ok(runner.config().clone())
+    }
+
+    /// Capture and compile code only. Activation is re-read by each admission;
+    /// no run, owner receipt, workspace authority or expected-call grant is
+    /// created by initialization. Policy invalidation still clears the store's
+    /// verified/prepared cache, so subsequent drift uses the original clock.
+    fn prepare_native_tool_runtime(&self) -> Result<(), String> {
         if self.inner.stateless_tools.load(Ordering::Acquire) {
             crate::runtime::native_tools::shared_embedded_runtime()?;
         } else if let Some(persistence) = self.inner.persistence.as_ref() {
@@ -1338,7 +1347,7 @@ impl AgentService {
                 .prepare(&locked.lock)
                 .map_err(|error| error.to_string())?;
         }
-        Ok(runner.config().clone())
+        Ok(())
     }
 
     /// Test failpoint: panic after a successful provider-step commit, before
@@ -1447,6 +1456,16 @@ impl AgentService {
             accepted_publishers: Vec::new(),
             unsigned_dev_space: None,
         });
+        // Prepare the closed builtin code, never an activation or owner pin.
+        // A later trusted plugin-store installation must still be able to
+        // activate its first signed graph at generation zero.
+        let lock = Self::embedding_tool_graph(&store).map_err(|error| {
+            crate::plugins::PluginError::new(
+                crate::plugins::PluginErrorKind::CompileFailed,
+                error.to_string(),
+            )
+        })?;
+        store.prepare(&lock)?;
         *self.inner.tool_packages.lock().expect("tool packages") = Some(Arc::new(store));
         self.inner.stateless_tools.store(false, Ordering::Release);
         Ok(())
@@ -1494,6 +1513,26 @@ impl AgentService {
         ))
     }
 
+    fn embedding_tool_graph(
+        store: &crate::plugins::PackageStore,
+    ) -> Result<crate::plugins::GraphLock, AdmitError> {
+        if let Some(lock) = store.prepared_embedding_lock() {
+            return Ok(lock);
+        }
+        store.install_embedding_owned().map_err(|error| {
+            AdmitError::Persistence(format!("embedding bootstrap failed: {error}"))
+        })?;
+        store
+            .resolve(&crate::plugins::ResolveRequest {
+                roots: vec![crate::plugins::PackageRequirement {
+                    id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.to_string(),
+                    version: "1.0.0".to_string(),
+                }],
+                host_runtime: crate::plugins::HOST_RUNTIME.to_string(),
+            })
+            .map_err(|error| AdmitError::Persistence(format!("embedding resolve failed: {error}")))
+    }
+
     fn ensure_active_tool_graph(
         &self,
         store: &crate::plugins::PackageStore,
@@ -1506,21 +1545,7 @@ impl AgentService {
         if !current.graph_id.is_empty() {
             return Ok(current);
         }
-        let revision = store.install_embedding_owned().map_err(|error| {
-            AdmitError::Persistence(format!("embedding bootstrap failed: {error}"))
-        })?;
-        let lock = store
-            .resolve(&crate::plugins::ResolveRequest {
-                roots: vec![crate::plugins::PackageRequirement {
-                    id: crate::runtime::native_tools::EMBEDDING_PACKAGE_ID.to_string(),
-                    version: "1.0.0".to_string(),
-                }],
-                host_runtime: crate::plugins::HOST_RUNTIME.to_string(),
-            })
-            .map_err(|error| {
-                AdmitError::Persistence(format!("embedding resolve failed: {error}"))
-            })?;
-        let _ = revision;
+        let lock = Self::embedding_tool_graph(store)?;
         control
             .store_lock(&lock)
             .map_err(|error| AdmitError::Persistence(error.message.to_string()))?;
@@ -10981,6 +11006,52 @@ mod external_legacy_admission_tests {
         drop(service);
         drop(state);
         std::fs::remove_dir_all(&root).expect("private external-legacy fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn sqlite_constructor_prepares_active_tool_graph_without_admitting_a_run() {
+        let root = private_root("prepared");
+        let state = AgentGatewayState::with_agent_source_and_sqlite(
+            short_config(),
+            INLINE_SOURCE,
+            root.join("gateway.db"),
+        )
+        .expect("SQLite state should open");
+        let service = state.service();
+        let persistence = service.persistence_handle().expect("durable store");
+        let control = crate::plugins::PluginControlStore::new(&persistence);
+        let active = control.activation().expect("trusted activation");
+        assert!(
+            active.graph_id.is_empty(),
+            "code preparation must preserve generation-zero activation for trusted plugin setup"
+        );
+        let store = service.tool_store().expect("installed Native store");
+        assert!(
+            store.prepared_embedding_lock().is_some(),
+            "trusted Native initialization must capture builtin code before an admission clock starts"
+        );
+        store.bind_policy(&crate::plugins::InstallAuthorization {
+            admin: false,
+            accepted_publishers: Vec::new(),
+            unsigned_dev_space: None,
+        });
+        assert!(
+            store.prepared_embedding_lock().is_none(),
+            "a policy replacement must invalidate even the prepared builtin capture"
+        );
+        assert_eq!(service.handle_count(), 0, "setup must not mint a run grant");
+        assert_eq!(
+            service.available_capacity(),
+            service.config().max_concurrent_runs
+        );
+        let pin = control
+            .pin_for_run("not-admitted")
+            .expect("typed pin lookup");
+        assert_eq!(pin["pinned"], false, "setup must not mint an owner receipt");
+        drop(persistence);
+        drop(service);
+        drop(state);
+        std::fs::remove_dir_all(root).expect("private preparation fixture cleanup");
     }
 
     #[tokio::test]
