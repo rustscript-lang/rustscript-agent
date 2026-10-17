@@ -1,6 +1,7 @@
 //! Checkpoint and branch restore for the Native filesystem effect API.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process,
@@ -9,9 +10,9 @@ use std::{
 };
 
 use rustscript_agent::effects::{
-    CheckpointRequest, EffectCancellation, EffectDeadline, EffectErrorKind, EffectStore,
-    ImportWorkspace, JournalKind, OpenViewRequest, PublicCheckpointRef, PublishRequest,
-    ResourceQuota, RestoreRequest, WorkspaceHandle, parse_checkpoint_yaml,
+    CheckpointRecord, CheckpointRequest, EffectCancellation, EffectDeadline, EffectErrorKind,
+    EffectStore, ImportWorkspace, JournalKind, OpenViewRequest, PublicCheckpointRef,
+    PublishRequest, ResourceQuota, RestoreRequest, WorkspaceHandle, parse_checkpoint_yaml,
     pre_conversion_yaml_error,
 };
 
@@ -492,4 +493,191 @@ fn duplicate_epoch_rejected_before_conversion() {
 fn duplicate_nested_availability_rejected_before_conversion() {
     let yaml = duplicate_mapping_line(&complete_checkpoint_yaml(), "availability");
     assert_scanner_rejects_duplicate(&yaml);
+}
+
+const LINEAGE_BOUND: usize = 64;
+
+fn document_lineage(record: &CheckpointRecord) -> Vec<String> {
+    record.to_json_value()["lineage"]
+        .as_array()
+        .expect("checkpoint lineage")
+        .iter()
+        .map(|item| item.as_str().expect("branch id").to_string())
+        .collect()
+}
+
+fn lineage_text(handle: &WorkspaceHandle) -> Vec<String> {
+    handle
+        .lineage()
+        .iter()
+        .map(|branch| branch.as_str().to_string())
+        .collect()
+}
+
+fn restore_recorded(
+    handle: &WorkspaceHandle,
+    checkpoint: &rustscript_agent::effects::CheckpointId,
+) -> Result<rustscript_agent::effects::RestoredBranch, rustscript_agent::effects::EffectError> {
+    handle.restore(RestoreRequest {
+        checkpoint_id: checkpoint.clone(),
+        expected_head: handle.head(),
+        expected_epoch: handle.epoch(),
+        cancellation: EffectCancellation::new(),
+        deadline: far_deadline(),
+    })
+}
+
+fn roundtrip_lineage(handle: &WorkspaceHandle, record: &CheckpointRecord) -> Vec<String> {
+    let path = handle.checkpoint_path(record.checkpoint_id()).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    let parsed = parse_checkpoint_yaml(&text).expect("parser accepts checkpoint producer output");
+    let from_file = document_lineage(&parsed);
+    assert_eq!(from_file, document_lineage(record));
+    assert_eq!(from_file, lineage_text(handle));
+    from_file
+}
+
+fn store_files(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    let mut files = Vec::new();
+    fn walk(root: &Path, dir: &Path, files: &mut Vec<(String, Option<Vec<u8>>)>) {
+        let mut entries = fs::read_dir(dir)
+            .expect("store entry")
+            .map(|entry| entry.expect("store dir"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .expect("store prefix")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let kind = entry.file_type().expect("file type");
+            if kind.is_dir() {
+                files.push((rel, None));
+                walk(root, &path, files);
+            } else if kind.is_file() {
+                files.push((rel, Some(fs::read(&path).expect("store file"))));
+            } else {
+                panic!("store snapshot saw a non-file at {rel}");
+            }
+        }
+    }
+    walk(root, root, &mut files);
+    files
+}
+
+#[test]
+fn lineage_bound_restore_is_rejected() {
+    let root = scratch("lineage-bound");
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    fs::write(seed.join("a.txt"), b"a").unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let mut handle = import_ok(&store, &seed);
+    let import_branch = handle.branch_id().clone();
+    let recorded = handle
+        .checkpoint(CheckpointRequest {
+            cancellation: EffectCancellation::new(),
+            deadline: far_deadline(),
+        })
+        .unwrap();
+    assert_eq!(handle.lineage().len(), 1);
+    while handle.lineage().len() < LINEAGE_BOUND {
+        handle = restore_recorded(&handle, recorded.checkpoint_id())
+            .expect("restore inside the lineage bound")
+            .handle;
+    }
+    let lineage = handle.lineage();
+    assert_eq!(lineage.len(), LINEAGE_BOUND);
+    assert_eq!(lineage.first(), Some(&import_branch));
+    assert_eq!(lineage.last(), Some(handle.branch_id()));
+    assert_eq!(lineage.iter().collect::<HashSet<_>>().len(), LINEAGE_BOUND);
+    let bound = handle
+        .checkpoint(CheckpointRequest {
+            cancellation: EffectCancellation::new(),
+            deadline: far_deadline(),
+        })
+        .expect("checkpoint at the lineage bound");
+    let bound_lineage = roundtrip_lineage(&handle, &bound);
+    assert_eq!(bound_lineage.len(), LINEAGE_BOUND);
+    assert_eq!(
+        bound_lineage.first().map(String::as_str),
+        Some(import_branch.as_str())
+    );
+    assert_eq!(
+        bound_lineage.last().map(String::as_str),
+        Some(handle.branch_id().as_str())
+    );
+
+    let held = handle
+        .open_view(OpenViewRequest {
+            expected_head: handle.head(),
+            expected_epoch: handle.epoch(),
+            cancellation: EffectCancellation::new(),
+            deadline: far_deadline(),
+        })
+        .unwrap();
+    held.write_file("held.txt", b"held").unwrap();
+    let busy = restore_recorded(&handle, recorded.checkpoint_id()).expect_err("live writer");
+    assert_eq!(busy.kind(), EffectErrorKind::Busy);
+    assert_eq!(held.read_file("held.txt").unwrap(), b"held");
+    held.write_file("held.txt", b"still-owner").unwrap();
+    let still_busy = handle
+        .checkpoint(CheckpointRequest {
+            cancellation: EffectCancellation::new(),
+            deadline: far_deadline(),
+        })
+        .expect_err("writer lease remains on the original branch");
+    assert_eq!(still_busy.kind(), EffectErrorKind::CheckpointBusy);
+    handle.discard(held).unwrap();
+
+    let head = handle.head();
+    let epoch = handle.epoch();
+    let branch = handle.branch_id().clone();
+    let journal = handle.journal();
+    let lineage_before = handle.lineage();
+    let files_before = store_files(store.root());
+    let rejected = restore_recorded(&handle, recorded.checkpoint_id())
+        .expect_err("restore past the lineage bound");
+    assert_eq!(rejected.kind(), EffectErrorKind::SchemaRejected);
+    let shown = rejected.to_string();
+    assert!(
+        !shown.contains('/') && !shown.contains('\\'),
+        "lineage rejection leaked a path: {shown}"
+    );
+    assert_eq!(shown, "SchemaRejected: lineage cannot grow past 64");
+    assert_eq!(handle.branch_id(), &branch);
+    assert_eq!(handle.head(), head);
+    assert_eq!(handle.epoch(), epoch);
+    assert_eq!(handle.lineage(), lineage_before);
+    assert_eq!(handle.journal(), journal);
+    assert_eq!(store_files(store.root()), files_before);
+    assert_eq!(handle.read_committed("a.txt").unwrap(), b"a");
+
+    let resumed = handle
+        .open_view(OpenViewRequest {
+            expected_head: head.clone(),
+            expected_epoch: epoch,
+            cancellation: EffectCancellation::new(),
+            deadline: far_deadline(),
+        })
+        .expect("original branch epoch and writer lease stay usable");
+    resumed.write_file("probe.txt", b"probe").unwrap();
+    assert_eq!(resumed.read_file("probe.txt").unwrap(), b"probe");
+    handle.discard(resumed).unwrap();
+    publish_edit(&handle, |view| {
+        view.write_file("after.txt", b"after").unwrap();
+    });
+    assert_eq!(handle.read_committed("after.txt").unwrap(), b"after");
+    assert_eq!(handle.lineage().len(), LINEAGE_BOUND);
+    let after = handle
+        .checkpoint(CheckpointRequest {
+            cancellation: EffectCancellation::new(),
+            deadline: far_deadline(),
+        })
+        .expect("legal checkpoint after the rejected restore");
+    let after_lineage = roundtrip_lineage(&handle, &after);
+    assert_eq!(after_lineage, lineage_text(&handle));
+    assert_eq!(after_lineage.len(), LINEAGE_BOUND);
 }

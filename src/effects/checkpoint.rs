@@ -1,7 +1,10 @@
 //! Checkpoint documents and branch restore for one Native filesystem workspace.
 //!
 //! A checkpoint records the immutable root, lineage, and epoch. Plugin state,
-//! graph lock, and history cursor stay explicitly out of scope.
+//! graph lock, and history cursor stay explicitly out of scope. Restore appends
+//! one ancestor and refuses, before changing a branch, epoch, journal, or file,
+//! when that append would pass 64. Checkpoint applies the same 1..=64 document
+//! bound before creating a file. The parser and schema maximum stay 64.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -157,13 +160,15 @@ impl WorkspaceHandle {
         }
         let head = branch.head.clone();
         let epoch = branch.epoch;
+        let lineage = workspace.lineage.clone();
+        accept_lineage_document(lineage.len())?;
         let record = CheckpointRecord {
             format: FORMAT.to_string(),
             checkpoint_id: CheckpointId::fresh(),
             workspace_id: self.workspace_id.clone(),
             owner_id: self.owner_id.clone(),
             branch_id: self.branch_id.clone(),
-            lineage: workspace.lineage.clone(),
+            lineage,
             immutable_root: head.clone(),
             epoch,
             parent_head: head.clone(),
@@ -217,12 +222,16 @@ impl WorkspaceHandle {
                 "expected head does not match",
             ));
         }
+        let lineage_len = workspace.lineage.len();
         let bumped = current.epoch.next();
         let record = workspace
             .checkpoints
             .get(&request.checkpoint_id)
             .cloned()
             .ok_or_else(|| not_found("checkpoint"))?;
+        if lineage_len >= MAX_LINEAGE {
+            return Err(schema("lineage cannot grow past 64"));
+        }
         let previous_branch = self.branch_id.clone();
         let restored_head = record.immutable_root.clone();
         workspace
@@ -306,9 +315,7 @@ impl CheckpointDocument {
         if self.active_writers != 0 {
             return Err(schema("active_writers must be 0"));
         }
-        if self.lineage.is_empty() || self.lineage.len() > MAX_LINEAGE {
-            return Err(schema("lineage length is outside 1..=64"));
-        }
+        accept_lineage_document(self.lineage.len())?;
         for scope in [&self.plugin_state, &self.graph, &self.history] {
             if scope.availability != NOT_IN_SCOPE {
                 return Err(schema("plugin, graph, and history cannot be snapshotted"));
@@ -342,6 +349,7 @@ fn write_checkpoint_file(
     root: &std::path::Path,
     record: &CheckpointRecord,
 ) -> Result<(), EffectError> {
+    accept_lineage_document(record.lineage.len())?;
     let final_path = root
         .join("checkpoints")
         .join(format!("{}.yaml", record.checkpoint_id));
@@ -442,6 +450,14 @@ impl YamlFrame {
 
 fn schema(message: impl Into<String>) -> EffectError {
     EffectError::new(EffectErrorKind::SchemaRejected, message)
+}
+
+fn accept_lineage_document(len: usize) -> Result<(), EffectError> {
+    if len == 0 || len > MAX_LINEAGE {
+        Err(schema("lineage length is outside 1..=64"))
+    } else {
+        Ok(())
+    }
 }
 
 fn not_found(what: &str) -> EffectError {
