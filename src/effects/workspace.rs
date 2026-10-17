@@ -4,12 +4,17 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use super::tree_store::{self, Usage, WorkRoot};
+#[cfg(feature = "workspace-io-fault")]
+use super::tree_store::{
+    IoFaultSlot, FAULT_FILE_FSYNC, FAULT_OWNED_CLEANUP, FAULT_PARTIAL_WRITE,
+    FAULT_POST_RENAME_CHMOD, FAULT_POST_RENAME_DIR_FSYNC,
+};
 use super::types::{
     BranchEpoch, BranchId, CapabilitySecret, EffectError, EffectErrorKind, EffectFailure,
     ImportConsistency, ImportWorkspace, JournalEntry, JournalKind, OpenViewRequest, OwnerId,
@@ -19,6 +24,8 @@ use super::types::{
 pub(crate) struct StoreInner {
     pub(crate) root: PathBuf,
     pub(crate) state: Mutex<StoreState>,
+    #[cfg(feature = "workspace-io-fault")]
+    io_fault: IoFaultSlot,
 }
 
 pub(crate) struct StoreState {
@@ -82,6 +89,8 @@ impl EffectStore {
                 state: Mutex::new(StoreState {
                     workspaces: HashMap::new(),
                 }),
+                #[cfg(feature = "workspace-io-fault")]
+                io_fault: IoFaultSlot::new(),
             }),
         })
     }
@@ -113,8 +122,9 @@ impl EffectStore {
                 format!("publish import tree failed: {error}"),
             ));
         }
-        tree_store::chmod_dir(&published, 0o555)?;
-        tree_store::fsync_dir(&self.inner.root.join("trees"))?;
+        if let Err(error) = self.inner.seal_published_tree(&published) {
+            return Err(self.inner.cleanup_owned_published(&published, error));
+        }
         let _ = copied;
         let workspace_id = WorkspaceId::fresh();
         let owner_id = OwnerId::fresh();
@@ -504,20 +514,9 @@ impl WorkspaceHandle {
         tree_id: &TreeId,
         staging: &Path,
     ) -> Result<Publication, EffectError> {
-        let mut state = self.store.state.lock();
-        let workspace = self.workspace_mut(&mut state)?;
-        if workspace.revoked {
-            return Err(revoked());
-        }
-        let branch = workspace
-            .branches
-            .get_mut(&self.branch_id)
-            .ok_or_else(|| not_found("branch"))?;
-        if branch.epoch != self.epoch || request.expected_epoch != branch.epoch {
-            return Err(stale());
-        }
-        if branch.head != request.expected_head || !branch.writers.contains(&view.view_id) {
-            return Err(conflict("head or writer changed before publish"));
+        {
+            let mut state = self.store.state.lock();
+            self.validate_publish(&mut state, view, request)?;
         }
         let published = self.store.root.join("trees").join(tree_id.as_str());
         fs::rename(staging, &published).map_err(|error| {
@@ -526,8 +525,55 @@ impl WorkspaceHandle {
                 format!("rename published tree failed: {error}"),
             )
         })?;
-        tree_store::chmod_dir(&published, 0o555)?;
-        tree_store::fsync_dir(&self.store.root.join("trees"))?;
+        if let Err(error) = self.store.seal_published_tree(&published) {
+            return Err(self.store.cleanup_owned_published(&published, error));
+        }
+        let finished = {
+            let mut state = self.store.state.lock();
+            self.finish_publish(&mut state, view, request, tree_id)
+        };
+        match finished {
+            Ok(publication) => Ok(publication),
+            Err(error) => Err(self.store.cleanup_owned_published(&published, error)),
+        }
+    }
+
+    fn validate_publish(
+        &self,
+        state: &mut StoreState,
+        view: &WritableView,
+        request: &PublishRequest,
+    ) -> Result<(), EffectError> {
+        let workspace = self.workspace_mut(state)?;
+        if workspace.revoked {
+            return Err(revoked());
+        }
+        let branch = workspace
+            .branches
+            .get(&self.branch_id)
+            .ok_or_else(|| not_found("branch"))?;
+        if branch.epoch != self.epoch || request.expected_epoch != branch.epoch {
+            return Err(stale());
+        }
+        if branch.head != request.expected_head || !branch.writers.contains(&view.view_id) {
+            return Err(conflict("head or writer changed before publish"));
+        }
+        Ok(())
+    }
+
+    fn finish_publish(
+        &self,
+        state: &mut StoreState,
+        view: &WritableView,
+        request: &PublishRequest,
+        tree_id: &TreeId,
+    ) -> Result<Publication, EffectError> {
+        self.validate_publish(state, view, request)?;
+        let workspace = self.workspace_mut(state)?;
+        let branch = workspace
+            .branches
+            .get_mut(&self.branch_id)
+            .ok_or_else(|| not_found("branch"))?;
         let previous_head = branch.head.clone();
         branch.head = tree_id.clone();
         branch.writers.remove(&view.view_id);
@@ -694,6 +740,120 @@ impl WritableView {
 impl Drop for WritableView {
     fn drop(&mut self) {
         self.finalize();
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SimulatedIoFault {
+    PartialWrite { errno: i32 },
+    FileFsync { errno: i32 },
+    PostRenameChmod { errno: i32 },
+    PostRenameDirFsync { errno: i32 },
+    OwnedCleanup { errno: i32 },
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl SimulatedIoFault {
+    pub const EIO: i32 = libc::EIO;
+    pub const ENOSPC: i32 = libc::ENOSPC;
+
+    fn checked(self) -> Result<(u8, i32), EffectError> {
+        let (point, errno) = match self {
+            Self::PartialWrite { errno } => (FAULT_PARTIAL_WRITE, errno),
+            Self::FileFsync { errno } => (FAULT_FILE_FSYNC, errno),
+            Self::PostRenameChmod { errno } => (FAULT_POST_RENAME_CHMOD, errno),
+            Self::PostRenameDirFsync { errno } => (FAULT_POST_RENAME_DIR_FSYNC, errno),
+            Self::OwnedCleanup { errno } => (FAULT_OWNED_CLEANUP, errno),
+        };
+        if errno != libc::EIO && errno != libc::ENOSPC {
+            return Err(EffectError::new(
+                EffectErrorKind::InvalidConfiguration,
+                "simulated I/O fault errno must be EIO or ENOSPC",
+            ));
+        }
+        Ok((point, errno))
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl EffectStore {
+    pub fn arm_simulated_io_fault(&self, fault: SimulatedIoFault) -> Result<(), EffectError> {
+        let (point, errno) = fault.checked()?;
+        self.inner.io_fault.arm(point, errno);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl WritableView {
+    pub fn arm_simulated_io_fault(&self, fault: SimulatedIoFault) -> Result<(), EffectError> {
+        let (point, errno) = fault.checked()?;
+        match point {
+            FAULT_PARTIAL_WRITE | FAULT_FILE_FSYNC => self.work.arm_io_fault(point, errno),
+            _ => self.store.io_fault.arm(point, errno),
+        }
+        Ok(())
+    }
+
+    pub fn accounted_usage(&self) -> (u64, u64) {
+        self.work.usage_snapshot()
+    }
+}
+
+impl StoreInner {
+    fn cleanup_owned_published(&self, published: &Path, error: EffectError) -> EffectError {
+        let tree_id = published
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if self.tree_is_registered(tree_id) {
+            return EffectError::new(
+                error.kind(),
+                format!("{error}; refusing to remove a registered tree"),
+            );
+        }
+        #[cfg(feature = "workspace-io-fault")]
+        if let Some(code) = self.io_fault.take(FAULT_OWNED_CLEANUP) {
+            let cleanup = tree_store::simulated_io("cleanup", code);
+            return EffectError::new(
+                error.kind(),
+                format!("{error}; owned tree cleanup failed: {cleanup}"),
+            );
+        }
+        match tree_store::remove_owned_tree(published) {
+            Ok(()) => error,
+            Err(cleanup) => EffectError::new(
+                error.kind(),
+                format!("{error}; owned tree cleanup failed: {cleanup}"),
+            ),
+        }
+    }
+
+    fn tree_is_registered(&self, tree_id: &str) -> bool {
+        if tree_id.is_empty() {
+            return true;
+        }
+        let state = self.state.lock();
+        state.workspaces.values().any(|workspace| {
+            workspace
+                .trees
+                .iter()
+                .any(|registered| registered.as_str() == tree_id)
+        })
+    }
+
+    fn seal_published_tree(&self, published: &Path) -> Result<(), EffectError> {
+        #[cfg(feature = "workspace-io-fault")]
+        if let Some(code) = self.io_fault.take(FAULT_POST_RENAME_CHMOD) {
+            return Err(tree_store::simulated_io("fchmod", code));
+        }
+        tree_store::chmod_dir(published, 0o555)?;
+        #[cfg(feature = "workspace-io-fault")]
+        if let Some(code) = self.io_fault.take(FAULT_POST_RENAME_DIR_FSYNC) {
+            return Err(tree_store::simulated_io("fsync", code));
+        }
+        tree_store::fsync_dir(&self.root.join("trees"))
     }
 }
 

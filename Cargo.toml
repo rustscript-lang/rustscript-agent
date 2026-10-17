@@ -52,6 +52,8 @@ tracing-core = "0.1"
 [features]
 default = []
 config-fixture = []
+# Test-only one-shot simulated I/O faults. Unarmed production builds do not include it.
+workspace-io-fault = []
 
 # Optimize the embedded compiler while retaining development checks.
 [profile.dev.package.pd-vm]

@@ -14,8 +14,8 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Arc, Barrier,
         atomic::{AtomicU64, Ordering},
+        Arc, Barrier,
     },
     thread,
     time::{Duration, Instant},
@@ -257,12 +257,10 @@ fn import_rejects_external_symlink() {
         .import_workspace(import_req(&seed, generous(), EffectCancellation::new()))
         .expect_err("symlink");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
-    assert!(
-        fs::read_dir(store.root().join("trees"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(store.root().join("trees"))
+        .unwrap()
+        .next()
+        .is_none());
     assert_eq!(fs::read(seed.join("inside.txt")).unwrap(), b"in");
 }
 
@@ -278,12 +276,10 @@ fn import_rejects_device_path() {
         ))
         .expect_err("device");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
-    assert!(
-        fs::read_dir(store.root().join("trees"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(store.root().join("trees"))
+        .unwrap()
+        .next()
+        .is_none());
 }
 
 #[test]
@@ -337,12 +333,10 @@ fn import_rejects_external_hardlink() {
         .expect_err("external hardlink");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
     assert_eq!(fs::read(root.join("outside.txt")).unwrap(), b"linked");
-    assert!(
-        fs::read_dir(store.root().join("trees"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(store.root().join("trees"))
+        .unwrap()
+        .next()
+        .is_none());
 }
 
 #[test]
@@ -381,12 +375,10 @@ fn quota_excess_does_not_publish() {
         ))
         .expect_err("entries");
     assert_eq!(err.kind(), EffectErrorKind::QuotaExceeded);
-    assert!(
-        fs::read_dir(store.root().join("trees"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(store.root().join("trees"))
+        .unwrap()
+        .next()
+        .is_none());
 
     fs::remove_dir_all(&seed).unwrap();
     fs::create_dir_all(&seed).unwrap();
@@ -460,12 +452,10 @@ fn cancellation_discards_partial_import() {
         .expect_err("cancel");
     assert_eq!(err.kind(), EffectErrorKind::Cancelled);
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(
-        fs::read_dir(store.root().join("trees"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(store.root().join("trees"))
+        .unwrap()
+        .next()
+        .is_none());
     assert_eq!(fs::read(seed.join("a.txt")).unwrap(), b"one");
 
     let pre = EffectCancellation::new();
@@ -494,12 +484,10 @@ fn expired_deadline_is_not_extended() {
         .expect_err("deadline");
     assert_eq!(err.kind(), EffectErrorKind::DeadlineExceeded);
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(
-        fs::read_dir(store.root().join("trees"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(store.root().join("trees"))
+        .unwrap()
+        .next()
+        .is_none());
     assert_eq!(
         ResourceQuota::new(0, 10, 1).unwrap_err().kind(),
         EffectErrorKind::InvalidConfiguration
@@ -696,12 +684,10 @@ fn source_change_during_import_is_rejected() {
         .import_workspace(import_req(&seed, generous(), cancellation))
         .expect_err("inconsistent");
     assert_eq!(err.kind(), EffectErrorKind::InconsistentSource);
-    assert!(
-        fs::read_dir(store.root().join("trees"))
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(store.root().join("trees"))
+        .unwrap()
+        .next()
+        .is_none());
     assert_eq!(fs::read(&first).unwrap(), b"during");
 }
 
@@ -739,13 +725,11 @@ fn setuid_bit_is_stripped_and_empty_dir_remains() {
         0
     );
     publish_ok(&handle, view);
-    assert!(
-        handle
-            .immutable_path(&handle.head())
-            .unwrap()
-            .join("added")
-            .is_dir()
-    );
+    assert!(handle
+        .immutable_path(&handle.head())
+        .unwrap()
+        .join("added")
+        .is_dir());
 }
 
 #[test]
@@ -1155,13 +1139,11 @@ fn legal_utf8_names_round_trip_through_publish() {
     view.delete(&del).unwrap();
     let rejected = view.write_file(&format!("no{}pe.txt", char::from(0x0a)), b"x");
     assert_eq!(rejected.unwrap_err().kind(), EffectErrorKind::RejectedPath);
-    assert!(
-        !view
-            .list("")
-            .unwrap()
-            .iter()
-            .any(|name| name.bytes().any(|byte| byte < 0x20))
-    );
+    assert!(!view
+        .list("")
+        .unwrap()
+        .iter()
+        .any(|name| name.bytes().any(|byte| byte < 0x20)));
     publish_ok(&handle, view);
     assert_eq!(handle.read_committed("plain.txt").unwrap(), b"updated");
     assert_eq!(handle.read_committed(created).unwrap(), b"created");
@@ -1174,4 +1156,416 @@ fn legal_utf8_names_round_trip_through_publish() {
     assert_eq!(fs::read(seed.join("plain.txt")).unwrap(), b"plain");
     assert_eq!(fs::read(seed.join(&del)).unwrap(), b"del-bytes");
     assert_eq!(fs::read(seed.join(dir).join(nested)).unwrap(), b"cjk-bytes");
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn assert_simulated_io(err: &EffectError, errno_name: &str) {
+    assert_eq!(err.kind(), EffectErrorKind::Io);
+    let text = err.to_string();
+    assert!(
+        text.contains("simulated I/O error"),
+        "fault must be labeled simulated, not a hardware or disk-full event: {text}"
+    );
+    assert!(
+        text.contains("not a hardware failure or disk-full event"),
+        "{text}"
+    );
+    assert!(text.contains(errno_name), "{text}");
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_new_file_partial_write_keeps_path_absent_and_quota() {
+    let root = scratch("io-new-partial");
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle = store
+        .import_workspace(import_req(
+            &seed,
+            ResourceQuota::new(4, 32, 4).unwrap(),
+            EffectCancellation::new(),
+        ))
+        .unwrap();
+    let view = open_ok(&handle);
+    assert_eq!(view.accounted_usage(), (0, 0));
+    view.arm_simulated_io_fault(rustscript_agent::effects::SimulatedIoFault::PartialWrite {
+        errno: rustscript_agent::effects::SimulatedIoFault::EIO,
+    })
+    .unwrap();
+    let err = view.write_file("new.txt", b"0123456789abcdef").unwrap_err();
+    assert_simulated_io(&err, "EIO");
+    let leaked = fs::read(view.work_root().join("new.txt")).ok();
+    assert!(
+        leaked.is_none(),
+        "partial new file leaked into the view: {leaked:?}"
+    );
+    assert_eq!(view.accounted_usage(), (0, 0));
+    view.write_file("new.txt", b"0123456789abcdef").unwrap();
+    assert_eq!(view.read_file("new.txt").unwrap(), b"0123456789abcdef");
+    assert_eq!(view.accounted_usage(), (1, 16));
+    let again = view.write_file("other.txt", b"0123456789abcdef0");
+    assert_eq!(again.unwrap_err().kind(), EffectErrorKind::QuotaExceeded);
+    assert_eq!(view.accounted_usage(), (1, 16));
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn private_file_residue(view: &WritableView) -> Vec<String> {
+    let view_dir = view.work_root().parent().expect("view dir");
+    let mut found = Vec::new();
+    for entry in fs::read_dir(view_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "work" || name == "tmp" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            for child in fs::read_dir(&path).unwrap() {
+                let child = child.unwrap();
+                found.push(format!("{name}/{}", child.file_name().to_string_lossy()));
+            }
+        } else {
+            found.push(name);
+        }
+    }
+    found.sort();
+    found
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn mode_bits(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().mode() & 0o777
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_overwrite_partial_write_keeps_bytes_mode_and_quota() {
+    let root = scratch("io-overwrite-partial");
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let original = b"0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(original.len(), 40);
+    let source = seed.join("a.txt");
+    fs::write(&source, original).unwrap();
+    let mut perms = fs::metadata(&source).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&source, perms).unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle = store
+        .import_workspace(import_req(
+            &seed,
+            ResourceQuota::new(4, 40, 4).unwrap(),
+            EffectCancellation::new(),
+        ))
+        .unwrap();
+    let view = open_ok(&handle);
+    let dest = view.work_root().join("a.txt");
+    assert_eq!(fs::read(&dest).unwrap(), original);
+    assert_eq!(mode_bits(&dest), 0o755);
+    assert_eq!(view.accounted_usage(), (1, 40));
+    view.arm_simulated_io_fault(rustscript_agent::effects::SimulatedIoFault::PartialWrite {
+        errno: rustscript_agent::effects::SimulatedIoFault::ENOSPC,
+    })
+    .unwrap();
+    let replacement = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    assert_eq!(replacement.len(), 40);
+    let err = view.write_file("a.txt", replacement).unwrap_err();
+    assert_simulated_io(&err, "ENOSPC");
+    assert_eq!(fs::read(&dest).unwrap(), original);
+    assert_eq!(mode_bits(&dest), 0o755);
+    assert_eq!(view.accounted_usage(), (1, 40));
+    assert!(private_file_residue(&view).is_empty());
+    view.write_file("a.txt", replacement).unwrap();
+    assert_eq!(view.read_file("a.txt").unwrap(), replacement);
+    assert_eq!(mode_bits(&dest), 0o755);
+    assert_eq!(view.accounted_usage(), (1, 40));
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_new_file_fsync_keeps_path_absent_and_usage() {
+    let root = scratch("io-new-fsync");
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle = store
+        .import_workspace(import_req(
+            &seed,
+            ResourceQuota::new(4, 32, 4).unwrap(),
+            EffectCancellation::new(),
+        ))
+        .unwrap();
+    let view = open_ok(&handle);
+    view.arm_simulated_io_fault(rustscript_agent::effects::SimulatedIoFault::FileFsync {
+        errno: rustscript_agent::effects::SimulatedIoFault::EIO,
+    })
+    .unwrap();
+    let err = view.write_file("new.txt", b"0123456789abcdef").unwrap_err();
+    assert_simulated_io(&err, "EIO");
+    let leaked = fs::read(view.work_root().join("new.txt")).ok();
+    assert!(
+        leaked.is_none(),
+        "fsync failure published a new file: {leaked:?}"
+    );
+    assert_eq!(view.accounted_usage(), (0, 0));
+    assert!(private_file_residue(&view).is_empty());
+    view.write_file("new.txt", b"0123456789abcdef").unwrap();
+    assert_eq!(view.accounted_usage(), (1, 16));
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_overwrite_fsync_keeps_bytes_mode_and_usage() {
+    let root = scratch("io-overwrite-fsync");
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let original = b"kept-bytes";
+    fs::write(seed.join("a.txt"), original).unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle = import_ok(&store, &seed);
+    let view = open_ok(&handle);
+    view.set_executable("a.txt", true).unwrap();
+    let dest = view.work_root().join("a.txt");
+    let mode = mode_bits(&dest);
+    assert_ne!(mode & 0o111, 0);
+    let usage = view.accounted_usage();
+    view.arm_simulated_io_fault(rustscript_agent::effects::SimulatedIoFault::FileFsync {
+        errno: rustscript_agent::effects::SimulatedIoFault::ENOSPC,
+    })
+    .unwrap();
+    let err = view.write_file("a.txt", b"replaced").unwrap_err();
+    assert_simulated_io(&err, "ENOSPC");
+    assert_eq!(fs::read(&dest).unwrap(), original);
+    assert_eq!(mode_bits(&dest), mode);
+    assert_eq!(view.accounted_usage(), usage);
+    assert!(private_file_residue(&view).is_empty());
+    view.write_file("a.txt", b"replaced").unwrap();
+    assert_eq!(view.read_file("a.txt").unwrap(), b"replaced");
+    assert_eq!(mode_bits(&dest), mode);
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn nested_seed(root: &Path) -> PathBuf {
+    let seed = root.join("seed");
+    fs::create_dir_all(seed.join("sub")).unwrap();
+    fs::write(seed.join("sub").join("a.txt"), b"kept").unwrap();
+    seed
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn publish_request(handle: &WorkspaceHandle) -> PublishRequest {
+    PublishRequest {
+        expected_head: handle.head(),
+        expected_epoch: handle.epoch(),
+        cancellation: EffectCancellation::new(),
+        deadline: far_deadline(),
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_import_post_rename_chmod_removes_unregistered_tree() {
+    let root = scratch("io-import-chmod");
+    let seed = nested_seed(&root);
+    let store = EffectStore::create(root.join("store")).unwrap();
+    store
+        .arm_simulated_io_fault(
+            rustscript_agent::effects::SimulatedIoFault::PostRenameChmod {
+                errno: rustscript_agent::effects::SimulatedIoFault::EIO,
+            },
+        )
+        .unwrap();
+    let err = store
+        .import_workspace(import_req(&seed, generous(), EffectCancellation::new()))
+        .unwrap_err();
+    assert_simulated_io(&err, "EIO");
+    let leaked = dir_names(&store.root().join("trees"));
+    assert!(
+        leaked.is_empty(),
+        "post-rename import failure left an unregistered tree: {leaked:?}; error={err}"
+    );
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+    assert!(dir_names(&store.root().join("views")).is_empty());
+    let handle = import_ok(&store, &seed);
+    assert_eq!(handle.read_committed("sub/a.txt").unwrap(), b"kept");
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_import_post_rename_fsync_removes_unregistered_tree() {
+    let root = scratch("io-import-fsync");
+    let seed = nested_seed(&root);
+    let store = EffectStore::create(root.join("store")).unwrap();
+    store
+        .arm_simulated_io_fault(
+            rustscript_agent::effects::SimulatedIoFault::PostRenameDirFsync {
+                errno: rustscript_agent::effects::SimulatedIoFault::ENOSPC,
+            },
+        )
+        .unwrap();
+    let err = store
+        .import_workspace(import_req(&seed, generous(), EffectCancellation::new()))
+        .unwrap_err();
+    assert_simulated_io(&err, "ENOSPC");
+    let leaked = dir_names(&store.root().join("trees"));
+    assert!(
+        leaked.is_empty(),
+        "post-rename import fsync failure left an unregistered tree: {leaked:?}; error={err}"
+    );
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+    import_ok(&store, &seed);
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_import_cleanup_retains_unregistered_tree_evidence() {
+    let root = scratch("io-import-cleanup");
+    let seed = nested_seed(&root);
+    let store = EffectStore::create(root.join("store")).unwrap();
+    store
+        .arm_simulated_io_fault(
+            rustscript_agent::effects::SimulatedIoFault::PostRenameChmod {
+                errno: rustscript_agent::effects::SimulatedIoFault::EIO,
+            },
+        )
+        .unwrap();
+    store
+        .arm_simulated_io_fault(rustscript_agent::effects::SimulatedIoFault::OwnedCleanup {
+            errno: rustscript_agent::effects::SimulatedIoFault::ENOSPC,
+        })
+        .unwrap();
+    let err = store
+        .import_workspace(import_req(&seed, generous(), EffectCancellation::new()))
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("simulated I/O error"),
+        "primary fault must stay simulated: {text}"
+    );
+    assert!(
+        text.contains("owned tree cleanup failed"),
+        "cleanup failure must stay explicit, not be reported as a clean failure: {text}"
+    );
+    assert!(
+        text.contains("ENOSPC"),
+        "cleanup fault must be labeled simulated ENOSPC, not a disk-full event: {text}"
+    );
+    let leaked = dir_names(&store.root().join("trees"));
+    assert_eq!(
+        leaked.len(),
+        1,
+        "failed cleanup must retain the unregistered tree as evidence, not pretend it is gone: {leaked:?}"
+    );
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_publish_post_rename_chmod_keeps_head_writer_and_removes_new_tree() {
+    let root = scratch("io-publish-chmod");
+    let seed = nested_seed(&root);
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle = import_ok(&store, &seed);
+    let head = handle.head();
+    let epoch = handle.epoch();
+    let journal = handle.journal();
+    let trees = dir_names(&store.root().join("trees"));
+    let committed = store.root().join("trees").join(head.as_str());
+    let committed_mode = mode_bits(&committed);
+    let view = open_ok(&handle);
+    view.write_file("sub/a.txt", b"next").unwrap();
+    let view_mode = mode_bits(&view.work_root().join("sub").join("a.txt"));
+    view.arm_simulated_io_fault(
+        rustscript_agent::effects::SimulatedIoFault::PostRenameChmod {
+            errno: rustscript_agent::effects::SimulatedIoFault::EIO,
+        },
+    )
+    .unwrap();
+    let EffectFailure { error, recovered } = handle
+        .publish(view, publish_request(&handle))
+        .expect_err("chmod after rename must fail");
+    assert_simulated_io(&error, "EIO");
+    assert_eq!(handle.head(), head);
+    assert_eq!(handle.epoch(), epoch);
+    assert_eq!(handle.journal(), journal);
+    assert_eq!(
+        dir_names(&store.root().join("trees")),
+        trees,
+        "post-rename publish failure left an unregistered tree; error={error}"
+    );
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+    assert_eq!(mode_bits(&committed), committed_mode);
+    assert_eq!(handle.read_committed("sub/a.txt").unwrap(), b"kept");
+    assert_eq!(
+        recovered.read_file("sub/a.txt").unwrap(),
+        b"next",
+        "failed publish must return the original writer view"
+    );
+    assert_eq!(
+        mode_bits(&recovered.work_root().join("sub").join("a.txt")),
+        view_mode
+    );
+    assert_eq!(
+        checkpoint_now(&handle).unwrap_err().kind(),
+        EffectErrorKind::CheckpointBusy
+    );
+    assert!(private_file_residue(&recovered).is_empty());
+    handle
+        .publish(recovered, publish_request(&handle))
+        .expect("same view retries after the one-shot fault");
+    assert_ne!(handle.head(), head);
+    assert_eq!(handle.epoch(), epoch);
+    assert_eq!(handle.read_committed("sub/a.txt").unwrap(), b"next");
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+    checkpoint_now(&handle).expect("successful publish released the writer");
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn failed_publish_post_rename_fsync_drop_discards_view_without_new_tree() {
+    let root = scratch("io-publish-fsync");
+    let seed = nested_seed(&root);
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle = import_ok(&store, &seed);
+    let head = handle.head();
+    let epoch = handle.epoch();
+    let journal = handle.journal();
+    let trees = dir_names(&store.root().join("trees"));
+    let view = open_ok(&handle);
+    let view_dir = view.work_root().parent().unwrap().to_path_buf();
+    view.arm_simulated_io_fault(
+        rustscript_agent::effects::SimulatedIoFault::PostRenameDirFsync {
+            errno: rustscript_agent::effects::SimulatedIoFault::ENOSPC,
+        },
+    )
+    .unwrap();
+    let EffectFailure { error, recovered } = handle
+        .publish(view, publish_request(&handle))
+        .expect_err("dir fsync after rename must fail");
+    assert_simulated_io(&error, "ENOSPC");
+    assert_eq!(handle.head(), head);
+    assert_eq!(handle.epoch(), epoch);
+    assert_eq!(handle.journal(), journal);
+    assert_eq!(
+        dir_names(&store.root().join("trees")),
+        trees,
+        "post-rename publish fsync failure left an unregistered tree; error={error}"
+    );
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+    assert!(
+        view_dir.exists(),
+        "writer view must survive the failed publish"
+    );
+    drop(recovered);
+    assert!(!view_dir.exists(), "drop must remove the view directory");
+    assert_eq!(handle.head(), head);
+    assert_eq!(handle.journal(), journal);
+    checkpoint_now(&handle).expect("drop released the writer");
+    let again = open_ok(&handle);
+    handle.discard(again).unwrap();
+    assert_eq!(handle.head(), head);
+    assert_eq!(handle.epoch(), epoch);
+    assert!(dir_names(&store.root().join("views")).is_empty());
 }

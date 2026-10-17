@@ -12,18 +12,75 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "workspace-io-fault")]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
 use super::types::{
-    EffectCancellation, EffectDeadline, EffectError, EffectErrorKind, MAX_COMPONENT_BYTES,
-    MAX_RELATIVE_BYTES, ResourceQuota,
+    EffectCancellation, EffectDeadline, EffectError, EffectErrorKind, ResourceQuota,
+    MAX_COMPONENT_BYTES, MAX_RELATIVE_BYTES,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Usage {
     pub(crate) entries: u64,
     pub(crate) bytes: u64,
+}
+
+#[cfg(feature = "workspace-io-fault")]
+pub(crate) const FAULT_PARTIAL_WRITE: u8 = 1;
+#[cfg(feature = "workspace-io-fault")]
+pub(crate) const FAULT_FILE_FSYNC: u8 = 2;
+#[cfg(feature = "workspace-io-fault")]
+pub(crate) const FAULT_POST_RENAME_CHMOD: u8 = 3;
+#[cfg(feature = "workspace-io-fault")]
+pub(crate) const FAULT_POST_RENAME_DIR_FSYNC: u8 = 4;
+#[cfg(feature = "workspace-io-fault")]
+pub(crate) const FAULT_OWNED_CLEANUP: u8 = 5;
+
+/// Per-instance one-shot faults. Unarmed `take` is one atomic swap, not a poll.
+#[cfg(feature = "workspace-io-fault")]
+pub(crate) struct IoFaultSlot {
+    errno: [AtomicI32; 6],
+}
+
+#[cfg(feature = "workspace-io-fault")]
+impl IoFaultSlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            errno: std::array::from_fn(|_| AtomicI32::new(0)),
+        }
+    }
+
+    pub(crate) fn arm(&self, point: u8, errno: i32) {
+        self.errno[point as usize].store(errno, Ordering::Release);
+    }
+
+    pub(crate) fn take(&self, point: u8) -> Option<i32> {
+        let code = self.errno[point as usize].swap(0, Ordering::AcqRel);
+        if code == 0 {
+            None
+        } else {
+            Some(code)
+        }
+    }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+pub(crate) fn simulated_io(operation: &str, code: i32) -> EffectError {
+    let name = match code {
+        libc::EIO => "EIO",
+        libc::ENOSPC => "ENOSPC",
+        _ => "errno",
+    };
+    EffectError::new(
+        EffectErrorKind::Io,
+        format!(
+            "simulated I/O error: {operation} failed with {name} ({code}); not a hardware failure or disk-full event"
+        ),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +126,10 @@ pub(crate) struct WorkRoot {
     dir: OwnedFd,
     quota: ResourceQuota,
     usage: Mutex<Usage>,
+    mutation: Mutex<()>,
+    scratch_seq: AtomicU64,
+    #[cfg(feature = "workspace-io-fault")]
+    io_fault: IoFaultSlot,
 }
 
 impl WorkRoot {
@@ -83,6 +144,10 @@ impl WorkRoot {
             dir,
             quota,
             usage: Mutex::new(usage),
+            mutation: Mutex::new(()),
+            scratch_seq: AtomicU64::new(0),
+            #[cfg(feature = "workspace-io-fault")]
+            io_fault: IoFaultSlot::new(),
         })
     }
 
@@ -91,6 +156,7 @@ impl WorkRoot {
     }
 
     pub(crate) fn write_file(&self, rel: &str, bytes: &[u8]) -> Result<(), EffectError> {
+        let _mutation = self.mutation.lock();
         let components = validate_relative(rel)?;
         self.ensure_depth(&components)?;
         let parent = self.open_parent(&components)?;
@@ -101,28 +167,62 @@ impl WorkRoot {
                 if file_kind(stat.st_mode) != FileKind::File {
                     return Err(unsupported("write target is not a regular file"));
                 }
-                Some(file_len(stat)?)
+                if stat.st_nlink != 1 {
+                    return Err(unsupported("refusing to write through a hardlink"));
+                }
+                let mode = stat.st_mode & 0o777;
+                Some((file_len(stat)?, mode))
             }
             Err(error) if error.kind() == EffectErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
         let mut usage = self.usage.lock();
+        let old_len = old.map(|(len, _)| len);
+        let mode = old.map(|(_, mode)| mode).unwrap_or(0o644);
         let next_entries = usage.entries + u64::from(old.is_none());
-        let next_bytes = usage.bytes - old.unwrap_or(0) + bytes.len() as u64;
+        let next_bytes = usage.bytes - old_len.unwrap_or(0) + bytes.len() as u64;
         if next_entries > self.quota.max_entries || next_bytes > self.quota.max_bytes {
             return Err(quota_error("view write exceeds quota"));
         }
-        let mode = 0o644;
-        let fd = if old.is_some() {
-            open_trunc(&parent, name)?
-        } else {
-            create_file(&parent, name, mode)?
+        let scratch_dir = self.private_scratch_dir()?;
+        let scratch_name = self.scratch_file_name();
+        let fd = create_file(&scratch_dir, &scratch_name, mode)?;
+        let staged = StagedFile {
+            dir: scratch_dir,
+            name: scratch_name,
+            fd,
         };
-        write_all(&fd, bytes)?;
-        fsync_fd(&fd)?;
+        let published = (|| {
+            fchmod_fd(&staged.fd, mode)?;
+            #[cfg(feature = "workspace-io-fault")]
+            if let Some(code) = self.io_fault.take(FAULT_PARTIAL_WRITE) {
+                return inject_partial_write(&staged.fd, bytes, code);
+            }
+            write_all(&staged.fd, bytes)?;
+            #[cfg(feature = "workspace-io-fault")]
+            if let Some(code) = self.io_fault.take(FAULT_FILE_FSYNC) {
+                return Err(simulated_io("fsync", code));
+            }
+            fsync_fd(&staged.fd)?;
+            rename_at(&staged.dir, &staged.name, &parent, name)
+        })();
+        if let Err(error) = published {
+            return Err(retain_cleanup_failure(error, staged.cleanup_owned()));
+        }
         usage.entries = next_entries;
         usage.bytes = next_bytes;
         Ok(())
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn arm_io_fault(&self, point: u8, errno: i32) {
+        self.io_fault.arm(point, errno);
+    }
+
+    #[cfg(feature = "workspace-io-fault")]
+    pub(crate) fn usage_snapshot(&self) -> (u64, u64) {
+        let usage = self.usage.lock();
+        (usage.entries, usage.bytes)
     }
 
     pub(crate) fn read_file(&self, rel: &str) -> Result<Vec<u8>, EffectError> {
@@ -130,6 +230,7 @@ impl WorkRoot {
     }
 
     pub(crate) fn delete(&self, rel: &str) -> Result<(), EffectError> {
+        let _mutation = self.mutation.lock();
         let components = validate_relative(rel)?;
         let parent = self.open_parent(&components)?;
         let name = components.last().expect("relative path has a component");
@@ -161,6 +262,7 @@ impl WorkRoot {
     }
 
     pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), EffectError> {
+        let _mutation = self.mutation.lock();
         let from_parts = validate_relative(from)?;
         let to_parts = validate_relative(to)?;
         self.ensure_depth(&to_parts)?;
@@ -190,6 +292,7 @@ impl WorkRoot {
     }
 
     pub(crate) fn create_dir(&self, rel: &str) -> Result<(), EffectError> {
+        let _mutation = self.mutation.lock();
         let components = validate_relative(rel)?;
         self.ensure_depth(&components)?;
         let parent = self.open_parent(&components)?;
@@ -204,6 +307,7 @@ impl WorkRoot {
     }
 
     pub(crate) fn set_executable(&self, rel: &str, executable: bool) -> Result<(), EffectError> {
+        let _mutation = self.mutation.lock();
         let components = validate_relative(rel)?;
         let parent = self.open_parent(&components)?;
         let name = components.last().expect("relative path has a component");
@@ -254,6 +358,20 @@ impl WorkRoot {
             return dup_dir(&self.dir);
         }
         open_existing_dir(&self.dir, &components[..components.len() - 1])
+    }
+
+    fn private_scratch_dir(&self) -> Result<OwnedFd, EffectError> {
+        let view_dir = self
+            .path
+            .parent()
+            .ok_or_else(|| rejected("work root has no parent"))?;
+        let parent = open_dir(view_dir)?;
+        ensure_private_dir(&parent, ".scratch")
+    }
+
+    fn scratch_file_name(&self) -> String {
+        let seq = self.scratch_seq.fetch_add(1, Ordering::Relaxed);
+        format!(".w-{seq}")
     }
 }
 
@@ -323,6 +441,22 @@ pub(crate) fn remove_tree(path: &Path) -> Result<(), EffectError> {
             }
             _ => fs::remove_file(path).map_err(|error| io_error("remove path", error)),
         },
+    }
+}
+
+pub(crate) fn remove_owned_tree(path: &Path) -> Result<(), EffectError> {
+    match lstat_path(path) {
+        Err(error) if error.kind() == EffectErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(stat) => {
+            if file_kind(stat.st_mode) != FileKind::Dir {
+                return Err(rejected("owned cleanup target is not a directory"));
+            }
+            let dir = open_dir(path)?;
+            chmod_tree_writable(&dir)?;
+            remove_children(&dir)?;
+            fs::remove_dir(path).map_err(|error| io_error("remove owned tree", error))
+        }
     }
 }
 
@@ -561,7 +695,11 @@ fn copy_planned_file(
     let readable = open_read(&source_parent, name)?;
     let bytes = read_fd(&readable, entry.stamp.len as usize)?;
     let mode = if seal {
-        if entry.stamp.executable { 0o555 } else { 0o444 }
+        if entry.stamp.executable {
+            0o555
+        } else {
+            0o444
+        }
     } else if entry.stamp.executable {
         0o755
     } else {
@@ -652,6 +790,21 @@ fn stat_relative(root: &OwnedFd, components: &[String]) -> Result<libc::stat, Ef
     stat_at(&parent, components.last().expect("component"))
 }
 
+fn chmod_tree_writable(dir: &OwnedFd) -> Result<(), EffectError> {
+    fchmod_fd(dir, 0o700)?;
+    for name in read_names(dir)? {
+        let text = name
+            .to_str()
+            .ok_or_else(|| rejected("directory entry is not utf-8"))?;
+        let stat = stat_at(dir, text)?;
+        if file_kind(stat.st_mode) == FileKind::Dir {
+            let child = open_child_dir(dir, text)?;
+            chmod_tree_writable(&child)?;
+        }
+    }
+    Ok(())
+}
+
 fn remove_children(dir: &OwnedFd) -> Result<(), EffectError> {
     for name in read_names(dir)? {
         let text = name
@@ -679,6 +832,11 @@ fn read_names(dir: &OwnedFd) -> Result<Vec<OsString>, EffectError> {
     let dup_fd = unsafe { libc::dup(dir.as_raw_fd()) };
     if dup_fd < 0 {
         return Err(from_errno("dup", errno()));
+    }
+    if unsafe { libc::lseek(dup_fd, 0, libc::SEEK_SET) } < 0 {
+        let code = errno();
+        unsafe { libc::close(dup_fd) };
+        return Err(from_errno("lseek", code));
     }
     let stream = unsafe { libc::fdopendir(dup_fd) };
     if stream.is_null() {
@@ -750,18 +908,6 @@ fn open_read(parent: &OwnedFd, name: &str) -> Result<OwnedFd, EffectError> {
     owned_fd(fd, "open file")
 }
 
-fn open_trunc(parent: &OwnedFd, name: &str) -> Result<OwnedFd, EffectError> {
-    let c_name = c_name(name)?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            c_name.as_ptr(),
-            libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    owned_fd(fd, "truncate file")
-}
-
 fn create_file(parent: &OwnedFd, name: &str, mode: u32) -> Result<OwnedFd, EffectError> {
     let c_name = c_name(name)?;
     let fd = unsafe {
@@ -824,6 +970,18 @@ fn lstat_path(path: &Path) -> Result<libc::stat, EffectError> {
     } else {
         Ok(unsafe { stat.assume_init() })
     }
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn inject_partial_write(fd: &OwnedFd, bytes: &[u8], code: i32) -> Result<(), EffectError> {
+    if !bytes.is_empty() {
+        let wrote =
+            unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast::<libc::c_void>(), 1) };
+        if wrote < 0 {
+            return Err(from_errno("write", errno()));
+        }
+    }
+    Err(simulated_io("write", code))
 }
 
 fn write_all(fd: &OwnedFd, bytes: &[u8]) -> Result<(), EffectError> {
@@ -890,6 +1048,91 @@ fn fchmod_fd(fd: &OwnedFd, mode: u32) -> Result<(), EffectError> {
         Err(from_errno("fchmod", errno()))
     } else {
         Ok(())
+    }
+}
+
+struct StagedFile {
+    dir: OwnedFd,
+    name: String,
+    fd: OwnedFd,
+}
+
+impl StagedFile {
+    fn cleanup_owned(&self) -> Result<(), EffectError> {
+        let live = fstat_fd(&self.fd)?;
+        let at = match stat_at(&self.dir, &self.name) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == EffectErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if live.st_dev != at.st_dev || live.st_ino != at.st_ino || live.st_nlink != 1 {
+            return Err(rejected(
+                "refusing to remove a scratch file that is not exclusively owned",
+            ));
+        }
+        unlink_at(&self.dir, &self.name, false)
+    }
+}
+
+fn fstat_fd(fd: &OwnedFd) -> Result<libc::stat, EffectError> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+    if rc < 0 {
+        Err(from_errno("fstat", errno()))
+    } else {
+        Ok(unsafe { stat.assume_init() })
+    }
+}
+
+fn ensure_private_dir(parent: &OwnedFd, name: &str) -> Result<OwnedFd, EffectError> {
+    let c_name = c_name(name)?;
+    let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) };
+    if rc < 0 {
+        let code = errno();
+        if code != libc::EEXIST {
+            return Err(from_errno("mkdir", code));
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    owned_fd(fd, "open scratch")
+}
+
+fn rename_at(
+    from_dir: &OwnedFd,
+    from: &str,
+    to_dir: &OwnedFd,
+    to: &str,
+) -> Result<(), EffectError> {
+    let from_c = c_name(from)?;
+    let to_c = c_name(to)?;
+    let rc = unsafe {
+        libc::renameat(
+            from_dir.as_raw_fd(),
+            from_c.as_ptr(),
+            to_dir.as_raw_fd(),
+            to_c.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        Err(from_errno("rename", errno()))
+    } else {
+        Ok(())
+    }
+}
+
+fn retain_cleanup_failure(error: EffectError, cleanup: Result<(), EffectError>) -> EffectError {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => EffectError::new(
+            error.kind(),
+            format!("{error}; scratch cleanup failed: {cleanup}"),
+        ),
     }
 }
 
