@@ -1587,3 +1587,242 @@ fn failed_publish_post_rename_fsync_drop_discards_view_without_new_tree() {
     assert_eq!(handle.epoch(), epoch);
     assert!(dir_names(&store.root().join("views")).is_empty());
 }
+
+const STALE_USAGE: &str = "InconsistentSource: accounted usage does not match the destination";
+
+fn assert_stale_usage(err: &EffectError) {
+    assert_eq!(err.kind(), EffectErrorKind::InconsistentSource);
+    assert_eq!(err.to_string(), STALE_USAGE);
+}
+
+fn plant_unaccounted_file(view: &WritableView) -> (PathBuf, Vec<u8>, u32) {
+    let dest = view.work_root().join("ext.txt");
+    let bytes = b"external".to_vec();
+    fs::write(&dest, &bytes).unwrap();
+    let mut perms = fs::metadata(&dest).unwrap().permissions();
+    perms.set_mode(0o640);
+    fs::set_permissions(&dest, perms).unwrap();
+    let mode = fs::symlink_metadata(&dest).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o640);
+    (dest, bytes, mode)
+}
+
+fn open_tight(store: &EffectStore, seed: &Path) -> (WorkspaceHandle, WritableView) {
+    let handle = store
+        .import_workspace(import_req(
+            seed,
+            ResourceQuota::new(2, 16, 4).unwrap(),
+            EffectCancellation::new(),
+        ))
+        .unwrap();
+    let view = open_ok(&handle);
+    (handle, view)
+}
+
+fn prove_usage_did_not_move(view: &WritableView) {
+    // Removing the external file is the test's reconciliation. Two later SDK
+    // writes fit only if the rejected operation left entries and bytes at zero.
+    // Aggregate counters still do not detect every external mutation.
+    view.write_file("a.txt", b"12345678").unwrap();
+    view.write_file("b.txt", b"12345678").unwrap();
+    let over = view.write_file("c.txt", b"1").unwrap_err();
+    assert_eq!(over.kind(), EffectErrorKind::QuotaExceeded);
+    assert_eq!(view.read_file("a.txt").unwrap(), b"12345678");
+    assert_eq!(view.read_file("b.txt").unwrap(), b"12345678");
+    #[cfg(feature = "workspace-io-fault")]
+    assert_eq!(view.accounted_usage(), (2, 16));
+}
+
+#[test]
+fn external_nonempty_overwrite_rejects_stale_usage() {
+    let root = scratch("stale-overwrite");
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let (_handle, view) = open_tight(&store, &seed);
+    #[cfg(feature = "workspace-io-fault")]
+    assert_eq!(view.accounted_usage(), (0, 0));
+    let (dest, bytes, mode) = plant_unaccounted_file(&view);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        view.write_file("ext.txt", b"replaced")
+    }));
+    let err = match outcome {
+        Ok(Err(err)) => err,
+        Ok(Ok(())) => panic!("overwrite of an unaccounted file must fail before replacement"),
+        Err(_) => panic!("overwrite must return a typed error, not panic"),
+    };
+    assert_stale_usage(&err);
+    assert_eq!(fs::read(&dest).unwrap(), bytes);
+    assert_eq!(fs::symlink_metadata(&dest).unwrap().mode() & 0o777, mode);
+    #[cfg(feature = "workspace-io-fault")]
+    assert_eq!(view.accounted_usage(), (0, 0));
+    fs::remove_file(&dest).unwrap();
+    prove_usage_did_not_move(&view);
+}
+
+#[test]
+fn external_nonempty_delete_rejects_stale_usage() {
+    let root = scratch("stale-delete");
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let (_handle, view) = open_tight(&store, &seed);
+    #[cfg(feature = "workspace-io-fault")]
+    assert_eq!(view.accounted_usage(), (0, 0));
+    let (dest, bytes, mode) = plant_unaccounted_file(&view);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| view.delete("ext.txt")));
+    let err = match outcome {
+        Ok(Err(err)) => err,
+        Ok(Ok(())) => panic!("delete of an unaccounted file must fail before unlink"),
+        Err(_) => panic!("delete must return a typed error, not panic"),
+    };
+    assert_stale_usage(&err);
+    assert_eq!(fs::read(&dest).unwrap(), bytes);
+    assert_eq!(fs::symlink_metadata(&dest).unwrap().mode() & 0o777, mode);
+    #[cfg(feature = "workspace-io-fault")]
+    assert_eq!(view.accounted_usage(), (0, 0));
+    fs::remove_file(&dest).unwrap();
+    prove_usage_did_not_move(&view);
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn arm_publication_faults(view: &WritableView) {
+    // Both post-rename points belong to this view. A shared one-shot slot would
+    // let the first consumer hide the leak from the next owner.
+    view.arm_simulated_io_fault(
+        rustscript_agent::effects::SimulatedIoFault::PostRenameChmod {
+            errno: rustscript_agent::effects::SimulatedIoFault::EIO,
+        },
+    )
+    .unwrap();
+    view.arm_simulated_io_fault(
+        rustscript_agent::effects::SimulatedIoFault::PostRenameDirFsync {
+            errno: rustscript_agent::effects::SimulatedIoFault::ENOSPC,
+        },
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "workspace-io-fault")]
+fn empty_seed(root: &Path, name: &str, body: &[u8]) -> PathBuf {
+    let seed = root.join(name);
+    fs::create_dir_all(&seed).unwrap();
+    fs::write(seed.join("f.txt"), body).unwrap();
+    seed
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn discarded_view_publication_fault_does_not_reach_sibling_or_import() {
+    let root = scratch("io-fault-drop");
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle_a = import_ok(&store, &empty_seed(&root, "seed-a", b"a-kept"));
+    let handle_b = import_ok(&store, &empty_seed(&root, "seed-b", b"b-kept"));
+    let head_b = handle_b.head();
+    {
+        let view_a = open_ok(&handle_a);
+        arm_publication_faults(&view_a);
+        handle_a.discard(view_a).unwrap();
+    }
+    let view_b = open_ok(&handle_b);
+    view_b.write_file("f.txt", b"b-next").unwrap();
+    let sibling = handle_b.publish(view_b, publish_request(&handle_b));
+    let later_seed = empty_seed(&root, "seed-c", b"c-kept");
+    let later = store.import_workspace(import_req(
+        &later_seed,
+        generous(),
+        EffectCancellation::new(),
+    ));
+    let sibling_text = match &sibling {
+        Ok(_) => "ok".to_string(),
+        Err(failure) => failure.error.to_string(),
+    };
+    let later_text = match &later {
+        Ok(_) => "ok".to_string(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        sibling.is_ok() && later.is_ok(),
+        "discarded view fault leaked: sibling={sibling_text} import={later_text}"
+    );
+    assert_ne!(handle_b.head(), head_b);
+    assert_eq!(handle_b.read_committed("f.txt").unwrap(), b"b-next");
+    assert_eq!(later.unwrap().read_committed("f.txt").unwrap(), b"c-kept");
+
+    store
+        .arm_simulated_io_fault(
+            rustscript_agent::effects::SimulatedIoFault::PostRenameChmod {
+                errno: rustscript_agent::effects::SimulatedIoFault::EIO,
+            },
+        )
+        .unwrap();
+    drop(open_ok(&handle_a));
+    let preserved = store
+        .import_workspace(import_req(
+            &empty_seed(&root, "seed-d", b"d-kept"),
+            generous(),
+            EffectCancellation::new(),
+        ))
+        .unwrap_err();
+    assert_simulated_io(&preserved, "EIO");
+}
+
+#[cfg(feature = "workspace-io-fault")]
+#[test]
+fn concurrent_publication_fault_stays_on_arming_view() {
+    let root = scratch("io-fault-concurrent");
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle_a = import_ok(&store, &empty_seed(&root, "seed-a", b"a-kept"));
+    let handle_b = import_ok(&store, &empty_seed(&root, "seed-b", b"b-kept"));
+    let head_a = handle_a.head();
+    let epoch_a = handle_a.epoch();
+    let head_b = handle_b.head();
+    let view_a = open_ok(&handle_a);
+    let view_b = open_ok(&handle_b);
+    view_a.write_file("f.txt", b"a-next").unwrap();
+    view_b.write_file("f.txt", b"b-next").unwrap();
+    arm_publication_faults(&view_a);
+    let barrier = Arc::new(Barrier::new(2));
+    let spawn = |handle: WorkspaceHandle, view: WritableView, barrier: Arc<Barrier>| {
+        thread::spawn(
+            #[allow(clippy::result_large_err)]
+            move || {
+                barrier.wait();
+                handle.publish(view, publish_request(&handle))
+            },
+        )
+    };
+    let armed = spawn(handle_a.clone(), view_a, Arc::clone(&barrier));
+    let sibling = spawn(handle_b.clone(), view_b, barrier);
+    let armed = armed.join().expect("arming publisher finished");
+    let sibling = sibling.join().expect("sibling publisher finished");
+    let armed_text = match &armed {
+        Ok(_) => "ok".to_string(),
+        Err(failure) => failure.error.to_string(),
+    };
+    let sibling_text = match &sibling {
+        Ok(_) => "ok".to_string(),
+        Err(failure) => failure.error.to_string(),
+    };
+    let Err(failure) = armed else {
+        panic!("only the arming view must fail, sibling={sibling_text}");
+    };
+    assert_simulated_io(&failure.error, "EIO");
+    assert!(
+        sibling.is_ok(),
+        "sibling consumed the arming view's fault: armed={armed_text} sibling={sibling_text}"
+    );
+    assert_eq!(failure.recovered.read_file("f.txt").unwrap(), b"a-next");
+    assert_eq!(handle_a.head(), head_a);
+    assert_eq!(handle_a.epoch(), epoch_a);
+    assert_eq!(handle_a.read_committed("f.txt").unwrap(), b"a-kept");
+    assert_ne!(handle_b.head(), head_b);
+    assert_eq!(handle_b.read_committed("f.txt").unwrap(), b"b-next");
+    assert!(dir_names(&store.root().join("staging")).is_empty());
+    assert!(store.root().join("trees").join(head_a.as_str()).is_dir());
+    handle_a.discard(failure.recovered).unwrap();
+    checkpoint_now(&handle_a).expect("failed publish kept the writer until discard");
+    checkpoint_now(&handle_b).expect("sibling publish released its writer");
+    let later = import_ok(&store, &empty_seed(&root, "seed-c", b"c-kept"));
+    assert_eq!(later.read_committed("f.txt").unwrap(), b"c-kept");
+}

@@ -175,8 +175,17 @@ impl WorkRoot {
         let mut usage = self.usage.lock();
         let old_len = old.map(|(len, _)| len);
         let mode = old.map(|(_, mode)| mode).unwrap_or(0o644);
-        let next_entries = usage.entries + u64::from(old.is_none());
-        let next_bytes = usage.bytes - old_len.unwrap_or(0) + bytes.len() as u64;
+        let next_entries = usage
+            .entries
+            .checked_add(u64::from(old_len.is_none()))
+            .ok_or_else(stale_usage)?;
+        let retained_bytes = match old_len {
+            Some(len) => usage.bytes.checked_sub(len).ok_or_else(stale_usage)?,
+            None => usage.bytes,
+        };
+        let next_bytes = retained_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(stale_usage)?;
         if next_entries > self.quota.max_entries || next_bytes > self.quota.max_bytes {
             return Err(quota_error("view write exceeds quota"));
         }
@@ -232,11 +241,9 @@ impl WorkRoot {
         let name = components.last().expect("relative path has a component");
         let stat = stat_at(&parent, name)?;
         reject_special(&stat, "delete")?;
-        let removed_bytes = match file_kind(stat.st_mode) {
-            FileKind::File => {
-                unlink_at(&parent, name, false)?;
-                file_len(stat)?
-            }
+        let kind = file_kind(stat.st_mode);
+        let removed_bytes = match kind {
+            FileKind::File => file_len(stat)?,
             FileKind::Dir => {
                 if !dir_is_empty(&parent, name)? {
                     return Err(io_error(
@@ -244,7 +251,6 @@ impl WorkRoot {
                         io::Error::from_raw_os_error(libc::ENOTEMPTY),
                     ));
                 }
-                unlink_at(&parent, name, true)?;
                 0
             }
             FileKind::Symlink | FileKind::Special => {
@@ -252,8 +258,14 @@ impl WorkRoot {
             }
         };
         let mut usage = self.usage.lock();
-        usage.entries = usage.entries.saturating_sub(1);
-        usage.bytes = usage.bytes.saturating_sub(removed_bytes);
+        let next_entries = usage.entries.checked_sub(1).ok_or_else(stale_usage)?;
+        let next_bytes = usage
+            .bytes
+            .checked_sub(removed_bytes)
+            .ok_or_else(stale_usage)?;
+        unlink_at(&parent, name, kind == FileKind::Dir)?;
+        usage.entries = next_entries;
+        usage.bytes = next_bytes;
         Ok(())
     }
 
@@ -294,11 +306,12 @@ impl WorkRoot {
         let parent = self.open_parent(&components)?;
         let name = components.last().expect("relative path has a component");
         let mut usage = self.usage.lock();
-        if usage.entries + 1 > self.quota.max_entries {
+        let next_entries = usage.entries.checked_add(1).ok_or_else(stale_usage)?;
+        if next_entries > self.quota.max_entries {
             return Err(quota_error("directory exceeds entry quota"));
         }
         mkdir_at(&parent, name)?;
-        usage.entries += 1;
+        usage.entries = next_entries;
         Ok(())
     }
 
@@ -1207,4 +1220,8 @@ fn quota_error(message: impl Into<String>) -> EffectError {
 
 fn inconsistent(message: impl Into<String>) -> EffectError {
     EffectError::new(EffectErrorKind::InconsistentSource, message)
+}
+
+fn stale_usage() -> EffectError {
+    inconsistent("accounted usage does not match the destination")
 }

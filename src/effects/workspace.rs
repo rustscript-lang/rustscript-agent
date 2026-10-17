@@ -122,8 +122,17 @@ impl EffectStore {
                 format!("publish import tree failed: {error}"),
             ));
         }
-        if let Err(error) = self.inner.seal_published_tree(&published) {
-            return Err(self.inner.cleanup_owned_published(&published, error));
+        if let Err(error) = self.inner.seal_published_tree(
+            &published,
+            #[cfg(feature = "workspace-io-fault")]
+            &self.inner.io_fault,
+        ) {
+            return Err(self.inner.cleanup_owned_published(
+                &published,
+                error,
+                #[cfg(feature = "workspace-io-fault")]
+                &self.inner.io_fault,
+            ));
         }
         let _ = copied;
         let workspace_id = WorkspaceId::fresh();
@@ -375,6 +384,8 @@ impl WorkspaceHandle {
                 temp_path,
                 work,
                 released: AtomicBool::new(false),
+                #[cfg(feature = "workspace-io-fault")]
+                io_fault: IoFaultSlot::new(),
             }),
             Err(error) => {
                 let _ = tree_store::remove_tree(&view_dir);
@@ -525,8 +536,17 @@ impl WorkspaceHandle {
                 format!("rename published tree failed: {error}"),
             )
         })?;
-        if let Err(error) = self.store.seal_published_tree(&published) {
-            return Err(self.store.cleanup_owned_published(&published, error));
+        if let Err(error) = self.store.seal_published_tree(
+            &published,
+            #[cfg(feature = "workspace-io-fault")]
+            &view.io_fault,
+        ) {
+            return Err(self.store.cleanup_owned_published(
+                &published,
+                error,
+                #[cfg(feature = "workspace-io-fault")]
+                &view.io_fault,
+            ));
         }
         let finished = {
             let mut state = self.store.state.lock();
@@ -534,7 +554,12 @@ impl WorkspaceHandle {
         };
         match finished {
             Ok(publication) => Ok(publication),
-            Err(error) => Err(self.store.cleanup_owned_published(&published, error)),
+            Err(error) => Err(self.store.cleanup_owned_published(
+                &published,
+                error,
+                #[cfg(feature = "workspace-io-fault")]
+                &view.io_fault,
+            )),
         }
     }
 
@@ -633,6 +658,9 @@ pub struct WritableView {
     temp_path: PathBuf,
     work: WorkRoot,
     released: AtomicBool,
+    /// Publication and cleanup faults for this view. Import faults stay on the store.
+    #[cfg(feature = "workspace-io-fault")]
+    io_fault: IoFaultSlot,
 }
 
 impl fmt::Debug for WritableView {
@@ -791,7 +819,7 @@ impl WritableView {
         let (point, errno) = fault.checked()?;
         match point {
             FAULT_PARTIAL_WRITE | FAULT_FILE_FSYNC => self.work.arm_io_fault(point, errno),
-            _ => self.store.io_fault.arm(point, errno),
+            _ => self.io_fault.arm(point, errno),
         }
         Ok(())
     }
@@ -802,7 +830,12 @@ impl WritableView {
 }
 
 impl StoreInner {
-    fn cleanup_owned_published(&self, published: &Path, error: EffectError) -> EffectError {
+    fn cleanup_owned_published(
+        &self,
+        published: &Path,
+        error: EffectError,
+        #[cfg(feature = "workspace-io-fault")] faults: &IoFaultSlot,
+    ) -> EffectError {
         let tree_id = published
             .file_name()
             .and_then(|name| name.to_str())
@@ -814,7 +847,7 @@ impl StoreInner {
             );
         }
         #[cfg(feature = "workspace-io-fault")]
-        if let Some(code) = self.io_fault.take(FAULT_OWNED_CLEANUP) {
+        if let Some(code) = faults.take(FAULT_OWNED_CLEANUP) {
             let cleanup = tree_store::simulated_io("cleanup", code);
             return EffectError::new(
                 error.kind(),
@@ -843,14 +876,18 @@ impl StoreInner {
         })
     }
 
-    fn seal_published_tree(&self, published: &Path) -> Result<(), EffectError> {
+    fn seal_published_tree(
+        &self,
+        published: &Path,
+        #[cfg(feature = "workspace-io-fault")] faults: &IoFaultSlot,
+    ) -> Result<(), EffectError> {
         #[cfg(feature = "workspace-io-fault")]
-        if let Some(code) = self.io_fault.take(FAULT_POST_RENAME_CHMOD) {
+        if let Some(code) = faults.take(FAULT_POST_RENAME_CHMOD) {
             return Err(tree_store::simulated_io("fchmod", code));
         }
         tree_store::chmod_dir(published, 0o555)?;
         #[cfg(feature = "workspace-io-fault")]
-        if let Some(code) = self.io_fault.take(FAULT_POST_RENAME_DIR_FSYNC) {
+        if let Some(code) = faults.take(FAULT_POST_RENAME_DIR_FSYNC) {
             return Err(tree_store::simulated_io("fsync", code));
         }
         tree_store::fsync_dir(&self.root.join("trees"))
