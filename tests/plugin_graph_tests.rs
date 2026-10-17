@@ -770,12 +770,20 @@ fn signed_completion_protocol_is_role_fenced_and_generic_artifacts_stay_denied()
     let library = manifest
         .replace("kind: tool", "kind: library")
         .replace("contract: agent.tool/v1", "contract: agent.library/v1");
+    let harness = manifest
+        .replace("kind: tool", "kind: harness")
+        .replace("contract: agent.tool/v1", "contract: agent.harness/v1");
     for source in [
         result,
         "pub fn invoke(value: map) -> map { agent_runtime::tool_prepare(value) }\n",
         "pub fn invoke(token: string) -> map { agent_runtime::tool_commit(token, {}) }\n",
         "pub fn invoke(value: int) -> int { agent::sleep_ms(value) }\n",
     ] {
+        // Harness packages are not an installable role in this manifest contract.
+        assert_kind(
+            prepare_policy_source(&harness, source).unwrap_err(),
+            PluginErrorKind::UnknownField,
+        );
         assert_kind(
             prepare_policy_source(&library, source).unwrap_err(),
             PluginErrorKind::UnauthorizedHostImport,

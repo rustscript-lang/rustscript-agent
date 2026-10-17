@@ -109,6 +109,16 @@ impl Effects {
         provider: Arc<dyn rustscript_agent::AgentProviderHost>,
         calls: usize,
     ) -> Vec<Value> {
+        self.execute_expected(run, provider, calls, &[]).await
+    }
+
+    async fn execute_expected(
+        &self,
+        run: &rustscript_agent::AdmittedRun,
+        provider: Arc<dyn rustscript_agent::AgentProviderHost>,
+        calls: usize,
+        failed: &[&str],
+    ) -> Vec<Value> {
         self.state.service().inject_provider_host(provider);
         self.state
             .service()
@@ -124,7 +134,11 @@ impl Effects {
         ] {
             assert_eq!(
                 events.iter().filter(|e| e["event"] == event).count(),
-                calls,
+                if event == "tool.completed" {
+                    calls - failed.len()
+                } else {
+                    calls
+                },
                 "{event}: {events:?}"
             );
         }
@@ -135,6 +149,12 @@ impl Effects {
                 .all(|e| e["data"]["ok"] == true),
             "{events:?}"
         );
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "tool.failed")
+            .map(|e| e["data"]["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(failures, failed);
         let persistence = self.state.persistence().unwrap();
         let durable = persistence
             .event_replay(
@@ -144,6 +164,41 @@ impl Effects {
         let columns = durable["columns"].as_array().unwrap();
         let kind = columns.iter().position(|c| c == "event_type").unwrap();
         let rows = durable["rows"].as_array().unwrap();
+        let payload = columns.iter().position(|c| c == "payload_json").unwrap();
+        for name in [
+            "tool.requested",
+            "tool.started",
+            "tool.output",
+            "tool.completed",
+            "tool.failed",
+            "model.requested",
+            "model.completed",
+        ] {
+            let live: Vec<_> = events
+                .iter()
+                .filter(|e| e["event"] == name)
+                .map(|e| e["data"].clone())
+                .collect();
+            let persisted: Vec<Value> = rows
+                .iter()
+                .filter(|r| r[kind] == name)
+                .map(|r| serde_json::from_str(r[payload].as_str().unwrap()).unwrap())
+                .collect();
+            assert_eq!(
+                live, persisted,
+                "durable {name} must retain exact Native facts"
+            );
+        }
+        let reviews = events
+            .iter()
+            .filter(|e| e["event"] == "tool.started" && e["data"]["risk_class"] != "read")
+            .count();
+        for name in ["model.requested", "model.completed"] {
+            assert_eq!(
+                events.iter().filter(|e| e["event"] == name).count(),
+                calls + 1 + reviews
+            );
+        }
         for event in [
             "tool.requested",
             "tool.started",
@@ -152,7 +207,11 @@ impl Effects {
         ] {
             assert_eq!(
                 rows.iter().filter(|r| r[kind] == event).count(),
-                calls,
+                if event == "tool.completed" {
+                    calls - failed.len()
+                } else {
+                    calls
+                },
                 "durable {event}: {durable}"
             );
         }
@@ -167,6 +226,26 @@ impl Effects {
             .cloned()
             .collect();
         assert_eq!(results.len(), calls, "{messages}");
+        let stored_messages = persistence.message_list(&run.session_id, 0).unwrap();
+        let content_column = stored_messages["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c == "content_json")
+            .unwrap();
+        let stored_results: Vec<Value> = stored_messages["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| {
+                serde_json::from_str::<Vec<Value>>(row[content_column].as_str().unwrap()).unwrap()
+            })
+            .filter(|block| block["type"] == "tool_result")
+            .collect();
+        assert_eq!(
+            stored_results, results,
+            "durable canonical blocks must equal public results"
+        );
         println!(
             "NATIVE_EFFECT {}",
             json!({"root":self.root,"run":run.run_id,"results":results,"events":events})
@@ -358,6 +437,8 @@ struct ProcessCalls {
     step: std::sync::atomic::AtomicUsize,
     handle: std::sync::Mutex<Option<String>>,
     requests: std::sync::Mutex<Vec<Value>>,
+    processes: Option<Arc<rustscript_agent::capabilities::ProcessCapability>>,
+    pids: std::sync::Mutex<Vec<u32>>,
 }
 
 fn process_id(value: &Value) -> Option<String> {
@@ -379,10 +460,17 @@ fn process_id(value: &Value) -> Option<String> {
 impl rustscript_agent::AgentProviderHost for ProcessCalls {
     fn call(&self, request: &Value, _: &rustscript_agent::RunCancellation) -> Value {
         self.requests.lock().unwrap().push(request.clone());
-        if request
-            .get("_provider_step_key")
+        // DurableProvider strips its private step key before transport.
+        // Classify the real tool-free Guardian request by its system message.
+        assert!(request.get("_provider_step_key").is_none());
+        let system = &request["messages"][0];
+        if system
+            .pointer("/content/0/text")
             .and_then(Value::as_str)
-            .is_some_and(|key| key.starts_with("review:"))
+            .or_else(|| system["content"].as_str())
+            .is_some_and(|text| {
+                text.starts_with("You are Guardian, reviewing one proposed tool action.")
+            })
         {
             let mut approval = response(None);
             approval["text"] = json!(
@@ -391,6 +479,11 @@ impl rustscript_agent::AgentProviderHost for ProcessCalls {
             return json!({"ok":true,"response":approval,"error":{}});
         }
         let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        if step == 1 {
+            *self.pids.lock().unwrap() = self.processes.as_ref().unwrap().live_pids();
+            assert_eq!(self.pids.lock().unwrap().len(), 1);
+        }
         let call = if step == 0 {
             Some(
                 json!({"id":"spawn","name":"terminal","arguments":{"argv":["/bin/cat"],"background":true}}),
@@ -407,7 +500,7 @@ impl rustscript_agent::AgentProviderHost for ProcessCalls {
                 1 => ("write", json!({"data":"caller-stdin\n"})),
                 2 => ("wait", json!({"timeout_ms":50})),
                 3 => ("poll", json!({})),
-                4 => ("log", json!({"stream":"stdout","offset":0,"limit":4096})),
+                4 => ("log", json!({"offset":0,"limit":4096})),
                 5 => ("kill", json!({})),
                 6 => ("poll", json!({})),
                 _ => unreachable!(),
@@ -428,17 +521,43 @@ async fn signed_process_uses_each_runs_native_child_stdin_poll_log_and_kill() {
     let mut f = Effects::new("process", false);
     let a = f.admit().await;
     f.activate_b();
-    let provider_a = Arc::new(ProcessCalls::default());
-    let out_a = f.execute(&a, provider_a.clone(), 7).await;
+    let provider_a = process_provider(&f, &a);
+    let out_a = f
+        .execute_expected(&a, provider_a.clone(), 7, &["process-6"])
+        .await;
     f.assert_pin(&a, true);
+    assert_eq!(out_a[1]["result"]["wrote_bytes"], 8);
+    for block in &out_a[2..5] {
+        assert_eq!(block["result"]["stdout"], "A-stdin\n");
+    }
     assert_eq!(out_a[4]["result"]["stdout"], "A-stdin\n", "{out_a:?}");
-    assert_ne!(out_a[6]["result"]["status"], "running");
+    assert_eq!(out_a[5]["result"]["status"], "signaled");
+    assert_eq!(out_a[5]["result"]["signal"], 9);
+    assert_eq!(out_a[6]["is_error"], true);
+    assert_eq!(out_a[6]["error"]["code"], "cancelled");
+    assert_process_gone(&provider_a);
     let b = f.admit().await;
-    let provider_b = Arc::new(ProcessCalls::default());
-    let out_b = f.execute(&b, provider_b.clone(), 7).await;
+    let provider_b = process_provider(&f, &b);
+    let out_b = f
+        .execute_expected(&b, provider_b.clone(), 7, &["process-6"])
+        .await;
     f.assert_pin(&b, false);
+    assert_eq!(out_b[1]["result"]["wrote_bytes"], 8);
+    for block in &out_b[2..5] {
+        assert_eq!(block["result"]["stdout"], "B-stdin\n");
+    }
     assert_eq!(out_b[4]["result"]["stdout"], "B-stdin\n", "{out_b:?}");
-    assert_ne!(out_b[6]["result"]["status"], "running");
+    assert_eq!(out_b[5]["result"]["status"], "signaled");
+    assert_eq!(out_b[5]["result"]["signal"], 9);
+    assert_eq!(out_b[6]["is_error"], true);
+    assert_eq!(out_b[6]["error"]["code"], "cancelled");
+    assert_process_gone(&provider_b);
+    let actions_a = assert_process_parent_arguments(&f, &a, &handle_from(&provider_a));
+    let actions_b = assert_process_parent_arguments(&f, &b, &handle_from(&provider_b));
+    assert_eq!(
+        actions_a, actions_b,
+        "compare public action payloads after projecting each run's own identity"
+    );
     let handle_a = provider_a.handle.lock().unwrap().clone().unwrap();
     let handle_b = provider_b.handle.lock().unwrap().clone().unwrap();
     assert_ne!(
@@ -446,4 +565,156 @@ async fn signed_process_uses_each_runs_native_child_stdin_poll_log_and_kill() {
         "opaque Native identities are run-owned and may differ"
     );
     println!("NATIVE_PROCESS_IDS {}", json!({"a":handle_a,"b":handle_b}));
+}
+
+fn process_provider(f: &Effects, run: &rustscript_agent::AdmittedRun) -> Arc<ProcessCalls> {
+    Arc::new(ProcessCalls {
+        processes: f
+            .state
+            .service()
+            .capability_host_bridges(&run.run_id)
+            .unwrap()
+            .unwrap()
+            .processes,
+        ..Default::default()
+    })
+}
+
+fn assert_process_gone(provider: &ProcessCalls) {
+    let pids = provider.pids.lock().unwrap();
+    assert_eq!(pids.len(), 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    for pid in pids.iter() {
+        let path = PathBuf::from(format!("/proc/{pid}"));
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !path.exists(),
+            "owned child {pid} must disappear after kill"
+        );
+    }
+    assert!(provider.processes.as_ref().unwrap().live_pids().is_empty());
+}
+
+fn handle_from(provider: &ProcessCalls) -> String {
+    provider.handle.lock().unwrap().clone().unwrap()
+}
+
+fn assert_process_parent_arguments(
+    f: &Effects,
+    run: &rustscript_agent::AdmittedRun,
+    handle: &str,
+) -> Vec<Value> {
+    let events = f.state.service().run_events(&run.run_id);
+    let mut arguments: Vec<Value> = events
+        .iter()
+        .filter(|e| e["event"] == "tool.started")
+        .map(|e| serde_json::from_str(e["data"]["argument_digest"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(arguments.len(), 7);
+    assert_eq!(arguments[0], json!({"argv":["/bin/cat"],"background":true}));
+    let expected = [
+        json!({"action":"write","data":"caller-stdin\n"}),
+        json!({"action":"wait","timeout_ms":50}),
+        json!({"action":"poll"}),
+        json!({"action":"log","offset":0,"limit":4096}),
+        json!({"action":"kill"}),
+        json!({"action":"poll"}),
+    ];
+    for (actual, expected) in arguments[1..].iter_mut().zip(expected) {
+        assert_eq!(actual["process_id"], handle);
+        actual.as_object_mut().unwrap().remove("process_id");
+        assert_eq!(*actual, expected);
+    }
+    arguments
+}
+
+fn assert_native_overflow(
+    f: &Effects,
+    run: &rustscript_agent::AdmittedRun,
+    block: &Value,
+    artifacts: &rustscript_agent::capabilities::ArtifactCapability,
+    stdout: &str,
+) {
+    assert_eq!(block["is_error"], false, "{block}");
+    assert_eq!(block["truncated"], true, "{block}");
+    let id = block["artifact"]["id"].as_str().unwrap();
+    let (bytes, metadata) = artifacts
+        .stored(id)
+        .expect("committed result artifact remains visible");
+    assert_eq!(bytes, format!("stdout:\n{stdout}stderr:\n").into_bytes());
+    assert_eq!(metadata["run"], run.run_id);
+    assert_eq!(metadata["call_id"], block["tool_call_id"]);
+    assert_eq!(metadata.as_object().unwrap().len(), 3);
+    assert!(metadata["owner"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(block["result"]["overflow_encoding"], "labeled-utf8");
+    assert_eq!(block["result"]["overflow_stdout_bytes"], stdout.len());
+    assert_eq!(block["result"]["overflow_stderr_bytes"], 0);
+    let completed = f
+        .state
+        .service()
+        .run_events(&run.run_id)
+        .into_iter()
+        .find(|e| {
+            e["event"] == "tool.completed" && e["data"]["tool_call_id"] == block["tool_call_id"]
+        })
+        .unwrap();
+    assert_eq!(completed["data"]["artifacts"], json!([id]));
+    assert_eq!(completed["data"]["truncated"], true);
+    println!(
+        "NATIVE_BOUNDED_PROCESS_OVERFLOW {}",
+        json!({"run":run.run_id,"call":block["tool_call_id"],"id":id,"bytes":bytes.len(),"metadata":metadata})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_terminal_overflow_publishes_real_labeled_result_artifact() {
+    let f = Effects::new("terminal", true);
+    let run = f.admit().await;
+    let artifacts = f
+        .state
+        .service()
+        .capability_host_bridges(&run.run_id)
+        .unwrap()
+        .unwrap()
+        .artifacts
+        .unwrap();
+    let args = json!({"argv":["/bin/printf","caller-content"],"timeout_ms":250});
+    let results = f.execute(&run, one_call("terminal", &args), 1).await;
+    f.assert_original_arguments(&run, &args);
+    assert_native_overflow(
+        &f,
+        &run,
+        &results[0],
+        &artifacts,
+        &format!("A-{}\n", "x".repeat(1200)),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_process_overflow_publishes_real_child_output_as_bounded_artifacts() {
+    let f = Effects::new("process", true);
+    let run = f.admit().await;
+    let artifacts = f
+        .state
+        .service()
+        .capability_host_bridges(&run.run_id)
+        .unwrap()
+        .unwrap()
+        .artifacts
+        .unwrap();
+    let provider = process_provider(&f, &run);
+    let results = f
+        .execute_expected(&run, provider.clone(), 7, &["process-6"])
+        .await;
+    assert_process_parent_arguments(&f, &run, &handle_from(&provider));
+    assert_native_overflow(
+        &f,
+        &run,
+        &results[4],
+        &artifacts,
+        &format!("A-{}\n", "x".repeat(1200)),
+    );
+    assert_process_gone(&provider);
 }

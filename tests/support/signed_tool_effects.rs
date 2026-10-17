@@ -80,7 +80,15 @@ pub fn install_pair(
             "search_files" => format!("arguments.pattern = \"{variant}*.txt\";"),
             "write_file" => format!("arguments.content = \"{marker}-write\\n\";"),
             "patch" => format!("arguments.new_string = \"{marker}-patch\";"),
+            "terminal" if overflow => format!(
+                "arguments.argv = [\"/bin/printf\", \"{marker}-{}\\n\"];",
+                "x".repeat(1200)
+            ),
             "terminal" => format!("arguments.argv = [\"/bin/printf\", \"{marker}-terminal\\n\"];"),
+            "process" if overflow => format!(
+                "if types::map_string(arguments, \"action\", \"\") == \"write\" {{ arguments.data = \"{marker}-{}\\n\"; }}",
+                "x".repeat(1200)
+            ),
             "process" => format!(
                 "if types::map_string(arguments, \"action\", \"\") == \"write\" {{ arguments.data = \"{marker}-stdin\\n\"; }}"
             ),
@@ -101,7 +109,9 @@ pub fn install_pair(
         } else {
             "leaf::invoke(changed)"
         };
-        let config = if overflow {
+        let config = if overflow && matches!(tool, "terminal" | "process") {
+            "changed.config = { max_output_bytes: 800, max_stream_bytes: 4096 };"
+        } else if overflow {
             "changed.config = { max_tool_output_bytes: 512 };"
         } else {
             ""

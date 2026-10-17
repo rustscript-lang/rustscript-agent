@@ -1018,6 +1018,28 @@ fn read_token_cannot_put_generic_artifact_but_can_publish_one_result() {
         .expect_err("unknown metadata field");
     assert_eq!(error_code(&unknown), "invalid_request");
 
+    for metadata in [
+        json!({"kind":"process_output"}),
+        json!({"encoding":"labeled-utf8"}),
+    ] {
+        let denied = artifacts
+            .put_result(&read, b"payload", &metadata)
+            .expect_err("legacy labels remain forbidden");
+        assert_eq!(error_code(&denied), "invalid_request");
+    }
+    let foreign_owner =
+        CapabilityOwner::new("foreign-profile", "foreign-session", "foreign-run").unwrap();
+    let foreign_store = ArtifactCapability::new(
+        fixture.lifecycle.clone(),
+        foreign_owner,
+        default_artifact_limits(),
+    )
+    .unwrap();
+    let denied = foreign_store
+        .put_result(&read, b"payload", &json!({}))
+        .expect_err("result publication cannot cross owners");
+    assert_eq!(error_code(&denied), "owner_mismatch");
+
     let mismatched = artifacts
         .put_result(&read, b"ok", &json!({"call_id": "other-call"}))
         .expect_err("mismatched call_id");
