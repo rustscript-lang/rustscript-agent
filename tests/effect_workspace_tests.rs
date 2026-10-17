@@ -221,7 +221,14 @@ fn writable_view_does_not_share_inode_with_snapshot() {
     let view_file = view.work_root().join("a.txt");
     let seed_id = dev_ino(&seed.join("a.txt"));
     let tree_id = dev_ino(&immutable);
-    let view_id = dev_ino(&view_file);
+    let path_view_id = dev_ino(&view_file);
+    // Keep the pre-write view open so its inode cannot be retired and reused.
+    let original_view = fs::File::open(&view_file).expect("hold original view");
+    let view_id = {
+        let meta = original_view.metadata().expect("original view metadata");
+        (meta.dev(), meta.ino())
+    };
+    assert_eq!(view_id, path_view_id);
     assert_ne!(seed_id, tree_id);
     assert_ne!(view_id, tree_id);
     assert_ne!(view_id, seed_id);
@@ -235,13 +242,36 @@ fn writable_view_does_not_share_inode_with_snapshot() {
         .open(&immutable)
         .expect_err("sealed file");
     fs::write(immutable.parent().unwrap().join("extra.txt"), b"no").expect_err("sealed dir");
+    let replaced_view = fs::File::open(&view_file).expect("hold replaced view");
+    let replaced_id = {
+        let meta = replaced_view.metadata().expect("replaced view metadata");
+        (meta.dev(), meta.ino())
+    };
     let recorded_view = view_id;
     publish_ok(&handle, view);
     let published = handle.immutable_path(&handle.head()).unwrap().join("a.txt");
+    let original_after = {
+        let meta = original_view
+            .metadata()
+            .expect("original view metadata after publish");
+        (meta.dev(), meta.ino())
+    };
+    let replaced_after = {
+        let meta = replaced_view
+            .metadata()
+            .expect("replaced view metadata after publish");
+        (meta.dev(), meta.ino())
+    };
+    assert_eq!(original_after, recorded_view);
+    assert_eq!(replaced_after, replaced_id);
     assert_ne!(dev_ino(&published), recorded_view);
+    assert_ne!(dev_ino(&published), original_after);
+    assert_ne!(dev_ino(&published), replaced_after);
     assert_ne!(dev_ino(&published), seed_id);
     assert_eq!(fs::symlink_metadata(&published).unwrap().nlink(), 1);
     assert_eq!(fs::read(&published).unwrap(), b"changed");
+    drop(original_view);
+    drop(replaced_view);
 }
 
 #[test]
