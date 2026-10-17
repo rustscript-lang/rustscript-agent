@@ -655,6 +655,55 @@ pub(crate) struct ExpectedCallGrant {
     pub registry_identity: String,
     pub risk_class: String,
     pub summary: String,
+    outcome: Arc<Mutex<PinnedCallOutcome>>,
+}
+
+/// Native-only evidence for one child invocation. Guest return values cannot
+/// populate this witness or borrow a sibling invocation's execution token.
+#[derive(Default)]
+enum PinnedCallOutcome {
+    #[default]
+    Pending,
+    Executing {
+        token: String,
+    },
+    Complete {
+        result: JsonValue,
+    },
+    Failed {
+        error: JsonValue,
+    },
+}
+
+impl PinnedCallOutcome {
+    fn resolve(&self, child: &JsonValue) -> JsonValue {
+        match self {
+            Self::Complete { result } => {
+                match crate::capabilities::lifecycle::validate_canonical_result(result) {
+                    Ok(()) => pinned_tool_result(result),
+                    Err(error) => {
+                        pinned_tool_result(&crate::capabilities::host::error_envelope(&error))
+                    }
+                }
+            }
+            Self::Failed { error } if error.get("ok") == Some(&JsonValue::Bool(false)) => {
+                pinned_tool_result(error)
+            }
+            Self::Pending | Self::Executing { .. }
+                if child.get("ok") == Some(&JsonValue::Bool(false)) =>
+            {
+                pinned_tool_result(child)
+            }
+            Self::Pending | Self::Executing { .. } | Self::Failed { .. } => pinned_outcome(
+                false,
+                "",
+                "",
+                "pinned_result_uncommitted",
+                "pinned tool did not complete a matching durable commit or replay",
+                "",
+            ),
+        }
+    }
 }
 
 impl ExpectedCallGrant {
@@ -829,6 +878,18 @@ impl AgentHostState {
         {
             return pinned_call_mismatch();
         }
+        let mut outcome = self.expected_call.as_ref().map(|grant| {
+            grant
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if outcome
+            .as_deref()
+            .is_some_and(|outcome| !matches!(outcome, PinnedCallOutcome::Pending))
+        {
+            return pinned_call_mismatch();
+        }
         let envelope = tool_prepare(lifecycle, owner, parsed);
         if envelope.get("ok") == Some(&JsonValue::Bool(true))
             && envelope.get("kind") == Some(&JsonValue::String("execute".to_string()))
@@ -839,6 +900,24 @@ impl AgentHostState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(token.to_string(), lease);
+            if let Some(outcome) = outcome.as_deref_mut() {
+                *outcome = PinnedCallOutcome::Executing {
+                    token: token.to_string(),
+                };
+            }
+        } else if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
+                && envelope.get("kind").and_then(JsonValue::as_str) == Some("replay")
+                && let Some(result) = envelope.get("result")
+            {
+                PinnedCallOutcome::Complete {
+                    result: result.clone(),
+                }
+            } else {
+                PinnedCallOutcome::Failed {
+                    error: envelope.clone(),
+                }
+            };
         }
         envelope
     }
@@ -982,6 +1061,7 @@ impl AgentHostState {
                 "arguments": arguments
             })
         };
+        let outcome = Arc::new(Mutex::new(PinnedCallOutcome::Pending));
         let grant = ExpectedCallGrant {
             run_id: pinned.run_id.clone(),
             call_id,
@@ -990,6 +1070,7 @@ impl AgentHostState {
             registry_identity: pinned.registry_identity.clone(),
             risk_class,
             summary,
+            outcome: Arc::clone(&outcome),
         };
         if grant.call_id.is_empty() || grant.tool_name.is_empty() {
             return pinned_call_mismatch();
@@ -1019,7 +1100,10 @@ impl AgentHostState {
             &pinned.authorized_imports,
             Some(grant),
         ) {
-            Ok(value) => pinned_tool_result(&vm_value_to_json(&value)),
+            Ok(value) => outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .resolve(&vm_value_to_json(&value)),
             Err(error) => pinned_outcome(false, "", "", "pinned_tool_failed", &error, ""),
         }
     }
@@ -1115,16 +1199,43 @@ impl AgentHostState {
                 "capability owner is not installed".to_string(),
             ));
         };
-        if self.expected_call.is_some()
+        let mut outcome = self.expected_call.as_ref().map(|grant| {
+            grant
+                .outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if outcome.as_deref().is_some_and(|outcome| {
+            !matches!(outcome, PinnedCallOutcome::Executing { token: expected } if expected == token)
+        }) || (self.expected_call.is_some()
             && !self
                 .leases
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(token)
+                .contains_key(token))
         {
             return pinned_call_mismatch();
         }
         let envelope = tool_commit(lifecycle, owner, token, result.clone());
+        if let Some(outcome) = outcome.as_deref_mut() {
+            *outcome = if envelope.get("ok") == Some(&JsonValue::Bool(true))
+                && envelope.get("kind").and_then(JsonValue::as_str) == Some("committed")
+                && envelope.get("call_id").and_then(JsonValue::as_str)
+                    == self
+                        .expected_call
+                        .as_ref()
+                        .map(|grant| grant.call_id.as_str())
+                && let Some(result) = envelope.get("result")
+            {
+                PinnedCallOutcome::Complete {
+                    result: result.clone(),
+                }
+            } else {
+                PinnedCallOutcome::Failed {
+                    error: envelope.clone(),
+                }
+            };
+        }
         let Some(mut lease) = self
             .leases
             .lock()
@@ -1771,11 +1882,6 @@ fn same_workspace(left: &std::path::Path, right: &std::path::Path) -> bool {
 const PINNED_CANONICAL_RESULT_MAX_BYTES: usize = 1024 * 1024;
 
 fn pinned_tool_result(value: &JsonValue) -> JsonValue {
-    if value.get("kind").and_then(JsonValue::as_str) == Some("committed")
-        && let Some(inner) = value.get("result")
-    {
-        return pinned_tool_result(inner);
-    }
     let explicit_ok = value.get("ok").and_then(JsonValue::as_bool);
     let content = value
         .get("content")

@@ -1020,7 +1020,7 @@ fn should_rollback_unpublished(error: &LifecycleError) -> bool {
     )
 }
 
-fn validate_canonical_result(result: &Value) -> Result<(), LifecycleError> {
+pub(crate) fn validate_canonical_result(result: &Value) -> Result<(), LifecycleError> {
     let object = result
         .as_object()
         .ok_or_else(|| LifecycleError::InvalidMetadata("tool result must be a map".to_string()))?;

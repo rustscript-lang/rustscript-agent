@@ -67,6 +67,7 @@ fn auth(signer: &Signer) -> InstallAuthorization {
 fn tool_source(offset: i64) -> String {
     format!(
         r#"
+use bytes;
 fn map_string(value: map, key: string, fallback: string) -> string {{
     let mut result: string = fallback;
     if value.has(key) {{
@@ -132,12 +133,12 @@ pub fn run(context: map) -> map {{
             }} else => {{
                 let payload: bytes = read.bytes;
                 let text: string = bytes::to_utf8(payload);
-                let result: map = {{ ok: true, text: text }};
+                let result: map = {{ ok: true, content: text, data: {{}}, error: null, truncated: false, artifacts: [] }};
                 let committed: map = agent_runtime::tool_commit(token, result);
                 if map_string(committed, "kind", "") == "committed" => {{
                     map_map(committed, "result")
                 }} else => {{
-                    result
+                    committed
                 }}
             }}
         }}
@@ -210,13 +211,8 @@ impl DurableToolLifecycle for MemoryDurable {
     fn commit_started(&self, _record: &DurableStarted) -> Result<(), LifecycleError> {
         Ok(())
     }
-    fn commit_result(&self, call_id: &str, result: &Value) -> Result<Value, LifecycleError> {
-        Ok(json!({
-            "ok": true,
-            "kind": "committed",
-            "call_id": call_id,
-            "result": result,
-        }))
+    fn commit_result(&self, _call_id: &str, result: &Value) -> Result<Value, LifecycleError> {
+        Ok(result.clone())
     }
     fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
         Ok(())
@@ -720,13 +716,8 @@ impl DurableToolLifecycle for CountingDurableShared {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    fn commit_result(&self, call_id: &str, result: &Value) -> Result<Value, LifecycleError> {
-        Ok(json!({
-            "ok": true,
-            "kind": "committed",
-            "call_id": call_id,
-            "result": result,
-        }))
+    fn commit_result(&self, _call_id: &str, result: &Value) -> Result<Value, LifecycleError> {
+        Ok(result.clone())
     }
     fn interrupt(&self, _call_id: &str) -> Result<(), LifecycleError> {
         Ok(())
