@@ -769,9 +769,17 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
     let stored = serde_json::to_string(&stored).expect("durable tool results serialize");
     assert!(stored.contains("workspace_unavailable"));
 
+    let persistence = state
+        .persistence()
+        .expect("owned no-workspace storage worker");
     drop(app);
     drop(service);
     drop(state);
+    // Terminal publication can precede the detached HTTP worker dropping its
+    // service clone. Join this fixture's storage worker before deleting files;
+    // never close a sibling fixture's repository or retry directory removal.
+    persistence.shutdown();
+    drop(persistence);
     fs::remove_dir_all(root).expect("remove no-workspace run fixture");
 }
 
