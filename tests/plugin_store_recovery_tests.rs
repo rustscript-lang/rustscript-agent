@@ -1163,13 +1163,13 @@ fn seam_retain_controller_unwind_must_not_commit() {
         .store_lock(&sample_lock("graph-unwind", "artifact-unwind"))
         .expect("store");
     let retention = seam_retention("graph-unwind", "ref-unwind");
+    let pause = persistence.arm_plugin_retain_precommit_pause();
     let worker = thread::spawn({
         let persistence = Arc::clone(&persistence);
         let retention = retention.clone();
         move || PluginControlStore::new(&persistence).retain(&retention)
     });
-    let unwound = catch_unwind(AssertUnwindSafe(|| {
-        let pause = persistence.arm_plugin_retain_precommit_pause();
+    let unwound = catch_unwind(AssertUnwindSafe(move || {
         pause.wait_entered();
         panic!("controller unwind");
     }));
