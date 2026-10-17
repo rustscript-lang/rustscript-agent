@@ -58,6 +58,27 @@ impl PluginControlError {
         )
     }
 
+    fn fixture_aborted() -> Self {
+        Self::new(
+            "plugin_control_fixture_aborted",
+            "plugin control fixture aborted",
+        )
+    }
+
+    fn fixture_timeout() -> Self {
+        Self::new(
+            "plugin_control_fixture_timeout",
+            "plugin control fixture timed out",
+        )
+    }
+
+    fn fixture_closed() -> Self {
+        Self::new(
+            "plugin_control_fixture_closed",
+            "plugin control fixture rendezvous is closed",
+        )
+    }
+
     fn invalid_ref() -> Self {
         Self::new("plugin_ref_invalid", "plugin graph reference is invalid")
     }
@@ -224,15 +245,32 @@ impl<'a> PluginControlStore<'a> {
         expected_generation: u64,
         refs: &[PackageArtifactRef],
     ) -> Result<ActivationPointer, PluginControlError> {
-        let loaded = self.load_lock(graph_id)?;
+        let attempt = self.persistence.begin_plugin_activate_receipt_attempt();
+        let loaded = match self.load_lock(graph_id) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                self.persistence.abort_plugin_control_precommit_gate();
+                return Err(err);
+            }
+        };
         if !same_refs(&refs_of(&loaded.lock), refs) {
+            self.persistence.abort_plugin_control_precommit_gate();
             return Err(PluginControlError::missing_ref());
         }
-        let current = self.activation()?;
+        let current = match self.activation() {
+            Ok(current) => current,
+            Err(err) => {
+                self.persistence.abort_plugin_control_precommit_gate();
+                return Err(err);
+            }
+        };
         if current.generation != expected_generation {
+            self.persistence.abort_plugin_control_precommit_gate();
             return Err(PluginControlError::activation_conflict());
         }
-        self.persistence.enter_plugin_control_precommit_gate();
+        self.persistence
+            .enter_plugin_control_precommit_gate()
+            .map_err(map_storage)?;
         let next = expected_generation.saturating_add(1);
         let now = now_ms();
         let data = self.command(
@@ -246,7 +284,7 @@ impl<'a> PluginControlStore<'a> {
                 "failpoint": self.failpoint(),
             }),
         )?;
-        self.persistence.run_plugin_activate_receipt_hook();
+        attempt.run();
         let pointer = activation_receipt(&data)?;
         if pointer.graph_id != graph_id
             || pointer.generation != next
@@ -290,10 +328,20 @@ impl<'a> PluginControlStore<'a> {
     }
 
     pub fn retain(&self, retention: &GraphRetention) -> Result<bool, PluginControlError> {
-        validate_retention(retention)?;
-        self.load_lock(&retention.graph_id)?;
-        self.persistence.enter_plugin_retain_precommit_pause();
-        self.persistence.enter_plugin_control_precommit_gate();
+        if let Err(err) = validate_retention(retention) {
+            self.persistence.abort_plugin_control_precommit_gate();
+            return Err(err);
+        }
+        if let Err(err) = self.load_lock(&retention.graph_id) {
+            self.persistence.abort_plugin_control_precommit_gate();
+            return Err(err);
+        }
+        self.persistence
+            .enter_plugin_retain_precommit_pause()
+            .map_err(map_storage)?;
+        self.persistence
+            .enter_plugin_control_precommit_gate()
+            .map_err(map_storage)?;
         let data = self.command(
             "plugin.retain",
             &retention_payload(retention, self.failpoint()),
@@ -466,6 +514,15 @@ fn map_storage(err: crate::gateway::store::StorageError) -> PluginControlError {
         "plugin_package_ref_missing" => PluginControlError::missing_ref(),
         "plugin_activation_conflict" => PluginControlError::activation_conflict(),
         "plugin_ref_invalid" => PluginControlError::invalid_ref(),
+        crate::gateway::store::PLUGIN_CONTROL_FIXTURE_ABORTED => {
+            PluginControlError::fixture_aborted()
+        }
+        crate::gateway::store::PLUGIN_CONTROL_FIXTURE_TIMEOUT => {
+            PluginControlError::fixture_timeout()
+        }
+        crate::gateway::store::PLUGIN_CONTROL_FIXTURE_CLOSED => {
+            PluginControlError::fixture_closed()
+        }
         _ => PluginControlError::unavailable(),
     }
 }

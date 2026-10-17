@@ -4,10 +4,13 @@
 //! do not treat a persisted graph id as host-catalog authority.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustscript_agent::plugins::{
     ActivationPointer, COMPILE_ENVIRONMENT, EffectOrigin, GraphLock, GraphRetention, HOST_RUNTIME,
@@ -665,7 +668,7 @@ fn concurrent_distinct_refs_keep_one_live_identity() {
     store
         .store_lock(&sample_lock("graph-slot", "artifact-slot"))
         .expect("store");
-    persistence.arm_plugin_control_precommit_gate(2);
+    let _precommit_gate = persistence.arm_plugin_control_precommit_gate(2);
     let run = |ref_id: &'static str| {
         let persistence = Arc::clone(&persistence);
         thread::spawn(move || {
@@ -729,7 +732,7 @@ fn same_graph_same_generation_activate_has_one_winner() {
     let lock = sample_lock("graph-cas", "artifact-cas");
     store.store_lock(&lock).expect("store");
     let refs = refs_of(&lock);
-    persistence.arm_plugin_control_precommit_gate(2);
+    let _precommit_gate = persistence.arm_plugin_control_precommit_gate(2);
     let spawn = || {
         let persistence = Arc::clone(&persistence);
         let refs = refs.clone();
@@ -890,6 +893,447 @@ pub fn run(context: map) -> map {
     assert!(
         rendered.contains("retain=approval_operation_invalid;activate=approval_operation_invalid;lock=approval_operation_invalid;release=approval_operation_invalid;list_ok=1"),
         "guest host did not deny plugin control ops: {rendered}"
+    );
+    persistence.shutdown();
+}
+
+const SEAM_CHILD_MARKER: &str = "RUSTSCRIPT_PLUGIN_STORE_SEAM_CHILD";
+const SEAM_CHILD_BOUND: Duration = Duration::from_secs(20);
+const SEAM_CHILD_OUTPUT_LIMIT: usize = 64 * 1024;
+
+struct SeamOwnedChild(Option<Child>);
+
+impl SeamOwnedChild {
+    fn wait_before(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            let child = self.0.as_mut().expect("owned seam child");
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.0.take();
+                    return Ok(Some(status));
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    self.kill_and_reap();
+                    return Ok(None);
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    self.kill_and_reap();
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for SeamOwnedChild {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+struct SeamBoundedOutput {
+    bytes: Vec<u8>,
+    discarded: usize,
+}
+
+fn capture_seam_output(mut reader: impl Read) -> std::io::Result<SeamBoundedOutput> {
+    let mut output = SeamBoundedOutput {
+        bytes: Vec::with_capacity(SEAM_CHILD_OUTPUT_LIMIT),
+        discarded: 0,
+    };
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(read) => {
+                let keep = read.min(SEAM_CHILD_OUTPUT_LIMIT.saturating_sub(output.bytes.len()));
+                output.bytes.extend_from_slice(&buffer[..keep]);
+                output.discarded += read - keep;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn seam_child_is_current(test_name: &str) -> bool {
+    let Ok(marker) = std::env::var(SEAM_CHILD_MARKER) else {
+        return false;
+    };
+    let mut parts = marker.splitn(3, ':');
+    let (Some(marked_test), Some(parent_pid), Some(nonce)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if marked_test != test_name
+        || parent_pid.parse::<libc::pid_t>().ok() != Some(unsafe { libc::getppid() })
+        || uuid::Uuid::parse_str(nonce).is_err()
+    {
+        return false;
+    }
+    std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|args| args[0] == "--exact" && args[1] == test_name)
+}
+
+/// Parent returns true after the exact child has passed. The child returns false
+/// and runs the body. A hang is killed and reaped before drain threads are joined.
+fn seam_parent_finished(test_name: &str) -> bool {
+    if seam_child_is_current(test_name) {
+        return false;
+    }
+    let deadline = Instant::now() + SEAM_CHILD_BOUND;
+    let nonce = uuid::Uuid::new_v4();
+    let marker = format!("{test_name}:{}:{nonce}", std::process::id());
+    let mut child = SeamOwnedChild(Some(
+        Command::new(std::env::current_exe().expect("seam test executable"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env_clear()
+            .envs(
+                [
+                    "PATH",
+                    "HOME",
+                    "XDG_CACHE_HOME",
+                    "RUSTC",
+                    "RUSTUP_HOME",
+                    "RUSTUP_TOOLCHAIN",
+                    "CARGO_HOME",
+                    "LD_LIBRARY_PATH",
+                    "CEF_PATH",
+                    "TMPDIR",
+                    "TEMP",
+                    "TMP",
+                    "TEMPDIR",
+                    "TEST_TMPDIR",
+                    "RUSTSCRIPT_AGENT_TEST_TMP",
+                    "RUSTSCRIPT_AGENT_TEST_TMPDIR",
+                ]
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+            )
+            .env("CARGO_TERM_COLOR", "never")
+            .env(SEAM_CHILD_MARKER, marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn exact seam child"),
+    ));
+    let stdout = child
+        .0
+        .as_mut()
+        .expect("owned seam child")
+        .stdout
+        .take()
+        .expect("seam child stdout");
+    let stderr = child
+        .0
+        .as_mut()
+        .expect("owned seam child")
+        .stderr
+        .take()
+        .expect("seam child stderr");
+    let stdout_reader = thread::spawn(move || capture_seam_output(stdout));
+    let stderr_reader = thread::spawn(move || capture_seam_output(stderr));
+    let status = child.wait_before(deadline);
+    let stdout = stdout_reader
+        .join()
+        .expect("seam stdout drain joined")
+        .expect("seam stdout");
+    let stderr = stderr_reader
+        .join()
+        .expect("seam stderr drain joined")
+        .expect("seam stderr");
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    let output = format!("{stdout_text}\n{stderr_text}");
+    let truncated = stdout.discarded + stderr.discarded;
+    let ran_exactly_one = output
+        .lines()
+        .filter(|line| line.trim() == "running 1 test")
+        .count()
+        == 1
+        && output
+            .lines()
+            .filter(|line| line.trim() == format!("test {test_name} ... ok"))
+            .count()
+            == 1
+        && output.lines().any(|line| {
+            line.trim()
+                .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        });
+    let evidence: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains("SEAM_EVIDENCE"))
+        .collect();
+    let status = status.expect("seam child wait");
+    assert!(
+        matches!(status, Some(ref exit) if exit.success()) && ran_exactly_one && truncated == 0,
+        "exact seam child {test_name} failed: status={status:?} ran_exactly_one={ran_exactly_one} truncated={truncated} evidence={evidence:?}"
+    );
+    true
+}
+
+fn seam_note(phase: &str) {
+    eprintln!("SEAM_EVIDENCE phase={phase}");
+    let _ = std::io::stderr().flush();
+}
+
+fn seam_retention(graph_id: &str, ref_id: &str) -> GraphRetention {
+    GraphRetention {
+        graph_id: graph_id.into(),
+        owner_kind: "run".into(),
+        owner_id: "run-seam".into(),
+        ref_id: ref_id.into(),
+    }
+}
+
+#[test]
+fn seam_retain_release_before_entry_still_reaches_command() {
+    let path = db_path("seam-release-before");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-before", "artifact-before"))
+        .expect("store");
+    let retention = seam_retention("graph-before", "ref-before");
+    let pause = persistence.arm_plugin_retain_precommit_pause();
+    pause.release();
+    let worker = thread::spawn({
+        let persistence = Arc::clone(&persistence);
+        let retention = retention.clone();
+        move || PluginControlStore::new(&persistence).retain(&retention)
+    });
+    let committed = worker
+        .join()
+        .expect("retain thread")
+        .expect("release before entry");
+    assert!(!committed, "first retain is not idempotent");
+    pause.wait_entered();
+    assert_eq!(
+        store.retained("graph-before").expect("rows"),
+        vec![retention]
+    );
+    persistence.shutdown();
+}
+
+#[test]
+fn seam_retain_controller_drop_must_not_commit() {
+    let path = db_path("seam-drop");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-drop", "artifact-drop"))
+        .expect("store");
+    let retention = seam_retention("graph-drop", "ref-drop");
+    let pause = persistence.arm_plugin_retain_precommit_pause();
+    let worker = thread::spawn({
+        let persistence = Arc::clone(&persistence);
+        let retention = retention.clone();
+        move || PluginControlStore::new(&persistence).retain(&retention)
+    });
+    pause.wait_entered();
+    drop(pause);
+    let outcome = worker.join().expect("retain thread");
+    let err = outcome.expect_err("controller drop after entered pause must not commit");
+    assert_eq!(code(&err), "plugin_control_fixture_aborted");
+    assert!(store.retained("graph-drop").expect("rows").is_empty());
+    persistence.shutdown();
+}
+
+#[test]
+fn seam_retain_controller_unwind_must_not_commit() {
+    let path = db_path("seam-unwind");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-unwind", "artifact-unwind"))
+        .expect("store");
+    let retention = seam_retention("graph-unwind", "ref-unwind");
+    let worker = thread::spawn({
+        let persistence = Arc::clone(&persistence);
+        let retention = retention.clone();
+        move || PluginControlStore::new(&persistence).retain(&retention)
+    });
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let pause = persistence.arm_plugin_retain_precommit_pause();
+        pause.wait_entered();
+        panic!("controller unwind");
+    }));
+    assert!(unwound.is_err(), "controller panic must unwind");
+    let outcome = worker.join().expect("retain thread");
+    let err = outcome.expect_err("unwinding controller must not commit the paused retain");
+    assert_eq!(code(&err), "plugin_control_fixture_aborted");
+    assert!(store.retained("graph-unwind").expect("rows").is_empty());
+    persistence.shutdown();
+}
+
+#[test]
+fn seam_retain_forgotten_controller_is_bounded_fixture_fault() {
+    if seam_parent_finished("seam_retain_forgotten_controller_is_bounded_fixture_fault") {
+        return;
+    }
+    let path = db_path("seam-forget");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-forget", "artifact-forget"))
+        .expect("store");
+    let retention = seam_retention("graph-forget", "ref-forget");
+    let pause = persistence.arm_plugin_retain_precommit_pause();
+    let worker = thread::spawn({
+        let persistence = Arc::clone(&persistence);
+        let retention = retention.clone();
+        move || PluginControlStore::new(&persistence).retain(&retention)
+    });
+    pause.wait_entered();
+    seam_note("entered");
+    std::mem::forget(pause);
+    let outcome = worker.join().expect("retain thread");
+    let err = outcome.expect_err("forgotten controller must not commit");
+    assert_eq!(code(&err), "plugin_control_fixture_timeout");
+    assert!(store.retained("graph-forget").expect("rows").is_empty());
+    persistence.shutdown();
+}
+
+#[test]
+fn seam_gate_missing_precheck_participant_is_bounded_fixture_fault() {
+    if seam_parent_finished("seam_gate_missing_precheck_participant_is_bounded_fixture_fault") {
+        return;
+    }
+    let path = db_path("seam-missing-gate");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-miss", "artifact-miss"))
+        .expect("store");
+    let retention = seam_retention("graph-miss", "ref-miss");
+    let _precommit_gate = persistence.arm_plugin_control_precommit_gate(2);
+    let pause = persistence.arm_plugin_retain_precommit_pause();
+    let worker = thread::spawn({
+        let persistence = Arc::clone(&persistence);
+        let retention = retention.clone();
+        move || PluginControlStore::new(&persistence).retain(&retention)
+    });
+    pause.wait_entered();
+    seam_note("entered");
+    let missing =
+        PluginControlStore::new(&persistence).retain(&seam_retention("graph-absent", "ref-absent"));
+    assert_eq!(
+        code(&missing.expect_err("missing graph")),
+        "plugin_graph_missing"
+    );
+    seam_note("peer_precheck_failed");
+    pause.release();
+    seam_note("released_toward_gate");
+    let outcome = worker.join().expect("retain thread");
+    let err = outcome.expect_err("missing gate participant must not commit");
+    assert!(
+        code(&err) == "plugin_control_fixture_timeout"
+            || code(&err) == "plugin_control_fixture_aborted",
+        "bounded fixture fault, got {}",
+        code(&err)
+    );
+    assert!(store.retained("graph-miss").expect("rows").is_empty());
+    persistence.disarm_plugin_control_precommit_gate();
+    persistence.shutdown();
+}
+
+#[test]
+fn seam_gate_extra_call_after_completion_does_not_wait() {
+    if seam_parent_finished("seam_gate_extra_call_after_completion_does_not_wait") {
+        return;
+    }
+    let path = db_path("seam-extra");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-extra", "artifact-extra"))
+        .expect("store");
+    let _precommit_gate = persistence.arm_plugin_control_precommit_gate(2);
+    let spawn_ref = |ref_id: &'static str| {
+        let persistence = Arc::clone(&persistence);
+        thread::spawn(move || {
+            PluginControlStore::new(&persistence).retain(&seam_retention("graph-extra", ref_id))
+        })
+    };
+    let left = spawn_ref("ref-left");
+    let right = spawn_ref("ref-right");
+    let left = left.join().expect("left thread");
+    let right = right.join().expect("right thread");
+    assert_eq!([left, right].iter().filter(|item| item.is_ok()).count(), 1);
+    seam_note("first_round_done");
+    let before = store.retained("graph-extra").expect("winner");
+    assert_eq!(before.len(), 1);
+    let pause = persistence.arm_plugin_retain_precommit_pause();
+    let third = spawn_ref("ref-third");
+    pause.wait_entered();
+    seam_note("entered");
+    pause.release();
+    seam_note("released_toward_gate");
+    let outcome = third.join().expect("third thread");
+    let err = outcome.expect_err("completed rendezvous must not start another wait");
+    assert_eq!(code(&err), "plugin_control_fixture_closed");
+    assert_eq!(store.retained("graph-extra").expect("unchanged"), before);
+    persistence.disarm_plugin_control_precommit_gate();
+    persistence.shutdown();
+}
+
+#[test]
+fn seam_activate_precheck_failure_drops_unconsumed_hook() {
+    let path = db_path("seam-hook-precheck");
+    let persistence = Arc::new(open(&path));
+    let captured = Arc::clone(&persistence);
+    persistence.arm_plugin_activate_receipt_hook(move || {
+        let _keep = &captured;
+    });
+    let store = PluginControlStore::new(&persistence);
+    let failed = store
+        .activate("graph-hook-missing", 0, &[])
+        .expect_err("precheck fails before the hook");
+    assert_eq!(code(&failed), "plugin_graph_missing");
+    assert_eq!(
+        Arc::strong_count(&persistence),
+        1,
+        "unconsumed receipt hook retained persistence after precheck failure"
+    );
+    persistence.shutdown();
+}
+
+#[test]
+fn seam_activate_command_failure_drops_unconsumed_hook() {
+    let path = db_path("seam-hook-command");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    let lock = sample_lock("graph-hook-cmd", "artifact-hook-cmd");
+    store.store_lock(&lock).expect("store");
+    let captured = Arc::clone(&persistence);
+    persistence.arm_plugin_activate_receipt_hook(move || {
+        let _keep = &captured;
+    });
+    persistence.inject_fail_plugin_control_partial();
+    let failed = store
+        .activate("graph-hook-cmd", 0, &refs_of(&lock))
+        .expect_err("command fails before the hook is consumed");
+    assert_eq!(code(&failed), "plugin_control_unavailable");
+    assert_eq!(store.activation().expect("no pointer").generation, 0);
+    assert_eq!(
+        Arc::strong_count(&persistence),
+        1,
+        "unconsumed receipt hook retained persistence after command failure"
     );
     persistence.shutdown();
 }
