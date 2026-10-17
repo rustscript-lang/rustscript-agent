@@ -476,7 +476,10 @@ fn scan_dir(
                 let len = file_len(stat)?;
                 account_entry(plan, quota, len)?;
                 let key = (stat_u64(stat.st_dev), stat_u64(stat.st_ino));
-                let slot = plan.inodes.entry(key).or_insert((stat.st_nlink as u64, 0));
+                let slot = plan
+                    .inodes
+                    .entry(key)
+                    .or_insert((stat_u64(stat.st_nlink), 0));
                 slot.1 += 1;
                 plan.entries.push(PlanEntry {
                     rel,
