@@ -654,7 +654,7 @@ impl GatewayPersistence {
     }
 
     /// Cascades one session (messages, runs, events, links, approvals,
-    /// compactions, delivery cursors, idempotency) in one transaction.
+    /// compactions, delivery cursors, idempotency, run graph refs) in one transaction.
     pub fn session_delete(&self, session_id: &str) -> Result<Value, StorageError> {
         self.command_data("session.delete", &json!({ "session_id": session_id }))
     }

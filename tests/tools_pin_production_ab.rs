@@ -627,6 +627,252 @@ async fn production_signed_a_survives_activation_of_b_and_reopen() {
     );
 }
 
+/// Session deletion releases only its own run refs in the original RSS cascade.
+/// Completion alone retains a pin; unrelated sessions, owner kinds and active
+/// deployment each independently protect their graph from collection.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_delete_releases_native_run_refs_without_collecting_other_owners() {
+    use rustscript_agent::plugins::GraphRetention;
+
+    let root = temp_root("session-retention");
+    let signer = signer();
+    let store = Arc::new(PackageStore::open(root.join("packages")).unwrap());
+    for (label, offset) in [("reta", 0), ("retb", 1)] {
+        install_tool(
+            &store,
+            &signer,
+            &root.join(label),
+            &format!("org.rustscript.tools.{label}"),
+            offset,
+        );
+    }
+    let a = resolve_tool(&store, "org.rustscript.tools.reta");
+    let b = resolve_tool(&store, "org.rustscript.tools.retb");
+    let (home, _) = workspace_home(&root);
+    let state = open_gateway(&root.join("state.db"), &home, Arc::clone(&store));
+    let persistence = state.persistence().unwrap();
+    let control = PluginControlStore::new(persistence.as_ref());
+    control.store_lock(&a).unwrap();
+    control.store_lock(&b).unwrap();
+    let active = control
+        .activate(&a.graph_id, 0, &artifact_refs(&a))
+        .unwrap();
+    let provider = ScriptedProvider::new();
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+
+    // Two completed runs in the deleted session, plus a still-live A run in
+    // another session. Every pin is produced by normal Native admission.
+    let mut completed = Vec::<rustscript_agent::AdmittedRun>::new();
+    for call in ["ret-first", "ret-second"] {
+        queue_read(&provider, call);
+        state
+            .service()
+            .inject_provider_host(Arc::new(provider.clone()));
+        let run = state
+            .service()
+            .admit_external_with_workspace_selector(
+                AdmitRunRequest {
+                    session_id: completed.first().map(|run| run.session_id.clone()),
+                    input: json!({"message":"read note"}),
+                    ..Default::default()
+                },
+                Some("name:lifecycle".to_string()),
+            )
+            .await
+            .unwrap();
+        state
+            .service()
+            .clone()
+            .run_worker(run.run_id.clone(), "ignored".to_string())
+            .await;
+        assert!(
+            observed_text(state.service().as_ref(), &run.run_id, &run.session_id)
+                .contains("AB-marker-bytes")
+        );
+        assert_eq!(
+            control.pin_for_run(&run.run_id).unwrap()["graph_id"],
+            a.graph_id
+        );
+        assert!(
+            state
+                .service()
+                .run_events(&run.run_id)
+                .iter()
+                .any(|event| event["event"] == "tool.completed")
+        );
+        completed.push(run);
+    }
+    let live = state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"read note"}),
+                ..Default::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_ne!(live.session_id, completed[0].session_id);
+    let live_receipt = control.pin_for_run(&live.run_id).unwrap();
+    assert_eq!(live_receipt["graph_id"], a.graph_id);
+    assert_eq!(control.retained(&a.graph_id).unwrap().len(), 3);
+
+    // Same owner id, different owner kind: session deletion must preserve it.
+    let checkpoint = GraphRetention {
+        graph_id: a.graph_id.clone(),
+        owner_kind: "checkpoint".to_string(),
+        owner_id: completed[0].run_id.clone(),
+        ref_id: "ret-checkpoint".to_string(),
+    };
+    control.retain(&checkpoint).unwrap();
+    control
+        .activate(&b.graph_id, active.generation, &artifact_refs(&b))
+        .unwrap();
+    assert!(control.collect_unreferenced().unwrap().is_empty());
+    assert!(control.load_lock(&a.graph_id).is_ok());
+
+    persistence
+        .session_delete(&completed[0].session_id)
+        .unwrap();
+    assert_eq!(
+        persistence
+            .session_delete(&completed[0].session_id)
+            .unwrap_err()
+            .code,
+        "session_not_found"
+    );
+    for run in &completed {
+        assert!(
+            persistence.run_get(&run.run_id).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let missing = control.pin_for_run(&run.run_id).unwrap();
+        assert_eq!(missing["pinned"], false, "deleted pin receipt must be gone");
+        assert_eq!(missing["ref_id"], "");
+        assert!(
+            rustscript_agent::plugins::restore_owned_pin(persistence.as_ref(), &store, &run.run_id)
+                .is_err()
+        );
+    }
+    assert!(
+        persistence
+            .message_list(&completed[0].session_id, 0)
+            .unwrap()["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let after_first_delete = control.retained(&a.graph_id).unwrap();
+    assert!(after_first_delete.contains(&checkpoint));
+    assert_eq!(control.pin_for_run(&live.run_id).unwrap(), live_receipt);
+    assert!(control.collect_unreferenced().unwrap().is_empty());
+
+    // Isolate the other session's run as the only legitimate A owner. It can
+    // still execute the original A after B activation and the first deletion.
+    control.release(&checkpoint).unwrap();
+    assert!(control.collect_unreferenced().unwrap().is_empty());
+    queue_read(&provider, "ret-live");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    state
+        .service()
+        .clone()
+        .run_worker(live.run_id.clone(), "ignored".to_string())
+        .await;
+    let live_observed = observed_text(state.service().as_ref(), &live.run_id, &live.session_id);
+    assert!(
+        live_observed.contains("AB-marker-bytes"),
+        "live A result: {live_observed}"
+    );
+    assert_eq!(control.pin_for_run(&live.run_id).unwrap(), live_receipt);
+
+    // Independently isolate the other owner kind, with no surviving A run.
+    control.retain(&checkpoint).unwrap();
+    persistence.session_delete(&live.session_id).unwrap();
+    assert_eq!(control.pin_for_run(&live.run_id).unwrap()["pinned"], false);
+    assert!(control.retained(&a.graph_id).unwrap().contains(&checkpoint));
+    assert!(control.collect_unreferenced().unwrap().is_empty());
+    control.release(&checkpoint).unwrap();
+    let collected = control.collect_unreferenced().unwrap();
+    assert_eq!(
+        collected,
+        vec![a.graph_id.clone()],
+        "RET-A-001: deleted sessions must no longer pin old A"
+    );
+    assert!(control.load_lock(&a.graph_id).is_err());
+    assert!(control.retained(&a.graph_id).unwrap().is_empty());
+    assert_eq!(
+        after_first_delete.len(),
+        2,
+        "only live A run and checkpoint may survive the first deletion"
+    );
+    assert_eq!(
+        control.load_lock(&b.graph_id).unwrap().lock.graph_id,
+        b.graph_id
+    );
+    assert_eq!(control.activation().unwrap().graph_id, b.graph_id);
+    assert!(
+        control.retained(&b.graph_id).unwrap().is_empty(),
+        "active B alone protects its lock"
+    );
+
+    // B remains executable after A has actually been collected.
+    queue_read(&provider, "ret-b");
+    state
+        .service()
+        .inject_provider_host(Arc::new(provider.clone()));
+    let run_b = state
+        .service()
+        .admit_external_with_workspace_selector(
+            AdmitRunRequest {
+                input: json!({"message":"read note"}),
+                ..Default::default()
+            },
+            Some("name:lifecycle".to_string()),
+        )
+        .await
+        .unwrap();
+    state
+        .service()
+        .clone()
+        .run_worker(run_b.run_id.clone(), "ignored".to_string())
+        .await;
+    let result_b = observed_text(state.service().as_ref(), &run_b.run_id, &run_b.session_id);
+    assert!(result_b.contains("B-marker-bytes"));
+    assert!(!result_b.contains("AB-marker-bytes"));
+
+    // Empty sessions have neither Native receipts nor refs. The session row
+    // result, not either preceding delete result, determines existence.
+    persistence
+        .session_create(&json!({
+            "id":"ret-empty", "profile":"default", "platform":"test",
+            "account_id":"empty", "chat_id":"empty", "thread_id":"", "user_id":"",
+            "generation":1, "system_prompt":"", "model":"test", "provider":"test",
+            "toolset_hash":"", "metadata_json":"{}", "title":"", "end_reason":"", "now_ms":1,
+        }))
+        .unwrap();
+    persistence
+        .session_delete("ret-empty")
+        .expect("empty existing session must delete successfully");
+    assert_eq!(
+        persistence.session_delete("ret-empty").unwrap_err().code,
+        "session_not_found"
+    );
+    assert_eq!(
+        control.pin_for_run(&run_b.run_id).unwrap()["graph_id"],
+        b.graph_id
+    );
+    println!(
+        "RET_A_001 collected_old_a=true completed_runs=2 other_session_executed_a=true checkpoint_preserved=true active_b_executed=true deleted_receipts_absent=true empty_session_delete=true"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn http_signed_graphs_ignore_request_graph_and_differ() {
     let root = temp_root("http");

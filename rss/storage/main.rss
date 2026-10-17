@@ -357,7 +357,7 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, admission::storage_admission_replay(db_id, command.payload_json));
     } else if command.op == "session.delete" {
         let delete_results: array = sessions::storage_session_delete(db_id, command.payload_json);
-        if storage_nth_rows_affected(delete_results, 1) == 0 {
+        if storage_nth_rows_affected(delete_results, 2) == 0 {
             result = storage_error(request_id, op, "session_not_found", "session does not exist");
         } else {
             result = storage_array_ok(request_id, op, delete_results);
