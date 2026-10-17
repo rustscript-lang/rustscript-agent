@@ -56,6 +56,16 @@ pub trait DurableToolLifecycle: Send + Sync {
         call_id: &str,
         tool_name: &str,
     ) -> Result<(), LifecycleError>;
+    /// Original Native parent arguments, independent of the bridge request.
+    /// Embedders that invoke retained programs directly must supply these facts.
+    fn parent_arguments(
+        &self,
+        _run_id: &str,
+        _call_id: &str,
+        _tool_name: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        Ok(None)
+    }
     fn replay_result(
         &self,
         run_id: &str,
@@ -480,6 +490,25 @@ impl CapabilityLifecycle {
     /// Frozen workspace path captured at admission.
     pub fn workspace(&self) -> &Path {
         &self.inner.workspace
+    }
+
+    /// Registry identity captured when this lifecycle was admitted.
+    pub fn registry_identity(&self) -> &str {
+        &self.inner.registry_identity
+    }
+
+    pub(crate) fn parent_arguments(
+        &self,
+        owner: &CapabilityOwner,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        if owner != &self.inner.owner {
+            return Err(LifecycleError::MissingParent);
+        }
+        self.inner
+            .durable
+            .parent_arguments(owner.run(), call_id, tool_name)
     }
 
     /// Monotonic milliseconds from the admitted clock. Callers cannot forge

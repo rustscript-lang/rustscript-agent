@@ -267,6 +267,9 @@ impl AgentGatewayState {
             CompactionSettings::default(),
         ));
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(std::path::Path::new(":memory:"))
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -307,6 +310,9 @@ impl AgentGatewayState {
         ));
         service.install_agent_entry(path);
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(std::path::Path::new(":memory:"))
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -391,6 +397,9 @@ impl AgentGatewayState {
             CompactionSettings::default(),
         ));
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(path.as_ref())
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -462,6 +471,11 @@ impl AgentGatewayState {
             service.install_agent_entry(entry);
         }
         service.install_agent_runner(runner);
+        service
+            .install_native_tool_runtime(
+                sqlite_path.unwrap_or_else(|| std::path::Path::new(":memory:")),
+            )
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         Ok(Self {
             config: Arc::clone(service.config()),
             store,
@@ -499,6 +513,11 @@ impl AgentGatewayState {
             compaction_settings,
         ));
         service.install_bundled_agent_entry(key)?;
+        service
+            .install_native_tool_runtime(
+                sqlite_path.unwrap_or_else(|| std::path::Path::new(":memory:")),
+            )
+            .map_err(|error| format!("compile embedded tool runtime: {error}"))?;
         let hash = service
             .installed_runner_snapshot_digest()
             .ok_or_else(|| "native bundled agent source could not be compiled".to_string())?;

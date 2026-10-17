@@ -504,6 +504,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, plugins::storage_plugin_retention_get(db_id, command.payload_json));
     } else if command.op == "plugin.release" {
         result = storage_unwrap(request_id, op, plugins::storage_plugin_release(db_id, command.payload_json));
+    } else if command.op == "plugin.pin_for_owner" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_pin_for_owner(db_id, command.payload_json));
     } else if command.op == "plugin.collect" {
         result = storage_unwrap(request_id, op, plugins::storage_plugin_collect(db_id, command.payload_json));
     }

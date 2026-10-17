@@ -17,6 +17,7 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 
 use super::error::{PluginError, PluginErrorKind};
 use super::manifest::{PluginManifest, parse_plugin_manifest, safe_relative};
+use super::resolve::GraphLock;
 
 const SIGNATURE_FILE: &str = "signature.ed25519";
 const MAX_CAPTURE_FILE: usize = 1024 * 1024;
@@ -40,6 +41,9 @@ pub struct InstallAuthorization {
 pub enum PackageTrust {
     AcceptedPublisher,
     DevUnsigned,
+    /// Closed catalog bytes installed by the trusted embedder, not a signature
+    /// or a dev-unsigned bypass.
+    EmbeddingOwnedBuiltin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +88,8 @@ pub struct PackageStore {
     ledger: OwnedFd,
     policy: Mutex<Option<InstallAuthorization>>,
     verified: Mutex<Option<Vec<InstalledPackage>>>,
+    // One immutable compiled graph; no VM, owner, grant, or mutable registry.
+    pub(super) prepared: Mutex<Option<(GraphLock, super::prepare::PreparedGraph)>>,
 }
 
 impl PackageStore {
@@ -102,12 +108,15 @@ impl PackageStore {
             ledger,
             policy: Mutex::new(None),
             verified: Mutex::new(None),
+            prepared: Mutex::new(None),
         })
     }
 
     pub fn bind_policy(&self, auth: &InstallAuthorization) {
         let mut policy = self.policy.lock().unwrap_or_else(|err| err.into_inner());
         *policy = Some(auth.clone());
+        drop(policy);
+        self.forget_verified();
     }
 
     pub fn signature_payload(&self, package: &Path) -> Result<Vec<u8>, PluginError> {
@@ -160,6 +169,49 @@ impl PackageStore {
         })
     }
 
+    /// Installs the closed embedded tool catalog as an immutable builtin.
+    /// A signature or dev-unsigned space is not accepted for these bytes.
+    pub fn install_embedding_owned(&self) -> Result<PackageRevision, PluginError> {
+        let files = crate::runtime::native_tools::embedding_package_files()
+            .map_err(|message| PluginError::new(PluginErrorKind::CompileFailed, message))?;
+        let manifest_bytes = files
+            .get("manifest.yaml")
+            .ok_or_else(|| PluginError::new(PluginErrorKind::UnknownField, "manifest.yaml"))?;
+        let manifest = parse_plugin_manifest(
+            std::str::from_utf8(manifest_bytes)
+                .map_err(|_| PluginError::new(PluginErrorKind::UnknownField, "manifest"))?,
+        )?;
+        if manifest.id != crate::runtime::native_tools::EMBEDDING_PACKAGE_ID {
+            return Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "embedding package",
+            ));
+        }
+        let payload = payload_bytes(&files);
+        let artifact_id = payload_artifact_id(&payload);
+        if let Some(existing) = self.find_version(&manifest.id, &manifest.version)? {
+            if existing == artifact_id {
+                return self.revision_from_capture(&artifact_id);
+            }
+            return Err(PluginError::new(
+                PluginErrorKind::VersionOverwrite,
+                format!("{} {}", manifest.id, manifest.version),
+            ));
+        }
+        self.write_artifact(
+            &artifact_id,
+            &files,
+            PackageTrust::EmbeddingOwnedBuiltin,
+            &manifest.publisher,
+            &payload,
+        )?;
+        Ok(PackageRevision {
+            artifact_id,
+            trust: PackageTrust::EmbeddingOwnedBuiltin,
+            manifest,
+        })
+    }
+
     pub fn load_installed(&self) -> Result<Vec<InstalledPackage>, PluginError> {
         reject_symlink_path(&self.root.join("artifacts"))?;
         reject_symlink_path(&self.root.join("ledger"))?;
@@ -190,12 +242,27 @@ impl PackageStore {
             return Ok(packages.clone());
         }
         drop(cached);
-        self.load_installed()
+        let mut packages = Vec::with_capacity(required.len());
+        for (id, artifact_id) in required {
+            let installed = self.read_installed(artifact_id)?;
+            if installed.manifest.id != *id || installed.artifact_id != *artifact_id {
+                return Err(PluginError::new(
+                    PluginErrorKind::PathEscape,
+                    "captured artifact identity",
+                ));
+            }
+            packages.push(installed);
+        }
+        Ok(packages)
     }
 
     fn forget_verified(&self) {
         let mut verified = self.verified.lock().unwrap_or_else(|err| err.into_inner());
         *verified = None;
+        *self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     fn find_version(&self, id: &str, version: &str) -> Result<Option<String>, PluginError> {
@@ -441,6 +508,17 @@ fn revalidate(
     payload: &[u8],
     recorded: PackageTrust,
 ) -> Result<PackageTrust, PluginError> {
+    if recorded == PackageTrust::EmbeddingOwnedBuiltin {
+        if signature.is_some() || !crate::runtime::native_tools::embedding_payload_matches(payload)
+        {
+            return Err(PluginError::new(
+                PluginErrorKind::PublisherUnauthorized,
+                "embedding payload",
+            ));
+        }
+        let _ = auth;
+        return Ok(PackageTrust::EmbeddingOwnedBuiltin);
+    }
     if let Some(signature) = signature {
         let trust = verify_signature(auth, &manifest.publisher, signature, payload)?;
         if recorded != PackageTrust::AcceptedPublisher {
@@ -481,6 +559,10 @@ fn verify_signature(
         .verify(payload, signature)
         .map_err(|_| PluginError::new(PluginErrorKind::PublisherUnauthorized, "signature"))?;
     Ok(PackageTrust::AcceptedPublisher)
+}
+
+pub(crate) fn embedding_payload_bytes(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    payload_bytes(files)
 }
 
 fn payload_bytes(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
@@ -642,6 +724,7 @@ fn encode_ledger(trust: PackageTrust, publisher: &str, payload: &[u8]) -> Vec<u8
     let trust_text = match trust {
         PackageTrust::AcceptedPublisher => "accepted-publisher",
         PackageTrust::DevUnsigned => "dev-unsigned",
+        PackageTrust::EmbeddingOwnedBuiltin => "embedding-owned-builtin",
     };
     let mut bytes = format!(
         "v1\ntrust={trust_text}\npublisher={publisher}\npayload_len={}\n",
@@ -687,6 +770,7 @@ fn decode_ledger(bytes: &[u8]) -> Result<LedgerRecord, PluginError> {
     let trust = match lines.next() {
         Some("trust=accepted-publisher") => PackageTrust::AcceptedPublisher,
         Some("trust=dev-unsigned") => PackageTrust::DevUnsigned,
+        Some("trust=embedding-owned-builtin") => PackageTrust::EmbeddingOwnedBuiltin,
         _ => {
             return Err(PluginError::new(
                 PluginErrorKind::PublisherUnauthorized,

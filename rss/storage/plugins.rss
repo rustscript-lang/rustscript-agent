@@ -126,6 +126,10 @@ struct PluginRetainInput {
     failpoint: string,
 }
 
+struct PluginOwnerInput {
+    owner_id: string,
+}
+
 struct PluginFailpointInput {
     failpoint: string,
 }
@@ -336,6 +340,11 @@ pub fn storage_plugin_release(db_id: resource<sqlite.connection>, payload_json: 
     result
 }
 
+pub fn storage_plugin_pin_for_owner(db_id: resource<sqlite.connection>, payload_json: string) -> map {
+    let input: PluginOwnerInput = json::decode::<PluginOwnerInput>(payload_json);
+    ok_value(storage_pin_by_owner(db_id, input.owner_id.copy()))
+}
+
 pub fn storage_plugin_collect(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: PluginFailpointInput = json::decode::<PluginFailpointInput>(payload_json);
     let before: SqliteQueryResult = sqlite::query(&db_id, "SELECT graph_id FROM plugin_graph_locks WHERE graph_id NOT IN (SELECT graph_id FROM plugin_activation) AND graph_id NOT IN (SELECT graph_id FROM plugin_graph_refs) ORDER BY graph_id", [], plugin_limits());
@@ -363,4 +372,79 @@ pub fn storage_plugin_collect(db_id: resource<sqlite.connection>, payload_json: 
     let listed = query_map(before);
     let _used = transaction_result;
     ok_value(listed)
+}
+
+pub fn storage_admission_pin_statements(graph_id: string, generation: int, ref_id: string, run_id: string, session_id: string, now_ms: int) -> array<SqliteStatement> {
+    [
+        {
+            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM plugin_activation WHERE graph_id = ? AND generation = ?) OR NOT EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ?)",
+            params: [sql_text(graph_id.copy()), sql_int(generation.copy()), sql_text(graph_id.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "INSERT INTO plugin_graph_refs (graph_id, owner_kind, owner_id, ref_id, retained_at_ms) SELECT ?, 'run', ?, ?, ? WHERE EXISTS (SELECT 1 FROM plugin_activation WHERE graph_id = ? AND generation = ?) AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND session_id = ?) AND NOT EXISTS (SELECT 1 FROM plugin_graph_refs existing WHERE existing.owner_kind = 'run' AND existing.owner_id = ? AND (existing.graph_id <> ? OR existing.ref_id <> ?))",
+            params: [sql_text(graph_id.copy()), sql_text(run_id.copy()), sql_text(ref_id.copy()), sql_int(now_ms.copy()), sql_text(graph_id.copy()), sql_int(generation.copy()), sql_text(run_id.copy()), sql_text(session_id.copy()), sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "INSERT INTO plugin_control_guard (id) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM plugin_graph_refs WHERE owner_kind = 'run' AND owner_id = ? AND graph_id = ? AND ref_id = ?)",
+            params: [sql_text(run_id.copy()), sql_text(graph_id.copy()), sql_text(ref_id.copy())],
+            query: false,
+            limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT refs.graph_id, refs.ref_id, activation.generation FROM plugin_graph_refs refs JOIN plugin_activation activation ON activation.graph_id = refs.graph_id AND activation.generation = ? WHERE refs.owner_kind = 'run' AND refs.owner_id = ? AND refs.ref_id = ?",
+            params: [sql_int(generation.copy()), sql_text(run_id.copy()), sql_text(ref_id.copy())],
+            query: true,
+            limits: plugin_limits(),
+        }
+    ]
+}
+
+pub fn storage_pin_text(entry: SqliteTransactionResult, column: int) -> string {
+    plugin_query_text(entry, column)
+}
+
+pub fn storage_pin_int(entry: SqliteTransactionResult, column: int) -> int {
+    plugin_query_int(entry, column)
+}
+
+pub fn storage_pin_by_owner(db_id: resource<sqlite.connection>, owner_id: string) -> map {
+    let queried: SqliteQueryResult = sqlite::query(&db_id, "SELECT COALESCE(json_extract(idem.response_json, '$.tool_graph_id'), ''), COALESCE(json_extract(idem.response_json, '$.tool_ref_id'), ''), COALESCE(CAST(json_extract(idem.response_json, '$.tool_generation') AS INTEGER), 0), idem.resource_id, COALESCE((SELECT session_id FROM runs WHERE id = idem.resource_id), ''), COALESCE(json_extract(idem.response_json, '$.registry_identity'), ''), COALESCE(json_extract(idem.response_json, '$.workspace'), ''), COALESCE(json_extract(idem.response_json, '$.profile'), '') FROM idempotency_records idem JOIN runs original ON original.id = idem.resource_id WHERE idem.resource_id = ? AND ((original.idempotency_key <> '' AND idem.scope = original.idempotency_scope AND idem.key = original.idempotency_key) OR (original.idempotency_key = '' AND idem.scope = 'native.tool-pin' AND idem.key = original.id)) AND EXISTS (SELECT 1 FROM plugin_graph_refs refs WHERE refs.graph_id = json_extract(idem.response_json, '$.tool_graph_id') AND refs.owner_kind = 'run' AND refs.owner_id = idem.resource_id AND refs.ref_id = json_extract(idem.response_json, '$.tool_ref_id'))", [sql_text(owner_id.copy())], plugin_limits());
+    let mut graph_id: string = "";
+    let mut ref_id: string = "";
+    let mut generation: int = 0;
+    let mut run_id: string = "";
+    let mut session_id: string = "";
+    let mut registry_identity: string = "";
+    let mut workspace: string = "";
+    let mut profile: string = "";
+    let mut pinned: bool = false;
+    let rows = queried.rows.copy();
+    if rows.length == 1 {
+        let row: SqliteRow = rows[0].copy();
+        let cells: array<SqliteValue> = row.cells.copy();
+        graph_id = cells[0].text_value;
+        ref_id = cells[1].text_value;
+        generation = cells[2].int_value;
+        run_id = cells[3].text_value;
+        session_id = cells[4].text_value;
+        registry_identity = cells[5].text_value;
+        workspace = cells[6].text_value;
+        profile = cells[7].text_value;
+        pinned = graph_id.copy() != "" && ref_id.copy() != "";
+    }
+    {
+        graph_id: graph_id,
+        ref_id: ref_id,
+        generation: generation,
+        run_id: run_id,
+        session_id: session_id,
+        registry_identity: registry_identity,
+        workspace: workspace,
+        profile: profile,
+        pinned: pinned
+    }
 }

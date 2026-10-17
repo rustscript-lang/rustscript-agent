@@ -94,6 +94,8 @@ impl std::fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
+type AdmissionPrecommitHook = Box<dyn FnOnce(&Value) + Send>;
+
 pub struct GatewayPersistence {
     worker: StorageWorker,
     max_events: i64,
@@ -112,6 +114,7 @@ pub struct GatewayPersistence {
     plugin_control_precommit_gate: Mutex<Option<Arc<PluginControlGate>>>,
     plugin_retain_precommit_pause: Mutex<Option<Arc<PluginRetainPause>>>,
     plugin_activate_receipt_hook: Mutex<Option<PluginActivateReceiptHook>>,
+    admission_precommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
 }
 
 /// Blocks the next storage command until [`PersistBlockGuard::release`].
@@ -448,6 +451,7 @@ impl GatewayPersistence {
             plugin_control_precommit_gate: Mutex::new(None),
             plugin_retain_precommit_pause: Mutex::new(None),
             plugin_activate_receipt_hook: Mutex::new(None),
+            admission_precommit_hook: Mutex::new(None),
         })
     }
 
@@ -558,6 +562,7 @@ impl GatewayPersistence {
             "plugin.retain",
             "plugin.retention_get",
             "plugin.release",
+            "plugin.pin_for_owner",
             "plugin.collect",
         ];
         if !OPS.contains(&op) {
@@ -578,7 +583,24 @@ impl GatewayPersistence {
     /// retention floor commit in a single transaction. The returned data
     /// carries `replayed`, `run`, `session`, `message`, and `idempotency`.
     pub fn admission_create(&self, payload: &Value) -> Result<Value, StorageError> {
+        let hook = self
+            .admission_precommit_hook
+            .lock()
+            .expect("admission hook")
+            .take();
+        if let Some(hook) = hook {
+            hook(payload);
+        }
         self.command_data("admission.create", payload)
+    }
+
+    /// Fixture-only Native seam after preparation and before the original
+    /// guarded transaction. No effect grants or storage authority are exposed.
+    pub fn inject_admission_precommit_hook(&self, hook: impl FnOnce(&Value) + Send + 'static) {
+        *self
+            .admission_precommit_hook
+            .lock()
+            .expect("admission hook") = Some(Box::new(hook));
     }
 
     /// Reads one durable admission identity without mutating repository state.
@@ -1533,6 +1555,10 @@ impl GatewayStore {
 
         let mut idempotency = HashMap::new();
         for row in idempotency_rows {
+            if string_cell(&row, 0, "idempotency scope")? == "native.tool-pin" {
+                // Internal original receipts are not caller idempotency keys.
+                continue;
+            }
             let key = string_cell(&row, 1, "idempotency key")?;
             let state = string_cell(&row, 5, "idempotency state")?;
             if state == "completed" {

@@ -222,6 +222,37 @@ named_struct!(
 );
 
 named_struct!(
+    PinnedToolInvokeRequest,
+    "PinnedToolInvokeRequest",
+    [
+        ("tool_name", HostTypeSchema::String),
+        ("call_id", HostTypeSchema::String),
+        ("canonical_arguments", HostTypeSchema::String),
+        ("canonical_input", HostTypeSchema::String),
+        ("run_id", HostTypeSchema::String),
+        ("registry_identity", HostTypeSchema::String),
+        ("argument_digest", HostTypeSchema::String),
+        ("risk_class", HostTypeSchema::String),
+        ("summary", HostTypeSchema::String),
+        ("untrusted_graph_id", HostTypeSchema::String)
+    ]
+);
+
+named_struct!(
+    PinnedToolInvokeResult,
+    "PinnedToolInvokeResult",
+    [
+        ("ok", HostTypeSchema::Bool),
+        ("text", HostTypeSchema::String),
+        ("content", HostTypeSchema::String),
+        ("kind", HostTypeSchema::String),
+        ("code", HostTypeSchema::String),
+        ("message", HostTypeSchema::String),
+        ("canonical_result", HostTypeSchema::String)
+    ]
+);
+
+named_struct!(
     AgentFsReadResult,
     "AgentFsReadResult",
     [

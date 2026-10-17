@@ -360,6 +360,10 @@ impl<'a> PluginControlStore<'a> {
         Ok(())
     }
 
+    pub fn pin_for_run(&self, owner_id: &str) -> Result<Value, PluginControlError> {
+        self.command("plugin.pin_for_owner", &json!({ "owner_id": owner_id }))
+    }
+
     pub fn collect_unreferenced(&self) -> Result<Vec<String>, PluginControlError> {
         let data = self.command("plugin.collect", &json!({ "failpoint": self.failpoint() }))?;
         let mut collected = Vec::new();

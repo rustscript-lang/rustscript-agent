@@ -872,6 +872,19 @@ pub fn run(context: map) -> map {
         })
         .await
         .expect("admit");
+    let persistence = state.persistence().expect("sqlite persistence");
+    let store = PluginControlStore::new(persistence.as_ref());
+    let locks_before = store.list_locks().expect("Native admission locks");
+    let active_before = store.activation().expect("Native admission activation");
+    let history_before = store
+        .activation_history()
+        .expect("Native admission history");
+    assert_eq!(
+        locks_before.len(),
+        1,
+        "Native default bootstrap owns one graph"
+    );
+    assert_eq!(active_before.generation, 1);
     Arc::clone(&service)
         .run_worker(admitted.run_id.clone(), "ignored".to_string())
         .await;
@@ -880,11 +893,9 @@ pub fn run(context: map) -> map {
         0,
         "plugin control must not reach the fake provider"
     );
-    let persistence = state.persistence().expect("sqlite persistence");
-    let store = PluginControlStore::new(persistence.as_ref());
-    assert!(store.list_locks().expect("locks").is_empty());
-    assert_eq!(store.activation().expect("activation").generation, 0);
-    assert!(store.activation_history().expect("history").is_empty());
+    assert_eq!(store.list_locks().expect("locks"), locks_before);
+    assert_eq!(store.activation().expect("activation"), active_before);
+    assert_eq!(store.activation_history().expect("history"), history_before);
     assert!(store.retained("graph-guest").expect("refs").is_empty());
     let messages = persistence
         .message_list(&admitted.session_id, 0)

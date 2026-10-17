@@ -42,8 +42,8 @@ use super::closed_bundle;
 use super::host_wait::wait_for_host_op_blocking_with_cancel;
 
 use super::agent_host::{
-    AgentHostBridges, AgentHostState, AgentProviderHost, AuthHostFactory, agent_host_catalog,
-    agent_host_module, register_agent_host_functions,
+    AgentHostBridges, AgentHostState, AgentProviderHost, AuthHostFactory, ExpectedCallGrant,
+    agent_host_catalog, agent_host_module, register_agent_host_functions,
 };
 use crate::auth::host::AuthHost;
 use crate::capabilities::sha256_hex;
@@ -914,6 +914,7 @@ pub struct AgentRunner {
     /// the requested logical export, and the exact root callable. `None` for
     /// legacy `from_source`/`from_file` runners.
     bundled_origin: Option<BundledOrigin>,
+    expected_call: Option<ExpectedCallGrant>,
 }
 
 struct NativeAuthBinding {
@@ -1127,6 +1128,7 @@ impl AgentRunner {
             prepare_fault: RunnerPrepareFault::None,
             snapshot_digest,
             bundled_origin,
+            expected_call: None,
         })
     }
 
@@ -1435,6 +1437,10 @@ impl AgentRunner {
             artifacts: self.host.artifacts.clone(),
             leases: Arc::new(Mutex::new(HashMap::new())),
             control_hook: self.host.control_hook.clone(),
+            pinned_tool: self.host.pinned_tool.clone(),
+            allow_stateless_pin: self.host.allow_stateless_pin,
+            expected_call: self.expected_call.clone(),
+            provider_arguments: Default::default(),
         });
         let auth_binding = if let Some(factory) = &self.host.auth_host_factory {
             let cancellation = cancellation
@@ -1628,6 +1634,56 @@ impl AgentRunner {
     }
 }
 
+/// Pure compiler-lowered conversions. They are not recorded as host imports,
+/// but the capability profile still checks them. Effect builtins stay denied
+/// unless the captured program imported them.
+const PINNED_PURE_BUILTINS: &[&str] = &[
+    "json::encode",
+    "json::decode",
+    "bytes::to_utf8",
+    "bytes::to_utf8_lossy",
+    "bytes::to_array_u8",
+    "bytes::from_utf8",
+];
+
+/// A fresh child registry uses only tool adapters from the original compile
+/// catalog. It never constructs then discards the full harness registry.
+fn build_pinned_registry(allowed: &[String]) -> std::result::Result<HostFunctionRegistry, VmError> {
+    let catalog = agent_host_catalog();
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    super::agent_host::retained_tool_host_module()
+        .install_from_catalog(&mut registry, catalog.as_ref())?;
+    if allowed.iter().any(|name| name.starts_with("http::")) {
+        register_http_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    }
+    if allowed.iter().any(|name| name == "stream::emit") {
+        for module in standard_host_modules() {
+            if module.name == "context" {
+                HostModuleDescriptor {
+                    name: "context",
+                    functions: module.owned,
+                    resources: &[],
+                }
+                .install_from_catalog(&mut registry, catalog.as_ref())?;
+            }
+        }
+    }
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+    for name in allowed
+        .iter()
+        .map(String::as_str)
+        .chain(PINNED_PURE_BUILTINS.iter().copied())
+    {
+        if registry.contains_name(name) {
+            registry.authorize_registered_builtin_import(name);
+        } else {
+            registry.allow_builtin(name)?;
+        }
+    }
+    Ok(registry)
+}
+
 /// Binds the restricted capability registry: JSON, bytes conversion, the
 /// invocation stream emit builtin, generic SQLite, the HTTP client, and the
 /// bounded agent provider/tool host bridges. Ambient runtime input/emit
@@ -1794,6 +1850,36 @@ impl RunEventSink for DiscardSink {
     fn deliver(&mut self, _value: Value) -> std::result::Result<(), RunDeliveryError> {
         Ok(())
     }
+}
+
+/// Runs one retained tool program on a child cancellation of the caller's run.
+/// The child shares the original deadline and cancel flag and owns only its watcher.
+pub(crate) fn invoke_retained_tool(
+    program: rustscript_vm::Program,
+    entry: &str,
+    mut host: AgentHostBridges,
+    context: Value,
+    cancellation: &RunCancellation,
+    authorized_imports: &[String],
+    expected_call: Option<ExpectedCallGrant>,
+) -> std::result::Result<Value, String> {
+    let child = cancellation.child();
+    host.cancellation = Some(child.clone());
+    host.pinned_tool = None;
+    let registry = build_pinned_registry(authorized_imports).map_err(|error| error.to_string())?;
+    let runner = AgentRunner {
+        program,
+        config: AgentConfig::default(),
+        registry: Arc::new(registry),
+        host,
+        prepare_fault: RunnerPrepareFault::None,
+        snapshot_digest: "pinned-tool".to_string(),
+        bundled_origin: None,
+        expected_call,
+    };
+    runner
+        .run_named_with_context_and_events(entry, context, &mut DiscardSink, &child)
+        .map_err(|error| error.to_string())
 }
 
 fn adapter_fail(code: &str, message: &str) -> serde_json::Value {

@@ -343,6 +343,21 @@ fn route(name: string, context: map) -> map {
     result
 }
 
+/// Native-selected embedded entry. The original harness has already resolved
+/// its frozen descriptor and approval facts. Native rebuilds this prepare map
+/// from the original parent and binds it to the child's one-call grant.
+pub fn invoke_prepared(input: map) -> map {
+    let call: map = call_from_input(input);
+    let name: string = call_name(call);
+    let mut context: map = types::map_map(input, "prepared_context");
+    let mut config: map = types::map_map(context, "config");
+    if config.has("max_output_bytes") == false {
+        config.max_output_bytes = map_int(config, "max_tool_output_bytes", 65536);
+    }
+    context.config = config;
+    envelope(call, route(name, context), false)
+}
+
 pub fn dispatch(input: map) -> map {
     let call: map = call_from_input(input);
     let name: string = call_name(call);

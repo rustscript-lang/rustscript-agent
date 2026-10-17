@@ -680,6 +680,7 @@ fn loop_host_with(
         filesystem: Some(filesystem),
         processes: Some(processes),
         artifacts: Some(artifacts),
+        allow_stateless_pin: true,
         ..AgentHostBridges::default()
     }
 }

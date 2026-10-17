@@ -19,11 +19,24 @@ use super::store::{InstalledPackage, PackageStore, PackageTrust};
 
 const VIRTUAL_ROOT: &str = "/__rustscript_agent_plugin_rss__";
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct PreparedGraph {
     sources: BTreeMap<(String, String), Vec<u8>>,
     callables: BTreeMap<String, String>,
+    exports: BTreeMap<String, String>,
     trust: BTreeMap<String, PackageTrust>,
+    programs: BTreeMap<String, Arc<rustscript_vm::Program>>,
+}
+
+impl std::fmt::Debug for PreparedGraph {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedGraph")
+            .field("callables", &self.callables)
+            .field("trust", &self.trust)
+            .field("programs", &self.programs.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl PreparedGraph {
@@ -37,8 +50,19 @@ impl PreparedGraph {
         self.callables.get(package_id).map(String::as_str)
     }
 
+    /// Export name from the captured package manifest, not a later store read.
+    pub fn export_name(&self, package_id: &str) -> Option<&str> {
+        self.exports.get(package_id).map(String::as_str)
+    }
+
     pub fn trust(&self, package_id: &str) -> Option<PackageTrust> {
         self.trust.get(package_id).copied()
+    }
+
+    /// Callable program compiled from the captured bytes. The graph id is not
+    /// a substitute for this program.
+    pub fn program(&self, package_id: &str) -> Option<Arc<rustscript_vm::Program>> {
+        self.programs.get(package_id).cloned()
     }
 }
 
@@ -56,6 +80,15 @@ impl PackageStore {
                 PluginErrorKind::ContractIncompatible,
                 "compile environment",
             ));
+        }
+        if let Some((cached_lock, prepared)) = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            && cached_lock == lock
+        {
+            return Ok(prepared.clone());
         }
         // One verified capture. Compilation uses these bytes and does not re-read the store.
         let required: Vec<(&str, &str)> = lock
@@ -82,7 +115,9 @@ impl PackageStore {
         let mut prepared = PreparedGraph {
             sources: BTreeMap::new(),
             callables: BTreeMap::new(),
+            exports: BTreeMap::new(),
             trust: BTreeMap::new(),
+            programs: BTreeMap::new(),
         };
         for package in &selected {
             for (path, bytes) in &package.sources {
@@ -93,11 +128,22 @@ impl PackageStore {
             prepared
                 .trust
                 .insert(package.manifest.id.clone(), package.trust);
-            let callable = compile_package(package)?;
+            prepared.exports.insert(
+                package.manifest.id.clone(),
+                package.manifest.entry.export.clone(),
+            );
+            let (callable, program) = compile_package(package)?;
             prepared
                 .callables
                 .insert(package.manifest.id.clone(), callable);
+            prepared
+                .programs
+                .insert(package.manifest.id.clone(), program);
         }
+        *self
+            .prepared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((lock.clone(), prepared.clone()));
         Ok(prepared)
     }
 }
@@ -178,7 +224,9 @@ fn scan_source(
     Ok(imports)
 }
 
-fn compile_package(package: &InstalledPackage) -> Result<String, PluginError> {
+fn compile_package(
+    package: &InstalledPackage,
+) -> Result<(String, Arc<rustscript_vm::Program>), PluginError> {
     let host_roots = host_roots();
     let catalog = agent_host_catalog();
     let owned: Vec<(String, String)> = package
@@ -226,14 +274,30 @@ fn compile_package(package: &InstalledPackage) -> Result<String, PluginError> {
         )
     })?;
     charge_program(package, &compiled.program)?;
-    Ok(entry)
+    Ok((entry, Arc::new(compiled.program)))
+}
+
+fn is_tool_role(package: &InstalledPackage) -> bool {
+    package.manifest.kind == "tool" && package.manifest.contract == "agent.tool/v1"
 }
 
 fn charge_program(
     package: &InstalledPackage,
     program: &rustscript_vm::Program,
 ) -> Result<(), PluginError> {
+    let tool_role = is_tool_role(package);
     for import in &program.imports {
+        if is_tool_lease(&import.name) && !tool_role {
+            return Err(PluginError::new(
+                PluginErrorKind::UnauthorizedHostImport,
+                import.name.clone(),
+            ));
+        }
+        if package.trust == PackageTrust::EmbeddingOwnedBuiltin
+            && is_embedding_runtime_import(&import.name)
+        {
+            continue;
+        }
         if let Some(effect) = charge_name(&import.name)? {
             let declared = package
                 .manifest
@@ -268,30 +332,37 @@ fn charge_name(name: &str) -> Result<Option<&'static str>, PluginError> {
         "agent::model_request" => Some("model.request"),
         "stream::emit" => Some("event.emit"),
         _ if name.starts_with("http::") => Some("remote.write"),
-        _ if name.starts_with("sqlite::")
-            || name.starts_with("auth::")
-            || name.starts_with("agent_runtime::") =>
-        {
-            None
-        }
+        _ if is_tool_lease(name) => None,
+        _ if name.starts_with("sqlite::") || name.starts_with("auth::") => None,
         _ => None,
     };
     if name.starts_with("sqlite::")
         || name.starts_with("auth::")
-        || name.starts_with("agent_runtime::")
+        || (name.starts_with("agent_runtime::") && !is_tool_lease(name))
     {
         return Err(PluginError::new(
             PluginErrorKind::UnauthorizedHostImport,
             name,
         ));
     }
-    if effect.is_none() && !is_pure(name) {
+    if effect.is_none() && !is_pure(name) && !is_tool_lease(name) {
         return Err(PluginError::new(
             PluginErrorKind::UnauthorizedHostImport,
             name,
         ));
     }
     Ok(effect)
+}
+
+fn is_embedding_runtime_import(name: &str) -> bool {
+    name.starts_with("cap::artifact_") || name == "agent::sleep_ms"
+}
+
+fn is_tool_lease(name: &str) -> bool {
+    matches!(
+        name,
+        "agent_runtime::tool_prepare" | "agent_runtime::tool_commit"
+    )
 }
 
 fn is_pure(name: &str) -> bool {
@@ -307,7 +378,10 @@ fn is_pure(name: &str) -> bool {
 }
 
 fn is_allowed_host_root(root: &str) -> bool {
-    matches!(root, "json" | "bytes" | "cap" | "agent" | "http" | "stream")
+    matches!(
+        root,
+        "json" | "bytes" | "cap" | "agent" | "agent_runtime" | "http" | "stream"
+    )
 }
 
 fn catalog_prelude() -> String {
