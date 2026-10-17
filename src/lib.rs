@@ -14,6 +14,7 @@ pub mod config_file;
 #[cfg(feature = "config-fixture")]
 mod config_host;
 pub mod domain;
+pub mod effects;
 pub mod events;
 pub mod gateway;
 #[cfg(any(test, feature = "config-fixture"))]
