@@ -30,6 +30,7 @@ pd-host-function = { git = "https://github.com/rustscript-lang/rustscript.git", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+semver = "1.0.28"
 yaml-rust2 = { version = "0.12", default-features = false }
 # Meta-schema validation only; resolver features stay disabled.
 jsonschema = { version = "0.52.1", default-features = false }

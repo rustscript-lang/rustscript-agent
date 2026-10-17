@@ -1,0 +1,226 @@
+{
+  "$id": "https://schemas.rustscript.local/v1/plugin-graph-lock.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "closure": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "effects": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "recovery": {
+                  "type": "string"
+                },
+                "scope": {
+                  "type": "string"
+                },
+                "via": {
+                  "additionalProperties": false,
+                  "description": "Provenance of one effect. direct, plugin, and library stay distinct. delegated is not a collapsed label. Semver satisfaction of version_requirement is a Native check.\n",
+                  "properties": {
+                    "alias": {
+                      "type": "string"
+                    },
+                    "callee_entry": {
+                      "type": "string"
+                    },
+                    "callee_package": {
+                      "type": "string"
+                    },
+                    "callee_version": {
+                      "type": "string"
+                    },
+                    "caller_entry": {
+                      "type": "string"
+                    },
+                    "caller_package": {
+                      "type": "string"
+                    },
+                    "relation": {
+                      "enum": [
+                        "direct",
+                        "plugin",
+                        "library"
+                      ],
+                      "type": "string"
+                    },
+                    "version_requirement": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "relation",
+                    "caller_package",
+                    "caller_entry",
+                    "alias",
+                    "callee_package",
+                    "callee_version",
+                    "callee_entry",
+                    "version_requirement"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "kind",
+                "scope",
+                "recovery",
+                "via"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "entry": {
+            "type": "string"
+          },
+          "package": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "package",
+          "entry",
+          "effects"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "compile_environment": {
+      "const": "closed-bundle/agent.cap/v1"
+    },
+    "edges": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "bindings": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "recovery": {
+                  "type": "string"
+                },
+                "scope": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "scope",
+                "recovery"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "from": {
+            "type": "string"
+          },
+          "from_entry": {
+            "type": "string"
+          },
+          "relation": {
+            "enum": [
+              "library",
+              "plugin"
+            ],
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "to_artifact_id": {
+            "description": "Installed object id from the existing integrity contract.",
+            "type": "string"
+          },
+          "to_entry": {
+            "type": "string"
+          },
+          "to_version": {
+            "description": "Resolved callee revision. Not a content digest.",
+            "type": "string"
+          },
+          "version_requirement": {
+            "description": "Caller requirement, verbatim. Satisfaction is a Native semantic check and is not claimed by this schema.\n",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "from_entry",
+          "alias",
+          "to",
+          "to_version",
+          "to_artifact_id",
+          "to_entry",
+          "relation",
+          "version_requirement",
+          "bindings"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "graph_id": {
+      "description": "Opaque lock identity. Not a capability and not a content digest.",
+      "type": "string"
+    },
+    "host_runtime": {
+      "type": "string"
+    },
+    "packages": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "library",
+              "tool"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "kind",
+          "artifact_id"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "closure",
+    "compile_environment",
+    "edges",
+    "graph_id",
+    "host_runtime",
+    "packages"
+  ],
+  "title": "RustScript plugin graph lock",
+  "type": "object"
+}

@@ -20,6 +20,7 @@ pub mod gateway;
 #[cfg(any(test, feature = "config-fixture"))]
 mod host_opaque;
 pub mod metrics;
+pub mod plugins;
 pub mod prompt;
 pub mod registry;
 pub mod runtime;
