@@ -341,6 +341,16 @@ pub(crate) fn chmod_dir(path: &Path, mode: u32) -> Result<(), EffectError> {
     }
 }
 
+fn component_rejected(component: &str) -> bool {
+    // NUL is a byte below 0x20, the same component rule validate_relative already uses.
+    component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.ends_with('.')
+        || component.len() > MAX_COMPONENT_BYTES
+        || component.as_bytes().iter().any(|byte| *byte < 0x20)
+}
+
 pub(crate) fn validate_relative(path: &str) -> Result<Vec<String>, EffectError> {
     if path.is_empty()
         || path.len() > MAX_RELATIVE_BYTES
@@ -354,13 +364,7 @@ pub(crate) fn validate_relative(path: &str) -> Result<Vec<String>, EffectError> 
     }
     let mut components = Vec::new();
     for component in path.split('/') {
-        if component.is_empty()
-            || component == "."
-            || component == ".."
-            || component.ends_with('.')
-            || component.len() > MAX_COMPONENT_BYTES
-            || component.as_bytes().iter().any(|byte| *byte < 0x20)
-        {
+        if component_rejected(component) {
             return Err(rejected("path component is not allowed"));
         }
         components.push(component.to_string());
@@ -426,7 +430,7 @@ fn scan_dir(
         let text = name
             .to_str()
             .ok_or_else(|| rejected("directory entry is not utf-8"))?;
-        if text.len() > MAX_COMPONENT_BYTES || text.ends_with('.') || text.contains('\0') {
+        if component_rejected(text) {
             return Err(rejected("directory entry name is not allowed"));
         }
         let rel = if prefix.is_empty() {

@@ -908,3 +908,270 @@ fn writer_lease_same_branch_discard_and_drop_release_once() {
     let restored = restore_now(&handle, &record);
     assert_eq!(restored.handle.read_committed("a.txt").unwrap(), b"a");
 }
+
+fn dir_names(path: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+struct ControlCase {
+    label: &'static str,
+    byte: u8,
+    control_dir: bool,
+    legal_parent: bool,
+    bytes: &'static [u8],
+}
+
+fn control_layout(case: &ControlCase) -> (Vec<String>, String) {
+    let marked = format!("bad{}name", char::from(case.byte));
+    if case.control_dir {
+        (vec![marked], "child.txt".to_string())
+    } else if case.legal_parent {
+        (vec!["ok".to_string()], format!("{marked}.txt"))
+    } else {
+        (Vec::new(), format!("{marked}.txt"))
+    }
+}
+
+fn join_rel(dirs: &[String], file: &str) -> String {
+    let mut parts = dirs.to_vec();
+    parts.push(file.to_string());
+    parts.join("/")
+}
+
+fn write_rel(seed: &Path, dirs: &[String], file: &str, bytes: &[u8]) -> PathBuf {
+    let mut path = seed.to_path_buf();
+    for dir in dirs {
+        path.push(dir);
+        fs::create_dir_all(&path).unwrap();
+    }
+    path.push(file);
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+// Import must reject a component validate_relative already rejects.
+// This is a path-policy boundary, not a symlink, hardlink, or traversal check.
+#[test]
+fn import_rejects_control_byte_components() {
+    let cases = [
+        ControlCase {
+            label: "newline-file",
+            byte: 0x0a,
+            control_dir: false,
+            legal_parent: false,
+            bytes: b"newline-bytes",
+        },
+        ControlCase {
+            label: "tab-file",
+            byte: 0x09,
+            control_dir: false,
+            legal_parent: false,
+            bytes: b"tab-bytes",
+        },
+        ControlCase {
+            label: "cr-file",
+            byte: 0x0d,
+            control_dir: false,
+            legal_parent: false,
+            bytes: b"cr-bytes",
+        },
+        ControlCase {
+            label: "us-file",
+            byte: 0x1f,
+            control_dir: false,
+            legal_parent: false,
+            bytes: b"us-bytes",
+        },
+        ControlCase {
+            label: "newline-dir",
+            byte: 0x0a,
+            control_dir: true,
+            legal_parent: false,
+            bytes: b"nested-bytes",
+        },
+        ControlCase {
+            label: "tab-nested-file",
+            byte: 0x09,
+            control_dir: false,
+            legal_parent: true,
+            bytes: b"nested-tab",
+        },
+    ];
+    let mut accepted = Vec::new();
+    for case in cases {
+        assert!(case.byte < 0x20, "{}", case.label);
+        let (dirs, file) = control_layout(&case);
+        let rel = join_rel(&dirs, &file);
+        assert!(
+            rel.bytes().any(|byte| byte < 0x20),
+            "{} must contain a control byte",
+            case.label
+        );
+        let root = scratch(&format!("ctrl-{}", case.label));
+        let legal = root.join("legal");
+        fs::create_dir_all(&legal).unwrap();
+        fs::write(legal.join("keep.txt"), b"kept").unwrap();
+        let store = EffectStore::create(root.join("store")).unwrap();
+        let handle = import_ok(&store, &legal);
+        let head = handle.head();
+        let epoch = handle.epoch();
+        let branch = handle.branch_id().clone();
+        let view = open_ok(&handle);
+        view.write_file("note.txt", b"live").unwrap();
+        let trees_before = dir_names(&store.root().join("trees"));
+        let staging_before = dir_names(&store.root().join("staging"));
+        let views_before = dir_names(&store.root().join("views"));
+        let seed = root.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        let seed_file = write_rel(&seed, &dirs, &file, case.bytes);
+        let parent = seed_file.parent().unwrap().to_path_buf();
+        let parent_before = dir_names(&parent);
+        let seed_root_before = dir_names(&seed);
+        let imported =
+            store.import_workspace(import_req(&seed, generous(), EffectCancellation::new()));
+        assert_eq!(fs::read(&seed_file).unwrap(), case.bytes, "{}", case.label);
+        assert_eq!(dir_names(&parent), parent_before, "{}", case.label);
+        assert_eq!(dir_names(&seed), seed_root_before, "{}", case.label);
+        assert_eq!(handle.head(), head, "{}", case.label);
+        assert_eq!(handle.epoch(), epoch, "{}", case.label);
+        assert_eq!(handle.branch_id(), &branch, "{}", case.label);
+        assert_eq!(handle.read_committed("keep.txt").unwrap(), b"kept");
+        assert_eq!(view.read_file("note.txt").unwrap(), b"live");
+        view.write_file("after.txt", b"after").unwrap();
+        assert_eq!(view.read_file("after.txt").unwrap(), b"after");
+        assert_eq!(handle.journal().len(), 1, "{}", case.label);
+        match imported {
+            Err(err) => {
+                assert_eq!(err.kind(), EffectErrorKind::RejectedPath, "{}", case.label);
+                assert_eq!(
+                    dir_names(&store.root().join("trees")),
+                    trees_before,
+                    "{}",
+                    case.label
+                );
+                assert_eq!(
+                    dir_names(&store.root().join("staging")),
+                    staging_before,
+                    "{}",
+                    case.label
+                );
+                assert_eq!(
+                    dir_names(&store.root().join("views")),
+                    views_before,
+                    "{}",
+                    case.label
+                );
+            }
+            Ok(bad) => {
+                let read_kind = bad
+                    .read_committed(&rel)
+                    .map(|bytes| format!("ok-{}", bytes.len()))
+                    .unwrap_or_else(|err| format!("{:?}", err.kind()));
+                let bad_view = open_ok(&bad);
+                let write_kind = bad_view
+                    .write_file(&rel, b"no")
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|err| format!("{:?}", err.kind()));
+                let delete_kind = bad_view
+                    .delete(&rel)
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|err| format!("{:?}", err.kind()));
+                let mut copied = bad.immutable_path(&bad.head()).expect("imported tree");
+                for dir in &dirs {
+                    copied.push(dir);
+                }
+                copied.push(&file);
+                let copied_ok = fs::read(&copied).ok().as_deref() == Some(case.bytes);
+                let tree_created = dir_names(&store.root().join("trees")) != trees_before;
+                accepted.push(format!(
+                    "{}: import accepted; read={} write={} delete={} copied={} tree_created={}",
+                    case.label, read_kind, write_kind, delete_kind, copied_ok, tree_created
+                ));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "import accepted entries the relative API cannot address: {accepted:?}"
+    );
+}
+
+#[test]
+fn legal_utf8_names_round_trip_through_publish() {
+    let root = scratch("legal-utf8");
+    let seed = root.join("seed");
+    let dir = "目录";
+    let nested = "文件.txt";
+    let created = "新建.txt";
+    let del = format!("del{}.txt", char::from(0x7f));
+    let pad = format!("pad{}.txt", char::from(0x80));
+    assert_eq!(dir.as_bytes(), &[0xe7, 0x9b, 0xae, 0xe5, 0xbd, 0x95]);
+    assert_eq!(
+        nested.as_bytes(),
+        &[0xe6, 0x96, 0x87, 0xe4, 0xbb, 0xb6, b'.', b't', b'x', b't']
+    );
+    assert!(del.as_bytes().contains(&0x7f));
+    assert!(pad.chars().any(|ch| ch == char::from(0x80)));
+    for name in [
+        &del,
+        &pad,
+        &dir.to_string(),
+        &nested.to_string(),
+        &created.to_string(),
+    ] {
+        assert!(
+            name.bytes().all(|byte| byte >= 0x20),
+            "{name:?} is a legal component"
+        );
+    }
+    fs::create_dir_all(seed.join(dir)).unwrap();
+    fs::write(seed.join("plain.txt"), b"plain").unwrap();
+    fs::write(seed.join(&del), b"del-bytes").unwrap();
+    fs::write(seed.join(&pad), b"pad-bytes").unwrap();
+    fs::write(seed.join(dir).join(nested), b"cjk-bytes").unwrap();
+    let store = EffectStore::create(root.join("store")).unwrap();
+    let handle = import_ok(&store, &seed);
+    let nested_rel = format!("{dir}/{nested}");
+    assert_eq!(handle.read_committed("plain.txt").unwrap(), b"plain");
+    assert_eq!(handle.read_committed(&del).unwrap(), b"del-bytes");
+    assert_eq!(handle.read_committed(&pad).unwrap(), b"pad-bytes");
+    assert_eq!(handle.read_committed(&nested_rel).unwrap(), b"cjk-bytes");
+    let tree = handle.immutable_path(&handle.head()).unwrap();
+    assert_eq!(fs::read(tree.join(&del)).unwrap(), b"del-bytes");
+    assert_eq!(fs::read(tree.join(dir).join(nested)).unwrap(), b"cjk-bytes");
+    let view = open_ok(&handle);
+    assert_eq!(view.read_file("plain.txt").unwrap(), b"plain");
+    assert_eq!(view.read_file(&del).unwrap(), b"del-bytes");
+    assert_eq!(view.read_file(&pad).unwrap(), b"pad-bytes");
+    assert_eq!(view.read_file(&nested_rel).unwrap(), b"cjk-bytes");
+    assert_eq!(view.list(dir).unwrap(), vec![nested.to_string()]);
+    view.write_file("plain.txt", b"updated").unwrap();
+    view.write_file(created, b"created").unwrap();
+    view.delete(&del).unwrap();
+    let rejected = view.write_file(&format!("no{}pe.txt", char::from(0x0a)), b"x");
+    assert_eq!(rejected.unwrap_err().kind(), EffectErrorKind::RejectedPath);
+    assert!(
+        !view
+            .list("")
+            .unwrap()
+            .iter()
+            .any(|name| name.bytes().any(|byte| byte < 0x20))
+    );
+    publish_ok(&handle, view);
+    assert_eq!(handle.read_committed("plain.txt").unwrap(), b"updated");
+    assert_eq!(handle.read_committed(created).unwrap(), b"created");
+    assert_eq!(handle.read_committed(&pad).unwrap(), b"pad-bytes");
+    assert_eq!(handle.read_committed(&nested_rel).unwrap(), b"cjk-bytes");
+    assert_eq!(
+        handle.read_committed(&del).unwrap_err().kind(),
+        EffectErrorKind::NotFound
+    );
+    assert_eq!(fs::read(seed.join("plain.txt")).unwrap(), b"plain");
+    assert_eq!(fs::read(seed.join(&del)).unwrap(), b"del-bytes");
+    assert_eq!(fs::read(seed.join(dir).join(nested)).unwrap(), b"cjk-bytes");
+}
