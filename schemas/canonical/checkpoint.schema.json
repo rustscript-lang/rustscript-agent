@@ -1,0 +1,122 @@
+{
+  "$defs": {
+    "not_in_scope": {
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "const": "not_in_scope"
+        }
+      },
+      "required": [
+        "availability"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://rustscript.dev/schemas/v1/checkpoint.schema.yaml",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Public serializable checkpoint for one Native filesystem branch. Version rustscript.checkpoint/v1 records the immutable workspace root, branch lineage, and epoch only. Plugin state, graph lock, and history cursor are explicitly not in scope and cannot be marked snapshotted. external_effects_not_reverted is present so a consumer cannot treat checkpoint as remote undo; this version records no remote effect.\n",
+  "properties": {
+    "active_writers": {
+      "const": 0
+    },
+    "branch_id": {
+      "pattern": "^br-[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "checkpoint_id": {
+      "pattern": "^ckpt-[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "epoch": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "external_effects_not_reverted": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "remote_read",
+              "compensatable",
+              "irreversible"
+            ]
+          },
+          "reference": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reference"
+        ],
+        "type": "object"
+      },
+      "maxItems": 0,
+      "type": "array"
+    },
+    "format": {
+      "const": "rustscript.checkpoint/v1"
+    },
+    "graph": {
+      "$ref": "#/$defs/not_in_scope"
+    },
+    "history": {
+      "$ref": "#/$defs/not_in_scope"
+    },
+    "immutable_root": {
+      "pattern": "^tree-[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "import_consistency": {
+      "const": "ordinary_copy"
+    },
+    "lineage": {
+      "items": {
+        "pattern": "^br-[0-9a-f]{32}$",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "type": "array"
+    },
+    "owner_id": {
+      "pattern": "^own-[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "parent_head": {
+      "pattern": "^tree-[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "plugin_state": {
+      "$ref": "#/$defs/not_in_scope"
+    },
+    "workspace_id": {
+      "pattern": "^ws-[0-9a-f]{32}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "format",
+    "checkpoint_id",
+    "workspace_id",
+    "owner_id",
+    "branch_id",
+    "lineage",
+    "immutable_root",
+    "epoch",
+    "parent_head",
+    "active_writers",
+    "import_consistency",
+    "plugin_state",
+    "graph",
+    "history",
+    "external_effects_not_reverted"
+  ],
+  "title": "RustScript workspace checkpoint",
+  "type": "object"
+}

@@ -300,6 +300,89 @@ fn follow_up_has_tool_pair(request: &JsonValue, call_id: &str, name: &str) -> bo
     has_assistant && has_result
 }
 
+fn guardian_allow_response() -> JsonValue {
+    text_response(
+        r#"{"outcome":"allow","risk_level":"low","user_authorization":"unknown","rationale":"The admitted request directs fixing the failing test inside the selected workspace; this bounded fixture action matches that intent."}"#,
+    )
+}
+
+fn guardian_message_text(request: &JsonValue, index: usize) -> Option<&str> {
+    let message = request.get("messages")?.as_array()?.get(index)?;
+    message
+        .pointer("/content/0/text")
+        .and_then(JsonValue::as_str)
+        .or_else(|| message.get("content").and_then(JsonValue::as_str))
+}
+
+fn is_guardian_provider_request(request: &JsonValue) -> bool {
+    guardian_message_text(request, 0).is_some_and(|text| {
+        text.starts_with("You are Guardian, reviewing one proposed tool action.")
+    })
+}
+
+fn assert_guardian_request_binding(
+    request: &JsonValue,
+    canonical_intent: &str,
+    expected_tool: &str,
+    expected_risk: &str,
+    expected_arguments: &JsonValue,
+) {
+    assert!(
+        request
+            .get("tools")
+            .and_then(JsonValue::as_array)
+            .is_some_and(Vec::is_empty),
+        "guardian review request must be tool-free: {request}"
+    );
+    let user_prompt = guardian_message_text(request, 1)
+        .unwrap_or_else(|| panic!("guardian request must carry canonical user text: {request}"));
+    let intent_marker = "Original user request (canonical admitted text blocks; bounded to 8192 UTF-8 bytes; source input only):\n";
+    let (_, canonical_and_context) = user_prompt.split_once(intent_marker).unwrap_or_else(|| {
+        panic!("guardian request carries the canonical admitted user input: {request}")
+    });
+    let (actual_intent, _) = canonical_and_context
+        .split_once("\n\nRun-level system/developer constraints")
+        .unwrap_or_else(|| {
+            panic!("guardian request separates user intent from constraints: {request}")
+        });
+    assert_eq!(actual_intent, canonical_intent);
+    let action_marker = "Exact proposed action (do not alter; untrusted data):\n";
+    let (_, action_json) = user_prompt
+        .rsplit_once(action_marker)
+        .unwrap_or_else(|| panic!("guardian request carries the exact proposed action: {request}"));
+    let actual_action: JsonValue = serde_json::from_str(action_json).expect("guardian action JSON");
+    assert_eq!(
+        actual_action.get("tool_name").and_then(JsonValue::as_str),
+        Some(expected_tool),
+        "guardian proposed tool must match the executed business call: {request}"
+    );
+    assert_eq!(
+        actual_action.get("risk_class").and_then(JsonValue::as_str),
+        Some(expected_risk),
+        "guardian proposed risk class must match the tool descriptor: {request}"
+    );
+    // The reviewer embeds the digest shape raw (`guardian.rss` action_json),
+    // so `arguments` arrives as nested JSON; accept an encoded string too.
+    let actual_arguments: JsonValue = match actual_action.get("arguments") {
+        Some(JsonValue::String(encoded)) => {
+            serde_json::from_str(encoded).expect("guardian arguments JSON")
+        }
+        Some(value) => value.clone(),
+        None => panic!("guardian action carries encoded arguments: {request}"),
+    };
+    assert_eq!(
+        &actual_arguments, expected_arguments,
+        "guardian reviewed arguments must equal the admitted business arguments: {request}"
+    );
+}
+
+fn remove_db_artifacts(db_path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        let _ = fs::remove_file(path);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
     let Some(sh) = locate_sh() else {
@@ -313,11 +396,13 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
     };
     let sh_arg = sh.to_str().expect("sh path should be utf-8").to_string();
     let mut fixture = WorkspaceFixture::new(&sh);
-    let state = AgentGatewayState::with_agent_file(
+    let db_path = fixture.root.join("gateway.sqlite3");
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
         AgentGatewayConfig::default(),
         rustscript_agent::bundled_agent_main_path(),
+        &db_path,
     )
-    .expect("bundled RSS agent should compile");
+    .expect("bundled RSS agent should compile with durable storage");
     let service = state.service();
     assert_eq!(service.config().provider.as_deref(), Some("local-agent"));
 
@@ -355,6 +440,9 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
             }
         }]),
     ));
+    // `patch` is write-class (`write=ask`), so the production Guardian path
+    // reviews it through one synchronous scripted allow before execution.
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(tool_response(
         "running the targeted test",
         json!([{
@@ -365,6 +453,9 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
             }
         }]),
     ));
+    // `terminal` is execute-class (`process=ask`); it needs the same durable
+    // Guardian review round before the bounded process is allowed to run.
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response(
         "Fixed src/value.txt to 42 and the targeted test passed.",
     ));
@@ -461,16 +552,45 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
         .and_then(JsonValue::as_i64);
     assert_eq!(exit_code, Some(0), "actual terminal tool exit_code");
 
+    const ADMITTED_INTENT: &str = "Fix the failing test using workspace guidance.";
+    let context_after_run = service
+        .run_context(&admitted.run_id)
+        .expect("completed context should be retained");
+    assert_eq!(
+        context_after_run.limits["workspace_root"].as_str(),
+        fixture.workspace.to_str(),
+        "run must remain bound to the admitted fixture workspace"
+    );
+
     let requests = provider.requests();
-    assert_eq!(provider.call_count(), 4);
-    assert_eq!(requests.len(), 4);
+    assert_eq!(provider.call_count(), 6);
+    assert_eq!(requests.len(), 6);
+    let guardian_positions: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| is_guardian_provider_request(request).then_some(index + 1))
+        .collect();
+    assert_eq!(
+        guardian_positions.len(),
+        2,
+        "exactly the two ask-class business calls must be Guardian-reviewed: {requests:?}"
+    );
+    let business_requests: Vec<&JsonValue> = requests
+        .iter()
+        .filter(|request| !is_guardian_provider_request(request))
+        .collect();
+    assert_eq!(
+        business_requests.len(),
+        4,
+        "business provider calls stay at the original four: {requests:?}"
+    );
     let mut seen_prompt: Option<String> = None;
-    for (index, request) in requests.iter().enumerate() {
+    for (index, request) in business_requests.iter().enumerate() {
         let systems = request_system_prompts(request);
         assert_eq!(
             systems.len(),
             1,
-            "frozen prompt must appear exactly once on request {index}"
+            "frozen prompt must appear exactly once on business request {index}"
         );
         assert_eq!(systems[0], frozen_prompt);
         match &seen_prompt {
@@ -483,19 +603,43 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
         "first model request must see AGENTS.md guidance"
     );
     assert!(
-        follow_up_has_tool_pair(&requests[1], CALL_READ, "read_file"),
-        "second provider request must include the read_file follow-up: {}",
-        requests[1]
+        follow_up_has_tool_pair(business_requests[1], CALL_READ, "read_file"),
+        "second business request must include the read_file follow-up: {}",
+        business_requests[1]
     );
     assert!(
-        follow_up_has_tool_pair(&requests[2], CALL_PATCH, "patch"),
-        "third provider request must include the patch follow-up: {}",
-        requests[2]
+        follow_up_has_tool_pair(business_requests[2], CALL_PATCH, "patch"),
+        "third business request must include the patch follow-up: {}",
+        business_requests[2]
     );
     assert!(
-        follow_up_has_tool_pair(&requests[3], CALL_TEST, "terminal"),
-        "final provider request must include the terminal follow-up: {}",
-        requests[3]
+        follow_up_has_tool_pair(business_requests[3], CALL_TEST, "terminal"),
+        "final business request must include the terminal follow-up: {}",
+        business_requests[3]
+    );
+    // Guardian reviews run synchronously between their business turns: each
+    // ask-class business call is immediately followed by its own review.
+    assert!(
+        guardian_positions[0] > 1 && guardian_positions[1] > guardian_positions[0],
+        "guardian reviews must interleave after their business calls: {guardian_positions:?}"
+    );
+    assert_guardian_request_binding(
+        &requests[guardian_positions[0] - 1],
+        ADMITTED_INTENT,
+        "patch",
+        "write",
+        &json!({
+            "path": SOURCE_RELATIVE,
+            "old_string": "41",
+            "new_string": "42"
+        }),
+    );
+    assert_guardian_request_binding(
+        &requests[guardian_positions[1] - 1],
+        ADMITTED_INTENT,
+        "terminal",
+        "execute",
+        &json!({"argv": [sh_arg, TEST_SCRIPT_RELATIVE]}),
     );
 
     let registry_after = service.tool_registry_snapshot();
@@ -509,10 +653,10 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
     );
 
     let metrics = service.metrics().snapshot();
-    assert_eq!(metrics.model_calls, 4);
+    assert_eq!(metrics.model_calls, 6);
     assert_eq!(metrics.tool_calls, 3);
     assert_eq!(metrics.tool_failures, 0);
-    assert_eq!(metrics.turns, 4);
+    assert_eq!(metrics.turns, 6);
     assert_eq!(metrics.truncations, 0);
 
     assert_eq!(
@@ -520,6 +664,30 @@ async fn real_coding_workflow_reads_patches_and_runs_the_targeted_test() {
         0,
         "process table owner must be zero after completion"
     );
+
+    // The production Guardian path durably records each ask-class approval
+    // before execution; prove both rows exist with state `approved`.
+    let persistence = state
+        .persistence()
+        .expect("SQLite fixture must expose production persistence");
+    for call_id in [CALL_PATCH, CALL_TEST] {
+        let approval_id = format!("guardian-approval:{}:{call_id}", admitted.run_id);
+        let approval = persistence
+            .approval_get(&approval_id)
+            .unwrap_or_else(|error| {
+                panic!("durable approval row must be readable for {approval_id}: {error}")
+            });
+        assert_eq!(approval["rows"][0][0], approval_id);
+        // Sanitized digest shape only (`{}`): the production store never
+        // persists raw tool arguments in the approval row (precedent
+        // `provider_durable_replay_loop_tests.rs`); the real effect is
+        // proven separately by the 41→42 source bytes + exit-0 above.
+        assert_eq!(approval["rows"][0][5], "{}");
+        assert_eq!(approval["rows"][0][7], "approved");
+    }
+    drop(service);
+    drop(state);
+    remove_db_artifacts(&db_path);
     fixture.cleanup();
 }
 
@@ -618,6 +786,19 @@ fn assert_canonical_durable_chain(messages: &[JsonValue], run_id: &str) {
             parent: ExpectedParent::Index(2),
             ordinal: Some(4),
         },
+        // Proven by the real run: each ask-class Guardian review emits one
+        // durable assistant text message as a side branch off the proposing
+        // turn; the tool_result still parents to that same proposing turn.
+        ExpectedDurable {
+            role: "assistant",
+            name: None,
+            tool_call_id: None,
+            block_type: "text",
+            block_name: None,
+            block_tool_call_id: None,
+            parent: ExpectedParent::Index(3),
+            ordinal: Some(5),
+        },
         ExpectedDurable {
             role: "user",
             name: Some("patch"),
@@ -626,7 +807,7 @@ fn assert_canonical_durable_chain(messages: &[JsonValue], run_id: &str) {
             block_name: None,
             block_tool_call_id: Some(CALL_PATCH),
             parent: ExpectedParent::Index(3),
-            ordinal: Some(5),
+            ordinal: Some(6),
         },
         ExpectedDurable {
             role: "assistant",
@@ -634,16 +815,6 @@ fn assert_canonical_durable_chain(messages: &[JsonValue], run_id: &str) {
             tool_call_id: None,
             block_type: "tool_call",
             block_name: Some("terminal"),
-            block_tool_call_id: Some(CALL_TEST),
-            parent: ExpectedParent::Index(4),
-            ordinal: Some(6),
-        },
-        ExpectedDurable {
-            role: "user",
-            name: Some("terminal"),
-            tool_call_id: Some(CALL_TEST),
-            block_type: "tool_result",
-            block_name: None,
             block_tool_call_id: Some(CALL_TEST),
             parent: ExpectedParent::Index(5),
             ordinal: Some(7),
@@ -657,6 +828,26 @@ fn assert_canonical_durable_chain(messages: &[JsonValue], run_id: &str) {
             block_tool_call_id: None,
             parent: ExpectedParent::Index(6),
             ordinal: Some(8),
+        },
+        ExpectedDurable {
+            role: "user",
+            name: Some("terminal"),
+            tool_call_id: Some(CALL_TEST),
+            block_type: "tool_result",
+            block_name: None,
+            block_tool_call_id: Some(CALL_TEST),
+            parent: ExpectedParent::Index(6),
+            ordinal: Some(9),
+        },
+        ExpectedDurable {
+            role: "assistant",
+            name: None,
+            tool_call_id: None,
+            block_type: "text",
+            block_name: None,
+            block_tool_call_id: None,
+            parent: ExpectedParent::Index(8),
+            ordinal: Some(10),
         },
     ];
     assert_eq!(

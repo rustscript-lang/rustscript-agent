@@ -1,0 +1,180 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://schemas.rustscript.local/v1/effect-contract.schema.yaml
+title: RustScript agent effect contract
+type: object
+additionalProperties: false
+required:
+  - contract
+  - entries
+properties:
+  contract:
+    const: agent.effects/v1
+  entries:
+    type: object
+    minProperties: 1
+    maxProperties: 1
+    description: >
+      v1 structural cardinality is one public effect entry. Matching that key
+      to entry.export, and closing every supported entry, are Native semantic
+      checks. This schema does not claim those checks.
+    additionalProperties:
+      $ref: "#/$defs/entry"
+$defs:
+  entry:
+    type: object
+    additionalProperties: false
+    required:
+      - direct
+      - delegated
+    properties:
+      direct:
+        type: array
+        items:
+          $ref: "#/$defs/effect"
+      delegated:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required:
+            - dependency
+            - entry
+            - allow
+          properties:
+            dependency:
+              type: string
+            entry:
+              type: string
+            allow:
+              type: array
+              items:
+                $ref: "#/$defs/effect"
+  effect:
+    type: object
+    additionalProperties: false
+    required:
+      - kind
+      - scope
+      - recovery
+    properties:
+      kind:
+        type: string
+        enum:
+          - workspace.fs.read
+          - workspace.fs.write
+          - process.spawn
+          - model.request
+          - remote.write
+          - clock.read
+          - event.emit
+          - delivery.send
+          - secret.use
+      scope:
+        type: string
+        enum:
+          - bound_workspace
+          - bound_process
+          - bound_run
+          - bound_delivery
+          - bound_secret
+      recovery:
+        type: string
+        enum:
+          - none
+          - checkpoint
+        description: >
+          replay is not a v1 recovery. checkpoint is structural only for
+          workspace.fs.write. remote.write and process.spawn cannot claim it.
+    allOf:
+      - if:
+          properties:
+            kind:
+              const: workspace.fs.read
+        then:
+          properties:
+            scope:
+              const: bound_workspace
+            recovery:
+              const: none
+      - if:
+          properties:
+            kind:
+              const: workspace.fs.write
+        then:
+          properties:
+            scope:
+              const: bound_workspace
+            recovery:
+              enum:
+                - none
+                - checkpoint
+      - if:
+          properties:
+            kind:
+              const: process.spawn
+        then:
+          properties:
+            scope:
+              const: bound_process
+            recovery:
+              const: none
+      - if:
+          properties:
+            kind:
+              const: model.request
+        then:
+          properties:
+            scope:
+              const: bound_run
+            recovery:
+              const: none
+      - if:
+          properties:
+            kind:
+              const: remote.write
+        then:
+          properties:
+            scope:
+              const: bound_run
+            recovery:
+              const: none
+      - if:
+          properties:
+            kind:
+              const: clock.read
+        then:
+          properties:
+            scope:
+              const: bound_run
+            recovery:
+              const: none
+      - if:
+          properties:
+            kind:
+              const: event.emit
+        then:
+          properties:
+            scope:
+              const: bound_run
+            recovery:
+              const: none
+      - if:
+          properties:
+            kind:
+              const: delivery.send
+        then:
+          properties:
+            scope:
+              const: bound_delivery
+            recovery:
+              const: none
+      - if:
+          properties:
+            kind:
+              const: secret.use
+        then:
+          properties:
+            scope:
+              const: bound_secret
+            recovery:
+              const: none

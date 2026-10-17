@@ -1,0 +1,86 @@
+// Auth command substrate: home and cancellation stay host-owned. All command
+// interpretation and sanitized metadata selection remain in RSS.
+use config;
+use auth;
+
+struct AuthCommandInput {
+    operation: string,
+    provider: string?,
+    credential_id: string?
+}
+
+struct AuthEntryResult {
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+}
+
+fn metadata_result(
+    operation: string,
+    snapshot_ok: bool,
+    loaded: AuthMetadataEnvelope
+) -> AuthEntryResult {
+    {
+        ok: snapshot_ok && loaded.ok,
+        operation: operation,
+        credential_id: loaded.metadata.credential_id,
+        generation: loaded.metadata.generation,
+        status: loaded.metadata.status,
+        error: loaded.error
+    }
+}
+
+pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
+    let snapshot = config::load_snapshot(&home);
+    let policy = snapshot.policy_handle;
+    if command.operation == "metadata" => {
+        if command.credential_id != null => {
+            let credential_id: string = command.credential_id;
+            let loaded = auth::load_metadata(credential_id, &policy);
+            metadata_result(command.operation, snapshot.ok, loaded)
+        } else => {
+            {
+                ok: false,
+                operation: command.operation,
+                credential_id: null,
+                generation: snapshot.policy_generation,
+                status: "credential_id_required",
+                error: "credential_id_required"
+            }
+        }
+    } else if command.operation == "snapshot" => {
+        let mut credential_id: string = "";
+        let credential_refs = snapshot.credential_refs;
+        if credential_refs.length > 0 {
+            credential_id = credential_refs[0];
+        }
+        if command.credential_id != null {
+            credential_id = command.credential_id;
+        }
+        if credential_id != "" => {
+            let loaded = auth::load_metadata(credential_id, &policy);
+            metadata_result("snapshot", snapshot.ok, loaded)
+        } else => {
+            {
+                ok: snapshot.ok,
+                operation: "snapshot",
+                credential_id: null,
+                generation: snapshot.policy_generation,
+                status: "snapshot_empty",
+                error: null
+            }
+        }
+    } else => {
+        {
+            ok: false,
+            operation: command.operation,
+            credential_id: command.credential_id,
+            generation: snapshot.policy_generation,
+            status: "unsupported_operation",
+            error: "unsupported_operation"
+        }
+    }
+}

@@ -140,6 +140,28 @@ fn large_scalar_alias_source(scalar_bytes: usize, alias_count: usize) -> String 
 }
 
 #[test]
+fn approval_workflow_options_remain_unset_and_structural_validation_defers_combinations() {
+    let config = ConfigFile::from_str(
+        "version: 1\napprovals:\n  required: false\n  allow_user_fallback: true\n",
+    )
+    .expect("workflow combination belongs to RSS, not native config loading");
+
+    assert_eq!(config.approvals.reviewer, None);
+    assert_eq!(config.approvals.allow_user_fallback, Some(true));
+    assert_eq!(config.approvals.required, Some(false));
+    assert_eq!(config.approvals.read, "allow");
+    assert_eq!(config.approvals.write, "ask");
+    assert_eq!(config.approvals.process, "ask");
+
+    let invalid_reviewer = ConfigFile::from_str("version: 1\napprovals:\n  reviewer: admin\n")
+        .expect_err("explicit reviewer remains a bounded structural enum");
+    assert!(matches!(
+        invalid_reviewer,
+        ConfigFileError::InvalidValue { .. }
+    ));
+}
+
+#[test]
 fn missing_config_and_auth_files_are_typed_errors() {
     let root = temp_root("missing");
     let paths = AgentPaths::from_home(&root).expect("absolute home should resolve");

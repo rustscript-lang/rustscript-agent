@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use super::types::CapabilityError;
+use super::vm_io::ConfinedFsRoot;
 
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_COMPONENT_BYTES: usize = 255;
@@ -54,6 +55,23 @@ impl FrozenDir {
         #[cfg(not(unix))]
         {
             let _ = path;
+            Err(unsupported())
+        }
+    }
+
+    /// Duplicates the already-retained directory descriptor without reopening
+    /// its display path.
+    pub(crate) fn adopt(root: &ConfinedFsRoot) -> Result<Self, CapabilityError> {
+        #[cfg(unix)]
+        {
+            let fd = root.duplicate_descriptor().map_err(|_| {
+                CapabilityError::new("workspace_denied", "workspace is unavailable")
+            })?;
+            Ok(Self { fd })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root;
             Err(unsupported())
         }
     }

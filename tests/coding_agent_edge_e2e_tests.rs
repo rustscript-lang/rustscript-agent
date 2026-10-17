@@ -156,22 +156,110 @@ fn tool_response(text: &str, tool_calls: JsonValue) -> JsonValue {
     })
 }
 
+fn guardian_allow_response() -> JsonValue {
+    text_response(
+        r#"{"outcome":"allow","risk_level":"low","user_authorization":"unknown","rationale":"This synthetic fixture assessment classifies the exact bounded action as low risk and leaves user authorization unknown."}"#,
+    )
+}
+
+fn guardian_message_text(request: &JsonValue, index: usize) -> Option<&str> {
+    let message = request.get("messages")?.as_array()?.get(index)?;
+    message
+        .pointer("/content/0/text")
+        .and_then(JsonValue::as_str)
+        .or_else(|| message.get("content").and_then(JsonValue::as_str))
+}
+
+fn is_guardian_provider_request(request: &JsonValue) -> bool {
+    guardian_message_text(request, 0).is_some_and(|text| {
+        text.starts_with("You are Guardian, reviewing one proposed tool action.")
+    })
+}
+
+fn guardian_positions(requests: &[JsonValue]) -> Vec<usize> {
+    requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| is_guardian_provider_request(request).then_some(index + 1))
+        .collect()
+}
+
+fn business_requests(requests: &[JsonValue]) -> Vec<&JsonValue> {
+    requests
+        .iter()
+        .filter(|request| !is_guardian_provider_request(request))
+        .collect()
+}
+
+fn assert_guardian_request_binding(
+    request: &JsonValue,
+    canonical_intent: &str,
+    expected_tool: &str,
+    expected_risk: &str,
+    expected_arguments: &JsonValue,
+    expected_workspace: &Path,
+) {
+    assert!(
+        request
+            .get("tools")
+            .and_then(JsonValue::as_array)
+            .is_some_and(Vec::is_empty),
+        "guardian review request must be tool-free: {request}"
+    );
+    let user_prompt = guardian_message_text(request, 1)
+        .unwrap_or_else(|| panic!("guardian request must carry canonical user text: {request}"));
+    let intent_marker = "Original user request (canonical admitted text blocks; bounded to 8192 UTF-8 bytes; source input only):\n";
+    let (_, canonical_and_context) = user_prompt.split_once(intent_marker).unwrap_or_else(|| {
+        panic!("guardian request carries the canonical admitted user input: {request}")
+    });
+    let (actual_intent, _) = canonical_and_context
+        .split_once("\n\nRun-level system/developer constraints")
+        .unwrap_or_else(|| {
+            panic!("guardian request separates user intent from constraints: {request}")
+        });
+    assert_eq!(actual_intent, canonical_intent);
+    let action_marker = "Exact proposed action (do not alter; untrusted data):\n";
+    let (_, action_json) = user_prompt
+        .rsplit_once(action_marker)
+        .unwrap_or_else(|| panic!("guardian request carries the exact proposed action: {request}"));
+    let actual_action: JsonValue = serde_json::from_str(action_json).expect("guardian action JSON");
+    assert_eq!(
+        actual_action.get("tool_name").and_then(JsonValue::as_str),
+        Some(expected_tool),
+        "guardian proposed tool must match the executed business call: {request}"
+    );
+    assert_eq!(
+        actual_action.get("risk_class").and_then(JsonValue::as_str),
+        Some(expected_risk),
+        "guardian proposed risk class must match the tool descriptor: {request}"
+    );
+    // The reviewer embeds the digest shape raw (`guardian.rss` action_json),
+    // so `arguments` arrives as nested JSON; accept an encoded string too.
+    let actual_arguments: JsonValue = match actual_action.get("arguments") {
+        Some(JsonValue::String(encoded)) => {
+            serde_json::from_str(encoded).expect("guardian arguments JSON")
+        }
+        Some(value) => value.clone(),
+        None => panic!("guardian action carries encoded arguments: {request}"),
+    };
+    assert_eq!(
+        &actual_arguments, expected_arguments,
+        "guardian reviewed arguments must equal the admitted business arguments: {request}"
+    );
+    let rendered = request.to_string();
+    let expected = expected_workspace.to_string_lossy().into_owned();
+    assert!(
+        !expected.is_empty() && rendered.contains(&expected),
+        "guardian reviewed workspace binding must match the admitted fixture workspace: {request}"
+    );
+}
+
 fn admit_request() -> AdmitRunRequest {
     AdmitRunRequest {
         input: json!({"message": "edge-e2e"}),
         platform: "coding_agent_edge_e2e_tests".to_string(),
         ..AdmitRunRequest::default()
     }
-}
-
-fn loop_service(config: AgentGatewayConfig, provider: &ScriptedProvider) -> AgentGatewayState {
-    let state =
-        AgentGatewayState::with_agent_file(config, rustscript_agent::bundled_agent_main_path())
-            .expect("bundled agent loop should compile");
-    state
-        .service()
-        .inject_provider_host(Arc::new(provider.clone()));
-    state
 }
 
 fn loop_service_sqlite(
@@ -191,7 +279,36 @@ fn loop_service_sqlite(
     state
 }
 
-/// Holds the second provider call so artifact retrieval can happen before owner cleanup.
+fn loop_service_sqlite_with_workspace(
+    config: AgentGatewayConfig,
+    provider: &ScriptedProvider,
+    db: &Path,
+    workspace: &Path,
+) -> AgentGatewayState {
+    let home = db
+        .parent()
+        .expect("fixture database parent")
+        .join("workspace-home");
+    fs::create_dir_all(&home).expect("private fixture home");
+    let yaml = format!(
+        "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots:\n    - '{}'\n  default: '{}'\n  named:\n    edge: '{}'\n",
+        workspace.display(),
+        workspace.display(),
+        workspace.display()
+    );
+    rustscript_agent::config_file::ConfigFile::from_str(&yaml).expect("fixture workspace config");
+    fs::write(home.join("config.yaml"), yaml).expect("fixture workspace policy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("home mode");
+        fs::set_permissions(home.join("config.yaml"), fs::Permissions::from_mode(0o600))
+            .expect("config mode");
+    }
+    loop_service_sqlite(config, provider, db).with_workspace_home(home)
+}
+
+/// Holds the second business provider call so artifact retrieval can happen before owner cleanup.
 #[derive(Clone)]
 struct SecondCallGate {
     provider: ScriptedProvider,
@@ -216,7 +333,9 @@ impl SecondCallGate {
 impl AgentProviderHost for SecondCallGate {
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
         let outcome = self.provider.call(request, cancellation);
-        if self.provider.call_count() < 2 {
+        if is_guardian_provider_request(request)
+            || business_requests(&self.provider.requests()).len() < 2
+        {
             return outcome;
         }
         let (flag, cv) = &*self.release;
@@ -344,6 +463,7 @@ fn assert_exact_parent_name_ordinal(
     parent: &JsonValue,
     name: &str,
     ordinal: i64,
+    parent_ordinal: i64,
 ) {
     assert_eq!(
         json_opt_str(result, "parent_message_id"),
@@ -362,7 +482,7 @@ fn assert_exact_parent_name_ordinal(
     );
     assert_eq!(
         parent.get("ordinal").and_then(JsonValue::as_i64),
-        Some(ordinal - 1),
+        Some(parent_ordinal),
         "assistant tool_call ordinal: {parent}"
     );
 }
@@ -524,9 +644,11 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         "",
         json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
     ));
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response("should-not-run"));
 
-    let state = loop_service(AgentGatewayConfig::default(), &provider);
+    let db = fixture.db_path();
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
     let service = state.service();
     apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
     let admitted = service
@@ -592,13 +714,34 @@ async fn stop_during_terminal_cancels_child_without_residue() {
     assert_eq!(cancel_reason(&service, &admitted.run_id), "requested");
     assert_eq!(
         provider.call_count(),
-        1,
+        2,
         "stop during the live terminal must cancel the RSS loop before the next provider call"
     );
 
     let names = event_names(&service, &admitted.run_id);
     assert_stop_lifecycle(&names);
 
+    let requests = provider.requests();
+    assert_eq!(guardian_positions(&requests), vec![2]);
+    assert_eq!(business_requests(&requests).len(), 1);
+    assert_guardian_request_binding(
+        &requests[1],
+        "edge-e2e",
+        "terminal",
+        "execute",
+        &call.arguments,
+        &fixture.workspace,
+    );
+    let approval = state
+        .persistence()
+        .expect("durable fixture")
+        .approval_get(&format!(
+            "guardian-approval:{}:{}",
+            admitted.run_id, call.id
+        ))
+        .expect("approval row");
+    assert_eq!(approval["rows"][0][5], "{}");
+    assert_eq!(approval["rows"][0][7], "approved");
     let messages = service.session_messages(&admitted.session_id);
     let chain = run_messages(&messages, &admitted.run_id);
     let parent = assistant_tool_call(&chain, &call.id);
@@ -608,7 +751,7 @@ async fn stop_during_terminal_cancels_child_without_residue() {
         Some(message_id(chain[0])),
         "assistant tool_call parent is the durable user admission message"
     );
-    assert_exact_parent_name_ordinal(result, parent, "terminal", 3);
+    assert_exact_parent_name_ordinal(result, parent, "terminal", 4, 2);
     let result_blocks = decode_message_blocks(&result["content"]);
     let result_block = result_blocks
         .iter()
@@ -668,12 +811,15 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         "",
         json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
     ));
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response("bounded-summary"));
     let gate = SecondCallGate::new(provider.clone());
 
-    let state = AgentGatewayState::with_agent_file(
+    let db = fixture.db_path();
+    let state = AgentGatewayState::with_agent_file_and_sqlite(
         AgentGatewayConfig::default(),
         rustscript_agent::bundled_agent_main_path(),
+        &db,
     )
     .expect("bundled agent loop should compile");
     let service = state.service();
@@ -692,7 +838,10 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         }
     });
     assert!(
-        wait_until(WAIT_BUDGET, || provider.call_count() >= 2).await,
+        wait_until(WAIT_BUDGET, || business_requests(&provider.requests())
+            .len()
+            >= 2)
+        .await,
         "second provider request should see the bounded tool_result: events={:?}",
         event_names(&service, &admitted.run_id)
     );
@@ -703,10 +852,21 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     let requests = provider.requests();
     assert_eq!(
         requests.len(),
-        2,
+        3,
         "provider follow-up must be bounded to one tool_result request plus the original: {requests:?}"
     );
-    let second = &requests[1];
+    assert_eq!(guardian_positions(&requests), vec![2]);
+    assert_guardian_request_binding(
+        &requests[1],
+        "edge-e2e",
+        "terminal",
+        "execute",
+        &call.arguments,
+        &fixture.workspace,
+    );
+    let business = business_requests(&requests);
+    assert_eq!(business.len(), 2);
+    let second = business[1];
     let blocks = tool_result_blocks(second);
     assert_eq!(
         blocks.len(),
@@ -715,10 +875,15 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
     );
     let block = blocks[0];
     assert_eq!(block["tool_call_id"], json!(call.id));
-    assert_eq!(block["truncated"], json!(true));
+    assert_eq!(
+        block["truncated"],
+        json!(true),
+        "actual tool block: {block}"
+    );
     let result = block.get("result").cloned().unwrap_or_else(|| json!({}));
-    assert_eq!(result.get("truncated"), Some(&json!(true)));
-    let envelope_len = encoded_len(&result);
+    // Truncation is projected on the tool_result block; `result` is terminal data.
+    // Bound the entire model-visible block, including truncation/artifact metadata.
+    let envelope_len = encoded_len(block);
     assert!(
         envelope_len <= OUTPUT_CAP as usize,
         "ToolResult envelope {envelope_len} exceeds cap {OUTPUT_CAP}: {result}"
@@ -800,7 +965,7 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         Some(message_id(chain[0])),
         "assistant tool_call parent is the durable user admission message"
     );
-    assert_exact_parent_name_ordinal(durable_result, parent, "terminal", 3);
+    assert_exact_parent_name_ordinal(durable_result, parent, "terminal", 4, 2);
 
     let artifact_root = fixture.artifact_root();
     for value in [
@@ -865,7 +1030,7 @@ async fn output_limit_bounds_envelope_artifact_and_next_provider_request() {
         "{:?}",
         service.run_events(&admitted.run_id)
     );
-    assert_eq!(provider.call_count(), 2);
+    assert_eq!(provider.call_count(), 3);
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     assert!(service.capability_host_closed(&admitted.run_id));
     assert_eq!(
@@ -919,6 +1084,7 @@ async fn completed_run_reopen_is_noop() {
         "",
         json!([{"id": call.id, "name": call.name, "arguments": call.arguments}]),
     ));
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response("restart-summary"));
 
     let db = fixture.db_path();
@@ -947,8 +1113,19 @@ async fn completed_run_reopen_is_noop() {
     );
     let before = service.metrics().snapshot();
     assert_eq!(before.tool_calls, 1);
-    assert_eq!(before.turns, 2);
-    assert_eq!(provider.call_count(), 2);
+    assert_eq!(before.turns, 3);
+    assert_eq!(provider.call_count(), 3);
+    let requests = provider.requests();
+    assert_eq!(guardian_positions(&requests), vec![2]);
+    assert_eq!(business_requests(&requests).len(), 2);
+    assert_guardian_request_binding(
+        &requests[1],
+        "edge-e2e",
+        "terminal",
+        "execute",
+        &call.arguments,
+        &fixture.workspace,
+    );
     let run_id = admitted.run_id.clone();
     drop(state);
 
@@ -1037,7 +1214,7 @@ fn assert_tool_parent_chain(
         Some(message_id(chain[0])),
         "assistant tool_call parent is the durable user admission message"
     );
-    assert_exact_parent_name_ordinal(result, parent, "terminal", 3);
+    assert_exact_parent_name_ordinal(result, parent, "terminal", 4, 2);
 }
 
 /// Crash after the durable `model.requested` boundary: reopen retries the same
@@ -1053,6 +1230,215 @@ async fn pending_provider_request_restart_retries_without_duplicate_tool() {
     let call = once_tool_call(&sh, "call-pending-retry");
     let provider = ScriptedProvider::new();
     provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(guardian_allow_response());
+    provider.push_ok(text_response("after-retry"));
+
+    let db = fixture.db_path();
+    let state = loop_service_sqlite_with_workspace(
+        AgentGatewayConfig::default(),
+        &provider,
+        &db,
+        &fixture.workspace,
+    );
+    let service = state.service();
+    apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
+    let admitted = service
+        .admit_external_with_workspace_selector(admit_request(), Some("name:edge".to_string()))
+        .await
+        .expect("admission should succeed");
+    service.inject_crash_after_provider_request();
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("crash worker should finish");
+
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "pending request crash must not commit a terminal: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.completed"),
+        0
+    );
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "inner provider must not run before the requested crash"
+    );
+    assert!(!counter.exists(), "tool must not run before recovery");
+    service.evict_run_handle(&admitted.run_id);
+    service.inject_provider_host(Arc::new(provider.clone()));
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("recovery worker should finish");
+
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed".to_string()],
+        "{:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(provider.call_count(), 3);
+    assert_eq!(
+        fs::read(&counter).unwrap_or_else(|error| panic!(
+            "counter after retry: {error}; context={:?}; tool_results={:?}",
+            service
+                .run_context(&admitted.run_id)
+                .map(|context| context.limits.clone()),
+            durable_tool_result_messages(&service, &admitted.session_id)
+        )),
+        b"x",
+        "retry-safe pending request must execute the tool exactly once"
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "tool.started"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.completed"),
+        3
+    );
+    assert_tool_parent_chain(&service, &admitted.session_id, &admitted.run_id, &call);
+    let messages = service.session_messages(&admitted.session_id);
+    let chain = run_messages(&messages, &admitted.run_id);
+    let parent = assistant_tool_call(&chain, &call.id);
+    assert_eq!(parent["metadata"]["usage"]["total_tokens"], json!(18));
+    assert_eq!(parent["metadata"]["provider"], json!("scripted-provider"));
+    assert_eq!(parent["metadata"]["model"], json!("scripted-model"));
+    assert_eq!(parent["metadata"]["truncated"], json!(false));
+    assert_eq!(
+        parent["metadata"]["reasoning"],
+        json!({"summary": "append once"})
+    );
+    assert_eq!(parent["finish_reason"], json!("tool_calls"));
+    let metrics = service.metrics().snapshot();
+    assert_eq!(metrics.model_calls, 3);
+    assert_eq!(metrics.tool_calls, 1);
+    assert_eq!(metrics.turns, 3);
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(state);
+    fixture.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_recovery_rejects_changed_workspace_binding() {
+    let Some(sh) = require_posix_sh() else {
+        return;
+    };
+    let mut fixture = Fixture::new("pending-request-retry");
+    fixture.write_script("once.sh", once_source());
+    let counter = fixture.workspace.join("counter.txt");
+    let call = once_tool_call(&sh, "call-pending-retry");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(guardian_allow_response());
+    provider.push_ok(text_response("after-retry"));
+
+    let db = fixture.db_path();
+    let state = loop_service_sqlite_with_workspace(
+        AgentGatewayConfig::default(),
+        &provider,
+        &db,
+        &fixture.workspace,
+    );
+    let service = state.service();
+    apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
+    let admitted = service
+        .admit_external_with_workspace_selector(admit_request(), Some("name:edge".to_string()))
+        .await
+        .expect("admission should succeed");
+    service.inject_crash_after_provider_request();
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("crash worker should finish");
+
+    assert!(
+        terminal_events(&service, &admitted.run_id).is_empty(),
+        "pending request crash must not commit a terminal: {:?}",
+        service.run_events(&admitted.run_id)
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.requested"),
+        1
+    );
+    assert_eq!(
+        event_name_count(&service, &admitted.run_id, "model.completed"),
+        0
+    );
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "inner provider must not run before the requested crash"
+    );
+    assert!(!counter.exists(), "tool must not run before recovery");
+    service.evict_run_handle(&admitted.run_id);
+    // Remove the current trusted workspace declaration after the original admission.
+    fs::write(db.parent().expect("fixture DB parent").join("workspace-home/config.yaml"), "version: 1\nmodel:\n  provider: local-test\n  model: synthetic\nproviders:\n  local-test:\n    protocol: codex-responses\n    base_url: https://127.0.0.1:1\nworkspaces:\n  allowed_roots: []\n").expect("revoke workspace fixture policy");
+    service.inject_provider_host(Arc::new(provider.clone()));
+    tokio::time::timeout(WORKER_BUDGET, {
+        let service = service.clone();
+        let run_id = admitted.run_id.clone();
+        async move {
+            service.run_worker(run_id, "ignored".to_string()).await;
+        }
+    })
+    .await
+    .expect("recovery worker should finish");
+
+    assert!(
+        !counter.exists(),
+        "unavailable workspace must deny before a native effect"
+    );
+    let results = durable_tool_result_messages(&service, &admitted.session_id);
+    assert_eq!(results.len(), 1);
+    let content = &results[0]["content"];
+    assert!(
+        content.to_string().contains("workspace_unavailable"),
+        "{content}"
+    );
+    assert_eq!(content[0]["is_error"], true);
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(service);
+    drop(state);
+    fixture.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_recovery_does_not_turn_limits_path_into_authority() {
+    let Some(sh) = require_posix_sh() else {
+        return;
+    };
+    let mut fixture = Fixture::new("pending-request-retry");
+    fixture.write_script("once.sh", once_source());
+    let counter = fixture.workspace.join("counter.txt");
+    let call = once_tool_call(&sh, "call-pending-retry");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response("after-retry"));
 
     let db = fixture.db_path();
@@ -1106,44 +1492,20 @@ async fn pending_provider_request_restart_retries_without_duplicate_tool() {
     .await
     .expect("recovery worker should finish");
 
-    assert_eq!(
-        terminal_events(&service, &admitted.run_id),
-        vec!["run.completed".to_string()],
-        "{:?}",
-        service.run_events(&admitted.run_id)
+    assert!(
+        !counter.exists(),
+        "unavailable workspace must deny before a native effect"
     );
-    assert_eq!(provider.call_count(), 2);
-    assert_eq!(
-        fs::read(&counter).expect("counter after retry"),
-        b"x",
-        "retry-safe pending request must execute the tool exactly once"
+    let results = durable_tool_result_messages(&service, &admitted.session_id);
+    assert_eq!(results.len(), 1);
+    let content = &results[0]["content"];
+    assert!(
+        content.to_string().contains("workspace_unavailable"),
+        "{content}"
     );
-    assert_eq!(
-        event_name_count(&service, &admitted.run_id, "tool.started"),
-        1
-    );
-    assert_eq!(
-        event_name_count(&service, &admitted.run_id, "model.completed"),
-        2
-    );
-    assert_tool_parent_chain(&service, &admitted.session_id, &admitted.run_id, &call);
-    let messages = service.session_messages(&admitted.session_id);
-    let chain = run_messages(&messages, &admitted.run_id);
-    let parent = assistant_tool_call(&chain, &call.id);
-    assert_eq!(parent["metadata"]["usage"]["total_tokens"], json!(18));
-    assert_eq!(parent["metadata"]["provider"], json!("scripted-provider"));
-    assert_eq!(parent["metadata"]["model"], json!("scripted-model"));
-    assert_eq!(parent["metadata"]["truncated"], json!(false));
-    assert_eq!(
-        parent["metadata"]["reasoning"],
-        json!({"summary": "append once"})
-    );
-    assert_eq!(parent["finish_reason"], json!("tool_calls"));
-    let metrics = service.metrics().snapshot();
-    assert_eq!(metrics.model_calls, 2);
-    assert_eq!(metrics.tool_calls, 1);
-    assert_eq!(metrics.turns, 2);
+    assert_eq!(content[0]["is_error"], true);
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(service);
     drop(state);
     fixture.cleanup();
 }
@@ -1161,14 +1523,20 @@ async fn completed_provider_step_restart_replays_without_duplicate_tool() {
     let call = once_tool_call(&sh, "call-completed-replay");
     let provider = ScriptedProvider::new();
     provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response("after-replay"));
 
     let db = fixture.db_path();
-    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &db);
+    let state = loop_service_sqlite_with_workspace(
+        AgentGatewayConfig::default(),
+        &provider,
+        &db,
+        &fixture.workspace,
+    );
     let service = state.service();
     apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
     let admitted = service
-        .admit(admit_request())
+        .admit_external_with_workspace_selector(admit_request(), Some("name:edge".to_string()))
         .await
         .expect("admission should succeed");
     service.inject_crash_after_provider_commit();
@@ -1239,11 +1607,14 @@ async fn completed_provider_step_restart_replays_without_duplicate_tool() {
     );
     assert_eq!(
         provider.call_count(),
-        2,
+        3,
         "replayed completed step must not call the inner provider again for turn 1"
     );
     assert_eq!(
-        fs::read(&counter).expect("counter after replay"),
+        fs::read(&counter).unwrap_or_else(|error| panic!(
+            "counter after replay: {error}; tool_results={:?}",
+            durable_tool_result_messages(&service, &admitted.session_id)
+        )),
         b"x",
         "completed durable replay must execute the tool exactly once"
     );
@@ -1253,7 +1624,7 @@ async fn completed_provider_step_restart_replays_without_duplicate_tool() {
     );
     assert_eq!(
         event_name_count(&service, &admitted.run_id, "model.completed"),
-        2
+        3
     );
     assert_tool_parent_chain(&service, &admitted.session_id, &admitted.run_id, &call);
     let messages = service.session_messages(&admitted.session_id);
@@ -1265,13 +1636,13 @@ async fn completed_provider_step_restart_replays_without_duplicate_tool() {
     let metrics = service.metrics().snapshot();
     assert_eq!(
         metrics.model_calls,
-        first_metrics.model_calls + 1,
+        first_metrics.model_calls + 2,
         "replayed turn must not count a second model call"
     );
     assert_eq!(metrics.tool_calls, 1);
     assert_eq!(
         metrics.turns,
-        first_metrics.turns + 1,
+        first_metrics.turns + 2,
         "replayed completed step must not double-count turns"
     );
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
@@ -1292,6 +1663,7 @@ async fn completed_tool_step_restart_replays_without_duplicate_effect() {
     let call = once_tool_call(&sh, "call-tool-replay");
     let provider = ScriptedProvider::new();
     provider.push_ok(rich_tool_response(&call));
+    provider.push_ok(guardian_allow_response());
     provider.push_ok(text_response("after-tool-replay"));
 
     let db = fixture.db_path();
@@ -1335,7 +1707,7 @@ async fn completed_tool_step_restart_replays_without_duplicate_effect() {
         b"x",
         "first drive must execute the tool once"
     );
-    assert_eq!(provider.call_count(), 1);
+    assert_eq!(provider.call_count(), 2);
     let first_metrics = service.metrics().snapshot();
     assert_eq!(first_metrics.tool_failures, 0);
     service.evict_run_handle(&admitted.run_id);
@@ -1356,9 +1728,18 @@ async fn completed_tool_step_restart_replays_without_duplicate_effect() {
         "{:?}",
         service.run_events(&admitted.run_id)
     );
+    let final_event = service
+        .run_events(&admitted.run_id)
+        .into_iter()
+        .find(|event| event["event"] == "run.completed")
+        .expect("completed event");
+    assert!(
+        final_event.to_string().contains("after-tool-replay"),
+        "actual final completion: {final_event}"
+    );
     assert_eq!(
         provider.call_count(),
-        2,
+        3,
         "replayed tool must not call the inner provider again for turn 1"
     );
     assert_eq!(

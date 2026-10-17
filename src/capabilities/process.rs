@@ -145,6 +145,7 @@ struct ProcessInner {
     owner: CapabilityOwner,
     host_limits: ProcessLimits,
     root: ConfinedFsRoot,
+    workspace: Option<Arc<crate::auth::host::workspace::WorkspaceGrant>>,
     table: Mutex<HashMap<String, OwnedProcess>>,
     closing: AtomicBool,
     generation: AtomicU64,
@@ -211,6 +212,60 @@ impl ProcessCapability {
                 owner,
                 host_limits,
                 root,
+                workspace: None,
+                table: Mutex::new(HashMap::new()),
+                closing: AtomicBool::new(false),
+                generation: AtomicU64::new(1),
+                after_running_poll_hook: Mutex::new(None),
+                write_blocked_hook: Mutex::new(None),
+                before_write_cycle_hook: Mutex::new(None),
+                before_os_spawn_hook: Mutex::new(None),
+                after_os_spawn_hook: Mutex::new(None),
+                stdin_workers: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    /// Constructs a run-scoped process table by adopting a live workspace root.
+    pub(crate) fn new_adopted(
+        lifecycle: CapabilityLifecycle,
+        owner: CapabilityOwner,
+        host_limits: ProcessLimits,
+        workspace: Arc<crate::auth::host::workspace::WorkspaceGrant>,
+    ) -> Result<Self, CapabilityError> {
+        if host_limits.timeout_ms == 0
+            || host_limits.stdout_limit == 0
+            || host_limits.stderr_limit == 0
+            || host_limits.total_limit == 0
+            || host_limits.stdin_limit == 0
+            || host_limits.log_limit == 0
+        {
+            return Err(CapabilityError::new(
+                "invalid_configuration",
+                "process limits must be positive",
+            ));
+        }
+        workspace
+            .check()
+            .map_err(|_| CapabilityError::new("workspace_denied", "workspace is unavailable"))?;
+        let root = workspace
+            .held()
+            .root()
+            .adopt(ConfinedFsLimits {
+                max_read_bytes: MAX_READ_BYTES,
+                max_write_bytes: MAX_WRITE_BYTES,
+                max_entries: MAX_ENUM_ENTRIES,
+                max_entry_name_bytes: MAX_COMPONENT_BYTES,
+                max_temp_attempts: 32,
+            })
+            .map_err(|_| CapabilityError::new("workspace_denied", "workspace is unavailable"))?;
+        Ok(Self {
+            inner: Arc::new(ProcessInner {
+                lifecycle,
+                owner,
+                host_limits,
+                root,
+                workspace: Some(workspace),
                 table: Mutex::new(HashMap::new()),
                 closing: AtomicBool::new(false),
                 generation: AtomicU64::new(1),
@@ -622,6 +677,11 @@ impl ProcessCapability {
     }
 
     fn authorize(&self, token: &str, risk: CapabilityRisk) -> Result<TokenClaims, CapabilityError> {
+        if let Some(workspace) = &self.inner.workspace {
+            workspace.check().map_err(|_| {
+                CapabilityError::new("workspace_denied", "workspace is unavailable")
+            })?;
+        }
         match self
             .inner
             .lifecycle

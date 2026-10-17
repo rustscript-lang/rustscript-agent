@@ -8,16 +8,19 @@
 
 pub mod auth;
 pub mod capabilities;
+pub mod cli;
 pub mod config;
 pub mod config_file;
 #[cfg(feature = "config-fixture")]
 mod config_host;
 pub mod domain;
+pub mod effects;
 pub mod events;
 pub mod gateway;
 #[cfg(any(test, feature = "config-fixture"))]
 mod host_opaque;
 pub mod metrics;
+pub mod plugins;
 pub mod prompt;
 pub mod registry;
 pub mod runtime;
@@ -26,7 +29,11 @@ pub mod sqlite_storage_rows;
 pub mod tool_result;
 pub mod tool_schema;
 
+mod bundled_sources;
 mod durable_provider;
+mod transport;
+
+pub use bundled_sources::bundled_rss_sources;
 
 pub use auth::config::{AuthConfig, AuthConfigError, Credential, CredentialConfig};
 #[cfg(feature = "config-fixture")]

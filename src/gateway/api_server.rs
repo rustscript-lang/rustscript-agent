@@ -101,6 +101,11 @@ struct UpdateSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetSessionWorkspaceRequest {
+    workspace: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateRunRequest {
     input: Option<Value>,
     session_id: Option<String>,
@@ -108,6 +113,7 @@ struct CreateRunRequest {
     provider: Option<String>,
     parent_run_id: Option<String>,
     instructions: Option<String>,
+    workspace: Option<String>,
     #[serde(rename = "conversation_history")]
     conversation_history: Option<Value>,
     #[serde(flatten)]
@@ -140,6 +146,12 @@ struct JobRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalResolveRequest {
+    decision: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct JobListQuery {
     include_disabled: Option<bool>,
 }
@@ -162,6 +174,14 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
                 .delete(delete_session_handler),
         )
         .route(
+            "/v1/sessions/{session_id}/workspace",
+            post(set_session_workspace_handler),
+        )
+        .route(
+            "/v1/sessions/{session_id}/compact",
+            post(compact_session_handler),
+        )
+        .route(
             "/api/sessions/{session_id}/messages",
             get(session_messages_handler),
         )
@@ -172,6 +192,14 @@ pub fn build_agent_gateway_app(state: AgentGatewayState) -> Router {
         .route("/v1/runs", post(create_run_handler))
         .route("/v1/runs/{run_id}/events", get(run_events_handler))
         .route("/v1/runs/{run_id}/stop", post(stop_run_handler))
+        .route(
+            "/v1/runs/{run_id}/approvals",
+            get(list_pending_approvals_handler),
+        )
+        .route(
+            "/v1/runs/{run_id}/approvals/{approval_id}",
+            post(resolve_approval_handler),
+        )
         .route("/api/jobs", get(list_jobs_handler).post(create_job_handler))
         .route(
             "/api/jobs/{job_id}",
@@ -390,14 +418,26 @@ async fn health_detailed_handler(State(state): State<AgentGatewayState>) -> impl
     // scrape renders, so health and metrics can never disagree (one source
     // of truth) and neither endpoint ever touches the store.
     let snapshot = state.metrics.snapshot();
-    Json(json!({
+    let mut payload = json!({
         "status": "ok",
         "active_agents": snapshot.active_runs.max(0),
         // Runs whose terminal commit is awaiting the bounded durable retry
         // (observable instead of a silent leak).
         "terminal_pending": snapshot.runs_terminal_pending.max(0),
         "agent": state.config.agent_name,
-    }))
+    });
+    // Bounded public source facts for an RSS-selected entry: the native
+    // `kind`, the runner's native snapshot `hash`, and the policy's migration
+    // indicator. Never a raw selected path or source text. Absent for the
+    // legacy constructors that carry no RSS selection.
+    if let Some(source) = state.source_metadata() {
+        payload["source"] = json!({
+            "kind": source.kind,
+            "hash": source.hash,
+            "deprecated_override": source.deprecated_override,
+        });
+    }
+    Json(payload)
 }
 
 /// Prometheus text exposition of the bounded registry. Reads atomics only;
@@ -446,6 +486,7 @@ async fn create_session_handler(
                 .or_else(|| state.config.provider.clone()),
             source: request.source.clone().unwrap_or_else(|| "yahu".to_string()),
             system_prompt: request.system_prompt.clone(),
+            workspace: None,
             created_at: now,
             updated_at: now,
             message_count: 0,
@@ -499,6 +540,48 @@ async fn create_session_handler(
         )
     })
     .await
+}
+
+async fn set_session_workspace_handler(
+    State(state): State<AgentGatewayState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<SetSessionWorkspaceRequest>,
+) -> Response {
+    match state
+        .service
+        .bind_session_workspace(&session_id, request.workspace)
+        .await
+    {
+        Ok(session) => json_response(
+            StatusCode::OK,
+            json!({"object":"hermes.session", "session":session, "data":session}),
+        ),
+        Err(crate::service::AdmitError::SessionNotFound) => json_error(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "session does not exist",
+        ),
+        Err(crate::service::AdmitError::ActiveRun) => json_error(
+            StatusCode::CONFLICT,
+            "active_run",
+            "workspace cannot change while a run is active",
+        ),
+        Err(crate::service::AdmitError::Persistence(message)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_unavailable",
+            &message,
+        ),
+        Err(crate::service::AdmitError::Halting) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "halting",
+            "gateway is halting",
+        ),
+        Err(error) => json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_rejected",
+            &error.to_string(),
+        ),
+    }
 }
 
 async fn list_sessions_handler(
@@ -714,6 +797,27 @@ async fn session_messages_handler(
     )
 }
 
+fn compaction_error_response(error: crate::service::CompactionError) -> Response {
+    let status =
+        StatusCode::from_u16(error.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    json_error(status, &error.code, &error.message)
+}
+
+async fn compact_session_handler(
+    State(state): State<AgentGatewayState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let service = state.service();
+    match tokio::task::spawn_blocking(move || service.compact_session_explicit(&session_id)).await {
+        Ok(Ok(result)) => json_response(StatusCode::OK, result),
+        Ok(Err(error)) => compaction_error_response(error),
+        Err(error) => compaction_error_response(crate::service::CompactionError::from_rss(
+            "internal",
+            error.to_string(),
+        )),
+    }
+}
+
 async fn session_chat_handler(
     State(state): State<AgentGatewayState>,
     Path(session_id): Path<String>,
@@ -906,6 +1010,7 @@ async fn create_run_handler(
             "provider": request.provider.clone(),
             "parent_run_id": request.parent_run_id.clone(),
             "instructions": request.instructions.clone(),
+            "workspace": request.workspace.clone(),
             "conversation_history": request.conversation_history.clone(),
             "extra": request.extra.clone(),
         }))
@@ -930,17 +1035,20 @@ async fn create_run_handler(
     // cancellation and delivery state; rejection leaves nothing behind.
     let admitted = match state
         .service
-        .admit(crate::service::AdmitRunRequest {
-            input,
-            session_id: request.session_id.clone(),
-            model: request.model.clone(),
-            provider: request.provider.clone(),
-            parent_run_id: request.parent_run_id.clone(),
-            instructions: request.instructions.clone(),
-            platform: "api_server".to_string(),
-            idempotency_key,
-            idempotency_hash: request_hash,
-        })
+        .admit_external_with_workspace_selector(
+            crate::service::AdmitRunRequest {
+                input,
+                session_id: request.session_id.clone(),
+                model: request.model.clone(),
+                provider: request.provider.clone(),
+                parent_run_id: request.parent_run_id.clone(),
+                instructions: request.instructions.clone(),
+                platform: "api_server".to_string(),
+                idempotency_key,
+                idempotency_hash: request_hash,
+            },
+            request.workspace.clone(),
+        )
         .await
     {
         Ok(admitted) => admitted,
@@ -970,6 +1078,21 @@ async fn create_run_handler(
                 StatusCode::NOT_FOUND,
                 "session_not_found",
                 "session not found",
+            );
+        }
+        Err(AdmitError::SessionMaintenanceBusy(error)) => {
+            return json_error(
+                StatusCode::from_u16(error.http_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                &error.code,
+                &error.message,
+            );
+        }
+        Err(AdmitError::ActiveRun) => {
+            return json_error(
+                StatusCode::CONFLICT,
+                "active_run",
+                "session workspace cannot change while a run is active",
             );
         }
         Err(AdmitError::Persistence(message)) => {
@@ -1076,6 +1199,104 @@ async fn run_events_handler(
                 .text("keepalive"),
         )
         .into_response()
+}
+
+async fn list_pending_approvals_handler(
+    State(state): State<AgentGatewayState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    if state.config.bearer_token.is_none() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "approval_resolver_unconfigured",
+            "HTTP user approval requires bearer authentication",
+        );
+    }
+    let service = state.service.clone();
+    let lookup_run_id = run_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || service.pending_approvals(&lookup_run_id, None)).await;
+    match result {
+        Ok(Ok(approvals)) => json_response(
+            StatusCode::OK,
+            json!({ "run_id": run_id, "approvals": approvals }),
+        ),
+        Ok(Err("run_not_active")) => {
+            json_error(StatusCode::CONFLICT, "run_not_active", "run is not active")
+        }
+        Ok(Err(_)) | Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "approval_storage_unavailable",
+            "pending approvals could not be read",
+        ),
+    }
+}
+
+async fn resolve_approval_handler(
+    State(state): State<AgentGatewayState>,
+    Path((run_id, approval_id)): Path<(String, String)>,
+    Json(request): Json<ApprovalResolveRequest>,
+) -> Response {
+    if state.config.bearer_token.is_none() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "approval_resolver_unconfigured",
+            "HTTP user approval requires bearer authentication",
+        );
+    }
+    if !matches!(request.decision.as_str(), "approved" | "denied") {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "decision_invalid",
+            "decision must be approved or denied",
+        );
+    }
+    let service = state.service.clone();
+    let resolution_run_id = run_id.clone();
+    let resolution_approval_id = approval_id.clone();
+    let decision = request.decision.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        service.resolve_pending_approval(
+            &resolution_run_id,
+            &resolution_approval_id,
+            &decision,
+            "http-bearer",
+            None,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => json_response(
+            StatusCode::OK,
+            json!({ "run_id": run_id, "approval_id": approval_id, "state": request.decision }),
+        ),
+        Ok(Err("approval_not_found")) => json_error(
+            StatusCode::NOT_FOUND,
+            "approval_not_found",
+            "approval not found",
+        ),
+        Ok(Err("approval_owner_mismatch")) => json_error(
+            StatusCode::NOT_FOUND,
+            "approval_not_found",
+            "approval not found",
+        ),
+        Ok(Err("approval_expired")) => {
+            json_error(StatusCode::GONE, "approval_expired", "approval has expired")
+        }
+        Ok(Err("approval_not_pending")) => json_error(
+            StatusCode::CONFLICT,
+            "approval_not_pending",
+            "approval is no longer pending",
+        ),
+        Ok(Err("run_not_active")) => {
+            json_error(StatusCode::CONFLICT, "run_not_active", "run is not active")
+        }
+        Ok(Err(_)) | Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "approval_storage_unavailable",
+            "approval could not be resolved",
+        ),
+    }
 }
 
 async fn stop_run_handler(

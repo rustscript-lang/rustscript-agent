@@ -1,0 +1,169 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://schemas.rustscript.local/v1/plugin-graph-lock.schema.yaml
+title: RustScript plugin graph lock
+type: object
+additionalProperties: false
+required:
+  - closure
+  - compile_environment
+  - edges
+  - graph_id
+  - host_runtime
+  - packages
+properties:
+  closure:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - package
+        - entry
+        - effects
+      properties:
+        package:
+          type: string
+        entry:
+          type: string
+        effects:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - kind
+              - scope
+              - recovery
+              - via
+            properties:
+              kind:
+                type: string
+              scope:
+                type: string
+              recovery:
+                type: string
+              via:
+                type: object
+                additionalProperties: false
+                description: >
+                  Provenance of one effect. direct, plugin, and library stay
+                  distinct. delegated is not a collapsed label. Semver
+                  satisfaction of version_requirement is a Native check.
+                required:
+                  - relation
+                  - caller_package
+                  - caller_entry
+                  - alias
+                  - callee_package
+                  - callee_version
+                  - callee_entry
+                  - version_requirement
+                properties:
+                  relation:
+                    type: string
+                    enum:
+                      - direct
+                      - plugin
+                      - library
+                  caller_package:
+                    type: string
+                  caller_entry:
+                    type: string
+                  alias:
+                    type: string
+                  callee_package:
+                    type: string
+                  callee_version:
+                    type: string
+                  callee_entry:
+                    type: string
+                  version_requirement:
+                    type: string
+  compile_environment:
+    const: closed-bundle/agent.cap/v1
+  edges:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - from
+        - from_entry
+        - alias
+        - to
+        - to_version
+        - to_artifact_id
+        - to_entry
+        - relation
+        - version_requirement
+        - bindings
+      properties:
+        from:
+          type: string
+        from_entry:
+          type: string
+        alias:
+          type: string
+        to:
+          type: string
+        to_version:
+          type: string
+          description: Resolved callee revision. Not a content digest.
+        to_artifact_id:
+          type: string
+          description: Installed object id from the existing integrity contract.
+        to_entry:
+          type: string
+        relation:
+          type: string
+          enum:
+            - library
+            - plugin
+        version_requirement:
+          type: string
+          description: >
+            Caller requirement, verbatim. Satisfaction is a Native semantic
+            check and is not claimed by this schema.
+        bindings:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - kind
+              - scope
+              - recovery
+            properties:
+              kind:
+                type: string
+              scope:
+                type: string
+              recovery:
+                type: string
+  graph_id:
+    type: string
+    description: Opaque lock identity. Not a capability and not a content digest.
+  host_runtime:
+    type: string
+  packages:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - version
+        - kind
+        - artifact_id
+      properties:
+        id:
+          type: string
+        version:
+          type: string
+        kind:
+          type: string
+          enum:
+            - library
+            - tool
+        artifact_id:
+          type: string

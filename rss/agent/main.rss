@@ -9,8 +9,10 @@
 // never retried. Durability of messages/events is owned by AgentService.
 
 use agent;
+use agent_runtime;
 use json;
 use super::tools::dispatch as tools;
+use super::agent::guardian as guardian;
 
 // ---------------------------------------------------------------------------
 // Typed context accessors (same-module; defensive dynamic navigation)
@@ -347,17 +349,23 @@ fn tools_from_context(context: map) -> array {
 fn build_llm_request(context: map, messages: array) -> map {
     let limits: map = ctx_map(context, "limits");
     let sampling: map = ctx_map(context, "sampling");
+    let provider_options: map = ctx_map(context, "provider_options");
+    let mut credential_id: string = ctx_string(context, "credential_id", "");
+    if !context.has("credential_id") {
+        credential_id = ctx_string(provider_options, "credential_id", "");
+    }
     {
         provider: ctx_string(context, "provider", "openai"),
         model: ctx_string(context, "model", ""),
         messages: messages,
         tools: tools_from_context(context),
         tool_choice: ctx_string(context, "tool_choice", ""),
+        credential_id: credential_id,
         reasoning: ctx_string(context, "reasoning", ""),
         sampling: sampling,
         max_output_tokens: ctx_int(context, "max_output_tokens", ctx_int(limits, "max_output_tokens", 0)),
         stream: false,
-        provider_options: ctx_map(context, "provider_options")
+        provider_options: provider_options
     }
 }
 
@@ -374,6 +382,293 @@ fn response_is_malformed(response: map) -> bool {
         }
     }
     malformed
+}
+
+fn approval_settings(context: map) -> map {
+    let mut configured: map = ctx_map(context, "approval_settings");
+    if configured.length == 0 {
+        let metadata: map = ctx_map(context, "metadata");
+        configured = ctx_map(metadata, "approval_settings");
+    }
+    let provider_options: map = ctx_map(context, "provider_options");
+    let guardian_options: map = ctx_map(provider_options, "guardian");
+    {
+        read: ctx_string(configured, "read", ctx_string(guardian_options, "read", "allow")),
+        write: ctx_string(configured, "write", ctx_string(guardian_options, "write", "ask")),
+        process: ctx_string(configured, "process", ctx_string(guardian_options, "process", "ask")),
+        reviewer: ctx_string(configured, "reviewer", ctx_string(guardian_options, "reviewer", "guardian")),
+        reviewer_model: ctx_string(configured, "reviewer_model", ctx_string(guardian_options, "model", "")),
+        allow_user_fallback: ctx_bool(configured, "allow_user_fallback", ctx_bool(guardian_options, "allow_user_fallback", false)),
+        required: ctx_bool(configured, "required", ctx_bool(guardian_options, "required", true))
+    }
+}
+
+fn persist_approval_request(context: map, metadata: map, action: map) -> map {
+    let run_id: string = ctx_string(context, "run_id", "");
+    let session_id: string = ctx_string(context, "session_id", "");
+    let call_id: string = ctx_string(metadata, "call_id", "");
+    let approval_id: string = "guardian-approval:" + run_id + ":" + call_id;
+    let created_at_ms: int = ctx_int(ctx_map(context, "metadata"), "created_at_ms", 0);
+    let deadline_at_ms: int = ctx_int(ctx_map(context, "metadata"), "deadline_at_ms", 0);
+    let preview_result: map = guardian::action_preview(action);
+    let owner_preview: string = ctx_string(preview_result, "text", "");
+    let mut request: map = {
+        id: approval_id,
+        run_id: run_id,
+        session_id: session_id,
+        tool_call_id: call_id,
+        tool_name: ctx_string(action, "tool_name", ""),
+        arguments_json: "{}",
+        risk_class: ctx_string(action, "risk_class", ""),
+        decision_scope: "single_call",
+        one_time: 1,
+        requested_at_ms: created_at_ms,
+        expires_at_ms: deadline_at_ms
+    };
+    request.owner_preview = owner_preview;
+    let mut stored: map = {
+        ok: false,
+        result: { rows: [] },
+        error: { code: "approval_preview_unavailable" }
+    };
+    if ctx_bool(preview_result, "ok", false) && owner_preview != "" && agent::utf8_byte_len(owner_preview) <= 2048 {
+        stored = agent::approval_storage("request", request);
+    }
+    let data: map = ctx_map(stored, "result");
+    let rows: array = ctx_array(data, "rows");
+    let error: map = ctx_map(stored, "error");
+    let code: string = ctx_string(error, "code", "approval_storage_unavailable");
+    let mut valid: bool = ctx_bool(stored, "ok", false) && rows.length == 1;
+    if valid {
+        let row: array = rows[0];
+        if row.length < 12 {
+            valid = false;
+        } else if row[0] != approval_id || row[1] != run_id || row[2] != session_id || row[3] != call_id || row[4] != ctx_string(action, "tool_name", "") || row[5] != "{}" || row[6] != ctx_string(action, "risk_class", "") || row[7] != "pending" || row[8] != "single_call" || row[9] != 1 {
+            valid = false;
+        }
+    }
+    { ok: valid, approval_id: approval_id, code: code }
+}
+
+fn resolve_approval(context: map, approval_id: string, state: string, reason: string) -> bool {
+    let run_id: string = ctx_string(context, "run_id", "");
+    let resolved_at_ms: int = ctx_int(ctx_map(context, "metadata"), "created_at_ms", 0);
+    let result: map = agent::approval_storage("resolve", {
+        id: approval_id,
+        run_id: run_id,
+        state: state,
+        resolver: "guardian",
+        decision_reason: reason,
+        resolved_at_ms: resolved_at_ms
+    });
+    let data: map = ctx_map(result, "result");
+    ctx_bool(result, "ok", false) && ctx_int(data, "rows_affected", 0) == 1
+}
+
+fn wait_for_user_approval(context: map, approval_id: string) -> map {
+    let run_id: string = ctx_string(context, "run_id", "");
+    let session_id: string = ctx_string(context, "session_id", "");
+    let mut done: bool = false;
+    let mut result: map = { ok: false, code: "approval_wait_failed", message: "user approval could not be confirmed" };
+    while done == false {
+        let control: map = agent::control_check();
+        if ctx_bool(control, "ok", false) == false {
+            let error: map = ctx_map(control, "error");
+            result = { ok: false, code: ctx_string(error, "code", "cancelled"), message: "user approval wait was interrupted" };
+            done = true;
+        } else {
+            let stored: map = agent::approval_storage("get", { run_id: run_id, approval_id: approval_id });
+            let data: map = ctx_map(stored, "result");
+            let rows: array = ctx_array(data, "rows");
+            if ctx_bool(stored, "ok", false) == false || rows.length != 1 {
+                result = { ok: false, code: "approval_storage_unavailable", message: "pending user approval could not be read" };
+                done = true;
+            } else {
+                let row: array = rows[0];
+                if row.length < 8 || row[0] != approval_id || row[1] != run_id || row[2] != session_id {
+                    result = { ok: false, code: "approval_owner_mismatch", message: "approval owner changed; no action was executed" };
+                    done = true;
+                } else {
+                    let state: string = row[7].copy();
+                    if state == "approved" {
+                        result = { ok: true, code: "user_approved", message: "user approved this exact action" };
+                        done = true;
+                    } else if state == "denied" {
+                        result = { ok: false, code: "user_denied", message: "user denied this action; no action was executed" };
+                        done = true;
+                    } else if state == "expired" {
+                        result = { ok: false, code: "approval_expired", message: "approval expired; no action was executed" };
+                        done = true;
+                    } else if state != "pending" {
+                        result = { ok: false, code: "approval_state_invalid", message: "approval state is invalid" };
+                        done = true;
+                    } else {
+                        agent::sleep_ms(100);
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn decide_approval(context: map, action: map, approval_id: string) -> map {
+    let settings: map = approval_settings(context);
+    let provider_options: map = ctx_map(context, "provider_options");
+    let guardian_options: map = ctx_map(provider_options, "guardian");
+    let reviewer: string = ctx_string(settings, "reviewer", ctx_string(guardian_options, "reviewer", "guardian"));
+    let allow_user_fallback: bool = ctx_bool(settings, "allow_user_fallback", ctx_bool(guardian_options, "allow_user_fallback", false));
+    let mut result: map = { ok: false, code: "approval_failed", message: "Approval failed closed; no action was executed" };
+    if reviewer == "user" {
+        result = wait_for_user_approval(context, approval_id);
+    } else {
+        if reviewer != "guardian" {
+            result = { ok: false, code: "reviewer_invalid", message: "configured approval reviewer is invalid; no action was executed" };
+        } else {
+            let mut review_action: map = action;
+            review_action["_provider_step_key"] = "review:" + approval_id;
+            let assessment: map = guardian::review(context, review_action);
+            if ctx_string(assessment, "code", "") == "guardian_context_insufficient"
+                && allow_user_fallback
+                && ctx_bool(settings, "required", true) == false
+            {
+                result = wait_for_user_approval(context, approval_id);
+            } else {
+                if ctx_bool(assessment, "ok", false) == false {
+                    let reason: string = ctx_string(assessment, "code", "guardian_review_failed");
+                    if resolve_approval(context, approval_id, "denied", reason) {
+                        result = assessment;
+                    } else {
+                        result = { ok: false, code: "approval_resolution_failed", message: "Guardian decision could not be durably recorded; no action was executed" };
+                    }
+                } else {
+                    if resolve_approval(context, approval_id, "approved", "guardian_allowed") {
+                        result = { ok: true, code: "guardian_allowed", message: "Guardian approved this exact action" };
+                    } else {
+                        result = { ok: false, code: "approval_resolution_failed", message: "Guardian approval could not be durably recorded; no action was executed" };
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn dispatch_reviewed(context: map, call: map) -> map {
+    let metadata: map = ctx_map(context, "metadata");
+    let identity: string = ctx_string(metadata, "registry_identity", "");
+    let dispatch_input: map = {
+        call: call,
+        registry: tools_from_context(context),
+        registry_identity: identity,
+        admitted_registry_identity: identity,
+        run_id: ctx_string(context, "run_id", ""),
+        session_id: ctx_string(context, "session_id", ""),
+        created_at_ms: ctx_int(metadata, "created_at_ms", 0),
+        deadline_at_ms: ctx_int(metadata, "deadline_at_ms", 0),
+        config: ctx_map(context, "limits")
+    };
+    let facts: map = tools::approval_context(dispatch_input);
+    let mut result: map = {};
+    if ctx_bool(facts, "ok", false) == false {
+        result = tools::dispatch(dispatch_input);
+    } else {
+        let tool_metadata: map = ctx_map(facts, "metadata");
+        let replay: map = agent_runtime::tool_replay(tool_metadata);
+        if ctx_bool(replay, "ok", false) == false {
+            result = tools::approval_failure(
+                dispatch_input,
+                "tool_replay_failed",
+                "tool replay validation failed; no action was executed"
+            );
+        } else {
+            let replayed: bool = ctx_string(replay, "kind", "") == "replay";
+            let tool_metadata: map = ctx_map(facts, "metadata");
+            let action: map = ctx_map(facts, "action");
+            let settings: map = approval_settings(context);
+            let risk: string = ctx_string(tool_metadata, "risk_class", "");
+            let mode: string = if risk == "read" => {
+                ctx_string(settings, "read", "allow")
+            } else => {
+                if risk == "write" => {
+                    ctx_string(settings, "write", "ask")
+                } else => {
+                    if risk == "execute" => {
+                        ctx_string(settings, "process", "ask")
+                    } else => {
+                        "invalid"
+                    }
+                }
+            };
+            if replayed {
+                result = tools::dispatch(dispatch_input);
+            } else if mode == "deny" {
+                result = tools::approval_failure(
+                    dispatch_input,
+                    "approval_policy_denied",
+                    "configured approval policy denied this action"
+                );
+            } else if mode == "allow" {
+                if ctx_bool(facts, "review_required", false) {
+                    let attested: map = agent_runtime::approval_attest(tool_metadata);
+                    if ctx_bool(attested, "ok", false) {
+                        result = tools::dispatch(dispatch_input);
+                    } else {
+                        result = tools::approval_failure(
+                            dispatch_input,
+                            "approval_attestation_rejected",
+                            "native policy facts rejected this action"
+                        );
+                    }
+                } else {
+                    result = tools::dispatch(dispatch_input);
+                }
+            } else if mode == "ask" && ctx_bool(facts, "review_required", false) {
+                let persisted: map = persist_approval_request(context, tool_metadata, action);
+                if ctx_bool(persisted, "ok", false) == false {
+                    result = tools::approval_failure(
+                        dispatch_input,
+                        ctx_string(persisted, "code", "approval_persist_failed"),
+                        "approval request could not be durably recorded; no action was executed"
+                    );
+                } else {
+                    let approval_id: string = ctx_string(persisted, "approval_id", "");
+                    let decision: map = decide_approval(context, action, approval_id);
+                    if ctx_bool(decision, "ok", false) == false {
+                        result = tools::approval_failure(
+                            dispatch_input,
+                            ctx_string(decision, "code", "guardian_review_failed"),
+                            ctx_string(decision, "message", "Approval failed closed; no action was executed")
+                        );
+                    } else {
+                        let attested: map = agent_runtime::approval_attest(tool_metadata);
+                        if ctx_bool(attested, "ok", false) == false {
+                            result = tools::approval_failure(
+                                dispatch_input,
+                                "approval_attestation_rejected",
+                                "native approval facts changed; no action was executed"
+                            );
+                        } else {
+                            result = tools::dispatch(dispatch_input);
+                        }
+                    }
+                }
+            } else if mode == "ask" {
+                result = tools::approval_failure(
+                    dispatch_input,
+                    "approval_risk_unsupported",
+                    "the configured review mode is unsupported for this action"
+                );
+            } else {
+                result = tools::approval_failure(
+                    dispatch_input,
+                    "approval_policy_invalid",
+                    "configured approval policy is invalid"
+                );
+            }
+        }
+    }
+    result
 }
 
 fn dispatch_serial(context: map, calls: array, max_tool_calls: int, tool_calls_used: int) -> map {
@@ -400,14 +695,7 @@ fn dispatch_serial(context: map, calls: array, max_tool_calls: int, tool_calls_u
                     stopped = true;
                 } else {
                     let call: map = array_map(calls, i);
-                    let dispatched: map = tools::dispatch({
-                        call: call,
-                        registry: tools_from_context(context),
-                        registry_identity: ctx_string(ctx_map(context, "metadata"), "registry_identity", ""),
-                        admitted_registry_identity: ctx_string(ctx_map(context, "metadata"), "registry_identity", ""),
-                        run_id: ctx_string(context, "run_id", ""),
-                        config: ctx_map(context, "limits")
-                    });
+                    let dispatched: map = dispatch_reviewed(context, call);
                     let after: map = agent::control_check();
                     messages[messages.length] = tool_result_message(ctx_map(dispatched, "content_block"));
                     used += 1;
@@ -474,7 +762,18 @@ fn run_serial_loop(context: map) -> map {
     let mut running = true;
     let mut decision: map = failed_code("internal", "loop did not produce a decision", 0, 0, 0);
     while running {
-        let control: map = agent::control_check();
+        let mut refreshed: map = agent::refresh_context({
+            run_id: ctx_string(context, "run_id", ""),
+            session_id: ctx_string(context, "session_id", ""),
+            messages: messages
+        });
+        if ctx_bool(refreshed, "storage_available", true) == false {
+            refreshed = { ok: true, messages: messages };
+        }
+        let mut control: map = agent::control_check();
+        if ctx_bool(refreshed, "ok", false) == false {
+            control = { ok: false, error: ctx_map(refreshed, "error") };
+        }
         if ctx_bool(control, "ok", false) == false {
             decision = control_failed(control, turn, retry_count, tool_calls_used);
             running = false;
@@ -482,9 +781,11 @@ fn run_serial_loop(context: map) -> map {
             decision = failed_code("max_turns", "max_turns exceeded", turn, retry_count, tool_calls_used);
             running = false;
         } else {
+            messages = ctx_array(refreshed, "messages");
             let mut events: array = [];
             events[events.length] = { type: "model.started", turn: turn, model: model };
-            let request: map = build_llm_request(context, messages);
+            let mut request: map = build_llm_request(context, messages);
+            request["_provider_step_key"] = "business:" + json::encode(turn);
             let provider_result: map = agent::provider_call(request);
             let after: map = agent::control_check();
             if ctx_bool(after, "ok", false) == false {

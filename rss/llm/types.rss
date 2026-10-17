@@ -15,7 +15,7 @@
 //   sampling: {temperature: float|null, top_p: float|null}
 //   max_output_tokens: int
 //   stream: bool
-//   provider_options: {base_url, api_key, model, ...}
+//   provider_options: {base_url, model, adapter, ...} (public values only)
 //
 // Tool arguments and schemas travel as JSON strings (`arguments_json`,
 // `schema_json`) because RustScript's `json::encode` only accepts
@@ -138,10 +138,23 @@ pub fn error_new(
     if code == "interrupted_provider" {
         retryable = false;
     }
+    // Explicit quota signal is terminal and overrides 429/rate-limit
+    // retryability: the native sanitizer strips JSON `code` fields, so the
+    // public `type` is the usable distinguisher here. Canonicalize the
+    // returned code while keeping status/type/message/param/request_id.
+    let mut out_code: string = code;
+    if error_type == "insufficient_quota" {
+        retryable = false;
+        out_code = "insufficient_quota";
+    }
+    if code == "insufficient_quota" {
+        retryable = false;
+        out_code = "insufficient_quota";
+    }
     {
         status: status,
         type: error_type,
-        code: code,
+        code: out_code,
         message: message,
         param: param,
         request_id: request_id,
@@ -320,7 +333,32 @@ pub fn provider_options(request: map) -> map {
     request_map(request, "provider_options")
 }
 
-/// Resolved profile fields: `{provider, base_url, api_key, model}`.
+/// Checks only the bounded, top-level public profile option key set. Values
+/// are never read, rendered, or traversed.
+pub fn profile_options_are_public(options: map) -> bool {
+    if options.has("api_key") => {
+        false
+    } else if options.has("authorization") => {
+        false
+    } else if options.has("token") => {
+        false
+    } else if options.has("access_token") => {
+        false
+    } else if options.has("refresh_token") => {
+        false
+    } else if options.has("headers") => {
+        false
+    } else if options.has("cookie") => {
+        false
+    } else if options.has("cookies") => {
+        false
+    } else => {
+        true
+    }
+}
+
+/// Resolved public profile fields: `{provider, base_url, model}` plus adapter
+/// and capability metadata.
 pub fn profile_string(profile: map, key: string) -> string {
     request_string(profile, key)
 }

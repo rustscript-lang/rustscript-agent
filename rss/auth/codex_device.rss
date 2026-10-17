@@ -1,0 +1,1176 @@
+use auth;
+use json;
+use oauth;
+use self::types;
+
+// Unit-local guest declarations are required by the pinned parser; match types.rss.
+struct CodexDeviceLoginRequest {
+    policy_handle: resource<auth.policy>,
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int
+}
+
+struct CodexDeviceInstruction {
+    verification_url: string,
+    user_code: string,
+    expires_in_seconds: int
+}
+
+struct CodexDeviceLoginResult {
+    ok: bool,
+    code: string,
+    message: string,
+    metadata: AuthMetadataEnvelope?
+}
+
+
+
+struct DeviceUrlParts {
+    ok: bool,
+    authority: string,
+    path: string
+}
+
+struct DeviceLoginDetails {
+    provider: ProviderEntry,
+    credential_id: string,
+    expected_generation: int
+}
+
+struct DeviceLoginOutcome {
+    policy_handle: resource<auth.policy>,
+    result: CodexDeviceLoginResult
+}
+
+struct DeviceEndpointChoice {
+    ok: bool,
+    issuer: string,
+    client_id: string,
+    start_path: string,
+    poll_path: string,
+    authorization_path: string,
+    token_path: string,
+    redirect_uri: string,
+    error_code: string,
+    error_message: string
+}
+
+struct DeviceClockCheck {
+    ok: bool,
+    now_ms: int,
+    failure: CodexDeviceLoginResult
+}
+
+struct DeviceInterval {
+    ok: bool,
+    milliseconds: int
+}
+
+struct DeviceStart {
+    ok: bool,
+    failure: CodexDeviceLoginResult,
+    user_code: string,
+    interval_ms: int,
+    expires_in_seconds: int,
+    verification_url: string,
+    instruction: CodexDeviceInstruction
+}
+
+struct DeviceStartState {
+    policy_handle: resource<auth.policy>,
+    device_handle: resource<oauth.device_session>?,
+    start: DeviceStart
+}
+
+struct DevicePollState {
+    policy_handle: resource<auth.policy>,
+    device_handle: resource<oauth.device_session>?,
+    user_code: string,
+    interval_ms: int
+}
+
+struct DevicePoll {
+    policy_handle: resource<auth.policy>,
+    last_ms: int,
+    ok: bool,
+    failure: CodexDeviceLoginResult,
+    code_handle: resource<oauth.authorization_code>?,
+    verifier_handle: resource<oauth.verifier>?
+}
+
+struct DeviceStartJson {
+    client_id: string
+}
+
+struct DevicePollJson {
+    user_code: string
+}
+
+struct DeviceTokenForm {
+    grant_type: string,
+    client_id: string
+}
+
+
+fn default_issuer() -> string { "https://auth.openai.com" }
+fn default_client_id() -> string { "app_EMoamEEZ73f0CkXaXp7hrann" }
+fn default_start_path() -> string { "/api/accounts/deviceauth/usercode" }
+fn default_poll_path() -> string { "/api/accounts/deviceauth/token" }
+fn default_authorization_path() -> string { "/codex/device" }
+fn default_token_path() -> string { "/oauth/token" }
+fn default_redirect_suffix() -> string { "/deviceauth/callback" }
+fn flow_deadline_ms() -> int { 900000 }
+fn default_interval_ms() -> int { 5000 }
+fn min_interval_ms() -> int { 1000 }
+fn max_interval_ms() -> int { 60000 }
+fn max_int() -> int { 9223372036854775807 }
+
+fn failed(code: string, message: string) -> CodexDeviceLoginResult {
+    {ok: false, code: code, message: message, metadata: null}
+}
+
+fn empty_instruction() -> CodexDeviceInstruction {
+    {verification_url: "", user_code: "", expires_in_seconds: 0}
+}
+
+fn empty_transport_response() -> TransportResponseEnvelope {
+    {ok: false, error: null, status: 0, public_headers: [], body_without_secret_fields: "", retry_after_ms: null, access_slot: null, refresh_slot: null, device_handle: null}
+}
+
+fn empty_transport_capture() -> TransportCaptureEnvelope {
+    {ok: false, error: null, response: empty_transport_response(), code_handle: null, verifier_handle: null}
+}
+
+fn empty_auth_metadata() -> AuthMetadataEnvelope {
+    {
+        ok: false,
+        error: null,
+        metadata: {credential_id: "", provider: "", kind: "", source: "", token_type: "", expires_at_ms: 0, scopes: [], account_id: null, generation: 0, status: "", last_refresh_at_ms: null, has_refresh_token: false},
+        outcome: ""
+    }
+}
+
+fn succeeded(metadata: AuthMetadataEnvelope) -> CodexDeviceLoginResult {
+    {ok: true, code: "ok", message: "Codex device login completed.", metadata: metadata}
+}
+
+fn static_failure(error_code: AuthBridgeFailure?, stage_code: string, stage_message: string) -> CodexDeviceLoginResult {
+    let mut code: string = stage_code;
+    let mut message: string = stage_message;
+    if error_code != null {
+        let detail: AuthBridgeFailure = error_code;
+        if detail.code.copy() == "policy_inactive" {
+            code = "cancelled_or_inactive";
+            message = "The login was cancelled or is no longer active.";
+        }
+        if detail.code.copy() == "wait_deadline_exceeded" {
+            code = "deadline_or_inactive";
+            message = "The login wait ended at an inactive deadline.";
+        }
+        if detail.code.copy() == "clock_unavailable" {
+            code = "clock_unavailable";
+            message = "The login clock is unavailable.";
+        }
+    }
+    failed(code, message)
+}
+
+fn char_at(value: string, index: int) -> string {
+    value[index:(index + 1)]
+}
+
+fn digit_value(value: string) -> int {
+    if value == "0" => { 0 }
+    else if value == "1" => { 1 }
+    else if value == "2" => { 2 }
+    else if value == "3" => { 3 }
+    else if value == "4" => { 4 }
+    else if value == "5" => { 5 }
+    else if value == "6" => { 6 }
+    else if value == "7" => { 7 }
+    else if value == "8" => { 8 }
+    else if value == "9" => { 9 }
+    else => { -1 }
+}
+
+fn is_ascii_alnum(value: string) -> bool {
+    value.length == 1 && find_text("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", value) >= 0
+}
+
+fn find_text(value: string, needle: string) -> int {
+    let mut found: int = -1;
+    let mut index: int = 0;
+    while found < 0 && index + needle.length <= value.length {
+        if value[index:(index + needle.length)] == needle {
+            found = index;
+        }
+        index = index + 1;
+    }
+    found
+}
+
+fn safe_authority(value: string) -> bool {
+    let mut valid: bool = value.length > 0 && value.length <= 253;
+    let colon: int = find_text(value, ":");
+    let mut host_end: int = value.length;
+    let mut port_start: int = value.length;
+    if colon >= 0 {
+        host_end = colon;
+        port_start = colon + 1;
+        if find_text(value[port_start:value.length], ":") >= 0 {
+            valid = false;
+        }
+        if port_start >= value.length || value.length - port_start > 5 {
+            valid = false;
+        }
+        let mut port_value: int = 0;
+        let mut port_index: int = port_start;
+        while valid && port_index < value.length {
+            let digit: string = char_at(value, port_index);
+            if digit_value(digit) < 0 {
+                valid = false;
+            } else {
+                port_value = port_value * 10 + digit_value(digit);
+            }
+            port_index = port_index + 1;
+        }
+        if port_value < 1 || port_value > 65535 {
+            valid = false;
+        }
+    }
+    if host_end == 0 {
+        valid = false;
+    }
+    if valid {
+        let host: string = value[0:host_end];
+        if char_at(host, 0) == "." || char_at(host, host.length - 1) == "." ||
+           char_at(host, 0) == "-" || char_at(host, host.length - 1) == "-" {
+            valid = false;
+        }
+        let mut index: int = 0;
+        while valid && index < host.length {
+            let character: string = char_at(host, index);
+            if !is_ascii_alnum(character) && character != "." && character != "-" {
+                valid = false;
+            }
+            if character == "." && index > 0 && char_at(host, index - 1) == "." {
+                valid = false;
+            }
+            index = index + 1;
+        }
+    }
+    valid
+}
+
+fn safe_endpoint_path(value: string) -> bool {
+    let mut valid: bool = value.length > 0 && value.length <= 2048 && char_at(value, 0) == "/";
+    if value.length > 1 && char_at(value, 1) == "/" {
+        valid = false;
+    }
+    let mut index: int = 0;
+    while valid && index < value.length {
+        let character: string = char_at(value, index);
+        if !is_ascii_alnum(character) && character != "/" && character != "." &&
+           character != "-" && character != "_" && character != "~" {
+            valid = false;
+        }
+        if character == "." && index + 1 < value.length && char_at(value, index + 1) == "." {
+            valid = false;
+        }
+        index = index + 1;
+    }
+    valid
+}
+
+fn parse_https_url(value: string) -> DeviceUrlParts {
+    let separator: int = find_text(value, "://");
+    let mut parts: DeviceUrlParts = {ok: false, authority: "", path: ""};
+    if separator == 5 && value[0:5] == "https" {
+        let authority_start: int = separator + 3;
+        let mut authority_end: int = authority_start;
+        while authority_end < value.length && char_at(value, authority_end) != "/" {
+            authority_end = authority_end + 1;
+        }
+        let authority: string = value[authority_start:authority_end];
+        let mut path: string = "/";
+        if authority_end < value.length {
+            path = value[authority_end:value.length];
+        }
+        if safe_authority(authority) && safe_endpoint_path(path) {
+            parts = {ok: true, authority: authority, path: path};
+        }
+    }
+    parts
+}
+
+fn safe_relative_path(value: string) -> bool {
+    safe_endpoint_path(value)
+}
+
+fn trim_trailing_slashes(value: string) -> string {
+    let mut end: int = value.length;
+    while end > 0 && char_at(value, end - 1) == "/" {
+        end = end - 1;
+    }
+    value[0:end]
+}
+
+fn configured(value: string?, fallback: string) -> string {
+    let mut selected: string = fallback;
+    if value != null {
+        let actual: string = value;
+        if actual != "" {
+            selected = actual;
+        }
+    }
+    selected
+}
+
+fn invalid_endpoints(message: string) -> DeviceEndpointChoice {
+    {
+        ok: false,
+        issuer: "",
+        client_id: "",
+        start_path: "",
+        poll_path: "",
+        authorization_path: "",
+        token_path: "",
+        redirect_uri: "",
+        error_code: "invalid_provider_config",
+        error_message: message
+    }
+}
+
+fn endpoint_choice(provider: ProviderEntry, credential_id: string, expected_generation: int) -> DeviceEndpointChoice {
+    if expected_generation < 0 || credential_id == "" => {
+        invalid_endpoints("The selected credential request is invalid.")
+    } else if provider.auth == null => {
+        invalid_endpoints("The selected provider does not match the credential.")
+    } else if provider.oauth == null => {
+        invalid_endpoints("The selected provider has no device-login configuration.")
+    } else => {
+        let selected_id: string = provider.auth;
+        let config: OAuthConfig = provider.oauth;
+        if selected_id != credential_id => {
+            invalid_endpoints("The selected provider does not match the credential.")
+        } else if config.flow != "codex-device" => {
+            invalid_endpoints("The selected provider does not support Codex device login.")
+        } else => {
+            let issuer: string = configured(config.issuer, default_issuer());
+            let issuer_parts: DeviceUrlParts = parse_https_url(issuer);
+            let client_id: string = configured(config.client_id, default_client_id());
+            let start_path: string = configured(config.device_user_code_path, default_start_path());
+            let poll_path: string = configured(config.device_poll_path, default_poll_path());
+            let authorization_path: string = configured(config.authorization_path, default_authorization_path());
+            let token_value: string = configured(config.token_endpoint, "");
+            let mut token_path: string = default_token_path();
+            let mut token_valid: bool = true;
+            if token_value != "" {
+                let token_parts: DeviceUrlParts = parse_https_url(token_value);
+                if !token_parts.ok || token_parts.authority != issuer_parts.authority {
+                    token_valid = false;
+                } else {
+                    token_path = token_parts.path;
+                }
+            }
+            let mut redirect_uri: string = configured(config.redirect_uri, "");
+            if redirect_uri == "" {
+                redirect_uri = trim_trailing_slashes(issuer) + default_redirect_suffix();
+            }
+            let mut config_valid: bool = issuer_parts.ok && token_valid &&
+                safe_relative_path(start_path) && safe_relative_path(poll_path) &&
+                safe_relative_path(authorization_path) && safe_relative_path(token_path) &&
+                client_id.length > 0 && client_id.length <= 256 &&
+                redirect_uri.length > 0 && redirect_uri.length <= 2048;
+            if config_valid {
+                let mut index: int = 0;
+                while config_valid && index < redirect_uri.length {
+                    let ch: string = char_at(redirect_uri, index);
+                    if ch == "\n" || ch == "\r" || ch == "\t" || ch == "\0" {
+                        config_valid = false;
+                    }
+                    index = index + 1;
+                }
+            }
+            if !config_valid => {
+                invalid_endpoints("The selected provider endpoints are not supported.")
+            } else => {
+                {
+                    ok: true,
+                    issuer: issuer,
+                    client_id: client_id,
+                    start_path: start_path,
+                    poll_path: poll_path,
+                    authorization_path: authorization_path,
+                    token_path: token_path,
+                    redirect_uri: redirect_uri,
+                    error_code: "",
+                    error_message: ""
+                }
+            }
+        }
+    }
+}
+
+fn clock_check_value(read: OAuthNowResultEnvelope, deadline_ms: int, previous_ms: int) -> DeviceClockCheck {
+    if !read.ok => {
+        {
+            ok: false,
+            now_ms: previous_ms,
+            failure: static_failure(read.error, "clock_unavailable", "The login clock is unavailable.")
+        }
+    } else if read.value.copy() == null => {
+        {
+            ok: false,
+            now_ms: previous_ms,
+            failure: failed("clock_unavailable", "The login clock is unavailable.")
+        }
+    } else => {
+        let current_ms: int = read.value.copy();
+        if current_ms < 0 || current_ms < previous_ms => {
+            {
+                ok: false,
+                now_ms: current_ms,
+                failure: failed("clock_unavailable", "The login clock is unavailable.")
+            }
+        } else if current_ms >= deadline_ms => {
+            {
+                ok: false,
+                now_ms: current_ms,
+                failure: failed("timeout", "Codex device login timed out.")
+            }
+        } else => {
+            {ok: true, now_ms: current_ms, failure: failed("", "")}
+        }
+    }
+}
+
+fn interval_from_field(field: PublicJsonFieldResultEnvelope) -> DeviceInterval {
+    if !field.ok || field.value.copy() == null => {
+        {ok: false, milliseconds: 0}
+    } else => {
+        let parsed: PublicJsonFieldEnvelope = field.value.copy();
+        if parsed.kind.copy() == "missing" => {
+            {ok: true, milliseconds: default_interval_ms()}
+        } else if parsed.kind.copy() == "int" && parsed.int_value.copy() != null => {
+            let seconds: int = parsed.int_value.copy();
+            if seconds < 0 => {
+                {ok: false, milliseconds: 0}
+            } else if seconds == 0 => {
+                {ok: true, milliseconds: min_interval_ms()}
+            } else if seconds >= 60 => {
+                {ok: true, milliseconds: max_interval_ms()}
+            } else => {
+                {ok: true, milliseconds: seconds * 1000}
+            }
+        } else if parsed.kind.copy() == "string" && parsed.string_value.copy() != null => {
+            let text: string = parsed.string_value.copy();
+            parse_interval_string(text)
+        } else => {
+            {ok: false, milliseconds: 0}
+        }
+    }
+}
+
+fn parse_interval_string(value: string) -> DeviceInterval {
+    let mut start: int = 0;
+    let mut end: int = value.length;
+    while start < end && (char_at(value, start) == " " || char_at(value, start) == "\t" || char_at(value, start) == "\r" || char_at(value, start) == "\n") {
+        start = start + 1;
+    }
+    while end > start && (char_at(value, end - 1) == " " || char_at(value, end - 1) == "\t" || char_at(value, end - 1) == "\r" || char_at(value, end - 1) == "\n") {
+        end = end - 1;
+    }
+    let mut valid: bool = end > start && end - start <= 32;
+    let text: string = value[start:end];
+    if valid && text.length > 1 && char_at(text, 0) == "0" {
+        valid = false;
+    }
+    let mut seconds: int = 0;
+    let mut index: int = 0;
+    while valid && index < text.length {
+        let digit: string = char_at(text, index);
+        if digit_value(digit) < 0 {
+            valid = false;
+        } else if seconds <= 60 {
+            let next: int = seconds * 10 + digit_value(digit);
+            if next > 60 {
+                seconds = 61;
+            } else {
+                seconds = next;
+            }
+        }
+        index = index + 1;
+    }
+    if !valid => {
+        {ok: false, milliseconds: 0}
+    } else if seconds == 0 => {
+        {ok: true, milliseconds: min_interval_ms()}
+    } else if seconds >= 60 => {
+        {ok: true, milliseconds: max_interval_ms()}
+    } else => {
+        {ok: true, milliseconds: seconds * 1000}
+    }
+}
+
+fn valid_user_code(value: string) -> bool {
+    let mut valid: bool = value.length > 0 && value.length <= 64;
+    let mut index: int = 0;
+    while valid && index < value.length {
+        let character: string = char_at(value, index);
+        if !is_ascii_alnum(character) && character != "-" {
+            valid = false;
+        }
+        index = index + 1;
+    }
+    valid
+}
+
+fn user_code_from_body(primary: PublicJsonFieldResultEnvelope, legacy: PublicJsonFieldResultEnvelope) -> DeviceStart {
+    let mut selected: string = "";
+    let mut valid: bool = false;
+    if primary.ok && primary.value.copy() != null && legacy.ok && legacy.value.copy() != null {
+        let primary_value: PublicJsonFieldEnvelope = primary.value.copy();
+        let legacy_value: PublicJsonFieldEnvelope = legacy.value.copy();
+        if primary_value.kind.copy() == "string" && primary_value.string_value.copy() != null {
+            selected = primary_value.string_value.copy();
+            valid = true;
+            if legacy_value.kind.copy() != "missing" {
+                if legacy_value.kind.copy() != "string" || legacy_value.string_value.copy() == null {
+                    valid = false;
+                } else if legacy_value.string_value.copy() != selected.copy() {
+                    valid = false;
+                }
+            }
+        } else if primary_value.kind.copy() == "missing" && legacy_value.kind.copy() == "string" && legacy_value.string_value.copy() != null {
+            selected = legacy_value.string_value.copy();
+            valid = true;
+        }
+    }
+    if valid && valid_user_code(selected.copy()) => {
+        {ok: true, failure: failed("", ""), user_code: selected, interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+    } else => {
+        {ok: false, failure: failed("invalid_start_response", "The device authorization response is invalid."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+    }
+}
+
+fn interval_from_body(field: PublicJsonFieldResultEnvelope) -> DeviceInterval {
+    interval_from_field(field)
+}
+
+fn start_expiry(field: PublicJsonFieldResultEnvelope) -> int {
+    if !field.ok || field.value.copy() == null => {
+        0
+    } else => {
+        let parsed: PublicJsonFieldEnvelope = field.value.copy();
+        if parsed.kind.copy() == "missing" => {
+            900
+        } else if parsed.kind.copy() == "int" && parsed.int_value.copy() != null => {
+            let seconds: int = parsed.int_value.copy();
+            if seconds > 0 => {
+                if seconds > 900 => { 900 } else => { seconds }
+            } else => { 0 }
+        } else => { 0 }
+    }
+}
+
+struct DeviceHandlePresence {
+    handle: resource<oauth.device_session>?
+}
+
+struct DeviceStartResponseParts {
+    status: int,
+    ok: bool,
+    body: string,
+    device: DeviceHandlePresence
+}
+
+fn device_start_response_parts(response: TransportResponseEnvelope) -> DeviceStartResponseParts {
+    let has_device: bool = response.has("device_handle");
+    let device: DeviceHandlePresence = if has_device => {
+        {handle: response.device_handle}
+    } else => {
+        {handle: null}
+    };
+    let response_status: int = response.status;
+    let response_ok: bool = response.ok;
+    let response_body: string = response.body_without_secret_fields;
+    {status: response_status, ok: response_ok, body: response_body, device: device}
+}
+
+fn device_start(policy: resource<auth.policy>, credential_id: string, endpoints: DeviceEndpointChoice) -> DeviceStartState {
+    let start_body: DeviceStartJson = {client_id: endpoints.client_id};
+    let public_body: string = json::encode(start_body);
+    let request: TransportPublicRequest = {
+        policy_handle: policy,
+        credential_id: credential_id,
+        method: "POST",
+        path: endpoints.start_path,
+        public_headers: [{name: "content-type", value: "application/json"}],
+        public_body: public_body
+    };
+    let usage: TransportCredentialUse = {kind: "none", access_handle: null, refresh_handle: null, code_handle: null, verifier_handle: null, device_handle: null};
+    let response: TransportResultEnvelope = oauth::transport_result(&request, &usage);
+    let response_value: TransportResponseEnvelope? = response.value;
+    let value: TransportResponseEnvelope = response_value.unwrap_or(empty_transport_response());
+    let parts: DeviceStartResponseParts = device_start_response_parts(value);
+    let response_status: int = parts.status;
+    let value_ok: bool = parts.ok;
+    let start_response_body: string = parts.body;
+    let device_holder: DeviceHandlePresence = parts.device;
+    let has_device_handle: bool = device_holder.has("handle");
+    let start: DeviceStart = if !response.ok => {
+        {ok: false, failure: static_failure(response.error, "start_transport_failed", "Device authorization could not be started."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+    } else => {
+        if !value_ok => {
+            {ok: false, failure: failed("start_transport_failed", "Device authorization could not be started."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+        } else if response_status.copy() == 404 => {
+            {ok: false, failure: failed("device_login_unavailable", "Codex device login is unavailable for this provider."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+        } else if response_status.copy() < 200 || response_status.copy() >= 300 => {
+            {ok: false, failure: failed("start_rejected", "Device authorization was rejected."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+        } else if !has_device_handle => {
+            {ok: false, failure: failed("invalid_start_response", "The device authorization response is invalid."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+        } else => {
+            let parsed_user: DeviceStart = user_code_from_body(
+                oauth::public_json_field_result(&request.policy_handle, start_response_body.copy(), "/user_code"),
+                oauth::public_json_field_result(&request.policy_handle, start_response_body.copy(), "/usercode")
+            );
+            let parsed_interval: DeviceInterval = interval_from_body(oauth::public_json_field_result(&request.policy_handle, start_response_body.copy(), "/interval"));
+            let expires: int = start_expiry(oauth::public_json_field_result(&request.policy_handle, start_response_body.copy(), "/expires_in"));
+            if !parsed_user.ok || !parsed_interval.ok || expires <= 0 => {
+                {ok: false, failure: failed("invalid_start_response", "The device authorization response is invalid."), user_code: "", interval_ms: 0, expires_in_seconds: 0, verification_url: "", instruction: empty_instruction()}
+            } else => {
+                let verification_url: string = trim_trailing_slashes(endpoints.issuer) + endpoints.authorization_path;
+                let user_code: string = parsed_user.user_code.copy();
+                let instruction: CodexDeviceInstruction = {verification_url: verification_url.copy(), user_code: user_code.copy(), expires_in_seconds: expires};
+                {ok: true, failure: failed("", ""), user_code: user_code, interval_ms: parsed_interval.milliseconds, expires_in_seconds: expires, verification_url: verification_url, instruction: instruction}
+            }
+        }
+    };
+    let response_device_handle: resource<oauth.device_session>? = device_holder?.handle;
+    {policy_handle: request.policy_handle, device_handle: response_device_handle, start: start}
+}
+
+struct SecretSlotPresence {
+    handle: resource<auth.secret_slot>?
+}
+
+struct CodeHandlePresence {
+    handle: resource<oauth.authorization_code>?
+}
+
+struct VerifierHandlePresence {
+    handle: resource<oauth.verifier>?
+}
+
+struct DeviceCaptureParts {
+    ok: bool,
+    response: TransportResponseEnvelope,
+    code: CodeHandlePresence,
+    verifier: VerifierHandlePresence
+}
+
+fn device_capture_parts(envelope: TransportCaptureEnvelope) -> DeviceCaptureParts {
+    let has_code: bool = envelope.has("code_handle");
+    let has_verifier: bool = envelope.has("verifier_handle");
+    let capture_ok: bool = envelope.ok;
+    let response: TransportResponseEnvelope = envelope.response;
+    if has_code && has_verifier => {
+        {ok: capture_ok, response: response, code: {handle: envelope.code_handle}, verifier: {handle: envelope.verifier_handle}}
+    } else if has_code => {
+        {ok: capture_ok, response: response, code: {handle: envelope.code_handle}, verifier: {handle: null}}
+    } else if has_verifier => {
+        {ok: capture_ok, response: response, code: {handle: null}, verifier: {handle: envelope.verifier_handle}}
+    } else => {
+        {ok: capture_ok, response: response, code: {handle: null}, verifier: {handle: null}}
+    }
+}
+
+struct ExchangeResponseParts {
+    status: int,
+    ok: bool,
+    body: string,
+    access: SecretSlotPresence,
+    refresh: SecretSlotPresence
+}
+
+struct PollResponseParts {
+    status: int,
+    has_retry_after: bool,
+    retry_after_ms: int,
+    access: SecretSlotPresence,
+    refresh: SecretSlotPresence,
+    device: DeviceHandlePresence
+}
+
+fn exchange_response_parts(response: TransportResponseEnvelope) -> ExchangeResponseParts {
+    let has_access: bool = response.has("access_slot");
+    let has_refresh: bool = response.has("refresh_slot");
+    let response_status: int = response.status;
+    let response_ok: bool = response.ok;
+    let response_body: string = response.body_without_secret_fields;
+    if has_access && has_refresh => {
+        {status: response_status, ok: response_ok, body: response_body, access: {handle: response.access_slot}, refresh: {handle: response.refresh_slot}}
+    } else if has_access => {
+        {status: response_status, ok: response_ok, body: response_body, access: {handle: response.access_slot}, refresh: {handle: null}}
+    } else if has_refresh => {
+        {status: response_status, ok: response_ok, body: response_body, access: {handle: null}, refresh: {handle: response.refresh_slot}}
+    } else => {
+        {status: response_status, ok: response_ok, body: response_body, access: {handle: null}, refresh: {handle: null}}
+    }
+}
+
+fn poll_response_parts(response: TransportResponseEnvelope) -> PollResponseParts {
+    let has_access: bool = response.has("access_slot");
+    let has_refresh: bool = response.has("refresh_slot");
+    let has_device: bool = response.has("device_handle");
+    let retry_after_field_present: bool = response.has("retry_after_ms");
+    let response_status: int = response.status;
+    let mut has_retry_after: bool = false;
+    let mut retry_after: int = 0;
+    if retry_after_field_present {
+        let retry_after_value: int? = response.retry_after_ms;
+        if retry_after_value != null {
+            has_retry_after = true;
+            retry_after = retry_after_value.copy();
+        }
+    }
+    if has_access && has_refresh && has_device => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: response.refresh_slot}, device: {handle: response.device_handle}}
+    } else if has_access && has_refresh => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: response.refresh_slot}, device: {handle: null}}
+    } else if has_access && has_device => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: null}, device: {handle: response.device_handle}}
+    } else if has_refresh && has_device => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: response.refresh_slot}, device: {handle: response.device_handle}}
+    } else if has_access => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: response.access_slot}, refresh: {handle: null}, device: {handle: null}}
+    } else if has_refresh => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: response.refresh_slot}, device: {handle: null}}
+    } else if has_device => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: null}, device: {handle: response.device_handle}}
+    } else => {
+        {status: response_status, has_retry_after: has_retry_after, retry_after_ms: retry_after, access: {handle: null}, refresh: {handle: null}, device: {handle: null}}
+    }
+}
+
+fn poll_until_complete(state: DevicePollState, credential_id: string, endpoints: DeviceEndpointChoice, deadline_ms: int, last_ms: int) -> DevicePoll {
+    let mut complete: bool = false;
+    let mut keep_polling: bool = true;
+    let mut code_handle: resource<oauth.authorization_code>? = null;
+    let mut verifier_handle: resource<oauth.verifier>? = null;
+    let mut failure: CodexDeviceLoginResult = failed("poll_failed", "Codex device authorization did not complete.");
+    let base_interval_ms: int = state.interval_ms;
+    let mut retry_delay_ms: int = base_interval_ms;
+    let mut next_poll_delay_ms: int = base_interval_ms;
+    let mut current_ms: int = last_ms;
+    let mut first_poll: bool = true;
+    let poll_body: DevicePollJson = {user_code: state.user_code};
+    let public_body: string = json::encode(poll_body);
+    let request: TransportPublicRequest = {
+        policy_handle: state.policy_handle,
+        credential_id: credential_id,
+        method: "POST",
+        path: endpoints.poll_path,
+        public_headers: [{name: "content-type", value: "application/json"}],
+        public_body: public_body
+    };
+    let usage: TransportCredentialUse = {kind: "device_session", access_handle: null, refresh_handle: null, code_handle: null, verifier_handle: null, device_handle: state.device_handle};
+    while keep_polling {
+        if !first_poll {
+            let before_wait: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&request.policy_handle), deadline_ms, current_ms);
+            current_ms = before_wait.now_ms.copy();
+            if !before_wait.ok {
+                failure = before_wait.failure;
+                keep_polling = false;
+            } else {
+                let remaining: int = deadline_ms - before_wait.now_ms.copy();
+                let mut delay: int = next_poll_delay_ms;
+                if delay > max_interval_ms() { delay = max_interval_ms(); }
+                if delay > remaining { delay = remaining; }
+                if delay <= 0 {
+                    failure = failed("timeout", "Codex device login timed out.");
+                    keep_polling = false;
+                } else {
+                    let waited: OAuthWaitResultEnvelope = oauth::wait_ms_result(&request.policy_handle, delay);
+                    if !waited.ok {
+                        failure = static_failure(waited.error, "wait_failed", "The device-login wait could not continue.");
+                        keep_polling = false;
+                    } else {
+                        let after_wait: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&request.policy_handle), deadline_ms, before_wait.now_ms.copy());
+                        current_ms = after_wait.now_ms;
+                        if !after_wait.ok {
+                            failure = after_wait.failure;
+                            keep_polling = false;
+                        }
+                    }
+                }
+            }
+        }
+        first_poll = false;
+        if keep_polling {
+            let before: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&request.policy_handle), deadline_ms, current_ms);
+            current_ms = before.now_ms;
+            if !before.ok {
+                failure = before.failure;
+                keep_polling = false;
+            }
+        }
+        if keep_polling {
+            let payload: TransportPayloadIntent = {encoding: "json_object", secret_fields: "device", device_field: "device_auth_id", code_field: null};
+            let capture: TransportCaptureIntent = {code_field: "authorization_code", redirect_uri: endpoints.redirect_uri};
+            let polled: TransportCaptureResultEnvelope = oauth::transport_capture_result(&request, &usage, payload, capture);
+            let polled_value: TransportCaptureEnvelope? = polled.value;
+            let envelope: TransportCaptureEnvelope = polled_value.unwrap_or(empty_transport_capture());
+            let parts: DeviceCaptureParts = device_capture_parts(envelope);
+            let envelope_ok: bool = parts.ok;
+            let response: TransportResponseEnvelope = parts.response;
+            let response_parts: PollResponseParts = poll_response_parts(response);
+            let code_holder: CodeHandlePresence = parts.code;
+            let verifier_holder: VerifierHandlePresence = parts.verifier;
+            let has_code: bool = code_holder.has("handle");
+            let has_verifier: bool = verifier_holder.has("handle");
+            let captured_code: resource<oauth.authorization_code>? = code_holder?.handle;
+            let captured_verifier: resource<oauth.verifier>? = verifier_holder?.handle;
+            let response_status: int = response_parts.status;
+            let retry_after_present: bool = response_parts.has_retry_after;
+            let retry_after_value: int = response_parts.retry_after_ms;
+            let response_access_holder: SecretSlotPresence = response_parts.access;
+            let response_refresh_holder: SecretSlotPresence = response_parts.refresh;
+            let response_device_holder: DeviceHandlePresence = response_parts.device;
+            let has_response_access: bool = response_access_holder.has("handle");
+            let has_response_refresh: bool = response_refresh_holder.has("handle");
+            let has_response_device: bool = response_device_holder.has("handle");
+            let after: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&request.policy_handle), deadline_ms, current_ms);
+            current_ms = after.now_ms.copy();
+            if !after.ok {
+                failure = after.failure;
+                keep_polling = false;
+            } else if !polled.ok {
+                failure = static_failure(polled.error, "poll_transport_failed", "Codex device authorization could not be checked.");
+                keep_polling = false;
+            } else if !envelope_ok {
+                failure = failed("invalid_poll_response", "The device authorization response is invalid.");
+                keep_polling = false;
+            } else {
+                if response_status.copy() == 403 || response_status.copy() == 404 {
+                    retry_delay_ms = base_interval_ms;
+                    next_poll_delay_ms = base_interval_ms;
+                    keep_polling = true;
+                } else if response_status.copy() == 429 {
+                    if retry_delay_ms < max_interval_ms() / 2 {
+                        retry_delay_ms = retry_delay_ms * 2;
+                    } else {
+                        retry_delay_ms = max_interval_ms();
+                    }
+                    let mut requested: int = retry_delay_ms;
+                    if requested < base_interval_ms { requested = base_interval_ms; }
+                    if retry_after_present {
+                        let mut retry_after: int = retry_after_value;
+                        if retry_after > max_interval_ms() { retry_after = max_interval_ms(); }
+                        if retry_after < 0 { retry_after = 0; }
+                        if retry_after > requested { requested = retry_after; }
+                    }
+                    next_poll_delay_ms = requested;
+                    keep_polling = true;
+                } else if response_status.copy() >= 200 && response_status.copy() < 300 {
+                    if !has_code || !has_verifier || captured_code == null || captured_verifier == null ||
+                       has_response_access || has_response_refresh || has_response_device {
+                        failure = failed("invalid_poll_response", "The device authorization response is invalid.");
+                        keep_polling = false;
+                    } else {
+                        code_handle = captured_code;
+                        verifier_handle = captured_verifier;
+                        complete = true;
+                        keep_polling = false;
+                    }
+                } else {
+                    failure = failed("poll_rejected", "Codex device authorization was rejected.");
+                    keep_polling = false;
+                }
+            }
+        }
+    }
+    if complete => {
+        {policy_handle: request.policy_handle, last_ms: current_ms, ok: true, failure: failed("", ""), code_handle: code_handle, verifier_handle: verifier_handle}
+    } else => {
+        {policy_handle: request.policy_handle, last_ms: current_ms, ok: false, failure: failure, code_handle: null, verifier_handle: null}
+    }
+}
+
+fn safe_form_client_id(value: string) -> bool {
+    let mut valid: bool = value.length > 0 && value.length <= 256;
+    let mut index: int = 0;
+    while valid && index < value.length {
+        let character: string = char_at(value, index);
+        if !is_ascii_alnum(character) && character != "-" && character != "." && character != "_" && character != "~" {
+            valid = false;
+        }
+        index = index + 1;
+    }
+    valid
+}
+
+fn exchange_and_save(details: DeviceLoginDetails, endpoints: DeviceEndpointChoice, policy: resource<auth.policy>, last_ms: int, code_handle: resource<oauth.authorization_code>?, verifier_handle: resource<oauth.verifier>?, deadline_ms: int) -> DeviceLoginOutcome {
+    let before: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&policy), deadline_ms, last_ms);
+    if !before.ok => {
+        {policy_handle: policy, result: before.failure}
+    } else if !safe_form_client_id(endpoints.client_id) => {
+        {policy_handle: policy, result: failed("invalid_provider_config", "The selected provider client identifier is unsupported.")}
+    } else => {
+        let form: DeviceTokenForm = {grant_type: "authorization_code", client_id: endpoints.client_id};
+        let public_body: string = "grant_type=" + form.grant_type + "&client_id=" + form.client_id;
+        let transport_request: TransportPublicRequest = {
+            policy_handle: policy,
+            credential_id: details.credential_id,
+            method: "POST",
+            path: endpoints.token_path,
+            public_headers: [{name: "content-type", value: "application/x-www-form-urlencoded"}],
+            public_body: public_body
+        };
+        let usage: TransportCredentialUse = {kind: "code_verifier", access_handle: null, refresh_handle: null, code_handle: code_handle, verifier_handle: verifier_handle, device_handle: null};
+        let payload: TransportPayloadIntent = {encoding: "form", secret_fields: "authorization_code", device_field: null, code_field: "code"};
+        let exchanged: TransportResultEnvelope = oauth::transport_payload_result(&transport_request, &usage, payload);
+        let exchanged_value: TransportResponseEnvelope? = exchanged.value;
+        let response: TransportResponseEnvelope = exchanged_value.unwrap_or(empty_transport_response());
+        let parts: ExchangeResponseParts = exchange_response_parts(response);
+        let response_status: int = parts.status;
+        let response_ok: bool = parts.ok;
+        let token_response_body: string = parts.body;
+        let access_holder: SecretSlotPresence = parts.access;
+        let refresh_holder: SecretSlotPresence = parts.refresh;
+        let has_access: bool = access_holder.has("handle");
+        let has_refresh: bool = refresh_holder.has("handle");
+        let response_access_slot: resource<auth.secret_slot>? = access_holder?.handle;
+        let response_refresh_slot: resource<auth.secret_slot>? = refresh_holder?.handle;
+        let after: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&transport_request.policy_handle), deadline_ms, before.now_ms);
+        let mut result_policy: resource<auth.policy> = transport_request.policy_handle;
+        let mut exchange_result: CodexDeviceLoginResult = failed("exchange_transport_failed", "Codex device token exchange failed.");
+        if !after.ok {
+            exchange_result = after.failure;
+        } else if !exchanged.ok {
+            exchange_result = static_failure(exchanged.error, "exchange_transport_failed", "Codex device token exchange failed.");
+        } else if !response_ok {
+            exchange_result = failed("exchange_transport_failed", "Codex device token exchange failed.");
+        } else if response_status.copy() < 200 || response_status.copy() >= 300 {
+            exchange_result = failed("exchange_rejected", "Codex device token exchange was rejected.");
+        } else if !has_access {
+            exchange_result = failed("invalid_token_response", "The token response is invalid.");
+        } else {
+            let access_slot: resource<auth.secret_slot>? = response_access_slot;
+            let refresh_slot: resource<auth.secret_slot>? = response_refresh_slot;
+            let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&result_policy, token_response_body.copy(), "/expires_in");
+            let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&result_policy, token_response_body.copy(), "/token_type");
+            let mut expires_in: int = 0;
+            let mut token_type: string = "Bearer";
+            let mut valid: bool = expiry_field.ok && expiry_field.value.copy() != null && token_type_field.ok && token_type_field.value.copy() != null;
+            if valid {
+                let expiry: PublicJsonFieldEnvelope = expiry_field.value;
+                if expiry.kind == "int" && expiry.int_value.copy() != null {
+                    expires_in = expiry.int_value;
+                    if expires_in <= 0 || expires_in > max_int() / 1000 {
+                        valid = false;
+                    }
+                } else {
+                    valid = false;
+                }
+                let token_type_value: PublicJsonFieldEnvelope = token_type_field.value;
+                if token_type_value.kind.copy() == "missing" {
+                    token_type = "Bearer";
+                } else if token_type_value.kind == "string" && token_type_value.string_value.copy() != null {
+                    token_type = token_type_value.string_value;
+                    if token_type != "Bearer" || token_type.length > 64 {
+                        valid = false;
+                    }
+                } else {
+                    valid = false;
+                }
+            }
+            let mut outcome: CodexDeviceLoginResult = failed("invalid_token_response", "The token response is invalid.");
+            if valid {
+                let lifetime_ms: int = expires_in * 1000;
+                if after.now_ms.copy() > max_int() - lifetime_ms {
+                    valid = false;
+                } else {
+                    let expires_at_ms: int = after.now_ms.copy() + lifetime_ms;
+                    let mut refresh_action: string = "clear";
+                    if has_refresh.copy() { refresh_action = "replace"; }
+                    let metadata: CredentialMetadata = {
+                        provider: details.provider.name,
+                        kind: "oauth",
+                        source: "codex-device",
+                        token_type: token_type,
+                        expires_at_ms: expires_at_ms,
+                        scopes: [],
+                        account_id: null,
+                        generation: details.expected_generation,
+                        status: "active",
+                        last_refresh_at_ms: null,
+                        has_refresh_token: has_refresh
+                    };
+                    let save_request: SaveCredentialRequest = {
+                        credential_id: details.credential_id,
+                        expected_generation: details.expected_generation,
+                        policy_handle: result_policy,
+                        metadata: metadata,
+                        access_slot: access_slot,
+                        refresh_action: refresh_action,
+                        refresh_slot: refresh_slot
+                    };
+                    let save_check: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&save_request.policy_handle), deadline_ms, after.now_ms.copy());
+                    if !save_check.ok {
+                        outcome = save_check.failure;
+                    } else {
+                        let saved: AuthSaveResultEnvelope = auth::save_if_generation_result(&save_request);
+                        let saved_metadata: AuthMetadataEnvelope? = saved.value;
+                        let has_saved_metadata: bool = saved_metadata != null;
+                        let saved_value: AuthMetadataEnvelope = saved_metadata.unwrap_or(empty_auth_metadata());
+                        if !saved.ok {
+                            outcome = static_failure(saved.error, "save_failed", "The credential could not be saved.");
+                        } else if !has_saved_metadata {
+                            outcome = failed("save_failed", "The credential could not be saved.");
+                        } else if !saved_value.ok.copy() {
+                            outcome = failed("save_failed", "The credential could not be saved.");
+                        } else {
+                            outcome = succeeded(saved_value);
+                        }
+                    }
+                    result_policy = save_request.policy_handle;
+                }
+            }
+            exchange_result = outcome;
+        }
+        {policy_handle: result_policy, result: exchange_result}
+    }
+}
+
+fn instruction_acknowledged(result: DeviceInstructionResultEnvelope) -> bool {
+    if result.has("ok") && result.ok.copy() &&
+       (!result.has("error") || result.error.copy() == null) &&
+       result.has("value") && result.value.copy() != null => {
+        let acknowledged: bool = result.value.copy();
+        acknowledged
+    } else => {
+        false
+    }
+}
+
+fn instruction_failure(result: DeviceInstructionResultEnvelope) -> CodexDeviceLoginResult {
+    if result.has("ok") && !result.ok.copy() && result.has("value") &&
+       result.value.copy() == null && result.has("error") && result.error.copy() != null => {
+        let failure: AuthBridgeFailure = result.error.copy();
+        let code: string = failure.code.copy();
+        if code.copy() == "ui_unavailable" || code.copy() == "ui_sink_full" ||
+           code.copy() == "ui_sink_closed" || code.copy() == "ui_instruction_invalid" => {
+            failed(code.copy(), "The device login instruction could not be displayed.")
+        } else if code.copy() == "policy_inactive" || code.copy() == "wait_deadline_exceeded" ||
+                  code.copy() == "clock_unavailable" => {
+            static_failure(result.error.copy(), "instruction_failed", "The device login instruction could not be delivered.")
+        } else => {
+            failed("host_failure", "The device login instruction could not be delivered.")
+        }
+    } else => {
+        failed("host_failure", "The device login instruction could not be delivered.")
+    }
+}
+
+fn login_inner(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> DeviceInstructionResultEnvelope) -> DeviceLoginOutcome {
+    let details: DeviceLoginDetails = {
+        provider: request.provider,
+        credential_id: request.credential_id,
+        expected_generation: request.expected_generation
+    };
+    let endpoint_details: DeviceLoginDetails = details.copy();
+    let start_details: DeviceLoginDetails = details.copy();
+    let poll_details: DeviceLoginDetails = details.copy();
+    let exchange_details: DeviceLoginDetails = details.copy();
+    let policy: resource<auth.policy> = request.policy_handle;
+    let endpoints: DeviceEndpointChoice = endpoint_choice(endpoint_details.provider, endpoint_details.credential_id, endpoint_details.expected_generation);
+    let start_endpoints: DeviceEndpointChoice = endpoints.copy();
+    let poll_endpoints: DeviceEndpointChoice = endpoints.copy();
+    let exchange_endpoints: DeviceEndpointChoice = endpoints.copy();
+    if !endpoints.ok => {
+        {policy_handle: policy, result: failed(endpoints.error_code, endpoints.error_message)}
+    } else => {
+        let initial: OAuthNowResultEnvelope = oauth::now_ms_result(&policy);
+        if !initial.ok => {
+            {policy_handle: policy, result: static_failure(initial.error, "clock_unavailable", "The login clock is unavailable.")}
+        } else if initial.value.copy() == null => {
+            {policy_handle: policy, result: failed("clock_unavailable", "The login clock is unavailable.")}
+        } else => {
+            let now_ms: int = initial.value.copy();
+            if now_ms < 0 || now_ms > max_int() - flow_deadline_ms() => {
+                {policy_handle: policy, result: failed("clock_unavailable", "The login clock is unavailable.")}
+            } else => {
+                let deadline_ms: int = now_ms + flow_deadline_ms();
+                let started: DeviceStartState = device_start(policy, start_details.credential_id, start_endpoints);
+                let start_response: DeviceStart = started.start;
+                let start_ok: bool = start_response.ok;
+                let start_failure: CodexDeviceLoginResult = start_response.failure;
+                let instruction: CodexDeviceInstruction = start_response.instruction;
+                let poll_user_code: string = start_response.user_code;
+                let poll_interval_ms: int = start_response.interval_ms;
+                let after_start: DeviceClockCheck = clock_check_value(oauth::now_ms_result(&started.policy_handle), deadline_ms, now_ms);
+                if !after_start.ok => {
+                    {policy_handle: started.policy_handle, result: after_start.failure}
+                } else if !start_ok => {
+                    {policy_handle: started.policy_handle, result: start_failure}
+                } else => {
+                    let remaining_seconds: int = (deadline_ms - after_start.now_ms.copy()) / 1000;
+                    if remaining_seconds <= 0 => {
+                        {policy_handle: started.policy_handle, result: failed("timeout", "Codex device login timed out.")}
+                    } else => {
+                        let mut bounded_expiry: int = instruction.expires_in_seconds;
+                        if bounded_expiry > remaining_seconds { bounded_expiry = remaining_seconds; }
+                        let bounded_instruction: CodexDeviceInstruction = {
+                            verification_url: instruction.verification_url,
+                            user_code: instruction.user_code,
+                            expires_in_seconds: bounded_expiry
+                        };
+                        let instruction_result: DeviceInstructionResultEnvelope = on_instruction(bounded_instruction);
+                        if instruction_acknowledged(instruction_result.copy()) => {
+                            let poll_state: DevicePollState = {
+                                policy_handle: started.policy_handle,
+                                device_handle: started.device_handle,
+                                user_code: poll_user_code,
+                                interval_ms: poll_interval_ms
+                            };
+                            let polled: DevicePoll = poll_until_complete(poll_state, poll_details.credential_id, poll_endpoints, deadline_ms, after_start.now_ms);
+                            if !polled.ok => {
+                                {policy_handle: polled.policy_handle, result: polled.failure}
+                            } else => {
+                                exchange_and_save(exchange_details, exchange_endpoints, polled.policy_handle, polled.last_ms, polled.code_handle, polled.verifier_handle, deadline_ms)
+                            }
+                        } else => {
+                            {policy_handle: started.policy_handle, result: instruction_failure(instruction_result.copy())}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn login_with_instruction_result(
+    request: CodexDeviceLoginRequest,
+    on_instruction: fn(CodexDeviceInstruction) -> DeviceInstructionResultEnvelope
+) -> CodexDeviceLoginResult {
+    let outcome: DeviceLoginOutcome = login_inner(request, on_instruction);
+    auth::cleanup_transients(&outcome.policy_handle);
+    outcome.result
+}
+
+fn legacy_instruction_ack(
+    instruction: CodexDeviceInstruction,
+    on_instruction: fn(CodexDeviceInstruction) -> null
+) -> DeviceInstructionResultEnvelope {
+    on_instruction(instruction);
+    {ok: true, value: true, error: null}
+}
+
+pub fn login(request: CodexDeviceLoginRequest, on_instruction: fn(CodexDeviceInstruction) -> null) -> CodexDeviceLoginResult {
+    let adapter: fn(CodexDeviceInstruction) -> DeviceInstructionResultEnvelope =
+        |instruction| legacy_instruction_ack(instruction, on_instruction.copy());
+    login_with_instruction_result(request, adapter)
+}

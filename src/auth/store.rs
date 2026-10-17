@@ -32,7 +32,15 @@ const HANDLE_EXPIRED: u8 = 2;
 const HANDLE_REVOKED: u8 = 3;
 const ACCESS_HANDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const REFRESH_HANDLE_TTL: Duration = Duration::from_secs(60);
-#[cfg(any(test, feature = "config-fixture"))]
+const MUTATION_LOCK_RETRY: Duration = Duration::from_millis(10);
+type MutationGuard<'a> = dyn Fn() -> Result<(), AuthStoreError> + 'a;
+
+fn check_mutation_guard(guard: Option<&MutationGuard<'_>>) -> Result<(), AuthStoreError> {
+    if let Some(check) = guard {
+        check()?;
+    }
+    Ok(())
+}
 const SECRET_SLOT_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// RSS-visible class name for a host-minted access handle.
@@ -147,7 +155,7 @@ impl OpaqueSecretSlot {
                 run_id: run_id.to_string(),
                 bytes: Mutex::new(bytes),
                 state: AtomicU8::new(SLOT_LIVE),
-                expires_at,
+                expires_at: expires_at.min(Instant::now() + SECRET_SLOT_TTL),
             }),
         })
     }
@@ -290,6 +298,11 @@ impl OpaqueSecretSlot {
         Ok(())
     }
 
+    pub(crate) fn is_terminal(&self) -> bool {
+        let _ = self.expire_if_due();
+        self.inner.state.load(Ordering::Acquire) != SLOT_LIVE
+    }
+
     pub(crate) fn revoke(&self) {
         if self.inner.state.swap(SLOT_USED, Ordering::AcqRel) != SLOT_USED {
             let mut bytes = self
@@ -299,6 +312,36 @@ impl OpaqueSecretSlot {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             bytes.zeroize();
         }
+    }
+}
+
+#[cfg(test)]
+mod secret_slot_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn host_secret_slot_deadline_is_capped_and_shorter_deadline_preserved() {
+        let before = Instant::now();
+        let make_slot = |deadline| {
+            OpaqueSecretSlot::from_host_secret_until(
+                SecretSlotKind::Access,
+                "fixture-codex",
+                0,
+                1,
+                "fixture-run",
+                Zeroizing::new(b"fixture-secret".to_vec()),
+                deadline,
+            )
+            .expect("valid slot")
+        };
+        let long = make_slot(before + Duration::from_secs(10 * 60));
+        let after = Instant::now();
+        assert!(long.inner.expires_at >= before + SECRET_SLOT_TTL);
+        assert!(long.inner.expires_at <= after + SECRET_SLOT_TTL);
+
+        let short_deadline = Instant::now() + Duration::from_secs(20);
+        let short = make_slot(short_deadline);
+        assert_eq!(short.inner.expires_at, short_deadline);
     }
 }
 
@@ -388,6 +431,13 @@ impl IssuedHandleInner {
 
     fn is_inflight(&self) -> bool {
         self.state.load(Ordering::Acquire) == HANDLE_LIVE && !self.is_time_expired()
+    }
+
+    fn is_terminal(&self) -> bool {
+        if self.is_time_expired() {
+            self.mark_expired();
+        }
+        self.state.load(Ordering::Acquire) != HANDLE_LIVE
     }
 
     fn mark_revoked(&self) {
@@ -534,6 +584,10 @@ impl OpaqueAccessHandle {
         self.inner.take_against_store()
     }
 
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
+
     pub fn force_expire(&self) {
         self.inner.force_expire();
     }
@@ -594,6 +648,10 @@ impl OpaqueRefreshHandle {
 
     pub(crate) fn take_for_transport(&self) -> Result<SecretText, AuthStoreError> {
         self.inner.take_against_store()
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
     }
 
     pub fn force_expire(&self) {
@@ -756,6 +814,8 @@ impl SaveOutcome {
 /// A typed, redaction-safe store failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthStoreError {
+    /// The trusted mutation admission expired before its commit boundary.
+    MutationInactive,
     UnsupportedPlatform,
     BackendUnavailable {
         operation: String,
@@ -866,6 +926,7 @@ pub enum AuthStoreError {
 impl AuthStoreError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::MutationInactive => "mutation_inactive",
             Self::UnsupportedPlatform | Self::BackendUnavailable { .. } => "backend_unavailable",
             Self::InvalidPath { .. } => "invalid_path",
             Self::Io { .. } => "io_error",
@@ -907,6 +968,7 @@ impl AuthStoreError {
 impl fmt::Display for AuthStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MutationInactive => write!(formatter, "auth mutation admission inactive"),
             Self::UnsupportedPlatform => {
                 write!(
                     formatter,
@@ -1127,6 +1189,8 @@ pub trait CredentialStore {
 struct StoreInner {
     paths: AgentPaths,
     process_lock: Mutex<()>,
+    /// Command diagnostics never initialize read-side control or recovery files.
+    non_creating_reads: bool,
     /// In-process issued-handle table. Lock order: `process_lock`, then the
     /// filesystem advisory lock, then `handle_registry`. Never hold
     /// `handle_registry` across filesystem I/O. This table can only govern
@@ -1234,11 +1298,27 @@ impl AuthStore {
     /// Opens a confined store and creates the home directory and lock file when
     /// they do not exist. A missing `auth.yaml` is a fresh empty document.
     pub fn open(paths: AgentPaths) -> Result<Self, AuthStoreError> {
+        Self::open_with_read_policy(paths, false)
+    }
+
+    /// Opens a command store without creating read-side files or directories.
+    pub(crate) fn open_for_commands(paths: AgentPaths) -> Result<Self, AuthStoreError> {
+        Self::open_with_read_policy(paths, true)
+    }
+
+    fn open_with_read_policy(
+        paths: AgentPaths,
+        non_creating_reads: bool,
+    ) -> Result<Self, AuthStoreError> {
         validate_paths(&paths)?;
         #[cfg(unix)]
         {
-            let home = unix::open_home(&paths.home)?;
-            unix::ensure_lock_file(&home, &paths.auth_lock)?;
+            let home = unix::open_home(&paths.home, !non_creating_reads)?;
+            if non_creating_reads {
+                drop(unix::lock_file_if_present(&home, &paths.auth_lock)?);
+            } else {
+                unix::ensure_lock_file(&home, &paths.auth_lock)?;
+            }
             if let Some(auth_file) = unix::open_auth_file(&home, &paths.auth)? {
                 drop(auth_file);
             }
@@ -1246,6 +1326,7 @@ impl AuthStore {
                 inner: Arc::new(StoreInner {
                     paths,
                     process_lock: Mutex::new(()),
+                    non_creating_reads,
                     handle_registry: Mutex::new(HandleRegistry::default()),
                     home,
                 }),
@@ -1253,7 +1334,7 @@ impl AuthStore {
         }
         #[cfg(not(unix))]
         {
-            let _ = paths;
+            let _ = (paths, non_creating_reads);
             Err(AuthStoreError::BackendUnavailable {
                 operation: "open".to_string(),
                 message: "confined no-follow storage requires Unix primitives".to_string(),
@@ -1326,10 +1407,29 @@ impl AuthStore {
         &self,
         request: SaveCredentialRequest,
     ) -> Result<SaveOutcome, AuthStoreError> {
+        self.save_if_generation_impl(request, None)
+    }
+
+    /// Mutation admission is checked throughout lock waits and at the final
+    /// pre-rename boundary. A completed rename is never rolled back.
+    pub(crate) fn save_if_generation_guarded(
+        &self,
+        request: SaveCredentialRequest,
+        guard: &MutationGuard<'_>,
+    ) -> Result<SaveOutcome, AuthStoreError> {
+        self.save_if_generation_impl(request, Some(guard))
+    }
+
+    fn save_if_generation_impl(
+        &self,
+        request: SaveCredentialRequest,
+        guard: Option<&MutationGuard<'_>>,
+    ) -> Result<SaveOutcome, AuthStoreError> {
+        check_mutation_guard(guard)?;
         request.validate()?;
         let credential_id = request.credential_id.to_string();
-        let result = self.with_process_lock(|store| {
-            let outcome = store.with_file_lock(|store| {
+        let result = self.with_mutation_process_lock(guard, |store| {
+            let outcome = store.with_mutation_file_lock(guard, |store| {
                 let mut document = store.load_locked()?;
                 let current = document.credentials.get(&credential_id);
                 let actual_generation = current.map_or(0, |credential| credential.generation);
@@ -1388,7 +1488,7 @@ impl AuthStore {
                     last_refresh_at_ms: request.metadata.last_refresh_at_ms,
                 };
                 document.credentials.insert(credential_id.clone(), updated);
-                store.save_locked(&document)?;
+                store.save_locked(&document, guard)?;
                 let saved = document
                     .credentials
                     .get(&credential_id)
@@ -1417,16 +1517,33 @@ impl AuthStore {
     /// Removes one named credential after host policy checks and preserves all
     /// other entries in the YAML document.
     pub fn delete(&self, credential_id: &str) -> Result<AuthMetadata, AuthStoreError> {
+        self.delete_impl(credential_id, None)
+    }
+
+    pub(crate) fn delete_guarded(
+        &self,
+        credential_id: &str,
+        guard: &MutationGuard<'_>,
+    ) -> Result<AuthMetadata, AuthStoreError> {
+        self.delete_impl(credential_id, Some(guard))
+    }
+
+    fn delete_impl(
+        &self,
+        credential_id: &str,
+        guard: Option<&MutationGuard<'_>>,
+    ) -> Result<AuthMetadata, AuthStoreError> {
+        check_mutation_guard(guard)?;
         let credential_id = checked_credential_id(credential_id)?;
-        self.with_process_lock(|store| {
-            let metadata = store.with_file_lock(|store| {
+        self.with_mutation_process_lock(guard, |store| {
+            let metadata = store.with_mutation_file_lock(guard, |store| {
                 let mut document = store.load_locked()?;
                 let Some(removed) = document.credentials.remove(credential_id.as_str()) else {
                     return Err(AuthStoreError::CredentialNotFound {
                         credential_id: credential_id.to_string(),
                     });
                 };
-                store.save_locked(&document)?;
+                store.save_locked(&document, guard)?;
                 Ok(AuthMetadata::from_stored(credential_id.as_str(), &removed))
             })?;
             store.revoke_issued_handles(credential_id.as_str());
@@ -1580,7 +1697,11 @@ impl AuthStore {
         })
     }
 
-    fn save_locked(&self, document: &StoredAuthConfig) -> Result<(), AuthStoreError> {
+    fn save_locked(
+        &self,
+        document: &StoredAuthConfig,
+        guard: Option<&MutationGuard<'_>>,
+    ) -> Result<(), AuthStoreError> {
         document
             .validate(&self.inner.paths.auth)
             .map_err(|error| AuthStoreError::from_auth_config(error, &self.inner.paths.auth))?;
@@ -1596,7 +1717,7 @@ impl AuthStore {
         }
         #[cfg(unix)]
         {
-            unix::atomic_write(&self.inner.home, &self.inner.paths.auth, &bytes)
+            unix::atomic_write(&self.inner.home, &self.inner.paths.auth, &bytes, guard)
         }
         #[cfg(not(unix))]
         {
@@ -1622,8 +1743,11 @@ impl AuthStore {
             match parse_stored_yaml(&self.inner.paths.auth, &bytes) {
                 Ok(document) => Ok(document),
                 Err(error) => {
-                    let artifact =
-                        unix::preserve_corrupt(&self.inner.home, &self.inner.paths.home, &bytes);
+                    let artifact = if self.inner.non_creating_reads {
+                        None
+                    } else {
+                        unix::preserve_corrupt(&self.inner.home, &self.inner.paths.home, &bytes)
+                    };
                     Err(AuthStoreError::CorruptFile {
                         path: self.inner.paths.auth.clone(),
                         artifact,
@@ -1667,7 +1791,68 @@ impl AuthStore {
         operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
     ) -> Result<T, AuthStoreError> {
         #[cfg(unix)]
-        let file_guard = unix::lock_file(&self.inner.home, &self.inner.paths.auth_lock)?;
+        let file_guard = if self.inner.non_creating_reads {
+            unix::lock_file_if_present(&self.inner.home, &self.inner.paths.auth_lock)?
+        } else {
+            Some(unix::lock_file(
+                &self.inner.home,
+                &self.inner.paths.auth_lock,
+            )?)
+        };
+        let result = operation(self);
+        #[cfg(unix)]
+        drop(file_guard);
+        result
+    }
+
+    fn with_mutation_process_lock<T>(
+        &self,
+        guard: Option<&MutationGuard<'_>>,
+        operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
+    ) -> Result<T, AuthStoreError> {
+        if guard.is_none() {
+            return self.with_process_lock(operation);
+        }
+        let process_guard = loop {
+            check_mutation_guard(guard)?;
+            match self.inner.process_lock.try_lock() {
+                Ok(lock) => break lock,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(MUTATION_LOCK_RETRY);
+                }
+            }
+        };
+        check_mutation_guard(guard)?;
+        let result = operation(self);
+        drop(process_guard);
+        result
+    }
+
+    fn with_mutation_file_lock<T>(
+        &self,
+        guard: Option<&MutationGuard<'_>>,
+        operation: impl FnOnce(&Self) -> Result<T, AuthStoreError>,
+    ) -> Result<T, AuthStoreError> {
+        check_mutation_guard(guard)?;
+        #[cfg(unix)]
+        if self.inner.non_creating_reads {
+            unix::ensure_lock_file(&self.inner.home, &self.inner.paths.auth_lock)?;
+        }
+        if guard.is_none() {
+            #[cfg(unix)]
+            if self.inner.non_creating_reads {
+                let file_guard = unix::lock_file(&self.inner.home, &self.inner.paths.auth_lock)?;
+                let result = operation(self);
+                drop(file_guard);
+                return result;
+            }
+            return self.with_file_lock(operation);
+        }
+        #[cfg(unix)]
+        let file_guard =
+            unix::lock_file_guarded(&self.inner.home, &self.inner.paths.auth_lock, guard)?;
+        check_mutation_guard(guard)?;
         let result = operation(self);
         #[cfg(unix)]
         drop(file_guard);
@@ -1963,7 +2148,7 @@ mod unix {
 
     use super::{AuthStoreError, MAX_AUTH_STORE_BYTES};
 
-    pub(super) fn open_home(path: &Path) -> Result<OwnedFd, AuthStoreError> {
+    pub(super) fn open_home(path: &Path, create_missing: bool) -> Result<OwnedFd, AuthStoreError> {
         let root = CString::new("/").expect("root has no NUL");
         let fd = unsafe {
             libc::open(
@@ -2003,7 +2188,7 @@ mod unix {
                 continue;
             }
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENOENT) {
+            if error.raw_os_error() != Some(libc::ENOENT) || !create_missing {
                 return Err(map_path_error(path, error));
             }
             let created = unsafe {
@@ -2114,6 +2299,37 @@ mod unix {
     }
 
     pub(super) fn lock_file(home: &OwnedFd, path: &Path) -> Result<File, AuthStoreError> {
+        lock_file_impl(home, path, None, false)?.ok_or_else(|| AuthStoreError::Lock {
+            path: path.to_path_buf(),
+            message: "required lock file is absent".to_string(),
+        })
+    }
+
+    pub(super) fn lock_file_if_present(
+        home: &OwnedFd,
+        path: &Path,
+    ) -> Result<Option<File>, AuthStoreError> {
+        lock_file_impl(home, path, None, true)
+    }
+
+    pub(super) fn lock_file_guarded(
+        home: &OwnedFd,
+        path: &Path,
+        guard: Option<&super::MutationGuard<'_>>,
+    ) -> Result<File, AuthStoreError> {
+        lock_file_impl(home, path, guard, false)?.ok_or_else(|| AuthStoreError::Lock {
+            path: path.to_path_buf(),
+            message: "required lock file is absent".to_string(),
+        })
+    }
+
+    fn lock_file_impl(
+        home: &OwnedFd,
+        path: &Path,
+        guard: Option<&super::MutationGuard<'_>>,
+        allow_missing: bool,
+    ) -> Result<Option<File>, AuthStoreError> {
+        super::check_mutation_guard(guard)?;
         let name = CString::new(super::AUTH_LOCK_FILE_NAME).expect("constant has no NUL");
         if is_symlink_at(home.as_raw_fd(), super::AUTH_LOCK_FILE_NAME.as_bytes()) {
             return Err(AuthStoreError::SymlinkRejected {
@@ -2128,21 +2344,38 @@ mod unix {
             )
         };
         if fd < 0 {
+            let error = io::Error::last_os_error();
+            if allow_missing && error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
             return Err(AuthStoreError::Lock {
                 path: path.to_path_buf(),
-                message: io::Error::last_os_error().to_string(),
+                message: error.to_string(),
             });
         }
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         validate_regular(&owned, path, true)?;
         let raw = owned.as_raw_fd();
-        if unsafe { libc::flock(raw, libc::LOCK_EX) } < 0 {
+        loop {
+            super::check_mutation_guard(guard)?;
+            let flags = libc::LOCK_EX | if guard.is_some() { libc::LOCK_NB } else { 0 };
+            if unsafe { libc::flock(raw, flags) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if guard.is_some()
+                && matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK | libc::EINTR))
+            {
+                std::thread::sleep(super::MUTATION_LOCK_RETRY);
+                continue;
+            }
             return Err(AuthStoreError::Lock {
                 path: path.to_path_buf(),
-                message: io::Error::last_os_error().to_string(),
+                message: error.to_string(),
             });
         }
-        Ok(File::from(owned))
+        super::check_mutation_guard(guard)?;
+        Ok(Some(File::from(owned)))
     }
 
     pub(super) fn read_bounded(
@@ -2221,6 +2454,7 @@ mod unix {
         home: &OwnedFd,
         path: &Path,
         bytes: &[u8],
+        guard: Option<&super::MutationGuard<'_>>,
     ) -> Result<(), AuthStoreError> {
         static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut temporary_name = String::new();
@@ -2286,6 +2520,12 @@ mod unix {
         let source =
             CString::new(temporary_path.as_os_str().as_bytes()).expect("generated name has no NUL");
         let destination = CString::new(super::AUTH_FILE_NAME).expect("constant has no NUL");
+        // Final admission point: a rejected check removes the staged replacement.
+        // After rename succeeds, the commit is complete even if the owner expires.
+        if let Err(error) = super::check_mutation_guard(guard) {
+            unlink(home, &temporary_name);
+            return Err(error);
+        }
         if unsafe {
             libc::renameat(
                 home.as_raw_fd(),
@@ -2405,6 +2645,135 @@ impl From<TokenError> for AuthStoreError {
             credential_id: "<invalid>".to_string(),
             reason: error.to_string(),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod guarded_mutation_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicBool;
+
+    fn fixture() -> (AgentPaths, AuthStore) {
+        let root = PathBuf::from(std::env::var("TEST_TMPDIR").expect("assigned temp"))
+            .join(format!("guarded-auth-{}", uuid::Uuid::new_v4()));
+        let paths = AgentPaths::from_home(root).expect("paths");
+        let store = AuthStore::open(paths.clone()).expect("store");
+        let yaml = include_str!("../../tests/fixtures/config_auth_rss/auth.yaml")
+            .replace("1788440000000", "1900000000000");
+        fs::write(&paths.auth, yaml).expect("fixture");
+        fs::set_permissions(&paths.auth, fs::Permissions::from_mode(0o600)).expect("mode");
+        (paths, store)
+    }
+
+    #[test]
+    fn guarded_delete_leaves_process_lock_wait_after_invalidation() {
+        use std::sync::mpsc;
+        let (paths, store) = fixture();
+        let before = fs::read(&paths.auth).expect("before");
+        let held = store.inner.process_lock.lock().expect("process lock");
+        let worker_store = store.clone();
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let signalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let token = active.clone();
+        let once = signalled.clone();
+        let worker = std::thread::spawn(move || {
+            let admission = || {
+                if !once.swap(true, Ordering::AcqRel) {
+                    ready_tx.send(()).expect("ready");
+                }
+                if token.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(AuthStoreError::MutationInactive)
+                }
+            };
+            done_tx
+                .send(worker_store.delete_guarded("fixture-codex", &admission))
+                .expect("done");
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("entered guard");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "blocked on process lock"
+        );
+        active.store(false, Ordering::Release);
+        let early = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        worker.join().expect("worker");
+        assert!(matches!(
+            early.expect("must exit without releasing lock"),
+            Err(AuthStoreError::MutationInactive)
+        ));
+        assert_eq!(fs::read(&paths.auth).expect("unchanged"), before);
+    }
+
+    #[test]
+    fn denied_final_admission_removes_staged_replacement_without_publishing() {
+        let (paths, store) = fixture();
+        let original = fs::read(&paths.auth).expect("original");
+        let access = store
+            .fixture_access_slot("fixture-codex", 4, 1, "run", "SYNTHETIC_NEW_ACCESS")
+            .expect("slot");
+        let meta = store.load_metadata("fixture-codex").expect("metadata");
+        let request = SaveCredentialRequest::new(
+            CredentialId::new("fixture-codex").expect("id"),
+            4,
+            1,
+            "run",
+            CredentialConfig {
+                provider: meta.provider,
+                kind: meta.kind,
+                source: meta.source,
+                token_type: meta.token_type,
+                expires_at_ms: meta.expires_at_ms,
+                scopes: meta.scopes,
+                account_id: meta.account_id,
+                generation: 4,
+                status: meta.status,
+                last_refresh_at_ms: meta.last_refresh_at_ms,
+                has_refresh_token: meta.has_refresh_token,
+            },
+            access,
+            RefreshSecretAction::Preserve,
+        );
+        let staged = AtomicBool::new(false);
+        let admission = || {
+            let replacement = fs::read_dir(&paths.home).expect("home").any(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth.yaml.tmp.")
+            });
+            if replacement {
+                staged.store(true, Ordering::Release);
+                Err(AuthStoreError::MutationInactive)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            store.save_if_generation_guarded(request, &admission),
+            Err(AuthStoreError::MutationInactive)
+        ));
+        assert!(
+            staged.load(Ordering::Acquire),
+            "guard must run after staging"
+        );
+        assert_eq!(fs::read(&paths.auth).expect("after"), original);
+        assert!(!fs::read_dir(&paths.home).expect("home").any(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".auth.yaml.tmp.")
+        }));
     }
 }
 

@@ -1,0 +1,372 @@
+use auth;
+use config;
+use json;
+use super::config::selection;
+use self::login::{run as login_run};
+
+struct AuthCommandInput {
+    operation: string,
+    provider: string?,
+    credential_id: string?
+}
+
+struct AuthEntryResult {
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+}
+
+struct CliAuthRow {
+    provider: string,
+    credential_id: string?,
+    status: string,
+    source: string?,
+    generation: int
+}
+
+struct CliSelectionRow {
+    kind: string,
+    provider: string,
+    model: string,
+    source: string
+}
+
+struct CliLogoutRow {
+    credential_id: string,
+    status: string
+}
+
+struct ProviderStatus {
+    ok: bool,
+    row: string,
+    credential_id: string?,
+    category: string,
+    inactive: bool
+}
+
+struct EffectiveSelection {
+    ok: bool,
+    provider: string,
+    model: string,
+    source: string,
+    error: string?
+}
+
+fn entry(
+    ok: bool,
+    operation: string,
+    credential_id: string?,
+    generation: int,
+    status: string,
+    error: string?
+) -> AuthEntryResult {
+    {ok: ok, operation: operation, credential_id: credential_id, generation: generation, status: status, error: error}
+}
+
+fn report_row(provider: string, credential_id: string?, status: string, source: string?, generation: int) -> string {
+    let row: CliAuthRow = {
+        provider: provider,
+        credential_id: credential_id,
+        status: status,
+        source: source,
+        generation: generation
+    };
+    json::encode(row) + "\n"
+}
+
+fn unconfigured_status(provider: ProviderEntry) -> ProviderStatus {
+    let name: string = provider.name.copy();
+    {
+        ok: true,
+        row: report_row(name.copy(), null, "not_configured", null, 0),
+        credential_id: null,
+        category: "",
+        inactive: false
+    }
+}
+
+fn metadata_value_valid(envelope: AuthMetadataEnvelope) -> bool {
+    envelope.ok.copy() && envelope.error.copy() == null && envelope.outcome.copy() == "loaded"
+}
+
+fn provider_status(provider: ProviderEntry, loaded: AuthMetadataResultEnvelope) -> ProviderStatus {
+    let name: string = provider.name.copy();
+    let credential_id: string = provider.auth.copy();
+    if loaded.ok => {
+        if loaded.error.copy() == null && loaded.value.copy() != null => {
+            let envelope: AuthMetadataEnvelope = loaded.value.copy();
+            if metadata_value_valid(envelope.copy()) => {
+                let metadata: AuthMetadata = envelope.metadata.copy();
+                {
+                    ok: true,
+                    row: report_row(name.copy(), metadata.credential_id.copy(), metadata.status.copy(), metadata.source.copy(), metadata.generation.copy()),
+                    credential_id: metadata.credential_id.copy(),
+                    category: "",
+                    inactive: metadata.status.copy() == "disabled" || metadata.status.copy() == "reauth_required"
+                }
+            } else => {
+                {
+                    ok: false,
+                    row: report_row(name.copy(), credential_id.copy(), "host_failure", null, 0),
+                    credential_id: credential_id.copy(),
+                    category: "host_failure",
+                    inactive: false
+                }
+            }
+        } else => {
+            {
+                ok: false,
+                row: report_row(name.copy(), credential_id.copy(), "host_failure", null, 0),
+                credential_id: credential_id.copy(),
+                category: "host_failure",
+                inactive: false
+            }
+        }
+    } else => {
+        if loaded.error.copy() != null && loaded.value.copy() == null => {
+            let failure: AuthBridgeFailure = loaded.error.copy();
+            let code: string = failure.code.copy();
+            if code.copy() == "credential_not_found" => {
+                {
+                    ok: true,
+                    row: report_row(name.copy(), credential_id.copy(), "missing", null, 0),
+                    credential_id: credential_id.copy(),
+                    category: "",
+                    inactive: true
+                }
+            } else => {
+                {
+                    ok: false,
+                    row: report_row(name.copy(), credential_id.copy(), code.copy(), null, 0),
+                    credential_id: credential_id.copy(),
+                    category: code.copy(),
+                    inactive: false
+                }
+            }
+        } else => {
+            {
+                ok: false,
+                row: report_row(name.copy(), credential_id.copy(), "host_failure", null, 0),
+                credential_id: credential_id.copy(),
+                category: "host_failure",
+                inactive: false
+            }
+        }
+    }
+}
+
+fn selection_row(provider: string, model: string, source: string) -> string {
+    let row: CliSelectionRow = {
+        kind: "selection",
+        provider: provider,
+        model: model,
+        source: source
+    };
+    json::encode(row) + "\n"
+}
+
+fn logout_report(credential_id: string, status: string) -> string {
+    let row: CliLogoutRow = {credential_id: credential_id, status: status};
+    json::encode(row)
+}
+
+pub fn run(home: resource<auth.host_home>, command: AuthCommandInput) -> AuthEntryResult {
+    let operation: string = command.operation.copy();
+    if operation.copy() == "auth.login" => {
+        login_run(home, command)
+    } else if operation.copy() == "auth.status" => {
+        if command.credential_id.copy() != null => {
+            entry(false, operation.copy(), null, 0, "invalid_command", "invalid_command")
+        } else => {
+            let snapshot = config::load_snapshot(&home);
+            let generation: int = snapshot.policy_generation;
+            let policy: resource<auth.policy> = snapshot.policy_handle;
+            let public_config = snapshot.public_config;
+            let providers = public_config.providers.copy();
+            if command.provider.copy() == null => {
+                let mut index: int = 0;
+                let mut report: string = "";
+                let mut failure: string = "";
+                while index < providers.length {
+                    let provider: ProviderEntry = providers[index].copy();
+                    let state: ProviderStatus = if provider.auth.copy() == null => {
+                    unconfigured_status(provider.copy())
+                } else => {
+                    let credential_id: string = provider.auth.copy();
+                    let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
+                    provider_status(provider.copy(), loaded)
+                };
+                    report = report + state.row.copy();
+                    if !state.ok && failure.copy() == "" {
+                        failure = state.category.copy();
+                    }
+                    index += 1;
+                }
+                if failure.copy() == "" => {
+                    entry(true, operation.copy(), null, generation.copy(), report, null)
+                } else => {
+                    entry(false, operation.copy(), null, generation.copy(), report, failure.copy())
+                }
+            } else => {
+                let selected: EffectiveSelection = selection::effective_selection(public_config.copy(), command.provider.copy());
+                if !selected.ok.copy() => {
+                    let code: string = selected.error.copy();
+                    entry(false, operation.copy(), null, generation.copy(), code.copy(), code.copy())
+                } else => {
+                    let requested: string = selected.provider.copy();
+                    let mut index: int = 0;
+                    let mut found: bool = false;
+                    let mut result: AuthEntryResult = entry(false, operation.copy(), null, generation.copy(), "provider_not_found", "provider_not_found");
+                    while index < providers.length && !found {
+                        let provider: ProviderEntry = providers[index].copy();
+                        if provider.name.copy() == requested.copy() {
+                            found = true;
+                            let state: ProviderStatus = if provider.auth.copy() == null => {
+                                unconfigured_status(provider.copy())
+                            } else => {
+                                let credential_id: string = provider.auth.copy();
+                                let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
+                                provider_status(provider.copy(), loaded)
+                            };
+                            if provider.auth.copy() == null {
+                                result = entry(true, operation.copy(), null, generation.copy(), state.row.copy(), null);
+                            } else {
+                                if state.ok {
+                                    result = entry(true, operation.copy(), state.credential_id.copy(), generation.copy(), state.row.copy(), null);
+                                } else {
+                                    result = entry(false, operation.copy(), state.credential_id.copy(), generation.copy(), state.row.copy(), state.category.copy());
+                                }
+                            }
+                        }
+                        index += 1;
+                    }
+                    result
+                }
+            }
+        }
+    } else if operation.copy() == "config.check" => {
+        if command.provider.copy() != null || command.credential_id.copy() != null => {
+            entry(false, operation.copy(), null, 0, "invalid_command", "invalid_command")
+        } else => {
+            let snapshot = config::load_snapshot(&home);
+            let generation: int = snapshot.policy_generation;
+            let policy: resource<auth.policy> = snapshot.policy_handle;
+            let public_config: BoundedPublicConfig = snapshot.public_config;
+            let selection: EffectiveSelection = selection::effective_selection(public_config.copy(), null);
+            let providers = public_config.providers;
+            let mut report: string = "";
+            let mut index: int = 0;
+            let mut native_failure: string = "";
+            let mut credential_failure: bool = false;
+            while index < providers.length {
+                let provider: ProviderEntry = providers[index].copy();
+                let state: ProviderStatus = if provider.auth.copy() == null => {
+                    unconfigured_status(provider.copy())
+                } else => {
+                    let credential_id: string = provider.auth.copy();
+                    let loaded: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
+                    provider_status(provider.copy(), loaded)
+                };
+                report = report + state.row.copy();
+                if !state.ok && native_failure.copy() == "" {
+                    native_failure = state.category.copy();
+                }
+                if state.inactive {
+                    credential_failure = true;
+                }
+                index += 1;
+            }
+            if selection.ok.copy() {
+                report = report + selection_row(selection.provider.copy(), selection.model.copy(), selection.source.copy());
+            }
+            if native_failure.copy() != "" => {
+                entry(false, operation.copy(), null, generation.copy(), report, native_failure.copy())
+            } else if !selection.ok.copy() => {
+                let code: string = selection.error.copy();
+                entry(false, operation.copy(), null, generation.copy(), report, code.copy())
+            } else if credential_failure => {
+                entry(false, operation.copy(), null, generation.copy(), report, "credential_check_failed")
+            } else => {
+                entry(true, operation.copy(), null, generation.copy(), report, null)
+            }
+        }
+    } else if operation.copy() == "auth.logout" => {
+        if command.provider.copy() != null => {
+            entry(false, operation.copy(), null, 0, "invalid_command", "invalid_command")
+        } else if command.credential_id.copy() == null => {
+            entry(false, operation.copy(), null, 0, "credential_id_required", "credential_id_required")
+        } else => {
+            let credential_id: string = command.credential_id.copy();
+            if credential_id.copy() == "" => {
+                entry(false, operation.copy(), null, 0, "credential_id_required", "credential_id_required")
+            } else => {
+                let snapshot = config::load_snapshot(&home);
+                let generation: int = snapshot.policy_generation;
+                let credential_refs = snapshot.credential_refs;
+                let mut index: int = 0;
+                let mut admitted: bool = false;
+                while index < credential_refs.length && !admitted {
+                    if credential_refs[index].copy() == credential_id.copy() {
+                        admitted = true;
+                    }
+                    index += 1;
+                }
+                if admitted => {
+                    let policy: resource<auth.policy> = snapshot.policy_handle;
+                    let preflight: AuthMetadataResultEnvelope = auth::load_metadata_result(credential_id.copy(), &policy);
+                    if preflight.ok.copy() => {
+                        if preflight.error.copy() == null && preflight.value.copy() != null => {
+                            let metadata: AuthMetadataEnvelope = preflight.value.copy();
+                            if metadata_value_valid(metadata.copy()) => {
+                                let deleted: AuthDeleteResultEnvelope = auth::delete_result(credential_id.copy(), &policy);
+                                if deleted.ok.copy() => {
+                                    if deleted.error.copy() == null && deleted.value.copy() != null => {
+                                        let mutation: RedactedMutationResult = deleted.value.copy();
+                                        if mutation.ok.copy() && mutation.error.copy() == null && mutation.deleted.copy() => {
+                                            entry(true, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "deleted"), null)
+                                        } else => {
+                                            entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                                        }
+                                    } else => {
+                                        entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                                    }
+                                } else => {
+                                    if deleted.error.copy() != null && deleted.value.copy() == null => {
+                                        let bridge_failure: AuthBridgeFailure = deleted.error.copy();
+                                        let logout_code: string = bridge_failure.code.copy();
+                                        entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), logout_code.copy()), logout_code.copy())
+                                    } else => {
+                                        entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                                    }
+                                }
+                            } else => {
+                                entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                            }
+                        } else => {
+                            entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                        }
+                    } else => {
+                        if preflight.error.copy() != null && preflight.value.copy() == null => {
+                            let bridge_failure: AuthBridgeFailure = preflight.error.copy();
+                            let preflight_code: string = bridge_failure.code.copy();
+                            if preflight_code.copy() == "credential_not_found" => {
+                                entry(true, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "already_absent"), null)
+                            } else => {
+                                entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), preflight_code.copy()), preflight_code.copy())
+                            }
+                        } else => {
+                            entry(false, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "host_failure"), "host_failure")
+                        }
+                    }
+                } else => {
+                    entry(true, operation.copy(), credential_id.copy(), generation.copy(), logout_report(credential_id.copy(), "already_absent"), null)
+                }
+            }
+        }
+    } else => {
+        entry(false, operation.copy(), command.credential_id.copy(), 0, "unsupported_operation", "unsupported_operation")
+    }
+}

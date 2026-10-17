@@ -1,0 +1,43 @@
+// Public-input fixture for the pure RSS OpenAI Responses codec (Task8).
+//
+// Invokes the real production body builder and codec state machine with plain
+// public maps. No fake native resource, no mirrored Rust parsing, no
+// credentials: the records are ordinary decoded event objects.
+use super::super::super::rss::llm::openai_responses_codec;
+use super::super::super::rss::llm::types;
+
+pub fn request_body(request: map) -> string {
+    let model: string = types::request_string(request, "model");
+    openai_responses_codec::responses_build_public_body(request, model, false)
+}
+
+pub fn stream_body(request: map) -> string {
+    let model: string = types::request_string(request, "model");
+    openai_responses_codec::responses_build_public_body(request, model, true)
+}
+
+pub fn collect(chunks: array, done: bool) -> map {
+    let mut state: map = openai_responses_codec::begin();
+    let mut i = 0;
+    while i < chunks.length {
+        let chunk: map = types::array_entry(chunks, i);
+        state = openai_responses_codec::push_chunk(state, chunk);
+        i += 1;
+    }
+    if done {
+        state = openai_responses_codec::push_done(state);
+    }
+    openai_responses_codec::finish(state)
+}
+
+pub fn parse_body(body: map) -> map {
+    openai_responses_codec::responses_parse_body(body)
+}
+
+pub fn parse_body_text(text: string) -> map {
+    openai_responses_codec::responses_parse_public_response(text)
+}
+
+pub fn parse_error(text: string, status: int) -> map {
+    openai_responses_codec::responses_parse_public_error(text, status)
+}

@@ -23,7 +23,7 @@ use crate::events::EventCommitError;
 use crate::metrics::Metrics;
 use crate::runtime::agent_host::{provider_error_is_retryable, typed_fail};
 use crate::runtime::rss_runner::RunCancellation;
-use crate::service::{AgentService, ProviderCommitOutcome};
+use crate::service::{AgentService, PendingApprovalPreviewBinding, ProviderCommitOutcome};
 use crate::{AgentProviderHost, ProviderPendingDecision};
 
 /// Counts actual inner provider calls. Turn metrics are recorded by
@@ -131,8 +131,213 @@ impl DurableProviderHost {
 }
 
 impl AgentProviderHost for DurableProviderHost {
+    fn refresh_context(
+        &self,
+        context: &JsonValue,
+        cancellation: &RunCancellation,
+    ) -> Option<JsonValue> {
+        Some(
+            self.service
+                .refresh_provider_context(&self.run_id, context, cancellation),
+        )
+    }
+
+    fn approval_storage(
+        &self,
+        operation: &str,
+        payload: &JsonValue,
+        cancellation: &RunCancellation,
+    ) -> JsonValue {
+        if cancellation.deadline_passed() {
+            return typed_fail("deadline_elapsed", "run deadline elapsed");
+        }
+        if cancellation.requested().is_some() {
+            return typed_fail("cancelled", "run was cancelled");
+        }
+        if payload.get("run_id").and_then(JsonValue::as_str) != Some(self.run_id.as_str()) {
+            return typed_fail(
+                "approval_owner_mismatch",
+                "approval run identity does not match",
+            );
+        }
+        let Some(persistence) = self.service.persistence_handle() else {
+            return typed_fail(
+                "approval_storage_unavailable",
+                "approval storage is unavailable",
+            );
+        };
+        let result = match operation {
+            "request" => {
+                let preview = payload
+                    .get("owner_preview")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| crate::gateway::store::StorageError {
+                        code: "approval_preview_unavailable".to_string(),
+                        message: "approval preview is unavailable".to_string(),
+                    });
+                preview.and_then(|preview| {
+                    let session_id = payload
+                        .get("session_id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_session_invalid".to_string(),
+                            message: "approval session is missing".to_string(),
+                        })?;
+                    let approval_id =
+                        payload
+                            .get("id")
+                            .and_then(JsonValue::as_str)
+                            .ok_or_else(|| crate::gateway::store::StorageError {
+                                code: "approval_id_invalid".to_string(),
+                                message: "approval id is missing".to_string(),
+                            })?;
+                    let tool_call_id = payload
+                        .get("tool_call_id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_call_invalid".to_string(),
+                            message: "approval call is missing".to_string(),
+                        })?;
+                    let tool_name = payload
+                        .get("tool_name")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_tool_invalid".to_string(),
+                            message: "approval tool is missing".to_string(),
+                        })?;
+                    let risk_class = payload
+                        .get("risk_class")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_risk_invalid".to_string(),
+                            message: "approval risk is missing".to_string(),
+                        })?;
+                    let expires_at_ms = payload
+                        .get("expires_at_ms")
+                        .and_then(JsonValue::as_i64)
+                        .ok_or_else(|| crate::gateway::store::StorageError {
+                            code: "approval_expiry_invalid".to_string(),
+                            message: "approval expiry is missing".to_string(),
+                        })?;
+                    let mut durable_payload = payload.clone();
+                    if let Some(object) = durable_payload.as_object_mut() {
+                        object.remove("owner_preview");
+                    }
+                    let binding = PendingApprovalPreviewBinding::new(
+                        session_id,
+                        approval_id,
+                        tool_call_id,
+                        tool_name,
+                        risk_class,
+                        expires_at_ms,
+                    );
+                    persistence
+                        .approval_request(&durable_payload)
+                        .and_then(|result| {
+                            match self.service.store_pending_approval_preview(
+                                &self.run_id,
+                                &binding,
+                                preview,
+                            ) {
+                                Ok(()) => Ok(result),
+                                Err(code) => Err(crate::gateway::store::StorageError {
+                                    code: code.to_string(),
+                                    message: "approval preview could not be bound to the live call"
+                                        .to_string(),
+                                }),
+                            }
+                        })
+                })
+            }
+            "get" => payload
+                .get("approval_id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| crate::gateway::store::StorageError {
+                    code: "approval_id_invalid".to_string(),
+                    message: "approval id is missing".to_string(),
+                })
+                .and_then(|approval_id| persistence.approval_get(approval_id)),
+            "list" => payload
+                .get("session_id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| crate::gateway::store::StorageError {
+                    code: "approval_session_invalid".to_string(),
+                    message: "approval session is missing".to_string(),
+                })
+                .and_then(|session_id| persistence.approval_list(&self.run_id, session_id)),
+            "resolve" => {
+                let result = persistence.approval_resolve(payload);
+                if result.as_ref().is_ok_and(|result| {
+                    result.get("rows_affected").and_then(JsonValue::as_i64) == Some(1)
+                }) && let Some(approval_id) = payload.get("id").and_then(JsonValue::as_str)
+                {
+                    self.service
+                        .clear_pending_approval_preview(&self.run_id, approval_id);
+                }
+                result
+            }
+            _ => {
+                return typed_fail(
+                    "approval_operation_invalid",
+                    "approval operation is invalid",
+                );
+            }
+        };
+        match result {
+            Ok(result) => json!({ "ok": true, "result": result }),
+            Err(error) => {
+                let code = if operation == "request" {
+                    match error.code.as_str() {
+                        "approval_preview_invalid"
+                        | "approval_expired"
+                        | "run_not_active"
+                        | "approval_owner_mismatch"
+                        | "storage_unavailable"
+                        | "approval_not_found"
+                        | "approval_call_mismatch"
+                        | "approval_preview_conflict"
+                        | "approval_preview_capacity" => error.code.as_str(),
+                        _ => "approval_storage_unavailable",
+                    }
+                } else {
+                    "approval_storage_unavailable"
+                };
+                typed_fail(
+                    code,
+                    "approval request could not be bound to its live action",
+                )
+            }
+        }
+    }
+
     fn call(&self, request: &JsonValue, cancellation: &RunCancellation) -> JsonValue {
-        let turn = self.turn.load(Ordering::SeqCst);
+        let positional = self.turn.load(Ordering::SeqCst);
+        let key = match request.get("_provider_step_key") {
+            None => None,
+            Some(JsonValue::String(key))
+                if !key.is_empty() && key.len() <= 512 && !key.chars().any(char::is_control) =>
+            {
+                Some(key.as_str())
+            }
+            Some(_) => {
+                return typed_fail(
+                    "provider_step_identity_invalid",
+                    "provider step identity is invalid",
+                );
+            }
+        };
+        let turn = if let Some(key) = key {
+            match self
+                .service
+                .provider_turn_for_step(&self.run_id, key, positional, request)
+            {
+                Ok(turn) => turn,
+                Err(error) => return Self::map_commit_error(error),
+            }
+        } else {
+            positional
+        };
+        self.turn.store(turn, Ordering::SeqCst);
         match self.replay_completed(turn) {
             Ok(Some(envelope)) => {
                 self.advance_turn();
@@ -181,7 +386,19 @@ impl AgentProviderHost for DurableProviderHost {
             panic!("provider_request_crash");
         }
 
-        let envelope = self.inner.call(request, cancellation);
+        // The private replay address never reaches the provider transport.
+        let mut transport_request;
+        let inner_request = if key.is_some() {
+            transport_request = request.clone();
+            transport_request
+                .as_object_mut()
+                .expect("scoped request object")
+                .remove("_provider_step_key");
+            &transport_request
+        } else {
+            request
+        };
+        let envelope = self.inner.call(inner_request, cancellation);
         if envelope.get("ok").and_then(JsonValue::as_bool) != Some(true) {
             if let Err(error) = self.persist_classified_failure(turn, attempt, &envelope) {
                 return Self::map_commit_error(error);
@@ -751,6 +968,149 @@ mod tests {
             Arc::new(inner),
             state.service().metrics(),
         )
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_keeps_review_and_business_steps_distinct() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("first business"));
+        inner.push_ok(text_ok("review assessment"));
+        inner.push_ok(text_ok("final business"));
+        let host = host_for(&state, &run_id, inner.clone());
+        let cancel = RunCancellation::new();
+        let mut first = request();
+        first["_provider_step_key"] = json!("business:0");
+        let mut review = request();
+        review["_provider_step_key"] = json!("nested:call:1");
+        assert_eq!(
+            host.call(&first, &cancel)["response"]["text"],
+            "first business"
+        );
+        assert_eq!(
+            host.call(&review, &cancel)["response"]["text"],
+            "review assessment"
+        );
+        let resumed = host_for(&state, &run_id, inner.clone());
+        assert_eq!(
+            resumed.call(&first, &cancel)["response"]["text"],
+            "first business"
+        );
+        let mut next = request();
+        next["_provider_step_key"] = json!("business:1");
+        assert_eq!(
+            resumed.call(&next, &cancel)["response"]["text"],
+            "final business"
+        );
+        assert_eq!(inner.call_count(), 3);
+        assert!(
+            inner
+                .requests()
+                .iter()
+                .all(|r| r.get("_provider_step_key").is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_rejects_changed_request_and_malformed_identity() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("recorded"));
+        let host = host_for(&state, &run_id, inner.clone());
+        let cancel = RunCancellation::new();
+        for invalid in [
+            json!(""),
+            json!("x".repeat(513)),
+            json!("x\n"),
+            json!({"value":"x"}),
+        ] {
+            let mut value = request();
+            value["_provider_step_key"] = invalid;
+            let failed = host.call(&value, &cancel);
+            assert_eq!(failed["error"]["code"], "provider_step_identity_invalid");
+        }
+        assert_eq!(inner.call_count(), 0);
+        let mut original = request();
+        original["_provider_step_key"] = json!("business:0");
+        assert_eq!(host.call(&original, &cancel)["ok"], true);
+        let mut changed = original.clone();
+        changed["model"] = json!("different-model");
+        let resumed = host_for(&state, &run_id, inner.clone());
+        assert_eq!(
+            resumed.call(&changed, &cancel)["error"]["code"],
+            "corrupt_provider_step"
+        );
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_refuses_ambiguous_legacy_completed_response() {
+        let (state, run_id, _) = admitted_state().await;
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("legacy"));
+        let cancel = RunCancellation::new();
+        assert_eq!(
+            host_for(&state, &run_id, inner.clone()).call(&request(), &cancel)["ok"],
+            true
+        );
+        let mut scoped = request();
+        scoped["_provider_step_key"] = json!("business:0");
+        assert_eq!(
+            host_for(&state, &run_id, inner.clone()).call(&scoped, &cancel)["error"]["code"],
+            "corrupt_provider_step"
+        );
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_replay_does_not_reissue_a_pruned_completed_step() {
+        let config = AgentGatewayConfig {
+            max_events_per_run: 4,
+            ..AgentGatewayConfig::default()
+        };
+        let state = AgentGatewayState::new(config).expect("in-memory gateway");
+        let admitted = state
+            .service()
+            .admit(AdmitRunRequest {
+                input: json!({"text":"retention"}),
+                platform: "durable_provider_tests".into(),
+                ..AdmitRunRequest::default()
+            })
+            .await
+            .unwrap();
+        let inner = ScriptedProvider::new();
+        inner.push_ok(text_ok("first"));
+        inner.push_ok(text_ok("second"));
+        let host = host_for(&state, &admitted.run_id, inner.clone());
+        let cancel = RunCancellation::new();
+        let mut first = request();
+        first["_provider_step_key"] = json!("business:0");
+        let mut second = request();
+        second["_provider_step_key"] = json!("business:1");
+        assert_eq!(host.call(&first, &cancel)["ok"], true);
+        assert_eq!(host.call(&second, &cancel)["ok"], true);
+        state
+            .service()
+            .persist_run_event(
+                &admitted.run_id,
+                "retention-marker",
+                "model.audit",
+                json!({"turn":2}),
+            )
+            .unwrap();
+        let events = state.service().run_events(&admitted.run_id);
+        assert!(events.first().unwrap()["seq"].as_u64().unwrap() > 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["data"].get("step_key") == Some(&json!("business:0")))
+        );
+        let resumed = host_for(&state, &admitted.run_id, inner.clone());
+        assert_eq!(
+            resumed.call(&first, &cancel)["error"]["code"],
+            "corrupt_provider_step"
+        );
+        assert_eq!(inner.call_count(), 2);
     }
 
     fn tool_event_count(state: &AgentGatewayState, run_id: &str) -> usize {

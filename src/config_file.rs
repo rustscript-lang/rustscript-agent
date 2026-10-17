@@ -36,6 +36,8 @@ pub const STATE_FILE_NAME: &str = "state.db";
 
 /// Maximum bytes read from `config.yaml` before parsing is attempted.
 pub const MAX_CONFIG_YAML_BYTES: usize = 256 * 1024;
+const MAX_OAUTH_PUBLIC_ENTRIES: usize = 32;
+const MAX_OAUTH_PUBLIC_BYTES: usize = 2048;
 /// Maximum YAML nesting depth accepted by either version-one document.
 pub const MAX_YAML_DEPTH: usize = 16;
 /// Maximum number of YAML scalar and collection nodes accepted by a document.
@@ -213,6 +215,8 @@ impl Default for ModelSettings {
 pub struct ProviderSettings {
     pub protocol: String,
     pub base_url: String,
+    /// Optional administrator-owned native transport identity intent.
+    pub transport_identity: Option<String>,
     /// A named credential reference. The token itself cannot be represented
     /// by this field because it is a string ID validated against auth.yaml.
     pub auth: Option<String>,
@@ -231,6 +235,16 @@ pub struct OAuthSettings {
     pub token_endpoint: Option<String>,
     pub redirect_uri: Option<String>,
     pub refresh_skew_seconds: u64,
+    pub scopes: Option<Vec<String>>,
+    pub authorization_parameters: Option<Vec<OAuthPublicQueryParameter>>,
+}
+
+/// One explicitly configured public authorization-query parameter.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthPublicQueryParameter {
+    pub name: String,
+    pub value: String,
 }
 
 impl Default for OAuthSettings {
@@ -245,6 +259,8 @@ impl Default for OAuthSettings {
             token_endpoint: None,
             redirect_uri: None,
             refresh_skew_seconds: 120,
+            scopes: None,
+            authorization_parameters: None,
         }
     }
 }
@@ -254,6 +270,23 @@ impl Default for OAuthSettings {
 pub struct WorkspaceSettings {
     pub allowed_roots: Vec<PathBuf>,
     pub default: Option<PathBuf>,
+    /// Explicitly named workspaces. The key is a bounded public selector
+    /// token; RSS interprets `name:<key>` and native validates the path like
+    /// any other trusted root path.
+    pub named: BTreeMap<String, PathBuf>,
+}
+
+/// Bounds of one named-workspace selector key.
+pub const MAX_NAMED_WORKSPACES: usize = 64;
+pub const MAX_WORKSPACE_NAME_BYTES: usize = 64;
+
+/// True when `name` is a valid named-workspace selector key.
+pub fn valid_workspace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_WORKSPACE_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -262,6 +295,10 @@ pub struct ApprovalSettings {
     pub read: String,
     pub write: String,
     pub process: String,
+    pub reviewer: Option<String>,
+    pub reviewer_model: Option<String>,
+    pub allow_user_fallback: Option<bool>,
+    pub required: Option<bool>,
 }
 
 impl Default for ApprovalSettings {
@@ -270,7 +307,38 @@ impl Default for ApprovalSettings {
             read: "allow".to_string(),
             write: "ask".to_string(),
             process: "ask".to_string(),
+            reviewer: None,
+            reviewer_model: None,
+            allow_user_fallback: None,
+            required: None,
         }
+    }
+}
+
+impl ApprovalSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .reviewer
+            .as_deref()
+            .is_some_and(|reviewer| !matches!(reviewer, "guardian" | "user"))
+        {
+            return Err("approvals.reviewer must be guardian or user".to_string());
+        }
+        if let Some(model) = self.reviewer_model.as_deref()
+            && (model.is_empty()
+                || model.len() > 128
+                || model.chars().any(char::is_control)
+                || model.trim() != model)
+        {
+            return Err("approvals.reviewer_model must be a bounded model name".to_string());
+        }
+        if self.read == "ask" {
+            return Err(
+                "approvals.read ask is unsupported by the current native permission primitive"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -323,6 +391,25 @@ impl ConfigFile {
     pub fn load_from_home() -> Result<Self, ConfigFileError> {
         let paths = AgentPaths::resolve()?;
         Self::load(paths.config_path())
+    }
+
+    /// Loads the existing validated compaction settings, defaulting only when
+    /// the config file is absent. Parse, validation, and I/O errors remain
+    /// startup errors rather than silently selecting defaults.
+    pub fn load_compaction_settings(
+        path: impl AsRef<Path>,
+    ) -> Result<CompactionSettings, ConfigFileError> {
+        match Self::load(path) {
+            Ok(config) => Ok(config.compaction),
+            Err(ConfigFileError::MissingFile { .. }) => Ok(CompactionSettings::default()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Production gateway producer for the existing home `config.yaml`.
+    pub fn load_compaction_settings_from_home() -> Result<CompactionSettings, ConfigFileError> {
+        let paths = AgentPaths::resolve()?;
+        Self::load_compaction_settings(paths.config_path())
     }
 
     pub fn load_pair(paths: &AgentPaths) -> Result<LoadedConfig, ConfigFileError> {
@@ -437,6 +524,17 @@ impl ConfigFile {
             if let Some(auth) = provider.auth.as_deref() {
                 validate_visible(auth, source, &format!("providers.{provider_name}.auth"))?;
             }
+            if provider
+                .transport_identity
+                .as_deref()
+                .is_some_and(|identity| identity != "codex_access_claim")
+            {
+                return Err(invalid_value(
+                    source,
+                    &format!("providers.{provider_name}.transport_identity"),
+                    "must be absent or codex_access_claim",
+                ));
+            }
             if let Some(oauth) = provider.oauth.as_ref() {
                 validate_oauth(source, provider_name, oauth)?;
             }
@@ -447,6 +545,35 @@ impl ConfigFile {
                 source,
                 &format!("workspaces.allowed_roots[{index}]"),
             )?;
+        }
+        if self.workspaces.named.len() > MAX_NAMED_WORKSPACES {
+            return Err(invalid_value(
+                source,
+                "workspaces.named",
+                "must contain at most 64 named workspaces",
+            ));
+        }
+        for (name, path) in &self.workspaces.named {
+            if !valid_workspace_name(name) {
+                return Err(invalid_value(
+                    source,
+                    "workspaces.named",
+                    "a named-workspace key must be 1..64 characters of [A-Za-z0-9_-]",
+                ));
+            }
+            validate_absolute_workspace(path, source, &format!("workspaces.named.{name}"))?;
+            if !self
+                .workspaces
+                .allowed_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+            {
+                return Err(invalid_value(
+                    source,
+                    &format!("workspaces.named.{name}"),
+                    "must be below one of workspaces.allowed_roots",
+                ));
+            }
         }
         if let Some(default) = self.workspaces.default.as_ref() {
             validate_absolute_workspace(default, source, "workspaces.default")?;
@@ -476,6 +603,9 @@ impl ConfigFile {
                 ));
             }
         }
+        self.approvals
+            .validate()
+            .map_err(|reason| invalid_value(source, "approvals", &reason))?;
         if self.compaction.max_context_messages == 0 {
             return Err(invalid_value(
                 source,
@@ -548,6 +678,144 @@ fn validate_oauth(
             &format!("{prefix}.refresh_skew_seconds"),
             "must be at most 86400",
         ));
+    }
+    if let Some(scopes) = oauth.scopes.as_deref() {
+        validate_oauth_scopes(scopes, source, &format!("{prefix}.scopes"))?;
+    }
+    if let Some(parameters) = oauth.authorization_parameters.as_deref() {
+        validate_oauth_public_parameters(
+            parameters,
+            source,
+            &format!("{prefix}.authorization_parameters"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_oauth_scopes(
+    scopes: &[String],
+    source: &Path,
+    field: &str,
+) -> Result<(), ConfigFileError> {
+    if scopes.len() > MAX_OAUTH_PUBLIC_ENTRIES {
+        return Err(invalid_value(
+            source,
+            field,
+            "must contain at most 32 entries",
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for scope in scopes {
+        total_bytes = total_bytes.saturating_add(scope.len());
+        if scope.is_empty() || scope.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(invalid_value(
+                source,
+                field,
+                "entries must be nonempty and contain no ASCII control bytes",
+            ));
+        }
+        if total_bytes > MAX_OAUTH_PUBLIC_BYTES {
+            return Err(invalid_value(
+                source,
+                field,
+                "aggregate UTF-8 bytes must not exceed 2048",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_oauth_public_parameters(
+    parameters: &[OAuthPublicQueryParameter],
+    source: &Path,
+    field: &str,
+) -> Result<(), ConfigFileError> {
+    if parameters.len() > MAX_OAUTH_PUBLIC_ENTRIES {
+        return Err(invalid_value(
+            source,
+            field,
+            "must contain at most 32 entries",
+        ));
+    }
+
+    const RESERVED_NAMES: &[&str] = &[
+        "host",
+        "authorization",
+        "cookie",
+        "redirect_uri",
+        "code_verifier",
+        "verifier",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "url",
+        "authority",
+        "code",
+        "authorization_code",
+        "device_auth_id",
+        "device_code",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token",
+        "api_key",
+        "client_secret",
+        "password",
+        "secret",
+        "scope",
+        "client_id",
+        "response_type",
+    ];
+
+    let mut total_bytes = 0usize;
+    let mut names = std::collections::BTreeSet::new();
+    for parameter in parameters {
+        total_bytes = total_bytes
+            .saturating_add(parameter.name.len())
+            .saturating_add(parameter.value.len());
+        if total_bytes > MAX_OAUTH_PUBLIC_BYTES {
+            return Err(invalid_value(
+                source,
+                field,
+                "aggregate name and value UTF-8 bytes must not exceed 2048",
+            ));
+        }
+        if parameter.name.is_empty()
+            || !parameter
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(invalid_value(
+                source,
+                field,
+                "parameter names must be nonempty ASCII identifiers",
+            ));
+        }
+        if parameter.value.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(invalid_value(
+                source,
+                field,
+                "parameter values must contain no ASCII control bytes",
+            ));
+        }
+        if !names.insert(parameter.name.as_str()) {
+            return Err(invalid_value(
+                source,
+                field,
+                "parameter names must be unique",
+            ));
+        }
+        if RESERVED_NAMES
+            .iter()
+            .any(|reserved| parameter.name.eq_ignore_ascii_case(reserved))
+        {
+            return Err(invalid_value(
+                source,
+                field,
+                "parameter name is reserved or security-sensitive",
+            ));
+        }
     }
     Ok(())
 }
@@ -750,7 +1018,13 @@ fn validate_config_shape(source: &Path, value: &Value) -> Result<(), ConfigFileE
                 source,
                 &path,
                 provider,
-                &["protocol", "base_url", "auth", "oauth"],
+                &[
+                    "protocol",
+                    "base_url",
+                    "auth",
+                    "oauth",
+                    "transport_identity",
+                ],
             )?;
             if let Some(oauth) = as_mapping_optional(provider, "oauth")? {
                 validate_known_keys(
@@ -767,6 +1041,8 @@ fn validate_config_shape(source: &Path, value: &Value) -> Result<(), ConfigFileE
                         "token_endpoint",
                         "redirect_uri",
                         "refresh_skew_seconds",
+                        "scopes",
+                        "authorization_parameters",
                     ],
                 )?;
             }
@@ -777,7 +1053,7 @@ fn validate_config_shape(source: &Path, value: &Value) -> Result<(), ConfigFileE
             source,
             "workspaces",
             workspaces,
-            &["allowed_roots", "default"],
+            &["allowed_roots", "default", "named"],
         )?;
     }
     if let Some(approvals) = root.get(Value::String("approvals".to_string())) {
@@ -785,7 +1061,15 @@ fn validate_config_shape(source: &Path, value: &Value) -> Result<(), ConfigFileE
             source,
             "approvals",
             approvals,
-            &["read", "write", "process"],
+            &[
+                "read",
+                "write",
+                "process",
+                "reviewer",
+                "reviewer_model",
+                "allow_user_fallback",
+                "required",
+            ],
         )?;
     }
     if let Some(compaction) = root.get(Value::String("compaction".to_string())) {
@@ -1858,6 +2142,10 @@ mod fixture_policy {
         pub approval_read: String,
         pub approval_write: String,
         pub approval_process: String,
+        pub approval_reviewer: Option<String>,
+        pub approval_reviewer_model: Option<String>,
+        pub approval_allow_user_fallback: Option<bool>,
+        pub approval_required: Option<bool>,
         pub policy_generation: u64,
         pub max_turns: u64,
         pub max_tool_calls: u64,
@@ -1912,6 +2200,14 @@ mod fixture_policy {
         approval_write: String,
         #[allow(dead_code)]
         approval_process: String,
+        #[allow(dead_code)]
+        approval_reviewer: Option<String>,
+        #[allow(dead_code)]
+        approval_reviewer_model: Option<String>,
+        #[allow(dead_code)]
+        approval_allow_user_fallback: Option<bool>,
+        #[allow(dead_code)]
+        approval_required: Option<bool>,
         allowed_header_names: BTreeSet<String>,
         #[allow(dead_code)]
         provider_authorities: Vec<String>,
@@ -2017,6 +2313,10 @@ mod fixture_policy {
                 approval_read: loaded.config.approvals.read.clone(),
                 approval_write: loaded.config.approvals.write.clone(),
                 approval_process: loaded.config.approvals.process.clone(),
+                approval_reviewer: loaded.config.approvals.reviewer.clone(),
+                approval_reviewer_model: loaded.config.approvals.reviewer_model.clone(),
+                approval_allow_user_fallback: loaded.config.approvals.allow_user_fallback,
+                approval_required: loaded.config.approvals.required,
                 policy_generation: generation,
                 max_turns: loaded.config.agent.max_turns,
                 max_tool_calls: loaded.config.agent.max_tool_calls,
@@ -2042,6 +2342,10 @@ mod fixture_policy {
                         approval_read: summary.approval_read.clone(),
                         approval_write: summary.approval_write.clone(),
                         approval_process: summary.approval_process.clone(),
+                        approval_reviewer: summary.approval_reviewer.clone(),
+                        approval_reviewer_model: summary.approval_reviewer_model.clone(),
+                        approval_allow_user_fallback: summary.approval_allow_user_fallback,
+                        approval_required: summary.approval_required,
                         allowed_header_names: ["content-type", "accept"]
                             .into_iter()
                             .map(str::to_string)

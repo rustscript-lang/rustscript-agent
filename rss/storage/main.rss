@@ -33,6 +33,7 @@ use self::events as events;
 use self::approvals as approvals;
 use self::compactions as compactions;
 use self::jobs as jobs;
+use self::plugins as plugins;
 use self::admission as admission;
 use self::load as load;
 
@@ -121,6 +122,10 @@ struct ApprovalIdInput {
     approval_id: string
 }
 
+struct ApprovalListInput {
+    run_id: string,
+    session_id: string
+}
 
 struct CompactionIdInput {
     compaction_id: string
@@ -317,6 +322,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_raw_ok(request_id, op, sessions::storage_session_list(db_id, input.profile, input.platform, command.max_rows, command.max_bytes));
     } else if command.op == "session.touch" {
         result = storage_raw_ok(request_id, op, sessions::storage_session_touch(db_id, command.payload_json, command.max_rows, command.max_bytes));
+    } else if command.op == "session.workspace_bind" {
+        result = storage_unwrap(request_id, op, sessions::storage_session_workspace_bind(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.append" {
         result = storage_unwrap(request_id, op, messages::storage_message_append(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "message.get" {
@@ -346,6 +353,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, runs::storage_run_terminal(db_id, command.payload_json));
     } else if command.op == "admission.create" {
         result = storage_unwrap(request_id, op, admission::storage_admission_create(db_id, command.payload_json));
+    } else if command.op == "admission.replay" {
+        result = storage_unwrap(request_id, op, admission::storage_admission_replay(db_id, command.payload_json));
     } else if command.op == "session.delete" {
         let delete_results: array = sessions::storage_session_delete(db_id, command.payload_json);
         if storage_nth_rows_affected(delete_results, 1) == 0 {
@@ -385,6 +394,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         };
     } else if command.op == "event.append" {
         result = storage_unwrap_array(request_id, op, events::storage_event_append(db_id, command.payload_json));
+    } else if command.op == "event.append_pair" {
+        result = storage_unwrap_array(request_id, op, events::storage_event_append_pair(db_id, command.payload_json));
     } else if command.op == "step.commit" {
         result = storage_unwrap_array(request_id, op, events::storage_step_commit(db_id, command.payload_json));
     } else if command.op == "recovery.reconcile_effects" {
@@ -445,6 +456,8 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
     } else if command.op == "approval.get" {
         let input: ApprovalIdInput = json::decode::<ApprovalIdInput>(command.payload_json);
         result = storage_raw_ok(request_id, op, approvals::storage_approval_get(db_id, input.approval_id, command.max_rows, command.max_bytes));
+    } else if command.op == "approval.list" {
+        result = storage_raw_ok(request_id, op, approvals::storage_approval_list(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "approval.resolve" {
         result = storage_execute_ok(request_id, op, approvals::storage_approval_resolve(db_id, command.payload_json));
     } else if command.op == "approval.expire" {
@@ -471,6 +484,28 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, jobs::storage_job_get(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "job.list" {
         result = storage_unwrap(request_id, op, jobs::storage_job_list(db_id, command.max_rows, command.max_bytes));
+    } else if command.op == "plugin.lock_put" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_lock_put(db_id, command.payload_json));
+    } else if command.op == "plugin.lock_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_lock_get(db_id, command.payload_json));
+    } else if command.op == "plugin.lock_list" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_lock_list(db_id));
+    } else if command.op == "plugin.ref_list" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_ref_list(db_id, command.payload_json));
+    } else if command.op == "plugin.activate" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_activate(db_id, command.payload_json));
+    } else if command.op == "plugin.activation_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_activation_get(db_id));
+    } else if command.op == "plugin.activation_history" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_activation_history(db_id));
+    } else if command.op == "plugin.retain" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_retain(db_id, command.payload_json));
+    } else if command.op == "plugin.retention_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_retention_get(db_id, command.payload_json));
+    } else if command.op == "plugin.release" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_release(db_id, command.payload_json));
+    } else if command.op == "plugin.collect" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_collect(db_id, command.payload_json));
     }
     result
 }

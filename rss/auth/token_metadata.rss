@@ -1,0 +1,191 @@
+use auth;
+use oauth;
+
+struct TokenMetadataIntent {
+    provider: string,
+    source: string,
+    expected_generation: int,
+    scopes: array<string>,
+    expiry_pointer: string,
+    token_type_pointer: string,
+    account_pointer: string?
+}
+
+struct TokenMetadataResult {
+    ok: bool,
+    code: string,
+    value: CredentialMetadata?
+}
+
+struct ParsedExpiry {
+    valid: bool,
+    seconds: int
+}
+
+struct ParsedTokenType {
+    valid: bool,
+    value: string
+}
+
+struct ParsedAccount {
+    valid: bool,
+    has_value: bool,
+    value: string
+}
+
+fn max_int() -> int {
+    9223372036854775807
+}
+
+fn failure(code: string) -> TokenMetadataResult {
+    {ok: false, code: code, value: null}
+}
+
+fn empty_transport_response() -> TransportResponseEnvelope {
+    {ok: false, error: null, status: 0, public_headers: [], body_without_secret_fields: "", retry_after_ms: null, access_slot: null, refresh_slot: null, device_handle: null}
+}
+
+fn parse_expiry(envelope: PublicJsonFieldResultEnvelope) -> ParsedExpiry {
+    let mut parsed: ParsedExpiry = {valid: false, seconds: 0};
+    let has_error: bool = envelope.has("error") && envelope.error != null;
+    if envelope.ok && !has_error && envelope.value.copy() != null {
+        let selected: PublicJsonFieldEnvelope = envelope.value;
+        if selected.kind == "int" && selected.int_value.copy() != null {
+            let seconds: int = selected.int_value;
+            if seconds > 0 && seconds <= max_int() / 1000 {
+                parsed = {valid: true, seconds: seconds};
+            }
+        }
+    }
+    parsed
+}
+
+fn parse_token_type(envelope: PublicJsonFieldResultEnvelope) -> ParsedTokenType {
+    let mut parsed: ParsedTokenType = {valid: false, value: ""};
+    let has_error: bool = envelope.has("error") && envelope.error != null;
+    if envelope.ok && !has_error && envelope.value.copy() != null {
+        let selected: PublicJsonFieldEnvelope = envelope.value;
+        if selected.kind == "string" && selected.string_value.copy() != null {
+            let value: string = selected.string_value;
+            if value == "Bearer" {
+                parsed = {valid: true, value: value};
+            }
+        }
+    }
+    parsed
+}
+
+fn parse_account(envelope: PublicJsonFieldResultEnvelope) -> ParsedAccount {
+    let mut parsed: ParsedAccount = {valid: false, has_value: false, value: ""};
+    let has_error: bool = envelope.has("error") && envelope.error != null;
+    if envelope.ok && !has_error && envelope.value.copy() != null {
+        let selected: PublicJsonFieldEnvelope = envelope.value;
+        if selected.kind.copy() == "missing" || selected.kind.copy() == "null" {
+            parsed = {valid: true, has_value: false, value: ""};
+        } else if selected.kind == "string" && selected.string_value.copy() != null {
+            let value: string = selected.string_value;
+            if value != "" {
+                parsed = {valid: true, has_value: true, value: value};
+            }
+        }
+    }
+    parsed
+}
+
+pub fn parse(
+    policy_handle: resource<auth.policy>,
+    response: TransportResponseEnvelope,
+    intent: TokenMetadataIntent
+) -> TokenMetadataResult {
+    let mut result: TokenMetadataResult = failure("invalid_token_metadata");
+    let valid_intent: bool = intent.provider != "" && intent.source != "" &&
+        intent.expected_generation >= 0 && intent.expiry_pointer != "" &&
+        intent.token_type_pointer != "" &&
+        (!intent.has("account_pointer") || intent.account_pointer == null || intent.account_pointer != "");
+    if valid_intent {
+        let has_transport_error: bool = response.has("error") && response.error != null;
+        if !response.ok || has_transport_error {
+            result = failure("token_transport_failed");
+        } else if response.status != 200 {
+            result = failure("token_http_rejected");
+        } else if !response.has("access_slot") || type(response["access_slot"]) == "null" {
+            result = failure("invalid_token_metadata");
+        } else {
+            let body: string = response.body_without_secret_fields;
+            let expiry_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), intent.expiry_pointer);
+            let token_type_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), intent.token_type_pointer);
+            let expiry: ParsedExpiry = parse_expiry(expiry_field);
+            let token_type: ParsedTokenType = parse_token_type(token_type_field);
+            let mut account: ParsedAccount = {valid: true, has_value: false, value: ""};
+            let mut account_pointer: string? = null;
+            if intent.has("account_pointer") {
+                account_pointer = intent.account_pointer;
+            }
+            if account_pointer != null {
+                let pointer: string = account_pointer;
+                let account_field: PublicJsonFieldResultEnvelope = oauth::public_json_field_result(&policy_handle, body.copy(), pointer);
+                account = parse_account(account_field);
+            }
+            if !expiry.valid || !token_type.valid || !account.valid {
+                result = failure("invalid_token_metadata");
+            } else {
+                let clock: OAuthNowResultEnvelope = oauth::now_ms_result(&policy_handle);
+                let clock_has_error: bool = clock.has("error") && clock.error.copy() != null;
+                if !clock.ok || clock_has_error || clock.value.copy() == null {
+                    let mut code: string = "clock_unavailable";
+                    if clock_has_error {
+                        let clock_error: AuthBridgeFailure = clock.error;
+                        code = clock_error.code;
+                    }
+                    result = failure(code);
+                } else {
+                    let now_ms: int = clock.value;
+                    if now_ms < 0 {
+                        result = failure("invalid_token_metadata");
+                    } else {
+                        let lifetime_ms: int = expiry.seconds * 1000;
+                        if now_ms > max_int() - lifetime_ms {
+                            result = failure("invalid_token_metadata");
+                        } else {
+                            let mut account_id: string? = null;
+                            if account.has_value {
+                                account_id = account.value;
+                            }
+                            let has_refresh_token: bool = response.has("refresh_slot") && type(response["refresh_slot"]) != "null";
+                            let metadata: CredentialMetadata = {
+                                provider: intent.provider,
+                                kind: "oauth",
+                                source: intent.source,
+                                token_type: token_type.value,
+                                expires_at_ms: now_ms + lifetime_ms,
+                                scopes: intent.scopes,
+                                account_id: account_id,
+                                generation: intent.expected_generation,
+                                status: "active",
+                                last_refresh_at_ms: null,
+                                has_refresh_token: has_refresh_token
+                            };
+                            result = {ok: true, code: "ok", value: metadata};
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+pub fn parse_transport_result(
+    policy_handle: resource<auth.policy>,
+    response: TransportResultEnvelope,
+    intent: TokenMetadataIntent
+) -> TokenMetadataResult {
+    let mut result: TokenMetadataResult = failure("token_transport_failed");
+    let has_error: bool = response.has("error") && response.error != null;
+    if response.ok && !has_error && response.value != null {
+        let maybe_value: TransportResponseEnvelope? = response.value;
+        let value: TransportResponseEnvelope = maybe_value.unwrap_or(empty_transport_response());
+        result = parse(policy_handle, value, intent);
+    }
+    result
+}

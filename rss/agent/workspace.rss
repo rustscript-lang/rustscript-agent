@@ -1,0 +1,325 @@
+// Workspace selection and admission entry (Task 10).
+//
+// RSS owns the public selection interpretation: default, named, explicit path
+// and stored session binding. Native `workspace::open_result` performs the
+// bounded decoding, trusted-root authorization, no-follow directory open and
+// owner/generation/deadline/revocation enforcement. This module never derives
+// authority from a path string, a persisted metadata record, the process cwd or
+// a user-selected home.
+use workspace;
+
+struct WorkspaceOpenOutcome {
+    ok: bool,
+    directory: resource<workspace.directory>?,
+    canonical_path: string?,
+    effective_selector: string?,
+    policy_generation: int?,
+    error: map?
+}
+
+fn char_at(value: string, index: int) -> string {
+    value[index:(index + 1)]
+}
+
+fn starts_with(value: string, prefix: string) -> bool {
+    let mut result: bool = false;
+    if prefix.length <= value.length {
+        result = value[0:prefix.length] == prefix;
+    }
+    result
+}
+
+fn map_string(value: map, key: string, fallback: string) -> string {
+    let mut result: string = fallback;
+    if value.has(key) {
+        if type(value[key]) == "string" {
+            let coerced: string = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_bool(value: map, key: string, fallback: bool) -> bool {
+    let mut result: bool = fallback;
+    if value.has(key) {
+        if type(value[key]) == "bool" {
+            let coerced: bool = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn map_array(value: map, key: string) -> array {
+    let mut result: array = [];
+    if value.has(key) {
+        if type(value[key]) == "array" {
+            let coerced: array = value[key];
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn array_map(items: array, index: int) -> map {
+    let mut result: map = {};
+    if items.has(index) {
+        if type(items[index].copy()) == "map" {
+            let coerced: map = items[index].copy();
+            result = coerced;
+        }
+    }
+    result
+}
+
+fn is_blank(value: string) -> bool {
+    let mut blank: bool = true;
+    let mut index: int = 0;
+    while index < value.length {
+        let ch: string = char_at(value, index);
+        if ch != " " && ch != "\t" && ch != "\n" && ch != "\r" {
+            blank = false;
+        }
+        index = index + 1;
+    }
+    blank
+}
+
+// A selector is a raw external token: it is never trimmed or normalized here.
+fn is_absolute(value: string) -> bool {
+    let mut absolute: bool = false;
+    if value.length > 0 {
+        if starts_with(value, "/") {
+            absolute = true;
+        }
+    }
+    absolute
+}
+
+fn is_relative(value: string) -> bool {
+    !is_absolute(value)
+}
+
+fn find_text(value: string, needle: string) -> int {
+    let mut found: int = -1;
+    let mut index: int = 0;
+    while found < 0 && index + needle.length <= value.length {
+        if value[index:(index + needle.length)] == needle {
+            found = index;
+        }
+        index = index + 1;
+    }
+    found
+}
+
+fn is_valid_name_key(value: string) -> bool {
+    let mut valid: bool = value.length >= 1 && value.length <= 64;
+    let allowed: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    let mut index: int = 0;
+    while valid && index < value.length {
+        if find_text(allowed, char_at(value, index)) < 0 {
+            valid = false;
+        }
+        index = index + 1;
+    }
+    valid
+}
+
+fn named_lookup(workspaces: map, key: string) -> map {
+    let mut resolved: map = {found: false, path: ""};
+    let entries: array = map_array(workspaces, "named");
+    let mut found: bool = false;
+    let mut index: int = 0;
+    while entries.has(index) && found == false {
+        let entry: map = array_map(entries, index);
+        if map_string(entry, "name", "") == key {
+            resolved = {found: true, path: map_string(entry, "path", "")};
+            found = true;
+        }
+        index = index + 1;
+    }
+    resolved
+}
+
+fn configured_default(workspaces: map) -> map {
+    let mut resolved: map = {found: false, path: ""};
+    if workspaces.has("default") {
+        if type(workspaces["default"]) == "string" {
+            let value: string = workspaces["default"];
+            resolved = {found: true, path: value};
+        }
+    }
+    resolved
+}
+
+fn failure(code: string, message: string) -> map {
+    {
+        ok: false,
+        code: code,
+        message: message,
+        canonical_path: "",
+        effective_selector: "",
+        selected_name: "",
+        generation: 0,
+        directory: null
+    }
+}
+
+// Resolves one selector token to a path plus the selected name (if any).
+//
+// `selector` is the raw external token. `session_selector` is the stored
+// session binding (possibly empty). RSS owns default/named/session priority
+// and the user-visible rejection meaning; nothing here grants authority.
+fn resolve(workspaces: map, selector: string, session_selector: string, selector_present: bool) -> map {
+    let mut resolved: map = {ok: false, path: "", name: "", effective_selector: "", code: "", message: ""};
+    let mut effective: string = selector;
+    if selector.length > 4096 {
+        resolved = {ok: false, path: "", name: "", effective_selector: "", code: "workspace_selector_too_long", message: "the workspace selector exceeds the size limit"};
+    } else if selector_present && selector.length == 0 {
+        resolved = {ok: false, path: "", name: "", effective_selector: "", code: "workspace_selector_blank", message: "the workspace selector is blank"};
+    } else {
+        if effective.length == 0 {
+            effective = session_selector;
+        }
+        if effective.length == 0 {
+            let fallback: map = configured_default(workspaces);
+            if map_bool(fallback, "found", false) {
+                let path: string = map_string(fallback, "path", "");
+                resolved = {ok: true, path: path.copy(), name: "", effective_selector: path.copy(), code: "", message: ""};
+            } else {
+                resolved = {ok: false, path: "", name: "", effective_selector: "", code: "workspace_unavailable", message: "no workspace is configured or selected"};
+            }
+        } else if starts_with(effective, "name:") {
+            let name_selector: string = effective.copy();
+            let key: string = name_selector[5:name_selector.length];
+            if is_valid_name_key(key) == false {
+                resolved = {ok: false, path: "", name: "", effective_selector: effective.copy(), code: "workspace_name_invalid", message: "the named workspace key is invalid"};
+            } else {
+                let named: map = named_lookup(workspaces, key);
+                if map_bool(named, "found", false) {
+                    resolved = {ok: true, path: map_string(named, "path", ""), name: key, effective_selector: effective.copy(), code: "", message: ""};
+                } else {
+                    resolved = {ok: false, path: "", name: key, effective_selector: effective.copy(), code: "workspace_name_unknown", message: "the named workspace is not configured"};
+                }
+            }
+        } else if is_absolute(effective) {
+            resolved = {ok: true, path: effective.copy(), name: "", effective_selector: effective.copy(), code: "", message: ""};
+        } else {
+            if is_blank(effective) {
+                resolved = {ok: false, path: "", name: "", effective_selector: effective.copy(), code: "workspace_selector_blank", message: "the workspace selector is blank"};
+            } else {
+                resolved = {ok: false, path: "", name: "", effective_selector: effective.copy(), code: "workspace_selector_relative", message: "the workspace selector must be an absolute path or a configured name"};
+            }
+        }
+    }
+    resolved
+}
+
+/// Resolves one selector and admits the directory through the native host.
+///
+/// `context` carries `host_home` (the bound trusted home resource), the raw
+/// `selector` token, the stored `session_selector` binding and the effective
+/// `idempotency_selector` used for binding. `selection_path` is the path the
+/// native admission consumes.
+fn open_with_policy(context: map, allow_switch: bool) -> map {
+    let mut outcome: map = failure("workspace_unavailable", "workspace admission did not complete");
+    if context.has("host_home") == false {
+        outcome = failure("workspace_unavailable", "no trusted workspace home is configured");
+    } else {
+        let host_home: resource<auth.host_home> = context["host_home"];
+        let selector: string = map_string(context, "selector", "");
+        let selector_present: bool = map_bool(context, "selector_present", false);
+        let session_selector: string = map_string(context, "session_selector", "");
+        let session_canonical_path: string = map_string(context, "session_canonical_path", "");
+        let snapshot: ConfigSnapshotEnvelope = config::load_snapshot(&host_home);
+        if snapshot.ok == false {
+            outcome = failure("workspace_unavailable", "the trusted configuration is unavailable");
+        } else {
+            let generation: int = snapshot.policy_generation;
+            let workspaces: map = snapshot.public_config.workspaces;
+            let resolved: map = resolve(workspaces, selector, session_selector, selector_present);
+            if map_bool(resolved, "ok", false) == false {
+                outcome = failure(map_string(resolved, "code", "workspace_unavailable"), map_string(resolved, "message", "the workspace selection was rejected"));
+                outcome["selected_name"] = map_string(resolved, "name", "");
+            } else {
+                let selection: WorkspaceSelection = {
+                    path: map_string(resolved, "path", ""),
+                    policy_generation: generation.copy()
+                };
+                let opened: WorkspaceOpenResult = workspace::open_result(selection, &snapshot.policy_handle);
+                let opened_ok: bool = opened.ok;
+                let opened_path: string? = opened.canonical_path;
+                let opened_directory: resource<workspace.directory>? = opened.directory;
+                let opened_canonical_path: string = map_string(
+                    {canonical_path: opened_path},
+                    "canonical_path",
+                    ""
+                );
+                if opened_ok == false || opened_canonical_path.length == 0 {
+                    let mut rejected: map = failure("workspace_denied", "the selected workspace is not available");
+                    rejected["selected_name"] = map_string(resolved, "name", "");
+                    outcome = rejected;
+                } else if allow_switch == false && session_canonical_path.length > 0 && (
+                    opened_canonical_path != session_canonical_path ||
+                    map_string(resolved, "effective_selector", "") != session_selector
+                ) {
+                    outcome = failure("workspace_conflict", "the session is bound to a different workspace");
+                } else {
+                    outcome = {
+                        ok: true,
+                        code: "ok",
+                        message: "",
+                        canonical_path: opened_canonical_path,
+                        effective_selector: map_string(resolved, "effective_selector", ""),
+                        selected_name: map_string(resolved, "name", ""),
+                        generation: generation,
+                        directory: opened_directory
+                    };
+                }
+            }
+        }
+    }
+    outcome
+}
+
+/// Compares original logical request selectors and frozen workspace identity
+/// without opening a workspace or creating native authority.
+pub fn replay_identity_matches(context: map) -> map {
+    let mut matches: bool = false;
+    if context.has("stored_request_hash") && type(context["stored_request_hash"]) == "string" && context.has("request_hash") && type(context["request_hash"]) == "string" && context.has("stored_workspace_identity_present") && type(context["stored_workspace_identity_present"]) == "bool" && context.has("stored_workspace_identity") && context.has("incoming_workspace_selector_present") && type(context["incoming_workspace_selector_present"]) == "bool" && context.has("incoming_workspace_selector") && type(context["incoming_workspace_selector"]) == "string" {
+        let stored_request_hash: string = context["stored_request_hash"];
+        let request_hash: string = context["request_hash"];
+        let stored_identity_present: bool = context["stored_workspace_identity_present"];
+        let incoming_selector_present: bool = context["incoming_workspace_selector_present"];
+        let incoming_selector: string = context["incoming_workspace_selector"];
+        let mut identity_matches: bool = false;
+        if stored_identity_present == false && incoming_selector_present == false {
+            identity_matches = true;
+        } else if stored_identity_present && type(context["stored_workspace_identity"]) == "map" {
+            let stored_identity: map = context["stored_workspace_identity"].copy();
+            if stored_identity.has("request_selector_present") && type(stored_identity["request_selector_present"].copy()) == "bool" && stored_identity.has("request_selector") && type(stored_identity["request_selector"].copy()) == "string" {
+                let stored_selector_present: bool = stored_identity["request_selector_present"].copy();
+                let stored_selector: string = stored_identity["request_selector"].copy();
+                let binding_identity_valid: bool = stored_identity.has("selector") && type(stored_identity["selector"].copy()) == "string" && stored_identity.has("canonical_path") && type(stored_identity["canonical_path"].copy()) == "string" && stored_identity.has("generation") && type(stored_identity["generation"].copy()) == "int";
+                let legacy_identity_valid: bool = stored_identity.has("legacy_root") && type(stored_identity["legacy_root"].copy()) == "string";
+                let selector_matches: bool = stored_selector_present == incoming_selector_present && stored_selector == incoming_selector;
+                identity_matches = selector_matches && (binding_identity_valid || legacy_identity_valid);
+            }
+        }
+        matches = stored_request_hash == request_hash && identity_matches;
+    }
+    {matches: matches}
+}
+
+/// Opens the effective workspace for a new run; a stored session binding
+/// cannot be changed through ordinary run admission.
+pub fn open(context: map) -> map {
+    open_with_policy(context, false)
+}
+
+/// Resolves an explicit idle-session workspace change. The storage command
+/// independently guards active runs and commits the metadata atomically.
+pub fn bind(context: map) -> map {
+    open_with_policy(context, true)
+}
