@@ -300,8 +300,13 @@ fn thread_alive(tid: i64) -> bool {
 
 fn task_absent_before(task: &Path, deadline: Instant) -> std::io::Result<bool> {
     loop {
-        match fs::metadata(task) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        match fs::symlink_metadata(task) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Instant::now() < deadline);
+            }
             Err(error) => return Err(error),
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(std::io::Error::new(
@@ -321,9 +326,27 @@ fn task_absent_before(task: &Path, deadline: Instant) -> std::io::Result<bool> {
 
 #[test]
 fn joined_task_observer_propagates_proc_read_errors() {
-    let error = task_absent_before(Path::new("/proc/self/stat/not-a-task"), Instant::now())
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let error = task_absent_before(Path::new("/proc/self/stat/not-a-task"), deadline)
         .expect_err("an unreadable task path must not be accepted as zero threads");
     assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+}
+
+#[test]
+fn joined_task_observer_rejects_regular_files_and_symlinks() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    assert!(fs::symlink_metadata("/proc/self/stat").unwrap().is_file());
+    assert!(
+        fs::symlink_metadata("/proc/thread-self")
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    for path in ["/proc/self/stat", "/proc/thread-self"] {
+        let error = task_absent_before(Path::new(path), deadline)
+            .expect_err("a non-directory task entry must fail, without following links");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
 
 #[test]
@@ -342,16 +365,35 @@ fn joined_task_observer_rejects_a_still_live_owned_worker() {
     let observation_started = Instant::now();
     let worker =
         NativeAuthorizationInstructionWorker::start(output, receiver, cancellation).unwrap();
-    assert_eq!(worker.deadline(), deadline);
-    let tid = wait_for_thread_id(&worker);
-    let task = PathBuf::from(format!("/proc/self/task/{tid}"));
-    assert!(thread_alive(tid), "owned worker is genuinely live");
+    let live_observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eq!(worker.deadline(), deadline);
+        let tid = wait_for_thread_id(&worker);
+        let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+        assert!(thread_alive(tid), "owned worker is genuinely live");
+        assert!(
+            !task_absent_before(&task, Instant::now()).unwrap(),
+            "live owner must reject zero-thread observation"
+        );
+        assert!(
+            fs::symlink_metadata(&task).unwrap().is_dir(),
+            "the same owned worker remains live after the expired probe"
+        );
+        task
+    }));
+    // Stop and synchronously join even when the live observation panics.
+    let finish_result = worker.finish();
+    let task = live_observation.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+    assert!(finish_result.is_ok());
+    assert!(task_absent_before(&task, observation_started + Duration::from_secs(2)).unwrap());
+    assert_eq!(
+        fs::symlink_metadata(&task).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound,
+        "the joined owned task path is genuinely absent"
+    );
     assert!(
         !task_absent_before(&task, Instant::now()).unwrap(),
-        "live owner must reject zero-thread observation"
+        "an expired window must reject even a known-absent owned task"
     );
-    assert!(worker.finish().is_ok());
-    assert!(task_absent_before(&task, observation_started + Duration::from_secs(2)).unwrap());
     drop(read_fd);
     assert_eq!(open_fd_count(), fds_before, "no descriptor leaked");
 }
@@ -961,13 +1003,18 @@ fn worker_aborted_pending_output_is_not_reported_delivered() {
     let result = worker.finish();
     assert!(matches!(result, Err(OAuthError::Cancelled)), "{result:?}");
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(!thread_alive(tid), "worker thread was joined, not detached");
     // The exact supplied cancellation still governs the accepted context.
     assert!(context.check().is_err());
     // The reader never received a partial record.
     let bytes = drain_nonblocking(read_fd.as_raw_fd());
     assert!(!bytes.is_empty());
     assert!(bytes.iter().all(|byte| *byte == b'x'));
+    let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+    assert!(
+        task_absent_before(&task, started + Duration::from_secs(2))
+            .expect("joined task observation must not hide a read error"),
+        "worker task must disappear within the original cancellation bound"
+    );
 }
 
 #[test]
@@ -1065,9 +1112,11 @@ fn worker_finish_draining_flushes_all_records_before_join() {
     let (sender, receiver) = queue();
     let deadline = Instant::now() + Duration::from_secs(10);
     let cancellation = RunCancellation::with_deadline(deadline);
+    let observation_started = Instant::now();
     let worker =
         NativeAuthorizationInstructionWorker::start(Arc::clone(&output), receiver, cancellation)
             .expect("worker with finite original context");
+    assert_eq!(worker.deadline(), deadline);
     let tid = wait_for_thread_id(&worker);
     for _ in 0..2 {
         sender
@@ -1076,14 +1125,19 @@ fn worker_finish_draining_flushes_all_records_before_join() {
     }
 
     assert!(worker.finish_draining().is_ok());
-    assert!(
-        !thread_alive(tid),
-        "drain joined the existing worker thread"
-    );
+    // Save and check the bytes immediately after native join, before any task
+    // polling: a later write must not be hidden by the observation window.
+    let bytes = drain_nonblocking(read_fd.as_raw_fd());
     assert_eq!(
-        drain_nonblocking(read_fd.as_raw_fd()),
+        bytes,
         [EXPECTED_RECORD, EXPECTED_RECORD].concat(),
         "finish_draining returns only after every queued record was written"
+    );
+    let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+    assert!(
+        task_absent_before(&task, observation_started + Duration::from_secs(2))
+            .expect("joined task observation must not hide a read error"),
+        "drained worker task must disappear within the original engagement bound"
     );
 }
 
@@ -1203,7 +1257,12 @@ fn worker_stops_promptly_on_supplied_child_cancellation() {
     cancellation.request(rustscript_agent::CancellationReason::Requested);
     assert!(worker.finish().is_ok(), "cancellation is an orderly stop");
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(!thread_alive(tid), "worker thread was joined, not detached");
+    let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+    assert!(
+        task_absent_before(&task, started + Duration::from_secs(2))
+            .expect("joined task observation must not hide a read error"),
+        "worker task must disappear within the original cancellation bound"
+    );
     drop(read_fd);
 }
 
