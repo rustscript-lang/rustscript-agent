@@ -33,6 +33,7 @@ use self::events as events;
 use self::approvals as approvals;
 use self::compactions as compactions;
 use self::jobs as jobs;
+use self::plugins as plugins;
 use self::admission as admission;
 use self::load as load;
 
@@ -483,6 +484,28 @@ fn storage_dispatch(db_id: resource<sqlite.connection>, command: StorageCommand)
         result = storage_unwrap(request_id, op, jobs::storage_job_get(db_id, command.payload_json, command.max_rows, command.max_bytes));
     } else if command.op == "job.list" {
         result = storage_unwrap(request_id, op, jobs::storage_job_list(db_id, command.max_rows, command.max_bytes));
+    } else if command.op == "plugin.lock_put" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_lock_put(db_id, command.payload_json));
+    } else if command.op == "plugin.lock_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_lock_get(db_id, command.payload_json));
+    } else if command.op == "plugin.lock_list" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_lock_list(db_id));
+    } else if command.op == "plugin.ref_list" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_ref_list(db_id, command.payload_json));
+    } else if command.op == "plugin.activate" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_activate(db_id, command.payload_json));
+    } else if command.op == "plugin.activation_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_activation_get(db_id));
+    } else if command.op == "plugin.activation_history" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_activation_history(db_id));
+    } else if command.op == "plugin.retain" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_retain(db_id, command.payload_json));
+    } else if command.op == "plugin.retention_get" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_retention_get(db_id, command.payload_json));
+    } else if command.op == "plugin.release" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_release(db_id, command.payload_json));
+    } else if command.op == "plugin.collect" {
+        result = storage_unwrap(request_id, op, plugins::storage_plugin_collect(db_id, command.payload_json));
     }
     result
 }

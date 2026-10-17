@@ -8,10 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::error::{COMPILE_ENVIRONMENT, PluginError, PluginErrorKind};
+use super::error::{
+    COMPILE_ENVIRONMENT, EFFECT_KINDS, PLUGIN_KINDS, PluginError, PluginErrorKind,
+    recovery_allowed, scope_for,
+};
 use super::manifest::EffectRequirement;
 use super::store::InstalledPackage;
 
@@ -33,7 +37,8 @@ pub struct ResolveRequest {
     pub host_runtime: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockedPackage {
     pub id: String,
     pub version: String,
@@ -41,14 +46,16 @@ pub struct LockedPackage {
     pub artifact_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeBinding {
     pub kind: String,
     pub scope: String,
     pub recovery: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockedEdge {
     pub from: String,
     pub from_entry: String,
@@ -62,7 +69,8 @@ pub struct LockedEdge {
     pub bindings: Vec<ScopeBinding>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EffectOrigin {
     pub relation: String,
     pub caller_package: String,
@@ -74,14 +82,16 @@ pub struct EffectOrigin {
     pub version_requirement: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockedEffect {
     pub package: String,
     pub entry: String,
     pub effects: Vec<LockedEffectItem>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockedEffectItem {
     pub kind: String,
     pub scope: String,
@@ -89,7 +99,8 @@ pub struct LockedEffectItem {
     pub via: EffectOrigin,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphLock {
     pub graph_id: String,
     pub host_runtime: String,
@@ -200,7 +211,7 @@ impl GraphLock {
         yaml
     }
 
-    fn schema_value(&self) -> Value {
+    pub(crate) fn schema_value(&self) -> Value {
         json!({
             "graph_id": self.graph_id,
             "host_runtime": self.host_runtime,
@@ -248,6 +259,131 @@ impl GraphLock {
             })).collect::<Vec<_>>(),
         })
     }
+
+    pub(crate) fn from_schema_value(value: Value) -> Result<Self, PluginError> {
+        serde_json::from_value(value)
+            .map_err(|_| PluginError::new(PluginErrorKind::UnknownField, "lock"))
+    }
+
+    pub(crate) fn validate_persisted(&self) -> Result<(), PluginError> {
+        if !plain_identity(&self.graph_id) {
+            return Err(PluginError::new(PluginErrorKind::PathEscape, "graph_id"));
+        }
+        Version::parse(&self.host_runtime)
+            .map_err(|_| PluginError::new(PluginErrorKind::ContractIncompatible, "host runtime"))?;
+        if self.compile_environment != COMPILE_ENVIRONMENT {
+            return Err(PluginError::new(
+                PluginErrorKind::ContractIncompatible,
+                "compile environment",
+            ));
+        }
+        if self.packages.is_empty() || self.packages.len() > 64 {
+            return Err(PluginError::new(PluginErrorKind::UnknownField, "packages"));
+        }
+        let mut package_ids = BTreeSet::new();
+        let mut packages = BTreeMap::new();
+        for package in &self.packages {
+            if !package_ids.insert(package.id.clone())
+                || !plain_identity(&package.id)
+                || !plain_identity(&package.artifact_id)
+                || !PLUGIN_KINDS.contains(&package.kind.as_str())
+                || Version::parse(&package.version).is_err()
+            {
+                return Err(PluginError::new(PluginErrorKind::UnknownField, "package"));
+            }
+            packages.insert(package.id.clone(), package);
+        }
+        if self.edges.len() > 256 || self.closure.len() > 64 {
+            return Err(PluginError::new(PluginErrorKind::UnknownField, "closure"));
+        }
+        for edge in &self.edges {
+            let from = packages
+                .get(&edge.from)
+                .ok_or_else(|| PluginError::new(PluginErrorKind::MissingDependency, &edge.from))?;
+            let to = packages
+                .get(&edge.to)
+                .ok_or_else(|| PluginError::new(PluginErrorKind::MissingDependency, &edge.to))?;
+            let expected_relation = if to.kind == "library" {
+                "library"
+            } else {
+                "plugin"
+            };
+            let requirement = VersionReq::parse(&edge.version_requirement).map_err(|_| {
+                PluginError::new(PluginErrorKind::UnknownField, "version_requirement")
+            })?;
+            let resolved = Version::parse(&to.version)
+                .map_err(|_| PluginError::new(PluginErrorKind::UnknownField, "version"))?;
+            if edge.from_entry.is_empty()
+                || edge.to_entry.is_empty()
+                || edge.alias.is_empty()
+                || edge.to_version != to.version
+                || edge.to_artifact_id != to.artifact_id
+                || edge.relation != expected_relation
+                || from.id == to.id
+                || !requirement.matches(&resolved)
+            {
+                return Err(PluginError::new(PluginErrorKind::UnknownField, "edge"));
+            }
+            for binding in &edge.bindings {
+                validate_effect(&binding.kind, &binding.scope, &binding.recovery)?;
+            }
+        }
+        for entry in &self.closure {
+            if !packages.contains_key(&entry.package) || entry.entry.is_empty() {
+                return Err(PluginError::new(PluginErrorKind::UnknownField, "closure"));
+            }
+            for effect in &entry.effects {
+                validate_effect(&effect.kind, &effect.scope, &effect.recovery)?;
+                validate_origin(&effect.via)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn plain_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains("..")
+        && value.chars().all(|item| !item.is_control())
+}
+
+fn validate_effect(kind: &str, scope: &str, recovery: &str) -> Result<(), PluginError> {
+    if !EFFECT_KINDS.contains(&kind)
+        || scope_for(kind) != Some(scope)
+        || !recovery_allowed(kind, recovery)
+    {
+        return Err(PluginError::new(PluginErrorKind::UnknownEffect, kind));
+    }
+    Ok(())
+}
+
+fn validate_origin(origin: &EffectOrigin) -> Result<(), PluginError> {
+    if !matches!(origin.relation.as_str(), "direct" | "plugin" | "library")
+        || origin.caller_package.is_empty()
+        || origin.caller_entry.is_empty()
+        || origin.callee_package.is_empty()
+        || origin.callee_entry.is_empty()
+        || Version::parse(&origin.callee_version).is_err()
+    {
+        return Err(PluginError::new(PluginErrorKind::UnknownField, "via"));
+    }
+    let direct = origin.relation == "direct";
+    if direct != origin.alias.is_empty() {
+        return Err(PluginError::new(PluginErrorKind::UnknownField, "via"));
+    }
+    if !origin.version_requirement.is_empty() {
+        let requirement = VersionReq::parse(&origin.version_requirement)
+            .map_err(|_| PluginError::new(PluginErrorKind::UnknownField, "via"))?;
+        let resolved = Version::parse(&origin.callee_version)
+            .map_err(|_| PluginError::new(PluginErrorKind::UnknownField, "via"))?;
+        if !requirement.matches(&resolved) {
+            return Err(PluginError::new(PluginErrorKind::UnknownField, "via"));
+        }
+    }
+    Ok(())
 }
 
 struct Bound {

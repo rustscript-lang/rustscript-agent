@@ -411,6 +411,24 @@ effects:
 fn canonical_snapshots_match_and_a_mutated_copy_is_rejected() {
     let dir = schema_dir().join("canonical");
     rustscript_agent::plugins::schema_snapshot_drift(&dir).expect("checked-in snapshots");
+    let produced = rustscript_agent::plugins::canonical_schema_documents().expect("producer");
+    let checkpoint = produced
+        .get("checkpoint.schema.json")
+        .expect("joined producer covers schemas/v1/checkpoint.schema.yaml");
+    let projected: serde_json::Value = serde_json::from_str(checkpoint).expect("canonical json");
+    assert_eq!(
+        projected["$id"],
+        "https://rustscript.dev/schemas/v1/checkpoint.schema.yaml"
+    );
+    assert_eq!(
+        projected["properties"]["plugin_state"]["$ref"],
+        "#/$defs/not_in_scope"
+    );
+    let source = fs::read_to_string(schema_dir().join("v1/checkpoint.schema.yaml")).unwrap();
+    assert!(
+        source.contains("additionalProperties: false"),
+        "projection must follow the existing checkpoint YAML, not a rewritten contract"
+    );
     let tmp =
         PathBuf::from(std::env::var("RUSTSCRIPT_AGENT_TEST_TMP").expect("assigned test temp"));
     let drift = tmp.join(format!(
@@ -426,6 +444,9 @@ fn canonical_snapshots_match_and_a_mutated_copy_is_rejected() {
         "plugin-manifest.schema.json",
         "effect-contract.schema.json",
         "plugin-graph-lock.schema.json",
+        "plugin-activation.schema.json",
+        "plugin-graph-ref.schema.json",
+        "checkpoint.schema.json",
     ] {
         fs::copy(dir.join(name), drift.join(name)).unwrap();
     }
@@ -434,4 +455,53 @@ fn canonical_snapshots_match_and_a_mutated_copy_is_rejected() {
     fs::write(drift.join("plugin-manifest.schema.json"), mutated).unwrap();
     assert!(rustscript_agent::plugins::schema_snapshot_drift(&drift).is_err());
     let _ = fs::remove_dir_all(&drift);
+}
+
+fn control_schema_accepts(name: &str, value: &serde_json::Value) -> bool {
+    let schema = load(name);
+    jsonschema::draft202012::meta::validate(&schema).expect("draft 2020-12 meta");
+    let validator = jsonschema::validator_for(&schema).expect("schema builds offline");
+    validator.validate(value).is_ok()
+}
+
+#[test]
+fn activation_and_graph_ref_schemas_reject_authority_and_guest_owners() {
+    let activation = serde_json::json!({
+        "graph_id": "graph-exact",
+        "generation": 1,
+        "previous_graph_id": "",
+        "activated_at_ms": 10
+    });
+    assert!(control_schema_accepts(
+        "plugin-activation.schema.yaml",
+        &activation
+    ));
+    let mut forged = activation.clone();
+    forged["program"] = serde_json::json!("rebuilt");
+    assert!(!control_schema_accepts(
+        "plugin-activation.schema.yaml",
+        &forged
+    ));
+    let reference = serde_json::json!({
+        "graph_id": "graph-held",
+        "owner_kind": "run",
+        "owner_id": "run-1",
+        "ref_id": "ref-1"
+    });
+    assert!(control_schema_accepts(
+        "plugin-graph-ref.schema.yaml",
+        &reference
+    ));
+    let mut guest = reference.clone();
+    guest["owner_kind"] = serde_json::json!("guest");
+    assert!(!control_schema_accepts(
+        "plugin-graph-ref.schema.yaml",
+        &guest
+    ));
+    let mut authority = reference.clone();
+    authority["host_catalog"] = serde_json::json!(true);
+    assert!(!control_schema_accepts(
+        "plugin-graph-ref.schema.yaml",
+        &authority
+    ));
 }

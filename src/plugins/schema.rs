@@ -16,11 +16,17 @@ use super::yaml::strict_yaml_to_json;
 const MANIFEST_SCHEMA: &str = include_str!("../../schemas/plugin-manifest.schema.yaml");
 const EFFECT_SCHEMA: &str = include_str!("../../schemas/effect-contract.schema.yaml");
 const LOCK_SCHEMA: &str = include_str!("../../schemas/plugin-graph-lock.schema.yaml");
+const ACTIVATION_SCHEMA: &str = include_str!("../../schemas/plugin-activation.schema.yaml");
+const GRAPH_REF_SCHEMA: &str = include_str!("../../schemas/plugin-graph-ref.schema.yaml");
+const CHECKPOINT_SCHEMA: &str = include_str!("../../schemas/v1/checkpoint.schema.yaml");
 
 const SCHEMA_SOURCES: &[(&str, &str)] = &[
     ("plugin-manifest.schema.yaml", MANIFEST_SCHEMA),
     ("effect-contract.schema.yaml", EFFECT_SCHEMA),
     ("plugin-graph-lock.schema.yaml", LOCK_SCHEMA),
+    ("plugin-activation.schema.yaml", ACTIVATION_SCHEMA),
+    ("plugin-graph-ref.schema.yaml", GRAPH_REF_SCHEMA),
+    ("checkpoint.schema.yaml", CHECKPOINT_SCHEMA),
 ];
 
 pub fn canonical_schema_documents() -> Result<BTreeMap<&'static str, String>, PluginError> {
@@ -39,6 +45,13 @@ pub fn canonical_schema_documents() -> Result<BTreeMap<&'static str, String>, Pl
             "plugin-graph-lock.schema.json" => {
                 documents.insert("plugin-graph-lock.schema.json", canonical)
             }
+            "plugin-activation.schema.json" => {
+                documents.insert("plugin-activation.schema.json", canonical)
+            }
+            "plugin-graph-ref.schema.json" => {
+                documents.insert("plugin-graph-ref.schema.json", canonical)
+            }
+            "checkpoint.schema.json" => documents.insert("checkpoint.schema.json", canonical),
             _ => None,
         };
     }
@@ -120,6 +133,13 @@ fn schema_uri(name: &str) -> &'static str {
         "plugin-graph-lock.schema.yaml" => {
             "https://schemas.rustscript.local/v1/plugin-graph-lock.schema.yaml"
         }
+        "plugin-activation.schema.yaml" => {
+            "https://schemas.rustscript.local/v1/plugin-activation.schema.yaml"
+        }
+        "plugin-graph-ref.schema.yaml" => {
+            "https://schemas.rustscript.local/v1/plugin-graph-ref.schema.yaml"
+        }
+        "checkpoint.schema.yaml" => "https://rustscript.dev/schemas/v1/checkpoint.schema.yaml",
         _ => "https://schemas.rustscript.local/v1/unknown",
     }
 }

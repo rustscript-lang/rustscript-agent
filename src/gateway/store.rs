@@ -94,6 +94,7 @@ pub struct GatewayPersistence {
     fail_after_partial_write: std::sync::atomic::AtomicBool,
     fail_after_commit_before_publish: std::sync::atomic::AtomicBool,
     fail_model_requested_append: std::sync::atomic::AtomicBool,
+    fail_plugin_control_partial: std::sync::atomic::AtomicBool,
     persist_block: Mutex<Option<Arc<PersistBlockState>>>,
 }
 
@@ -276,6 +277,7 @@ impl GatewayPersistence {
             fail_after_partial_write: std::sync::atomic::AtomicBool::new(false),
             fail_after_commit_before_publish: std::sync::atomic::AtomicBool::new(false),
             fail_model_requested_append: std::sync::atomic::AtomicBool::new(false),
+            fail_plugin_control_partial: std::sync::atomic::AtomicBool::new(false),
             persist_block: Mutex::new(None),
         })
     }
@@ -369,6 +371,33 @@ impl GatewayPersistence {
             });
         }
         decode_command_data(result.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    pub(crate) fn plugin_control_command(
+        &self,
+        op: &str,
+        payload: &Value,
+    ) -> Result<Value, StorageError> {
+        const OPS: &[&str] = &[
+            "plugin.lock_put",
+            "plugin.lock_get",
+            "plugin.lock_list",
+            "plugin.ref_list",
+            "plugin.activate",
+            "plugin.activation_get",
+            "plugin.activation_history",
+            "plugin.retain",
+            "plugin.retention_get",
+            "plugin.release",
+            "plugin.collect",
+        ];
+        if !OPS.contains(&op) {
+            return Err(StorageError {
+                code: "plugin_control_unavailable".to_string(),
+                message: "plugin control operation is not registered".to_string(),
+            });
+        }
+        self.command_data(op, payload)
     }
 
     // ------------------------------------------------------------------
@@ -551,6 +580,18 @@ impl GatewayPersistence {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test failpoint: the next plugin-control write aborts inside its SQLite
+    /// transaction after the partial statements, so that transaction rolls back.
+    pub fn inject_fail_plugin_control_partial(&self) {
+        self.fail_plugin_control_partial
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_plugin_control_failpoint(&self) -> bool {
+        self.fail_plugin_control_partial
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Test failpoint: the next storage command blocks until the returned
     /// guard is released. Used to prove GET/write can proceed without the
     /// GatewayStore lock being held across SQLite IO.
@@ -710,7 +751,7 @@ impl GatewayPersistence {
         let migrated = self
             .command_data("migrate", &json!({}))
             .map_err(|error| format!("migrate gateway state: {error}"))?;
-        if migrated.get("schema_version") != Some(&json!(4)) {
+        if migrated.get("schema_version") != Some(&json!(5)) {
             return Err(format!(
                 "gateway schema migrated to an unexpected version: {migrated}"
             ));

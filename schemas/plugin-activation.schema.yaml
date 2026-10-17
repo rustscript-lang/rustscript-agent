@@ -1,0 +1,28 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://schemas.rustscript.local/v1/plugin-activation.schema.yaml
+title: RustScript plugin activation record
+description: >
+  Structural activation pointer or history entry. graph_id is an opaque lock
+  identity. This document does not grant host-catalog authority, rebuild a
+  callable program, pin a live run, or claim hot reload.
+type: object
+additionalProperties: false
+required:
+  - graph_id
+  - generation
+  - previous_graph_id
+  - activated_at_ms
+properties:
+  graph_id:
+    type: string
+    minLength: 1
+    maxLength: 128
+  generation:
+    type: integer
+    minimum: 0
+  previous_graph_id:
+    type: string
+    maxLength: 128
+  activated_at_ms:
+    type: integer
+    minimum: 0
