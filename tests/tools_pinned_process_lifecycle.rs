@@ -404,7 +404,7 @@ fn child_registration_failure_reaps_only_its_process_and_preserves_siblings() {
                 json!({"action": "poll", "process_id": handle}),
             );
             assert_eq!(polled["ok"], true, "legal sibling poll: {polled}");
-            if polled["content_block"]["result"]["data"]["stdout"] == "SURVIVING_OWNER\n" {
+            if polled["data"]["stdout"] == "SURVIVING_OWNER\n" {
                 break;
             }
             assert!(Instant::now() < deadline, "surviving child stdout");

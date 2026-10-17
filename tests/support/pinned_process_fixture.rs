@@ -209,9 +209,9 @@ pub fn run(context: map) -> map {
             json!({"argv": ["/bin/cat"], "background": true}),
         );
         assert_eq!(value["ok"], true, "start result: {value}");
-        value["content_block"]["result"]["data"]["process_id"]
+        value["data"]["process_id"]
             .as_str()
-            .unwrap()
+            .unwrap_or_else(|| panic!("canonical start result lacks process_id: {value}"))
             .into()
     }
     pub fn interrupted(&self, call: &str) -> bool {
