@@ -4,16 +4,16 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
 use super::tree_store::{self, Usage, WorkRoot};
 #[cfg(feature = "workspace-io-fault")]
 use super::tree_store::{
-    IoFaultSlot, FAULT_FILE_FSYNC, FAULT_OWNED_CLEANUP, FAULT_PARTIAL_WRITE,
-    FAULT_POST_RENAME_CHMOD, FAULT_POST_RENAME_DIR_FSYNC,
+    FAULT_FILE_FSYNC, FAULT_OWNED_CLEANUP, FAULT_PARTIAL_WRITE, FAULT_POST_RENAME_CHMOD,
+    FAULT_POST_RENAME_DIR_FSYNC, IoFaultSlot,
 };
 use super::types::{
     BranchEpoch, BranchId, CapabilitySecret, EffectError, EffectErrorKind, EffectFailure,

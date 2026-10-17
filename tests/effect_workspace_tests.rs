@@ -14,8 +14,8 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -257,10 +257,12 @@ fn import_rejects_external_symlink() {
         .import_workspace(import_req(&seed, generous(), EffectCancellation::new()))
         .expect_err("symlink");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
-    assert!(fs::read_dir(store.root().join("trees"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert_eq!(fs::read(seed.join("inside.txt")).unwrap(), b"in");
 }
 
@@ -276,10 +278,12 @@ fn import_rejects_device_path() {
         ))
         .expect_err("device");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
-    assert!(fs::read_dir(store.root().join("trees"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -333,10 +337,12 @@ fn import_rejects_external_hardlink() {
         .expect_err("external hardlink");
     assert_eq!(err.kind(), EffectErrorKind::UnsupportedEntry);
     assert_eq!(fs::read(root.join("outside.txt")).unwrap(), b"linked");
-    assert!(fs::read_dir(store.root().join("trees"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -375,10 +381,12 @@ fn quota_excess_does_not_publish() {
         ))
         .expect_err("entries");
     assert_eq!(err.kind(), EffectErrorKind::QuotaExceeded);
-    assert!(fs::read_dir(store.root().join("trees"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 
     fs::remove_dir_all(&seed).unwrap();
     fs::create_dir_all(&seed).unwrap();
@@ -452,10 +460,12 @@ fn cancellation_discards_partial_import() {
         .expect_err("cancel");
     assert_eq!(err.kind(), EffectErrorKind::Cancelled);
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(fs::read_dir(store.root().join("trees"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert_eq!(fs::read(seed.join("a.txt")).unwrap(), b"one");
 
     let pre = EffectCancellation::new();
@@ -484,10 +494,12 @@ fn expired_deadline_is_not_extended() {
         .expect_err("deadline");
     assert_eq!(err.kind(), EffectErrorKind::DeadlineExceeded);
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(fs::read_dir(store.root().join("trees"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert_eq!(
         ResourceQuota::new(0, 10, 1).unwrap_err().kind(),
         EffectErrorKind::InvalidConfiguration
@@ -684,10 +696,12 @@ fn source_change_during_import_is_rejected() {
         .import_workspace(import_req(&seed, generous(), cancellation))
         .expect_err("inconsistent");
     assert_eq!(err.kind(), EffectErrorKind::InconsistentSource);
-    assert!(fs::read_dir(store.root().join("trees"))
-        .unwrap()
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(store.root().join("trees"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert_eq!(fs::read(&first).unwrap(), b"during");
 }
 
@@ -725,11 +739,13 @@ fn setuid_bit_is_stripped_and_empty_dir_remains() {
         0
     );
     publish_ok(&handle, view);
-    assert!(handle
-        .immutable_path(&handle.head())
-        .unwrap()
-        .join("added")
-        .is_dir());
+    assert!(
+        handle
+            .immutable_path(&handle.head())
+            .unwrap()
+            .join("added")
+            .is_dir()
+    );
 }
 
 #[test]
@@ -1139,11 +1155,13 @@ fn legal_utf8_names_round_trip_through_publish() {
     view.delete(&del).unwrap();
     let rejected = view.write_file(&format!("no{}pe.txt", char::from(0x0a)), b"x");
     assert_eq!(rejected.unwrap_err().kind(), EffectErrorKind::RejectedPath);
-    assert!(!view
-        .list("")
-        .unwrap()
-        .iter()
-        .any(|name| name.bytes().any(|byte| byte < 0x20)));
+    assert!(
+        !view
+            .list("")
+            .unwrap()
+            .iter()
+            .any(|name| name.bytes().any(|byte| byte < 0x20))
+    );
     publish_ok(&handle, view);
     assert_eq!(handle.read_committed("plain.txt").unwrap(), b"updated");
     assert_eq!(handle.read_committed(created).unwrap(), b"created");

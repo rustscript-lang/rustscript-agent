@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 
 use super::types::{
-    EffectCancellation, EffectDeadline, EffectError, EffectErrorKind, ResourceQuota,
-    MAX_COMPONENT_BYTES, MAX_RELATIVE_BYTES,
+    EffectCancellation, EffectDeadline, EffectError, EffectErrorKind, MAX_COMPONENT_BYTES,
+    MAX_RELATIVE_BYTES, ResourceQuota,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,11 +60,7 @@ impl IoFaultSlot {
 
     pub(crate) fn take(&self, point: u8) -> Option<i32> {
         let code = self.errno[point as usize].swap(0, Ordering::AcqRel);
-        if code == 0 {
-            None
-        } else {
-            Some(code)
-        }
+        if code == 0 { None } else { Some(code) }
     }
 }
 
@@ -695,11 +691,7 @@ fn copy_planned_file(
     let readable = open_read(&source_parent, name)?;
     let bytes = read_fd(&readable, entry.stamp.len as usize)?;
     let mode = if seal {
-        if entry.stamp.executable {
-            0o555
-        } else {
-            0o444
-        }
+        if entry.stamp.executable { 0o555 } else { 0o444 }
     } else if entry.stamp.executable {
         0o755
     } else {
