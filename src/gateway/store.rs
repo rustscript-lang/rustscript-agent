@@ -96,6 +96,12 @@ impl std::error::Error for StorageError {}
 
 type AdmissionPrecommitHook = Box<dyn FnOnce(&Value) + Send>;
 
+#[cfg(feature = "config-fixture")]
+struct ApprovalExpireHook {
+    before: Box<dyn FnOnce() + Send>,
+    completed: Box<dyn FnOnce(bool) + Send>,
+}
+
 pub struct GatewayPersistence {
     worker: StorageWorker,
     max_events: i64,
@@ -115,6 +121,8 @@ pub struct GatewayPersistence {
     plugin_retain_precommit_pause: Mutex<Option<Arc<PluginRetainPause>>>,
     plugin_activate_receipt_hook: Mutex<Option<PluginActivateReceiptHook>>,
     admission_precommit_hook: Mutex<Option<AdmissionPrecommitHook>>,
+    #[cfg(feature = "config-fixture")]
+    approval_expire_hook: Mutex<Option<ApprovalExpireHook>>,
 }
 
 /// Blocks the next storage command until [`PersistBlockGuard::release`].
@@ -452,6 +460,8 @@ impl GatewayPersistence {
             plugin_retain_precommit_pause: Mutex::new(None),
             plugin_activate_receipt_hook: Mutex::new(None),
             admission_precommit_hook: Mutex::new(None),
+            #[cfg(feature = "config-fixture")]
+            approval_expire_hook: Mutex::new(None),
         })
     }
 
@@ -1086,7 +1096,40 @@ impl GatewayPersistence {
     }
 
     pub fn approval_expire(&self, payload: &Value) -> Result<Value, StorageError> {
-        self.command_data("approval.expire", payload)
+        #[cfg(feature = "config-fixture")]
+        let hook = self
+            .approval_expire_hook
+            .lock()
+            .expect("approval expiry hook")
+            .take();
+        #[cfg(feature = "config-fixture")]
+        let completed = hook.map(|hook| {
+            (hook.before)();
+            hook.completed
+        });
+        let result = self.command_data("approval.expire", payload);
+        #[cfg(feature = "config-fixture")]
+        if let Some(completed) = completed {
+            completed(result.is_ok());
+        }
+        result
+    }
+
+    /// Fixture-local one-shot observer immediately before approval expiry IO.
+    /// No payload or SQL is exposed, and the callback runs outside the lock.
+    #[cfg(feature = "config-fixture")]
+    pub fn inject_approval_expire_hook(
+        &self,
+        before: impl FnOnce() + Send + 'static,
+        completed: impl FnOnce(bool) + Send + 'static,
+    ) {
+        *self
+            .approval_expire_hook
+            .lock()
+            .expect("approval expiry hook") = Some(ApprovalExpireHook {
+            before: Box::new(before),
+            completed: Box::new(completed),
+        });
     }
 
     pub fn compaction_start(&self, payload: &Value) -> Result<Value, StorageError> {

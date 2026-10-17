@@ -39,7 +39,7 @@ use rustscript_vm::{HttpConfig, InvocationError, Value as VmValue};
 
 use crate::runtime::cancellation::{CancellationReason, CancellationToken};
 use serde_json::{Map, Value as JsonValue, json};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::capabilities::{
@@ -870,6 +870,7 @@ struct AgentServiceInner {
     runs: Mutex<HashMap<String, Arc<RunHandle>>>,
     pending: Mutex<HashMap<String, PendingTerminal>>,
     halting: AtomicBool,
+    janitor_stop: Notify,
     store_generation: AtomicU64,
     metrics: Arc<Metrics>,
     file_search_entered: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -984,6 +985,7 @@ impl AgentService {
             runs: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             halting: AtomicBool::new(false),
+            janitor_stop: Notify::new(),
             store_generation: AtomicU64::new(0),
             metrics,
             file_search_entered: Mutex::new(None),
@@ -5656,6 +5658,9 @@ impl AgentService {
     /// active runs via [`Self::halt`]. Idempotent.
     pub fn stop_admission(&self) {
         self.inner.halting.store(true, Ordering::Release);
+        // Wake the idle janitor now: its interval must not retain the last
+        // service/storage owner after the embedding stops admission.
+        self.inner.janitor_stop.notify_one();
     }
 
     /// Marks a run terminal: records the terminal time for TTL retention,
@@ -8639,7 +8644,10 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
         let mut interval = tokio::time::interval(interval_duration);
         interval.tick().await;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {},
+                _ = inner.janitor_stop.notified() => {},
+            }
             if inner.halting.load(Ordering::Acquire) {
                 return;
             }
@@ -8680,6 +8688,41 @@ fn spawn_lifecycle_janitor(inner: Arc<AgentServiceInner>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use crate::gateway::AgentGatewayState;
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_admission_releases_idle_janitor_owner_within_cleanup_budget() {
+        let state = AgentGatewayState::new(AgentGatewayConfig::default()).unwrap();
+        let service = state.service();
+        let (sender, finished) = tokio::sync::oneshot::channel();
+        let signal = DropSignal(Some(sender));
+        service.inject_capability_host_shutdown_observer(Arc::new(move || {
+            let _ = &signal;
+        }));
+        tokio::task::yield_now().await;
+        service.stop_admission();
+        drop(service);
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(2), finished)
+            .await
+            .expect("idle janitor must release its owner within the cleanup budget")
+            .expect("service owner retirement acknowledgement");
+    }
 }
 
 #[cfg(test)]
