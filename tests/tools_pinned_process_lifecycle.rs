@@ -43,7 +43,7 @@ impl Fixture {
         let state = AgentGatewayState::with_agent_file_and_sqlite(
             AgentGatewayConfig::default(),
             rustscript_agent::bundled_agent_main_path(),
-            &root.join("gateway.sqlite3"),
+            root.join("gateway.sqlite3"),
         )
         .unwrap()
         .with_workspace_home(home);
