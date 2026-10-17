@@ -44,6 +44,57 @@ fn ok_value(value: map) -> map {
     { ok: true, code: "ok", message: "", result: value }
 }
 
+fn plugin_control_error(code: string, message: string) -> map {
+    { ok: false, code: code, message: message, result: {} }
+}
+
+fn plugin_tx_rows(entry: SqliteTransactionResult) -> int {
+    let mut affected: int = 0;
+    if entry.kind == "execute" {
+        let exec: SqliteExecuteResult = entry.execute;
+        affected = exec.rows_affected;
+    }
+    affected
+}
+
+fn plugin_query_int(entry: SqliteTransactionResult, column: int) -> int {
+    let mut value: int = -1;
+    if entry.kind == "query" {
+        let queried: SqliteQueryResult = entry.query;
+        let rows = queried.rows.copy();
+        if rows.length > 0 {
+            let row: SqliteRow = rows[0].copy();
+            let cells = row.cells.copy();
+            if cells.length > column {
+                let cell: SqliteValue = cells[column].copy();
+                if cell.kind == "int" && cell.int_value.copy() != null {
+                    value = cell.int_value;
+                }
+            }
+        }
+    }
+    value
+}
+
+fn plugin_query_text(entry: SqliteTransactionResult, column: int) -> string {
+    let mut value: string = "";
+    if entry.kind == "query" {
+        let queried: SqliteQueryResult = entry.query;
+        let rows = queried.rows.copy();
+        if rows.length > 0 {
+            let row: SqliteRow = rows[0].copy();
+            let cells = row.cells.copy();
+            if cells.length > column {
+                let cell: SqliteValue = cells[column].copy();
+                if cell.kind == "text" && cell.text_value.copy() != null {
+                    value = cell.text_value;
+                }
+            }
+        }
+    }
+    value
+}
+
 struct PluginLockPutInput {
     graph_id: string,
     lock_json: string,
@@ -142,12 +193,40 @@ pub fn storage_plugin_activate(db_id: resource<sqlite.connection>, payload_json:
             params: [sql_text(input.failpoint.copy())],
             query: false,
             limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT CASE WHEN EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ?) THEN 1 ELSE 0 END, COALESCE((SELECT generation FROM plugin_activation), -1), CASE WHEN (SELECT COUNT(*) FROM plugin_package_refs WHERE graph_id = ?) = ? AND (SELECT COUNT(*) FROM json_each(?) AS provided WHERE EXISTS (SELECT 1 FROM plugin_package_refs AS stored WHERE stored.graph_id = ? AND stored.package_id = json_extract(provided.value, '$.package_id') AND stored.version = json_extract(provided.value, '$.version') AND stored.kind = json_extract(provided.value, '$.kind') AND stored.artifact_id = json_extract(provided.value, '$.artifact_id'))) = ? THEN 1 ELSE 0 END",
+            params: [sql_text(input.graph_id.copy()), sql_text(input.graph_id.copy()), sql_int(input.package_count.copy()), sql_text(input.packages_json.copy()), sql_text(input.graph_id.copy()), sql_int(input.package_count.copy())],
+            query: true,
+            limits: plugin_limits(),
         }
     ];
-    let transaction_result = sqlite::transaction(&db_id, statements);
-    let stored: map = { graph_id: input.graph_id.copy(), generation: next_generation };
-    let _used = transaction_result;
-    ok_value(stored)
+    let transaction_result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut result: map = plugin_control_error("plugin_control_unavailable", "plugin control storage is unavailable");
+    if transaction_result.length >= 4 {
+        let history_rows: int = plugin_tx_rows(transaction_result[0]);
+        let pointer_rows: int = plugin_tx_rows(transaction_result[1]);
+        if history_rows == 1 && pointer_rows == 1 {
+            let stored: map = {
+                graph_id: input.graph_id.copy(),
+                generation: next_generation.copy(),
+                updated_at_ms: input.now_ms.copy()
+            };
+            result = ok_value(stored);
+        } else if history_rows == 0 && pointer_rows == 0 {
+            let classification: SqliteTransactionResult = transaction_result[3].copy();
+            let graph_present: int = plugin_query_int(classification.copy(), 0);
+            let refs_ok: int = plugin_query_int(classification, 2);
+            if graph_present == 0 {
+                result = plugin_control_error("plugin_graph_missing", "plugin graph lock is not stored");
+            } else if refs_ok == 0 {
+                result = plugin_control_error("plugin_package_ref_missing", "plugin package reference does not match the stored lock");
+            } else {
+                result = plugin_control_error("plugin_activation_conflict", "plugin activation generation does not match");
+            }
+        }
+    }
+    result
 }
 
 pub fn storage_plugin_activation_get(db_id: resource<sqlite.connection>) -> map {
@@ -159,16 +238,16 @@ pub fn storage_plugin_activation_history(db_id: resource<sqlite.connection>) -> 
 }
 
 pub fn storage_plugin_retention_get(db_id: resource<sqlite.connection>, payload_json: string) -> map {
-    let input: PluginRetainInput = json::decode::<PluginRetainInput>(payload_json);
-    ok_query(sqlite::query(&db_id, "SELECT ref_id FROM plugin_graph_refs WHERE graph_id = ? AND owner_kind = ? AND owner_id = ? LIMIT 1", [sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy())], plugin_limits()))
+    let input: PluginGraphInput = json::decode::<PluginGraphInput>(payload_json);
+    ok_query(sqlite::query(&db_id, "SELECT graph_id, owner_kind, owner_id, ref_id FROM plugin_graph_refs WHERE graph_id = ? ORDER BY owner_kind, owner_id, ref_id", [sql_text(input.graph_id.copy())], plugin_limits()))
 }
 
 pub fn storage_plugin_retain(db_id: resource<sqlite.connection>, payload_json: string) -> map {
     let input: PluginRetainInput = json::decode::<PluginRetainInput>(payload_json);
     let statements: array<SqliteStatement> = [
         {
-            sql: "INSERT INTO plugin_graph_refs (graph_id, owner_kind, owner_id, ref_id, retained_at_ms) SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ?) AND ? IN ('run', 'checkpoint') ON CONFLICT (graph_id, owner_kind, owner_id) DO NOTHING",
-            params: [sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.ref_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy())],
+            sql: "INSERT INTO plugin_graph_refs (graph_id, owner_kind, owner_id, ref_id, retained_at_ms) SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ?) AND ? IN ('run', 'checkpoint') AND NOT EXISTS (SELECT 1 FROM plugin_graph_refs WHERE graph_id = ? AND owner_kind = ? AND owner_id = ? AND ref_id <> ?) ON CONFLICT (graph_id, owner_kind, owner_id) DO NOTHING",
+            params: [sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.ref_id.copy()), sql_int(input.now_ms.copy()), sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy()), sql_text(input.ref_id.copy())],
             query: false,
             limits: plugin_limits(),
         },
@@ -177,12 +256,46 @@ pub fn storage_plugin_retain(db_id: resource<sqlite.connection>, payload_json: s
             params: [sql_text(input.failpoint.copy())],
             query: false,
             limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT CASE WHEN EXISTS (SELECT 1 FROM plugin_graph_locks WHERE graph_id = ?) THEN 1 ELSE 0 END, COALESCE((SELECT ref_id FROM plugin_graph_refs WHERE graph_id = ? AND owner_kind = ? AND owner_id = ?), '')",
+            params: [sql_text(input.graph_id.copy()), sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy())],
+            query: true,
+            limits: plugin_limits(),
         }
     ];
-    let transaction_result = sqlite::transaction(&db_id, statements);
-    let stored: map = { graph_id: input.graph_id.copy() };
-    let _used = transaction_result;
-    ok_value(stored)
+    let transaction_result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut result: map = plugin_control_error("plugin_control_unavailable", "plugin control storage is unavailable");
+    if transaction_result.length >= 3 {
+        let inserted: int = plugin_tx_rows(transaction_result[0]);
+        let classification: SqliteTransactionResult = transaction_result[2].copy();
+        let graph_present: int = plugin_query_int(classification.copy(), 0);
+        let live_ref: string = plugin_query_text(classification, 1);
+        if inserted == 1 && live_ref.copy() == input.ref_id.copy() {
+            let stored: map = {
+                idempotent: false,
+                graph_id: input.graph_id.copy(),
+                owner_kind: input.owner_kind.copy(),
+                owner_id: input.owner_id.copy(),
+                ref_id: input.ref_id.copy()
+            };
+            result = ok_value(stored);
+        } else if inserted == 0 && graph_present == 1 && live_ref.copy() == input.ref_id.copy() {
+            let stored: map = {
+                idempotent: true,
+                graph_id: input.graph_id.copy(),
+                owner_kind: input.owner_kind.copy(),
+                owner_id: input.owner_id.copy(),
+                ref_id: input.ref_id.copy()
+            };
+            result = ok_value(stored);
+        } else if graph_present == 0 {
+            result = plugin_control_error("plugin_graph_missing", "plugin graph lock is not stored");
+        } else {
+            result = plugin_control_error("plugin_ref_invalid", "plugin graph reference is invalid");
+        }
+    }
+    result
 }
 
 pub fn storage_plugin_release(db_id: resource<sqlite.connection>, payload_json: string) -> map {
@@ -199,12 +312,28 @@ pub fn storage_plugin_release(db_id: resource<sqlite.connection>, payload_json: 
             params: [sql_text(input.failpoint.copy())],
             query: false,
             limits: plugin_limits(),
+        },
+        {
+            sql: "SELECT COALESCE((SELECT ref_id FROM plugin_graph_refs WHERE graph_id = ? AND owner_kind = ? AND owner_id = ?), '')",
+            params: [sql_text(input.graph_id.copy()), sql_text(input.owner_kind.copy()), sql_text(input.owner_id.copy())],
+            query: true,
+            limits: plugin_limits(),
         }
     ];
-    let transaction_result = sqlite::transaction(&db_id, statements);
-    let stored: map = { graph_id: input.graph_id.copy() };
-    let _used = transaction_result;
-    ok_value(stored)
+    let transaction_result: array<SqliteTransactionResult> = sqlite::transaction(&db_id, statements);
+    let mut result: map = plugin_control_error("plugin_control_unavailable", "plugin control storage is unavailable");
+    if transaction_result.length >= 3 {
+        let deleted: int = plugin_tx_rows(transaction_result[0]);
+        let live_ref: string = plugin_query_text(transaction_result[2], 0);
+        if deleted == 1 && live_ref.copy() == "" {
+            result = ok_value({ graph_id: input.graph_id.copy(), ref_id: input.ref_id.copy(), deleted: deleted.copy() });
+        } else if deleted == 0 && live_ref.copy() == "" {
+            result = ok_value({ graph_id: input.graph_id.copy(), ref_id: input.ref_id.copy(), deleted: deleted.copy() });
+        } else if deleted == 0 && live_ref.copy() != "" {
+            result = plugin_control_error("plugin_ref_invalid", "plugin graph reference is invalid");
+        }
+    }
+    result
 }
 
 pub fn storage_plugin_collect(db_id: resource<sqlite.connection>, payload_json: string) -> map {

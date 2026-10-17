@@ -15,11 +15,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Barrier, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustscript_vm::Value as VmValue;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,11 @@ pub struct GatewayPersistence {
     fail_model_requested_append: std::sync::atomic::AtomicBool,
     fail_plugin_control_partial: std::sync::atomic::AtomicBool,
     persist_block: Mutex<Option<Arc<PersistBlockState>>>,
+    /// Fixture-local barrier. Armed tests wait here after a stale pre-check
+    /// and before the guarded command. Unarmed production calls do not wait.
+    plugin_control_precommit_gate: Mutex<Option<Arc<Barrier>>>,
+    plugin_retain_precommit_pause: Mutex<Option<Arc<PluginRetainPause>>>,
+    plugin_activate_receipt_hook: Mutex<Option<PluginActivateReceiptHook>>,
 }
 
 /// Blocks the next storage command until [`PersistBlockGuard::release`].
@@ -128,6 +133,57 @@ impl PersistBlockGuard {
     pub fn release(&self) {
         self.inner.released.store(true, Ordering::SeqCst);
         self.inner.released_cvar.notify_all();
+    }
+}
+
+type PluginActivateReceiptHook = Arc<dyn Fn() + Send + Sync>;
+
+struct PluginRetainPause {
+    mutex: Mutex<()>,
+    entered: AtomicBool,
+    released: AtomicBool,
+    entered_cvar: Condvar,
+    released_cvar: Condvar,
+}
+
+/// Pauses `plugin.retain` after the graph pre-read and before the retain command.
+pub struct PluginRetainPauseGuard {
+    inner: Arc<PluginRetainPause>,
+}
+
+impl PluginRetainPauseGuard {
+    /// Fails if retain does not reach the precommit pause. This is a missed-seam
+    /// detector, not a retry used to manufacture a race.
+    pub fn wait_entered(&self) {
+        let mut guard = self.inner.mutex.lock().expect("retain pause lock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.inner.entered.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("plugin retain precommit pause was not entered");
+            }
+            let (next, timeout) = self
+                .inner
+                .entered_cvar
+                .wait_timeout(guard, deadline - now)
+                .expect("retain pause entered wait");
+            guard = next;
+            if timeout.timed_out() && !self.inner.entered.load(Ordering::SeqCst) {
+                panic!("plugin retain precommit pause was not entered");
+            }
+        }
+    }
+
+    /// Lets the paused retain continue into its command.
+    pub fn release(&self) {
+        self.inner.released.store(true, Ordering::SeqCst);
+        self.inner.released_cvar.notify_all();
+    }
+}
+
+impl Drop for PluginRetainPauseGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -279,6 +335,9 @@ impl GatewayPersistence {
             fail_model_requested_append: std::sync::atomic::AtomicBool::new(false),
             fail_plugin_control_partial: std::sync::atomic::AtomicBool::new(false),
             persist_block: Mutex::new(None),
+            plugin_control_precommit_gate: Mutex::new(None),
+            plugin_retain_precommit_pause: Mutex::new(None),
+            plugin_activate_receipt_hook: Mutex::new(None),
         })
     }
 
@@ -605,6 +664,91 @@ impl GatewayPersistence {
         });
         *self.persist_block.lock().expect("persist block lock") = Some(Arc::clone(&inner));
         PersistBlockGuard { inner }
+    }
+
+    /// Arms a fixture-local barrier of `parties` callers. Each guarded plugin
+    /// command waits after its stale pre-check and before the mutation.
+    pub fn arm_plugin_control_precommit_gate(&self, parties: usize) {
+        *self
+            .plugin_control_precommit_gate
+            .lock()
+            .expect("plugin precommit gate") = Some(Arc::new(Barrier::new(parties)));
+    }
+
+    /// Clears the fixture-local precommit barrier.
+    pub fn disarm_plugin_control_precommit_gate(&self) {
+        *self
+            .plugin_control_precommit_gate
+            .lock()
+            .expect("plugin precommit gate") = None;
+    }
+
+    pub(crate) fn enter_plugin_control_precommit_gate(&self) {
+        let gate = self
+            .plugin_control_precommit_gate
+            .lock()
+            .expect("plugin precommit gate")
+            .clone();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+    }
+
+    /// Arms a one-shot pause between retain's graph pre-read and its command.
+    pub fn arm_plugin_retain_precommit_pause(&self) -> PluginRetainPauseGuard {
+        let inner = Arc::new(PluginRetainPause {
+            mutex: Mutex::new(()),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_cvar: Condvar::new(),
+            released_cvar: Condvar::new(),
+        });
+        *self
+            .plugin_retain_precommit_pause
+            .lock()
+            .expect("retain pause slot") = Some(Arc::clone(&inner));
+        PluginRetainPauseGuard { inner }
+    }
+
+    pub(crate) fn enter_plugin_retain_precommit_pause(&self) {
+        let pause = self
+            .plugin_retain_precommit_pause
+            .lock()
+            .expect("retain pause slot")
+            .clone();
+        let Some(pause) = pause else {
+            return;
+        };
+        let mut guard = pause.mutex.lock().expect("retain pause lock");
+        pause.entered.store(true, Ordering::SeqCst);
+        pause.entered_cvar.notify_all();
+        while !pause.released.load(Ordering::SeqCst) {
+            guard = pause
+                .released_cvar
+                .wait(guard)
+                .expect("retain pause release");
+        }
+    }
+
+    /// Runs once after this activation's command returns and before the caller
+    /// builds its result. A later legitimate activation can commit here without
+    /// a sleep or a process-global lock.
+    pub fn arm_plugin_activate_receipt_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .plugin_activate_receipt_hook
+            .lock()
+            .expect("activate receipt hook") = Some(Arc::new(hook));
+    }
+
+    pub(crate) fn run_plugin_activate_receipt_hook(&self) {
+        let hook = self
+            .plugin_activate_receipt_hook
+            .lock()
+            .expect("activate receipt hook")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// One atomic terminal commit: run status transition plus terminal

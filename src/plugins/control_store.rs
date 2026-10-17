@@ -184,6 +184,22 @@ impl<'a> PluginControlStore<'a> {
             .collect()
     }
 
+    /// Reads the live retention slot for one graph through the production command.
+    pub fn retained(&self, graph_id: &str) -> Result<Vec<GraphRetention>, PluginControlError> {
+        let data = self.command("plugin.retention_get", &json!({ "graph_id": graph_id }))?;
+        storage_rows(&data)?
+            .iter()
+            .map(|row| {
+                Ok(GraphRetention {
+                    graph_id: text_at(row, 0)?,
+                    owner_kind: text_at(row, 1)?,
+                    owner_id: text_at(row, 2)?,
+                    ref_id: text_at(row, 3)?,
+                })
+            })
+            .collect()
+    }
+
     pub fn package_refs(
         &self,
         graph_id: &str,
@@ -216,21 +232,27 @@ impl<'a> PluginControlStore<'a> {
         if current.generation != expected_generation {
             return Err(PluginControlError::activation_conflict());
         }
+        self.persistence.enter_plugin_control_precommit_gate();
         let next = expected_generation.saturating_add(1);
-        self.command(
+        let now = now_ms();
+        let data = self.command(
             "plugin.activate",
             &json!({
                 "graph_id": graph_id,
                 "expected_generation": expected_generation,
                 "packages_json": serde_json::to_string(refs).map_err(|_| PluginControlError::invalid())?,
                 "package_count": refs.len(),
-                "now_ms": now_ms(),
+                "now_ms": now,
                 "failpoint": self.failpoint(),
             }),
         )?;
-        let pointer = self.activation()?;
-        if pointer.graph_id != graph_id || pointer.generation != next {
-            return Err(PluginControlError::activation_conflict());
+        self.persistence.run_plugin_activate_receipt_hook();
+        let pointer = activation_receipt(&data)?;
+        if pointer.graph_id != graph_id
+            || pointer.generation != next
+            || pointer.updated_at_ms != now
+        {
+            return Err(PluginControlError::unavailable());
         }
         Ok(pointer)
     }
@@ -270,15 +292,15 @@ impl<'a> PluginControlStore<'a> {
     pub fn retain(&self, retention: &GraphRetention) -> Result<bool, PluginControlError> {
         validate_retention(retention)?;
         self.load_lock(&retention.graph_id)?;
-        let existing = self.command("plugin.retention_get", &retention_payload(retention, ""))?;
-        if !storage_rows(&existing)?.is_empty() {
-            return Ok(true);
-        }
-        self.command(
+        self.persistence.enter_plugin_retain_precommit_pause();
+        self.persistence.enter_plugin_control_precommit_gate();
+        let data = self.command(
             "plugin.retain",
             &retention_payload(retention, self.failpoint()),
         )?;
-        Ok(false)
+        data.get("idempotent")
+            .and_then(Value::as_bool)
+            .ok_or_else(PluginControlError::unavailable)
     }
 
     pub fn release(&self, retention: &GraphRetention) -> Result<(), PluginControlError> {
@@ -317,6 +339,29 @@ impl<'a> PluginControlStore<'a> {
             ""
         }
     }
+}
+
+fn activation_receipt(data: &Value) -> Result<ActivationPointer, PluginControlError> {
+    Ok(ActivationPointer {
+        graph_id: data
+            .get("graph_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(PluginControlError::unavailable)?,
+        generation: json_u64(data.get("generation"))?,
+        updated_at_ms: json_u64(data.get("updated_at_ms"))?,
+    })
+}
+
+fn json_u64(value: Option<&Value>) -> Result<u64, PluginControlError> {
+    value
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .and_then(Value::as_i64)
+                .and_then(|item| u64::try_from(item).ok())
+        })
+        .ok_or_else(PluginControlError::unavailable)
 }
 
 fn retention_payload(retention: &GraphRetention, failpoint: &str) -> Value {

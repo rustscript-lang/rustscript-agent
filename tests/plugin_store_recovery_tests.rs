@@ -14,7 +14,10 @@ use rustscript_agent::plugins::{
     LockedEdge, LockedEffect, LockedEffectItem, LockedPackage, PackageArtifactRef,
     PluginControlStore, ScopeBinding, ValidatedLockMetadata,
 };
-use rustscript_agent::{AgentGatewayConfig, GatewayPersistence};
+use rustscript_agent::{
+    AdmitRunRequest, AgentGatewayConfig, AgentGatewayState, AgentProviderHost, GatewayPersistence,
+    ScriptedProvider,
+};
 use serde_json::json;
 
 fn db_path(label: &str) -> PathBuf {
@@ -558,5 +561,335 @@ fn loaded_metadata_does_not_grant_execution_authority() {
         0
     );
     assert!(store.activation_history().expect("no history").is_empty());
+    persistence.shutdown();
+}
+
+#[test]
+fn conflicting_live_ref_is_not_idempotent_and_release_does_not_delete_other_ref() {
+    let path = db_path("ref-identity");
+    let persistence = open(&path);
+    let store = PluginControlStore::new(&persistence);
+    let lock = sample_lock("graph-ref-id", "artifact-ref-id");
+    store.store_lock(&lock).expect("store");
+    let live = GraphRetention {
+        graph_id: "graph-ref-id".into(),
+        owner_kind: "run".into(),
+        owner_id: "run-1".into(),
+        ref_id: "ref-live".into(),
+    };
+    assert!(!store.retain(&live).expect("first retain"));
+    let other = GraphRetention {
+        ref_id: "ref-other".into(),
+        ..live.clone()
+    };
+    let conflict = store
+        .retain(&other)
+        .expect_err("different live ref is not an idempotent retain");
+    assert_eq!(code(&conflict), "plugin_ref_invalid");
+    assert_eq!(
+        store.retained("graph-ref-id").expect("rows"),
+        vec![live.clone()]
+    );
+    let release_other = store
+        .release(&other)
+        .expect_err("different live ref is not an idempotent release");
+    assert_eq!(code(&release_other), "plugin_ref_invalid");
+    assert_eq!(
+        store.retained("graph-ref-id").expect("other release"),
+        vec![live.clone()]
+    );
+    assert!(store.collect_unreferenced().expect("held").is_empty());
+    store.release(&live).expect("release live ref");
+    assert!(store.retained("graph-ref-id").expect("released").is_empty());
+    store
+        .release(&live)
+        .expect("absent requested identity stays idempotent");
+    assert_eq!(
+        store.collect_unreferenced().expect("collect"),
+        vec!["graph-ref-id".to_string()]
+    );
+    persistence.shutdown();
+}
+
+#[test]
+fn retain_after_collect_between_preread_and_commit_is_not_success() {
+    let path = db_path("retain-collected");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-raced", "artifact-raced"))
+        .expect("store");
+    let retention = GraphRetention {
+        graph_id: "graph-raced".into(),
+        owner_kind: "checkpoint".into(),
+        owner_id: "checkpoint-1".into(),
+        ref_id: "ref-raced".into(),
+    };
+    let pause = persistence.arm_plugin_retain_precommit_pause();
+    let worker = thread::spawn({
+        let persistence = Arc::clone(&persistence);
+        move || PluginControlStore::new(&persistence).retain(&retention)
+    });
+    pause.wait_entered();
+    assert_eq!(
+        PluginControlStore::new(&persistence)
+            .collect_unreferenced()
+            .expect("collect during stale pre-read"),
+        vec!["graph-raced".to_string()]
+    );
+    pause.release();
+    let missing = worker
+        .join()
+        .expect("retain thread")
+        .expect_err("graph collected before retain commit must not succeed");
+    assert_eq!(code(&missing), "plugin_graph_missing");
+    assert!(
+        PluginControlStore::new(&persistence)
+            .load_lock("graph-raced")
+            .is_err()
+    );
+    assert!(
+        PluginControlStore::new(&persistence)
+            .retained("graph-raced")
+            .expect("no ref")
+            .is_empty()
+    );
+    persistence.shutdown();
+}
+
+#[test]
+fn concurrent_distinct_refs_keep_one_live_identity() {
+    let path = db_path("retain-race");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    store
+        .store_lock(&sample_lock("graph-slot", "artifact-slot"))
+        .expect("store");
+    persistence.arm_plugin_control_precommit_gate(2);
+    let run = |ref_id: &'static str| {
+        let persistence = Arc::clone(&persistence);
+        thread::spawn(move || {
+            PluginControlStore::new(&persistence).retain(&GraphRetention {
+                graph_id: "graph-slot".into(),
+                owner_kind: "run".into(),
+                owner_id: "run-1".into(),
+                ref_id: ref_id.into(),
+            })
+        })
+    };
+    let left = run("ref-left");
+    let right = run("ref-right");
+    let left = left.join().expect("left thread");
+    let right = right.join().expect("right thread");
+    persistence.disarm_plugin_control_precommit_gate();
+    let outcomes = [left, right];
+    assert_eq!(outcomes.iter().filter(|item| item.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|item| item
+                .as_ref()
+                .err()
+                .is_some_and(|err| err.code == "plugin_ref_invalid"))
+            .count(),
+        1
+    );
+    let stored = store.retained("graph-slot").expect("one slot");
+    assert_eq!(stored.len(), 1);
+    let winner = stored[0].ref_id.as_str();
+    assert!(winner == "ref-left" || winner == "ref-right");
+    let loser = if winner == "ref-left" {
+        "ref-right"
+    } else {
+        "ref-left"
+    };
+    let release_loser = store
+        .release(&GraphRetention {
+            graph_id: "graph-slot".into(),
+            owner_kind: "run".into(),
+            owner_id: "run-1".into(),
+            ref_id: loser.into(),
+        })
+        .expect_err("loser must not delete the live ref");
+    assert_eq!(code(&release_loser), "plugin_ref_invalid");
+    assert_eq!(store.retained("graph-slot").expect("still winner").len(), 1);
+    store.release(&stored[0]).expect("winner release");
+    assert_eq!(
+        store.collect_unreferenced().expect("collect"),
+        vec!["graph-slot".to_string()]
+    );
+    persistence.shutdown();
+}
+
+#[test]
+fn same_graph_same_generation_activate_has_one_winner() {
+    let path = db_path("cas-same");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    let lock = sample_lock("graph-cas", "artifact-cas");
+    store.store_lock(&lock).expect("store");
+    let refs = refs_of(&lock);
+    persistence.arm_plugin_control_precommit_gate(2);
+    let spawn = || {
+        let persistence = Arc::clone(&persistence);
+        let refs = refs.clone();
+        thread::spawn(move || PluginControlStore::new(&persistence).activate("graph-cas", 0, &refs))
+    };
+    let left = spawn();
+    let right = spawn();
+    let left = left.join().expect("left thread");
+    let right = right.join().expect("right thread");
+    persistence.disarm_plugin_control_precommit_gate();
+    let outcomes = [left, right];
+    assert_eq!(outcomes.iter().filter(|item| item.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|item| item
+                .as_ref()
+                .err()
+                .is_some_and(|err| err.code == "plugin_activation_conflict"))
+            .count(),
+        1
+    );
+    let active = store.activation().expect("winner");
+    assert_eq!(active.graph_id, "graph-cas");
+    assert_eq!(active.generation, 1);
+    let history = store.activation_history().expect("history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].generation, 1);
+    assert_eq!(history[0].graph_id, "graph-cas");
+    let winner = outcomes.into_iter().find_map(Result::ok).expect("winner");
+    assert_eq!(winner.generation, 1);
+    assert_eq!(winner.graph_id, "graph-cas");
+    persistence.shutdown();
+}
+
+#[test]
+fn activate_receipt_survives_later_legitimate_activation() {
+    let path = db_path("cas-successor");
+    let persistence = Arc::new(open(&path));
+    let store = PluginControlStore::new(&persistence);
+    let lock = sample_lock("graph-receipt", "artifact-receipt");
+    store.store_lock(&lock).expect("store");
+    let refs = refs_of(&lock);
+    let hook_persistence = Arc::clone(&persistence);
+    let hook_refs = refs.clone();
+    persistence.arm_plugin_activate_receipt_hook(move || {
+        PluginControlStore::new(&hook_persistence)
+            .activate("graph-receipt", 1, &hook_refs)
+            .expect("later legitimate activation");
+    });
+    let first = store
+        .activate("graph-receipt", 0, &refs)
+        .expect("this invocation returns its own receipt");
+    assert_eq!(first.graph_id, "graph-receipt");
+    assert_eq!(first.generation, 1);
+    let latest = store.activation().expect("latest pointer");
+    assert_eq!(latest.generation, 2);
+    assert_eq!(latest.graph_id, "graph-receipt");
+    assert_ne!(first.generation, latest.generation);
+    let history = store.activation_history().expect("both commits");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].generation, 1);
+    assert_eq!(first.updated_at_ms, history[0].activated_at_ms);
+    persistence.shutdown();
+}
+
+#[tokio::test]
+async fn guest_approval_storage_does_not_forward_plugin_control_ops() {
+    let path = db_path("guest-fence");
+    let source = r#"
+pub fn run(context: map) -> map {
+    let run_id: string = context["run_id"];
+    let session_id: string = context["session_id"];
+    let retain: map = agent::approval_storage("plugin.retain", {
+        run_id: run_id.copy(),
+        session_id: session_id.copy(),
+        graph_id: "graph-guest",
+        owner_kind: "run",
+        owner_id: "run-guest",
+        ref_id: "ref-guest"
+    });
+    let activate: map = agent::approval_storage("plugin.activate", {
+        run_id: run_id.copy(),
+        session_id: session_id.copy(),
+        graph_id: "graph-guest",
+        expected_generation: 0
+    });
+    let lock_put: map = agent::approval_storage("plugin.lock_put", {
+        run_id: run_id.copy(),
+        session_id: session_id.copy(),
+        graph_id: "graph-guest"
+    });
+    let release: map = agent::approval_storage("plugin.release", {
+        run_id: run_id.copy(),
+        session_id: session_id.copy(),
+        graph_id: "graph-guest",
+        owner_kind: "run",
+        owner_id: "run-guest",
+        ref_id: "ref-guest"
+    });
+    let listed: map = agent::approval_storage("list", {
+        run_id: run_id.copy(),
+        session_id: session_id.copy()
+    });
+    let retain_error: map = retain["error"];
+    let activate_error: map = activate["error"];
+    let lock_error: map = lock_put["error"];
+    let release_error: map = release["error"];
+    let retain_code: string = retain_error["code"];
+    let activate_code: string = activate_error["code"];
+    let lock_code: string = lock_error["code"];
+    let release_code: string = release_error["code"];
+    let list_ok: bool = listed["ok"];
+    let mut list_flag: string = "0";
+    if list_ok == true {
+        list_flag = "1";
+    }
+    let answer: string = "retain=" + retain_code.copy() + ";activate=" + activate_code.copy() + ";lock=" + lock_code.copy() + ";release=" + release_code.copy() + ";list_ok=" + list_flag;
+    { kind: "run.completed", answer: answer }
+}
+"#;
+    let state = AgentGatewayState::with_agent_source_and_sqlite(
+        AgentGatewayConfig::default(),
+        source,
+        &path,
+    )
+    .expect("guest fixture compiles through the production host catalog");
+    let service = state.service();
+    let provider = ScriptedProvider::new();
+    let host: Arc<dyn AgentProviderHost> = Arc::new(provider.clone());
+    service.inject_provider_host(host);
+    let admitted = service
+        .admit(AdmitRunRequest {
+            input: json!({"message": "guest fence"}),
+            platform: "plugin_store_recovery".to_string(),
+            ..AdmitRunRequest::default()
+        })
+        .await
+        .expect("admit");
+    Arc::clone(&service)
+        .run_worker(admitted.run_id.clone(), "ignored".to_string())
+        .await;
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "plugin control must not reach the fake provider"
+    );
+    let persistence = state.persistence().expect("sqlite persistence");
+    let store = PluginControlStore::new(persistence.as_ref());
+    assert!(store.list_locks().expect("locks").is_empty());
+    assert_eq!(store.activation().expect("activation").generation, 0);
+    assert!(store.activation_history().expect("history").is_empty());
+    assert!(store.retained("graph-guest").expect("refs").is_empty());
+    let messages = persistence
+        .message_list(&admitted.session_id, 0)
+        .expect("messages");
+    let rendered = messages.to_string();
+    assert!(
+        rendered.contains("retain=approval_operation_invalid;activate=approval_operation_invalid;lock=approval_operation_invalid;release=approval_operation_invalid;list_ok=1"),
+        "guest host did not deny plugin control ops: {rendered}"
+    );
     persistence.shutdown();
 }
