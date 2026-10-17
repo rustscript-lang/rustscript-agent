@@ -85,6 +85,12 @@ impl std::fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
+#[cfg(feature = "config-fixture")]
+struct ApprovalExpireHook {
+    before: Box<dyn FnOnce() + Send>,
+    completed: Box<dyn FnOnce(bool) + Send>,
+}
+
 pub struct GatewayPersistence {
     worker: StorageWorker,
     max_events: i64,
@@ -95,6 +101,8 @@ pub struct GatewayPersistence {
     fail_after_commit_before_publish: std::sync::atomic::AtomicBool,
     fail_model_requested_append: std::sync::atomic::AtomicBool,
     persist_block: Mutex<Option<Arc<PersistBlockState>>>,
+    #[cfg(feature = "config-fixture")]
+    approval_expire_hook: Mutex<Option<ApprovalExpireHook>>,
 }
 
 /// Blocks the next storage command until [`PersistBlockGuard::release`].
@@ -277,6 +285,8 @@ impl GatewayPersistence {
             fail_after_commit_before_publish: std::sync::atomic::AtomicBool::new(false),
             fail_model_requested_append: std::sync::atomic::AtomicBool::new(false),
             persist_block: Mutex::new(None),
+            #[cfg(feature = "config-fixture")]
+            approval_expire_hook: Mutex::new(None),
         })
     }
 
@@ -678,7 +688,40 @@ impl GatewayPersistence {
     }
 
     pub fn approval_expire(&self, payload: &Value) -> Result<Value, StorageError> {
-        self.command_data("approval.expire", payload)
+        #[cfg(feature = "config-fixture")]
+        let hook = self
+            .approval_expire_hook
+            .lock()
+            .expect("approval expiry hook")
+            .take();
+        #[cfg(feature = "config-fixture")]
+        let completed = hook.map(|hook| {
+            (hook.before)();
+            hook.completed
+        });
+        let result = self.command_data("approval.expire", payload);
+        #[cfg(feature = "config-fixture")]
+        if let Some(completed) = completed {
+            completed(result.is_ok());
+        }
+        result
+    }
+
+    /// Fixture-local one-shot observer immediately before approval expiry IO.
+    /// No payload or SQL is exposed, and the callback runs outside the lock.
+    #[cfg(feature = "config-fixture")]
+    pub fn inject_approval_expire_hook(
+        &self,
+        before: impl FnOnce() + Send + 'static,
+        completed: impl FnOnce(bool) + Send + 'static,
+    ) {
+        *self
+            .approval_expire_hook
+            .lock()
+            .expect("approval expiry hook") = Some(ApprovalExpireHook {
+            before: Box::new(before),
+            completed: Box::new(completed),
+        });
     }
 
     pub fn compaction_start(&self, payload: &Value) -> Result<Value, StorageError> {

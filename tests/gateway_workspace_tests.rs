@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
+#[path = "support/gateway_teardown.rs"]
+mod gateway_teardown;
+
 fn private_test_root(prefix: &str) -> PathBuf {
     let base = std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMPDIR")
         .map(PathBuf::from)
@@ -785,6 +788,16 @@ async fn http_main_runs_without_workspace_and_persists_typed_effect_denials() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn http_named_workspace_runs_production_rss_file_and_process_effects() {
+    run_named_workspace_effects(false).await;
+}
+
+#[cfg(feature = "config-fixture")]
+#[tokio::test(flavor = "multi_thread")]
+async fn http_named_workspace_cleanup_waits_for_post_terminal_storage_owner() {
+    run_named_workspace_effects(true).await;
+}
+
+async fn run_named_workspace_effects(controlled_teardown: bool) {
     let root = private_test_root("workspace-native-effects");
     let home = root.join("auth-home");
     let workspace = root.join("project");
@@ -816,6 +829,15 @@ async fn http_named_workspace_runs_production_rss_file_and_process_effects() {
     )
     .expect("production bundled Main with durable store")
     .with_workspace_home(home.clone());
+    let teardown = gateway_teardown::GatewayTeardown::observe(&state);
+    #[cfg(feature = "config-fixture")]
+    let mut pause = controlled_teardown.then(|| {
+        gateway_teardown::TerminalCleanupPause::install(
+            &state.persistence().expect("private storage owner"),
+        )
+    });
+    #[cfg(not(feature = "config-fixture"))]
+    assert!(!controlled_teardown);
     let provider = ScriptedProvider::new();
     provider.push_ok(scripted_tool_response(json!([
         {
@@ -917,10 +939,41 @@ async fn http_named_workspace_runs_production_rss_file_and_process_effects() {
     );
     assert_eq!(session["workspace"]["selector"], "name:project");
 
+    #[cfg(feature = "config-fixture")]
+    if let Some(pause) = &pause {
+        pause.wait_entered();
+        assert!(teardown.storage_owner_alive());
+        eprintln!(
+            "GATEWAY_TEARDOWN stage=post_terminal_approval_expire owner_alive=true root={}",
+            root.display()
+        );
+    }
+    service.stop_admission();
     drop(app);
     drop(service);
     drop(state);
-    fs::remove_dir_all(root).expect("remove workspace effect fixture");
+    let finished = teardown.finish();
+    tokio::pin!(finished);
+    #[cfg(feature = "config-fixture")]
+    if let Some(pause) = &mut pause {
+        let observed = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(finished.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            observed.is_pending(),
+            "teardown must wait for the paused expiry owner"
+        );
+        pause.release();
+    }
+    finished.await;
+    #[cfg(feature = "config-fixture")]
+    if let Some(pause) = &pause {
+        pause.assert_completed();
+        eprintln!("GATEWAY_TEARDOWN stage=expiry_succeeded_storage_joined");
+    }
+    fs::remove_dir_all(&root).expect("remove workspace effect fixture");
+    assert!(!root.exists(), "workspace fixture root must be removed");
 }
 
 #[tokio::test]
