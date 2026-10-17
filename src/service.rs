@@ -1579,6 +1579,14 @@ impl AgentService {
         &self,
         run_id: &str,
     ) -> Result<Option<crate::runtime::agent_host::PinnedToolProgram>, AdmitError> {
+        // A live handle retains the sealed admission binding. Read-only
+        // idempotent replay must not reopen storage or select current activation.
+        if let Some(pin) = self
+            .handle(run_id)
+            .and_then(|handle| handle.pinned_tool.clone())
+        {
+            return Ok(Some(pin));
+        }
         if self.inner.stateless_tools.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -3191,10 +3199,17 @@ impl AgentService {
         let lifecycle = CapabilityLifecycle::builder()
             .owner(capability_owner.clone())
             .registry_identity(expected.to_string())
-            // CapabilityLifecycle currently requires a path-shaped token claim.
-            // The empty value is an absent marker only: filesystem/process
-            // capabilities are omitted below when no trusted root exists.
-            .workspace(limits_root)
+            // Identity survives revocation and legacy-handle eviction. Restore
+            // it only from the sealed original pin, never the saved limits path.
+            // Current authority above alone decides whether filesystem/process
+            // capabilities exist; this token claim grants no IO by itself.
+            .workspace(workspace.clone().unwrap_or_else(|| {
+                handle
+                    .pinned_tool
+                    .as_ref()
+                    .map(|pin| pin.workspace_identity().to_path_buf())
+                    .unwrap_or_default()
+            }))
             .limits(LifecycleLimits {
                 max_tool_calls,
                 max_output_bytes: output_cap,
@@ -5758,25 +5773,29 @@ impl AgentService {
         );
     }
 
-    /// Removes and returns one pending terminal entry (the retry loop owns
-    /// the entry while it attempts the durable commit).
-    pub(crate) fn take_pending_terminal(&self, run_id: &str) -> Option<PendingTerminal> {
+    /// Snapshot for the commit-gate-serialized retry. Keep the entry observable
+    /// throughout storage IO, including a failed attempt.
+    fn pending_terminal(&self, run_id: &str) -> Option<PendingTerminal> {
         self.inner
+            .pending
+            .lock()
+            .expect("pending lock")
+            .get(run_id)
+            .cloned()
+    }
+
+    /// Remove only when retry has a final outcome, not while it is in flight.
+    fn clear_pending_terminal(&self, run_id: &str) {
+        if self
+            .inner
             .pending
             .lock()
             .expect("pending lock")
             .remove(run_id)
-    }
-
-    /// Re-inserts a pending terminal entry whose retry attempt failed (the
-    /// storage outage is still ongoing).
-    pub(crate) fn put_pending_terminal(&self, run_id: &str, pending: PendingTerminal) {
-        self.inner
-            .pending
-            .lock()
-            .expect("pending lock")
-            .insert(run_id.to_string(), pending);
-        self.inner.metrics.runs_terminal_pending_inc();
+            .is_some()
+        {
+            self.inner.metrics.runs_terminal_pending_dec();
+        }
     }
 
     /// Number of runs awaiting a durable terminal commit retry (observable
@@ -8258,20 +8277,22 @@ impl AgentService {
         tokio::task::spawn_blocking(move || {
             let _serial = service.inner.commit_gate.lock();
             let persistence = service.persistence_handle();
-            let Some(pending) = service.take_pending_terminal(&run_id_for_block) else {
+            let Some(pending) = service.pending_terminal(&run_id_for_block) else {
                 return PendingRetryOutcome::Gone;
             };
-            service.inner.metrics.runs_terminal_pending_dec();
             {
                 let store = service.inner.store.read();
                 let Some(run) = store.runs.get(&run_id_for_block) else {
+                    service.clear_pending_terminal(&run_id_for_block);
                     return PendingRetryOutcome::Gone;
                 };
                 if run.status != "terminal_pending" {
+                    service.clear_pending_terminal(&run_id_for_block);
                     return PendingRetryOutcome::Gone;
                 }
             }
             if std::time::Instant::now() >= pending.deadline {
+                service.clear_pending_terminal(&run_id_for_block);
                 let mut store = service.inner.store.write();
                 if let Some(run) = store.runs.get_mut(&run_id_for_block) {
                     close_run_stream(run);
@@ -8306,6 +8327,7 @@ impl AgentService {
                         pending.assistant_message.as_ref(),
                         service.inner.config.max_events_per_run,
                     );
+                    service.clear_pending_terminal(&run_id_for_block);
                     let sender = store
                         .runs
                         .get(&run_id_for_block)
@@ -8335,6 +8357,7 @@ impl AgentService {
                     PendingRetryOutcome::Committed
                 }
                 Err(error) if error.code == "transition_conflict" => {
+                    service.clear_pending_terminal(&run_id_for_block);
                     let mut store = service.inner.store.write();
                     if let Some(run) = store.runs.get_mut(&run_id_for_block) {
                         close_run_stream(run);
@@ -8356,7 +8379,6 @@ impl AgentService {
                         error = %truncate_for_log(&error.message, 256),
                         "terminal retry failed; will retry on the next janitor tick"
                     );
-                    service.put_pending_terminal(&run_id_for_block, pending);
                     service
                         .inner
                         .metrics

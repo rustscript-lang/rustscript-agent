@@ -254,7 +254,11 @@ fn tool_payload(result: map) -> map {
 }
 
 fn envelope(call: map, result: map, _terminal: bool) -> map {
-    let mut payload: map = tool_payload(result);
+    canonical_envelope(call, tool_payload(result))
+}
+
+fn canonical_envelope(call: map, result: map) -> map {
+    let mut payload: map = result;
     let ok: bool = map_bool(payload, "ok", false);
     let content: string = types::map_string(payload, "content", "");
     let truncated: bool = map_bool(payload, "truncated", false);
@@ -288,6 +292,21 @@ fn envelope(call: map, result: map, _terminal: bool) -> map {
 
 fn fail_envelope(call: map, code: string, message: string, terminal: bool) -> map {
     envelope(call, fail_result(code, message), terminal)
+}
+
+/// Project the Native-witnessed canonical result into the public message
+/// protocol. The retained child's return wrapper is not execution evidence.
+pub fn result_envelope(call: map, result: map) -> map {
+    let mut projected: map = canonical_envelope(call, result);
+    let error: map = types::map_map(projected, "error");
+    let code: string = types::map_string(error, "code", "");
+    // A committed process-handle observation can report cancellation without
+    // cancelling its run. The loop's independent Native control_check decides
+    // run cancellation/deadline immediately after invocation.
+    if code == "cancelled" || code == "deadline_elapsed" {
+        projected.terminal = false;
+    }
+    projected
 }
 
 fn tool_context(input: map, call: map, descriptor: map) -> map {

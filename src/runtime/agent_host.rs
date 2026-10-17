@@ -640,6 +640,12 @@ impl PinnedToolProgram {
         self.generation
     }
 
+    /// Original sealed identity only. This path does not confer workspace IO
+    /// authority and must never be used to construct filesystem capabilities.
+    pub(crate) fn workspace_identity(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
     pub fn shares_program(&self, other: &Arc<rustscript_vm::Program>) -> bool {
         Arc::ptr_eq(&self.program, other)
     }

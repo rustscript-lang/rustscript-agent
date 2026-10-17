@@ -594,7 +594,7 @@ fn execute_pinned_dispatch(context: map, dispatch_input: map, facts: map) -> map
     if canonical_result.length > 0 {
         let decoded: map = json::decode(canonical_result);
         if decoded.has("ok") {
-            result = decoded;
+            result = tools::result_envelope(call, decoded);
         }
     }
     result
