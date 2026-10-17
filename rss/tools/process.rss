@@ -414,7 +414,7 @@ fn apply_output_bounds(result: map, token: string, config: map, envelope: map) -
         data.overflow_stdout_bytes = stdout_raw.length;
         data.overflow_stderr_bytes = stderr_raw.length;
         bounded.data = data;
-        let stored: map = cap::artifact_put(token, payload, {kind: "process_output", encoding: "labeled-utf8"});
+        let stored: map = cap::artifact_put_result(token, payload, {});
         let mut stored_artifact: bool = false;
         if map_bool(stored, "ok", false) {
             stored_artifact = true;
