@@ -189,6 +189,20 @@ fn install_tool(store: &PackageStore, signer: &Signer, dir: &Path, id: &str, off
 struct MemoryDurable;
 
 impl DurableToolLifecycle for MemoryDurable {
+    fn parent_arguments(
+        &self,
+        run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        assert_eq!(run_id, "run-pin-a");
+        assert_eq!(tool_name, "read_file");
+        assert!(matches!(
+            call_id,
+            "call-read-1" | "call-read-2" | "call-legal"
+        ));
+        Ok(Some(json!({"path": "note.txt"})))
+    }
     fn assert_active_run(&self, _run_id: &str) -> Result<(), LifecycleError> {
         Ok(())
     }

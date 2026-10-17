@@ -20,8 +20,23 @@ use std::{
 struct Durable {
     results: Mutex<HashMap<String, Value>>,
     interruptions: Mutex<Vec<String>>,
+    parents: Mutex<HashMap<(String, String, String), Value>>,
 }
 impl DurableToolLifecycle for Durable {
+    fn parent_arguments(
+        &self,
+        run: &str,
+        call: &str,
+        tool: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        self.parents
+            .lock()
+            .unwrap()
+            .get(&(run.into(), call.into(), tool.into()))
+            .cloned()
+            .map(Some)
+            .ok_or(LifecycleError::MissingParent)
+    }
     fn assert_active_run(&self, _: &str) -> Result<(), LifecycleError> {
         Ok(())
     }
@@ -83,6 +98,13 @@ pub struct NativeFixture {
     durable: Arc<Durable>,
     issuer: Arc<Issuer>,
 }
+
+pub struct PreparedCall {
+    call: String,
+    tool: String,
+    pub arguments: Value,
+}
+
 impl NativeFixture {
     pub fn new(run: &str) -> Self {
         let root = PathBuf::from(std::env::var_os("RUSTSCRIPT_AGENT_TEST_TMP").unwrap())
@@ -167,16 +189,36 @@ pub fn run(context: map) -> map {
             drop(lifecycle.lease(&token).unwrap());
         })
     }
-    pub fn invoke(&self, call: &str, tool: &str, args: Value) -> Value {
-        self.invoke_with(self.host.clone(), call, tool, args)
+    pub fn parent_call(&self, call: &str, tool: &str, original_arguments: Value) -> PreparedCall {
+        let run = self
+            .host
+            .capability_owner
+            .as_ref()
+            .unwrap()
+            .run()
+            .to_string();
+        let key = (run, call.to_string(), tool.to_string());
+        let mut parents = self.durable.parents.lock().unwrap();
+        if let Some(original) = parents.get(&key) {
+            assert_eq!(original, &original_arguments, "parent facts are immutable");
+        } else {
+            parents.insert(key, original_arguments.clone());
+        }
+        PreparedCall {
+            call: call.into(),
+            tool: tool.into(),
+            arguments: original_arguments,
+        }
     }
-    pub fn invoke_with(
-        &self,
-        host: AgentHostBridges,
-        call: &str,
-        tool: &str,
-        args: Value,
-    ) -> Value {
+    pub fn invoke(&self, prepared: PreparedCall) -> Value {
+        self.invoke_with(self.host.clone(), prepared)
+    }
+    pub fn invoke_with(&self, host: AgentHostBridges, prepared: PreparedCall) -> Value {
+        let PreparedCall {
+            call,
+            tool,
+            arguments: args,
+        } = prepared;
         let identity = rustscript_agent::bundled_tool_registry()
             .unwrap()
             .identity()
@@ -203,11 +245,12 @@ pub fn run(context: map) -> map {
         }
     }
     pub fn start(&self, call: &str) -> String {
-        let value = self.invoke(
+        let prepared = self.parent_call(
             call,
             "terminal",
             json!({"argv": ["/bin/cat"], "background": true}),
         );
+        let value = self.invoke(prepared);
         assert_eq!(value["ok"], true, "start result: {value}");
         value["data"]["process_id"]
             .as_str()

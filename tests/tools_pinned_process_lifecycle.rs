@@ -347,6 +347,15 @@ fn child_registration_failure_reaps_only_its_process_and_preserves_siblings() {
     use pinned_process_fixture::NativeFixture;
     let fixture = NativeFixture::new("first-run");
     let other = NativeFixture::new("other-run");
+    let mut forged = fixture.parent_call(
+        "forged-parent",
+        "terminal",
+        json!({"argv": ["/bin/cat"], "background": true}),
+    );
+    forged.arguments = json!({"argv": ["/bin/sh", "-c", "exit 0"], "background": true});
+    let rejected = fixture.invoke(forged);
+    assert_eq!(rejected["code"], "pinned_call_mismatch", "{rejected}");
+    assert_eq!(fixture.processes.table_len(), 0);
     let sibling = fixture.start("sibling");
     let separate = other.start("separate");
     assert_eq!(fixture.processes.table_len(), 1);
@@ -373,7 +382,7 @@ fn child_registration_failure_reaps_only_its_process_and_preserves_siblings() {
             interrupt_child();
         }
     }));
-    let failed = fixture.invoke(
+    let unpublished = fixture.parent_call(
         "unpublished",
         "terminal",
         json!({
@@ -381,6 +390,7 @@ fn child_registration_failure_reaps_only_its_process_and_preserves_siblings() {
             "background": true
         }),
     );
+    let failed = fixture.invoke(unpublished);
     assert_eq!(
         failed["ok"], false,
         "registration must fail closed: {failed}"
@@ -393,16 +403,18 @@ fn child_registration_failure_reaps_only_its_process_and_preserves_siblings() {
     assert_eq!(fixture.processes.table_len(), 1);
     assert!(fixture.interrupted("unpublished"));
     for (owner, handle) in [(&fixture, &sibling), (&other, &separate)] {
-        let written = owner.invoke("write-after-failure", "process", json!({"action": "write", "process_id": handle, "data": "SURVIVING_OWNER\n", "timeout_ms": 2000}));
+        let write = owner.parent_call("write-after-failure", "process", json!({"action": "write", "process_id": handle, "data": "SURVIVING_OWNER\n", "timeout_ms": 2000}));
+        let written = owner.invoke(write);
         assert_eq!(written["ok"], true, "legal sibling write: {written}");
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut ordinal = 0;
         loop {
-            let polled = owner.invoke(
+            let poll = owner.parent_call(
                 &format!("survivor-poll-{ordinal}"),
                 "process",
                 json!({"action": "poll", "process_id": handle}),
             );
+            let polled = owner.invoke(poll);
             assert_eq!(polled["ok"], true, "legal sibling poll: {polled}");
             if polled["data"]["stdout"] == "SURVIVING_OWNER\n" {
                 break;
@@ -412,11 +424,12 @@ fn child_registration_failure_reaps_only_its_process_and_preserves_siblings() {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    let foreign = other.invoke(
+    let foreign_call = other.parent_call(
         "foreign-process",
         "process",
         json!({"action": "write", "process_id": sibling, "data": "FORBIDDEN", "timeout_ms": 2000}),
     );
+    let foreign = other.invoke(foreign_call);
     assert_eq!(foreign["ok"], false, "other-run handle must fail");
     assert_eq!(foreign["error"]["code"], "process_not_found");
     fixture
@@ -427,7 +440,8 @@ fn child_registration_failure_reaps_only_its_process_and_preserves_siblings() {
         .request(rustscript_agent::CancellationReason::Requested);
     fixture.processes.shutdown_all();
     assert_eq!(fixture.processes.table_len(), 0);
-    let written = other.invoke("other-after-cancel", "process", json!({"action": "write", "process_id": separate, "data": "STILL_LIVE\n", "timeout_ms": 2000}));
+    let write = other.parent_call("other-after-cancel", "process", json!({"action": "write", "process_id": separate, "data": "STILL_LIVE\n", "timeout_ms": 2000}));
+    let written = other.invoke(write);
     assert_eq!(
         written["ok"], true,
         "separate run after original cancellation: {written}"

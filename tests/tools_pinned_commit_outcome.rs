@@ -133,6 +133,7 @@ struct RecordingState {
 struct RecordingDurable {
     state: Mutex<RecordingState>,
     fail_commit: bool,
+    original_arguments: Value,
 }
 impl DurableToolLifecycle for RecordingDurable {
     fn assert_active_run(&self, run: &str) -> Result<(), LifecycleError> {
@@ -142,6 +143,15 @@ impl DurableToolLifecycle for RecordingDurable {
     fn prepare_parent(&self, run: &str, call: &str, tool: &str) -> Result<(), LifecycleError> {
         assert_eq!((run, call, tool), ("run-outcome", "call-1", "read_file"));
         Ok(())
+    }
+    fn parent_arguments(
+        &self,
+        run: &str,
+        call: &str,
+        tool: &str,
+    ) -> Result<Option<Value>, LifecycleError> {
+        self.prepare_parent(run, call, tool)?;
+        Ok(Some(self.original_arguments.clone()))
     }
     fn replay_result(
         &self,
@@ -231,6 +241,7 @@ impl Fixture {
         .unwrap();
         let durable = Arc::new(RecordingDurable {
             fail_commit,
+            original_arguments: json!({"path": "note.txt"}),
             ..Default::default()
         });
         let owner = CapabilityOwner::new("gateway", "session-outcome", "run-outcome").unwrap();
