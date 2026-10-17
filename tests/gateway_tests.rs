@@ -3204,6 +3204,11 @@ async fn sustained_persistence_failure_never_permanently_exhausts_capacity() {
         "the pending state must stay observable after the permit is released"
     );
     assert_eq!(
+        service.metrics().snapshot().runs_terminal_pending,
+        1,
+        "in-flight storage retries must not hide pending health state"
+    );
+    assert_eq!(
         service.stop(&run_id).as_deref(),
         Some("terminal_pending"),
         "no terminal may be committed while storage is down; the status must stay observable"

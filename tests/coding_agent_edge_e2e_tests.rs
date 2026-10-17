@@ -1338,6 +1338,60 @@ async fn pending_provider_request_restart_retries_without_duplicate_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn persistent_recovery_without_original_pin_fails_before_provider_or_effect() {
+    let mut fixture = Fixture::new("missing-original-pin");
+    let provider = ScriptedProvider::new();
+    provider.push_ok(text_response("must not be sent"));
+    let state = loop_service_sqlite(AgentGatewayConfig::default(), &provider, &fixture.db_path());
+    let service = state.service();
+    apply_workspace_limits(&service, &fixture.workspace, 64 * 1024);
+    let admitted = service
+        .admit(admit_request())
+        .await
+        .expect("admit original pin");
+    let persistence = state.persistence().expect("durable store");
+    let control = rustscript_agent::plugins::PluginControlStore::new(persistence.as_ref());
+    let original = control
+        .pin_for_run(&admitted.run_id)
+        .expect("original Native receipt");
+    assert_eq!(original["pinned"], true);
+    control
+        .release(&rustscript_agent::plugins::GraphRetention {
+            graph_id: original["graph_id"].as_str().unwrap().to_string(),
+            owner_kind: "run".to_string(),
+            owner_id: admitted.run_id.clone(),
+            ref_id: original["ref_id"].as_str().unwrap().to_string(),
+        })
+        .expect("release original retention through the SDK");
+    service.evict_run_handle(&admitted.run_id);
+    tokio::time::timeout(
+        WORKER_BUDGET,
+        service
+            .clone()
+            .run_worker(admitted.run_id.clone(), "ignored".to_string()),
+    )
+    .await
+    .expect("bounded recovery denial");
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.failed"]
+    );
+    let events = service.run_events(&admitted.run_id);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["data"]["error_code"] == "tool_pin_unavailable")
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(tool_event_count(&service, &admitted.run_id), 0);
+    assert!(durable_tool_result_messages(&service, &admitted.session_id).is_empty());
+    assert_eq!(service.process_owner_count(&admitted.run_id), 0);
+    drop(service);
+    drop(state);
+    fixture.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pending_recovery_rejects_changed_workspace_binding() {
     let Some(sh) = require_posix_sh() else {
         return;
@@ -1421,6 +1475,15 @@ async fn pending_recovery_rejects_changed_workspace_binding() {
         "{content}"
     );
     assert_eq!(content[0]["is_error"], true);
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed"]
+    );
+    assert_eq!(
+        provider.call_count(),
+        3,
+        "pending request, Guardian and final reply"
+    );
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     drop(service);
     drop(state);
@@ -1504,6 +1567,15 @@ async fn pending_recovery_does_not_turn_limits_path_into_authority() {
         "{content}"
     );
     assert_eq!(content[0]["is_error"], true);
+    assert_eq!(
+        terminal_events(&service, &admitted.run_id),
+        vec!["run.completed"]
+    );
+    assert_eq!(
+        provider.call_count(),
+        3,
+        "pending request, Guardian and final reply"
+    );
     assert_eq!(service.process_owner_count(&admitted.run_id), 0);
     drop(service);
     drop(state);
