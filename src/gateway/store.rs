@@ -773,11 +773,15 @@ impl StorageWorker {
     /// Signals the worker to exit and joins it, exactly once (idempotent
     /// under concurrent calls and `Drop`).
     fn shutdown(&self) {
+        // Every caller waits behind the join, including callers that observe
+        // `closed` while the first shutdown still owns a live worker. `closed`
+        // fences new commands; it is not a completion signal.
+        let mut thread = self.thread.lock().expect("storage thread lock");
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
         let _ = self.shutdown.send(());
-        if let Some(thread) = self.thread.lock().expect("storage thread lock").take() {
+        if let Some(thread) = thread.take() {
             let _ = thread.join();
         }
     }
@@ -1304,4 +1308,69 @@ pub(crate) fn append_message(
     view.message_count = messages.len();
     view.updated_at = timestamp();
     message
+}
+
+#[cfg(test)]
+mod storage_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn concurrent_storage_shutdown_waits_for_the_owned_worker_join() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let (sender, _requests) = mpsc::channel();
+        let (shutdown, stop) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_worker = Arc::clone(&finished);
+        let thread = std::thread::spawn(move || {
+            stop.recv().unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_worker.store(true, Ordering::Release);
+        });
+        let worker = Arc::new(StorageWorker {
+            sender,
+            shutdown,
+            thread: std::sync::Mutex::new(Some(thread)),
+            closed: AtomicBool::new(false),
+        });
+        let first = {
+            let worker = Arc::clone(&worker);
+            std::thread::spawn(move || worker.shutdown())
+        };
+        let entered =
+            entered_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+        let second = {
+            let worker = Arc::clone(&worker);
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                worker.shutdown();
+                returned_tx.send(finished.load(Ordering::Acquire)).unwrap();
+            })
+        };
+        // Preserve an early return observation before releasing the same owned
+        // worker. Cleanup cannot turn this captured failure into a pass.
+        let early = returned_rx.recv_timeout(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        entered.expect("first shutdown reached the live owned worker");
+        let joined = early.unwrap_or_else(|_| {
+            returned_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap()
+        });
+        assert!(
+            joined,
+            "concurrent shutdown returned before the owned worker joined"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shared cleanup budget"
+        );
+        worker.shutdown();
+    }
 }
