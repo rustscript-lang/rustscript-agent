@@ -41,6 +41,56 @@ fn failed() -> OAuthError {
     }
 }
 
+fn failed_body(error: hyper::Error) -> OAuthError {
+    // Classify only fixed library diagnostics, never publish their raw source
+    // text (which can contain response data).
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            let source_text = io.to_string();
+            let classified = if source_text.contains("chunk extensions over limit") {
+                Some("native_https_chunk_extensions_limit")
+            } else if source_text.contains("chunk trailers") {
+                Some("native_https_chunk_trailers_invalid")
+            } else if source_text.contains("chunk size") || source_text.contains("chunk body") {
+                Some("native_https_chunk_framing_invalid")
+            } else if source_text.contains("close_notify") {
+                Some("native_https_tls_close_notify_missing")
+            } else {
+                None
+            };
+            if let Some(message) = classified {
+                return OAuthError::Transport {
+                    message: message.into(),
+                };
+            }
+            let message = match io.kind() {
+                std::io::ErrorKind::UnexpectedEof => "native_https_body_io_eof",
+                std::io::ErrorKind::ConnectionReset => "native_https_body_io_reset",
+                std::io::ErrorKind::InvalidData => "native_https_body_io_invalid_data",
+                std::io::ErrorKind::InvalidInput => "native_https_body_io_invalid_input",
+                _ => "native_https_body_io_other",
+            };
+            return OAuthError::Transport {
+                message: message.into(),
+            };
+        }
+        source = cause.source();
+    }
+    let message = if error.is_incomplete_message() {
+        "native_https_incomplete_body"
+    } else if error.is_parse() {
+        "native_https_body_parse_failed"
+    } else if error.is_closed() {
+        "native_https_body_closed"
+    } else {
+        "native_https_body_failed"
+    };
+    OAuthError::Transport {
+        message: message.into(),
+    }
+}
+
 fn busy() -> OAuthError {
     OAuthError::Transport {
         message: "native_https_busy".into(),
@@ -483,7 +533,7 @@ async fn pump_response(
         let Some(frame) = frame else {
             break;
         };
-        let frame = frame.map_err(|_| failed())?;
+        let frame = frame.map_err(failed_body)?;
         if let Some(chunk) = frame.data_ref() {
             let remaining = context.max_response_body_bytes().saturating_sub(body_bytes);
             if chunk.len() > remaining {

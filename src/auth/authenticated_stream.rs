@@ -1,24 +1,24 @@
 //! Native authenticated sanitized incremental SSE record security layer.
 //!
-//! This adapter frames complete data-only records over the accepted
+//! This adapter sanitizes bounded data-only records over the accepted
 //! authenticated incremental reader (`OAuthHost::start_access_stream_scoped`).
 //! Each complete data item becomes either bounded strict JSON with all
 //! secret-shaped keys removed, or an index into the caller-supplied public
-//! marker vector. Raw response head values, body chunks, and SSE control
-//! fields never leave this module. Provider event meaning, terminal-marker
-//! semantics, and every retry/refresh/fallback decision remain RSS work.
+//! marker vector. The transport framer owns EventSource syntax. Raw response
+//! head values, body chunks, and SSE control fields never cross the sanitized
+//! guest boundary. Provider event meaning, terminal-marker semantics, and every
+//! retry/refresh/fallback decision remain RSS work.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use crate::auth::store::OpaqueAccessHandle;
+use crate::transport::sse::{FrameError, SseFramer};
 
-use super::{
-    BoundedHttpsStream, MAX_JSON_DEPTH, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext,
-    ProviderRequest, TrustedTransportPolicy, parse_strict_json_with_limits, retry_after_ms,
-    strip_secret_keys,
+use super::oauth::{
+    BoundedHttpsStream, OAuthCancel, OAuthError, OAuthHost, OAuthIoContext, ProviderRequest,
+    TrustedTransportPolicy, parse_strict_json_with_limits, retry_after_ms, strip_secret_keys,
 };
 
 const MAX_PUBLIC_MARKERS: usize = 16;
@@ -26,7 +26,9 @@ const MAX_PUBLIC_MARKER_BYTES: usize = 64;
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_SSE_DATA_BYTES: usize = 64 * 1024;
 const MAX_SSE_OUTPUT_BYTES: usize = 64 * 1024;
-const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+// Public event trees use the same bounded nesting budget as the public JSON
+// host. Credential-response parsing retains its independent eight-level cap.
+const MAX_SSE_JSON_DEPTH: usize = 64;
 
 /// Canonical, sanitized response head. `content_type` is only ever
 /// `text/event-stream`, `application/json`, or empty; no raw header value,
@@ -55,11 +57,13 @@ enum SseMode {
     Unsupported,
 }
 
-/// Framing progress for one consumed byte.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ByteOutcome {
-    Continue,
-    Dispatch,
+fn frame_error(error: FrameError) -> OAuthError {
+    let reason = match error {
+        FrameError::LineTooLong => "sse line exceeds limit",
+        FrameError::DataTooLong => "sse data exceeds limit",
+        FrameError::InvalidUtf8 => "sse line is not utf-8",
+    };
+    static_malformed(reason)
 }
 
 fn static_malformed(reason: &'static str) -> OAuthError {
@@ -136,12 +140,8 @@ pub(crate) struct SanitizedAccessSseStream {
     markers: Vec<String>,
     raw_buf: Vec<u8>,
     cursor: usize,
-    prefix: Vec<u8>,
-    bom_decided: bool,
-    after_cr: bool,
-    line: Vec<u8>,
+    framer: SseFramer,
     data: Vec<u8>,
-    has_data: bool,
     eof: bool,
     buffered_json_done: bool,
     terminal_error: Option<OAuthError>,
@@ -162,24 +162,29 @@ impl std::fmt::Debug for SanitizedAccessSseStream {
 
 #[allow(dead_code)]
 impl OAuthHost {
-    /// Native-only authenticated incremental SSE/JSON stream. Trusted policy is
-    /// the sole authority; the caller cannot supply a URL. Public markers are
-    /// validated before any credential consumption. Raw head/chunks never leave
-    /// native scope. No guest/RSS caller is bound yet, so this carries a narrow
-    /// `allow(dead_code)` like the existing scoped streaming entry point.
+    /// Open an authenticated stream without owning EventSource framing.
     pub(crate) fn start_access_sse_scoped(
         &self,
         policy: &TrustedTransportPolicy,
         request: ProviderRequest,
-        access: OpaqueAccessHandle,
+        access: crate::auth::store::OpaqueAccessHandle,
         owner_cancel: Arc<dyn OAuthCancel>,
         public_markers: Vec<String>,
     ) -> Result<SanitizedAccessSseStream, OAuthError> {
-        // Validate the caller literals before the raw start consumes anything.
         let markers = validate_public_markers(public_markers)?;
-        // Independent context clone: same policy deadline and owner cancellation.
         let context = self.io_context_with_cancel(policy.deadline, Arc::clone(&owner_cancel));
-        let mut reader = self.start_access_stream_scoped(policy, request, access, owner_cancel)?;
+        let reader = self.start_access_stream_scoped(policy, request, access, owner_cancel)?;
+        SanitizedAccessSseStream::from_raw(reader, context, markers)
+    }
+}
+
+#[allow(dead_code)]
+impl SanitizedAccessSseStream {
+    fn from_raw(
+        mut reader: Box<dyn BoundedHttpsStream>,
+        context: OAuthIoContext,
+        markers: Vec<String>,
+    ) -> Result<Self, OAuthError> {
         let status = reader.head().status;
         if !(100..=599).contains(&status) {
             reader.cancel();
@@ -203,7 +208,7 @@ impl OAuthHost {
             content_type: media.unwrap_or("").to_string(),
             retry_after_ms: retry_after_ms(&reader.head().headers),
         };
-        Ok(SanitizedAccessSseStream {
+        Ok(Self {
             reader,
             context,
             head,
@@ -211,21 +216,13 @@ impl OAuthHost {
             markers,
             raw_buf: Vec::new(),
             cursor: 0,
-            prefix: Vec::new(),
-            bom_decided: false,
-            after_cr: false,
-            line: Vec::new(),
+            framer: SseFramer::new(MAX_SSE_LINE_BYTES, MAX_SSE_DATA_BYTES),
             data: Vec::new(),
-            has_data: false,
             eof: false,
             buffered_json_done: false,
             terminal_error: None,
         })
     }
-}
-
-#[allow(dead_code)]
-impl SanitizedAccessSseStream {
     pub(crate) fn head(&self) -> &SanitizedSseHead {
         &self.head
     }
@@ -273,13 +270,11 @@ impl SanitizedAccessSseStream {
             }
             let byte = self.raw_buf[self.cursor];
             self.cursor += 1;
-            let outcome = match self.step(byte) {
-                Ok(outcome) => outcome,
-                Err(error) => return Err(self.fail(error)),
+            let data = match self.framer.push_byte(byte) {
+                Ok(data) => data,
+                Err(error) => return Err(self.fail(frame_error(error))),
             };
-            if matches!(outcome, ByteOutcome::Dispatch) {
-                let data = std::mem::take(&mut self.data);
-                self.has_data = false;
+            if let Some(data) = data {
                 if let Err(error) = self.context.check() {
                     return Err(self.fail(error));
                 }
@@ -361,88 +356,6 @@ impl SanitizedAccessSseStream {
         }
     }
 
-    /// BOM gate, mirroring the pinned Core parser, then per-byte line framing.
-    fn step(&mut self, byte: u8) -> Result<ByteOutcome, OAuthError> {
-        if !self.bom_decided {
-            self.prefix.push(byte);
-            if self.prefix == BOM {
-                self.prefix.clear();
-                self.bom_decided = true;
-                return Ok(ByteOutcome::Continue);
-            }
-            if BOM.starts_with(&self.prefix) {
-                return Ok(ByteOutcome::Continue);
-            }
-            let pending = std::mem::take(&mut self.prefix);
-            self.bom_decided = true;
-            for pending_byte in pending {
-                if matches!(self.process_byte(pending_byte)?, ByteOutcome::Dispatch) {
-                    return Ok(ByteOutcome::Dispatch);
-                }
-            }
-            return Ok(ByteOutcome::Continue);
-        }
-        self.process_byte(byte)
-    }
-
-    fn process_byte(&mut self, byte: u8) -> Result<ByteOutcome, OAuthError> {
-        if self.after_cr {
-            self.after_cr = false;
-            if byte == b'\n' {
-                return Ok(ByteOutcome::Continue);
-            }
-        }
-        match byte {
-            b'\r' => {
-                self.after_cr = true;
-                self.process_line()
-            }
-            b'\n' => self.process_line(),
-            _ => {
-                if self.line.len() >= MAX_SSE_LINE_BYTES {
-                    return Err(static_malformed("sse line exceeds limit"));
-                }
-                self.line.push(byte);
-                Ok(ByteOutcome::Continue)
-            }
-        }
-    }
-
-    fn process_line(&mut self) -> Result<ByteOutcome, OAuthError> {
-        let line = std::mem::take(&mut self.line);
-        let text =
-            std::str::from_utf8(&line).map_err(|_| static_malformed("sse line is not utf-8"))?;
-        if text.is_empty() {
-            // Dispatch only on a blank line; ignore an empty line with no data.
-            if self.has_data {
-                return Ok(ByteOutcome::Dispatch);
-            }
-            return Ok(ByteOutcome::Continue);
-        }
-        if text.starts_with(':') {
-            // Comment lines are never surfaced.
-            return Ok(ByteOutcome::Continue);
-        }
-        let (field, value) = text.split_once(':').unwrap_or((text, ""));
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        if field == "data" {
-            let added = value.len() + usize::from(self.has_data);
-            let total = match self.data.len().checked_add(added) {
-                Some(total) if total <= MAX_SSE_DATA_BYTES => total,
-                _ => return Err(static_malformed("sse data exceeds limit")),
-            };
-            debug_assert!(total <= MAX_SSE_DATA_BYTES);
-            if self.has_data {
-                self.data.push(b'\n');
-            }
-            self.data.extend_from_slice(value.as_bytes());
-            self.has_data = true;
-        }
-        // event/id/retry/unknown fields are intentionally ignored and never
-        // published.
-        Ok(ByteOutcome::Continue)
-    }
-
     fn decode_data(&self, data: &[u8]) -> Result<SanitizedSseRecord, OAuthError> {
         let text =
             std::str::from_utf8(data).map_err(|_| static_malformed("sse data is not utf-8"))?;
@@ -459,8 +372,9 @@ impl SanitizedAccessSseStream {
     fn sanitize_json(text: &str) -> Result<SanitizedSseRecord, OAuthError> {
         // The custom parser counts primitive leaves as one seed level beyond
         // container nesting; allow that leaf for the existing container cap.
-        let parsed = parse_strict_json_with_limits(text, MAX_JSON_DEPTH + 1, Some(MAX_JSON_DEPTH))
-            .map_err(|_| static_malformed("sse data is not strict json"))?;
+        let parsed =
+            parse_strict_json_with_limits(text, MAX_SSE_JSON_DEPTH + 1, Some(MAX_SSE_JSON_DEPTH))
+                .map_err(|_| static_malformed("sse data is not strict json"))?;
         let cleaned = strip_secret_keys(parsed);
         if !matches!(cleaned, JsonValue::Object(_) | JsonValue::Array(_)) {
             return Err(static_malformed("sse data is not a json object or array"));
@@ -494,10 +408,8 @@ impl SanitizedAccessSseStream {
     fn clear_pending(&mut self) {
         self.raw_buf.clear();
         self.cursor = 0;
-        self.prefix.clear();
-        self.line.clear();
+        self.framer.discard_pending();
         self.data.clear();
-        self.has_data = false;
     }
 }
 
@@ -511,7 +423,7 @@ impl Drop for SanitizedAccessSseStream {
 
 #[cfg(test)]
 mod sanitized_sse_tests {
-    use super::super::{
+    use super::super::oauth::{
         BoundedHttpsStream, BoundedHttpsTransport, OAuthCancel, OAuthError, OAuthHost,
         OAuthIoContext, PreparedHttpsRequest, ProviderRequest, RawHttpsResponse,
         RawHttpsResponseHead, ScriptedBrowser, ScriptedCallback, ScriptedCancel, ScriptedClock,
@@ -741,7 +653,7 @@ mod sanitized_sse_tests {
             transport,
             Arc::new(ScriptedCallback::new()),
             Arc::new(ScriptedBrowser::new()),
-            Arc::clone(clock) as Arc<dyn super::super::OAuthClock>,
+            Arc::clone(clock) as Arc<dyn super::super::oauth::OAuthClock>,
             Arc::clone(cancel) as Arc<dyn OAuthCancel>,
         )
     }
@@ -803,6 +715,47 @@ mod sanitized_sse_tests {
             SanitizedSseRecord::Json(text) => text,
             other => panic!("expected a sanitized json record, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_stream_accepts_many_bounded_records_beyond_credential_body_cap() {
+        let (_store, access) = issue_access("stream-total");
+        let chunk = format!("data: {{\"text\":\"{}\"}}\n\n", "x".repeat(1024)).into_bytes();
+        let mut queue: Vec<_> = (0..128).map(|_| Injected::Chunk(chunk.clone())).collect();
+        queue.push(Injected::Eof);
+        let (transport, _) = make_transport(200, mime("text/event-stream"), queue);
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec![]);
+        for _ in 0..128 {
+            expect_record(stream.read_record());
+        }
+        expect_end(stream.read_record());
+    }
+
+    #[test]
+    fn provider_stream_total_cap_remains_enforced_and_credential_io_stays_small() {
+        let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
+        let cancel = Arc::new(ScriptedCancel::new());
+        let context = OAuthIoContext::new(
+            Instant::now() + Duration::from_secs(3),
+            clock.clone(),
+            cancel.clone(),
+        );
+        assert_eq!(context.max_response_body_bytes(), 64 * 1024);
+        let (_store, access) = issue_access("stream-over-total");
+        let (transport, state) = make_transport(
+            200,
+            mime("text/event-stream"),
+            vec![Injected::Chunk(vec![b' '; 8 * 1024 * 1024 + 1])],
+        );
+        let host = make_host(transport, &clock, &cancel);
+        let mut stream = start_stream(&host, access, &cancel, vec![]);
+        assert!(
+            matches!(expect_error(stream.read_record()), OAuthError::ResponseTooLarge { max_bytes } if max_bytes == 8 * 1024 * 1024)
+        );
+        assert_eq!(locked(&state).cancels, 1);
     }
 
     #[test]
@@ -1003,11 +956,11 @@ mod sanitized_sse_tests {
     #[test]
     fn sanitized_sse_fails_closed_and_stays_terminal() {
         let mut deep = String::new();
-        for _ in 0..10 {
+        for _ in 0..=super::MAX_SSE_JSON_DEPTH {
             deep.push_str("{\"a\":");
         }
         deep.push('1');
-        for _ in 0..10 {
+        for _ in 0..=super::MAX_SSE_JSON_DEPTH {
             deep.push('}');
         }
         let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -1109,8 +1062,10 @@ mod sanitized_sse_tests {
             200,
             mime("text/event-stream"),
             vec![
-                Injected::Chunk(vec![b'a'; 40 * 1024]),
-                Injected::Chunk(vec![b'b'; 40 * 1024]),
+                // Many short comment lines stay under per-record framing
+                // limits while crossing the independent stream total.
+                Injected::Chunk(b": heartbeat\n".repeat(5 * 1024 * 1024 / 12)),
+                Injected::Chunk(b": heartbeat\n".repeat(5 * 1024 * 1024 / 12)),
                 Injected::Eof,
             ],
         );
@@ -1242,14 +1197,55 @@ mod sanitized_sse_tests {
     }
 
     #[test]
-    fn sanitized_sse_depth_eight_record_keeps_general_limit_and_redacts() {
+    fn responses_moderation_metadata_is_a_valid_public_sse_record() {
+        use serde_json::json;
+        // Shape reproduced from a captured public response.metadata record;
+        // no account identifiers or captured moderation values are retained.
+        let event = json!({
+            "type": "response.metadata",
+            "metadata": {"openai_chatgpt_moderation_metadata": {"prompt": {
+                "omnimod": {"outputs": [{"results": [{"category_flags": {
+                    "safe_fixture": false, "access_token": "SYNTHETIC_SECRET"
+                }}]}]}
+            }}}
+        });
+        let text = event.to_string();
+        assert!(
+            super::super::oauth::parse_strict_json(&text).is_err(),
+            "credential JSON must keep its existing small bound"
+        );
+        let record = SanitizedAccessSseStream::sanitize_json(&text)
+            .expect("valid bounded public metadata must not abort the provider stream");
+        let super::SanitizedSseRecord::Json(public) = record else {
+            panic!("expected public JSON");
+        };
+        assert!(!public.contains("SYNTHETIC_SECRET"));
+        assert!(!public.contains("access_token"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&public).unwrap()["type"],
+            "response.metadata"
+        );
+    }
+
+    #[test]
+    fn sanitized_sse_public_depth_bound_keeps_credential_limit_and_redacts() {
+        assert_eq!(
+            super::super::oauth::MAX_JSON_DEPTH,
+            8,
+            "credential bound must remain unchanged"
+        );
+        assert_eq!(
+            super::MAX_SSE_JSON_DEPTH,
+            64,
+            "public JSON nesting is explicitly bounded"
+        );
         let mut json = r#"{"access_token":"SYNTHETIC_SECRET"}"#.to_string();
-        for _ in 0..7 {
+        for _ in 0..(super::MAX_SSE_JSON_DEPTH - 1) {
             json = format!("{{\"nested\":{json}}}");
         }
-        assert!(super::super::parse_strict_json(&json).is_err());
+        assert!(super::super::oauth::parse_strict_json(&json).is_err());
 
-        let (_store, access) = issue_access("depth-eight");
+        let (_store, access) = issue_access("public-depth-limit");
         let body = format!("data: {json}\n\n").into_bytes();
         let (transport, state) =
             make_transport(200, Vec::new(), vec![Injected::Chunk(body), Injected::Eof]);
@@ -1262,39 +1258,39 @@ mod sanitized_sse_tests {
         assert!(!sanitized.contains("SYNTHETIC_SECRET"));
         let mut parsed: serde_json::Value =
             serde_json::from_str(&sanitized).expect("sanitized JSON parses");
-        for _ in 0..7 {
+        for _ in 0..(super::MAX_SSE_JSON_DEPTH - 1) {
             parsed = parsed["nested"].clone();
         }
         assert!(parsed.get("access_token").is_none());
         assert_eq!(locked(&state).reads, 1);
         expect_end(stream.read_record());
 
-        let mut empty_ninth_object = "{}".to_string();
-        let mut empty_ninth_array = "[]".to_string();
-        let mut mixed_ninth_container = "[]".to_string();
-        for depth in 1..9 {
-            empty_ninth_object = format!("{{\"nested\":{empty_ninth_object}}}");
-            empty_ninth_array = format!("[{empty_ninth_array}]");
-            mixed_ninth_container = if depth % 2 == 0 {
-                format!("{{\"nested\":{mixed_ninth_container}}}")
+        let mut empty_over_limit_object = "{}".to_string();
+        let mut empty_over_limit_array = "[]".to_string();
+        let mut mixed_over_limit_container = "[]".to_string();
+        for depth in 1..=super::MAX_SSE_JSON_DEPTH {
+            empty_over_limit_object = format!("{{\"nested\":{empty_over_limit_object}}}");
+            empty_over_limit_array = format!("[{empty_over_limit_array}]");
+            mixed_over_limit_container = if depth % 2 == 0 {
+                format!("{{\"nested\":{mixed_over_limit_container}}}")
             } else {
-                format!("[{mixed_ninth_container}]")
+                format!("[{mixed_over_limit_container}]")
             };
         }
         for candidate in [
-            &empty_ninth_object,
-            &empty_ninth_array,
-            &mixed_ninth_container,
+            &empty_over_limit_object,
+            &empty_over_limit_array,
+            &mixed_over_limit_container,
         ] {
             assert!(
-                super::super::parse_strict_json(candidate).is_err(),
+                super::super::oauth::parse_strict_json(candidate).is_err(),
                 "general OAuth strict seed depth remains eight"
             );
         }
         for (label, json) in [
-            ("empty-ninth-object", empty_ninth_object),
-            ("empty-ninth-array", empty_ninth_array),
-            ("mixed-ninth-container", mixed_ninth_container),
+            ("empty-over-limit-object", empty_over_limit_object),
+            ("empty-over-limit-array", empty_over_limit_array),
+            ("mixed-over-limit-container", mixed_over_limit_container),
         ] {
             let (_store, access) = issue_access(label);
             let body = format!("data: {json}\n\n").into_bytes();
@@ -1307,12 +1303,12 @@ mod sanitized_sse_tests {
             assert_eq!(
                 expect_error(stream.read_record()).code(),
                 "malformed_response",
-                "{label} must be rejected at nine containers"
+                "{label} must be rejected beyond the public container bound"
             );
         }
 
         let mut too_deep = r#"{"value":"leaf"}"#.to_string();
-        for _ in 0..8 {
+        for _ in 0..super::MAX_SSE_JSON_DEPTH {
             too_deep = format!("{{\"nested\":{too_deep}}}");
         }
         let body = format!("data: {too_deep}\n\n").into_bytes();
@@ -1321,7 +1317,7 @@ mod sanitized_sse_tests {
         let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
         let cancel = Arc::new(ScriptedCancel::new());
         let host = make_host(transport, &clock, &cancel);
-        let (_depth_store, depth_access) = issue_access("depth-nine");
+        let (_depth_store, depth_access) = issue_access("public-depth-over-limit");
         let mut stream = start_stream(&host, depth_access, &cancel, vec!["DONE".to_string()]);
         assert_eq!(
             expect_error(stream.read_record()).code(),

@@ -17,17 +17,18 @@ use crate::auth::pkce::{self, PKCE_CHALLENGE_METHOD, PkceError};
 use crate::auth::request_body::{self, SecretField};
 
 mod codex_metadata;
-/// Native authenticated sanitized incremental SSE-record security adapter.
-pub(crate) mod sanitized_sse;
 use crate::auth::store::{AuthStoreError, OpaqueRefreshHandle, OpaqueSecretSlot, SecretSlotKind};
 use crate::auth::token::CredentialId;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+// Incremental provider streams include event framing and repeated cumulative
+// output. Keep their finite total separate from credential/token JSON bodies.
+const MAX_ACCESS_STREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXCHANGE_CODE_BYTES: usize = 4096;
 const MAX_PUBLIC_QUERY_ENTRIES: usize = 32;
 const MAX_PUBLIC_QUERY_BYTES: usize = 2048;
-const MAX_JSON_DEPTH: usize = 8;
+pub(super) const MAX_JSON_DEPTH: usize = 8;
 const CALLBACK_TTL: Duration = Duration::from_secs(15 * 60);
 /// Live PKCE/device flow ceiling, matching the opaque registry bound.
 pub const MAX_LIVE_OAUTH_FLOWS: usize = 64;
@@ -470,6 +471,7 @@ impl OAuthCancel for CombinedOAuthCancel {
 /// the call. The context itself does not preempt arbitrary synchronous code.
 #[derive(Clone)]
 pub struct OAuthIoContext {
+    max_response_body_bytes: usize,
     deadline: Instant,
     clock: Arc<dyn OAuthClock>,
     cancel: Arc<dyn OAuthCancel>,
@@ -482,6 +484,7 @@ impl OAuthIoContext {
         cancel: Arc<dyn OAuthCancel>,
     ) -> Self {
         Self {
+            max_response_body_bytes: MAX_RESPONSE_BODY_BYTES,
             deadline,
             clock,
             cancel,
@@ -490,6 +493,7 @@ impl OAuthIoContext {
 
     pub(crate) fn with_additional_cancel(&self, extra: Arc<dyn OAuthCancel>) -> Self {
         Self {
+            max_response_body_bytes: self.max_response_body_bytes,
             deadline: self.deadline,
             clock: Arc::clone(&self.clock),
             cancel: Arc::new(CombinedOAuthCancel {
@@ -506,7 +510,12 @@ impl OAuthIoContext {
         MAX_REQUEST_BODY_BYTES
     }
     pub fn max_response_body_bytes(&self) -> usize {
-        MAX_RESPONSE_BODY_BYTES
+        self.max_response_body_bytes
+    }
+
+    fn for_access_stream(mut self) -> Self {
+        self.max_response_body_bytes = MAX_ACCESS_STREAM_BODY_BYTES;
+        self
     }
 
     pub fn check(&self) -> Result<(), OAuthError> {
@@ -1506,7 +1515,9 @@ impl OAuthHost {
             &CredentialUse::Access(access.clone()),
         )?;
         reject_reserved_form_keys(&request.public_body)?;
-        let context = self.io_context_with_cancel(policy.deadline, owner_cancel);
+        let context = self
+            .io_context_with_cancel(policy.deadline, owner_cancel)
+            .for_access_stream();
         context.check()?;
         // Only now consume the one-shot access and inject the shared final
         // Bearer. If injection fails the slot is already terminal and the
@@ -1527,7 +1538,7 @@ impl OAuthHost {
         Ok(Box::new(AuthenticatedAccessStream {
             inner,
             context,
-            max_body_bytes: MAX_RESPONSE_BODY_BYTES,
+            max_body_bytes: MAX_ACCESS_STREAM_BODY_BYTES,
             received: 0,
             eof: false,
             terminal_error: None,
@@ -2467,7 +2478,7 @@ impl OAuthHost {
         )
     }
 
-    fn io_context_with_cancel(
+    pub(super) fn io_context_with_cancel(
         &self,
         deadline: Instant,
         owner_cancel: Arc<dyn OAuthCancel>,
@@ -3081,7 +3092,7 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     }
 }
 
-fn parse_strict_json(text: &str) -> Result<JsonValue, OAuthError> {
+pub(super) fn parse_strict_json(text: &str) -> Result<JsonValue, OAuthError> {
     parse_strict_json_with_depth(text, MAX_JSON_DEPTH)
 }
 
@@ -3089,7 +3100,7 @@ fn parse_strict_json_with_depth(text: &str, max_depth: usize) -> Result<JsonValu
     parse_strict_json_with_limits(text, max_depth, None)
 }
 
-fn parse_strict_json_with_limits(
+pub(super) fn parse_strict_json_with_limits(
     text: &str,
     max_depth: usize,
     max_container_depth: Option<usize>,
@@ -3412,7 +3423,7 @@ fn secret_key(key: &str) -> bool {
 /// Removes every secret-shaped key at every nesting level without minting any
 /// credential slot. This is the discard-only sibling of `strip_secrets`, shared
 /// with the sanitized incremental SSE record path so there is one classifier.
-fn strip_secret_keys(value: JsonValue) -> JsonValue {
+pub(super) fn strip_secret_keys(value: JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => {
             let mut kept = JsonMap::new();
@@ -3453,7 +3464,7 @@ fn public_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String
     public
 }
 
-fn retry_after_ms(headers: &BTreeMap<String, String>) -> Option<u64> {
+pub(super) fn retry_after_ms(headers: &BTreeMap<String, String>) -> Option<u64> {
     headers.iter().find_map(|(name, value)| {
         if name.eq_ignore_ascii_case("retry-after") {
             value
@@ -5027,8 +5038,8 @@ mod authenticated_stream_tests {
     fn misbehaving_transport_is_bounded_by_cumulative_checked_cap() {
         let (_store, access) = issue_access("bound");
         let (transport, state) = transport(vec![
-            Injected::Chunk(vec![b'a'; 40 * 1024]),
-            Injected::Chunk(vec![b'b'; 40 * 1024]),
+            Injected::Chunk(vec![b'a'; 5 * 1024 * 1024]),
+            Injected::Chunk(vec![b'b'; 5 * 1024 * 1024]),
         ]);
         let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
         let cancel = Arc::new(ScriptedCancel::new());
@@ -5046,7 +5057,7 @@ mod authenticated_stream_tests {
                 Arc::clone(&cancel) as Arc<dyn OAuthCancel>,
             )
             .expect("authenticated stream starts");
-        assert_eq!(stream.read_chunk().unwrap().unwrap().len(), 40 * 1024);
+        assert_eq!(stream.read_chunk().unwrap().unwrap().len(), 5 * 1024 * 1024);
         assert_eq!(
             stream.read_chunk().unwrap_err().code(),
             "response_too_large"
@@ -5060,7 +5071,7 @@ mod authenticated_stream_tests {
     #[test]
     fn oversize_single_chunk_is_refused_even_without_eof() {
         let (_store, access) = issue_access("single-oversize");
-        let (transport, _state) = transport(vec![Injected::Chunk(vec![b'x'; 70 * 1024])]);
+        let (transport, _state) = transport(vec![Injected::Chunk(vec![b'x'; 8 * 1024 * 1024 + 1])]);
         let clock = Arc::new(ScriptedClock::new(1_900_000_000_000));
         let cancel = Arc::new(ScriptedCancel::new());
         let host = host(

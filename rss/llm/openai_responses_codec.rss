@@ -783,6 +783,18 @@ struct ResponsesWireFunctionCallItem {
     arguments: string
 }
 
+struct ResponsesWireToolSuccess {
+    content: string,
+    result: map,
+    truncated: bool
+}
+
+struct ResponsesWireToolError {
+    error: string,
+    message: string,
+    content: string,
+}
+
 struct ResponsesWireFunctionCallOutputItem {
     type: string,
     call_id: string,
@@ -939,7 +951,7 @@ fn responses_append_user(parts: array, message: map) -> array {
         if part.has("type") {
             if types::part_type(part) == "tool_result" {
                 let call_id: string = types::request_string(part, "tool_call_id");
-                let output: string = types::request_string(part, "content");
+                let output: string = responses_tool_output(part);
                 let item: ResponsesWireFunctionCallOutputItem = {
                     type: "function_call_output",
                     call_id: call_id,
@@ -956,6 +968,32 @@ fn responses_append_user(parts: array, message: map) -> array {
         result[result.length] = json::encode(item);
     }
     result
+}
+
+fn responses_tool_output(part: map) -> string {
+    let content: string = types::request_string(part, "content");
+    let error: map = types::request_map(part, "error");
+    if types::request_bool(part, "is_error", false) => {
+        let failure: ResponsesWireToolError = {
+            error: types::request_string(error, "code"),
+            message: types::request_string(error, "message"),
+            content: content
+        };
+        json::encode(failure)
+    } else if field_is_map(part, "result") => {
+        responses_tool_success(part)
+    } else => {
+        content
+    }
+}
+
+fn responses_tool_success(part: map) -> string {
+    let output: ResponsesWireToolSuccess = {
+        content: types::request_string(part, "content"),
+        result: types::request_map(part, "result"),
+        truncated: types::request_bool(part, "truncated", false)
+    };
+    json::encode(output)
 }
 
 /// One assistant message contributes its text as an `output_text` message item

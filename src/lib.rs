@@ -29,6 +29,7 @@ pub mod tool_schema;
 
 mod bundled_sources;
 mod durable_provider;
+mod transport;
 
 pub use bundled_sources::bundled_rss_sources;
 

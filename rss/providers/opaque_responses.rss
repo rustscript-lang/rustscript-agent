@@ -86,7 +86,17 @@ fn run_responses_mode(context: map, force_stream: bool) -> map {
 
 fn stream_transport_failure(failure: AuthBridgeFailure?) -> map {
     let detail: AuthBridgeFailure = failure.unwrap_or({code: "transport_error", cancelled: false, deadline_exceeded: false, revoked: false});
-    types::fail(types::error_request(detail.code, "provider transport failed"))
+    responses_transport_failure(detail)
+}
+
+// A failed provider read has produced no local tool effect. Retry only the
+// explicit native transport category within the existing loop retry budget;
+// cancellation, expiry and revocation remain terminal.
+fn responses_transport_failure(detail: AuthBridgeFailure) -> map {
+    let mut error: map = types::error_request(detail.code, "provider transport failed");
+    error.retryable = detail.code == "transport_error"
+        && detail.cancelled == false && detail.deadline_exceeded == false && detail.revoked == false;
+    types::fail(error)
 }
 
 fn malformed_stream(status: int) -> map {
@@ -138,7 +148,7 @@ fn responses_interpret_transport(envelope: TransportResultEnvelope) -> map {
     let result: map = if envelope.ok => {
         responses_parse_transport_response(response)
     } else => {
-        types::fail(types::error_request(failure.code, "provider transport failed"))
+        responses_transport_failure(failure)
     };
     result
 }

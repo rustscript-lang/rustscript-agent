@@ -254,6 +254,68 @@ fn admitted_responses_stream_returns_canonical_text_and_tool() {
     assert_eq!(wire["store"], json!(false));
 }
 
+struct FailedTransport(rustscript_agent::auth::oauth::OAuthError);
+impl rustscript_agent::auth::oauth::BoundedHttpsTransport for FailedTransport {
+    fn send(
+        &self,
+        _: &rustscript_agent::auth::oauth::PreparedHttpsRequest,
+        _: &rustscript_agent::auth::oauth::OAuthIoContext,
+    ) -> Result<
+        rustscript_agent::auth::oauth::RawHttpsResponse,
+        rustscript_agent::auth::oauth::OAuthError,
+    > {
+        Err(self.0.clone())
+    }
+    fn start_stream(
+        &self,
+        _: &rustscript_agent::auth::oauth::PreparedHttpsRequest,
+        _: &rustscript_agent::auth::oauth::OAuthIoContext,
+    ) -> Result<
+        Box<dyn rustscript_agent::auth::oauth::BoundedHttpsStream>,
+        rustscript_agent::auth::oauth::OAuthError,
+    > {
+        Err(self.0.clone())
+    }
+}
+#[test]
+fn native_transport_retry_flag_excludes_cancellation_revocation_and_malformed_data() {
+    use rustscript_agent::auth::oauth::OAuthError;
+    for failure in [
+        OAuthError::Transport {
+            message: "PRIVATE_TRANSPORT_DETAIL".into(),
+        },
+        OAuthError::Cancelled,
+        OAuthError::DeadlineExceeded,
+        OAuthError::HandleRevoked {
+            class: "private".into(),
+        },
+        OAuthError::MalformedResponse {
+            reason: "PRIVATE_TRANSPORT_DETAIL".into(),
+        },
+    ] {
+        let transient = matches!(failure, OAuthError::Transport { .. });
+        for stream in [false, true] {
+            let home = codex_home();
+            let transport = Arc::new(FailedTransport(failure.clone()));
+            let runner = harness_runner(&home, transport);
+            let result = run_harness(
+                &runner,
+                "openai_responses",
+                canonical_request(stream),
+                codex_profile(),
+                CREDENTIAL,
+            );
+            assert_eq!(result["ok"], false, "{result}");
+            assert_eq!(
+                result["error"]["retryable"].as_bool().unwrap_or(false),
+                transient,
+                "{result}"
+            );
+            assert!(!result.to_string().contains("PRIVATE_TRANSPORT_DETAIL"));
+        }
+    }
+}
+
 #[test]
 fn admitted_responses_upstream_error_maps_canonical_error() {
     let home = codex_home();

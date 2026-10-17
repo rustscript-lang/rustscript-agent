@@ -59,6 +59,10 @@ use crate::config::{
     validate_request_hash, validate_visible_name,
 };
 use crate::config_file::CompactionSettings;
+#[cfg(test)]
+#[path = "service_preflight_tests.rs"]
+mod preflight_tests;
+
 use crate::domain::{
     LlmContentBlock, MAX_DURABLE_TEXT_CHARS, RunContext, decode_message_blocks,
     decode_message_content, durable_message_id, durable_provider_event_id, durable_tool_event_id,
@@ -1504,6 +1508,15 @@ impl AgentService {
         if cancellation.requested().is_some() || cancellation.deadline_passed() {
             return compaction_error("cancelled", "run was cancelled before context refresh");
         }
+        if self
+            .persist_unstarted_tool_failures(run_id, context)
+            .is_err()
+        {
+            return compaction_error(
+                "tool_failure_persist_failed",
+                "tool validation failure could not be recorded",
+            );
+        }
         match self.refresh_session_compaction(
             &session_context.session_id,
             run_id,
@@ -1539,6 +1552,92 @@ impl AgentService {
                 result
             }
         }
+    }
+
+    /// Preserve pre-execution validation failures before durable history replaces
+    /// the RSS-local transcript. This records no successful effect and issues no
+    /// execution token. The committer checks parent/run and absence of started
+    /// effects under the same gate as the write.
+    fn persist_unstarted_tool_failures(
+        &self,
+        run_id: &str,
+        context: &JsonValue,
+    ) -> Result<(), EventCommitError> {
+        let Some(messages) = context.get("messages").and_then(JsonValue::as_array) else {
+            return Ok(());
+        };
+        for message in messages {
+            if message.get("role").and_then(JsonValue::as_str) != Some("user") {
+                continue;
+            }
+            for block in decode_message_blocks(&message["content"]) {
+                if block.block_type != "tool_result" || block.is_error != Some(true) {
+                    continue;
+                }
+                let call_id = block.tool_call_id.as_deref().unwrap_or_default();
+                let error = block.error.as_ref().unwrap_or(&JsonValue::Null);
+                let code = error
+                    .get("code")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default();
+                if call_id.is_empty() || code.is_empty() {
+                    return Err(EventCommitError::Corrupt(
+                        "invalid local tool failure".into(),
+                    ));
+                }
+                // Committed results are already authoritative; do not re-account
+                // them or reinterpret an interrupted effect as validation.
+                let name = {
+                    let store = self.inner.store.read();
+                    let run = store.runs.get(run_id).ok_or(EventCommitError::Terminal)?;
+                    if store.sessions.get(&run.session_id).is_some_and(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .any(|message| message.tool_call_id.as_deref() == Some(call_id))
+                    }) {
+                        continue;
+                    }
+                    let (_, name) = lookup_tool_call_parent(&store, &run.session_id, call_id)
+                        .ok_or(EventCommitError::MissingParent)?;
+                    if block.name.as_ref().is_some_and(|claimed| claimed != &name) {
+                        return Err(EventCommitError::Corrupt(
+                            "tool failure name mismatch".into(),
+                        ));
+                    }
+                    name
+                };
+                if self
+                    .replay_durable_tool_result(run_id, call_id, &name)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let result = ToolResult::failure_with(
+                    code,
+                    error
+                        .get("message")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("tool arguments rejected"),
+                    block.content.as_deref().unwrap_or_default(),
+                    json!({}),
+                    block.truncated.unwrap_or(false),
+                );
+                self.commit_tool_step(
+                    run_id,
+                    "tool.failed",
+                    json!({
+                        "tool_call_id": call_id,
+                        "name": block.name,
+                        "ok": false,
+                        "error_code": code,
+                        "validation_only": true,
+                    }),
+                    Some(&result),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Force the same RSS compaction policy used before provider turns without
@@ -7018,6 +7117,38 @@ impl DurableEventCommitter for ServiceEventCommitter {
             } else {
                 (String::new(), String::new())
             };
+            if data.get("validation_only").and_then(JsonValue::as_bool) == Some(true) {
+                if self.stop_requested() {
+                    return Err(EventCommitError::Cancelled);
+                }
+                let parent = store
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .find(|message| message.id == parent_message_id)
+                    })
+                    .ok_or(EventCommitError::MissingParent)?;
+                if event_type != "tool.failed"
+                    || result.is_none_or(|result| result.ok)
+                    || parent.run_id.as_deref() != Some(self.run_id.as_str())
+                    || data
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|name| name != tool_name)
+                    || run.events.iter().any(|event| {
+                        event.event == "tool.started"
+                            && event.data.get("tool_call_id").and_then(JsonValue::as_str)
+                                == Some(tool_call_id.as_str())
+                    })
+                {
+                    return Err(EventCommitError::Corrupt(
+                        "invalid unstarted tool failure".into(),
+                    ));
+                }
+            }
             let mut event = event_candidate(run, event_type, data, self.max_event_bytes);
             if !event_id.is_empty() {
                 event.event_id = event_id.clone();

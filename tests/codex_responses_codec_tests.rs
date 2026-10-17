@@ -194,6 +194,24 @@ fn continuation_input_maps_tool_result_and_function_call() {
 }
 
 #[test]
+fn continuation_output_preserves_process_exit_code_and_data() {
+    let mut vm = codec_vm();
+    let request = json!({"model":"fixture", "messages":[{"role":"user","content":[{
+        "type":"tool_result","tool_call_id":"process-1","content":"invalid argument", "is_error":false,
+        "result":{"exit_code":1,"stdout":"","stderr":"invalid argument","status":"exited"}
+    }]}]});
+    let result = invoke(&mut vm, "request_body", &[json_to_value(&request)]);
+    let Value::String(body) = result else {
+        panic!("body string")
+    };
+    let wire: JsonValue = serde_json::from_str(&body).unwrap();
+    let output: JsonValue = serde_json::from_str(wire["input"][0]["output"].as_str().unwrap())
+        .expect("structured process observation");
+    assert_eq!(output["result"]["exit_code"], 1);
+    assert_eq!(output["content"], "invalid argument");
+}
+
+#[test]
 fn tool_schemas_are_emitted_as_flat_function_tools() {
     let mut vm = codec_vm();
     let request = json!({

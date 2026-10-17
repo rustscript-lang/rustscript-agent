@@ -1,4 +1,7 @@
-//! Explicit one-call cached-access E2E through bundled Main and production SQLite.
+//! Explicit cached-access E2E through bundled Main and production SQLite.
+
+#[path = "support/live_rust_program.rs"]
+mod live_rust_program;
 
 use rustscript_agent::auth::host::{AuthHost, RunOAuthCancel, SystemOAuthClock};
 use rustscript_agent::auth::native_https::NativeHttpsTransport;

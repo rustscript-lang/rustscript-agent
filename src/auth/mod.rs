@@ -1,5 +1,6 @@
 //! Authentication configuration, token, and secure-store modules.
 
+pub(crate) mod authenticated_stream;
 #[cfg(target_os = "linux")]
 pub mod authorization_output;
 pub mod config;

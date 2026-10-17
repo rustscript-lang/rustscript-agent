@@ -3,7 +3,7 @@
 //! This is the resource host seam only. `oauth.stream` privately owns the
 //! accepted `SanitizedAccessSseStream` plus its `Owner`. Networking, SSE
 //! framing, sanitization, Authorization injection and the incremental reader
-//! all live in the existing Core/`oauth` layers; this module only maps the
+//! live in the transport/authenticated-stream layers; this module only maps the
 //! fixed guest start/read/close records onto them. Provider event meaning,
 //! terminal-marker semantics and every retry/refresh/fallback decision remain
 //! RSS work.
@@ -16,7 +16,7 @@ use rustscript_vm::{
     HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey, Value, Vm, VmResult,
 };
 
-use crate::auth::oauth::sanitized_sse::{SanitizedAccessSseStream, SanitizedSseRecord};
+use crate::auth::authenticated_stream::{SanitizedAccessSseStream, SanitizedSseRecord};
 
 use super::flow;
 use super::{
