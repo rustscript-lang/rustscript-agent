@@ -408,3 +408,66 @@ fn host_roots() -> BTreeSet<String> {
     }
     roots
 }
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn completion_names_are_exact_and_embedding_trust_cannot_bypass_tool_role() {
+        assert_eq!(charge_name("cap::artifact_put_result").unwrap(), None);
+        for name in [
+            "cap::artifact_put",
+            "cap::artifact_get",
+            "cap::artifact_reference",
+            "cap::artifact_put_results",
+            "cap::artifact_unknown",
+        ] {
+            assert_eq!(
+                charge_name(name).unwrap_err().kind,
+                PluginErrorKind::UnauthorizedHostImport
+            );
+        }
+        let manifest = super::super::manifest::parse_plugin_manifest(
+            "format: rustscript.plugin/v1\nid: org.rustscript.policy\nversion: 1.0.0\nkind: library\nruntime: \">=0.1.0, <0.2.0\"\ncontract: agent.library/v1\nhost_abi: agent.cap/v1\nentry:\n  path: invoke.rss\n  export: invoke\ndependencies: []\ncapabilities: []\neffects:\n  contract: agent.effects/v1\n  entries:\n    invoke:\n      direct: []\n      delegated: []\n"
+        ).unwrap();
+        for trust in [
+            PackageTrust::AcceptedPublisher,
+            PackageTrust::EmbeddingOwnedBuiltin,
+        ] {
+            for source in [
+                "pub fn invoke(token: string) -> map { cap::artifact_put_result(token, bytes::from_utf8(\"result\"), {}) }\n",
+                "pub fn invoke(value: map) -> map { agent_runtime::tool_prepare(value) }\n",
+                "pub fn invoke(token: string) -> map { agent_runtime::tool_commit(token, {}) }\n",
+                "pub fn invoke(value: int) -> int { agent::sleep_ms(value) }\n",
+            ] {
+                let mut package = InstalledPackage::new(
+                    "policy",
+                    manifest.clone(),
+                    BTreeMap::from([("invoke.rss".into(), source.as_bytes().to_vec())]),
+                );
+                package.trust = trust;
+                assert_eq!(
+                    compile_package(&package).unwrap_err().kind,
+                    PluginErrorKind::UnauthorizedHostImport
+                );
+            }
+        }
+        let mut manifest = manifest;
+        manifest.kind = "tool".into();
+        manifest.contract = "agent.tool/v1".into();
+        let mut package = InstalledPackage::new(
+            "policy",
+            manifest,
+            BTreeMap::from([(
+                "invoke.rss".into(),
+                b"pub fn invoke(value: int) -> int { agent::sleep_ms(value) }\n".to_vec(),
+            )]),
+        );
+        package.trust = PackageTrust::EmbeddingOwnedBuiltin;
+        assert_eq!(
+            compile_package(&package).unwrap_err().kind,
+            PluginErrorKind::UndeclaredDirectEffect
+        );
+    }
+}
